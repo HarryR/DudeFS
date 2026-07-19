@@ -1,0 +1,18 @@
+# Ruff — lint + format config (Astral). Dev-only; the runtime stays stdlib.
+target-version = "py312"
+line-length = 100
+
+[lint]
+# Pragmatic default set: pyflakes (F), pycodestyle (E/W), isort (I),
+# pyupgrade (UP), flake8-bugbear (B), comprehensions (C4).
+select = ["F", "E", "W", "I", "UP", "B", "C4"]
+ignore = [
+    "E741",   # ambiguous names (l, I) — the crypto/math code uses them deliberately
+]
+
+[lint.per-file-ignores]
+# Tests exercise internals and build deliberately-malformed inputs.
+"tests/*" = ["B011"]
+
+[format]
+docstring-code-format = false

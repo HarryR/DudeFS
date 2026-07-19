@@ -1,0 +1,22 @@
+# Project-local dev toolchain (self-contained; see Makefile) — never commit.
+/.uv/
+/.venv/
+.ruff_cache/
+.ty_cache/
+
+# External prior-art clones (large; each carries its own upstream .git).
+# FORMAL.md cites references/quepaxa — clone it separately if you want it.
+/references/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Test scratch DBs
+*.db
+
+# OS / editor cruft
+.DS_Store
+*~

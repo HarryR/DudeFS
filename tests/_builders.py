@@ -1,0 +1,172 @@
+# Test scenario builder — deterministic, seeded worlds and committed-set
+# "soups" for the A-hypothesis property tests (IMPLEMENTATION.md §6).
+#
+# Everything here is pure and reproducible from a seed; a failing property
+# test replays from its seed.
+
+from __future__ import annotations
+
+import random
+from dataclasses import dataclass
+
+from dudefs import artifacts as A
+from dudefs import crypto as C
+from dudefs import fold
+from dudefs.handlers import control as ctl
+
+
+def _seed_keypair(rng: random.Random) -> tuple[bytes, bytes]:
+    sk = bytes(rng.getrandbits(8) for _ in range(32))
+    return sk, C.SIGNER.public(sk)
+
+
+@dataclass
+class Client:
+    """A client's signing identity + its mutable chain head (seq/prev)."""
+
+    sk: bytes
+    pub: bytes
+    seq: int = 0
+    prev: bytes = A.GENESIS_PREV
+
+
+class World:
+    """A manager, some authorized clients, and a multi-epoch keyring. Tracks
+    per-client chain heads so generated chains are structurally valid."""
+
+    def __init__(self, seed: int = 0, n_clients: int = 2, epochs: tuple[int, ...] = (0,)):
+        self.rng = random.Random(seed)
+        self.mgr_sk, self.mgr_pub = _seed_keypair(self.rng)
+        self.genesis: fold.Genesis = {"manager_pub": self.mgr_pub}
+        self.keyring: fold.Keyring = {}
+        for e in epochs:
+            self.keyring[e] = {
+                "data_key": bytes(self.rng.getrandbits(8) for _ in range(32)),
+                "slot_secret": bytes(self.rng.getrandbits(8) for _ in range(32)),
+            }
+        self.clients: list[Client] = [Client(*_seed_keypair(self.rng)) for _ in range(n_clients)]
+        # manager control chain: a cert per client
+        self._mseq = 0
+        self._mprev = A.GENESIS_PREV
+        self._hlc = 1
+        self.control_ops: list[A.Op] = []
+        for c in self.clients:
+            self.control_ops.append(self._mgr_op(ctl.cert_issue_body(c.pub, [ctl.Cap.WRITE], 0)))
+
+    # ---- clocks ---------------------------------------------------------- #
+    def tick(self) -> A.HLC:
+        self._hlc += 1
+        return A.HLC(self._hlc, 0)
+
+    # ---- manager (control) ops ------------------------------------------- #
+    def _mgr_op(self, payload: bytes, keyepoch: int = 0) -> A.Op:
+        op = A.Op.build(
+            author_sk=self.mgr_sk,
+            author_pub=self.mgr_pub,
+            cls_=A.OpClass.CONTROL,
+            seq=self._mseq,
+            prev=self._mprev,
+            hlc=self.tick(),
+            deps=[],
+            authz=b"root",
+            keyepoch=keyepoch,
+            payload=payload,
+        )
+        self._mseq += 1
+        self._mprev = op.op_hash
+        return op
+
+    def rotate(self, keyepoch: int) -> A.Op:
+        op = self._mgr_op(ctl.rotate_body(keyepoch))
+        self.control_ops.append(op)
+        return op
+
+    def revoke(self, client_index: int) -> A.Op:
+        op = self._mgr_op(ctl.cert_revoke_body(self.clients[client_index].pub))
+        self.control_ops.append(op)
+        return op
+
+    def checkpoint(
+        self,
+        cut: A.Heads | None = None,
+        state_root: bytes = b"",
+        snapshot: bytes = b"",
+        keyepoch: int = 0,
+    ) -> A.Op:
+        op = self._mgr_op(ctl.checkpoint_body(cut or {}, state_root, snapshot, keyepoch))
+        self.control_ops.append(op)
+        return op
+
+    # ---- client (data) ops ----------------------------------------------- #
+    def data_op(
+        self,
+        ci: int,
+        *,
+        txn: A.Txn,
+        slot_tag: bytes | None,
+        keyepoch: int = 0,
+        hlc: A.HLC | None = None,
+    ) -> A.Op:
+        c = self.clients[ci]
+        op = A.Op.build_data(
+            author_sk=c.sk,
+            author_pub=c.pub,
+            seq=c.seq,
+            prev=c.prev,
+            hlc=hlc or self.tick(),
+            deps=[],
+            authz=b"cert",
+            keyepoch=keyepoch,
+            data_key=self.keyring[keyepoch]["data_key"],
+            txn_bytes=txn.encode(),
+            slot_tag=slot_tag,
+        )
+        c.seq += 1
+        c.prev = op.op_hash
+        return op
+
+    def cas(
+        self,
+        ci: int,
+        key: bytes,
+        version: bytes,
+        attempt: int,
+        guards: list[list[bytes]],
+        mutations: list[list[bytes]],
+        keyepoch: int = 0,
+    ) -> A.Op:
+        secret = self.keyring[keyepoch]["slot_secret"]
+        tag = A.compute_slot_tag(secret, key, version, attempt)
+        txn = A.Txn(slot=(key, version, attempt), guards=guards, mutations=mutations)
+        return self.data_op(ci, txn=txn, slot_tag=tag, keyepoch=keyepoch)
+
+    def blind(
+        self, ci: int, guards: list[list[bytes]], mutations: list[list[bytes]], keyepoch: int = 0
+    ) -> A.Op:
+        txn = A.Txn(slot=None, guards=guards, mutations=mutations)
+        return self.data_op(ci, txn=txn, slot_tag=None, keyepoch=keyepoch)
+
+    def opaque(self, ci: int, slot_tag: bytes, keyepoch: int = 0) -> A.Op:
+        """A data op whose payload will not AEAD-open (garbage) — an
+        undecryptable op that participates only by tag-equality (DESIGN §6)."""
+        c = self.clients[ci]
+        garbage = bytes(self.rng.getrandbits(8) for _ in range(48))  # tag||ct that won't auth
+        op = A.Op.build(
+            author_sk=c.sk,
+            author_pub=c.pub,
+            cls_=A.OpClass.DATA,
+            seq=c.seq,
+            prev=c.prev,
+            hlc=self.tick(),
+            deps=[],
+            authz=b"cert",
+            keyepoch=keyepoch,
+            payload=garbage,
+            slot_tag=slot_tag,
+        )
+        c.seq += 1
+        c.prev = op.op_hash
+        return op
+
+    def all_control(self) -> list[A.Op]:
+        return list(self.control_ops)

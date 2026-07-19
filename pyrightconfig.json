@@ -1,0 +1,8 @@
+{
+  "include": ["dudefs", "tests"],
+  "exclude": ["**/__pycache__", "**/.mypy_cache", ".devtools"],
+  "pythonVersion": "3.12",
+  "typeCheckingMode": "standard",
+  "reportMissingModuleSource": "warning",
+  "reportUnnecessaryTypeIgnoreComment": "warning"
+}
