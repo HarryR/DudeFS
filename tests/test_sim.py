@@ -192,6 +192,45 @@ class TestPartitions(unittest.TestCase):
         self.assertIsInstance(r.outcome, Q.Committed)  # retransmit rides a healed window
 
 
+class TestTimeSkew(unittest.TestCase):
+    """WP2.3: per-node clock skew (offset / drift / NTP-style step jumps) feeding
+    the acceptor's floor and skew gates under the sim composition."""
+
+    def test_backward_step_jump_keeps_floor_monotone(self):
+        # node 0's floor rises with the clock; an NTP-style backward step jump must
+        # NOT regress the DURABLE attested floor (floor = max(computed, attested)).
+        # The sim's _on_floor asserts B3 monotonicity, so finishing IS the proof.
+        sim = Sim(seed=3, n=3, delta=50)
+        floors: list[A.HLC] = []
+        for t in (100, 200, 300, 400, 500):
+            sim.sched.at(t, lambda: floors.append(sim.nodes[0].watermark().floor))
+        sim.sched.at(250, lambda: sim.set_skew(0, -400))  # jump the clock back 400ms
+        while sim.sched.step():
+            if sim.sched.now > 600:
+                break
+        self.assertEqual(floors, sorted(floors))  # never regressed across the jump
+        self.assertGreater(floors[-1], floors[0])  # and it did advance beforehand
+
+    def test_a_node_running_ahead_rejects_via_the_past_gate(self):
+        # node 2 runs 300ms ahead (δ=10): its finality floor sits far above a
+        # normal op's hlc, so its PAST gate rejects an accept the in-sync node takes.
+        sim = Sim(seed=4, n=3, delta=10, skew={2: 300})
+        w = World(seed=4, n_clients=1)
+        op = _create(w, 0, b"k", b"1")
+        assert op.slot_tag is not None
+        b = A.Ballot(1, b"x")
+        self.assertIsInstance(sim.nodes[0].accept(op.slot_tag, b, op), A.Receipt)  # in sync
+        self.assertNotIsInstance(sim.nodes[2].accept(op.slot_tag, b, op), A.Receipt)  # ahead
+
+    def test_commit_survives_nodes_skewed_within_delta(self):
+        # nodes skewed ±50ms with δ=200 (within tolerance) still reach agreement.
+        sim = Sim(seed=7, n=3, delta=200, skew={0: 50, 1: -50})
+        w = World(seed=7, n_clients=1)
+        r = sim.commit(_create(w, 0, b"k", b"1"))
+        sim.run()
+        self.assertIsInstance(r.outcome, Q.Committed)
+
+
 class TestFinalityAndVerdict(unittest.TestCase):
     def test_B3_finality_then_applied_verdict(self):
         # δ=5 so floors pass the op's small hlc quickly; clean link keeps the

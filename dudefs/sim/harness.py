@@ -148,10 +148,18 @@ class Sim:
         faults: Faults = NO_FAULTS,
         delta: int = tunables.SIM_DELTA_MS,
         net: NetworkLinks | None = None,
+        skew: dict[int, int] | None = None,
+        drift: dict[int, float] | None = None,
     ):
         self.sched = Scheduler()
         self.n = n
         self.quorum = quorum_size(n)
+        # per-node clock skew (WP2.3): each node acts at `now + offset + drift·now`.
+        # A step jump is a scheduled reassignment of self._skew[i] mid-run; the
+        # acceptor's floor = max(computed, attested) makes B3 survive a backward
+        # jump by construction (the durable attested floor never regresses).
+        self._skew = dict(skew or {})
+        self._drift = dict(drift or {})
         self._raw = self._build_nodes(n, delta)
         self.roster = [nd.acc.pub for nd in self._raw]
         self.nodes = [LoggingNode(nd, i, self) for i, nd in enumerate(self._raw)]
@@ -172,8 +180,21 @@ class Sim:
             sk = bytes([200 + i] * 32)
             pub = SIGNER.public(sk)
             acc = Acceptor(sk, pub, ChainStore(), config_epoch=0, delta_ms=delta)
-            out.append(LocalNode(acc, lambda: self.sched.now))
+            out.append(LocalNode(acc, self._node_clock(i)))
         return out
+
+    def _node_clock(self, i: int):
+        """Node i's skewed clock: `now + offset + drift·now`, floored at 0."""
+
+        def clk() -> int:
+            off = self._skew.get(i, 0) + int(self._drift.get(i, 0) * self.sched.now)
+            return max(0, self.sched.now + off)
+
+        return clk
+
+    def set_skew(self, i: int, offset: int) -> None:
+        """Jump node i's clock offset (a scheduled call is an NTP-style step)."""
+        self._skew[i] = offset
 
     # ---- launching clients ------------------------------------------------- #
     def cfg(self, client_pub: bytes, **kw) -> QuorumConfig:
