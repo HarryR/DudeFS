@@ -91,6 +91,7 @@ class Acceptor:
         self.store = store
         self.epoch = config_epoch
         self.delta_ms = delta_ms
+        self.horizon = HLC(0, 0)  # checkpoint horizon (DESIGN §12); no checkpoint yet
 
     # ------------------------------------------------------------------ #
     # Finality floor (DESIGN §9): floor = max(hw, now) − δ, monotone.     #
@@ -172,12 +173,29 @@ class Acceptor:
     # ------------------------------------------------------------------ #
     def on_prepare(self, tag: bytes, ballot: Ballot) -> PrepareResult:
         s = self.store.get_slot(tag)
+        # void rule (NOTES 27, DESIGN §8): a slot whose accepted op is below the
+        # checkpoint horizon is dead — a reborn creation tag must not make PREPARE
+        # report an ancient decided op that §1.3 would re-propose but that can never
+        # re-commit (its hlc is below the floor), a livelock until every node GCs.
+        # Discard the accept; the promise reports a fresh slot and the new op wins.
+        if s.accepted_op is not None:
+            acc = self.store.get_op(s.accepted_op)
+            if acc is None or acc.hlc < self.horizon:
+                s.accepted_ballot = None
+                s.accepted_op = None
         if ballot > s.promised:
             s.promised = ballot
             self.store._write_slot(tag, s)
             self.store.commit()  # fsync before signing the promise
             return A.Promise.issue(self.sk, self.pub, tag, ballot, s.accepted_ballot, s.accepted_op)
         return Nack(s.promised)
+
+    def advance_horizon(self, hlc: HLC) -> None:
+        """Raise the checkpoint horizon on observing a quorum-committed checkpoint
+        (DESIGN §12): ops below it are GC'd and slot state accepting a below-horizon
+        op is void on prepare (the void rule above). Monotone."""
+        if hlc > self.horizon:
+            self.horizon = hlc
 
     # ------------------------------------------------------------------ #
     # ACCEPT — classic Paxos phase 2 (DESIGN §8 recovery)               #

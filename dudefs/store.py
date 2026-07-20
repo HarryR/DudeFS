@@ -271,6 +271,19 @@ class ChainStore:
             out.append(A.QC(oh, ep, Ballot.decode(codec.decode(ballot)), bitmap, sig_list))
         return out
 
+    def gc_checkpoint(self, dead: list[bytes]) -> None:
+        """Log-compaction GC (DESIGN §12 rev 6): on observing a quorum-committed
+        checkpoint, drop the ops named in its `dead` delta and every receipt/QC for
+        them — the checkpoint's retained commitment vouches for below-cut commitment
+        (NOTES 29d), so provenance survives in the retained envelopes. Retained
+        winners, control-plane liveness, and pinned heads stay. Lazy, local,
+        uncoordinated: each node runs it independently."""
+        for oh in dead:
+            self.db.execute("DELETE FROM ops WHERE op_hash=?", (oh,))
+            self.db.execute("DELETE FROM receipts WHERE op_hash=?", (oh,))
+            self.db.execute("DELETE FROM qcs WHERE op_hash=?", (oh,))
+        self.db.commit()
+
     # ---- slot acceptor state (DESIGN §8) ---------------------------------- #
     def get_slot(self, tag: bytes) -> SlotState:
         row = self.db.execute(

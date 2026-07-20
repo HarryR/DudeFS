@@ -6,8 +6,12 @@
 import unittest
 
 from dudefs import artifacts as A
-from dudefs import compactor, fold
+from dudefs import compactor, crypto, fold
+from dudefs.acceptor import Acceptor
+from dudefs.store import ChainStore
 from tests._builders import World
+
+BIG_DELTA = 1_000_000
 
 
 def _cut(w):
@@ -155,6 +159,71 @@ class TestA4RetainedBootstrap(unittest.TestCase):
         no_sidecar = compactor.barrier_state(data_retained, {}, w.keyring)
         bad = fold.fold(control + tail, w.keyring, w.genesis, barrier=no_sidecar, cut_frontier=cut)
         self.assertNotEqual(bad.state, full.state)  # diverged without the sidecar
+
+
+class TestNodeGC(unittest.TestCase):
+    def test_gc_drops_dead_keeps_retained(self):
+        # A node applies a checkpoint's `dead` delta: superseded ops go, the
+        # retained winner (and control liveness) stay (DESIGN §12).
+        w = World(seed=8, n_clients=1)
+        control = list(w.control_ops)
+        below = list(control)
+        first = w.cas(
+            0, b"k", A.VERSION_ABSENT, 0, [[A.Guard.ABSENT, b"k"]], [[A.Mutation.SET, b"k", b"v1"]]
+        )
+        below.append(first)
+        v, a = fold.fold(below, w.keyring, w.genesis).lineage(b"k")
+        winner = w.cas(
+            0, b"k", v, a, [[A.Guard.VERSION_EQ, b"k", v]], [[A.Mutation.SET, b"k", b"v2"]]
+        )
+        below.append(winner)
+        cut = _cut(w)
+        cr = compactor.compact(below, w.keyring, w.genesis, cut)
+
+        store = ChainStore()
+        for op in below:
+            store.append(op)
+        self.assertIn(first.op_hash, cr.dead)
+        self.assertIn(winner.op_hash, {o.op_hash for o in cr.retained})
+
+        store.gc_checkpoint(cr.dead)
+        self.assertIsNone(store.get_op(first.op_hash))  # superseded op GC'd
+        self.assertIsNotNone(store.get_op(winner.op_hash))  # retained winner kept
+        self.assertIsNotNone(store.get_op(control[0].op_hash))  # control liveness kept
+
+
+class TestVoidRule(unittest.TestCase):
+    def test_reborn_tag_below_horizon_is_voided_on_prepare(self):
+        # NOTES 27: a reborn creation tag whose old slot decision sits un-GC'd
+        # below the checkpoint horizon must NOT be re-proposed (a livelock — its
+        # hlc is below the floor and can never re-commit). The acceptor voids the
+        # below-horizon accept on PREPARE, so the reborn op proposes itself.
+        nsk = bytes([200] * 32)
+        node = Acceptor(nsk, crypto.SIGNER.public(nsk), ChainStore(), 0, BIG_DELTA)
+        w = World(seed=7, n_clients=1)
+        tag = A.compute_slot_tag(w.keyring[0]["slot_secret"], b"k", A.VERSION_ABSENT, 0)
+        ancient = w.data_op(
+            0,
+            txn=A.Txn(
+                slot=(b"k", A.VERSION_ABSENT, 0),
+                guards=[],
+                mutations=[[A.Mutation.SET, b"k", b"old"]],
+            ),
+            slot_tag=tag,
+            hlc=A.HLC(100, 0),
+        )
+        self.assertIsInstance(node.on_accept(tag, A.Ballot(1, b"a"), ancient, 100), A.Receipt)
+
+        # before the horizon advances, PREPARE reports the ancient decided op
+        before = node.on_prepare(tag, A.Ballot(2, b"x"))
+        assert isinstance(before, A.Promise)
+        self.assertEqual(before.accepted_op_hash, ancient.op_hash)
+
+        # a checkpoint seals past hlc 100 -> the horizon rises above the ancient op
+        node.advance_horizon(A.HLC(200, 0))
+        after = node.on_prepare(tag, A.Ballot(3, b"y"))
+        assert isinstance(after, A.Promise)
+        self.assertIsNone(after.accepted_op_hash)  # voided -> fresh slot, reborn op wins
 
 
 if __name__ == "__main__":
