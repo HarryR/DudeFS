@@ -818,6 +818,32 @@ class Promise:
             crypto.SIGNER.sign(node_sk, msg),
         )
 
+    def encode(self) -> bytes:
+        return codec.encode(
+            [
+                self.tag,
+                self.ballot.encode(),
+                self.accepted_ballot.encode() if self.accepted_ballot is not None else b"",
+                self.accepted_op_hash if self.accepted_op_hash is not None else b"",
+                list(self.accepted_hlc.encode()) if self.accepted_hlc is not None else b"",
+                self.signer,
+                self.sig,
+            ]
+        )
+
+    @staticmethod
+    def decode(data: bytes) -> Promise:
+        p = codec.as_seq(codec.decode(data))
+        return Promise(
+            codec.as_bytes(p[0]),
+            Ballot.decode(p[1]),
+            Ballot.decode(p[2]) if p[2] != b"" else None,
+            b if (b := codec.as_bytes(p[3])) else None,
+            None if p[4] == b"" else HLC.decode(p[4]),
+            codec.as_bytes(p[5]),
+            codec.as_bytes(p[6]),
+        )
+
 
 # --------------------------------------------------------------------------- #
 # QC — quorum certificate (DESIGN §8)                                          #
@@ -961,6 +987,22 @@ class Watermark:
         msg = watermark_message(floor, config_epoch, issue_seq)
         return Watermark(floor, config_epoch, issue_seq, node_pub, crypto.SIGNER.sign(node_sk, msg))
 
+    def encode(self) -> bytes:
+        return codec.encode(
+            [list(self.floor.encode()), self.config_epoch, self.issue_seq, self.signer, self.sig]
+        )
+
+    @staticmethod
+    def decode(data: bytes) -> Watermark:
+        p = codec.as_seq(codec.decode(data))
+        return Watermark(
+            HLC.decode(p[0]),
+            codec.as_int(p[1]),
+            codec.as_int(p[2]),
+            codec.as_bytes(p[3]),
+            codec.as_bytes(p[4]),
+        )
+
 
 # --------------------------------------------------------------------------- #
 # Frontier bundle — the read primitive (PROTOCOL §1, §7.3)                     #
@@ -1012,4 +1054,33 @@ class FrontierBundle:
         msg = frontier_message(heads, checkpoint_head, config_epoch, floor)
         return FrontierBundle(
             heads, checkpoint_head, config_epoch, floor, node_pub, crypto.SIGNER.sign(node_sk, msg)
+        )
+
+    def encode(self) -> bytes:
+        heads_enc = {a: [s, hh] for a, (s, hh) in self.heads.items()}
+        return codec.encode(
+            [
+                heads_enc,
+                self.checkpoint_head or b"",
+                self.config_epoch,
+                list(self.floor.encode()),
+                self.signer,
+                self.sig,
+            ]
+        )
+
+    @staticmethod
+    def decode(data: bytes) -> FrontierBundle:
+        p = codec.as_seq(codec.decode(data))
+        heads = {}
+        for a, entry in codec.as_dict(p[0]).items():
+            pair = codec.as_seq(entry, 2)
+            heads[codec.as_bytes(a)] = (codec.as_int(pair[0]), codec.as_bytes(pair[1]))
+        return FrontierBundle(
+            heads,
+            ch if (ch := codec.as_bytes(p[1])) else None,
+            codec.as_int(p[2]),
+            HLC.decode(p[3]),
+            codec.as_bytes(p[4]),
+            codec.as_bytes(p[5]),
         )
