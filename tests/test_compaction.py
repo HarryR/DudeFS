@@ -86,6 +86,30 @@ class TestA4RetainedBootstrap(unittest.TestCase):
             fold.fold(below[: len(control) + 1], w.keyring, w.genesis).state, [{b"k1": b"v1"}]
         )
 
+    def test_A4_resurrection_mask_is_a_fixpoint(self):
+        # R1 adversarial finding: a retained MASK tombstone is itself replayed at
+        # bootstrap, so the mask closure must reach a fixpoint (NOTES 29b: "no
+        # RETAINED op mutates its key"). Chain: W sets A,B; X deletes B AND sets C;
+        # Z deletes C. W is A's winner; X is retained to mask B — but X sets C, so
+        # C's tombstone Z must ALSO be retained, else bootstrap resurrects C.
+        w = World(seed=12, n_clients=1)
+        control = list(w.control_ops)
+        below = list(control)
+        below.append(w.blind(0, [], [[A.Mutation.SET, b"A", b"1"], [A.Mutation.SET, b"B", b"1"]]))
+        below.append(w.blind(0, [], [[A.Mutation.DEL, b"B"], [A.Mutation.SET, b"C", b"1"]]))
+        z = w.blind(0, [], [[A.Mutation.DEL, b"C"]])
+        below.append(z)
+        cut = _cut(w)
+        cr = compactor.compact(below, w.keyring, w.genesis, cut)
+        ckpt = w.checkpoint(cut=cut, state_root=cr.state_root, dead=cr.dead)
+        full = fold.fold(below + [ckpt], w.keyring, w.genesis)
+        boot = _boot(w, cr, control, [], cut)
+        self.assertEqual(boot.state, full.state)  # C not resurrected
+        self.assertEqual(full.state, {b"A": b"1"})
+        self.assertIn(
+            z.op_hash, {o.op_hash for o in cr.retained}
+        )  # C's tombstone kept via fixpoint
+
     def test_A4_resurrection_vector(self):
         # A retained multi-key winner (sets A and B) whose key B is later deleted
         # below the cut. WITHOUT the resurrection mask, bootstrap replays the

@@ -54,22 +54,32 @@ def compact(
     attempts = {k: e["attempt"] for k, e in barrier.items() if e["attempt"] > 0}
 
     by_hash = {o.op_hash: o for o in covered}
-    # resurrection mask (NOTES 29b): a retained multi-key winner replays ALL its
-    # mutations at bootstrap; a key it set that was later DELETED below the cut must
-    # keep its tombstone, or bootstrap resurrects a key full-history clients hold
-    # dead. The killing tombstone's hash IS that key's current `version`.
+    # resurrection mask (NOTES 29b): a retained op replays ALL its mutations at
+    # bootstrap; a key it set that was later DELETED below the cut must keep its
+    # tombstone, or bootstrap resurrects a key full-history clients hold dead. The
+    # killing tombstone's hash IS that key's current `version`. This is a FIXPOINT
+    # over "no RETAINED op mutates its key": a mask tombstone can itself be a
+    # multi-key op that sets a further dead key, so we scan newly-added masks too
+    # (not just winners) until closure — else a chain W→X(mask)→Z leaks Z.
     masks: set[bytes] = set()
-    for wh in winners:
-        w = by_hash.get(wh)
-        if w is None or w.is_control:
-            continue
-        d = data_handler.decode(w, keyring, aead)
-        if isinstance(d, Opaque):
-            continue
-        for m in d.mutations:
-            meta = r.meta.get(m[1])
-            if meta is not None and not meta.present and meta.version != VERSION_ABSENT:
-                masks.add(meta.version)
+    frontier = set(winners)  # ops whose mutations we still need to scan
+    while frontier:
+        nxt: set[bytes] = set()
+        for wh in frontier:
+            w = by_hash.get(wh)
+            if w is None or w.is_control:
+                continue
+            d = data_handler.decode(w, keyring, aead)
+            if isinstance(d, Opaque):
+                continue
+            for m in d.mutations:
+                meta = r.meta.get(m[1])
+                if meta is not None and not meta.present and meta.version != VERSION_ABSENT:
+                    tomb = meta.version
+                    if tomb not in winners and tomb not in masks:
+                        masks.add(tomb)
+                        nxt.add(tomb)  # the tombstone may itself mutate a dead key
+        frontier = nxt
 
     # control-plane liveness set (NOTES 29e): certs/revocations, wrap-sets, roster,
     # endpoints, checkpoints never GC. POC keeps every control op ≤ cut (tiny).
