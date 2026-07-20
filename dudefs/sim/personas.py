@@ -45,3 +45,18 @@ class EquivocatingAcceptor(Acceptor):
         self._advance_hw(op)
         self.store.commit()  # fsync before signing
         return self._issue_receipt(op.op_hash, ballot, receipt_epoch)
+
+
+class FloorPerjurer(Acceptor):
+    """WP3.2 — attests a finality floor, then receipts an op BENEATH it, breaking
+    the finality promise (B3 / DESIGN §9). It drops the PAST half of the skew gate
+    (keeping the future gate), so it signs below-floor ops; its own watermark plus
+    that receipt are a portable FLOOR_PERJURY proof. Containment: an honest quorum
+    never finalizes below its own floor, so honest finality still converges — only
+    the perjurer is incriminated."""
+
+    def _skew_reason(self, op: Op, now_ms: int) -> RejectReason | None:
+        # only the future gate; the past gate (op.hlc < floor) is what it perjures.
+        if op.hlc.wall_ms > now_ms + self.delta_ms:
+            return RejectReason.FUTURE_HLC
+        return None

@@ -52,6 +52,20 @@ def _decode_pairs(raw: bytes) -> dict[bytes, tuple[int, bytes]]:
     return out
 
 
+def _wm_fields(wm: A.Watermark) -> list:
+    """Pack a Watermark for the evidence blob (it has no wire codec of its own)."""
+    return [wm.floor.wall_ms, wm.floor.counter, wm.config_epoch, wm.signer, wm.sig]
+
+
+def _wm_from(p) -> A.Watermark:
+    return A.Watermark(
+        HLC(codec.as_int(p[0]), codec.as_int(p[1])),
+        codec.as_int(p[2]),
+        codec.as_bytes(p[3]),
+        codec.as_bytes(p[4]),
+    )
+
+
 class AppendStatus(StrEnum):
     """append() outcomes (ARCHITECTURE L2: ok | dup | gap | fork-evidence).
     INVALID (bad structure/signature — drop) is distinct from GAP (missing
@@ -71,7 +85,8 @@ class EvidenceKind(StrEnum):
 
     FORK = "fork"  # two signed ops at one (author, seq)
     DOUBLE_VOTE = "double_vote"  # one signer's two receipts for one slot at one ballot
-    # FLOOR_PERJURY: with the floor-perjurer persona (RESILIENCE §3.1, WP3)
+    FLOOR_PERJURY = "floor_perjury"  # a watermark + the signer's receipt beneath its floor
+    LOST_COMMIT = "lost_commit"  # a QC below a recovery fence, absent from its manifest
 
 
 class AppendResult:
@@ -141,6 +156,34 @@ class DoubleVoteEvidence:
             and self.rcpt_a.ballot == self.rcpt_b.ballot  # same ballot
             and self.rcpt_a.verify()
             and self.rcpt_b.verify()  # genuine signer signatures
+        )
+
+
+class FloorPerjuryEvidence:
+    """A signer's watermark attesting finality floor F, plus its own receipt for an
+    op with `hlc < F` — receipting beneath a floor it swore was final (a B3
+    violation). Self-verifying; the op envelope rides along for its hlc (the receipt
+    omits it), and both the watermark and receipt carry the signer's signature."""
+
+    __slots__ = ("signer", "wm", "rcpt", "op_raw")
+
+    def __init__(self, signer: bytes, wm: A.Watermark, rcpt: Receipt, op_raw: bytes):
+        self.signer = signer
+        self.wm = wm
+        self.rcpt = rcpt
+        self.op_raw = op_raw
+
+    def verify(self) -> bool:
+        try:
+            op = A.Op.from_bytes(self.op_raw)
+        except Exception:
+            return False
+        return (
+            self.wm.signer == self.rcpt.signer == self.signer
+            and self.rcpt.op_hash == op.op_hash
+            and op.hlc < self.wm.floor  # the receipted op is beneath the sworn floor
+            and self.wm.verify()
+            and self.rcpt.verify()
         )
 
 
@@ -470,8 +513,12 @@ class ChainStore:
         )
         self.db.commit()
 
-    def evidence(self) -> list[tuple[EvidenceKind, ForkEvidence | DoubleVoteEvidence]]:
-        out: list[tuple[EvidenceKind, ForkEvidence | DoubleVoteEvidence]] = []
+    def evidence(
+        self,
+    ) -> list[tuple[EvidenceKind, ForkEvidence | DoubleVoteEvidence | FloorPerjuryEvidence]]:
+        out: list[
+            tuple[EvidenceKind, ForkEvidence | DoubleVoteEvidence | FloorPerjuryEvidence]
+        ] = []
         for kind, data in self.db.execute("SELECT kind, data FROM evidence"):
             k = EvidenceKind(kind)
             p = codec.as_seq(codec.decode(data))
@@ -502,7 +549,50 @@ class ChainStore:
                         ),
                     )
                 )
+            elif k == EvidenceKind.FLOOR_PERJURY:
+                out.append(
+                    (
+                        k,
+                        FloorPerjuryEvidence(
+                            codec.as_bytes(p[0]),
+                            _wm_from(codec.as_seq(p[1])),
+                            A.Receipt.decode(codec.as_bytes(p[2])),
+                            codec.as_bytes(p[3]),
+                        ),
+                    )
+                )
         return out
+
+    def detect_floor_perjury(self, watermarks: list[A.Watermark]) -> list[FloorPerjuryEvidence]:
+        """Against a set of observed `watermarks`, scan held receipts + ops for a
+        signer that receipted an op BENEATH a floor it attested (a B3 violation) and
+        mint + persist a portable FLOOR_PERJURY proof. Watermarks are not stored
+        artifacts (they ride the finality path), so the caller supplies the ones it
+        observed; ops + receipts come from the store. Idempotent."""
+        ops = {o.op_hash: o for o in self.all_ops()}
+        rc_by_signer: dict[bytes, list[Receipt]] = {}
+        for r in self.all_receipts():
+            rc_by_signer.setdefault(r.signer, []).append(r)
+        seen = {
+            (ev.signer, ev.rcpt.op_hash, ev.wm.floor.as_tuple())
+            for k, ev in self.evidence()
+            if k == EvidenceKind.FLOOR_PERJURY and isinstance(ev, FloorPerjuryEvidence)
+        }
+        found: list[FloorPerjuryEvidence] = []
+        for wm in watermarks:
+            for r in rc_by_signer.get(wm.signer, []):
+                op = ops.get(r.op_hash)
+                if op is None or not (op.hlc < wm.floor):
+                    continue
+                if (wm.signer, r.op_hash, wm.floor.as_tuple()) in seen:
+                    continue
+                found.append(FloorPerjuryEvidence(wm.signer, wm, r, op.raw))
+        for ev in found:
+            self._store_evidence(
+                EvidenceKind.FLOOR_PERJURY,
+                [ev.signer, _wm_fields(ev.wm), ev.rcpt.encode(), ev.op_raw],
+            )
+        return found
 
     def detect_double_votes(self) -> list[DoubleVoteEvidence]:
         """Scan held receipts + ops for a signer that receipted two DIFFERENT ops

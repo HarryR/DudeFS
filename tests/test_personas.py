@@ -8,7 +8,7 @@ import unittest
 from dudefs import artifacts as A
 from dudefs import fold, gossip
 from dudefs.sim.harness import Sim
-from dudefs.sim.personas import EquivocatingAcceptor
+from dudefs.sim.personas import EquivocatingAcceptor, FloorPerjurer
 from dudefs.store import EvidenceKind
 from tests._builders import World
 from tests._cluster import creation_op
@@ -88,6 +88,42 @@ class TestEquivocator(unittest.TestCase):
         sim.nodes[1].accept(a.slot_tag, ballot, a)
         sim.nodes[1].accept(a.slot_tag, ballot, b)  # would raise if B1 tripped
         self.assertEqual(sim.decided_ops(a.slot_tag), set())
+
+
+class TestFloorPerjurer(unittest.TestCase):
+    """WP3.2: a node that attests a finality floor, then receipts an op beneath it.
+    Its watermark + that receipt are a portable FLOOR_PERJURY proof; honest finality
+    (which never finalizes below its own floor) is unaffected."""
+
+    def test_floor_perjury_mints_evidence_honest_rejects(self):
+        sim = Sim(seed=1, n=3, delta=10, personas={0: FloorPerjurer})
+        w = World(seed=1, n_clients=1)
+        op = creation_op(w, 0, b"v")  # small hlc
+        assert op.slot_tag is not None
+        perjurer = sim._raw[0].acc
+
+        wm = perjurer.issue_watermark(1000)  # attests floor ~990
+        self.assertGreater(wm.floor.wall_ms, op.hlc.wall_ms)  # op is beneath the sworn floor
+
+        # the perjurer receipts the below-floor op; an HONEST node rejects it (B3).
+        rc = perjurer.on_accept(op.slot_tag, A.Ballot(1, b"x"), op, 1000)
+        self.assertIsInstance(rc, A.Receipt)
+        honest = sim._raw[1].acc
+        honest.issue_watermark(1000)
+        hr = honest.on_accept(op.slot_tag, A.Ballot(1, b"y"), op, 1000)
+        self.assertNotIsInstance(hr, A.Receipt)  # BELOW_FLOOR
+
+        # a third party assembles the proof (B6) from the watermark + receipt + op
+        store = sim._raw[2].acc.store
+        store.put_op_raw(op)
+        assert isinstance(rc, A.Receipt)
+        store.put_receipt(rc)
+        proofs = store.detect_floor_perjury([wm])
+        self.assertEqual(len(proofs), 1)
+        self.assertTrue(proofs[0].verify())
+        self.assertEqual(proofs[0].signer, sim.roster[0])
+        self.assertTrue(any(k == EvidenceKind.FLOOR_PERJURY for k, _ in store.evidence()))
+        self.assertEqual(store.detect_floor_perjury([wm]), [])  # idempotent
 
 
 if __name__ == "__main__":
