@@ -1,6 +1,6 @@
 # DudeFS — Python proof of concept
 
-> Implementation of the design in [DESIGN.md](DESIGN.md) (rev 5) and companions
+> Implementation of the design in [DESIGN.md](DESIGN.md) (rev 6) and companions
 > ([PROTOCOL.md](PROTOCOL.md), [ARCHITECTURE.md](ARCHITECTURE.md),
 > [MANAGER.md](MANAGER.md), [RESILIENCE.md](RESILIENCE.md),
 > [FORMAL.md](FORMAL.md), [COMPARISON.md](COMPARISON.md)), following the plan in
@@ -31,7 +31,7 @@ exercised for real. Confidentiality arrives as a keyepoch rotation to a real
 cipher suite (`b2s1` / `xcp1`); `dudefs.crypto.zero_knowledge_active()` returns
 `False` here, by design and on purpose.
 
-## Status: M0–M3 complete (plus two adversarial review passes)
+## Status: M0–M4 complete (plus three adversarial review passes)
 
 | Milestone | Scope | State |
 |---|---|---|
@@ -40,13 +40,14 @@ cipher suite (`b2s1` / `xcp1`); `dudefs.crypto.zero_knowledge_active()` returns
 | **M2** | node kernel: sqlite `ChainStore` + per-slot `Acceptor`; B1 scenarios | ✅ |
 | **M2.5** | adversarial review: cut-relative barrier (A4), universal lineage-advance (A2), fail-closed `pver` fence, accept-time `deps`, fold totality — [NOTES.md §M2.5](NOTES.md) | ✅ |
 | **M3** | sans-I/O quorum client (`quorum.py` + `node.py` seam) + fault-injecting memory transport + sim harness (continuous B1/B2/B3 checks, seeded replay). The sim caught the fast-path double-commit — resolved by **rev 5: classic two-phase Paxos always** ([NOTES item 21](NOTES.md)) | ✅ |
-| M4+ | gossip/relay, control plane, compaction, daemon/CLI | not started |
+| **M4** | gossip/anti-entropy (summary/delta fixpoint convergence on partial meshes) + relay: single-push writes, PULL-then-accept deps, the §7.3 relayed linearizable read; consensus hardening — receipt persistence, dueling-proposer liveness (jitter + round-timeout escalation), per-slot ballot priorities ([NOTES items 22–24](NOTES.md)) | ✅ |
+| M5+ | control plane (+ delegated compactor cert), compaction (**log-compaction — rev 6**, DESIGN §12), daemon/CLI | not started |
 
 The kernel is **pure and synchronous** — no I/O, no clocks, no randomness; time
 is injected as `now_ms`, and the L4 quorum client is a sans-I/O state machine
 (events in, commands out). The store is the one stateful edge: one sqlite DB
 per node = one durability domain, and the acceptor signs **only after** COMMIT
-(sign-after-fsync, RESILIENCE §0). Real networking begins at M4 (gossip).
+(sign-after-fsync, RESILIENCE §0). Gossip (M4) is pure-function + sim-harness level; real networking begins at M7 (daemon/demo).
 
 ## Layout (mirrors ARCHITECTURE.md)
 

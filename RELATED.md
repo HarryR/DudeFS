@@ -1,6 +1,6 @@
 # DudeFS Related Work — where this design sits in the literature
 
-> **Status:** companion to [DESIGN.md](DESIGN.md) (rev 5). A positioned review of the Paxos/Raft/leaderless/randomized lines and Lamport's research, triggered by reading Cloudflare's Meerkat announcement and the QuePaxa paper (SOSP '23). The per-decision triangulation matrix (decision → prior mechanism → posture, with verified quotes) lives in [COMPARISON.md](COMPARISON.md); this document is the narrative. Verdict up front: **every pillar of DudeFS has a formal ancestor**, which is reassuring — and each ancestor's known failure modes tell us exactly what to model-check hardest.
+> **Status:** companion to [DESIGN.md](DESIGN.md) (rev 6). A positioned review of the Paxos/Raft/leaderless/randomized lines and Lamport's research, triggered by reading Cloudflare's Meerkat announcement and the QuePaxa paper (SOSP '23). The per-decision triangulation matrix (decision → prior mechanism → posture, with verified quotes) lives in [COMPARISON.md](COMPARISON.md); this document is the narrative. Verdict up front: **every pillar of DudeFS has a formal ancestor**, which is reassuring — and each ancestor's known failure modes tell us exactly what to model-check hardest.
 
 ## 0. Positioning: DudeFS is not SMR
 

@@ -120,6 +120,18 @@ class StateView:
 # Control state (shared by the full profile and the node control profile)     #
 # --------------------------------------------------------------------------- #
 
+# The delegable capability each control kind needs (DESIGN §15). Root authors
+# any kind; kinds absent here are root-only (pver/endpoint). Revocation drives
+# key rotation, so rotate/wrap-set ride the issue-revoke capability.
+_CAP_FOR_KIND: dict[control_handler.ControlKind, control_handler.Cap] = {
+    control_handler.ControlKind.CHECKPOINT: control_handler.Cap.COMPACT,
+    control_handler.ControlKind.ROSTER: control_handler.Cap.MANAGE_ROSTER,
+    control_handler.ControlKind.CERT_ISSUE: control_handler.Cap.ISSUE_REVOKE,
+    control_handler.ControlKind.CERT_REVOKE: control_handler.Cap.ISSUE_REVOKE,
+    control_handler.ControlKind.ROTATE: control_handler.Cap.ISSUE_REVOKE,
+    control_handler.ControlKind.WRAP_SET: control_handler.Cap.ISSUE_REVOKE,
+}
+
 
 class ControlState:
     """Roster / cert / keyepoch / pver state. Reachable without HLC ordering
@@ -141,6 +153,19 @@ class ControlState:
             return True
         c = self.certs.get(pub)
         return bool(c and not c["revoked"] and cap in c["caps"])
+
+    def can_author_control(self, author: bytes, kind: control_handler.ControlKind) -> bool:
+        """Control-op authorization (DESIGN §15; upgrades NOTES item 9's M1
+        root-only shortcut). The root may author any kind; a delegate needs the
+        capability mapped to that kind — a checkpoint signed by a `compact` cert
+        is authorized, one signed by a plain client cert is not. Fold-positional:
+        `is_authorized` sees a revocation the moment it is applied in the walk, so
+        a revoked delegate's later control ops fold `invalid`. Kinds with no
+        delegable capability (pver, endpoint) stay root-only."""
+        if author == self.manager_pub:
+            return True
+        cap = _CAP_FOR_KIND.get(kind)
+        return cap is not None and self.is_authorized(author, cap)
 
     def activate_pending_pver(self) -> None:
         """The lane-2 fence: pending versions become active only at a
@@ -418,7 +443,9 @@ def fold(
 
             if op.is_control:
                 body = control_handler.decode(op)
-                if body is None or op.author != control.manager_pub:
+                if body is None or not control.can_author_control(
+                    op.author, body[control_handler.BK_KIND]
+                ):
                     verdicts[op.op_hash] = Verdict.INVALID
                     _consume_invalid_slot(op, keyring, universe, state)
                     continue
@@ -626,10 +653,13 @@ class ControlReducer:
             return False
         if not _struct_and_sig_ok(op):
             return False
-        if op.author != self.control.manager_pub:
-            return False
         body = control_handler.decode(op)
         if body is None:
+            return False
+        # best-effort capability filter (DESIGN §15): the node profile is
+        # order-independent, so revocation isn't fold-positional here — the full
+        # fold is authoritative. Enough to recognize a delegate's control op.
+        if not self.control.can_author_control(op.author, body[control_handler.BK_KIND]):
             return False
         self.control.apply_control(op, body)
         if body[control_handler.BK_KIND] == control_handler.ControlKind.CHECKPOINT:

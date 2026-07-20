@@ -1,6 +1,6 @@
 # DudeFS Manager — capabilities & admin tool
 
-> **Status:** companion to [DESIGN.md](DESIGN.md) (rev 5) / [ARCHITECTURE.md](ARCHITECTURE.md). What the manager *is* operationally, what it can do, and the shape of the command-line tool. Command names are a sketch; flows are normative by reference to PROTOCOL.md.
+> **Status:** companion to [DESIGN.md](DESIGN.md) (rev 6) / [ARCHITECTURE.md](ARCHITECTURE.md). What the manager *is* operationally, what it can do, and the shape of the command-line tool. Command names are a sketch; flows are normative by reference to PROTOCOL.md.
 
 ## 0. What the manager is (and is not)
 
@@ -8,7 +8,7 @@ The manager is **the client library plus the root key plus extra commands** — 
 
 - **No daemon, no special channel.** The admin tool embeds L0–L6 (client profile) and talks **directly to storage nodes** with the ordinary verbs (PROTOCOL §1), doing its own quorum legwork like any client — "nodes never fan out" applies to it too. It does *not* connect through a local client node; there is no such thing. Any machine with the genesis config, the root key, and a network path to a quorum is a fully-armed manager.
 - **Offline-root workflow for free.** Because every artifact is self-authenticating (PROTOCOL §0), signing and submission separate cleanly: `--sign-only` writes the signed op(s) to a file on an air-gapped machine; `submit <file>` from *any* online host — even an untrusted courier — completes the flow. The root key never has to touch a networked machine. (The sign-only step must still respect chain sequencing; the tool tracks the manager chain head across staged ops.)
-- **Rarely needed.** The data path never waits on the manager (DESIGN §2). It appears for: bootstrap, membership, identity, rotation, compaction, audit, disaster.
+- **Rarely needed — compaction is delegated.** The data path never waits on the manager (DESIGN §2). The root appears for: bootstrap, membership, identity, rotation, audit, disaster. Routine compaction is a **conveyor** run continuously by a **compactor identity** — a manager-issued `compact`-capability cert plus the group key (DESIGN §12/§15) — precisely so the root key never has to be online for it. The compactor maintains a warm incremental fold; that cache doubles as a salvage source in disaster (RESILIENCE §2.2).
 
 ## 1. Persistent state (the manager's durable set)
 
@@ -18,7 +18,7 @@ The manager is **the client library plus the root key plus extra commands** — 
 | Manager chain head `(seq, prev)` | **Author-amnesia procedure is mandatory on loss** (DESIGN §4): quorum-read own head, wait out δ, resume. The tool enforces this — it refuses to author after detecting head-state loss until the procedure completes. |
 | Genesis config | Manager pubkey + seed nodes (DESIGN §14). |
 | Cached roster | For reachability; refreshed from the control plane on any contact. |
-| Log cache | Optional, soft — refetchable. Needed locally only for `compact` and `verify` (they fold). |
+| Log cache | Optional, soft — refetchable. Needed locally only for `compact` and `verify` (they fold); the compactor keeps it warm as an incremental fold, and it is a salvage source (RESILIENCE §2.2). |
 
 ## 2. Capabilities → commands
 
@@ -31,10 +31,10 @@ One binary (working name: `dude`); manager powers come from *which keys are pres
 | Revocation | `dude cert revoke <fingerprint>` | DESIGN §15 | Automatically stages `rotate` next (revoke without rotation is a foot-gun; `--no-rotate` to override, loudly). |
 | Rotation | `dude rotate` | PROTOCOL §3.3 | New group key, wrap-set for every remaining member, `keyepoch` bump — one control op. |
 | Membership | `dude node add <cert>` (learner) · `dude node promote/remove/replace` | PROTOCOL §3.1 | Roster ops; odd-size and possession-barrier validation is node-side, but the tool pre-checks and refuses obviously invalid changes. `replace` = add-learner + promote + remove, staged. |
-| Compaction | `dude compact` | PROTOCOL §3.2 | Final-frontier quorum read → local fold → checkpoint op. Refuses a non-final frontier by construction. |
+| Compaction | `dude compact` | PROTOCOL §3.2 | Advances the conveyor cut: incremental fold → dead set + retained commitment + attempts sidecar → checkpoint op. Refuses a non-final frontier by construction (the fiat variant exists only inside `recover --fence`). Routinely run under a delegated compactor cert, not the root; `dude cert issue --compactor` stages that delegation. |
 | Audit | `dude verify` | DESIGN §12 | Recomputes `state_root` from raw history vs the latest checkpoint; validates chains and QCs. Any client can run this — it needs no root key. |
 | Evidence | `dude evidence list` · `dude evidence eject <node>` | RESILIENCE §3 | Lists collected equivocation proofs (gossiped via `EVIDENCE`); `eject` = revoke + roster-remove, staged from the proof. |
-| Disaster | `dude recover --fence` | RESILIENCE §2.2 | Salvage (nodes **and** reachable clients) → verify → recovery checkpoint + fresh roster → disclosure report. Requires an explicit `--i-understand-data-loss`. |
+| Disaster | `dude recover --fence` | RESILIENCE §2.2 | Salvage (nodes, the compactor cache, **and** reachable clients) → verify → recovery checkpoint (fiat cut; retained commitment = salvage manifest) + fresh roster → disclosure report. Requires an explicit `--i-understand-data-loss`. |
 | Telemetry | `dude status` | PROTOCOL §2.3 | Roster + epoch, per-node floors and lag spread, finality frontier, undecided slots, held evidence. Surfaces the three-level ladder (accepted / committed / final) explicitly. |
 
 ## 3. Interlocks (the tool protects the operator)

@@ -1,6 +1,6 @@
 # DudeFS Resilience — faults & adversaries
 
-> **Status:** companion to [DESIGN.md](DESIGN.md) (rev 5) and [PROTOCOL.md](PROTOCOL.md). Three personas in ascending malice: the **chaos monkey** (crashes, partitions, delays, duplication), the **destructive gorilla** (permanent loss of machines and disks), and the **evil interactive octopus** (Byzantine, adaptive, interactive — least likely, analyzed anyway). The tolerance table is at the end; the honest headline sits right above it.
+> **Status:** companion to [DESIGN.md](DESIGN.md) (rev 6) and [PROTOCOL.md](PROTOCOL.md). Three personas in ascending malice: the **chaos monkey** (crashes, partitions, delays, duplication), the **destructive gorilla** (permanent loss of machines and disks), and the **evil interactive octopus** (Byzantine, adaptive, interactive — least likely, analyzed anyway). The tolerance table is at the end; the honest headline sits right above it.
 
 ## 0. Durable-state inventory
 
@@ -16,7 +16,7 @@ What each party must persist — in one crash-consistent durability domain, with
 **Client:**
 - signing key — loss is cheap: manager revokes and reissues; no data at risk
 - own chain head `(seq, prev)` — loss without key loss ⇒ **author-amnesia procedure** (DESIGN §4): quorum-read own head, wait out δ, resume — or just retire the key
-- group-key history — recoverable from log wrap-sets (PROTOCOL §3.3); worst case the manager re-wraps
+- group-key history — recoverable from log wrap-sets (PROTOCOL §3.3; wrap-sets are in the control-plane liveness set and survive every compaction — DESIGN §12); worst case the manager re-wraps
 - log cache — soft state, always refetchable
 
 **Manager:** the root key — irreplaceable (DESIGN §3): escrow offline copies. Chain head: the author-amnesia procedure is *mandatory* (the root cannot be retired).
@@ -39,7 +39,7 @@ Every verb is idempotent and every artifact self-authenticating (PROTOCOL §0), 
 | Node dies after persist, before reply | Client retries; the identical receipt is re-issued. |
 | Node restart | Rejoins gossip, catches up. Persisted floor prevents below-floor receipts; persisted acceptor state prevents double-votes. |
 | Manager dies mid-roster-change | Steps are idempotent and the change is slot-guarded (`H("roster" ‖ e)`); resume verbatim or abandon — at most one change activates out of `e` regardless. |
-| Manager dies mid-checkpoint | A checkpoint is one op: committed or not; retry verbatim. GC is lazy and local, so nodes GC'ing at different times is normal operation, not a race. |
+| Compactor dies mid-checkpoint | A checkpoint is one op: committed or not; retry verbatim (the warm fold cache rebuilds from retained + tail if lost). GC is lazy and local, so nodes GC'ing at different times is normal operation, not a race. |
 
 ### 1.3 Partitions
 
@@ -79,10 +79,10 @@ Lose committed data. Fork state. Flip final verdicts. Break determinism. Every c
 
 With fewer than q survivors nothing new can commit — the system is already parked. Recovery:
 
-1. **Salvage:** union all surviving evidence — every remaining node **and every reachable client**. Clients fold the full log, so they are replicas of everything they ever saw; this is the payoff of client-side folding.
-2. **Verify:** every artifact is self-authenticating; the salvaged set is a provably genuine subset of what was committed.
-3. **Fence:** the manager mints a **recovery checkpoint** at the salvage frontier plus a fresh roster (all-new identities) — a manager-signed **epoch fence**, visible in the log forever.
-4. **Disclose:** any committed-but-unsalvaged op is *lost*. If its QC ever surfaces, that QC is a cryptographic receipt of the broken durability promise — detect-and-disclose, never silently rewrite.
+1. **Salvage:** union all surviving evidence — every remaining node, **the compactor's warm fold cache** (a de-facto client replica — DESIGN §12), **and every reachable client**. Clients fold the full log, so they are replicas of everything they ever saw; this is the payoff of client-side folding. Because routine compaction keeps the log ≈ retained live set + recent tail, the salvage surface is bounded by state + churn, never by history.
+2. **Verify:** every artifact is self-authenticating; the salvaged set is a provably genuine subset of what was written.
+3. **Fence:** the manager mints a **recovery checkpoint** at the salvage frontier plus a fresh roster (all-new identities) — a manager-signed **epoch fence**, visible in the log forever. The recovery checkpoint is the *same artifact* as a routine checkpoint (DESIGN §12) with one precondition swapped: its cut is the **salvage frontier, adopted by root fiat** — finality cannot advance without a quorum, so the "cut must be final" rule is unmeetable here by construction. Its `retained` commitment doubles as the **salvage manifest**: named = exists; absent = lost. **Salvaged-but-uncommitted ops** (sub-quorum receipts at outage time) are **adopted by fiat into the cut** — they are signed and attributable, and linearizability already does not span the fence. The paired roster op activates without the (dead) old-roster half of the joint QC — the sole fiat exception, DESIGN §13. The manager never carries bulk state: it signs the manifest (kilobytes); retained data flows to new learners peer-to-peer from survivors and clients via ordinary `DELTA` intake (PROTOCOL §2.2 — intake is not peer-gated), verified against the manifest digests, with `state_root` as the client-side semantic check. Bulk transfer is thereby correctness-free — any dumb resumable channel.
+4. **Disclose:** any committed-but-unsalvaged op is *lost*. If its QC ever surfaces, that QC is a cryptographic receipt of the broken durability promise — detect-and-disclose, never silently rewrite. Practical blast-radius: what is at risk is exactly the ops **no client had yet folded** — bounded by client sync cadence, not by compaction cadence (compaction changes replication *shape*, never durability); the retained baseline is the most-replicated object in the system.
 
 Across a fence: strong eventual consistency of the salvaged prefix holds; linearizability does **not** span the fence, and the design refuses to pretend otherwise.
 
@@ -139,7 +139,7 @@ Game over by definition — it is the root of trust (DESIGN §2). One interactiv
 
 ### 3.6 Evil network (MITM without keys)
 
-Integrity intact — artifacts are self-authenticating. Its powers reduce to the chaos monkey's plus targeted censorship. **The one liveness subtlety** (sharpened by QuePaxa's analysis — [RELATED.md](RELATED.md) §6): CAS recovery is ballot-driven, and a network adversary that can *read* ballots off the wire can selectively delay whichever proposer is currently winning, starving slot liveness indefinitely while safety holds. TLS therefore does real work for **liveness**, not just metadata privacy: an encrypted-link adversary is *content-oblivious* — it can delay nodes, but it cannot aim. Residual: a content-oblivious adversary delaying a fixed minority is the chaos monkey; delaying a rotating majority halts progress like any quorum system's. Accepted, consistent with FORMAL B7's partial-synchrony honesty; the randomized escape hatch is on record in RELATED.md §6.
+Integrity intact — artifacts are self-authenticating. Its powers reduce to the chaos monkey's plus targeted censorship. **The one liveness subtlety** (sharpened by QuePaxa's analysis — [RELATED.md](RELATED.md) §6): CAS recovery is ballot-driven, and a network adversary that can *read* ballots off the wire can selectively delay whichever proposer is currently winning, starving slot liveness indefinitely while safety holds. TLS therefore does real work for **liveness**, not just metadata privacy: an encrypted-link adversary is *content-oblivious* — it can delay nodes, but it cannot aim. Residual: a content-oblivious adversary delaying a fixed minority is the chaos monkey; delaying a rotating majority halts progress like any quorum system's. One sharpening (NOTES item 28): the dueling-proposer jitter (DESIGN §8) is a deterministic function of *public* data, so even a content-oblivious adversary can compute both duelers' schedules offline — TLS alone does not restore dueling liveness. Real drivers therefore mix true entropy into retry timing (free — timers are client policy, PROTOCOL §4). Accepted, consistent with FORMAL B7's partial-synchrony honesty; the randomized escape hatch is on record in RELATED.md §6.
 
 ### 3.7 Tolerance table
 

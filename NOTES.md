@@ -96,7 +96,8 @@ A post-M2 review found the fold implementing readings of DESIGN that broke A2
 and A4 as formally stated. Resolutions decided with the design owner; DESIGN
 §6/§12 and RESILIENCE §3.4 have been edited accordingly (documents win).
 
-13. **Checkpoint barrier is cut-relative, derive-and-verify.** The barrier sits
+13. *(Snapshot-era wording superseded at rev 6 — bootstrap now seeds from the retained set, items 25/29; the barrier semantics here remain canonical.)*
+    **Checkpoint barrier is cut-relative, derive-and-verify.** The barrier sits
     immediately above the *cut* (well-defined: the cut is final, so covered ops
     sort below everything still committable), NOT at the checkpoint op's own
     hlc position as M1 had it. Full-history clients derive the barrier state
@@ -302,6 +303,354 @@ and A4 as formally stated. Resolutions decided with the design owner; DESIGN
       / quorum-intersection are untouched — NOT a VRF: honest clients compute it
       the same and a Byzantine node never proposes, so nothing to grind. The
       backoff jitter salt is now per-slot too (`priority[:8]`).
+
+## Compaction model (DESIGN §12) — DESIGN QUESTION, specify before M6
+
+25. **RESOLVED 2026-07-20 — adopted as DESIGN §12 rev 6, amended by items
+    29–31 (attempts sidecar, resurrection mask, retained commitment, QC GC,
+    compactor delegation, cut-lag W, declared costs).** Original raise text
+    kept below as rationale. **Compaction is LOG-COMPACTION (retain live
+    winners in place), NOT snapshot
+    materialization — REVISE §12. Raised 2026-07-20. This is a *design decision*,
+    not an implementation note: it changes the §12 architecture and MUST be
+    written into DESIGN §12 (schema + rules + argument), not left as intuition for
+    M6 to fill in blindly.** §12 as written embeds `snapshot: ciphertext(
+    materialized state at cut)` in the checkpoint op — a config-store-scale
+    assumption that breaks at the target scale (5–10 GB, DynamoDB-shard ballpark,
+    plausible over a year of a slow "glacier" store).
+    - **The better model (Kafka-style log-compaction).** Keep the live *winner op*
+      per key in place; GC everything below the cut that it supersedes (overwritten
+      ≥ once, or deleted). No materialized blob, no re-encryption, no data push —
+      nodes drop dead ops they already hold. The retained winners ARE the baseline,
+      in native ciphertext-op form.
+    - **Manager-driven because nodes are zero-knowledge.** A node cannot see that an
+      op was overwritten (it can't decrypt), so it cannot compact itself. The
+      manager folds (it holds the key), computes the dead set, and signs "GC these
+      ≤ cut"; the checkpoint carries the DELTA (newly-dead hashes, ∝ churn), not the
+      state. Cost is the manager's *incremental tail-fold* — compaction is cheap and
+      continuous, not a heavy whole-state event.
+    - **Auditability unchanged.** `state_root` still lets a client who kept history
+      detect a wrongful GC of a live winner as a root mismatch (detect-and-disclose).
+      A single audit root suffices for THIS model — no navigable Merkle tree /
+      chunked-snapshot transfer is needed (that machinery only existed to serve a
+      materialize-and-ship snapshot this model replaces; amends the exploratory
+      "promote state_root to a tree" idea — DON'T).
+    - **Bootstrap.** A new client fetches the retained winner ops and LWW-folds
+      their *mutations* in hlc order — no guard re-evaluation (it is reading current
+      state, not re-deciding CAS) — then verifies `state_root`.
+    - **To specify in §12:** checkpoint schema (`retained live-set + cut +
+      state_root`, delta-encoded), the GC rule (drop non-retained ≤ cut), the
+      zero-knowledge manager-authority + audit argument, bootstrap semantics
+      (mutations-only LWW fold), and — explicitly — the **5–10 GB target-scale
+      assumption** (the current docs' cost model, e.g. "SUMMARY ≲1 KB, a rounding
+      error," silently assumes a far smaller store).
+
+## Review wave R1 — design review of items 22–25 (review side, 2026-07-20)
+
+> **REVIEW MARKER (the line in the sand) — updated 2026-07-20, all rulings
+> LANDED.** Items **1–24** reviewed at commit `59e9eda`: settled. **Owner
+> rulings received 2026-07-20** (recommended options accepted in full): 27 →
+> acceptor void + client guard; 29a → encrypted attempts sidecar; 29d → GC
+> QCs below cut, checkpoint vouches; 29f/29g/29i/30 → delegated compactor
+> cert / cut-lag window W / accept-and-declare with re-anchor recorded /
+> adopt-by-fiat. **The documents have been edited to revision 6 accordingly**
+> (DESIGN §1/§7/§8/§12–§17, PROTOCOL, RESILIENCE, FORMAL, MANAGER,
+> IMPLEMENTATION, COMPARISON, ARCHITECTURE, README — including item 26's
+> mechanical edits and item 28's §3.6 note). Items 25–31 below are retained
+> as the **rationale record** for the rev-6 edits; they are all RESOLVED and
+> the docs are canonical. **Implementation side (Opus): work from the rev-6
+> documents + HANDOFF-R1.md — M5 next, then M6.** New discrepancies go below
+> this marker as numbered items, never coded around.
+
+26. **APPLIED 2026-07-20 (all edits landed at rev 6).**
+    **Doc edits owed by committed items 22–24 (mechanical — no ruling needed).**
+    The code landed but the normative text didn't: (a) DESIGN §8 still says
+    ballots are `(round ≥ 1, client-id)` and PROTOCOL §1.3 step 2 says
+    `(r ≥ 1, my-id)`; IMPLEMENTATION §2 says `(round, client_fingerprint)` —
+    all need the item-24d `(round, priority)` amendment, `priority =
+    h(slot_tag ‖ client_fp)`. (b) DESIGN §8's "randomized backoff suffices
+    (noted, accepted)" and PROTOCOL §1.3 step 5's "randomized backoff" should
+    state the actual mechanism (item 23): deterministic per-`(priority, round)`
+    jitter + per-round timeout escalation + `max_rounds`; FORMAL B7's "backoff
+    fairness" wording likewise. (c) PROTOCOL §2.2 should state explicitly that
+    a node persists the receipts it issues (item 22) — RESILIENCE §0 already
+    lists "receipts (own and gossiped)" in the durable inventory, so this is
+    alignment, not a change.
+
+27. **RESOLVED 2026-07-20 — ruling: acceptor-side void rule + client guard;
+    docs edited (DESIGN §8/§12, PROTOCOL §1.3, FORMAL B1 scope,
+    ARCHITECTURE L3); code + regression test land with M6.**
+    **Spent-tag rebirth × lazy slot-GC livelock — pre-existing in rev 5,
+    independent of item 25; conveyor compaction makes it frequent.** DESIGN §12's barrier resets deleted keys and `(⊥, n)`
+    lineages to `(⊥, 0)`. Same key + same `keyepoch` ⇒ the post-barrier
+    creation tag `PRF(key ‖ ⊥ ‖ 0)` is **byte-identical** to the pre-barrier
+    one, whose slot was already decided — a reborn tag. §8's slot-state GC is
+    *lazy*, so a node that hasn't yet GC'd holds `(promised, accepted_ballot,
+    accepted_op)` for the old decision; a new creation CAS's PREPARE then gets
+    a promise reporting the ancient accepted op, which §1.3 step 3 **MUST**
+    re-propose — but its `hlc` is below the horizon floor, so it can never
+    commit: livelock until every quorum node happens to GC. Also scopes FORMAL
+    B1 ("at most one op ever decided per slot") to barrier intervals for
+    reborn tags. Proposed fix: **acceptor-side void rule** — per-slot state
+    whose `accepted_op.hlc` is below the node's checkpoint horizon is dead;
+    on PREPARE, discard it and answer as a fresh slot (deterministic from
+    local state). Belt-and-braces client rule: treat a promised accept with
+    `hlc` below the horizon as no-accept. Edits: §8 (acceptor-state GC), §12,
+    FORMAL B1 scope note; code lands with M6.
+
+28. **APPLIED 2026-07-20 (RESILIENCE §3.6 + DESIGN §8 + PROTOCOL §1.3.5
+    edited; driver-side entropy is an M7 task).**
+    **Deterministic backoff is precomputable — note for M7, no ruling.** Item
+    23's jitter is a public function of `(priority, round)`, so RESILIENCE
+    §3.6's content-*oblivious* delay adversary can compute both duelers'
+    schedules offline — TLS no longer restores liveness for the dueling case.
+    Consistent with B7's partial-synchrony honesty and the QuePaxa escape
+    hatch, but worth one sentence in §3.6. Cheap mitigation: the M7 real
+    driver mixes true entropy into retry timing — timers are client policy,
+    not protocol (PROTOCOL §4), so the kernel stays pure and the sim stays
+    deterministic.
+
+29. **RESOLVED 2026-07-20 — all rulings landed (a: sidecar · d: GC QCs ·
+    f: compactor cert · g: cut-lag W · i: accept-and-declare + re-anchor
+    recorded); every sub-item below is now written into the rev-6 docs.**
+    **Item 25 (log-compaction) — ENDORSED, with mandatory revisions and open
+    rulings.** The model is right at the 5–10 GB target and is *less*
+    machinery than the snapshot blob (no re-encryption, no chunked transfer,
+    delta ∝ churn). But as drafted it has two correctness holes, and several
+    §12-adjacent consequences must be specified with it:
+    - **(a) RULING — attempt counters don't survive compaction.** The dead ops
+      (rejected/invalid/guard-only) that justified a live key's nonzero
+      `attempt` are GC'd, so bootstrap clients would derive `attempt = 0`
+      where full-history clients hold `n > 0` → different expected tags →
+      A4 divergence. The snapshot carried per-key `(version, attempt)`
+      precisely for this. Options: **(i, recommended)** checkpoint carries a
+      small encrypted sidecar `attempts: ct({key: n})` for *nonzero* attempts
+      on live keys only (sparse — attempts reset on every applied write;
+      preserves A2/A4 exactly, no new staleness); (ii) universal attempt-reset
+      `(v, n) → (v, 0)` at the barrier — simpler but mints reborn tags for
+      *live* keys too, widening item 27 and adding stale-CAS races per
+      checkpoint on contended keys; (iii) add a barrier counter to the PRF
+      preimage — kills all rebirth structurally but staleness-kills every
+      CAS in flight across a barrier. `state_root` already commits to
+      `attempt`, so whichever is chosen must match its leaf definition.
+    - **(b) MANDATORY — resurrection-aware tombstone retention.** A retained
+      multi-key winner replays *all* its mutations at bootstrap. If op X is
+      retained as winner for live key A but also set key B, and B was later
+      deleted below the cut, B's tombstone is "dead" under the draft rule and
+      GC'd — bootstrap resurrects B while full-history clients hold it
+      deleted: A4 broken. Rule: **a tombstone-winner is GC-able only if no
+      retained op mutates its key**; a so-retained tombstone masks
+      resurrection only and is *not* a lineage anchor (the key still resets
+      to `(⊥, 0)` per §12).
+    - **(c) MANDATORY — retained-set commitment.** With sparse below-cut
+      chains, per-author contiguous heads no longer describe holdings: a node
+      cannot distinguish "never received (live winner)" from "dead and
+      dropped", and `state_root` detects omissions only client-side, only
+      after a full 5–10 GB fetch. The checkpoint carries a per-author
+      `(count, digest)` over retained op-hashes (plaintext-safe — hashes are
+      public metadata): nodes verify below-cut completeness locally, the §13
+      possession barrier stays checkable, gossip `SUMMARY` gains the digest
+      alongside tail heads, and a bootstrap client localizes omissions
+      per-author. This *rescues* 25's "no navigable Merkle tree" stance — a
+      flat digest list suffices; each checkpoint is self-contained (digest
+      over the *full* retained set; the `dead` delta is just incremental GC
+      work), so only the latest checkpoint stays pinned.
+    - **(d) RULING — GC receipts/QCs below the cut.** Per-op QC retention at
+      ~450 B (Ed25519 list, n=7) against millions of live keys is GBs of pure
+      overhead. Since A4 is already *conditional on an honest checkpoint*
+      (item 13), let the manager-signed retained-set commitment vouch for
+      below-cut commitment and GC the QCs — envelopes keep author signatures,
+      so provenance survives. Same trust posture, big cost win.
+    - **(e) Control-plane retention set** (specify in §12): the latest
+      checkpoint, cert/revocation history, **wrap-sets** (the log *is* the
+      key-distribution channel — load-bearing forever), current roster +
+      endpoint records; old roster epochs droppable once no surviving QC
+      references them (moot if (d) adopted).
+    - **(f) RULING — the conveyor must not put the root key online.**
+      Continuous manager folding contradicts the offline-root posture
+      (DESIGN §3, MANAGER §0). Delegate: a **compactor identity** holding a
+      manager-issued cert with the `compact` capability (§15 already names
+      it; delegation is already M5 per item 9) plus the group key. Blast
+      radius on compromise: wrongful-GC (auditable, detect-and-disclose) +
+      data confidentiality (any client has that) — never roster/cert
+      authority.
+    - **(g) RULING — cut-lag policy.** Under rare big-bang checkpoints the
+      audit window (time to fold history before it's GC'd) was implicitly
+      huge; a conveyor makes it a knob that must be set consciously: cut ≤
+      finality frontier − W, with W ≥ client audit cadence. Answers the §17
+      "checkpoint cadence" open question; belongs in §12.
+    - **(h) Leakage declaration (§7).** The `dead` delta teaches nodes which
+      ops were superseded together — supersession/lifetime structure the
+      uniform snapshot-era GC never revealed, and retention itself marks
+      "this ciphertext is live state". Within the metadata boundary's spirit,
+      but the boundary is a *declared* one — declare it.
+    - **(i) RULING — epoch-key history becomes load-bearing forever, and §16
+      weakens.** Retained winners never re-encrypt: clients must hold every
+      `keyepoch` back to the oldest live winner (kills §17's "do snapshots
+      re-encrypt?" question — answer is now structurally *no*), a leaked old
+      epoch key exposes everything still live from that epoch with no
+      re-encryption path short of overwriting, and §16's "implementations may
+      eventually delete old fold code" claim shrinks: the *mutation-decode*
+      vocabulary of every `pver` still present in the retained set must be
+      kept (guards/verdicts still sealable). Accept and declare, or specify a
+      manager "re-anchor" op (re-encrypt + re-author a winner, original
+      provenance noted by reference) as the escape hatch.
+    - **(j) Protocol surface (M6, mechanical once ruled):** `PULL` below the
+      cut serves sparse retained runs (+ paged enumeration for bootstrap)
+      instead of "answers with the checkpoint"; `SUMMARY` carries the
+      retained digest; client caches apply the same `dead` delta.
+    - **(k) COMPARISON row.** Add: retained-winner log-compaction ↔ **Kafka
+      compacted topics** (ADOPT the retention shape; CARVE axis 1 — the
+      *broker* computes Kafka's winner set, our storage nodes can't, hence
+      manager-computed dead-deltas); re-cite rows 11/12 (Raft §7 snapshot
+      anchoring stays for the *horizon*; the snapshot-contents half is
+      superseded).
+
+30. **RESOLVED 2026-07-20 — ruling: adopt-by-fiat; all findings written into
+    RESILIENCE §2.2, DESIGN §12/§13, PROTOCOL §0/§2.2, MANAGER.md.**
+    **Recovery × compaction interplay — the motivating scenario (gorilla breaks
+    quorum, manager reconfigures), walked through under log-compaction.
+    Findings for the §12 rewrite + RESILIENCE §2.2 + DESIGN §13.**
+    - **The recovery checkpoint is the same artifact as a conveyor checkpoint
+      with one precondition swapped:** its cut is the *salvage frontier*,
+      adopted by root fiat, not a final frontier — finality cannot advance
+      without a quorum, so §12's "cut must be final" is unmeetable during
+      recovery by construction. §12 must state both preconditions; the fence
+      stays a distinct, non-replayable op kind (§2.2 already implies this).
+    - **The retained-set commitment (29c) IS the salvage manifest:** named =
+      exists; absent = lost-and-disclosed. **RULING needed — salvaged-but-
+      uncommitted ops** (sub-quorum receipts at outage time): adopt-by-fiat
+      into the cut (recommended — linearizability already doesn't span the
+      fence, and the writes are signed and attributable) or drop-and-disclose.
+      §2.2 currently only addresses committed-but-unsalvaged.
+    - **29d generalizes to disaster for free:** a salvaged op whose QC was
+      destroyed is unprovably-committed; under "the checkpoint vouches below
+      the cut" its legitimacy flows from the fence exactly like any routine
+      below-cut op — one legitimacy rule, one code path, disaster and routine.
+    - **The manager never carries bulk state.** It certifies (a checkpoint op:
+      cut + digests + `state_root` + sidecar — KBs); the 5–10 GB of retained
+      winners flows peer-to-peer from survivors *and reachable clients* to new
+      learners, verified against the digests, with `state_root` as the
+      client-side semantic check. Bulk transfer is therefore correctness-free
+      — any dumb resumable channel — because the manifest is the invariant.
+      **Gap:** no specified mechanical path for *client-held* ops to enter new
+      nodes' stores (clients don't speak §2 gossip verbs); needs a salvage-
+      mode intake or manager relay in PROTOCOL.
+    - **The recovery roster op cannot obtain an old-roster QC** (the old
+      quorum is dead). §13's joint-quorum rule is overridden by root fiat
+      exactly here and nowhere else — state it in §13 explicitly.
+    - **Framing correction for implementers:** retention is **in-place** —
+      retained winners keep their original `hlc`/`seq` position and the log
+      goes *sparse* (Kafka compacted-topic offsets don't move). Nothing is
+      "pushed to the head" of the conveyor; only the cut moves. The sole
+      forward-rewrite is the optional 29i re-anchor op, which has a declared
+      provenance cost.
+    - The compactor's warm fold cache (29f) is itself a salvage source — a
+      de-facto client replica; add to §2.2 step 1's inventory.
+    - Contrast case, for completeness: **≤ f destroyed is not this scenario**
+      — quorum intact, ordinary learner-add + promote, data flows via normal
+      gossip catch-up, the manager ships zero data and no checkpoint is
+      required at all (compaction only bounds how much the learner copies).
+
+31. **APPLIED 2026-07-20 (DESIGN §12 trust-surface paragraph, RESILIENCE §2.2
+    blast-radius note, COMPARISON row 12/20).**
+    **Trust-surface characterization for the §12 rewrite's argument section
+    (discussion outcome, 2026-07-20).** Three precise statements the new §12
+    should make — they are what makes log-compaction *stronger* than the
+    snapshot blob, not merely cheaper:
+    - **Compaction can no longer alter a byte, only select.** A snapshot was
+      manager-*authored* ciphertext: for a bootstrap client, both content and
+      selection were fiat (a tampering manager could fabricate values inside
+      it, detectable only by history-holders). Retained winners are the
+      *original author-signed envelopes*: fabricating a value now requires
+      forging a client signature. The manager's power over sealed history
+      reduces to **omission/selection of genuinely-authored ops** — "a
+      compression channel, not a write channel" becomes structural, not just
+      audited. The audit (`state_root` vs resident clients' derived state)
+      now guards only the selection, a strictly smaller surface.
+    - **What a bootstrap client verifies vs trusts.** Verifies: genesis →
+      unbroken manager control chain → checkpoint signature; every retained
+      op's author signature, cert chain, `hlc`/`seq` provenance; retained-set
+      digests; recomputed `state_root`. Trusts (manager fiat): the dead set —
+      that nothing live was omitted and nothing superseded was kept. Resident
+      full-history clients audit exactly that residue, continuously,
+      checkpoint by checkpoint, within the cut-lag window (29g).
+    - **Checkpoint-sync costs zero trust here — unlike a blockchain.**
+      Replay-from-genesis exists in trustless systems because there is no
+      root; here genesis and the checkpoint are signed by the *same* root of
+      trust, so genesis-replay would terminate in the same anchor and buy a
+      bootstrap client nothing. History replay's only marginal value —
+      detecting manager misbehavior between genesis and now — is provided by
+      resident clients' continuous audit instead. (This is weak-subjectivity
+      sync, made free by the pre-existing root.) Client sync cost is
+      O(live state + tail), never O(history).
+    - **Salvage blast-radius precision (amends the item 30 discussion):**
+      "> f destroyed loses only in-flight ops" is slightly too optimistic —
+      committed-but-narrowly-held tail ops can die too (that is §2.2's
+      disclosure clause). The practical bound: what's at risk is ops **no
+      client has folded yet** — bounded by client sync cadence, not by
+      compaction cadence (compaction changes replication *shape*, not
+      durability). The retained baseline is the most-replicated object in
+      the system (every node + every client + the compactor cache), so the
+      fragile zone is precisely the recent tail.
+
+32. **OPEN — config-plane governance (raised 2026-07-20; RULING pending; does
+    NOT block M5/M6 — nothing below is in the current handoff scope).** The
+    questions: which parameters are changeable and how; multiple manager
+    keys; root rotation; whole-roster replacement; recovering from a wonky
+    parameter change. Review-side recommendations, for ratification:
+    - **(a) Parameters classify by the existing §16 lanes — no new machinery.**
+      Client timers, hedge delays, backoff scale, retransmit/poll cadence:
+      **lane 1** — pure client policy (PROTOCOL §4: nothing depends on a
+      client timing out "correctly"), change freely, no coordination. Gossip
+      cadence: node-local policy, liveness-only. **W** (cut-lag): compactor
+      policy, declared in the control plane so clients know their audit
+      window. **δ is the one true protocol parameter** — it shapes floors and
+      the author-amnesia wait (FORMAL B8), so heterogeneous δ is a liveness
+      hazard and an amnesia-soundness hazard: δ must live in the control
+      plane and change via a **lane-3 epoch-fenced control op**. Floors/WMs
+      already bind `config_epoch`, so mixed-epoch floors interpret
+      deterministically across the fence.
+    - **(b) Wonky-value protection is the existing three-layer pattern:**
+      tool interlocks (MANAGER §3, fail near the operator) → node-side
+      bounds validation (reject δ outside fixed sane protocol bounds, exactly
+      like even-roster rejection) → the activation gate itself (a change that
+      prevents its own acknowledgment quorum simply never activates — the
+      joint-quorum pattern is inherently fail-safe; the old epoch continues).
+    - **(c) The corrective channel must never be gated by the parameter it
+      corrects.** A δ set pathologically small could bounce the very control
+      op that reverts it (`future_hlc`/`below_floor` on the manager's own
+      write) — a self-locking wedge. Rule: nodes accept `class = control` ops
+      under a **fixed protocol-constant skew window δ_control** (generous,
+      NOT settable), independent of the settable data-plane δ. Same asymmetry
+      family as ballot-`ACCEPT`'s exemption from dep/contiguity gates
+      ("completing a decision must never block on context").
+    - **(d) Multiple managers: delegation, never co-equal roots.** v1 answer
+      is §15 capability certs (M5): several operators can hold
+      `issue-revoke` / `manage-roster` / `compact` certs, each revocable by
+      the root; the root stays singular and offline. Co-equal independent
+      root keys are REJECTED — they widen the §3.5 split-view surface and
+      make "root compromise = game over" plural. The recorded hardening
+      remains a **threshold root** (§3, §16 worked example), not multiple
+      roots.
+    - **(e) Root rotation = succession, and it only helps the healthy case.**
+      A slotted **root-succession control op** (public slot
+      `H("root" ‖ generation)`, old root signs the new root key; the
+      succession chain joins the control-plane liveness set forever;
+      bootstrap verifies the chain from the genesis root). Serves proactive
+      hygiene, escrow refresh, and the §16 post-quantum path. Stated
+      honestly: succession does NOT mitigate compromise (a compromised root
+      signs a hostile successor just as happily) and CANNOT recover loss
+      (the old key must sign) — escrow/threshold remains the loss answer;
+      genesis TOFU remains the anchor.
+    - **(f) Whole-roster replacement in one go: already sound** — B4 + the
+      possession barrier cover arbitrary joint jumps including disjoint
+      old/new rosters (stage as learner-adds, then one replace op).
+      Operational caveat to write down: full replacement orphans a
+      long-offline client whose entire cached seed set is the old roster
+      (§17's hard-bootstrap-failure open question) — policy: stage
+      replacements, or keep one legacy endpoint record alive as a forwarder
+      until client caches have rolled over.
 
 # Not yet built (by design, M2+)
 

@@ -1,6 +1,6 @@
 # DudeFS Architecture — layers & interfaces
 
-> **Status:** companion to [DESIGN.md](DESIGN.md) (rev 5). The protocol documents mix concerns deliberately — they are definition-first. An implementation must not. This document cuts the system into strictly-layered black boxes, states each layer's interface and determinism obligations, and gives the deployment matrix (which layers run in a node, a client, the manager tool). The load-bearing pattern is the **payload handler** (L6): predicates apply to *opaque bytes* at the coordination layer and to *decrypted content* at the fold layer, and the handler interface is where that duality lives — it is also what turns the zero-knowledge property from a promise into a build constraint.
+> **Status:** companion to [DESIGN.md](DESIGN.md) (rev 6). The protocol documents mix concerns deliberately — they are definition-first. An implementation must not. This document cuts the system into strictly-layered black boxes, states each layer's interface and determinism obligations, and gives the deployment matrix (which layers run in a node, a client, the manager tool). The load-bearing pattern is the **payload handler** (L6): predicates apply to *opaque bytes* at the coordination layer and to *decrypted content* at the fold layer, and the handler interface is where that duality lives — it is also what turns the zero-knowledge property from a promise into a build constraint.
 
 Interfaces below are language-neutral pseudocode. The dependency rule is **strictly downward** — a layer may call only layers beneath it.
 
@@ -43,7 +43,7 @@ Acceptor: on_submit(op)              → Receipt | SlotConflict(accepted) | Reje
           on_accept(tag, ballot, op) → Receipt | Nack(promised)
 ```
 
-State per tag: `(promised, accepted_ballot, accepted_op)` — the single-decree machinery of DESIGN §8. Tags are opaque; the only operation is equality. This layer plus L2's floor is the entire TLA+ surface on the node side.
+State per tag: `(promised, accepted_ballot, accepted_op)` — the single-decree machinery of DESIGN §8. Tags are opaque; the only operation is equality. Slot state whose `accepted_op.hlc` lies below the checkpoint horizon is **void on `prepare`** (DESIGN §8 — the reborn-tag rule). This layer plus L2's floor is the entire TLA+ surface on the node side.
 
 ## L4 — Quorum client (commitment & finality, client-side)
 

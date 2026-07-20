@@ -1,6 +1,6 @@
 # DudeFS Protocol — interactions above the wire
 
-> **Status:** companion to [DESIGN.md](DESIGN.md) (rev 5). This defines every conversation in the system — verbs, flows, invariants, crash points — one level above serialization. Wire formats will bind to this; nothing here depends on them.
+> **Status:** companion to [DESIGN.md](DESIGN.md) (rev 6). This defines every conversation in the system — verbs, flows, invariants, crash points — one level above serialization. Wire formats will bind to this; nothing here depends on them.
 
 ## 0. Conventions
 
@@ -10,7 +10,7 @@
 - **Nodes never fan out.** Every response is served from local state; quorum assembly is always the *caller's* job. Nodes stay trivially simple, and partial failure is a client-visible, client-policy matter — never a server-side mystery.
 - Every response carries the node's current `config_epoch` and (where useful) its watermark floor — clients learn of roster changes and finality passively, from any traffic.
 - Data-plane reads are served only to bearers of valid certs (per the node's current control-plane view). This is defense-in-depth on ciphertext and metadata; the actual confidentiality boundary is encryption.
-- **The manager is not a distinct protocol actor.** It speaks exactly the client verbs below; what distinguishes it is its cert capabilities and that its ops are `class = control` (plaintext, node-folded). There is no manager-only verb or channel.
+- **The manager is not a distinct protocol actor** — and neither is the compactor (DESIGN §12). Both speak exactly the client verbs below; what distinguishes them is cert capabilities and that their privileged ops are `class = control` (plaintext, node-folded). There is no manager-only verb or channel.
 
 **Terminology (three tiers).** A **worker** is an application process with *no* protocol identity — it speaks only the local worker API (§6). A **client node** is the daemon (or in-process library) holding a manager-authorized keypair that does everything in §1 on workers' behalf. A **storage node** is the replicating acceptor of DESIGN §2. Unqualified "node" in these documents means storage node; unqualified "client" means client node.
 
@@ -25,7 +25,7 @@
 | `ACCEPT` | `{slot_tag, ballot, op}` | `ACCEPTED{receipt@ballot}` \| `NACK{promised}` | Phase 2. Carries the envelope in case the node lacks it. |
 | `FETCH_OP` | `{op_hash}` | envelope + known receipts | |
 | `FRONTIER` | – | signed **frontier bundle**: `sign(node_sk, per-author heads ‖ checkpoint_head ‖ config_epoch ‖ floor)` | The read primitive. Heads and floor are signed *at one instant* — this is what makes quorum reads relay-safe (§7.3). |
-| `PULL` | `{author, from_seq, to_seq}` | contiguous envelopes + receipts + QCs | Ranges at/below the cut answer with the checkpoint instead. |
+| `PULL` | `{author, from_seq, to_seq}` | envelopes + receipts + QCs | Above the cut: contiguous runs. At/below the cut: the **sparse retained subset** of the range (DESIGN §12), with *no* receipts/QCs — the checkpoint's `retained` commitment vouches for below-cut commitment; the caller verifies holdings per author against the `(count, digest)` in the checkpoint. Idempotent range paging is the bootstrap fetch primitive. |
 | `GET_QC` / `PUT_QC` | `{op_hash}` / `{QC}` | QC / ack | Clients deposit QCs they assemble; nodes also assemble from gossiped receipts. |
 | `WATERMARK` | – | fresh signed floor | |
 | `RERECEIPT` | `{op_hash \| slot_tag}` | receipt under the node's *current* epoch | For in-flight ops across roster changes (DESIGN §13). Acceptor state untouched. |
@@ -37,7 +37,7 @@
 
 1. `FRONTIER` to all reachable nodes; proceed once any quorum has answered.
 2. `PULL` whatever you lack, from whichever answering node has it.
-3. For committed-looking ops without QCs in hand: `GET_QC`, or assemble from the receipts you now hold.
+3. For committed-looking ops without QCs in hand: `GET_QC`, or assemble from the receipts you now hold. (Above the cut only — below it, receipts/QCs are GC'd and the checkpoint's `retained` commitment is the commitment proof, DESIGN §12.)
 4. Fold locally at the checkpoint barrier (DESIGN §12).
 5. The returned `WM`s give the **finality frontier**: the highest `h` such that a quorum attests floors ≥ `h`.
 
@@ -49,10 +49,10 @@ Because frontier bundles are signed atomically, the quorum read is **path-indepe
 
 0. Quorum read → the key's `(version, attempt)` at the finality frontier.
 1. Build `Txn` (slot preimage, guards, mutations), AEAD-encrypt, compute `slot_tag`, envelope with fresh `hlc`.
-2. `PREPARE` `(slot_tag, b)` with `b = (r ≥ 1, my-id)` above anything seen, to at least a quorum, in parallel (rev 5: every slotted proposal runs both phases — DESIGN §8).
-3. From a quorum of promises: if any reports an accepted op, you MUST `ACCEPT` the highest-ballot one — even a rival's; you may be completing someone else's decision, and that is required, not courtesy. Otherwise `ACCEPT` your own. Quorum of `ACCEPTED@b` → assemble QC → **committed** (durable). If the decided op is a rival's: it is committed — go to step 4, observe, then retry your own intent against the advanced lineage.
+2. `PREPARE` `(slot_tag, b)` with `b = (r ≥ 1, priority)`, `priority = h(slot_tag ‖ my_fp)` (the per-slot tiebreak, DESIGN §8), above anything seen, to at least a quorum, in parallel (rev 5: every slotted proposal runs both phases — DESIGN §8).
+3. From a quorum of promises: if any reports an accepted op, you MUST `ACCEPT` the highest-ballot one — even a rival's; you may be completing someone else's decision, and that is required, not courtesy. (Exception: a reported accept whose op `hlc` lies below the checkpoint horizon is dead state — treat as no accept; acceptors void such state themselves on `PREPARE`, DESIGN §8.) Otherwise `ACCEPT` your own. Quorum of `ACCEPTED@b` → assemble QC → **committed** (durable). If the decided op is a rival's: it is committed — go to step 4, observe, then retry your own intent against the advanced lineage.
 4. Poll `WATERMARK` (it piggybacks on any traffic) until a quorum's floors pass `op.hlc` → **final**. Fold verdict: `applied` → success. `rejected`/`stale` → a guard failed or the lineage moved — re-read, reconsider, maybe retry. Done either way; report which.
-5. **Contention** (`NACK{promised}` or timeout): pick a round above the reported promise and re-run from step 2. Randomized backoff between rounds (dueling proposers; trivial at 1–3 clients).
+5. **Contention** (`NACK{promised}` or timeout): pick a round above the reported promise and re-run from step 2, after the deterministic per-`(priority, round)` jitter; a per-round timeout escalates the round even when Nacks are lost (DESIGN §8). Real drivers may mix true entropy into these timers — they are policy, not protocol (§4).
 
 ### 1.4 Offline / single-push writes
 
@@ -62,7 +62,7 @@ Because frontier bundles are signed atomically, the quorum read is **path-indepe
 
 ### 2.1 Invariants
 
-- **Contiguity:** a node stores `(author, seq)` only if it holds `seq−1` (or `seq ≤` the checkpoint cut). Chains always validate locally; there are no orphan islands. An eager-pushed op that would open a gap triggers an immediate `PULL` of the gap; if the gap can't be filled now, drop the push — the periodic cycle will carry it.
+- **Contiguity:** a node stores `(author, seq)` only if it holds `seq−1` (or `seq ≤` the checkpoint cut — below the cut chains are legitimately **sparse**: a node holds exactly the retained subset, validated against the checkpoint's per-author `(count, digest)` commitment, DESIGN §12). Chains always validate locally; there are no orphan islands. An eager-pushed op that would open a gap triggers an immediate `PULL` of the gap; if the gap can't be filled now, drop the push — the periodic cycle will carry it.
 - **Dep resolution before acceptance:** a node accepts an op only once every `deps`-referenced op is present locally — committed *or merely stored* (floors gate receipts, not storage, so a dep on an uncommitted op is always satisfiable). Unknown deps trigger a `PULL`; if they can't be fetched now, defer (`unknown_dep`) and let the periodic cycle carry them. This is what makes a fork visible at the first node where two branches' observers meet: the pulled branch collides in the store and mints equivocation evidence **at accept time** (DESIGN §4). Ballot `ACCEPT` (recovery) is exempt, like contiguity — completing a decision must never block on context.
 - **The watermark floor never gates gossip.** Floors gate *issuing receipts*; storing and relaying already-receipted material must always proceed, or convergence breaks (DESIGN §8).
 - Deduplicate by hash; validate before storing (signature, authz against the current control-plane view, chain links).
@@ -72,11 +72,11 @@ Because frontier bundles are signed atomically, the quorum read is **path-indepe
 
 | Verb | Payload | Notes |
 |---|---|---|
-| `SUMMARY` | per-author heads · per-author receipt coverage · checkpoint head · floor · epoch · evidence digest | Exchanged pairwise; each node runs a periodic epidemic round against a uniformly random peer. |
-| `DELTA` | contiguous envelope runs + receipts + QCs + checkpoints + control ops + evidence | Ships exactly the diff the `SUMMARY` exposed, honoring contiguity. |
+| `SUMMARY` | per-author heads · per-author receipt coverage · checkpoint head + retained digests · floor · epoch · evidence digest | Exchanged pairwise; each node runs a periodic epidemic round against a uniformly random peer. |
+| `DELTA` | envelope runs (contiguous above the cut; retained-sparse below) + receipts + QCs + checkpoints + control ops + evidence | Ships exactly the diff the `SUMMARY` exposed, honoring contiguity. |
 | eager push | `{op, my receipt}` on fresh accept, to all peers | Latency optimization only; correctness rests on the periodic cycle alone. |
 
-Any node accumulating a quorum of receipts assembles, stores, and serves the QC — this is what makes single-push (§1.4) work. Cycle constants and the receipt-coverage digest encoding are wire-adjacent: open (DESIGN §17).
+A node **persists the receipts it issues** (derived from already-fsynced slot state, so a stored receipt never outlives its justification — RESILIENCE §0); its own receipts are gossip payload like any other. Any node accumulating a quorum of receipts assembles, stores, and serves the QC — this is what makes single-push (§1.4) work. **`DELTA` intake is not peer-gated:** any bearer of a valid cert — a client node, the manager, the compactor — may push artifact bundles through the same validation path; storing already-signed material is always harmless (floors gate receipts, never storage), and this is the salvage path of RESILIENCE §2.2. Cycle constants and the receipt-coverage digest encoding are wire-adjacent: open (DESIGN §17).
 
 ### 2.3 Cost & health accounting
 
@@ -98,13 +98,15 @@ Same verbs throughout; control ops are plaintext ops on the manager's authored c
 
 Crash at any step: everything is idempotent and slot-guarded; resume or retry verbatim, or abandon. A manager that lost its chain-head state must run the author-amnesia procedure first (DESIGN §4) — mandatory, since the root key cannot be retired.
 
-### 3.2 Checkpoint (compaction)
+### 3.2 Checkpoint (conveyor compaction)
 
-1. Final quorum read → frontier `F`, entirely final (no straggler can ever sort below it — DESIGN §9/§12).
-2. Fold to `F`; build `Checkpoint{cut, state_root, snapshot, …}`. The snapshot holds live keys only, each with `(version, attempt)`; **tombstones die here** and their lineages restart at `(⊥, 0)`.
+Run routinely by the **compactor** — a delegated `compact`-capability identity holding the group key (DESIGN §12/§15); the root key stays offline. The compactor maintains a warm incremental fold; each conveyor step is cheap and proportional to churn.
+
+1. Final quorum read → frontier `F`, entirely final (no straggler can ever sort below it — DESIGN §9/§12), trailing the finality frontier by the audit window `W`.
+2. Incremental tail-fold to `F`; compute the newly-dead set (superseded or deleted ≤ `cut`, honoring the resurrection mask — DESIGN §12 retention rule) and the full retained commitment; build `Checkpoint{cut, state_root, dead, retained, attempts, …}` — kilobytes, ∝ churn. **Tombstones die here** and their lineages restart at `(⊥, 0)`; live-key attempts ride the encrypted sidecar.
 3. `SUBMIT` like any op → QC → the checkpoint is committed.
-4. Nodes, on observing the committed checkpoint, **may** — lazily, locally, at leisure — drop envelopes ≤ `cut`, drop slot acceptor-state consumed ≤ `cut`, and enforce the receipt floor at the horizon. No coordination needed: the barrier is logical, not physical, so nodes GC'ing at different times is normal operation.
-5. Any full-history client recomputes `state_root` and shouts on mismatch — compaction stays a *compression* channel, auditable forever (DESIGN §12).
+4. Nodes, on observing the committed checkpoint, **may** — lazily, locally, at leisure — drop the `dead` ops, drop receipts/QCs ≤ `cut` (the `retained` commitment vouches), drop slot acceptor-state consumed ≤ `cut` (void on `PREPARE` regardless — DESIGN §8), and enforce the receipt floor at the horizon. No coordination needed: the barrier is logical, not physical, so nodes GC'ing at different times is normal operation. Clients apply the same `dead` delta to their caches.
+5. Any full-history client recomputes `state_root` within `W` and shouts on mismatch — compaction stays a *selection* channel, auditable (DESIGN §12 trust surface).
 
 ### 3.3 Certs, revocation, key rotation
 
@@ -160,7 +162,7 @@ A **transport** is anything that can move a request/response pair or a bag of ar
 2. Reach *any one* storage node via any seed endpoint.
 3. Pull the latest **checkpoint** + the control-plane chain; verify manager signatures and quorum commitment — all offline-checkable.
 4. From the control chain: current roster, **current endpoint records**, certs/revocations, `keyepoch` wrap-sets (the log is the key-distribution channel, §3.3).
-5. Sync the tail (§1.2), fold, cache roster + endpoints (never evict the last-known set — DESIGN §14).
+5. Sync the retained set (sparse `PULL`s verified against the checkpoint's per-author digests) + the tail (§1.2); fold per DESIGN §12 bootstrap semantics; cache roster + endpoints (never evict the last-known set — DESIGN §14).
 6. Operational: serve workers (§6), stay current by polling/gossip-adjacency.
 
 One reachable seed node therefore suffices to recover *everything*: roster, endpoints, keys wrapped to you — then the data.
