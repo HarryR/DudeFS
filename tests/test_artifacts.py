@@ -100,7 +100,7 @@ class TestQuorumArtifacts(unittest.TestCase):
 
     def test_qc_needs_majority(self):
         oph = bytes([7] * 32)
-        rs = [A.Receipt.issue(self.sks[i], self.pubs[i], oph, 0, A.BLIND) for i in (0, 1, 3)]
+        rs = [A.Receipt.issue(self.sks[i], self.pubs[i], oph, 0, A.BLIND, 1) for i in (0, 1, 3)]
         for r in rs:
             self.assertTrue(r.verify())
         qc = A.QC.assemble(rs, self.n, self.index)
@@ -117,7 +117,7 @@ class TestQuorumArtifacts(unittest.TestCase):
         self.assertLess(A.Ballot(1, b"a"), A.Ballot(1, b"b"))
 
     def test_watermark_and_frontier(self):
-        wm = A.Watermark.issue(self.sks[0], self.pubs[0], A.HLC(5000, 0), 0)
+        wm = A.Watermark.issue(self.sks[0], self.pubs[0], A.HLC(5000, 0), 0, 1)
         self.assertTrue(wm.verify())
         wm.floor = A.HLC(9999, 0)
         self.assertFalse(wm.verify())
@@ -158,14 +158,14 @@ class TestGoldenVectors(unittest.TestCase):
         self.assertEqual(tag.hex(), GOLDEN_SLOT_TAG)
 
     def test_receipt_message_golden(self):
-        msg = A.receipt_message(bytes([7] * 32), 0, A.BLIND)
+        msg = A.receipt_message(bytes([7] * 32), 0, A.BLIND, 1)
         self.assertEqual(C.h(msg).hex(), GOLDEN_RECEIPT_MSG_HASH)
 
 
 # Golden constants captured from the reference implementation (M0 freeze).
 GOLDEN_OP_HASH = "37a34cb07514b88499aeaed18c320c93f314dbf438bccde768ccfae5245408df"
 GOLDEN_SLOT_TAG = "90f95fff86da601e863bff7a94a015ef6a55241da944541f4ee5ce26556a6c53"
-GOLDEN_RECEIPT_MSG_HASH = "eb0bac1ecd1edf2fefa388cb6e67a666cbe8929b9cd9552d9753525e59f412b4"
+GOLDEN_RECEIPT_MSG_HASH = "14b2178154576d6005816103e16b6f4fee08c09fedcbce7323fdfb9d3e593bac"
 
 
 if __name__ == "__main__":

@@ -95,7 +95,7 @@ class TestConvergence(unittest.TestCase):
             nkeys = [bytes([200 + i] * 32) for i in range(3)]
             npubs = [C.SIGNER.public(k) for k in nkeys]
             th = ops[0].op_hash
-            recs = [A.Receipt.issue(nkeys[i], npubs[i], th, 0, A.BLIND) for i in range(3)]
+            recs = [A.Receipt.issue(nkeys[i], npubs[i], th, 0, A.BLIND, 1) for i in range(3)]
             for i, r in enumerate(recs):
                 stores[i % n].put_receipt(r)
             stores[0].put_qc(A.QC.assemble(recs, 3, {p: i for i, p in enumerate(npubs)}))

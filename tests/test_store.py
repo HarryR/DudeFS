@@ -78,7 +78,7 @@ class TestReceiptsQCs(unittest.TestCase):
         s.append(op)
         nsk = bytes([5] * 32)
         npub = C.SIGNER.public(nsk)
-        r = A.Receipt.issue(nsk, npub, op.op_hash, 0, A.BLIND)
+        r = A.Receipt.issue(nsk, npub, op.op_hash, 0, A.BLIND, 1)
         s.put_receipt(r)
         got = s.receipts_for(op.op_hash)
         self.assertEqual(len(got), 1)

@@ -169,6 +169,23 @@ class Ed25519ListMultiSig:
                 return False
         return True
 
+    @staticmethod
+    def verify_each(
+        bitmap: bytes, sigs: list[bytes], msgs: list[bytes], roster_pubkeys: list[bytes]
+    ) -> bool:
+        """Verify each listed signature against ITS OWN message (finding-17): the
+        shares no longer sign an identical message — each carries the signer's own
+        `issue_seq` — so `msgs[i]` is the message for the i-th named signer (index
+        order). Bitmap-count / quorum sizing stays the QC layer's job."""
+        n = len(roster_pubkeys)
+        indices = bitmap_indices(bitmap, n)
+        if len(indices) != len(sigs) or len(indices) != len(msgs):
+            return False
+        for idx, sig, msg in zip(indices, sigs, msgs, strict=False):
+            if not ed25519.verify(roster_pubkeys[idx], msg, sig):
+                return False
+        return True
+
 
 MULTISIG = Ed25519ListMultiSig
 

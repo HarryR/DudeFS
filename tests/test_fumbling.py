@@ -288,6 +288,13 @@ class TestButtonMasher(unittest.TestCase):
                 self.assertEqual(pf.signer, sim.roster[0])
             if not has_persona:
                 self.assertEqual(sim.evidence(), [], f"seed {seed}: honest run minted evidence")
+                # finding-17 arm: honest nodes' below-floor receipts (legally issued
+                # then re-issued forever) must NOT convict. Attest high floors and
+                # run the perjury detector on every node -> zero false accusations.
+                wms = [sim._raw[i].acc.issue_watermark(10_000_000) for i in range(3)]
+                for i in range(3):
+                    fp = sim._raw[i].acc.store.detect_floor_perjury(wms)
+                    self.assertEqual(fp, [], f"seed {seed}: FALSE floor-perjury on honest node {i}")
 
 
 if __name__ == "__main__":

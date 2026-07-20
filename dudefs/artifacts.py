@@ -638,10 +638,13 @@ class Txn:
 # --------------------------------------------------------------------------- #
 
 
-def receipt_message(op_hash: bytes, config_epoch: int, ballot: Ballot) -> bytes:
-    """The identical message a quorum signs: `op_hash ‖ config_epoch ‖ ballot`
-    (DESIGN §8). Canonical & injective."""
-    return codec.encode([op_hash, int(config_epoch), ballot.encode()])
+def receipt_message(op_hash: bytes, config_epoch: int, ballot: Ballot, issue_seq: int) -> bytes:
+    """The message a node signs: `op_hash ‖ config_epoch ‖ ballot ‖ issue_seq`
+    (DESIGN §8, finding-17 fix). `issue_seq` is the signer's own monotone issuance
+    counter — it puts every receipt on the node's ISSUANCE CHAIN, so a floor-perjury
+    proof can carry the ordering the two artifacts otherwise lack (RESILIENCE §3.1).
+    Canonical & injective."""
+    return codec.encode([op_hash, int(config_epoch), ballot.encode(), int(issue_seq)])
 
 
 class ReceiptField(BytesEnum):
@@ -651,36 +654,54 @@ class ReceiptField(BytesEnum):
     OP_HASH = b"op_hash"
     EPOCH = b"epoch"
     BALLOT = b"ballot"
+    ISSUE_SEQ = b"seq"
     SIGNER = b"signer"
     SIG = b"sig"
 
 
 class Receipt:
-    __slots__ = ("op_hash", "config_epoch", "ballot", "signer", "sig")
+    __slots__ = ("op_hash", "config_epoch", "ballot", "issue_seq", "signer", "sig")
 
     def __init__(
-        self, op_hash: bytes, config_epoch: int, ballot: Ballot, signer: bytes, sig: bytes
+        self,
+        op_hash: bytes,
+        config_epoch: int,
+        ballot: Ballot,
+        issue_seq: int,
+        signer: bytes,
+        sig: bytes,
     ):
         self.op_hash = op_hash
         self.config_epoch = int(config_epoch)
         self.ballot = ballot
+        self.issue_seq = int(issue_seq)  # the signer's monotone issuance-chain position
         self.signer = signer  # node pubkey
         self.sig = sig
 
     @property
     def message(self):
-        return receipt_message(self.op_hash, self.config_epoch, self.ballot)
+        return receipt_message(self.op_hash, self.config_epoch, self.ballot, self.issue_seq)
 
     def verify(self) -> bool:
         return crypto.SIGNER.verify(self.signer, self.message, self.sig)
 
     @staticmethod
     def issue(
-        node_sk: bytes, node_pub: bytes, op_hash: bytes, config_epoch: int, ballot: Ballot
+        node_sk: bytes,
+        node_pub: bytes,
+        op_hash: bytes,
+        config_epoch: int,
+        ballot: Ballot,
+        issue_seq: int,
     ) -> Receipt:
-        msg = receipt_message(op_hash, config_epoch, ballot)
+        msg = receipt_message(op_hash, config_epoch, ballot, issue_seq)
         return Receipt(
-            op_hash, config_epoch, ballot, node_pub, crypto.MULTISIG.sign_share(node_sk, msg)
+            op_hash,
+            config_epoch,
+            ballot,
+            issue_seq,
+            node_pub,
+            crypto.MULTISIG.sign_share(node_sk, msg),
         )
 
     def encode(self) -> bytes:
@@ -688,6 +709,7 @@ class Receipt:
             {
                 ReceiptField.BALLOT: self.ballot.encode(),
                 ReceiptField.EPOCH: self.config_epoch,
+                ReceiptField.ISSUE_SEQ: self.issue_seq,
                 ReceiptField.OP_HASH: self.op_hash,
                 ReceiptField.SIG: self.sig,
                 ReceiptField.SIGNER: self.signer,
@@ -701,6 +723,7 @@ class Receipt:
             codec.as_bytes(_require(d, ReceiptField.OP_HASH)),
             codec.as_int(_require(d, ReceiptField.EPOCH)),
             Ballot.decode(_require(d, ReceiptField.BALLOT)),
+            codec.as_int(_require(d, ReceiptField.ISSUE_SEQ)),
             codec.as_bytes(_require(d, ReceiptField.SIGNER)),
             codec.as_bytes(_require(d, ReceiptField.SIG)),
         )
@@ -809,13 +832,17 @@ class QCField(BytesEnum):
     BALLOT = b"ballot"
     BITMAP = b"bitmap"
     SIGS = b"sigs"
+    ISSUE_SEQS = b"seqs"
 
 
 class QC:
-    """A quorum multi-signature over one identical message plus a signer set.
-    v1 instantiation: signer bitmap + Ed25519 signature list."""
+    """A quorum multi-signature plus a signer set. v1 instantiation: signer bitmap
+    + Ed25519 signature list. Post-finding-17 each share signs over its own message
+    (the signer's `issue_seq` differs), so the QC carries the per-signer `issue_seqs`
+    list PARALLEL to `sigs`/the bitmap, and verification reconstructs each signer's
+    message from its seq."""
 
-    __slots__ = ("op_hash", "config_epoch", "ballot", "signer_bitmap", "sigs")
+    __slots__ = ("op_hash", "config_epoch", "ballot", "signer_bitmap", "sigs", "issue_seqs")
 
     def __init__(
         self,
@@ -824,23 +851,20 @@ class QC:
         ballot: Ballot,
         signer_bitmap: bytes,
         sigs: list[bytes],
+        issue_seqs: list[int],
     ):
         self.op_hash = op_hash
         self.config_epoch = int(config_epoch)
         self.ballot = ballot
         self.signer_bitmap = signer_bitmap
         self.sigs = list(sigs)
-
-    @property
-    def message(self):
-        return receipt_message(self.op_hash, self.config_epoch, self.ballot)
+        self.issue_seqs = [int(s) for s in issue_seqs]  # parallel to sigs (index order)
 
     def verify(self, roster_pubkeys: list[bytes]) -> bool:
-        """Look up the roster at `config_epoch`, check the bitmap names a
-        MAJORITY of it, verify the signature list over the identical message
-        (DESIGN §8). Bitmap is strict (NOTES item 18): exactly ceil(n/8) bytes,
-        no set bits above n — one signer set has one encoding, and a malformed
-        wire bitmap is a False verdict, never a crash."""
+        """Check the bitmap names a MAJORITY of the epoch roster, then verify every
+        share against ITS signer's message (`op_hash‖epoch‖ballot‖issue_seq`, DESIGN
+        §8 / finding-17). Bitmap is strict (NOTES item 18): exactly ceil(n/8) bytes,
+        no set bits above n; a malformed wire QC is a False verdict, never a crash."""
         n = len(roster_pubkeys)
         bm = self.signer_bitmap
         if len(bm) != (n + 7) // 8:
@@ -849,7 +873,13 @@ class QC:
             return False  # stray bits beyond roster size
         if crypto.bitmap_count(bm, n) < quorum_size(n):
             return False
-        return crypto.MULTISIG.verify(bm, self.sigs, self.message, roster_pubkeys)
+        if len(self.issue_seqs) != len(self.sigs):
+            return False
+        msgs = [
+            receipt_message(self.op_hash, self.config_epoch, self.ballot, s)
+            for s in self.issue_seqs
+        ]
+        return crypto.MULTISIG.verify_each(bm, self.sigs, msgs, roster_pubkeys)
 
     @staticmethod
     def assemble(receipts: list[Receipt], n: int, roster_index: dict[bytes, int]) -> QC:
@@ -859,12 +889,16 @@ class QC:
             raise ValueError("no receipts")
         r0 = receipts[0]
         shares: dict[int, bytes] = {}
+        seqs: dict[int, int] = {}
         for r in receipts:
             if (r.op_hash, r.config_epoch, r.ballot) != (r0.op_hash, r0.config_epoch, r0.ballot):
                 raise ValueError("receipts disagree on (op,epoch,ballot)")
-            shares[roster_index[r.signer]] = r.sig
+            idx = roster_index[r.signer]
+            shares[idx] = r.sig
+            seqs[idx] = r.issue_seq
         bitmap, sigs = crypto.MULTISIG.combine(shares, n)
-        return QC(r0.op_hash, r0.config_epoch, r0.ballot, bitmap, sigs)
+        issue_seqs = [seqs[i] for i in sorted(shares)]  # index order — parallel to sigs
+        return QC(r0.op_hash, r0.config_epoch, r0.ballot, bitmap, sigs, issue_seqs)
 
     def encode(self) -> bytes:
         return codec.encode(
@@ -872,6 +906,7 @@ class QC:
                 QCField.BALLOT: self.ballot.encode(),
                 QCField.BITMAP: self.signer_bitmap,
                 QCField.EPOCH: self.config_epoch,
+                QCField.ISSUE_SEQS: list(self.issue_seqs),
                 QCField.OP_HASH: self.op_hash,
                 QCField.SIGS: list(self.sigs),
             }
@@ -886,6 +921,7 @@ class QC:
             Ballot.decode(_require(d, QCField.BALLOT)),
             codec.as_bytes(_require(d, QCField.BITMAP)),
             [codec.as_bytes(x) for x in codec.as_seq(_require(d, QCField.SIGS))],
+            [codec.as_int(x) for x in codec.as_seq(_require(d, QCField.ISSUE_SEQS))],
         )
 
 
@@ -894,28 +930,36 @@ class QC:
 # --------------------------------------------------------------------------- #
 
 
-def watermark_message(floor: HLC, config_epoch: int) -> bytes:
-    return codec.encode([floor.encode(), int(config_epoch)])
+def watermark_message(floor: HLC, config_epoch: int, issue_seq: int) -> bytes:
+    """`floor ‖ config_epoch ‖ issue_seq` (DESIGN §9 / finding-17). The `issue_seq`
+    puts the attestation on the signer's issuance chain so a floor-perjury proof can
+    order it against a receipt."""
+    return codec.encode([floor.encode(), int(config_epoch), int(issue_seq)])
 
 
 class Watermark:
-    __slots__ = ("floor", "config_epoch", "signer", "sig")
+    __slots__ = ("floor", "config_epoch", "issue_seq", "signer", "sig")
 
-    def __init__(self, floor: HLC, config_epoch: int, signer: bytes, sig: bytes):
+    def __init__(self, floor: HLC, config_epoch: int, issue_seq: int, signer: bytes, sig: bytes):
         self.floor = floor
         self.config_epoch = int(config_epoch)
+        self.issue_seq = int(issue_seq)
         self.signer = signer
         self.sig = sig
 
     def verify(self) -> bool:
         return crypto.SIGNER.verify(
-            self.signer, watermark_message(self.floor, self.config_epoch), self.sig
+            self.signer,
+            watermark_message(self.floor, self.config_epoch, self.issue_seq),
+            self.sig,
         )
 
     @staticmethod
-    def issue(node_sk: bytes, node_pub: bytes, floor: HLC, config_epoch: int) -> Watermark:
-        msg = watermark_message(floor, config_epoch)
-        return Watermark(floor, config_epoch, node_pub, crypto.SIGNER.sign(node_sk, msg))
+    def issue(
+        node_sk: bytes, node_pub: bytes, floor: HLC, config_epoch: int, issue_seq: int
+    ) -> Watermark:
+        msg = watermark_message(floor, config_epoch, issue_seq)
+        return Watermark(floor, config_epoch, issue_seq, node_pub, crypto.SIGNER.sign(node_sk, msg))
 
 
 # --------------------------------------------------------------------------- #

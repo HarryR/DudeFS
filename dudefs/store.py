@@ -54,15 +54,16 @@ def _decode_pairs(raw: bytes) -> dict[bytes, tuple[int, bytes]]:
 
 def _wm_fields(wm: A.Watermark) -> list:
     """Pack a Watermark for the evidence blob (it has no wire codec of its own)."""
-    return [wm.floor.wall_ms, wm.floor.counter, wm.config_epoch, wm.signer, wm.sig]
+    return [wm.floor.wall_ms, wm.floor.counter, wm.config_epoch, wm.issue_seq, wm.signer, wm.sig]
 
 
 def _wm_from(p) -> A.Watermark:
     return A.Watermark(
         HLC(codec.as_int(p[0]), codec.as_int(p[1])),
         codec.as_int(p[2]),
-        codec.as_bytes(p[3]),
+        codec.as_int(p[3]),
         codec.as_bytes(p[4]),
+        codec.as_bytes(p[5]),
     )
 
 
@@ -85,7 +86,8 @@ class EvidenceKind(StrEnum):
 
     FORK = "fork"  # two signed ops at one (author, seq)
     DOUBLE_VOTE = "double_vote"  # one signer's two receipts for one slot at one ballot
-    FLOOR_PERJURY = "floor_perjury"  # a watermark + the signer's receipt beneath its floor
+    FLOOR_PERJURY = "floor_perjury"  # a watermark + a LATER receipt beneath its floor
+    SEQ_REUSE = "seq_reuse"  # two receipts at one signer/issue_seq (issuance-chain fork)
     LOST_COMMIT = "lost_commit"  # a QC below a recovery fence, absent from its manifest
 
 
@@ -160,10 +162,17 @@ class DoubleVoteEvidence:
 
 
 class FloorPerjuryEvidence:
-    """A signer's watermark attesting finality floor F, plus its own receipt for an
-    op with `hlc < F` — receipting beneath a floor it swore was final (a B3
-    violation). Self-verifying; the op envelope rides along for its hlc (the receipt
-    omits it), and both the watermark and receipt carry the signer's signature."""
+    """A signer's watermark attesting floor F at issuance-chain position `s`, plus
+    its own receipt at position `s' > s` for an op with `hlc < F` — receipting
+    beneath a floor it swore was final, AFTER swearing it (a B3 violation).
+
+    The ORDERING is the whole proof (finding-17): the naive pair (any WM above any
+    below-floor receipt) convicts honest nodes, because receipting X while the floor
+    is low and letting the floor rise later is legal. Only `rcpt.issue_seq >
+    wm.issue_seq` — issued AFTER the attestation — is the crime, and an honest node
+    structurally cannot produce it (after attesting F the past gate refuses below-F
+    acceptances, and re-issues preserve their original lower seq). Self-verifying;
+    the op envelope rides along for its hlc (the receipt omits it)."""
 
     __slots__ = ("signer", "wm", "rcpt", "op_raw")
 
@@ -182,8 +191,33 @@ class FloorPerjuryEvidence:
             self.wm.signer == self.rcpt.signer == self.signer
             and self.rcpt.op_hash == op.op_hash
             and op.hlc < self.wm.floor  # the receipted op is beneath the sworn floor
+            and self.rcpt.issue_seq > self.wm.issue_seq  # ...and issued AFTER swearing it
             and self.wm.verify()
             and self.rcpt.verify()
+        )
+
+
+class SeqReuseEvidence:
+    """One signer's two DIFFERENT receipts at a single issuance-chain position
+    (`issue_seq`) — the issuance-chain analog of a FORK (finding-17). The monotone
+    counter must never be reused; two distinct ops sharing a `(signer, issue_seq)`
+    is a signed contradiction (a legitimate cross-epoch re-issue keeps the same op,
+    so it is NOT reuse). Self-verifying."""
+
+    __slots__ = ("signer", "issue_seq", "rcpt_a", "rcpt_b")
+
+    def __init__(self, signer: bytes, issue_seq: int, rcpt_a: Receipt, rcpt_b: Receipt):
+        self.signer = signer
+        self.issue_seq = int(issue_seq)
+        self.rcpt_a, self.rcpt_b = rcpt_a, rcpt_b
+
+    def verify(self) -> bool:
+        return (
+            self.rcpt_a.signer == self.rcpt_b.signer == self.signer
+            and self.rcpt_a.issue_seq == self.rcpt_b.issue_seq == self.issue_seq
+            and self.rcpt_a.op_hash != self.rcpt_b.op_hash  # distinct ops at one seq
+            and self.rcpt_a.verify()
+            and self.rcpt_b.verify()
         )
 
 
@@ -218,10 +252,10 @@ CREATE TABLE IF NOT EXISTS ops (
     raw BLOB NOT NULL);
 CREATE INDEX IF NOT EXISTS ops_author_seq ON ops(author, seq);
 CREATE TABLE IF NOT EXISTS receipts (
-    op_hash BLOB, epoch INTEGER, ballot BLOB, signer BLOB, sig BLOB,
+    op_hash BLOB, epoch INTEGER, ballot BLOB, signer BLOB, sig BLOB, issue_seq INTEGER,
     PRIMARY KEY (op_hash, epoch, ballot, signer));
 CREATE TABLE IF NOT EXISTS qcs (
-    op_hash BLOB, epoch INTEGER, ballot BLOB, bitmap BLOB, sigs BLOB,
+    op_hash BLOB, epoch INTEGER, ballot BLOB, bitmap BLOB, sigs BLOB, issue_seqs BLOB,
     PRIMARY KEY (op_hash, epoch, ballot));
 CREATE TABLE IF NOT EXISTS slot_state (
     tag BLOB PRIMARY KEY, promised BLOB NOT NULL,
@@ -370,38 +404,85 @@ class ChainStore:
     # ---- receipts & QCs --------------------------------------------------- #
     def put_receipt(self, r: Receipt) -> None:
         self.db.execute(
-            "INSERT OR IGNORE INTO receipts VALUES (?,?,?,?,?)",
-            (r.op_hash, r.config_epoch, codec.encode(r.ballot.encode()), r.signer, r.sig),
+            "INSERT OR IGNORE INTO receipts VALUES (?,?,?,?,?,?)",
+            (
+                r.op_hash,
+                r.config_epoch,
+                codec.encode(r.ballot.encode()),
+                r.signer,
+                r.sig,
+                r.issue_seq,
+            ),
         )
         self.db.commit()
 
+    def _row_to_receipt(self, oh, ep, ballot, signer, sig, seq) -> Receipt:
+        return A.Receipt(oh, ep, Ballot.decode(codec.decode(ballot)), int(seq), signer, sig)
+
     def receipts_for(self, op_hash: bytes) -> list[Receipt]:
-        out: list[Receipt] = []
-        for oh, ep, ballot, signer, sig in self.db.execute(
-            "SELECT * FROM receipts WHERE op_hash=?", (op_hash,)
-        ):
-            out.append(A.Receipt(oh, ep, Ballot.decode(codec.decode(ballot)), signer, sig))
-        return out
+        return [
+            self._row_to_receipt(*row)
+            for row in self.db.execute("SELECT * FROM receipts WHERE op_hash=?", (op_hash,))
+        ]
 
     def all_receipts(self) -> list[Receipt]:
         """Every receipt held, for gossip coverage/diff (M4)."""
-        return [
-            A.Receipt(oh, ep, Ballot.decode(codec.decode(ballot)), signer, sig)
-            for oh, ep, ballot, signer, sig in self.db.execute("SELECT * FROM receipts")
-        ]
+        return [self._row_to_receipt(*row) for row in self.db.execute("SELECT * FROM receipts")]
+
+    def get_receipt(
+        self, op_hash: bytes, epoch: int, ballot: Ballot, signer: bytes
+    ) -> Receipt | None:
+        """The exact stored receipt for one (op, epoch, ballot, signer), or None —
+        the serve-from-store lookup (finding-17): an idempotent re-issue returns THIS
+        instead of re-signing with a fresh issue_seq."""
+        row = self.db.execute(
+            "SELECT * FROM receipts WHERE op_hash=? AND epoch=? AND ballot=? AND signer=?",
+            (op_hash, epoch, codec.encode(ballot.encode()), signer),
+        ).fetchone()
+        return self._row_to_receipt(*row) if row else None
+
+    def acceptance_issue_seq(self, op_hash: bytes, ballot: Ballot, signer: bytes) -> int | None:
+        """The ORIGINAL issue_seq this signer bound to accepting (op_hash, ballot),
+        across ANY epoch — so a cross-epoch re-issue (RERECEIPT) reuses it rather
+        than minting a fresh, higher seq that would frame the node (finding-17)."""
+        row = self.db.execute(
+            "SELECT MIN(issue_seq) FROM receipts WHERE op_hash=? AND ballot=? AND signer=?",
+            (op_hash, codec.encode(ballot.encode()), signer),
+        ).fetchone()
+        return int(row[0]) if row and row[0] is not None else None
+
+    def next_issue_seq(self) -> int:
+        """The signer's next monotone issuance-chain position — durable, never
+        reused (finding-17). Shared by receipts AND watermarks so their relative
+        order is cryptographically carried."""
+        raw = self.get_meta("issue_seq")
+        nxt = (codec.as_int(codec.decode(raw)) if raw else 0) + 1
+        self.set_meta("issue_seq", codec.encode(nxt))
+        return nxt
 
     def put_qc(self, qc: QC) -> None:
         self.db.execute(
-            "INSERT OR REPLACE INTO qcs VALUES (?,?,?,?,?)",
+            "INSERT OR REPLACE INTO qcs VALUES (?,?,?,?,?,?)",
             (
                 qc.op_hash,
                 qc.config_epoch,
                 codec.encode(qc.ballot.encode()),
                 qc.signer_bitmap,
                 codec.encode(qc.sigs),
+                codec.encode(list(qc.issue_seqs)),
             ),
         )
         self.db.commit()
+
+    def _row_to_qc(self, oh, ep, ballot, bitmap, sigs, seqs) -> QC:
+        return A.QC(
+            oh,
+            ep,
+            Ballot.decode(codec.decode(ballot)),
+            bitmap,
+            [codec.as_bytes(x) for x in codec.as_seq(codec.decode(sigs))],
+            [codec.as_int(x) for x in codec.as_seq(codec.decode(seqs))],
+        )
 
     def get_qc(self, op_hash: bytes) -> QC | None:
         # deterministic pick when one op holds QCs under several epochs/ballots
@@ -409,19 +490,11 @@ class ChainStore:
             "SELECT * FROM qcs WHERE op_hash=? ORDER BY epoch DESC, ballot DESC LIMIT 1",
             (op_hash,),
         ).fetchone()
-        if not row:
-            return None
-        oh, ep, ballot, bitmap, sigs = row
-        sig_list = [codec.as_bytes(x) for x in codec.as_seq(codec.decode(sigs))]
-        return A.QC(oh, ep, Ballot.decode(codec.decode(ballot)), bitmap, sig_list)
+        return self._row_to_qc(*row) if row else None
 
     def all_qcs(self) -> list[QC]:
         """Every QC held, for gossip coverage/diff (M4)."""
-        out: list[QC] = []
-        for oh, ep, ballot, bitmap, sigs in self.db.execute("SELECT * FROM qcs"):
-            sig_list = [codec.as_bytes(x) for x in codec.as_seq(codec.decode(sigs))]
-            out.append(A.QC(oh, ep, Ballot.decode(codec.decode(ballot)), bitmap, sig_list))
-        return out
+        return [self._row_to_qc(*row) for row in self.db.execute("SELECT * FROM qcs")]
 
     # ---- checkpoint cut (the log-compaction boundary; DESIGN §12) ---------- #
     def adopt_checkpoint(
@@ -542,13 +615,21 @@ class ChainStore:
     ) -> list[
         tuple[
             EvidenceKind,
-            ForkEvidence | DoubleVoteEvidence | FloorPerjuryEvidence | LostCommitEvidence,
+            ForkEvidence
+            | DoubleVoteEvidence
+            | FloorPerjuryEvidence
+            | SeqReuseEvidence
+            | LostCommitEvidence,
         ]
     ]:
         out: list[
             tuple[
                 EvidenceKind,
-                ForkEvidence | DoubleVoteEvidence | FloorPerjuryEvidence | LostCommitEvidence,
+                ForkEvidence
+                | DoubleVoteEvidence
+                | FloorPerjuryEvidence
+                | SeqReuseEvidence
+                | LostCommitEvidence,
             ]
         ] = []
         for kind, data in self.db.execute("SELECT kind, data FROM evidence"):
@@ -593,6 +674,18 @@ class ChainStore:
                         ),
                     )
                 )
+            elif k == EvidenceKind.SEQ_REUSE:
+                out.append(
+                    (
+                        k,
+                        SeqReuseEvidence(
+                            codec.as_bytes(p[0]),
+                            codec.as_int(p[1]),
+                            A.Receipt.decode(codec.as_bytes(p[2])),
+                            A.Receipt.decode(codec.as_bytes(p[3])),
+                        ),
+                    )
+                )
             elif k == EvidenceKind.LOST_COMMIT:
                 out.append(
                     (
@@ -605,6 +698,41 @@ class ChainStore:
                     )
                 )
         return out
+
+    def detect_seq_reuse(self) -> list[SeqReuseEvidence]:
+        """Scan held receipts for a signer that bound TWO different ops to one
+        issuance-chain position `(signer, issue_seq)` — the FORK-analog of the
+        issuance chain (finding-17). A legitimate cross-epoch re-issue keeps the same
+        op_hash, so it is not flagged. Mints + persists; idempotent."""
+        seen = {
+            (ev.signer, ev.issue_seq, ev.rcpt_a.op_hash, ev.rcpt_b.op_hash)
+            for k, ev in self.evidence()
+            if k == EvidenceKind.SEQ_REUSE and isinstance(ev, SeqReuseEvidence)
+        }
+        by_key: dict[tuple[bytes, int], list[Receipt]] = {}
+        for r in self.all_receipts():
+            by_key.setdefault((r.signer, r.issue_seq), []).append(r)
+        found: list[SeqReuseEvidence] = []
+        for (signer, seq), rcpts in by_key.items():
+            for i in range(len(rcpts)):
+                for j in range(i + 1, len(rcpts)):
+                    a, b = rcpts[i], rcpts[j]
+                    if a.op_hash == b.op_hash:
+                        continue  # same op across epochs — a legitimate re-issue
+                    if (signer, seq, a.op_hash, b.op_hash) in seen or (
+                        signer,
+                        seq,
+                        b.op_hash,
+                        a.op_hash,
+                    ) in seen:
+                        continue
+                    found.append(SeqReuseEvidence(signer, seq, a, b))
+        for ev in found:
+            self._store_evidence(
+                EvidenceKind.SEQ_REUSE,
+                [ev.signer, ev.issue_seq, ev.rcpt_a.encode(), ev.rcpt_b.encode()],
+            )
+        return found
 
     def detect_lost_commits(
         self, recovery_epoch: int, recovery_ckpt_hash: bytes, retained_hashes: frozenset[bytes]
@@ -655,6 +783,8 @@ class ChainStore:
                 op = ops.get(r.op_hash)
                 if op is None or not (op.hlc < wm.floor):
                     continue
+                if r.issue_seq <= wm.issue_seq:
+                    continue  # NOT issued after the attestation -> honest, not perjury
                 if (wm.signer, r.op_hash, wm.floor.as_tuple()) in seen:
                     continue
                 found.append(FloorPerjuryEvidence(wm.signer, wm, r, op.raw))

@@ -117,8 +117,9 @@ class Acceptor:
         att = self.store.get_attested()
         new_att = fl if att <= fl else att
         self.store._write_attested(new_att)
-        self.store.commit()  # fsync before signing
-        return A.Watermark.issue(self.sk, self.pub, new_att, self.epoch)
+        seq = self.store.next_issue_seq()  # this attestation's issuance-chain position
+        self.store.commit()  # fsync before signing (incl. the consumed issue_seq)
+        return A.Watermark.issue(self.sk, self.pub, new_att, self.epoch, seq)
 
     def issue_frontier(self, now_ms: int) -> FrontierBundle:
         """The signed read primitive (PROTOCOL §1): per-author heads + floor +
@@ -241,9 +242,22 @@ class Acceptor:
         (PROTOCOL §2.2, §1.4). Storage is derived from the already-fsynced slot
         state, so it never outlives its justification (RESILIENCE §0). `epoch`
         overrides the node's current epoch — a new-roster node receipts a roster
-        op under e+1 before activating (DESIGN §13)."""
+        op under e+1 before activating (DESIGN §13).
+
+        Serve-from-store (finding-17): a receipt already stored for exactly this
+        (op, epoch, ballot) is returned UNCHANGED — re-issuing is idempotent and
+        must preserve the original `issue_seq`; re-signing with a fresh seq is the
+        crime the perjury proof relies on. A cross-epoch re-issue (RERECEIPT) reuses
+        the ACCEPTANCE seq (bound when the op was first accepted, any epoch); only a
+        genuinely new acceptance consumes the next monotone issue_seq."""
         ep = self.epoch if epoch is None else epoch
-        r = A.Receipt.issue(self.sk, self.pub, op_hash, ep, ballot)
+        existing = self.store.get_receipt(op_hash, ep, ballot, self.pub)
+        if existing is not None:
+            return existing
+        seq = self.store.acceptance_issue_seq(op_hash, ballot, self.pub)
+        if seq is None:
+            seq = self.store.next_issue_seq()
+        r = A.Receipt.issue(self.sk, self.pub, op_hash, ep, ballot, seq)
         self.store.put_receipt(r)
         return r
 

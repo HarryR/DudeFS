@@ -213,6 +213,88 @@ class TestFloorPerjurer(unittest.TestCase):
         self.assertTrue(any(k == EvidenceKind.FLOOR_PERJURY for k, _ in store.evidence()))
         self.assertEqual(store.detect_floor_perjury([wm]), [])  # idempotent
 
+    def test_honest_below_floor_receipt_is_not_perjury(self):
+        # THE finding-17 regression: an honest node legally receipts op X while its
+        # floor is low (issue_seq s1), the floor later rises, and it attests F >
+        # X.hlc (issue_seq s2 > s1). The naive pair "proves" perjury; the ORDERED
+        # pair does not — the receipt was issued BEFORE the attestation. FAILS
+        # against the pre-fix detector (which had no seq check).
+        sim = Sim(seed=2, n=3, delta=10_000)  # all honest
+        w = World(seed=2, n_clients=1)
+        op = creation_op(w, 0, b"v")
+        assert op.slot_tag is not None
+        honest = sim._raw[0].acc
+        rc = honest.on_accept(op.slot_tag, A.Ballot(1, b"x"), op, 100)  # floor(100) < 0 -> legal
+        assert isinstance(rc, A.Receipt)
+        wm = honest.issue_watermark(1_000_000)  # floor rises far above op.hlc; a LATER seq
+        self.assertGreater(wm.floor.wall_ms, op.hlc.wall_ms)  # op below the (later) floor
+        self.assertLess(rc.issue_seq, wm.issue_seq)  # ...but receipted BEFORE attesting
+
+        store = sim._raw[1].acc.store
+        store.put_op_raw(op)
+        store.put_receipt(rc)
+        self.assertEqual(store.detect_floor_perjury([wm]), [])  # NOT convicted
+        self.assertEqual(store.evidence(), [])
+
+    def test_reissue_preserves_issue_seq(self):
+        # serve-from-store: a resubmitted ACCEPT returns the identical receipt, and a
+        # RERECEIPT under e+1 reuses the ACCEPTANCE seq — re-signing fresh would frame
+        # the node, so seq stability is load-bearing (not just idempotent bytes).
+        sim = Sim(seed=3, n=3, delta=10_000)
+        w = World(seed=3, n_clients=1)
+        op = creation_op(w, 0, b"v")
+        assert op.slot_tag is not None
+        acc = sim._raw[0].acc
+        r1 = acc.on_accept(op.slot_tag, A.Ballot(1, b"x"), op, 100)
+        r2 = acc.on_accept(op.slot_tag, A.Ballot(1, b"x"), op, 100)  # resubmission
+        assert isinstance(r1, A.Receipt) and isinstance(r2, A.Receipt)
+        self.assertEqual(
+            (r1.issue_seq, r1.config_epoch, r1.sig), (r2.issue_seq, r2.config_epoch, r2.sig)
+        )
+
+        acc.activate_epoch(1)
+        rr = acc.on_rereceipt(op.slot_tag)  # RERECEIPT under e+1
+        assert isinstance(rr, A.Receipt)
+        self.assertEqual(rr.config_epoch, 1)  # a new epoch...
+        self.assertEqual(rr.issue_seq, r1.issue_seq)  # ...but the ORIGINAL acceptance seq
+
+
+class TestSeqReuse(unittest.TestCase):
+    """WP finding-17: reusing one issuance-chain position for two different ops is
+    the FORK-analog of the issuance chain — it mints SEQ_REUSE."""
+
+    def test_seq_reuse_mints_evidence(self):
+        w = World(seed=4, n_clients=2)
+        a, b = creation_op(w, 0, b"A"), creation_op(w, 1, b"B")
+        nsk = bytes([250] * 32)
+        npub = C.SIGNER.public(nsk)
+        ballot = A.Ballot(1, b"x")
+        ra = A.Receipt.issue(nsk, npub, a.op_hash, 0, ballot, 5)  # issue_seq 5
+        rb = A.Receipt.issue(nsk, npub, b.op_hash, 0, ballot, 5)  # 5 REUSED, different op
+        store = ChainStore()
+        store.put_receipt(ra)
+        store.put_receipt(rb)
+        proofs = store.detect_seq_reuse()
+        self.assertEqual(len(proofs), 1)
+        self.assertTrue(proofs[0].verify())
+        self.assertEqual(proofs[0].signer, npub)
+        self.assertTrue(any(k == EvidenceKind.SEQ_REUSE for k, _ in store.evidence()))
+        self.assertEqual(store.detect_seq_reuse(), [])  # idempotent
+
+    def test_legitimate_cross_epoch_reissue_is_not_reuse(self):
+        # the same op at one issue_seq across two epochs (a RERECEIPT) is NOT reuse.
+        w = World(seed=5, n_clients=1)
+        a = creation_op(w, 0, b"A")
+        nsk = bytes([251] * 32)
+        npub = C.SIGNER.public(nsk)
+        ballot = A.Ballot(1, b"x")
+        r_e0 = A.Receipt.issue(nsk, npub, a.op_hash, 0, ballot, 7)
+        r_e1 = A.Receipt.issue(nsk, npub, a.op_hash, 1, ballot, 7)  # same op, e+1, same seq
+        store = ChainStore()
+        store.put_receipt(r_e0)
+        store.put_receipt(r_e1)
+        self.assertEqual(store.detect_seq_reuse(), [])  # same op -> legitimate
+
 
 if __name__ == "__main__":
     unittest.main()

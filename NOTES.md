@@ -1169,6 +1169,100 @@ and A4 as formally stated. Resolutions decided with the design owner; DESIGN
       kept second on Go-parity and the hand-rolled wrap it would need) —
       flippable cheaply before launch only.
 
+43. **WP3/4 FINAL REVIEW (2026-07-21, `0ca9e29..1586b8c`) — track cleared
+    EXCEPT finding 17 (HIGH): FLOOR_PERJURY as built convicts honest
+    nodes. One fix wave closes HANDOFF-R3.**
+    Cleared: ruling 41(a) implemented exactly (strict B1 for all-honest;
+    duplicate QCs must trace to a persona in the quorum intersection;
+    revert-checked against the genuine two-QC race); ruling 41(b)
+    LOST_COMMIT is sound (disclosure with external-context verify —
+    correctly NOT signer-misbehavior; flagging orphaned below-fence
+    control-op QCs too is accepted behavior); personas 3.3–3.6, fumbling
+    4.1–4.6, the NOTES-40 infra, and the button-masher all read clean.
+    163 green.
+    - **(17, HIGH — `FloorPerjuryEvidence` is a false-accusation
+      machine.)** Its `verify()` = same signer + `op.hlc < wm.floor` +
+      two valid signatures. An HONEST node satisfies that with purely
+      legitimate artifacts: receipt op X at `hlc=100` while floor=50
+      (legal); floor later rises; issue WM@990 (legal, mandatory). The
+      pair now "proves" perjury. Aggravated by PROTOCOL §1.1: honest
+      nodes MUST re-yield identical old receipts on resubmission (and
+      `RERECEIPT` re-issues across bridges), so below-current-floor
+      receipts are ordinary honest output forever. The suite is green
+      only because the masher never calls `detect_floor_perjury` and the
+      dedicated test builds only the true positive. **Root cause is the
+      DESIGN, not the code**: RESILIENCE §3.1's "the WM + the receipt
+      are self-contradicting signatures = proof" presumes an ORDERING
+      ("receipted beneath it *later*") that the two artifacts do not
+      cryptographically carry. The reviewers (me included) let that
+      overclaim stand in R1; the persona wave faithfully reified it.
+    - **RULING — artifact issuance chains (the node-side mirror of the
+      author chain).** Receipts and watermarks gain a per-signer
+      monotone `issue_seq`, persisted in the signer's durability domain
+      and never reused; **idempotent re-issue returns the STORED
+      original artifact** (resubmission and RERECEIPT alike — re-signing
+      with a fresh seq becomes the crime, so serve-from-store turns
+      load-bearing). Perjury proof = one signer's WM at `issue_seq = s`
+      attesting floor F **plus** its receipt at `issue_seq > s` for an
+      op with `hlc < F`. Sound: an honest node cannot produce the
+      ordered pair (after attesting F the past gate refuses below-F
+      acceptances, and re-issues carry their original seqs). Complete:
+      a perjurer either stops attesting (exits the finality game) or
+      yields the pair; counter-reuse (two artifacts at one
+      `(signer, issue_seq)`) is its own FORK-analog proof. Framing
+      impossible. Wire change (receipt + WM grow ~8 B; golden-vector
+      bump) — Harry may veto for the recorded fallback: downgrade
+      FLOOR_PERJURY to witness-grade policy evidence (RESILIENCE §1's
+      no-proof-no-punishment regime), at the cost of weakening the §3.7
+      "finality: violable · with proof" cell to "violable · detected".
+      **Quarantine meanwhile:** `detect_floor_perjury` and the pair
+      `verify()` are UNSOUND as accusation — gate or remove before
+      anything consumes evidence for ejection; the found-and-fixed rule
+      applies (the honest-node false-positive vector above becomes the
+      regression test — it FAILS against current code).
+    - **Scope rulings:** (i) the masher driving manager verbs
+      (roster/checkpoint/recovery + inline LOST_COMMIT assertion) is
+      accepted as a follow-up, backlog not gate — the dedicated WP4
+      tests cover those paths; (ii) the masher-surfaced M4 property —
+      a same-author non-contiguous op (e.g. a second create after a
+      lost slot leaves an orphan-island accept) cannot be healed by the
+      seq-based gossip delta — is RECORDED as a known, accepted M4
+      property: orphan islands are by-design excluded from heads
+      (NOTES 16), and the healing paths are dep-PULL, re-proposal, and
+      the M7 daemon's retransmit; not a defect.
+    - **Track status: HANDOFF-R3 is complete modulo the finding-17 fix
+      wave** (quarantine + issuance chains or the fallback, Harry's
+      call; plus its regression vectors per IMPLEMENTATION §6.7).
+    - **BLESSED 2026-07-21: Harry accepts the wire change; the
+      witness-grade fallback is DECLINED** (explained and recorded: it
+      would move floor perjury into RESILIENCE §1's no-proof-no-punish
+      regime — zero wire cost, but no automatic ejection ever, framing
+      prevented socially not cryptographically, an adjudication burden
+      and accusation-spam surface, and the §3.7 finality cell demoted;
+      not worth saving ~8 bytes). Normative edits landed: RESILIENCE
+      §3.1 (proof rides the issuance chain; the naive pair is explicitly
+      called out as non-proof), IMPLEMENTATION §2 (receipt signs
+      `op_hash ‖ epoch ‖ ballot ‖ issue_seq`; **QC carries the
+      per-signer `issue_seqs` list parallel to `sigs`** — each receipt's
+      signature covers its seq, so QC verification must reconstruct
+      per-signer messages; watermarks sign `floor ‖ epoch ‖ issue_seq`).
+      **Fix-wave work order (Opus):** (1) `issue_seq` persisted in the
+      signer's durability domain, monotone, never reused; stamped into
+      receipts + watermarks; (2) serve-from-store re-issue everywhere
+      (resubmission, RERECEIPT — re-signing fresh is the crime; the
+      idempotent-identical-receipt tests extend to assert seq
+      stability); (3) QC schema + assemble/verify carry `issue_seqs`;
+      golden-vector bump, one commit; (4) `FloorPerjuryEvidence` becomes
+      the ordered pair (WM@s attesting F + receipt@s'>s for op.hlc < F);
+      `detect_floor_perjury` reworked accordingly; (5) seq-reuse
+      evidence kind (`SEQ_REUSE` or fold into FLOOR_PERJURY's family —
+      implementer's naming call, ruling: it must be minted); (6)
+      regression vectors: the honest-node false-positive (old receipt +
+      newer WM must NOT convict — fails against current code), the true
+      perjurer (caught via ordered pair), the re-issue-preserves-seq
+      pair, and a masher arm that calls `detect_floor_perjury` under
+      honest chaos and asserts zero proofs.
+
 # Not yet built (by design, M2+)
 
 QCs are *constructed and verified* (M0) but no acceptor, quorum client, floor,

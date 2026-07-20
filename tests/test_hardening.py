@@ -27,24 +27,31 @@ class TestQCBitmapStrictness(unittest.TestCase):
         self.index = {p: i for i, p in enumerate(self.pubs)}
 
     def test_short_bitmap_is_false_not_crash(self):
-        qc = A.QC(bytes(32), 0, A.BLIND, b"", [])
+        qc = A.QC(bytes(32), 0, A.BLIND, b"", [], [])
         self.assertFalse(A.QC.decode(qc.encode()).verify(self.pubs))
 
     def test_overlong_bitmap_is_false(self):
         oph = bytes([7] * 32)
-        rs = [A.Receipt.issue(self.sks[i], self.pubs[i], oph, 0, A.BLIND) for i in (0, 1, 2)]
+        rs = [A.Receipt.issue(self.sks[i], self.pubs[i], oph, 0, A.BLIND, 1) for i in (0, 1, 2)]
         qc = A.QC.assemble(rs, self.n, self.index)
         self.assertTrue(qc.verify(self.pubs))
-        padded = A.QC(qc.op_hash, qc.config_epoch, qc.ballot, qc.signer_bitmap + b"\x00", qc.sigs)
+        padded = A.QC(
+            qc.op_hash,
+            qc.config_epoch,
+            qc.ballot,
+            qc.signer_bitmap + b"\x00",
+            qc.sigs,
+            qc.issue_seqs,
+        )
         self.assertFalse(padded.verify(self.pubs))
 
     def test_stray_bits_beyond_n_are_false(self):
         oph = bytes([7] * 32)
-        rs = [A.Receipt.issue(self.sks[i], self.pubs[i], oph, 0, A.BLIND) for i in (0, 1, 2)]
+        rs = [A.Receipt.issue(self.sks[i], self.pubs[i], oph, 0, A.BLIND, 1) for i in (0, 1, 2)]
         qc = A.QC.assemble(rs, self.n, self.index)
         bm = bytearray(qc.signer_bitmap)
         bm[-1] |= 0x01  # a bit above roster index n-1; same signer set, second encoding
-        tampered = A.QC(qc.op_hash, qc.config_epoch, qc.ballot, bytes(bm), qc.sigs)
+        tampered = A.QC(qc.op_hash, qc.config_epoch, qc.ballot, bytes(bm), qc.sigs, qc.issue_seqs)
         self.assertFalse(tampered.verify(self.pubs))
 
 
