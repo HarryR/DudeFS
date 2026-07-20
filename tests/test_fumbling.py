@@ -5,6 +5,7 @@
 # WP2.2's partitions) — nothing new is implemented here.
 
 import os
+import random
 import tempfile
 import unittest
 
@@ -14,9 +15,11 @@ from dudefs import quorum as Q
 from dudefs.acceptor import Acceptor, Rejected
 from dudefs.handlers import control as ctl
 from dudefs.sim.harness import Sim
-from dudefs.store import ChainStore, EvidenceKind
+from dudefs.sim.personas import EquivocatingAcceptor
+from dudefs.store import AppendStatus, ChainStore, EvidenceKind
 from dudefs.transports.memory import Link, NetworkLinks
 from tests._builders import World
+from tests._cluster import creation_op
 
 NOW = 100
 NSK = bytes([220] * 32)
@@ -223,6 +226,68 @@ class TestFumblingManager(unittest.TestCase):
         self.assertIsInstance(r, A.Receipt)  # a possession receipt under e+1...
         # ...but NO node advanced its epoch — the abandoned flow half-activated nothing
         self.assertEqual([sim._raw[i].acc.epoch for i in range(3)], [0, 0, 0])
+
+
+class TestAmnesiacManager(unittest.TestCase):
+    """WP4.6: a manager that re-authors its own seq WITHOUT the DESIGN §4 amnesia
+    procedure forks; a fresh-seq continuation (the procedure) does not."""
+
+    def test_reused_seq_forks_fresh_seq_does_not(self):
+        w = World(seed=41, n_clients=0)
+        px, py, pz = (C.SIGNER.public(bytes([k] * 32)) for k in (1, 2, 3))
+        o0 = w._mgr_op(ctl.roster_body(0, [px], {}))  # seq 0
+        o1 = w._mgr_op(ctl.roster_body(1, [py], {}))  # seq 1 — the amnesia PROCEDURE
+        store = ChainStore()
+        self.assertTrue(store.append(o0))
+        self.assertTrue(store.append(o1))
+        self.assertEqual(store.evidence(), [])  # fresh-seq continuation: no fork
+
+        w._mseq, w._mprev = 0, A.GENESIS_PREV  # WITHOUT the procedure: forget + rewind
+        o0b = w._mgr_op(ctl.roster_body(0, [pz], {}))  # seq 0 again, different -> FORK
+        res = store.append(o0b)
+        self.assertEqual(res.status, AppendStatus.FORK)
+        assert res.evidence is not None
+        self.assertEqual(res.evidence.seq, 0)
+        self.assertTrue(res.evidence.verify())
+
+
+class TestButtonMasher(unittest.TestCase):
+    """WP4.8: 'I hit all the buttons without keeping track.' Seeded random chaos —
+    partitions × contended commits × an occasional equivocator — with the sim's
+    CONTINUOUS invariants (relaxed B1, B3) plus B2 at run-end doing the asserting;
+    finishing without a raise IS the proof. Per run: heal converges, and any
+    assembled proof is correctly attributed (a double vote to the persona; an
+    all-honest run mints nothing)."""
+
+    def test_invariants_hold_under_random_chaos(self):
+        for seed in range(15):
+            rng = random.Random(seed)
+            net = NetworkLinks(default=Link(base_ms=2, jitter_ms=1))
+            has_persona = rng.random() < 0.4
+            personas: dict[int, type[Acceptor]] = {0: EquivocatingAcceptor} if has_persona else {}
+            sim = Sim(seed=seed, n=3, net=net, personas=personas)
+            w = World(seed=seed, n_clients=5)
+            if rng.random() < 0.4:  # a random partition
+                g = [rng.randrange(3)]
+                sim.partition(g, [x for x in range(3) if x not in g])
+            # contended commits on ONE slot by DISTINCT clients (each a seq-0
+            # create — same-client second creates would gap the chain, which the
+            # seq-based gossip delta can't heal, an inherent M4 limitation).
+            for i in range(rng.randint(1, 4)):
+                sim.commit(creation_op(w, i, bytes([i + 1])), round_timeout_ms=50, max_rounds=6)
+            sim.run()  # relaxed B1 + B3 continuous, B2 at end: not raising is the proof
+
+            net.down.clear()
+            for _ in range(6):
+                sim.gossip_round()
+            self.assertTrue(sim.converged(), f"seed {seed}: heal did not converge")
+            # every assembled double vote is a TRUE accusation against the persona;
+            # an all-honest run mints nothing.
+            for pf in sim._raw[1].acc.store.detect_double_votes():
+                self.assertTrue(pf.verify())
+                self.assertEqual(pf.signer, sim.roster[0])
+            if not has_persona:
+                self.assertEqual(sim.evidence(), [], f"seed {seed}: honest run minted evidence")
 
 
 if __name__ == "__main__":

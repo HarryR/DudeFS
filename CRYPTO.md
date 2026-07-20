@@ -1,27 +1,49 @@
 # DudeFS crypto transition spec (POC → production suites)
 
-> **Status:** design ruling (NOTES 42), 2026-07-21. Companion to
-> [IMPLEMENTATION.md](IMPLEMENTATION.md) §1 (the POC choices this supersedes for
-> production) and [DESIGN.md](DESIGN.md) §3/§16. Migration mechanics are already
-> designed: **suites are per-`keyepoch`, so every transition here is a key
-> rotation** (DESIGN §16) — nothing below needs new protocol machinery. Old-suite
-> history stays decodable forever (retained winners never re-encrypt — DESIGN §12
-> declared cost (a)).
+> **Status:** design ruling (NOTES 42, as amended), 2026-07-21. Companion to
+> [IMPLEMENTATION.md](IMPLEMENTATION.md) §1 (the POC choices this supersedes)
+> and [DESIGN.md](DESIGN.md) §3/§16.
+>
+> **The one-scheme rule (Harry's ruling).** v1 ships with **exactly one**
+> payload encryption scheme — there is no suite menu, no per-op or
+> per-keyepoch scheme selector, and therefore no negotiation or downgrade
+> surface anywhere on the wire. `auth0` was development scaffolding only (the
+> system was never going to ship unencrypted); it is retired with the dev
+> deployments that used it — no `auth0` ciphertext ever exists in a shipped
+> log, and `b2s1`/`xcp1` are struck before ever existing. If the scheme ever
+> changes, that is a **protocol-version event**: a lane-2 `pver` fence at a
+> checkpoint barrier (fail-closed via `FoldHalted` — DESIGN §16 machinery,
+> already built and tested) plus a key rotation. The active `pver` *determines*
+> the scheme; nothing chooses at runtime. The old scheme survives only as
+> legacy-decode for pre-fence retained history (DESIGN §12 declared cost (a);
+> the re-anchor op is the recorded retirement path). `keyepoch` keeps meaning
+> exactly what it means today — *which key* — never *which scheme*.
 
 ## 0. The decisions, in one table
 
-| Axis | Ruling | Suite id |
-|---|---|---|
-| Author + receipt signatures | **Ed25519, permanently for v1** — BLS12-381 DECLINED (below) | `ed25519` (unchanged) |
-| Payload AEAD | **XChaCha20-Poly1305-IETF with SIV-style derived nonce** (misuse-resistant in practice; below) | `xcs1` |
-| Wrap-sets (key distribution) | **libsodium sealed box** (X25519-XSalsa20-Poly1305, anonymous), recipient key **derived from the member's Ed25519 identity** (`crypto_sign_ed25519_pk_to_curve25519`) — one identity keypair per member, nothing new to distribute or rotate separately | `sbx1` |
-| PRF / hashing / KDF | **keyed BLAKE2b** everywhere, domain-separated via `person` (`dude.tag`, `dude.nonce`, `dude.mac`, merkle domains) — unchanged from POC | — |
-| Backend | **PyNaCl (libsodium; PyCA-maintained)** for production; the **vendored pure-Python RFC 8032 / auth0 code is retained as the differential-test oracle** (CI keeps a no-native-deps lane; property tests cross-check backends byte-for-byte) | — |
+| Axis | Ruling (THE scheme — internal names, not wire selectors) |
+|---|---|
+| Author + receipt signatures | **Ed25519, permanently for v1** — BLS12-381 DECLINED (below) |
+| Payload AEAD (`xcs1`) | **XChaCha20-Poly1305-IETF with SIV-style derived nonce** (misuse-resistant in practice; below) |
+| Wrap-sets (`sbx1`) | **libsodium sealed box** (X25519-XSalsa20-Poly1305, anonymous), recipient key **derived from the member's Ed25519 identity** (`crypto_sign_ed25519_pk_to_curve25519`) — one identity keypair per member, nothing new to distribute or rotate separately |
+| PRF / hashing / KDF | **keyed BLAKE2b** everywhere, domain-separated via `person` (`dude.tag`, `dude.nonce`, merkle domains) — unchanged from POC |
+| Backend | **PyNaCl (libsodium; PyCA-maintained)** — the single `uv`-managed crypto dependency on top of stdlib; the **vendored pure-Python implementations are retained as the differential-test oracle only** (a no-native CI lane cross-checks byte-for-byte; never a runtime alternative) |
+
+The internal names (`xcs1`, `sbx1`) label the constructions in code and docs;
+they are **not** wire-visible selectors — the active `pver` implies them. The
+genesis "suite id" field collapses to a genesis-pinned constant asserting this
+scheme set (defensive versioning for TOFU bootstrap, not a menu).
 
 Premise correction that shaped this: PyNaCl ≥ 1.5 **does** ship a first-class
 AEAD with associated data — `nacl.secret.Aead` = XChaCha20-Poly1305-IETF — so
 nothing is homebrewed from `box`/`secretbox`. `secretbox` (no AD) is used for
 nothing; `box` appears only in its sealed form for wraps.
+
+**Runner-up, recorded:** PyCA `cryptography` + **AES-256-GCM-SIV** (RFC 8452)
+— a standards-stamped MRAE with zero AEAD composition of ours, at the cost of
+a hand-rolled (HPKE-shaped) wrap construction and materially weaker Go-side
+library support for GCM-SIV. Kept second for those two reasons; flipping is
+cheap **before launch only** (after launch it's a pver event like any other).
 
 ## 1. BLS12-381: declined for v1 (door held open)
 
@@ -106,20 +128,23 @@ keyepoch bump away, by construction.
 - **FROST (future threshold root):** Rust `frost-ed25519` (Zcash Foundation);
   Go implementations exist and mature. Not v1 code; recorded path only.
 
-## 4. Migration plan (all existing machinery)
+## 4. Migration plan (dev scaffolding out, one scheme in)
 
 1. Land the PyNaCl backend behind the existing L0 `Signer`/`AEAD` boundary;
    the vendored implementations become the differential oracle (a CI lane runs
    the suite on both; artifacts must be byte-identical).
-2. Introduce `xcs1` + `sbx1` as suite ids; **enabling them is a `keyepoch`
-   rotation** (rotate op + wrap-set, PROTOCOL §3.3) — the encryption-later
-   staging (`auth0` → real confidentiality) that IMPLEMENTATION §1 already
-   promises, now with a named production suite instead of `b2s1`.
-3. `auth0` (and any `b2s1` history, if ever minted) remains decodable forever;
-   the `dude status` zero-knowledge banner clears only when the active
-   keyepoch's suite is `xcs1`.
+2. **`xcs1`/`sbx1` become THE scheme at the code level** — the `aead_suite`
+   parameter threaded through `fold`/`compact` collapses to the
+   pver-determined constant (implementation cleanup for the implementer,
+   post-WP3/4; test hooks may keep an internal injection point, never a wire
+   one). `auth0` moves to the test tree as oracle scaffolding; no shipped
+   deployment ever mints it.
+3. Dev deployments that used `auth0` are torn down with their logs — there is
+   no auth0-legacy-decode obligation because no shipped log contains it. The
+   `dude status` zero-knowledge banner exists only in dev builds.
 4. Slot tags, state roots, op hashes: unchanged (keyed/plain BLAKE2b) — no
-   artifact format changes anywhere in this transition.
+   artifact format changes anywhere in this transition. A future scheme change
+   is a lane-2 `pver` fence + rotation, per the one-scheme rule above.
 
 ## 5. What this closes and what stays open
 

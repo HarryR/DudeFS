@@ -8,6 +8,7 @@ import unittest
 from dudefs import artifacts as A
 from dudefs import crypto as C
 from dudefs import fold, gossip
+from dudefs.acceptor import Acceptor
 from dudefs.handlers import control as ctl
 from dudefs.sim.harness import Sim
 from dudefs.sim.personas import EquivocatingAcceptor, FloorPerjurer
@@ -16,6 +17,7 @@ from tests._builders import World
 from tests._cluster import creation_op
 
 NOW = 100
+BIG = 1_000_000
 
 
 class TestEquivocator(unittest.TestCase):
@@ -90,6 +92,56 @@ class TestEquivocator(unittest.TestCase):
         sim.nodes[1].accept(a.slot_tag, ballot, a)
         sim.nodes[1].accept(a.slot_tag, ballot, b)  # would raise if B1 tripped
         self.assertEqual(sim.decided_ops(a.slot_tag), set())
+
+
+class TestAmnesiacNode(unittest.TestCase):
+    """WP3.4: a node that lost its durable store but resumes under its OLD key
+    (DESIGN §13 forbids this). Forgetting it already voted, it double-votes; the
+    portable proof enables identity retirement (revoke + fresh learner)."""
+
+    def test_amnesia_double_votes_and_is_retirable(self):
+        w = World(seed=40, n_clients=2)
+        a, b = creation_op(w, 0, b"A"), creation_op(w, 1, b"B")  # same slot
+        assert a.slot_tag is not None
+        tag, ballot = a.slot_tag, A.Ballot(1, b"x")
+        nsk = bytes([240] * 32)
+        npub = C.SIGNER.public(nsk)
+
+        acc1 = Acceptor(nsk, npub, ChainStore(), config_epoch=0, delta_ms=BIG)  # life 1
+        ra = acc1.on_accept(tag, ballot, a, NOW)
+        acc2 = Acceptor(nsk, npub, ChainStore(), config_epoch=0, delta_ms=BIG)  # WIPED, same key
+        rb = acc2.on_accept(tag, ballot, b, NOW)  # forgot A -> votes B at the same ballot
+        self.assertIsInstance(ra, A.Receipt)
+        self.assertIsInstance(rb, A.Receipt)
+
+        # a party assembles the double vote from the two lives' receipts + ops
+        store = ChainStore()
+        store.put_op_raw(a)
+        store.put_op_raw(b)
+        assert isinstance(ra, A.Receipt) and isinstance(rb, A.Receipt)
+        store.put_receipt(ra)
+        store.put_receipt(rb)
+        proofs = store.detect_double_votes()
+        self.assertEqual(len(proofs), 1)
+        self.assertTrue(proofs[0].verify())
+        self.assertEqual(proofs[0].signer, npub)  # retirement targets this identity
+
+
+class TestWithholder(unittest.TestCase):
+    """WP3.3: a node that WITHHOLDS a committed op cannot cause unsafety —
+    staleness is never divergence; one honest contact heals the victim."""
+
+    def test_withheld_op_heals_via_one_honest_contact(self):
+        sim = Sim(seed=42, n=3)
+        w = World(seed=42, n_clients=1)
+        op = creation_op(w, 0, b"v")
+        # nodes 1,2 hold the committed op; node 0 is eclipsed (withheld from it)
+        sim._raw[1].acc.store.append(op)
+        sim._raw[2].acc.store.append(op)
+        self.assertIsNone(sim._raw[0].acc.store.get_op(op.op_hash))  # victim lacks it
+        # a single honest contact (anti-entropy from node 1) heals the victim
+        gossip.merge(sim._raw[0].acc.store, sim._raw[1].acc.store)
+        self.assertIsNotNone(sim._raw[0].acc.store.get_op(op.op_hash))
 
 
 class TestSplitView(unittest.TestCase):

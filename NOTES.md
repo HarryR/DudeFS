@@ -1149,10 +1149,25 @@ and A4 as formally stated. Resolutions decided with the design owner; DESIGN
       member's Ed25519 identity — one keypair per member.
     - **Backend = PyNaCl (PyCA-maintained); vendored pure-Python stays
       as the differential-test oracle** (no-native CI lane, byte-for-byte
-      cross-checks). Migration is entirely existing machinery: suites are
-      per-keyepoch, so enabling `xcs1` is a rotate + wrap-set; `b2s1` is
-      superseded before ever shipping. Rust/Go parity verified for every
-      chosen primitive (CRYPTO.md §3).
+      cross-checks). Rust/Go parity verified for every chosen primitive
+      (CRYPTO.md §3).
+    - **AMENDED same day — the one-scheme rule (Harry's correction).**
+      `auth0` was dev scaffolding only; the system never ships
+      unencrypted, and dev logs die with dev deployments (no
+      auth0-legacy-decode obligation). The per-keyepoch suite-menu
+      framing is WITHDRAWN as a downgrade/malleability surface: v1 ships
+      exactly ONE scheme; `xcs1`/`sbx1` are internal construction names,
+      not wire selectors; the genesis suite id collapses to a pinned
+      constant; **a future scheme change is a lane-2 `pver` fence +
+      rotation** (existing fail-closed machinery), and `keyepoch` selects
+      keys, never schemes. PyNaCl confirmed as the single `uv`-managed
+      crypto dependency (stdlib-only rule consciously amended for
+      production). Implementation cleanup noted for post-WP3/4: collapse
+      the `aead_suite` parameter threading to the pver-determined
+      constant. Runner-up recorded in CRYPTO.md §0: PyCA `cryptography` +
+      AES-256-GCM-SIV (standards-stamped MRAE, zero AEAD composition;
+      kept second on Go-parity and the hand-rolled wrap it would need) —
+      flippable cheaply before launch only.
 
 # Not yet built (by design, M2+)
 
