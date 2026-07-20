@@ -6,12 +6,14 @@
 # are kept as regression tests asserting exactly one decided op. Names carry the
 # FORMAL hypothesis ids; every run is a pure function of its seed (replayable).
 
+import random
 import unittest
 
 from dudefs import artifacts as A
 from dudefs import fold
 from dudefs import quorum as Q
 from dudefs.sim.harness import Sim
+from dudefs.store import AppendStatus
 from dudefs.transports.memory import CLIENT, Faults, Link, NetworkLinks
 from tests._builders import World
 from tests._cluster import creation_op
@@ -229,6 +231,47 @@ class TestTimeSkew(unittest.TestCase):
         r = sim.commit(_create(w, 0, b"k", b"1"))
         sim.run()
         self.assertIsInstance(r.outcome, Q.Committed)
+
+
+class TestA1AndB6(unittest.TestCase):
+    """WP2.5: A1 (the fold is a pure function of the committed SET — byte-identical
+    at quiescence regardless of assembly order) and B6 (a violation mints portable
+    evidence; honest runs mint none)."""
+
+    def test_A1_fold_is_order_independent_and_no_evidence(self):
+        sim = Sim(seed=5, n=3, faults=CHAOS)
+        w = World(seed=5, n_clients=2)
+        a, b = creation_op(w, 0, b"A"), creation_op(w, 1, b"B")
+        sim.commit(a)
+        sim.commit(b)
+        sim.run()
+        assert a.slot_tag is not None
+        decided = [op for h in sim.decided_ops(a.slot_tag) if (op := sim.get_op(h)) is not None]
+        base = [*w.all_control(), *decided]
+        roots = set()
+        for s in range(6):
+            shuffled = base[:]
+            random.Random(s).shuffle(shuffled)
+            roots.add(fold.state_root(fold.fold(shuffled, w.keyring, w.genesis)))
+        self.assertEqual(len(roots), 1)  # A1: one state_root across every order
+        self.assertEqual(sim.evidence(), [])  # B6: honest chaos run mints no proof
+
+    def test_B6_a_fork_mints_portable_evidence(self):
+        # the one violation an honest sim can be *fed* today: two signed ops at one
+        # (author, seq). append detects it and mints self-verifying FORK evidence.
+        sim = Sim(seed=9, n=3)
+        w = World(seed=9, n_clients=1)
+        op1 = w.blind(0, [], [[A.Mutation.SET, b"k", b"A"]])  # client 0, seq 0
+        w.clients[0].seq, w.clients[0].prev = 0, A.GENESIS_PREV  # rewind -> equivocate
+        op2 = w.blind(0, [], [[A.Mutation.SET, b"k", b"B"]])  # seq 0 AGAIN (a fork)
+        self.assertNotEqual(op1.op_hash, op2.op_hash)
+        store = sim._raw[0].acc.store
+        self.assertTrue(store.append(op1))
+        res = store.append(op2)
+        self.assertEqual(res.status, AppendStatus.FORK)
+        assert res.evidence is not None
+        self.assertTrue(res.evidence.verify())  # self-verifying portable proof
+        self.assertTrue(sim.evidence())  # B6: the node minted it
 
 
 class TestFinalityAndVerdict(unittest.TestCase):

@@ -293,6 +293,13 @@ class Sim:
         sets = [frozenset(o.op_hash for o in nd.acc.store.all_ops()) for nd in self._raw]
         return all(s == sets[0] for s in sets)
 
+    def evidence(self) -> list:
+        """Every portable misbehavior proof any node has minted (B6). Honest nodes
+        never violate, so this stays empty across chaos runs; the persona builds
+        (WP3) that equivocate are what exercise the minting side of B6. FORK
+        (two signed ops at one author/seq) is the one kind wired today."""
+        return [ev for nd in self._raw for ev in nd.acc.store.evidence()]
+
     # ---- read helpers for tests ------------------------------------------- #
     def decided_ops(self, slot_tag: bytes) -> set[bytes]:
         """Every op that obtained a QC for this slot. rev 5: exactly one (or zero
