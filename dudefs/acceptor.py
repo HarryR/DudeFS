@@ -258,6 +258,36 @@ class Acceptor:
         if new_epoch > self.epoch:
             self.epoch = new_epoch
 
+    def on_recovery_fence(
+        self,
+        roster_op: Op,
+        recovery_ckpt: Op,
+        new_epoch: int,
+        recovery_hash: bytes,
+        manager_pub: bytes,
+    ) -> bool:
+        """The recovery trigger / activation-is-the-park (DESIGN §13 recovery
+        exception, NOTES 36a). A ROOT-signed pair — a recovery checkpoint and a
+        ROSTER op naming it via its `recovery` field — SUBSTITUTES for the joint
+        certificate to activate `new_epoch`. There is deliberately no joint QC (a
+        quorum may be gone — that is what recovery is for), so the acceptor trusts
+        the root signature on the pair; fiat is root-only, so a delegate's recovery
+        op never reaches a valid fence (it also folds invalid). The park is
+        EMERGENT, not a separate rule: once activated the node stamps every
+        receipt/watermark at e+1 and old-epoch coordination dies wherever the fence
+        propagates. Distinct from the possession barrier (`on_roster_accept`, which
+        gates JOINING the new roster); this fence parks everyone who sees it.
+        Monotone (`activate_epoch`): replaying a fence for a passed epoch is a
+        no-op. Returns whether the pair is a valid fence."""
+        if roster_op.author != manager_pub or recovery_ckpt.author != manager_pub:
+            return False  # fiat is root-only
+        if not (roster_op.verify_sig(manager_pub) and recovery_ckpt.verify_sig(manager_pub)):
+            return False
+        if recovery_hash != recovery_ckpt.op_hash:
+            return False  # the roster must name THIS checkpoint (the pairing)
+        self.activate_epoch(new_epoch)  # monotone; a passed epoch is a no-op
+        return True
+
     def on_rereceipt(self, target: bytes) -> Receipt | None:
         """RERECEIPT (PROTOCOL §1.1): re-issue a receipt under the node's CURRENT
         epoch for an op/slot it already holds, so a client can assemble a fresh

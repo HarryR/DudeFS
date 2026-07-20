@@ -89,11 +89,17 @@ def _v_roster(b: dict[bytes, codec.Bencodable]) -> dict[bytes, Any]:
     # rejected by validation (they enlarge quorums without adding tolerance).
     if len(roster) == 0 or len(roster) % 2 == 0:
         raise codec.CodecError("roster must have an odd, non-zero voting-member count")
+    # optional `recovery` (NOTES 36a / WP1.7): an op_hash naming the recovery
+    # checkpoint this roster op is paired with. Present => the fiat recovery
+    # trigger (root-only, substitutes for the joint certificate); absent => a
+    # normal roster change (joint certificate required).
+    recovery = b.get(b"recovery")
     return {
         BK_KIND: ControlKind.ROSTER,
         b"from_epoch": _uint(codec.field(b, b"from_epoch")),
         b"roster": roster,
         b"sync_frontier": _heads(codec.field(b, b"sync_frontier")),
+        b"recovery": codec.as_bytes(recovery) if recovery is not None else None,
     }
 
 
@@ -202,16 +208,21 @@ def cert_revoke_body(subject_pub: bytes) -> bytes:
     return codec.encode({BK_KIND: ControlKind.CERT_REVOKE, b"subject": subject_pub})
 
 
-def roster_body(from_epoch: int, roster_pubs: list[bytes], sync_frontier: Heads) -> bytes:
-    sf = {a: [s, h] for a, (s, h) in sync_frontier.items()}
-    return codec.encode(
-        {
-            BK_KIND: ControlKind.ROSTER,
-            b"from_epoch": int(from_epoch),
-            b"roster": [bytes(p) for p in roster_pubs],
-            b"sync_frontier": sf,
-        }
-    )
+def roster_body(
+    from_epoch: int,
+    roster_pubs: list[bytes],
+    sync_frontier: Heads,
+    recovery: bytes | None = None,
+) -> bytes:
+    body: dict[bytes, Any] = {
+        BK_KIND: ControlKind.ROSTER,
+        b"from_epoch": int(from_epoch),
+        b"roster": [bytes(p) for p in roster_pubs],
+        b"sync_frontier": {a: [s, h] for a, (s, h) in sync_frontier.items()},
+    }
+    if recovery is not None:  # the fiat recovery pairing; omit for a normal roster
+        body[b"recovery"] = recovery
+    return codec.encode(body)
 
 
 def rotate_body(keyepoch: int) -> bytes:

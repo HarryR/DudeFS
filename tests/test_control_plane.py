@@ -160,6 +160,142 @@ class TestEpochBridge(unittest.TestCase):
             self.assertEqual(nd.store.get_slot(tag).accepted_op, op.op_hash)
 
 
+class TestRecoveryFence(unittest.TestCase):
+    """WP1.7 / NOTES 36a: activation-is-the-park. A ROOT-signed pair (a recovery
+    checkpoint + a ROSTER op naming it via `recovery`) substitutes for the joint
+    certificate to activate the new epoch — a restatement of activate_epoch, not
+    new machinery. Fiat is root-only; the park is emergent (receipts stamp e+1)."""
+
+    def setUp(self):
+        self.w = World(seed=1, n_clients=1)
+        self.msk, self.mpub = self.w.mgr_sk, self.w.mgr_pub
+
+    def _fold(self, ops):
+        return fold.fold(ops, self.w.keyring, self.w.genesis)
+
+    def _pair(self, roster, from_epoch=0):
+        """A root-signed recovery pair: (recovery checkpoint, roster naming it)."""
+        rckpt = _ctl(
+            self.msk,
+            self.mpub,
+            5,
+            A.GENESIS_PREV,
+            200,
+            ctl.checkpoint_body({}, b"root", [], {}, b"", 0, A.HLC(0, 0)),
+        )
+        rop = _ctl(
+            self.msk,
+            self.mpub,
+            6,
+            rckpt.op_hash,
+            201,
+            ctl.roster_body(from_epoch, roster, {}, recovery=rckpt.op_hash),
+        )
+        return rckpt, rop
+
+    def test_a_valid_root_pair_activates_without_joint_qc_and_parks(self):
+        nodes, _r = _acc_cluster(3)
+        rckpt, rop = self._pair([n.pub for n in nodes])
+        n = nodes[0]
+        self.assertEqual(n.epoch, 0)
+        self.assertTrue(n.on_recovery_fence(rop, rckpt, 1, rckpt.op_hash, self.mpub))
+        self.assertEqual(n.epoch, 1)  # activated with NO joint certificate
+
+        # the park is emergent: receipts now stamp e+1, old-epoch coordination dies
+        op = self.w.cas(
+            0, b"k", A.VERSION_ABSENT, 0, [[A.Guard.ABSENT, b"k"]], [[A.Mutation.SET, b"k", b"v"]]
+        )
+        assert op.slot_tag is not None
+        r = n.on_accept(op.slot_tag, A.Ballot(1, b"x"), op, NOW)
+        assert isinstance(r, A.Receipt)
+        self.assertEqual(r.config_epoch, 1)
+
+    def test_b_delegate_recovery_roster_folds_invalid_and_no_fence(self):
+        dsk, dpub = _key(60)
+        cert = _ctl(
+            self.msk,
+            self.mpub,
+            0,
+            A.GENESIS_PREV,
+            1,
+            ctl.cert_issue_body(dpub, [ctl.Cap.MANAGE_ROSTER], 0),
+        )
+        rckpt = _ctl(
+            self.msk,
+            self.mpub,
+            1,
+            cert.op_hash,
+            2,
+            ctl.checkpoint_body({}, b"", [], {}, b"", 0, A.HLC(0, 0)),
+        )
+        # a manage-roster delegate authors a recovery-marked roster -> root-only -> invalid
+        rop = _ctl(
+            dsk,
+            dpub,
+            0,
+            A.GENESIS_PREV,
+            3,
+            ctl.roster_body(0, [dpub], {}, recovery=rckpt.op_hash),
+        )
+        r = self._fold([cert, rckpt, rop])
+        self.assertEqual(r.verdicts[rop.op_hash], fold.Verdict.INVALID)
+
+        # load-bearing: the SAME delegate's NON-recovery roster IS authorized —
+        # it is the recovery marking, not the delegate, that forces root.
+        rop_ok = _ctl(dsk, dpub, 0, A.GENESIS_PREV, 3, ctl.roster_body(0, [dpub], {}))
+        r2 = self._fold([cert, rop_ok])
+        self.assertEqual(r2.verdicts[rop_ok.op_hash], fold.Verdict.CONTROL)
+
+        # the acceptor fence also refuses a non-root-signed pair
+        n = _acc_cluster(1)[0][0]
+        self.assertFalse(n.on_recovery_fence(rop, rckpt, 1, rckpt.op_hash, self.mpub))
+        self.assertEqual(n.epoch, 0)
+
+    def test_c_replayed_fence_is_a_monotone_noop(self):
+        nodes, _r = _acc_cluster(1)
+        n = nodes[0]
+        rckpt, rop = self._pair([n.pub])
+        self.assertTrue(n.on_recovery_fence(rop, rckpt, 1, rckpt.op_hash, self.mpub))
+        self.assertEqual(n.epoch, 1)
+        # replay the identical fence for the now-passed epoch -> valid but no-op
+        self.assertTrue(n.on_recovery_fence(rop, rckpt, 1, rckpt.op_hash, self.mpub))
+        self.assertEqual(n.epoch, 1)  # no double-advance
+        # a stale fence while at a higher epoch never regresses
+        n.activate_epoch(2)
+        n.on_recovery_fence(rop, rckpt, 1, rckpt.op_hash, self.mpub)
+        self.assertEqual(n.epoch, 2)
+
+    def test_d_normal_roster_is_not_a_fence(self):
+        # a normal roster (no `recovery`) is delegable -> it takes the joint-
+        # certificate route, not fiat; and the fence refuses to fire without the
+        # explicit checkpoint pairing.
+        dsk, dpub = _key(62)
+        cert = _ctl(
+            self.msk,
+            self.mpub,
+            0,
+            A.GENESIS_PREV,
+            1,
+            ctl.cert_issue_body(dpub, [ctl.Cap.MANAGE_ROSTER], 0),
+        )
+        rop_normal = _ctl(dsk, dpub, 0, A.GENESIS_PREV, 2, ctl.roster_body(0, [dpub], {}))
+        r = self._fold([cert, rop_normal])
+        self.assertEqual(r.verdicts[rop_normal.op_hash], fold.Verdict.CONTROL)  # normal path
+
+        rckpt = _ctl(
+            self.msk,
+            self.mpub,
+            1,
+            cert.op_hash,
+            3,
+            ctl.checkpoint_body({}, b"", [], {}, b"", 0, A.HLC(0, 0)),
+        )
+        n = _acc_cluster(1)[0][0]
+        # the fence requires the explicit pairing: a wrong recovery hash won't fire
+        self.assertFalse(n.on_recovery_fence(rop_normal, rckpt, 1, b"\x00" * 32, self.mpub))
+        self.assertEqual(n.epoch, 0)
+
+
 class TestPossessionBarrier(unittest.TestCase):
     def test_new_roster_node_receipts_only_if_it_holds_the_frontier(self):
         nodes, _roster = _acc_cluster(3)

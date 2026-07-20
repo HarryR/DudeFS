@@ -135,6 +135,15 @@ _CAP_FOR_KIND: dict[control_handler.ControlKind, control_handler.Cap] = {
 }
 
 
+def _is_recovery_roster(body: dict[bytes, Any]) -> bool:
+    """A ROSTER op carrying a `recovery` field is the fiat recovery trigger
+    (NOTES 36a / WP1.7) — root-only, never delegable."""
+    return (
+        body[control_handler.BK_KIND] == control_handler.ControlKind.ROSTER
+        and body.get(b"recovery") is not None
+    )
+
+
 class ControlState:
     """Roster / cert / keyepoch / pver state. Reachable without HLC ordering
     for the node profile (activation is by certificate observation and
@@ -156,14 +165,23 @@ class ControlState:
         c = self.certs.get(pub)
         return bool(c and not c["revoked"] and cap in c["caps"])
 
-    def can_author_control(self, author: bytes, kind: control_handler.ControlKind) -> bool:
+    def can_author_control(
+        self, author: bytes, kind: control_handler.ControlKind, is_recovery: bool = False
+    ) -> bool:
         """Control-op authorization (DESIGN §15; upgrades NOTES item 9's M1
         root-only shortcut). The root may author any kind; a delegate needs the
         capability mapped to that kind — a checkpoint signed by a `compact` cert
         is authorized, one signed by a plain client cert is not. Fold-positional:
         `is_authorized` sees a revocation the moment it is applied in the walk, so
         a revoked delegate's later control ops fold `invalid`. Kinds with no
-        delegable capability (pver, endpoint) stay root-only."""
+        delegable capability (pver, endpoint) stay root-only.
+
+        `is_recovery` (a ROSTER op carrying a `recovery` field, NOTES 36a): FIAT
+        recovery is ROOT-ONLY and never delegable — even a `manage-roster`
+        delegate's recovery-marked op folds invalid, because fiat activation
+        bypasses the joint-quorum safeguard that makes delegation safe."""
+        if is_recovery:
+            return author == self.manager_pub
         if author == self.manager_pub:
             return True
         cap = _CAP_FOR_KIND.get(kind)
@@ -465,7 +483,7 @@ def fold(
             if op.is_control:
                 body = control_handler.decode(op)
                 if body is None or not control.can_author_control(
-                    op.author, body[control_handler.BK_KIND]
+                    op.author, body[control_handler.BK_KIND], _is_recovery_roster(body)
                 ):
                     verdicts[op.op_hash] = Verdict.INVALID
                     _consume_invalid_slot(op, keyring, universe, state)
@@ -681,7 +699,9 @@ class ControlReducer:
         # best-effort capability filter (DESIGN §15): the node profile is
         # order-independent, so revocation isn't fold-positional here — the full
         # fold is authoritative. Enough to recognize a delegate's control op.
-        if not self.control.can_author_control(op.author, body[control_handler.BK_KIND]):
+        if not self.control.can_author_control(
+            op.author, body[control_handler.BK_KIND], _is_recovery_roster(body)
+        ):
             return False
         self.control.apply_control(op, body)
         if body[control_handler.BK_KIND] == control_handler.ControlKind.CHECKPOINT:
