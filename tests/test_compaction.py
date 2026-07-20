@@ -4,6 +4,7 @@
 # if their mechanism is removed — that is what proves they are load-bearing.
 
 import os
+import random
 import tempfile
 import unittest
 
@@ -261,6 +262,96 @@ class TestA4TwoCheckpoints(unittest.TestCase):
         boot = _boot(w, ckpt2, ckpt2_control, [], cut2)
         self.assertEqual(boot.state, full.state)
         self.assertEqual(full.state, {b"k": b"v2"})
+
+
+class TestA4PropertyFuzz(unittest.TestCase):
+    """WP1.6: the resurrection-mask fixpoint and the incremental carry-forward are
+    CLASSES of behavior; a hand-built vector catches one member. Seeded random
+    chains (multi-key set/del + CAS + rejected-CAS-consumes-attempt) compacted at
+    a random cut must satisfy A4 byte-for-byte: fold(full) ≡ bootstrap(retained ∘
+    tail). All seeded -> deterministic and replayable."""
+
+    KEYS = [b"k0", b"k1", b"k2", b"k3", b"k4"]
+
+    def _gen(self, rng, w, below):
+        """Append one random VALID op to `below`, tracking live state for guards."""
+        folded = fold.fold(below, w.keyring, w.genesis)
+        state = folded.state
+        ci = rng.randrange(len(w.clients))
+        roll = rng.random()
+        if roll < 0.35 or not state:  # blind multi-key set (1-2 keys)
+            ks = rng.sample(self.KEYS, rng.randint(1, 2))
+            muts = [[A.Mutation.SET, k, bytes([rng.randrange(256)])] for k in ks]
+            op = w.blind(ci, [], muts)
+        elif roll < 0.55:  # blind delete of a live key
+            k = rng.choice(list(state))
+            op = w.blind(ci, [], [[A.Mutation.DEL, k]])
+        elif roll < 0.8:  # CAS overwrite of a live key
+            k = rng.choice(list(state))
+            v, a = folded.lineage(k)
+            nv = bytes([rng.randrange(256)])
+            op = w.cas(ci, k, v, a, [[A.Guard.VERSION_EQ, k, v]], [[A.Mutation.SET, k, nv]])
+        else:  # a CAS whose guard FAILS -> rejected, slot attempt consumed
+            k = rng.choice(list(state))
+            v, a = folded.lineage(k)
+            op = w.cas(ci, k, v, a, [[A.Guard.VALUE_EQ, k, b"never"]], [[A.Mutation.SET, k, b"z"]])
+        below.append(op)
+
+    def test_single_checkpoint_A4_holds(self):
+        for seed in range(25):
+            rng = random.Random(seed)
+            w = World(seed=seed, n_clients=3)
+            below = list(w.control_ops)
+            n_below = rng.randint(4, 14)
+            for _ in range(n_below):
+                self._gen(rng, w, below)
+            cut = _cut(w)
+            seg = len(below)
+            for _ in range(rng.randint(0, 8)):
+                self._gen(rng, w, below)
+            full_ops = list(below)
+            below_only = full_ops[:seg]
+            tail = full_ops[seg:]
+
+            cr = compactor.compact_genesis(below_only, w.keyring, w.genesis, cut)
+            boot = _boot(w, cr, list(w.control_ops), tail, cut)
+            full = fold.fold(full_ops, w.keyring, w.genesis)
+            self.assertEqual(boot.state, full.state, f"seed {seed}: state diverged")
+            self.assertEqual(
+                fold.state_root(boot), fold.state_root(full), f"seed {seed}: root diverged"
+            )
+
+    def test_two_checkpoint_A4_holds(self):
+        for seed in range(25):
+            rng = random.Random(1000 + seed)
+            w = World(seed=seed, n_clients=3)
+            below1 = list(w.control_ops)
+            for _ in range(rng.randint(3, 10)):
+                self._gen(rng, w, below1)
+            cut1 = _cut(w)
+            seg1 = len(below1)
+            for _ in range(rng.randint(1, 6)):
+                self._gen(rng, w, below1)
+            cut2 = _cut(w)
+            seg2 = len(below1)
+            for _ in range(rng.randint(0, 6)):
+                self._gen(rng, w, below1)
+
+            full_ops = list(below1)
+            below1_only = full_ops[:seg1]
+            tail1 = full_ops[seg1:seg2]
+            tail2 = full_ops[seg2:]
+
+            ckpt1 = compactor.compact_genesis(below1_only, w.keyring, w.genesis, cut1)
+            ckpt2 = compactor.compact(
+                ckpt1.retained, ckpt1.attempts, cut1, tail1, w.keyring, w.genesis, cut2
+            )
+            boot = _boot(w, ckpt2, list(w.control_ops), tail2, cut2)
+            full = fold.fold(full_ops, w.keyring, w.genesis)
+            self.assertEqual(boot.state, full.state, f"seed {seed}: state diverged")
+            self.assertEqual(
+                fold.state_root(boot), fold.state_root(full), f"seed {seed}: root diverged"
+            )
 
 
 class TestNodeGC(unittest.TestCase):
