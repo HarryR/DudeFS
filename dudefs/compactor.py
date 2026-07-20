@@ -81,18 +81,6 @@ def compact(
     return CompactResult(cut, fold.state_root(r), dead, retained, attempts)
 
 
-def retained_commitment(retained: list[Op]) -> dict[bytes, tuple[int, bytes]]:
-    """The per-author `(count, digest)` over retained op-hashes (DESIGN §12,
-    NOTES 29c) — the checkpoint's `retained` field. Plaintext (hashes are public
-    metadata). Lets a node verify below-cut completeness locally and localizes an
-    omission to a single author, so a sparse below-cut log stays checkable without
-    a full state fetch. Self-contained: the digest covers the FULL retained set."""
-    by_author: dict[bytes, list[bytes]] = {}
-    for op in retained:
-        by_author.setdefault(op.author, []).append(op.op_hash)
-    return {a: (len(hs), crypto.h(b"".join(sorted(hs)))) for a, hs in by_author.items()}
-
-
 def barrier_state(
     retained: list[Op],
     attempts: dict[bytes, int],

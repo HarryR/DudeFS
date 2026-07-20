@@ -6,7 +6,7 @@
 import unittest
 
 from dudefs import artifacts as A
-from dudefs import compactor, crypto, fold
+from dudefs import compactor, crypto, fold, gossip
 from dudefs.acceptor import Acceptor
 from dudefs.handlers import control as ctl
 from dudefs.store import ChainStore
@@ -210,7 +210,7 @@ class TestCheckpointArtifact(unittest.TestCase):
         )
         cut = _cut(w)
         cr = compactor.compact(below, w.keyring, w.genesis, cut)
-        retained = compactor.retained_commitment(cr.retained)
+        retained = A.retained_commitment(cr.retained)
         ckpt = w.checkpoint(
             cut=cut, state_root=cr.state_root, dead=cr.dead, retained=retained, attempts=b"ct"
         )
@@ -248,13 +248,65 @@ class TestCheckpointArtifact(unittest.TestCase):
         )
         cut = _cut(w)
         cr = compactor.compact(below, w.keyring, w.genesis, cut)
-        commit = compactor.retained_commitment(cr.retained)
+        commit = A.retained_commitment(cr.retained)
         # a node holding the full retained set recomputes the identical digest
-        self.assertEqual(compactor.retained_commitment(cr.retained), commit)
+        self.assertEqual(A.retained_commitment(cr.retained), commit)
         # drop one retained op -> only its author's (count, digest) changes
         dropped = cr.retained[-1]
-        partial = compactor.retained_commitment(cr.retained[:-1])
+        partial = A.retained_commitment(cr.retained[:-1])
         self.assertNotEqual(partial.get(dropped.author), commit.get(dropped.author))
+
+
+class TestBaselineSync(unittest.TestCase):
+    def test_sparse_baseline_syncs_and_verifies_against_checkpoint(self):
+        # Below the cut the log is sparse (no receipts/QCs — the checkpoint
+        # certifies commitment). A lagging node compares per-author retained
+        # digests, pulls only the author it lacks (envelopes), and verifies its
+        # baseline against the checkpoint's signed `retained` field (DESIGN §12).
+        w = World(seed=11, n_clients=2)
+        below = list(w.control_ops)
+        below.append(
+            w.cas(
+                0,
+                b"k",
+                A.VERSION_ABSENT,
+                0,
+                [[A.Guard.ABSENT, b"k"]],
+                [[A.Mutation.SET, b"k", b"v"]],
+            )
+        )
+        below.append(
+            w.cas(
+                1,
+                b"j",
+                A.VERSION_ABSENT,
+                0,
+                [[A.Guard.ABSENT, b"j"]],
+                [[A.Mutation.SET, b"j", b"w"]],
+            )
+        )
+        cut = _cut(w)
+        cr = compactor.compact(below, w.keyring, w.genesis, cut)
+        committed = A.retained_commitment(cr.retained)  # the checkpoint's `retained` field
+
+        # SUMMARY carries the per-author baseline digest + the active checkpoint
+        src = ChainStore()
+        for op in cr.retained:
+            src.put_op_raw(op)
+        s = gossip.summary(src, cut=cut, checkpoint=b"ckpt")
+        self.assertEqual(s.retained, committed)
+        self.assertEqual(s.checkpoint, b"ckpt")
+
+        # a lagging node is missing client 1's baseline -> digest mismatch localizes
+        dst = ChainStore()
+        for op in cr.retained:
+            if op.author != w.clients[1].pub:
+                dst.put_op_raw(op)
+        self.assertEqual(gossip.verify_baseline(dst, cut, committed), {w.clients[1].pub})
+
+        # pull the missing author's sparse baseline, then it verifies complete
+        self.assertGreater(gossip.pull_baseline(dst, src, cut), 0)
+        self.assertEqual(gossip.verify_baseline(dst, cut, committed), set())
 
 
 class TestVoidRule(unittest.TestCase):

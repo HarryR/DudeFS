@@ -129,6 +129,19 @@ def slot_priority(slot_tag: bytes, client_fp: bytes) -> bytes:
     return crypto.h(slot_tag + client_fp)
 
 
+def retained_commitment(retained: list[Op]) -> dict[bytes, tuple[int, bytes]]:
+    """The per-author `(count, digest)` over retained op-hashes (DESIGN §12 rev 6,
+    NOTES 29c) — carried by a checkpoint's `retained` field and by gossip SUMMARY.
+    Plaintext (hashes are public metadata). Below the cut it does double duty: the
+    anti-entropy diff key (what to PULL) AND the completeness/commitment evidence
+    (a manager-signed digest replaces the per-op QCs that were GC'd, NOTES 29d), so
+    an omission is detectable and localizes to a single author."""
+    by_author: dict[bytes, list[bytes]] = {}
+    for op in retained:
+        by_author.setdefault(op.author, []).append(op.op_hash)
+    return {a: (len(hs), crypto.h(b"".join(sorted(hs)))) for a, hs in by_author.items()}
+
+
 def roster_slot_tag(epoch: int) -> bytes:
     """The public slot a roster change `epoch -> epoch+1` contends on (DESIGN §13):
     `h("roster" ‖ epoch)`. Plaintext — the roster is public, so this needs no PRF

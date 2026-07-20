@@ -21,10 +21,19 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
-from .artifacts import HLC, QC, Op, Receipt
+from . import artifacts as A
+from .artifacts import HLC, QC, Heads, Op, Receipt
 from .store import ChainStore
+
+
+def _covered(op: Op, cut: Heads) -> bool:
+    """At-or-below the pinned cut, per-author by seq (DESIGN §12) — the boundary
+    between the sparse baseline and the dense tail."""
+    entry = cut.get(op.author)
+    return entry is not None and op.seq <= entry[0]
+
 
 # --------------------------------------------------------------------------- #
 # Summary — the compact "what I hold" advertisement (PROTOCOL §2.2)            #
@@ -34,24 +43,35 @@ from .store import ChainStore
 @dataclass(frozen=True)
 class Summary:
     """What a node advertises in an epidemic round. `heads` is the per-author
-    contiguous frontier (author pubkey -> head seq); `receipts` is per-(op,
-    signer) coverage; `qcs` names the ops a QC is held for. `floor`/`epoch` ride
-    along for health (§2.3) and roster awareness — not used by convergence."""
+    contiguous frontier of the DENSE TAIL (author pubkey -> head seq); `receipts`
+    is per-(op, signer) coverage; `qcs` names the ops a QC is held for. Post-M6:
+    `checkpoint` names the active cut, and `retained` is the per-author
+    (count, digest) of the SPARSE BASELINE below it — the diff key for below-cut
+    sync (DESIGN §12, NOTES 29c). `floor`/`epoch` ride along for health (§2.3)."""
 
-    heads: dict[bytes, int]  # author_pub -> highest contiguous seq held
+    heads: dict[bytes, int]  # author_pub -> highest contiguous seq held (dense tail)
     receipts: frozenset[tuple[bytes, bytes]]  # (op_hash, signer) coverage
     qcs: frozenset[bytes]  # op_hashes a QC is held for
     floor: HLC
     epoch: int
+    checkpoint: bytes = b""  # the active checkpoint op_hash (b"" = no compaction)
+    retained: dict[bytes, tuple[int, bytes]] = field(default_factory=dict)  # baseline digest
 
 
-def summary(store: ChainStore, epoch: int = 0) -> Summary:
+def summary(
+    store: ChainStore, epoch: int = 0, cut: Heads | None = None, checkpoint: bytes = b""
+) -> Summary:
+    baseline = (
+        A.retained_commitment([o for o in store.all_ops() if _covered(o, cut)]) if cut else {}
+    )
     return Summary(
         heads={author: seq for author, (seq, _hh) in store.heads().items()},
         receipts=frozenset((r.op_hash, r.signer) for r in store.all_receipts()),
         qcs=frozenset(qc.op_hash for qc in store.all_qcs()),
         floor=store.get_attested(),
         epoch=epoch,
+        checkpoint=checkpoint,
+        retained=baseline,
     )
 
 
@@ -109,3 +129,47 @@ def pull_op(dst: ChainStore, src: ChainStore, op_hash: bytes) -> bool:
         return False
     dst.put_op_raw(op)
     return True
+
+
+# --------------------------------------------------------------------------- #
+# Sparse below-cut baseline sync (DESIGN §12 rev 6, PROTOCOL §2)               #
+# --------------------------------------------------------------------------- #
+# Below the cut the log is SPARSE (retained winners/masks only, gaps where the
+# `dead` delta was GC'd), and carries NO receipts/QCs — commitment there is
+# certified by the manager-signed checkpoint, not per-op quorum proofs (NOTES
+# 29d). So this path is digest-diff + pull-by-hash of author-signed envelopes,
+# not the contiguous-run DELTA the dense tail uses.
+
+
+def pull_baseline(dst: ChainStore, src: ChainStore, cut: Heads) -> int:
+    """Sync the sparse below-cut baseline from `src` into `dst`: compare per-author
+    retained digests and, for each author whose digest differs, pull `src`'s
+    below-cut retained ops (envelopes ONLY — there are no receipts/QCs below the
+    cut). Returns how many envelopes were pulled. The digest localizes the diff to
+    an author, so a lagging node never refetches the whole 5–10 GB baseline."""
+    src_below: dict[bytes, list[Op]] = {}
+    for o in src.all_ops():
+        if _covered(o, cut):
+            src_below.setdefault(o.author, []).append(o)
+    dst_digest = A.retained_commitment([o for o in dst.all_ops() if _covered(o, cut)])
+    src_digest = A.retained_commitment([o for run in src_below.values() for o in run])
+    pulled = 0
+    for author, ops in src_below.items():
+        if dst_digest.get(author) != src_digest.get(author):
+            for o in ops:
+                if dst.get_op(o.op_hash) is None:
+                    dst.put_op_raw(o)  # author-signed envelope; checkpoint certifies commitment
+                    pulled += 1
+    return pulled
+
+
+def verify_baseline(
+    store: ChainStore, cut: Heads, committed: dict[bytes, tuple[int, bytes]]
+) -> set[bytes]:
+    """Verify a node/client holds the FULL below-cut baseline against the
+    checkpoint's signed `retained` commitment (DESIGN §12 intake, NOTES 29c/29d).
+    Returns the set of authors whose held baseline doesn't match — empty means
+    complete. A tampered or partial baseline (a missing/extra op) fails here,
+    localized to the author; the checkpoint signature is verified separately."""
+    have = A.retained_commitment([o for o in store.all_ops() if _covered(o, cut)])
+    return {a for a in set(have) | set(committed) if have.get(a) != committed.get(a)}
