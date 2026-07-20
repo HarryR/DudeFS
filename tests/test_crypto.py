@@ -1,5 +1,5 @@
-# M0 — L0 crypto: Ed25519 RFC 8032 KATs (SIGNER over PyNaCl), PRF, AEAD auth0,
-# MultiSig list.
+# M0 — L0 crypto: Ed25519 RFC 8032 KATs (SIGNER over PyNaCl), PRF, AEAD xcs1
+# (XChaCha20-Poly1305-IETF, SIV nonce — CRYPTO.md §2), MultiSig list.
 
 import binascii
 import random
@@ -60,21 +60,45 @@ class TestPRF(unittest.TestCase):
         self.assertEqual(len(C.prf_tag(s1, b"k")), 32)
 
 
-class TestAeadAuth0(unittest.TestCase):
-    def test_seal_open_and_auth(self):
-        k = bytes(range(32))
-        nonce = b"nonce-1234567890"
-        aad = b"env"
-        pt = b"the-secret-value"
-        ct, tag = C.AeadAuth0.seal(k, nonce, aad, pt)
-        self.assertEqual(ct, pt)  # UNENCRYPTED — zero-knowledge suspended, loudly
-        self.assertEqual(C.AeadAuth0.open(k, nonce, aad, ct, tag), pt)
-        self.assertIsNone(C.AeadAuth0.open(k, nonce, b"other-aad", ct, tag))
-        self.assertIsNone(C.AeadAuth0.open(k, b"other-nonce-0000", aad, ct, tag))
-        self.assertIsNone(C.AeadAuth0.open(k, nonce, aad, ct, bytes(32)))
+class TestAeadXcs1(unittest.TestCase):
+    # Canonical KAT for xcs1 (XChaCha20-Poly1305-IETF over the SIV nonce of
+    # CRYPTO.md §2). SELF-GENERATED here, and thereby the construction's reference
+    # vector — the Rust/Go ports MUST reproduce this exact blob for k = 00..1f,
+    # aad = ab*32, pt = b"the-secret-value". Blob layout: nonce(24) ‖ ct ‖ tag(16).
+    KAT_KEY = bytes(range(32))
+    KAT_AAD = bytes([0xAB]) * 32
+    KAT_PT = b"the-secret-value"
+    KAT_BLOB = binascii.unhexlify(
+        "f09f5a46316a9c0e08e0e4b4bb65a0b5be7b34126ec8f1dd"
+        "b34a5a26f036fe43031c8ae051ecb2005df5a0e7391ccec7899155b047049b38"
+    )
 
-    def test_zero_knowledge_suspended(self):
-        self.assertFalse(C.zero_knowledge_active(b"auth0"))
+    def test_kat_blob_is_canonical(self):
+        self.assertEqual(C.AeadXcs1.seal(self.KAT_KEY, self.KAT_AAD, self.KAT_PT), self.KAT_BLOB)
+        self.assertEqual(C.AeadXcs1.open(self.KAT_KEY, self.KAT_AAD, self.KAT_BLOB), self.KAT_PT)
+
+    def test_seal_open_roundtrip_and_auth(self):
+        k, aad, pt = self.KAT_KEY, b"env", b"the-secret-value"
+        blob = C.AeadXcs1.seal(k, aad, pt)
+        self.assertNotIn(pt, blob)  # ENCRYPTED — zero-knowledge genuinely on
+        self.assertEqual(C.AeadXcs1.open(k, aad, blob), pt)
+        self.assertIsNone(C.AeadXcs1.open(bytes(32), aad, blob))  # wrong key -> ⊥
+        self.assertIsNone(C.AeadXcs1.open(k, b"other-aad", blob))  # wrong AD -> ⊥
+        self.assertIsNone(C.AeadXcs1.open(k, aad, blob[:-1] + bytes([blob[-1] ^ 1])))  # tamper
+        self.assertIsNone(C.AeadXcs1.open(k, aad, b"\x00" * 39))  # too short -> ⊥
+
+    def test_deterministic_and_misuse_resistant(self):
+        # SIV: (key, aad, pt) -> identical blob (determinism, the MRAE bound), but
+        # two plaintexts under ONE header get INDEPENDENT nonces — keystream reuse
+        # is structurally impossible (CRYPTO.md §2, the equivocating-author case).
+        k, aad = self.KAT_KEY, b"header"
+        self.assertEqual(C.AeadXcs1.seal(k, aad, b"P1"), C.AeadXcs1.seal(k, aad, b"P1"))
+        n1 = C.AeadXcs1.seal(k, aad, b"P1")[:24]
+        n2 = C.AeadXcs1.seal(k, aad, b"P2")[:24]
+        self.assertNotEqual(n1, n2)
+
+    def test_zero_knowledge_active(self):
+        self.assertTrue(C.zero_knowledge_active(b"xcs1"))
 
 
 class TestMultiSigList(unittest.TestCase):

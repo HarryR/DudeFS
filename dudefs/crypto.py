@@ -8,22 +8,22 @@
 #
 #   Hash      h(bytes) -> 32B                       content addressing everywhere
 #   PRF       tag(secret, preimage) -> 32B          opaque, keyed slot tags (§7)
-#   AEAD      seal(k,nonce,aad,pt) / open(...)       data payloads (staged, §16)
+#   AEAD      seal(k,aad,pt)->blob / open(k,aad,blob)  data payloads (SIV, §5)
 #   Signer    sign(sk,msg) / verify(pk,msg,sig)      authors (Ed25519)
 #   MultiSig  sign_share / combine / verify          node receipts -> QC (§8)
 #
-# v1 concrete choices (IMPLEMENTATION §1): BLAKE2b-256, keyed-BLAKE2 PRF,
-# Ed25519 (authors) + Ed25519 signature list & signer bitmap (node MultiSig),
-# and the `auth0` AEAD suite — authenticated-UNENCRYPTED. auth0 suspends
-# zero-knowledge *loudly*: callers must surface `zero_knowledge_active()`.
+# v1 concrete choices (IMPLEMENTATION §1 / CRYPTO.md): BLAKE2b-256, keyed-BLAKE2
+# PRF, Ed25519 (authors) + Ed25519 signature list & signer bitmap (node MultiSig),
+# and the `xcs1` AEAD suite — XChaCha20-Poly1305-IETF with an SIV-derived
+# (misuse-resistant) nonce over libsodium. Zero-knowledge is genuinely on.
 
 from __future__ import annotations
 
 import hashlib
-import hmac
 from collections.abc import Iterable
 
 import nacl.exceptions
+import nacl.secret
 import nacl.signing
 
 from .errors import DudeFSError
@@ -58,7 +58,7 @@ HASH_SUITE = b"blake2b-256"
 SIGNER_SUITE = b"ed25519"
 MULTISIG_SUITE = b"ed25519-list"
 PRF_SUITE = b"blake2b-tag"
-AEAD_SUITE = b"auth0"
+AEAD_SUITE = b"xcs1"
 
 
 # --------------------------------------------------------------------------- #
@@ -213,49 +213,58 @@ MULTISIG = Ed25519ListMultiSig
 # --------------------------------------------------------------------------- #
 
 
-def _mac(subkey: bytes, aad: bytes, ct: bytes) -> bytes:
-    # Injective framing: le64(len(aad)) ‖ aad ‖ le64(len(ct)) ‖ ct, then keyed
-    # BLAKE2 (IMPLEMENTATION §1). Length prefixes stop aad/ct boundary confusion.
-    msg = len(aad).to_bytes(8, "little") + aad + len(ct).to_bytes(8, "little") + ct
-    return hashlib.blake2b(msg, key=subkey, digest_size=DIGEST_SIZE).digest()
+NONCE_SIZE = 24  # XChaCha20 (192-bit) nonce
+AEAD_TAG_SIZE = 16  # Poly1305 tag
 
 
-class AeadAuth0:
-    """Suite `auth0` (launch): authenticated-UNENCRYPTED. `ct = pt`; a keyed
-    BLAKE2 MAC binds (nonce, aad, ct). **Zero-knowledge is suspended — this
-    suite does not conceal payloads.** Every other property (provenance,
-    durability, CAS, finality, detect-and-punish) is exercised for real.
-    Migration to a real cipher (`b2s1`/`xcp1`) is a keyepoch rotation (§16)."""
+class AeadXcs1:
+    """Suite `xcs1`: XChaCha20-Poly1305-IETF (libsodium) with an SIV-derived,
+    misuse-resistant nonce. The kernel is deterministic, so nonces are *derived*,
+    not random; folding the plaintext into the nonce (SIV) makes keystream reuse
+    structurally impossible even for an equivocating/crash-retrying author who
+    emits two payloads under one header (CRYPTO.md §2). Zero-knowledge is on.
 
-    suite_id = b"auth0"
-    confidential = False
+    Sealed blob layout: `nonce(24) ‖ ciphertext ‖ tag(16)` — the derived nonce
+    travels with the ciphertext because `open` cannot re-derive it (it lacks the
+    plaintext). AD binds the envelope-minus-payload and is NOT stored (the caller
+    recomputes it from the envelope)."""
+
+    suite_id = b"xcs1"
+    confidential = True
 
     @staticmethod
-    def _subkey(k: bytes, nonce: bytes) -> bytes:
-        return hashlib.blake2b(nonce, key=k, person=b"dude.mac").digest()[:32]
+    def _nonce(k: bytes, aad: bytes, pt: bytes) -> bytes:
+        # SIV nonce (CRYPTO.md §2). nk: 32-byte keyed-BLAKE2b subkey under a fixed
+        # personalization; nonce: 24-byte keyed digest over AD ‖ H(plaintext), so
+        # two plaintexts under one header get independent nonces. These vectors are
+        # the construction's canonical reference (KATs; the Rust/Go ports match).
+        nk = hashlib.blake2b(b"", key=k, person=b"dude.nonce", digest_size=32).digest()
+        return hashlib.blake2b(aad + h(pt), key=nk, digest_size=NONCE_SIZE).digest()
 
     @classmethod
-    def seal(cls, k: bytes, nonce: bytes, aad: bytes, pt: bytes) -> tuple[bytes, bytes]:
-        ct = pt
-        tag = _mac(cls._subkey(k, nonce), aad, ct)
-        return ct, tag
+    def seal(cls, k: bytes, aad: bytes, pt: bytes) -> bytes:
+        nonce = cls._nonce(k, aad, pt)
+        enc = nacl.secret.Aead(k).encrypt(pt, aad, nonce)  # nonce ‖ ct ‖ tag
+        return bytes(enc)
 
     @classmethod
-    def open(cls, k: bytes, nonce: bytes, aad: bytes, ct: bytes, tag: bytes) -> bytes | None:
-        expected = _mac(cls._subkey(k, nonce), aad, ct)
-        if not hmac.compare_digest(expected, tag):
+    def open(cls, k: bytes, aad: bytes, sealed: bytes) -> bytes | None:
+        if len(sealed) < NONCE_SIZE + AEAD_TAG_SIZE:
+            return None
+        try:
+            return nacl.secret.Aead(k).decrypt(sealed, aad)
+        except (nacl.exceptions.CryptoError, ValueError):
             return None  # authentication failure — decrypt fails loudly (⊥)
-        return ct  # pt == ct under auth0
 
 
 AEAD_SUITES = {
-    b"auth0": AeadAuth0,
-    # b"b2s1": AeadB2s1,   # BLAKE2 stream+MAC — later (IMPLEMENTATION §1, M8)
-    # b"xcp1": AeadXcp1,   # vendored ChaCha20-Poly1305 — alternative
+    b"xcs1": AeadXcs1,
+    # runner-ups if a standards-stamped MRAE is demanded (CRYPTO.md §2): `dxy2`
+    # (Deoxys-II), `AES-SIV`/`AES-GCM-SIV` — each one keyepoch bump away.
 }
 
 
-def get_aead(suite_id: bytes = AEAD_SUITE) -> type[AeadAuth0]:
+def get_aead(suite_id: bytes = AEAD_SUITE) -> type[AeadXcs1]:
     try:
         return AEAD_SUITES[suite_id]
     except KeyError:
@@ -263,6 +272,7 @@ def get_aead(suite_id: bytes = AEAD_SUITE) -> type[AeadAuth0]:
 
 
 def zero_knowledge_active(aead_suite_id: bytes = AEAD_SUITE) -> bool:
-    """False under `auth0` — the README banner and `dude status` MUST say so
-    (IMPLEMENTATION §1). True once a confidential suite is active."""
+    """True under `xcs1` — payloads are genuinely encrypted (CRYPTO.md §2). The
+    README banner / `dude status` surface this; it was False under the retired
+    authenticated-unencrypted `auth0` launch suite."""
     return bool(get_aead(aead_suite_id).confidential)

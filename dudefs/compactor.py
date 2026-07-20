@@ -17,7 +17,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from . import artifacts as A
-from . import crypto, fold
+from . import fold
 from .artifacts import VERSION_ABSENT, Heads, Op
 from .handlers import data as data_handler
 from .handlers.data import Opaque
@@ -36,7 +36,7 @@ class CompactResult:
     attempts: dict[bytes, int]  # live keys with a nonzero attempt at the cut
 
 
-def _mut_meta(ops: list[Op], keyring: fold.Keyring, aead: bytes) -> dict[bytes, tuple[bool, bytes]]:
+def _mut_meta(ops: list[Op], keyring: fold.Keyring) -> dict[bytes, tuple[bool, bytes]]:
     """A MUTATIONS-ONLY meta fold (no guard re-eval): key -> (present, version)
     where `version` is the last mutation's op_hash — a SET's hash for a live key,
     the killing DEL's hash (the tombstone) for a dead one.
@@ -49,7 +49,7 @@ def _mut_meta(ops: list[Op], keyring: fold.Keyring, aead: bytes) -> dict[bytes, 
     then overlays the band's guard-evaluated `r.meta`."""
     meta: dict[bytes, tuple[bool, bytes]] = {}
     for op in sorted((o for o in ops if not o.is_control), key=fold._total_order_key):
-        d = data_handler.decode(op, keyring, aead)
+        d = data_handler.decode(op, keyring)
         if isinstance(d, Opaque):
             continue
         for m in d.mutations:
@@ -68,7 +68,6 @@ def compact(
     keyring: fold.Keyring,
     genesis: fold.Genesis,
     cut: Heads,
-    aead_suite: bytes | None = None,
 ) -> CompactResult:
     """INCREMENTAL compaction (DESIGN §12 rev 6, HANDOFF-R3 WP1.4 / Q4). Advance
     the checkpoint from `prev_cut` to `cut`, given the previous checkpoint's
@@ -80,7 +79,6 @@ def compact(
     new_retained` — the ops a node holding the previous baseline + this tail drops
     to reach the new baseline. A4 holds across BOTH the tail fold (winners/state)
     and the successive-checkpoint mask carry-forward (see `_mut_meta`)."""
-    aead = crypto.AEAD_SUITE if aead_suite is None else aead_suite
     # precondition: the cut monotonically advances prev_cut (no author regresses).
     for author, (pseq, _ph) in prev_cut.items():
         entry = cut.get(author)
@@ -89,7 +87,7 @@ def compact(
 
     prev_data = [o for o in prev_retained if not o.is_control]
     prev_control = [o for o in prev_retained if o.is_control]
-    prev_barrier = barrier_state(prev_data, prev_attempts, keyring, aead)
+    prev_barrier = barrier_state(prev_data, prev_attempts, keyring)
 
     # the band (prev_cut, cut] — the only ops we re-fold. Sealing the barrier at
     # prev_cut (NOT the new cut) is what keeps these tail ops in the fold instead
@@ -105,7 +103,6 @@ def compact(
         genesis,
         barrier=prev_barrier,
         cut_frontier=(prev_cut or None),
-        aead_suite=aead,
     )
     barrier = fold.make_barrier(r)  # authoritative live keys -> {value, version, attempt}
     winners = {e["version"] for e in barrier.values()}
@@ -122,7 +119,7 @@ def compact(
     # mutations-only fold would treat REJECTED ops as applied and drop real
     # tombstones. The ⊥ guard stops a band attempt-only lineage (a rejected create
     # bumps the attempt but leaves version ⊥) from erasing a below-prev_cut tomb.
-    meta_mut = _mut_meta(prev_data, keyring, aead)
+    meta_mut = _mut_meta(prev_data, keyring)
     for key, m in r.meta.items():
         if m.version != VERSION_ABSENT:
             meta_mut[key] = (m.present, m.version)
@@ -139,7 +136,7 @@ def compact(
             w = universe.get(wh)
             if w is None or w.is_control:
                 continue
-            d = data_handler.decode(w, keyring, aead)
+            d = data_handler.decode(w, keyring)
             if isinstance(d, Opaque):
                 continue
             for m in d.mutations:
@@ -165,27 +162,24 @@ def compact_genesis(
     keyring: fold.Keyring,
     genesis: fold.Genesis,
     cut: Heads,
-    aead_suite: bytes | None = None,
 ) -> CompactResult:
     """The first checkpoint: the degenerate `prev = ∅` of `compact` — fold the
     whole committed set below `cut` from scratch (DESIGN §12)."""
-    return compact([], {}, {}, committed_ops, keyring, genesis, cut, aead_suite)
+    return compact([], {}, {}, committed_ops, keyring, genesis, cut)
 
 
 def barrier_state(
     retained: list[Op],
     attempts: dict[bytes, int],
     keyring: fold.Keyring,
-    aead_suite: bytes | None = None,
 ) -> fold.BarrierState:
     """Reconstruct the barrier from the retained winner ops (DESIGN §12 bootstrap):
     a MUTATIONS-ONLY LWW fold in `(hlc, author, seq, op_hash)` order — NO guard
     re-evaluation (reading settled state, not re-deciding CAS) — then apply the
     attempts sidecar. A4: equals `make_barrier` of the full fold below the cut."""
-    aead = crypto.AEAD_SUITE if aead_suite is None else aead_suite
     live: dict[bytes, tuple[bytes, bytes]] = {}  # key -> (value, version)
     for op in sorted((o for o in retained if not o.is_control), key=fold._total_order_key):
-        d = data_handler.decode(op, keyring, aead)
+        d = data_handler.decode(op, keyring)
         if isinstance(d, Opaque):
             continue
         for m in d.mutations:

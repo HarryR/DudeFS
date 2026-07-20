@@ -163,7 +163,12 @@ class TestGoldenVectors(unittest.TestCase):
 
 
 # Golden constants captured from the reference implementation (M0 freeze).
-GOLDEN_OP_HASH = "37a34cb07514b88499aeaed18c320c93f314dbf438bccde768ccfae5245408df"
+# GOLDEN_OP_HASH bumped ONCE at the auth0→xcs1 crypto swap: the payload is now
+# real XChaCha20-Poly1305 ciphertext (was authenticated-plaintext), so the sealed
+# envelope — and its hash — changed. The slot-tag and receipt-message goldens are
+# untouched (they never involved the AEAD). Deterministic: the SIV nonce is a pure
+# function of (data_key, AD, plaintext), so this hash is stable across runs.
+GOLDEN_OP_HASH = "26143bb56b0450b396076a558e18e8b3da1b0355c49de937e5625fdfbee48d3a"
 GOLDEN_SLOT_TAG = "90f95fff86da601e863bff7a94a015ef6a55241da944541f4ee5ce26556a6c53"
 GOLDEN_RECEIPT_MSG_HASH = "14b2178154576d6005816103e16b6f4fee08c09fedcbce7323fdfb9d3e593bac"
 

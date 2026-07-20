@@ -415,7 +415,6 @@ def fold(
     keyring: Keyring,
     genesis: Genesis,
     barrier: BarrierState | None = None,
-    aead_suite: bytes | None = None,
     cut_frontier: Heads | None = None,
 ) -> FoldResult:
     """Deterministic fold of a *committed* op set (FORMAL A1). Any arrival order
@@ -423,8 +422,6 @@ def fold(
     `barrier` + `cut_frontier` to fold a checkpoint tail above a sealed barrier
     (bootstrap client, DESIGN §12). Raises FoldHalted at a lane-2 fence above
     SUPPORTED_PVER."""
-    if aead_suite is None:
-        aead_suite = crypto.AEAD_SUITE
     # The fold is a pure function of the committed *SET* (FORMAL A1): dedupe by
     # op_hash so re-delivery is a no-op (idempotent gossip, DESIGN §8).
     ops = list({op.op_hash: op for op in committed_ops}.values())
@@ -456,7 +453,7 @@ def fold(
     decoded: dict[bytes, Txn | Opaque] = {}  # op_hash -> parsed payload
     for op in ops_sorted:
         if not op.is_control:
-            decoded[op.op_hash] = data_handler.decode(op, keyring, aead_suite)
+            decoded[op.op_hash] = data_handler.decode(op, keyring)
 
     # ---- checkpoint partition: fold covered set, barrier, fold tail (§12) --- #
     stages: list[list[Op]] = []

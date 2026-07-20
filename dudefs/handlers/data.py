@@ -65,7 +65,7 @@ class EvalResult:
         self.slot_preimage = slot_preimage  # (key, version, attempt) | None
 
 
-def decode(op: Op, keyring: Keyring, aead_suite: bytes | None = None) -> Txn | Opaque:
+def decode(op: Op, keyring: Keyring) -> Txn | Opaque:
     """Open a data op's payload and parse the Txn, or return Opaque. keyring:
     {keyepoch: {"data_key":.., "slot_secret":..}} (DESIGN §3). Total over
     arbitrary envelopes: a missing/mistyped keyepoch or payload field is
@@ -74,8 +74,7 @@ def decode(op: Op, keyring: Keyring, aead_suite: bytes | None = None) -> Txn | O
         ring = keyring.get(op.keyepoch)
         if ring is None:
             return Opaque(OpaqueReason.NO_KEY)
-        suite = aead_suite if aead_suite is not None else _suite_default()
-        pt = op.open_payload(ring["data_key"], suite)
+        pt = op.open_payload(ring["data_key"])
     except (KeyError, A.ArtifactError, A.codec.CodecError):
         return Opaque(OpaqueReason.MALFORMED_TXN)  # unreadable envelope fields
     if pt is None:
@@ -84,12 +83,6 @@ def decode(op: Op, keyring: Keyring, aead_suite: bytes | None = None) -> Txn | O
         return A.Txn.decode(pt)
     except Exception:
         return Opaque(OpaqueReason.MALFORMED_TXN)
-
-
-def _suite_default() -> bytes:
-    from .. import crypto
-
-    return crypto.AEAD_SUITE
 
 
 def evaluate(txn: Txn, view: StateReader) -> EvalResult:

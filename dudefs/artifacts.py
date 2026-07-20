@@ -401,17 +401,12 @@ class Op:
         return True
 
     # ---- data payload open (client-only; needs the group key) ------------- #
-    def open_payload(self, data_key: bytes, aead_suite: bytes = crypto.AEAD_SUITE) -> bytes | None:
+    def open_payload(self, data_key: bytes) -> bytes | None:
         """Decrypt a data op's payload -> plaintext Txn bytes, or None on
         authentication failure (⊥). Control ops carry plaintext payloads and
-        must not be opened this way."""
-        aead = crypto.get_aead(aead_suite)
-        pay = self.payload
-        if len(pay) < 32:
-            return None
-        tag, ct = pay[:32], pay[32:]
-        nonce = self.aad_hash()
-        return aead.open(data_key, nonce, self.aad_hash(), ct, tag)
+        must not be opened this way. AD = envelope-minus-payload, recomputed from
+        the envelope; the SIV nonce travels inside the sealed blob (CRYPTO.md §2)."""
+        return crypto.get_aead().open(data_key, self.aad_hash(), self.payload)
 
     # ---- construction ----------------------------------------------------- #
     @classmethod
@@ -485,7 +480,6 @@ class Op:
         txn_bytes: bytes,
         slot_tag: bytes | None = None,
         pver: int = 0,
-        aead_suite: bytes = crypto.AEAD_SUITE,
     ) -> Self:
         """Build a data op: seal `txn_bytes` under the group key with
         AAD = envelope-minus-payload, then sign. The AAD is computed from the
@@ -504,9 +498,7 @@ class Op:
         if slot_tag is not None:
             base[Field.SLOT_TAG] = slot_tag
         aad = crypto.h(codec.encode(base))  # envelope-minus-payload-minus-sig
-        aead = crypto.get_aead(aead_suite)
-        ct, tag = aead.seal(data_key, aad, aad, txn_bytes)  # nonce == aad
-        payload = tag + ct
+        payload = crypto.get_aead().seal(data_key, aad, txn_bytes)  # nonce ‖ ct ‖ tag
         return cls.build(
             author_sk=author_sk,
             author_pub=author_pub,
