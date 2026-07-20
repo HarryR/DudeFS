@@ -461,6 +461,77 @@ class TestBaselineSync(unittest.TestCase):
         self.assertEqual(gossip.verify_baseline(dst, cut, committed), set())
 
 
+class TestBaselineProjection(unittest.TestCase):
+    """WP1.3: below-cut completeness is compared over the RETAINED projection
+    (covered ∖ dead), so a lazy-GC node agrees with a GC'd node and with the
+    checkpoint's winners-only commitment. Each test pins the bug by showing the
+    OLD all-covered digest gets it wrong."""
+
+    def _overwrite_world(self, seed):
+        # k written (first, dies) then overwritten (winner, retained).
+        w = World(seed=seed, n_clients=1)
+        below = list(w.control_ops)
+        first = w.cas(
+            0, b"k", A.VERSION_ABSENT, 0, [[A.Guard.ABSENT, b"k"]], [[A.Mutation.SET, b"k", b"v1"]]
+        )
+        below.append(first)
+        v, a = fold.fold(below, w.keyring, w.genesis).lineage(b"k")
+        winner = w.cas(
+            0, b"k", v, a, [[A.Guard.VERSION_EQ, b"k", v]], [[A.Mutation.SET, b"k", b"v2"]]
+        )
+        below.append(winner)
+        cut = _cut(w)
+        cr = compactor.compact(below, w.keyring, w.genesis, cut)
+        committed = A.retained_commitment(cr.retained)
+        return w, below, cut, cr, committed, first, winner
+
+    def test_lazy_gc_node_verifies_complete(self):
+        w, below, cut, cr, committed, first, _winner = self._overwrite_world(30)
+        dead = frozenset(cr.dead)
+        self.assertIn(first.op_hash, dead)
+
+        # a LAZY node: adopted the checkpoint, holds the winner AND the not-yet-GC'd
+        # dead `first`.
+        lazy = ChainStore()
+        for o in below:
+            lazy.append(o)
+        lazy.adopt_checkpoint(cut, committed, cr.dead)
+        self.assertIsNotNone(lazy.get_op(first.op_hash))  # dead op still physically held
+
+        # ACCEPT: over the retained projection it is complete...
+        self.assertEqual(gossip.verify_baseline(lazy, cut, committed, dead), set())
+        # ...and the store's own possession digest agrees (holds_frontier path).
+        self.assertEqual(lazy.baseline_commitment(), committed)
+        # load-bearing: the OLD all-covered digest (no dead mask) FALSE-rejects it.
+        self.assertNotEqual(gossip.verify_baseline(lazy, cut, committed), set())
+
+    def test_gc_and_lazy_peers_converge_no_oscillation(self):
+        w, below, cut, cr, committed, first, _winner = self._overwrite_world(31)
+        dead = frozenset(cr.dead)
+
+        lazy = ChainStore()  # holds winner + dead first
+        for o in below:
+            lazy.append(o)
+        lazy.adopt_checkpoint(cut, committed, cr.dead)
+
+        gc = ChainStore()  # adopted + physically GC'd: winner only
+        for o in below:
+            gc.append(o)
+        gc.adopt_checkpoint(cut, committed, cr.dead)
+        gc.gc_checkpoint(cr.dead)
+        self.assertIsNone(gc.get_op(first.op_hash))
+
+        # ACCEPT/converge: neither direction re-pulls the dead envelope.
+        self.assertEqual(gossip.pull_baseline(gc, lazy, cut, dead), 0)
+        self.assertEqual(gossip.pull_baseline(lazy, gc, cut, dead), 0)
+        self.assertIsNone(gc.get_op(first.op_hash))  # gc did NOT re-acquire the dead op
+
+        # load-bearing: WITHOUT the dead mask the GC'd node re-pulls `first` from
+        # the lazy peer — the oscillation the projection fix removes.
+        self.assertGreater(gossip.pull_baseline(gc, lazy, cut), 0)
+        self.assertIsNotNone(gc.get_op(first.op_hash))  # re-acquired (the bug)
+
+
 class TestVoidRule(unittest.TestCase):
     def test_reborn_tag_below_horizon_is_voided_on_prepare(self):
         # NOTES 27: a reborn creation tag whose old slot decision sits un-GC'd

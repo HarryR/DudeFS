@@ -23,9 +23,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from . import artifacts as A
 from .artifacts import HLC, QC, Heads, Op, Receipt
-from .store import ChainStore
+from .store import ChainStore, baseline_digest
 from .store import covered as _covered  # the canonical cut boundary (store L2)
 
 # --------------------------------------------------------------------------- #
@@ -52,11 +51,15 @@ class Summary:
 
 
 def summary(
-    store: ChainStore, epoch: int = 0, cut: Heads | None = None, checkpoint: bytes = b""
+    store: ChainStore,
+    epoch: int = 0,
+    cut: Heads | None = None,
+    checkpoint: bytes = b"",
+    dead: frozenset[bytes] = frozenset(),
 ) -> Summary:
-    baseline = (
-        A.retained_commitment([o for o in store.all_ops() if _covered(o, cut)]) if cut else {}
-    )
+    # the advertised baseline commits to the RETAINED projection (covered ∖ dead),
+    # so a lazy-GC node and a GC'd node advertise the SAME digest (WP1.3).
+    baseline = baseline_digest(store.all_ops(), cut, dead) if cut else {}
     return Summary(
         heads={author: seq for author, (seq, _hh) in store.heads().items()},
         receipts=frozenset((r.op_hash, r.signer) for r in store.all_receipts()),
@@ -134,18 +137,24 @@ def pull_op(dst: ChainStore, src: ChainStore, op_hash: bytes) -> bool:
 # not the contiguous-run DELTA the dense tail uses.
 
 
-def pull_baseline(dst: ChainStore, src: ChainStore, cut: Heads) -> int:
+def pull_baseline(
+    dst: ChainStore, src: ChainStore, cut: Heads, dead: frozenset[bytes] = frozenset()
+) -> int:
     """Sync the sparse below-cut baseline from `src` into `dst`: compare per-author
-    retained digests and, for each author whose digest differs, pull `src`'s
-    below-cut retained ops (envelopes ONLY — there are no receipts/QCs below the
+    RETAINED projections (covered ∖ dead) and, for each author whose digest differs,
+    pull `src`'s retained below-cut ops (envelopes ONLY — no receipts/QCs below the
     cut). Returns how many envelopes were pulled. The digest localizes the diff to
-    an author, so a lagging node never refetches the whole 5–10 GB baseline."""
+    an author, so a lagging node never refetches the whole 5–10 GB baseline.
+
+    Excluding `dead` is load-bearing (WP1.3): without it a GC'd node and a lazy-GC
+    peer disagree every round and re-pull each other's superseded envelopes forever
+    (the oscillation bug). Only winners cross the wire, and only on a real diff."""
+    dst_digest = baseline_digest(dst.all_ops(), cut, dead)
+    src_digest = baseline_digest(src.all_ops(), cut, dead)
     src_below: dict[bytes, list[Op]] = {}
     for o in src.all_ops():
-        if _covered(o, cut):
+        if _covered(o, cut) and o.op_hash not in dead:
             src_below.setdefault(o.author, []).append(o)
-    dst_digest = A.retained_commitment([o for o in dst.all_ops() if _covered(o, cut)])
-    src_digest = A.retained_commitment([o for run in src_below.values() for o in run])
     pulled = 0
     for author, ops in src_below.items():
         if dst_digest.get(author) != src_digest.get(author):
@@ -157,12 +166,17 @@ def pull_baseline(dst: ChainStore, src: ChainStore, cut: Heads) -> int:
 
 
 def verify_baseline(
-    store: ChainStore, cut: Heads, committed: dict[bytes, tuple[int, bytes]]
+    store: ChainStore,
+    cut: Heads,
+    committed: dict[bytes, tuple[int, bytes]],
+    dead: frozenset[bytes] = frozenset(),
 ) -> set[bytes]:
     """Verify a node/client holds the FULL below-cut baseline against the
     checkpoint's signed `retained` commitment (DESIGN §12 intake, NOTES 29c/29d).
     Returns the set of authors whose held baseline doesn't match — empty means
-    complete. A tampered or partial baseline (a missing/extra op) fails here,
+    complete. Compared over the RETAINED projection (covered ∖ dead, NOTES 34 Q2)
+    so a node that has adopted the checkpoint but not yet GC'd its `dead` ops still
+    verifies complete. A tampered or genuinely partial baseline fails here,
     localized to the author; the checkpoint signature is verified separately."""
-    have = A.retained_commitment([o for o in store.all_ops() if _covered(o, cut)])
+    have = baseline_digest(store.all_ops(), cut, dead)
     return {a for a in set(have) | set(committed) if have.get(a) != committed.get(a)}

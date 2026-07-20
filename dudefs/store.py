@@ -27,6 +27,17 @@ def covered(op: Op, cut: Heads) -> bool:
     return entry is not None and op.seq <= entry[0]
 
 
+def baseline_digest(
+    ops: list[Op], cut: Heads, dead: frozenset[bytes]
+) -> dict[bytes, tuple[int, bytes]]:
+    """The per-author commitment over the RETAINED below-cut projection —
+    `covered ∖ dead` (DESIGN §12 / NOTES 34, Q2). Excluding `dead` is what makes
+    a lazy-GC node (still holding superseded ops) agree with a GC'd node and with
+    the checkpoint's winners-only `retained`: both project to the same winners, so
+    completeness compares equal and neither re-pulls the other's dead envelopes."""
+    return A.retained_commitment([o for o in ops if covered(o, cut) and o.op_hash not in dead])
+
+
 def _encode_pairs(d: dict[bytes, tuple[int, bytes]]) -> bytes:
     """Serialize a {key: (n, hash)} map (a cut or a retained commitment) for the
     durable `meta` table."""
@@ -312,15 +323,23 @@ class ChainStore:
         return out
 
     # ---- checkpoint cut (the log-compaction boundary; DESIGN §12) ---------- #
-    def adopt_checkpoint(self, cut: Heads, retained: dict[bytes, tuple[int, bytes]]) -> None:
-        """Persist the active compaction cut + its `retained` commitment on
-        observing a quorum-committed checkpoint (WP1.2). DURABLE — the cut
-        re-parametrizes heads()/append()/possession below it, so it must survive
-        crash-restart exactly like the floor (both `set_meta` writes COMMIT-fsync).
-        GC of the `dead` delta is a separate step (gc_checkpoint); adoption must
-        precede it so the gates never see dropped ops without the cut."""
+    def adopt_checkpoint(
+        self,
+        cut: Heads,
+        retained: dict[bytes, tuple[int, bytes]],
+        dead: list[bytes] = [],  # noqa: B006 (read-only default; never mutated)
+    ) -> None:
+        """Persist the active compaction cut, its `retained` commitment, and the
+        `dead` set on observing a quorum-committed checkpoint (WP1.2/1.3). DURABLE
+        — the cut re-parametrizes heads()/append()/possession below it, and `dead`
+        is the RETAINED-projection mask (covered ∖ dead) the possession and
+        completeness checks run against while GC is still lazy; all must survive
+        crash-restart like the floor (`set_meta` COMMIT-fsyncs). Physical GC of
+        `dead` is a separate step (gc_checkpoint); adoption must precede it so the
+        gates never see dropped ops without the cut."""
         self.set_meta("cut", _encode_pairs(cut))
         self.set_meta("cut_retained", _encode_pairs(retained))
+        self.set_meta("cut_dead", codec.encode(list(dead)))
 
     def cut(self) -> Heads:
         """The active compaction cut, or {} when uncompacted (pre-M6 behavior)."""
@@ -333,12 +352,22 @@ class ChainStore:
         raw = self.get_meta("cut_retained")
         return _decode_pairs(raw) if raw else {}
 
+    def cut_dead(self) -> frozenset[bytes]:
+        """The active checkpoint's `dead` set — masked out of the retained
+        projection while GC is lazy (post-GC these ops are gone, so the mask is a
+        no-op). Empty when uncompacted."""
+        raw = self.get_meta("cut_dead")
+        if not raw:
+            return frozenset()
+        return frozenset(codec.as_bytes(h) for h in codec.as_seq(codec.decode(raw)))
+
     def baseline_commitment(self) -> dict[bytes, tuple[int, bytes]]:
-        """This node's ACTUAL retained commitment over the below-cut ops it holds
-        — compared per author against cut_retained() to prove baseline
-        completeness (WP1.2 possession, WP1.3 gossip)."""
-        cut = self.cut()
-        return A.retained_commitment([o for o in self.all_ops() if covered(o, cut)])
+        """This node's ACTUAL commitment over the RETAINED below-cut projection
+        (covered ∖ dead) — compared per author against cut_retained() to prove
+        baseline completeness (WP1.2 possession, WP1.3 gossip). Excluding `dead`
+        lets a lazy-GC node prove completeness before it has physically dropped
+        the superseded ops."""
+        return baseline_digest(self.all_ops(), self.cut(), self.cut_dead())
 
     def gc_checkpoint(self, dead: list[bytes]) -> None:
         """Log-compaction GC (DESIGN §12 rev 6): on observing a quorum-committed
