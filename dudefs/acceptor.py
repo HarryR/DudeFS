@@ -182,7 +182,9 @@ class Acceptor:
     # ------------------------------------------------------------------ #
     # ACCEPT — classic Paxos phase 2 (DESIGN §8 recovery)               #
     # ------------------------------------------------------------------ #
-    def on_accept(self, tag: bytes, ballot: Ballot, op: Op, now_ms: int) -> AcceptResult:
+    def on_accept(
+        self, tag: bytes, ballot: Ballot, op: Op, now_ms: int, *, receipt_epoch: int | None = None
+    ) -> AcceptResult:
         if not (op.verify_structure() and op.verify_sig(op.author)):
             return Rejected(RejectReason.BAD_STRUCTURE)
         if op.slot_tag != tag:
@@ -208,13 +210,72 @@ class Acceptor:
         self.store._write_slot(tag, s)
         self._advance_hw(op)
         self.store.commit()  # fsync before signing
-        return self._issue_receipt(op.op_hash, ballot)
+        return self._issue_receipt(op.op_hash, ballot, receipt_epoch)
 
-    def _issue_receipt(self, op_hash: bytes, ballot: Ballot) -> Receipt:
+    def _issue_receipt(self, op_hash: bytes, ballot: Ballot, epoch: int | None = None) -> Receipt:
         """Sign a receipt AND persist it. A node holds every receipt it issues so
         gossip can spread it and any node can assemble the QC from a quorum
         (PROTOCOL §2.2, §1.4). Storage is derived from the already-fsynced slot
-        state, so it never outlives its justification (RESILIENCE §0)."""
-        r = A.Receipt.issue(self.sk, self.pub, op_hash, self.epoch, ballot)
+        state, so it never outlives its justification (RESILIENCE §0). `epoch`
+        overrides the node's current epoch — a new-roster node receipts a roster
+        op under e+1 before activating (DESIGN §13)."""
+        ep = self.epoch if epoch is None else epoch
+        r = A.Receipt.issue(self.sk, self.pub, op_hash, ep, ballot)
         self.store.put_receipt(r)
         return r
+
+    # ------------------------------------------------------------------ #
+    # Membership / epoch bridge (DESIGN §13, PROTOCOL §3.1)               #
+    # ------------------------------------------------------------------ #
+    def activate_epoch(self, new_epoch: int) -> None:
+        """Switch config epochs on holding a roster op's joint certificate. Slot
+        acceptor state `(promised, accepted_ballot, accepted_op)` is UNTOUCHED — it
+        carries across epochs unchanged; the node simply issues receipts, promises,
+        and watermarks under `new_epoch` from now on (DESIGN §13)."""
+        if new_epoch > self.epoch:
+            self.epoch = new_epoch
+
+    def on_rereceipt(self, target: bytes) -> Receipt | None:
+        """RERECEIPT (PROTOCOL §1.1): re-issue a receipt under the node's CURRENT
+        epoch for an op/slot it already holds, so a client can assemble a fresh
+        single-epoch QC for an op that was in-flight across a roster change (DESIGN
+        §13). Idempotent — the slot state is untouched. `target` is a slot_tag
+        (re-receipt its accepted op at its accepted ballot) or a blind op_hash."""
+        s = self.store.get_slot(target)
+        if s.accepted_op is not None and s.accepted_ballot is not None:
+            return self._issue_receipt(s.accepted_op, s.accepted_ballot)
+        if self.store.get_op(target) is not None:
+            return self._issue_receipt(target, BLIND)  # blind op held directly
+        return None
+
+    def holds_frontier(self, sync_frontier: A.Heads) -> bool:
+        """The data-possession barrier (DESIGN §13): does this node hold every
+        committed op at or below `sync_frontier`? Checks that its contiguous head
+        for each author reaches the frontier seq AND that it holds the exact
+        frontier op — so a new-roster node's receipt proves possession, not just
+        agreement. A node that fails this PULLs to baseline and retries."""
+        heads = self.store.heads()
+        for author, (seq, head_hash) in sync_frontier.items():
+            cur = heads.get(author)
+            if cur is None or cur[0] < seq or self.store.get_op(head_hash) is None:
+                return False
+        return True
+
+    def on_roster_accept(
+        self,
+        tag: bytes,
+        ballot: Ballot,
+        op: Op,
+        sync_frontier: A.Heads,
+        new_epoch: int,
+        now_ms: int,
+    ) -> AcceptResult:
+        """A NEW-roster node accepting a roster op (DESIGN §13 step 4): gate on the
+        possession barrier, then accept via the ordinary slot machinery but stamp
+        the receipt `new_epoch` (e+1). That receipt is simultaneously the agreement
+        proof and the data-possession proof — the joint certificate's new half. The
+        caller (a manager, L4+) supplies `sync_frontier`/`new_epoch` decoded from the
+        op body, so the acceptor stays free of the L6 control vocabulary."""
+        if not self.holds_frontier(sync_frontier):
+            return Rejected(RejectReason.UNKNOWN_PREV)  # not caught up — PULL, then retry
+        return self.on_accept(tag, ballot, op, now_ms, receipt_epoch=new_epoch)

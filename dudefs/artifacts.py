@@ -129,6 +129,14 @@ def slot_priority(slot_tag: bytes, client_fp: bytes) -> bytes:
     return crypto.h(slot_tag + client_fp)
 
 
+def roster_slot_tag(epoch: int) -> bytes:
+    """The public slot a roster change `epoch -> epoch+1` contends on (DESIGN §13):
+    `h("roster" ‖ epoch)`. Plaintext — the roster is public, so this needs no PRF
+    secrecy; it just serializes roster changes so at most one activates out of any
+    epoch (B4). Contested on the OLD roster through the ordinary ballot machinery."""
+    return crypto.h(b"roster" + codec.encode(int(epoch)))
+
+
 def quorum_size(n: int) -> int:
     """Majority = floor(n/2)+1 = ceil((n+1)/2) (DESIGN §13).
     n=1->1, 3->2, 5->3, 7->4."""
