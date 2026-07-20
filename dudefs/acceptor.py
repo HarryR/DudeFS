@@ -178,16 +178,21 @@ class Acceptor:
         # report an ancient decided op that §1.3 would re-propose but that can never
         # re-commit (its hlc is below the floor), a livelock until every node GCs.
         # Discard the accept; the promise reports a fresh slot and the new op wins.
+        accepted_hlc: HLC | None = None
         if s.accepted_op is not None:
             acc = self.store.get_op(s.accepted_op)
             if acc is None or acc.hlc < self.horizon:
                 s.accepted_ballot = None
                 s.accepted_op = None
+            else:
+                accepted_hlc = acc.hlc  # reported so the client can apply its own guard
         if ballot > s.promised:
             s.promised = ballot
             self.store._write_slot(tag, s)
             self.store.commit()  # fsync before signing the promise
-            return A.Promise.issue(self.sk, self.pub, tag, ballot, s.accepted_ballot, s.accepted_op)
+            return A.Promise.issue(
+                self.sk, self.pub, tag, ballot, s.accepted_ballot, s.accepted_op, accepted_hlc
+            )
         return Nack(s.promised)
 
     def advance_horizon(self, hlc: HLC) -> None:

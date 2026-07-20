@@ -652,6 +652,58 @@ and A4 as formally stated. Resolutions decided with the design owner; DESIGN
       replacements, or keep one legacy endpoint record alive as a forwarder
       until client caches have rolled over.
 
+## R1 adversarial review findings (2026-07-21) — false rejections + containment
+
+33. **Adversarial review of M0–M6 (three parallel reviewers, all findings
+    verified against code). Two correctness bugs FIXED; a cut-unaware gossip
+    trio RAISED for pre-M7 fix.**
+    - **(7, SEVERE, FIXED) Resurrection mask must be a FIXPOINT.** `compact()`
+      scanned only `winners`, but a retained mask tombstone is itself replayed at
+      bootstrap — a chain `W(set A,B) → X(del B, set C) → Z(del C)` retained X to
+      mask B but GC'd Z, so bootstrap resurrected C (A4 broken: `full={A}`,
+      `boot={A,C}`). NOTES 29b is a fixpoint ("no *retained* op mutates its key").
+      Fixed: closure over newly-added masks. Regression:
+      `test_A4_resurrection_mask_is_a_fixpoint`.
+    - **(5, MEDIUM, FIXED — code, not doc) Client below-horizon guard.** The R1
+      reviewer flagged it "unimplementable — `Promise` lacks the accepted op's
+      hlc." Owner ruling: **fix the code to meet the design, do not weaken the
+      design** — the guard (DESIGN §8 / PROTOCOL §1.3 step 3) is well-specified.
+      `Promise` now carries `accepted_hlc` (wire change — R2 note); `QuorumConfig`
+      gains `horizon`; `_choose_and_accept` treats a below-horizon accept as
+      no-accept. Tests: reborn op wins with the horizon set, ancient re-proposed
+      without it. Documents win; the struct grew a field.
+    - **(1, CRITICAL, RAISED — latent) `store.heads()` severs the dense tail
+      after GC.** heads() anchors runs at `seq==0`; after GC drops a below-cut
+      seq-0 op the author vanishes from heads(), so its valid tail is never
+      gossiped/advertised/served in a frontier bundle. The `gc_checkpoint`
+      docstring promises "pinned heads stay" — NOT implemented. Fix (pre-M7):
+      thread the active `cut` into `heads()`/`append()` and keep a pinned per-author
+      cut-boundary head that GC preserves.
+    - **(2, HIGH, RAISED — latent) `store.append()` GAPs a valid tail op** whose
+      `seq-1 ≤ cut` predecessor was GC'd — PROTOCOL §2.1's cut contiguity
+      exemption is uncoded. Same fix family as (1).
+    - **(3, MEDIUM, RAISED — live) `verify_baseline` false-rejects a complete
+      baseline** that still holds not-yet-GC'd dead ops (the normal lazy-GC
+      state): its digest is over all covered ops, the checkpoint's over winners
+      only. Fix: compare over retained semantics, or accept `have ⊇ committed`.
+    - **(4, HIGH, RAISED) `Commit._on_fetch_reply` false-abort.** Returns
+      `Failed(EXHAUSTED)` on ANY non-matching reply, so a late/hedged promise or
+      Nack during the FETCH window aborts a decidable commit. Fix: `return []`,
+      let the round-timeout escalate.
+    - **(8/9/10, LOW, R2 rulings)** `dead` is the full below-cut set not the
+      incremental delta (cost); cert `epoch` decoded but unenforced (permissive);
+      equivocating-manager non-nested cuts → double barrier (Byzantine root, out
+      of model). **Reviewers CLEARED** as correctly-strict: skew boundaries,
+      equivocation guard, QC bitmap, `_CAP_FOR_KIND`, pver fence, revocation
+      ordering, universe reset, attempts-sidecar completeness, codec extractors,
+      `holds_frontier`.
+    - **Root theme:** M6 compaction left three read/validate gates cut-unaware;
+      the M6 tests missed them by using clean already-GC'd stores. The testing
+      plan adds a false-rejection matrix (boundary-valid-ACCEPTED beside each
+      invalid-rejected test), an adversarial-node sim suite (equivocator / floor
+      perjurer / time-traveller / amnesiac manager, per RESILIENCE §3), and A4 as
+      a property/fuzz test (the fixpoint class a point vector misses).
+
 # Not yet built (by design, M2+)
 
 QCs are *constructed and verified* (M0) but no acceptor, quorum client, floor,

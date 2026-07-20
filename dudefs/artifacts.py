@@ -712,7 +712,11 @@ class Receipt:
 
 
 def promise_message(
-    tag: bytes, ballot: Ballot, accepted_ballot: Ballot | None, accepted_op_hash: bytes | None
+    tag: bytes,
+    ballot: Ballot,
+    accepted_ballot: Ballot | None,
+    accepted_op_hash: bytes | None,
+    accepted_hlc: HLC | None,
 ) -> bytes:
     return codec.encode(
         [
@@ -720,16 +724,28 @@ def promise_message(
             ballot.encode(),
             accepted_ballot.encode() if accepted_ballot is not None else b"",
             accepted_op_hash if accepted_op_hash is not None else b"",
+            list(accepted_hlc.encode()) if accepted_hlc is not None else b"",
         ]
     )
 
 
 class Promise:
     """Reply to PREPARE(tag, ballot): the node has promised `ballot` and reports
-    the highest op it has already accepted for `tag` (if any). Signed — a
-    proposer's evidence of the promise (PROTOCOL §1.1)."""
+    the highest op it has already accepted for `tag` (if any), WITH that op's
+    `hlc` — so a proposer can apply the below-horizon guard (a promised accept
+    with hlc below the client's checkpoint horizon is treated as no accept,
+    DESIGN §8 / PROTOCOL §1.3 step 3; the belt-and-braces half of the NOTES-27
+    reborn-tag void rule). Signed — a proposer's evidence of the promise."""
 
-    __slots__ = ("tag", "ballot", "accepted_ballot", "accepted_op_hash", "signer", "sig")
+    __slots__ = (
+        "tag",
+        "ballot",
+        "accepted_ballot",
+        "accepted_op_hash",
+        "accepted_hlc",
+        "signer",
+        "sig",
+    )
 
     def __init__(
         self,
@@ -737,6 +753,7 @@ class Promise:
         ballot: Ballot,
         accepted_ballot: Ballot | None,
         accepted_op_hash: bytes | None,
+        accepted_hlc: HLC | None,
         signer: bytes,
         sig: bytes,
     ):
@@ -744,12 +761,15 @@ class Promise:
         self.ballot = ballot
         self.accepted_ballot = accepted_ballot  # Ballot | None
         self.accepted_op_hash = accepted_op_hash  # bytes | None
+        self.accepted_hlc = accepted_hlc  # HLC | None — the accepted op's hlc
         self.signer = signer
         self.sig = sig
 
     @property
     def message(self):
-        return promise_message(self.tag, self.ballot, self.accepted_ballot, self.accepted_op_hash)
+        return promise_message(
+            self.tag, self.ballot, self.accepted_ballot, self.accepted_op_hash, self.accepted_hlc
+        )
 
     def verify(self) -> bool:
         return crypto.SIGNER.verify(self.signer, self.message, self.sig)
@@ -762,13 +782,15 @@ class Promise:
         ballot: Ballot,
         accepted_ballot: Ballot | None,
         accepted_op_hash: bytes | None,
+        accepted_hlc: HLC | None,
     ) -> Promise:
-        msg = promise_message(tag, ballot, accepted_ballot, accepted_op_hash)
+        msg = promise_message(tag, ballot, accepted_ballot, accepted_op_hash, accepted_hlc)
         return Promise(
             tag,
             ballot,
             accepted_ballot,
             accepted_op_hash,
+            accepted_hlc,
             node_pub,
             crypto.SIGNER.sign(node_sk, msg),
         )

@@ -162,6 +162,51 @@ class TestSplitVote(unittest.TestCase):
         self.assertIn(qc.op_hash, {opA.op_hash, opB.op_hash, mine.op_hash})
 
 
+class TestBelowHorizonGuard(unittest.TestCase):
+    def _reborn_scenario(self, horizon):
+        # nodes hold an ANCIENT decision at a reborn tag (hlc 50); their horizons
+        # are NOT advanced, so on_prepare reports the ancient op (with its hlc). A
+        # client commits a new op at the SAME tag with `horizon` configured.
+        nodes, roster = _cluster(3)
+        w = World(seed=20, n_clients=2)
+        tag = A.compute_slot_tag(w.keyring[0]["slot_secret"], b"k", A.VERSION_ABSENT, 0)
+        ancient = w.data_op(
+            0,
+            txn=A.Txn((b"k", A.VERSION_ABSENT, 0), [], [[A.Mutation.SET, b"k", b"old"]]),
+            slot_tag=tag,
+            hlc=A.HLC(50, 0),
+        )
+        _preaccept(nodes, ancient, A.Ballot(1, b"\x01"))
+        reborn = w.data_op(
+            1,
+            txn=A.Txn((b"k", A.VERSION_ABSENT, 0), [], [[A.Mutation.SET, b"k", b"new"]]),
+            slot_tag=tag,
+            hlc=A.HLC(NOW, 0),
+        )
+        cfg = Q.QuorumConfig(
+            roster=roster, epoch=0, client_fp=A.fingerprint(reborn.author), horizon=horizon
+        )
+        return _Driver(nodes).run(Q.Commit(cfg, reborn)), ancient, reborn
+
+    def test_below_horizon_accept_is_ignored_reborn_op_wins(self):
+        # NOTES 27 belt-and-braces (DESIGN §8 / PROTOCOL §1.3 step 3): with the
+        # horizon above the ancient op, the client treats the promise as no-accept
+        # and proposes its own reborn op — no re-proposing a sealed op that can
+        # never re-commit (the livelock the void rule guards, from the client side).
+        outcome, _ancient, reborn = self._reborn_scenario(A.HLC(100, 0))
+        self.assertIsInstance(outcome, Q.Committed)
+        assert isinstance(outcome, Q.Committed)
+        self.assertEqual(outcome.qc.op_hash, reborn.op_hash)
+
+    def test_without_horizon_the_ancient_accept_is_re_proposed(self):
+        # contrast: horizon 0 -> the guard never fires -> §1.3 re-proposes the
+        # ancient op (LostSlot), exactly the behavior the guard exists to avoid.
+        outcome, ancient, _reborn = self._reborn_scenario(A.HLC(0, 0))
+        self.assertIsInstance(outcome, Q.LostSlot)
+        assert isinstance(outcome, Q.LostSlot)
+        self.assertEqual(outcome.winner, ancient.op_hash)
+
+
 class TestBallotFairness(unittest.TestCase):
     def test_per_slot_tiebreak_prevents_starvation(self):
         # NOTES item 24d: a fixed pair of clients (raw fp ordering is constant, so

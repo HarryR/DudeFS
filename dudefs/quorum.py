@@ -43,6 +43,7 @@ class QuorumConfig:
     max_rounds: int = tunables.MAX_ROUNDS
     finality_poll_ms: int = tunables.FINALITY_POLL_MS
     max_polls: int = tunables.MAX_POLLS
+    horizon: HLC = HLC(0, 0)  # the client's known checkpoint horizon (below-horizon guard)
 
     @property
     def n(self) -> int:
@@ -362,6 +363,13 @@ class Commit:
         best: tuple[Ballot, bytes] | None = None
         for p in self._promises.values():
             if p.accepted_op_hash is not None and p.accepted_ballot is not None:
+                # below-horizon guard (DESIGN §8 / PROTOCOL §1.3 step 3): an accept
+                # whose op is below the client's checkpoint horizon is sealed and
+                # can never re-commit — treat it as NO accept, so a reborn tag does
+                # not re-propose an ancient decided op (belt-and-braces for the
+                # acceptor void rule against a node that hasn't advanced its horizon).
+                if p.accepted_hlc is not None and p.accepted_hlc < self.cfg.horizon:
+                    continue
                 if best is None or p.accepted_ballot > best[0]:
                     best = (p.accepted_ballot, p.accepted_op_hash)
         if best is None or best[1] == self.op.op_hash:
