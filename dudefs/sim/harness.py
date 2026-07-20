@@ -235,20 +235,34 @@ class Sim:
         by_op = self._b1.receipts.setdefault((slot, ballot), {})
         by_op.setdefault(op_hash, set()).add(node)
         quorumed = [h for h, nodes in by_op.items() if len(nodes) >= self.quorum]
-        # B1 (FORMAL, rev 5 — the strengthened invariant): at most one op ever
-        # obtains a quorum, both at a single ballot AND across all ballots. The
-        # two-phase-only slot layer makes this unconditional (no fast-path
-        # collision), so the sim asserts full single-decree.
-        assert len(quorumed) <= 1, (
-            f"B1 violated: {len(quorumed)} ops reached a same-ballot quorum "
-            f"for one slot at {ballot}"
-        )
+        # B1 (FORMAL, rev 5): at most one op ever obtains a quorum for a slot, both
+        # at a single ballot AND across all ballots — STRICT single-decree for
+        # all-honest quorums. With adversarial personas present it relaxes to
+        # exactly FORMAL B6 (NOTES 41 ruling a): an equivocator CAN mint duplicate
+        # same-slot QCs (RESILIENCE §3.1), but only via its own equivocation, so
+        # every such duplicate must trace to a persona node — never an honest one.
+        if len(quorumed) > 1:
+            self._b1_relaxed(quorumed, by_op, "same-ballot", ballot)
         if quorumed:
             decided = self._b1.decided.setdefault(slot, set())
-            decided.add(quorumed[0])
-            assert len(decided) == 1, (
-                f"B1 violated: {len(decided)} distinct ops decided for one slot "
-                f"(cross-ballot) — {[h.hex()[:8] for h in decided]}"
+            decided.update(quorumed)
+            if len(decided) > 1:
+                self._b1_relaxed(list(decided), None, "cross-ballot", ballot)
+
+    def _b1_relaxed(self, ops, by_op, kind: str, ballot: Ballot) -> None:
+        """A slot got >1 QC. Legal ONLY under personas (NOTES 41 a): assert a
+        persona is responsible. For same-ballot, the equivocator is the node in the
+        intersection of the quorums (it receipted two ops at one ballot); it must be
+        a known persona. The one-winner fold and the assemblable DOUBLE_VOTE proof
+        (B6's other two clauses) are asserted by the persona tests."""
+        personas = set(self._personas)
+        assert personas, (
+            f"B1 violated ({kind}): {len(ops)} ops decided one slot at {ballot}; no persona"
+        )
+        if by_op is not None:
+            doubles = {n for h in ops for n in by_op[h] if sum(n in by_op[g] for g in ops) >= 2}
+            assert doubles and doubles <= personas, (
+                f"B1 violated ({kind}): duplicate same-slot QCs but the intersection is HONEST"
             )
 
     def _on_floor(self, node: int, floor: HLC) -> None:

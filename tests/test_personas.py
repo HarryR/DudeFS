@@ -55,6 +55,28 @@ class TestEquivocator(unittest.TestCase):
         r = fold.fold([*w.all_control(), a, b], w.keyring, w.genesis)
         self.assertIn(r.state.get(b"k"), (b"A", b"B"))  # one value, never both
 
+    def test_two_qcs_via_equivocator_pass_relaxed_b1(self):
+        # NOTES 41 (a): an equivocator CAN mint two QCs for one slot (two quorums
+        # intersecting only in it). The old STRICT B1 would crash the harness on
+        # this documented behavior; the relaxed rule passes it — every duplicate
+        # traces to the persona, the fold yields one winner, a proof is assemblable.
+        sim = Sim(seed=3, n=3, personas={0: EquivocatingAcceptor})
+        w = World(seed=3, n_clients=2)
+        a, b = creation_op(w, 0, b"A"), creation_op(w, 1, b"B")  # same slot
+        assert a.slot_tag is not None
+        tag, ballot = a.slot_tag, A.Ballot(1, b"x")
+        # node 0 (persona) signs BOTH; node 1 signs a, node 2 signs b -> QCs {0,1},{0,2}
+        sim.nodes[0].accept(tag, ballot, a)
+        sim.nodes[0].accept(tag, ballot, b)
+        sim.nodes[1].accept(tag, ballot, a)
+        sim.nodes[2].accept(tag, ballot, b)  # this call reaches the 2nd QC; relaxed B1 must pass
+        self.assertEqual(sim.decided_ops(tag), {a.op_hash, b.op_hash})  # two decrees, allowed
+        # B6's other clauses: proof assemblable + fold still one winner
+        gossip.merge(sim._raw[1].acc.store, sim._raw[0].acc.store)
+        self.assertTrue(sim._raw[1].acc.store.detect_double_votes())
+        r = fold.fold([*w.all_control(), a, b], w.keyring, w.genesis)
+        self.assertIn(r.state.get(b"k"), (b"A", b"B"))
+
     def test_equivocator_alone_does_not_trip_quorum_b1(self):
         # the honest B1 continuous check (quorum-level) must NOT fire for a lone
         # equivocator: it holds only its own two receipts, never a quorum's.

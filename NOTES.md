@@ -1072,6 +1072,52 @@ and A4 as formally stated. Resolutions decided with the design owner; DESIGN
     checkpoint-aware sim plumbing (adopt/GC hooks) before it can
     compose partitions with compaction.
 
+41. **WP3.1 + WP4.7 REVIEW (2026-07-21, `3d71dfe..0ca9e29`): CLEARED —
+    continue through the WP3/4 remainder WITHOUT another hard gate; final
+    review at WP3/4 completion. Two rulings issued for the remainder.**
+    Verified: `DoubleVoteEvidence` is correctly scoped — omitting an
+    epoch-equality check is RIGHT (slot state carries across epochs
+    untouched, §13, so two different-op receipts at one ballot is a
+    violation in any epoch mix), and skipping author-sig checks on the
+    ride-along envelopes is sound (they are hash-bound to the receipts;
+    even a garbage envelope the signer receipted is a genuine double
+    vote). `detect_double_votes` is the right third-party shape
+    (assemble-after-gossip, idempotent, attributed). WP4.7 composes
+    WP1.7+WP2.2 with nothing new, as claimed; heal-time fence propagation
+    is test-driven `on_recovery_fence` calls standing in for the M7
+    daemon observing gossiped control ops — consistent with the NOTES 40
+    scope. 150 green.
+    - **RULING (a) — B1-assertion scoping under personas; land BEFORE the
+      floor-perjurer or button-masher.** The harness's `_B1State` asserts
+      strict quorum-level single-decree, which is an HONEST-configuration
+      invariant. RESILIENCE §3.1 documents that an equivocator CAN mint
+      two QCs for one slot (two quorums intersecting only in it) — a
+      contained, evidenced behavior, not a failure. Today's tests don't
+      drive that race, so the assertion never fires; the first persona
+      run that does (a two-client commit race through the equivocator, or
+      the button-masher by chance) will fail the harness on documented
+      behavior. Rule: with personas present, quorum-level B1 relaxes to
+      exactly FORMAL B6 — *if* duplicate same-slot QCs exist, then (1)
+      every involved quorum contains a persona node, (2) the fold still
+      yields one winner, (3) a DOUBLE_VOTE proof is assemblable from the
+      union of honest stores. Strict B1 stays asserted for quorums
+      composed entirely of honest nodes.
+    - **RULING (b) — the disclosure gets a detector and an artifact.**
+      WP4.7 asserts the disclosure's INGREDIENTS (an e=0 QC verifying
+      below the parked epoch) but no detector produces a persistent
+      record. RESILIENCE §2.2 step 4's "the QC is a cryptographic receipt
+      of the broken durability promise" becomes code: a new evidence kind
+      `LOST_COMMIT` — minted when a party holds a QC for an op that is
+      (i) below the recovery fence's epoch and (ii) absent from the
+      recovery checkpoint's `retained` manifest — persisting the QC + the
+      recovery checkpoint reference, attributable to the recovery op.
+      Not signer-misbehavior evidence but the same table and audit
+      surface (detect-and-disclose has one place to look). Lands with the
+      WP4 remainder so the button-masher can assert on it.
+    - Standing from NOTES 40, still open and still gating the fuller
+      scenarios: `converged()` receipt/QC coverage, and checkpoint-aware
+      sim plumbing before partitions compose with compaction.
+
 # Not yet built (by design, M2+)
 
 QCs are *constructed and verified* (M0) but no acceptor, quorum client, floor,
