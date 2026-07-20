@@ -1044,6 +1044,34 @@ and A4 as formally stated. Resolutions decided with the design owner; DESIGN
       now standing as IMPLEMENTATION §6.7 (Harry's ruling: reproducers
       live in the repo as regression tests, never in session memory).
 
+40. **WP2 HARNESS REVIEW (2026-07-21, `b176821..3d71dfe`): CLEARED —
+    WP3/4 personas unlocked; equivocator + mistaken-recovery lead.**
+    Verified: `UniformLinks` reproduces the exact pre-WP2 RNG call order
+    (old seeds replay byte-identically — the back-compat claim holds);
+    the directed request/reply hop split makes one-way partitions and
+    dead-return links real at the protocol edge (and the dead-return
+    test proves a commit through the remaining quorum); Gilbert-Elliott
+    transitions are correct (bad persists at `1−p_good`, `bad_loss` vs
+    base loss per state); every axis is scheduler-driven and seeded — no
+    wall clock, no unseeded randomness; the crash suite pins each
+    persistence boundary to its invariant (mid-GC rollback rests on
+    `gc_checkpoint`'s single-COMMIT, verified true); skew feeds the
+    acceptor through an injected per-node clock and B1/B2/B3 continuous
+    assertions remain wired through every new axis (the backward-jump
+    test finishing IS the B3 proof, as intended). Accepted scope, on
+    record: (a) B6's minting side for `DOUBLE_VOTE`/`FLOOR_PERJURY`
+    stays deferred to the WP3 personas per NOTES 34/35 — WP2's B6
+    asserts honest-mints-nothing plus the live FORK path; (b)
+    `gossip_round` is a test-driven pairwise sweep, not the epidemic
+    daemon (M7) — sufficient for convergence proofs; (c) two forward
+    notes for WP3/4, not defects: `converged()` compares op sets only —
+    extend to receipt/QC coverage when the equivocator persona needs
+    third-party evidence assembly (the sweep itself already carries
+    receipts via `gossip.merge`); and the sim's gossip path is
+    cut-unaware — the WP4 mistaken-recovery scenario needs
+    checkpoint-aware sim plumbing (adopt/GC hooks) before it can
+    compose partitions with compaction.
+
 # Not yet built (by design, M2+)
 
 QCs are *constructed and verified* (M0) but no acceptor, quorum client, floor,

@@ -70,7 +70,8 @@ class EvidenceKind(StrEnum):
     table, so its stable string value round-trips through sqlite."""
 
     FORK = "fork"  # two signed ops at one (author, seq)
-    # DOUBLE_VOTE, FLOOR_PERJURY: later (RESILIENCE §3.1)
+    DOUBLE_VOTE = "double_vote"  # one signer's two receipts for one slot at one ballot
+    # FLOOR_PERJURY: with the floor-perjurer persona (RESILIENCE §3.1, WP3)
 
 
 class AppendResult:
@@ -107,6 +108,39 @@ class ForkEvidence:
             and a.op_hash != b.op_hash
             and a.verify_sig(a.author)
             and b.verify_sig(b.author)
+        )
+
+
+class DoubleVoteEvidence:
+    """One signer's two receipts for DIFFERENT ops on the SAME slot at one ballot —
+    a B1 (slot-safety) violation, portable and self-verifying (DESIGN §4 / §8). The
+    receipt signs only (op_hash, epoch, ballot), so the two op envelopes ride along
+    to prove the shared slot_tag; the accuser cannot forge either receipt (both are
+    the signer's own signatures)."""
+
+    __slots__ = ("signer", "raw_a", "raw_b", "rcpt_a", "rcpt_b")
+
+    def __init__(self, signer: bytes, raw_a: bytes, raw_b: bytes, rcpt_a: Receipt, rcpt_b: Receipt):
+        self.signer = signer
+        self.raw_a, self.raw_b = raw_a, raw_b
+        self.rcpt_a, self.rcpt_b = rcpt_a, rcpt_b
+
+    def verify(self) -> bool:
+        try:
+            a = A.Op.from_bytes(self.raw_a)
+            b = A.Op.from_bytes(self.raw_b)
+        except Exception:
+            return False
+        return (
+            a.slot_tag is not None
+            and a.slot_tag == b.slot_tag  # same slot
+            and a.op_hash != b.op_hash  # different ops
+            and self.rcpt_a.op_hash == a.op_hash
+            and self.rcpt_b.op_hash == b.op_hash
+            and self.rcpt_a.signer == self.rcpt_b.signer == self.signer
+            and self.rcpt_a.ballot == self.rcpt_b.ballot  # same ballot
+            and self.rcpt_a.verify()
+            and self.rcpt_b.verify()  # genuine signer signatures
         )
 
 
@@ -172,7 +206,7 @@ class ChainStore:
                 return AppendResult(AppendStatus.DUP)  # idempotent
             # different hash at same (author, seq) -> fork
             ev = ForkEvidence(op.author, op.seq, raw, op.raw)
-            self._store_evidence(EvidenceKind.FORK, ev)
+            self._store_evidence(EvidenceKind.FORK, [ev.author, ev.seq, ev.raw_a, ev.raw_b])
             return AppendResult(AppendStatus.FORK, ev)
         # contiguity: need seq-1 (or seq 0). Gaps are deferred (PROTOCOL §2.1).
         if op.seq > 0:
@@ -429,29 +463,84 @@ class ChainStore:
         )
 
     # ---- evidence --------------------------------------------------------- #
-    def _store_evidence(self, kind: EvidenceKind, ev: ForkEvidence) -> None:
+    def _store_evidence(self, kind: EvidenceKind, payload: list) -> None:
         self.db.execute(
             "INSERT INTO evidence (kind, data) VALUES (?,?)",
-            (kind.value, codec.encode([ev.author, ev.seq, ev.raw_a, ev.raw_b])),
+            (kind.value, codec.encode(payload)),
         )
         self.db.commit()
 
-    def evidence(self) -> list[tuple[EvidenceKind, ForkEvidence]]:
-        out: list[tuple[EvidenceKind, ForkEvidence]] = []
+    def evidence(self) -> list[tuple[EvidenceKind, ForkEvidence | DoubleVoteEvidence]]:
+        out: list[tuple[EvidenceKind, ForkEvidence | DoubleVoteEvidence]] = []
         for kind, data in self.db.execute("SELECT kind, data FROM evidence"):
+            k = EvidenceKind(kind)
             p = codec.as_seq(codec.decode(data))
-            out.append(
-                (
-                    EvidenceKind(kind),
-                    ForkEvidence(
-                        codec.as_bytes(p[0]),
-                        codec.as_int(p[1]),
-                        codec.as_bytes(p[2]),
-                        codec.as_bytes(p[3]),
-                    ),
+            if k == EvidenceKind.FORK:
+                out.append(
+                    (
+                        k,
+                        ForkEvidence(
+                            *(
+                                codec.as_bytes(p[0]),
+                                codec.as_int(p[1]),
+                                codec.as_bytes(p[2]),
+                                codec.as_bytes(p[3]),
+                            )
+                        ),
+                    )
                 )
-            )
+            elif k == EvidenceKind.DOUBLE_VOTE:
+                out.append(
+                    (
+                        k,
+                        DoubleVoteEvidence(
+                            codec.as_bytes(p[0]),
+                            codec.as_bytes(p[1]),
+                            codec.as_bytes(p[2]),
+                            A.Receipt.decode(codec.as_bytes(p[3])),
+                            A.Receipt.decode(codec.as_bytes(p[4])),
+                        ),
+                    )
+                )
         return out
+
+    def detect_double_votes(self) -> list[DoubleVoteEvidence]:
+        """Scan held receipts + ops for a signer that receipted two DIFFERENT ops
+        on one slot at one ballot (a B1 violation), and mint + persist a portable
+        DOUBLE_VOTE proof for each. This is the "assemble both" step (B6): any party
+        that gossips in an equivocator's receipts + ops can run it. Idempotent — a
+        proof already stored (same signer/ballot/op pair) is not re-minted."""
+        ops = {o.op_hash: o for o in self.all_ops()}
+        by_key: dict[tuple[bytes, bytes], list[Receipt]] = {}
+        for r in self.all_receipts():
+            by_key.setdefault((r.signer, codec.encode(r.ballot.encode())), []).append(r)
+        seen = {
+            (ev.signer, ev.rcpt_a.op_hash, ev.rcpt_b.op_hash)
+            for k, ev in self.evidence()
+            if k == EvidenceKind.DOUBLE_VOTE and isinstance(ev, DoubleVoteEvidence)
+        }
+        found: list[DoubleVoteEvidence] = []
+        for (signer, _b), rcpts in by_key.items():
+            for i in range(len(rcpts)):
+                for j in range(i + 1, len(rcpts)):
+                    a, b = rcpts[i], rcpts[j]
+                    oa, ob = ops.get(a.op_hash), ops.get(b.op_hash)
+                    if oa is None or ob is None or oa.slot_tag is None:
+                        continue
+                    if oa.op_hash != ob.op_hash and oa.slot_tag == ob.slot_tag:
+                        if (signer, a.op_hash, b.op_hash) in seen or (
+                            signer,
+                            b.op_hash,
+                            a.op_hash,
+                        ) in seen:
+                            continue
+                        found.append(DoubleVoteEvidence(signer, oa.raw, ob.raw, a, b))
+        for ev in found:
+            self._store_evidence(
+                EvidenceKind.DOUBLE_VOTE,
+                [ev.signer, ev.raw_a, ev.raw_b, ev.rcpt_a.encode(), ev.rcpt_b.encode()],
+            )
+        return found
 
     # ---- transactional commit boundary (sign-after-fsync) ----------------- #
     def commit(self) -> None:

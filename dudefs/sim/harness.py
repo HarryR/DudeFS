@@ -150,10 +150,12 @@ class Sim:
         net: NetworkLinks | None = None,
         skew: dict[int, int] | None = None,
         drift: dict[int, float] | None = None,
+        personas: dict[int, type[Acceptor]] | None = None,
     ):
         self.sched = Scheduler()
         self.n = n
         self.quorum = quorum_size(n)
+        self._personas = personas or {}  # node idx -> adversarial Acceptor subclass (WP3)
         # per-node clock skew (WP2.3): each node acts at `now + offset + drift·now`.
         # A step jump is a scheduled reassignment of self._skew[i] mid-run; the
         # acceptor's floor = max(computed, attested) makes B3 survive a backward
@@ -179,7 +181,8 @@ class Sim:
         for i in range(n):
             sk = bytes([200 + i] * 32)
             pub = SIGNER.public(sk)
-            acc = Acceptor(sk, pub, ChainStore(), config_epoch=0, delta_ms=delta)
+            cls = self._personas.get(i, Acceptor)  # an adversarial subclass, or honest
+            acc = cls(sk, pub, ChainStore(), config_epoch=0, delta_ms=delta)
             out.append(LocalNode(acc, self._node_clock(i)))
         return out
 
