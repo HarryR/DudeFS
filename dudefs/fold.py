@@ -371,7 +371,15 @@ def _authorized_cuts(ops_sorted: list[Op], invalid: set[bytes], genesis: Genesis
     attempts, and pver activation all silently dropped. Authorization depends only
     on prior control ops (certs/revocations), never on data or HLC, so this
     pre-walk is self-contained, deterministic, and agrees op-for-op with the main
-    walk's CONTROL verdicts."""
+    walk's CONTROL verdicts.
+
+    It mirrors the main walk's gates so it cannot record a cut the main walk would
+    reject (findings 14/15): the lane-2 pver fence (an op above the active pver
+    folds INVALID — no state, no barrier; PVER_ACTIVATE pends, and pending
+    activates at each recorded cut's barrier position, i.e. when the walk first
+    crosses an op that cut does not cover), and the root-only recovery marking
+    (`is_recovery`). Stage-order-vs-total-order divergence under a NON-FINAL
+    (dishonest) cut is contained, not solved — deterministic for all clients."""
     control = ControlState(
         genesis["manager_pub"],
         genesis.get("epoch", 0),
@@ -379,14 +387,25 @@ def _authorized_cuts(ops_sorted: list[Op], invalid: set[bytes], genesis: Genesis
         genesis.get("pver", 0),
     )
     cuts: list[Heads] = []
+    pending_barrier: Heads | None = None  # a recorded cut whose pver activation is due
     for op in ops_sorted:  # already in _total_order_key order
+        # barrier-position pver activation: crossing beyond a recorded cut moves
+        # its pending pver active, mirroring the main walk's end-of-stage step.
+        if pending_barrier is not None and not _covered(op, pending_barrier):
+            control.activate_pending_pver()
+            pending_barrier = None
         if op.op_hash in invalid or not op.is_control:
             continue
+        if op.pver > control.pver:
+            continue  # lane-2 fence: INVALID in the main walk -> no state, no barrier
         body = control_handler.decode(op)
-        if body is None or not control.can_author_control(op.author, body[control_handler.BK_KIND]):
+        if body is None or not control.can_author_control(
+            op.author, body[control_handler.BK_KIND], _is_recovery_roster(body)
+        ):
             continue  # unauthorized -> folds `invalid` in the main walk; no barrier
         if body[control_handler.BK_KIND] == control_handler.ControlKind.CHECKPOINT:
             cuts.append(body[b"cut"])
+            pending_barrier = body[b"cut"]  # its barrier activates pending downstream
         control.apply_control(op, body)
     return cuts
 

@@ -37,13 +37,16 @@ class CompactResult:
 
 
 def _mut_meta(ops: list[Op], keyring: fold.Keyring, aead: bytes) -> dict[bytes, tuple[bool, bytes]]:
-    """A MUTATIONS-ONLY meta fold (no guard re-eval) over a committed op set:
-    key -> (present, version) where `version` is the last mutation's op_hash — a
-    SET's hash for a live key, the killing DEL's hash (the tombstone) for a dead
-    one. Unlike the incremental barrier fold's `r.meta`, this ranges over the WHOLE
-    universe handed to it, so it still carries the tombstone of a key that died
-    BELOW the previous cut — the mask that keeps A4 across successive checkpoints.
-    (Committed ops all fold: guard-eval ≡ mutations-only on a committed set, A4.)"""
+    """A MUTATIONS-ONLY meta fold (no guard re-eval): key -> (present, version)
+    where `version` is the last mutation's op_hash — a SET's hash for a live key,
+    the killing DEL's hash (the tombstone) for a dead one.
+
+    ONLY sound over a RETAINED set, whose ops are all applied (NOTES 34 applied-ops
+    lemma). It must NOT be fed an arbitrary committed band: that band contains
+    committed-but-REJECTED ops whose mutations never applied, and replaying them
+    mutations-only would nominate a rejected write as its key's version and drop
+    the real tombstone (finding 13). The compactor feeds it `prev_retained` only,
+    then overlays the band's guard-evaluated `r.meta`."""
     meta: dict[bytes, tuple[bool, bytes]] = {}
     for op in sorted((o for o in ops if not o.is_control), key=fold._total_order_key):
         d = data_handler.decode(op, keyring, aead)
@@ -108,12 +111,21 @@ def compact(
     winners = {e["version"] for e in barrier.values()}
     attempts = {k: e["attempt"] for k, e in barrier.items() if e["attempt"] > 0}
 
-    # the universe available to retain: the previous baseline + the new band. The
-    # mask fixpoint's tombstones must come from HERE (via _mut_meta), not r.meta —
-    # a key that died below prev_cut has no r.meta entry, but its tombstone lives
-    # in prev_retained and must carry forward (the two-checkpoint A4 case).
+    # the universe available to retain: the previous baseline + the new band.
     universe = {o.op_hash: o for o in [*prev_retained, *tail_new]}
-    meta_mut = _mut_meta(list(universe.values()), keyring, aead)
+
+    # meta for the mask fixpoint (finding 13): mutations-only over prev_retained
+    # ONLY — sound there by the applied-ops lemma, and it still carries the
+    # tombstone of a key that died below prev_cut (the two-checkpoint carry-
+    # forward) — OVERLAID by the band's guard-evaluated r.meta for every key the
+    # band actually touched (version != ⊥). Feeding the whole committed band to a
+    # mutations-only fold would treat REJECTED ops as applied and drop real
+    # tombstones. The ⊥ guard stops a band attempt-only lineage (a rejected create
+    # bumps the attempt but leaves version ⊥) from erasing a below-prev_cut tomb.
+    meta_mut = _mut_meta(prev_data, keyring, aead)
+    for key, m in r.meta.items():
+        if m.version != VERSION_ABSENT:
+            meta_mut[key] = (m.present, m.version)
 
     # resurrection mask (NOTES 29b): a retained op replays ALL its mutations at
     # bootstrap; a key it set that is DEAD at the cut must keep its tombstone, or

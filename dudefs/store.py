@@ -336,10 +336,17 @@ class ChainStore:
         completeness checks run against while GC is still lazy; all must survive
         crash-restart like the floor (`set_meta` COMMIT-fsyncs). Physical GC of
         `dead` is a separate step (gc_checkpoint); adoption must precede it so the
-        gates never see dropped ops without the cut."""
-        self.set_meta("cut", _encode_pairs(cut))
-        self.set_meta("cut_retained", _encode_pairs(retained))
-        self.set_meta("cut_dead", codec.encode(list(dead)))
+        gates never see dropped ops without the cut. Atomic (finding 16): the
+        three writes are ONE transaction/COMMIT, so a crash can never leave the cut
+        adopted without its retained/dead companions (nothing re-runs adoption)."""
+        self.db.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", ("cut", _encode_pairs(cut)))
+        self.db.execute(
+            "INSERT OR REPLACE INTO meta VALUES (?,?)", ("cut_retained", _encode_pairs(retained))
+        )
+        self.db.execute(
+            "INSERT OR REPLACE INTO meta VALUES (?,?)", ("cut_dead", codec.encode(list(dead)))
+        )
+        self.db.commit()  # one atomic COMMIT for all three
 
     def cut(self) -> Heads:
         """The active compaction cut, or {} when uncompacted (pre-M6 behavior)."""

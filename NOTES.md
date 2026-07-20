@@ -969,6 +969,68 @@ and A4 as formally stated. Resolutions decided with the design owner; DESIGN
     key split is possible future work; v1 gets the same effect as an
     app-side convention.
 
+39. **D3 REVIEW of WP1 (2026-07-21, `ac4c710..97eeab7`) — NOT cleared:
+    one HIGH regression (A4 break, reproduced) + one MEDIUM (reproduced,
+    partly pre-existing) + two LOW. Fix wave gates WP2.**
+    Overall: WP1.1/1.2/1.3/1.5/1.7 read clean and well-paired; the two
+    flagged-highest-risk diffs are where the findings are.
+    - **(13, HIGH, WP1.4 REGRESSION — `_mut_meta` treats committed-but-
+      REJECTED ops as applied; A4 breaks.)** The docstring's justification
+      ("guard-eval ≡ mutations-only on a committed set") is FALSE for the
+      compactor's input: it holds only for the RETAINED set (whose ops are
+      all applied — the NOTES 34 applied-ops lemma), not for an arbitrary
+      committed band, which contains rejected/stale ops whose mutations
+      never applied. Reproduced vector (3 ops, single checkpoint):
+      `W(set A, set B)` applied; `Z(del B)` applied; `R(guard-fails,
+      set B)` committed-REJECTED, sorting after Z. `_mut_meta[B] =
+      (True, R.hash)` ⇒ mask scan believes B live ⇒ Z not retained ⇒
+      bootstrap resurrects B (`full={A}`, `boot={A,B}`). Honestly
+      reachable (any stale client's failing CAS/blind-guard write touching
+      a since-deleted key). Mirror vector: a REJECTED `del C` makes
+      `_mut_meta` nominate the rejected op as C's "tombstone" — the mask
+      scan can then retain a rejected op whose OTHER mutations replay at
+      bootstrap. Pre-WP1 code took masks from `r.meta` (guard-evaluated) —
+      this is a rewrite regression. **Fix ruling:** universe-wide meta :=
+      mutations-only over `prev_retained` data ops ONLY (sound there by
+      the applied-ops lemma) **overlaid by `r.meta`** for every key whose
+      `r.meta.version != ⊥` (the band's guard-evaluated truth; the ⊥
+      guard keeps a band attempt-only lineage from erasing a below-
+      prev-cut tombstone). Never feed non-retained band ops to a
+      mutations-only fold. Regression tests: both vectors above, plus a
+      fuzz generator arm that aims failing-guard writes at DEAD keys —
+      the current arm picks targets from live state only, which is
+      exactly why 50 seeds missed this.
+    - **(14, MEDIUM, reproduced — `_authorized_cuts` does not mirror the
+      lane-2 pver fence; partly PRE-EXISTING.)** A checkpoint with
+      `op.pver > active pver` folds INVALID in the main walk yet the
+      pre-walk records its cut: the barrier of an invalid op runs
+      (reproduced: a fenced checkpoint still killed a tombstone lineage
+      via barrier death). The old `_checkpoint_cuts` had the same hole
+      for root-authored checkpoints; the pre-walk inherited it and adds
+      cert-application divergence (a high-pver CERT_ISSUE folds INVALID
+      in the main walk but grants caps in the pre-walk). **Fix ruling:**
+      the pre-walk mirrors the fence — track its own pver view (skip any
+      control op with `op.pver >` that view; apply PVER_ACTIVATE to
+      pending; activate pending when the walk first crosses an op not
+      covered by a recorded cut, mirroring barrier-position activation).
+      Stage-order-vs-total-order divergence under a NON-FINAL (dishonest)
+      cut is documented as contained — deterministic for all clients,
+      wrongful-but-auditable territory — not solved.
+    - **(15, LOW — pre-walk omits the `is_recovery` argument.)**
+      `_authorized_cuts` calls `can_author_control` without
+      `_is_recovery_roster(body)`, so a delegate's recovery-marked roster
+      op is APPLIED in the pre-walk state while folding INVALID in the
+      main walk. No cut-authorization impact today (caps don't depend on
+      roster state) — but it is a divergence lying in wait. One-line fix.
+    - **(16, LOW — `adopt_checkpoint` is not atomic.)** Three `set_meta`
+      calls = three COMMITs; a crash between them leaves the cut adopted
+      without its retained/dead companions, and nothing re-runs adoption.
+      Fix: one transaction, one COMMIT.
+    - **Process:** ceaabb3's swept-in doc edits stay as-is — no history
+      rewrite; the attribution conflation is recorded here and content is
+      intact. This item rides uncommitted in the working tree for the fix
+      wave to commit (Opus holds the commit token).
+
 # Not yet built (by design, M2+)
 
 QCs are *constructed and verified* (M0) but no acceptor, quorum client, floor,

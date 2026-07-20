@@ -189,6 +189,55 @@ class TestA4RetainedBootstrap(unittest.TestCase):
         self.assertNotEqual(bad.state, full.state)  # diverged without the sidecar
 
 
+class TestA4RejectedOps(unittest.TestCase):
+    """D3 finding 13: a committed-but-REJECTED op's mutations never applied, so the
+    mask meta must NOT be a mutations-only fold of the whole band — it takes the
+    band's truth from the guard-evaluated r.meta. Both reproduced vectors: without
+    the fix, bootstrap resurrects a key a full-history client holds dead."""
+
+    def test_rejected_write_to_dead_key_does_not_resurrect_it(self):
+        # W(set A, set B); Z(del B); R(guard fails, set B) — committed REJECTED,
+        # sorting after Z. A mutations-only band fold would read B live (R's set)
+        # and drop Z; bootstrap would resurrect B.
+        w = World(seed=60, n_clients=2)
+        control = list(w.control_ops)
+        below = list(control)
+        below.append(w.blind(0, [], [[A.Mutation.SET, b"A", b"1"], [A.Mutation.SET, b"B", b"1"]]))
+        below.append(w.blind(1, [], [[A.Mutation.DEL, b"B"]]))
+        rej = w.blind(0, [[A.Guard.PRESENT, b"B"]], [[A.Mutation.SET, b"B", b"resurrect"]])
+        below.append(rej)
+        cut = _cut(w)
+        cr = compactor.compact_genesis(below, w.keyring, w.genesis, cut)
+        full = fold.fold(below, w.keyring, w.genesis)
+        boot = _boot(w, cr, control, [], cut)
+        self.assertEqual(full.verdicts[rej.op_hash], fold.Verdict.REJECTED)
+        self.assertEqual(full.state, {b"A": b"1"})  # B dead
+        self.assertEqual(boot.state, full.state)  # B NOT resurrected
+        self.assertNotIn(rej.op_hash, {o.op_hash for o in cr.retained})
+
+    def test_rejected_op_is_not_retained_as_a_tombstone(self):
+        # Mirror: a REJECTED op that names `del C` must not be nominated as C's
+        # tombstone — retaining it would replay its OTHER mutation (set D) at
+        # bootstrap. C's real tombstone T must be kept instead.
+        w = World(seed=61, n_clients=2)
+        control = list(w.control_ops)
+        below = list(control)
+        below.append(w.blind(0, [], [[A.Mutation.SET, b"A", b"1"], [A.Mutation.SET, b"C", b"1"]]))
+        below.append(w.blind(1, [], [[A.Mutation.DEL, b"C"]]))  # T: real tombstone
+        rej = w.blind(
+            0, [[A.Guard.PRESENT, b"C"]], [[A.Mutation.DEL, b"C"], [A.Mutation.SET, b"D", b"1"]]
+        )
+        below.append(rej)  # rejected (C absent): neither the del nor the set apply
+        cut = _cut(w)
+        cr = compactor.compact_genesis(below, w.keyring, w.genesis, cut)
+        full = fold.fold(below, w.keyring, w.genesis)
+        boot = _boot(w, cr, control, [], cut)
+        self.assertEqual(full.verdicts[rej.op_hash], fold.Verdict.REJECTED)
+        self.assertEqual(full.state, {b"A": b"1"})  # C dead, D never set
+        self.assertEqual(boot.state, full.state)  # D NOT resurrected
+        self.assertNotIn(rej.op_hash, {o.op_hash for o in cr.retained})
+
+
 class TestA4TwoCheckpoints(unittest.TestCase):
     """WP1.4: A4 must hold across SUCCESSIVE incremental checkpoints, not just a
     single genesis compaction. The dangerous case the incremental fold's r.meta
@@ -271,7 +320,7 @@ class TestA4PropertyFuzz(unittest.TestCase):
     a random cut must satisfy A4 byte-for-byte: fold(full) ≡ bootstrap(retained ∘
     tail). All seeded -> deterministic and replayable."""
 
-    KEYS = [b"k0", b"k1", b"k2", b"k3", b"k4"]
+    KEYS = [b"k0", b"k1", b"k2", b"k3"]
 
     def _gen(self, rng, w, below):
         """Append one random VALID op to `below`, tracking live state for guards."""
@@ -279,19 +328,28 @@ class TestA4PropertyFuzz(unittest.TestCase):
         state = folded.state
         ci = rng.randrange(len(w.clients))
         roll = rng.random()
-        if roll < 0.35 or not state:  # blind multi-key set (1-2 keys)
-            ks = rng.sample(self.KEYS, rng.randint(1, 2))
+        if roll < 0.4 or not state:  # blind multi-key set (2-3 keys -> shared dead keys)
+            ks = rng.sample(self.KEYS, rng.randint(2, 3))
             muts = [[A.Mutation.SET, k, bytes([rng.randrange(256)])] for k in ks]
             op = w.blind(ci, [], muts)
         elif roll < 0.55:  # blind delete of a live key
             k = rng.choice(list(state))
             op = w.blind(ci, [], [[A.Mutation.DEL, k]])
-        elif roll < 0.8:  # CAS overwrite of a live key
+        elif roll < 0.7:  # CAS overwrite of a live key
             k = rng.choice(list(state))
             v, a = folded.lineage(k)
             nv = bytes([rng.randrange(256)])
             op = w.cas(ci, k, v, a, [[A.Guard.VERSION_EQ, k, v]], [[A.Mutation.SET, k, nv]])
-        else:  # a CAS whose guard FAILS -> rejected, slot attempt consumed
+        elif roll < 0.85 and set(self.KEYS) - set(state):
+            # a REJECTED write AIMED AT A DEAD KEY (D3 finding 13): a mutations-only
+            # band fold would treat this as applied and drop the key's real
+            # tombstone. The old arm targeted live keys only, which is why 50 seeds
+            # missed the resurrection.
+            dead = rng.choice(list(set(self.KEYS) - set(state)))
+            op = w.blind(
+                ci, [[A.Guard.PRESENT, dead]], [[A.Mutation.SET, dead, bytes([rng.randrange(256)])]]
+            )
+        else:  # a CAS whose guard FAILS on a live key -> rejected, attempt consumed
             k = rng.choice(list(state))
             v, a = folded.lineage(k)
             op = w.cas(ci, k, v, a, [[A.Guard.VALUE_EQ, k, b"never"]], [[A.Mutation.SET, k, b"z"]])
@@ -361,7 +419,7 @@ class TestDelegateCheckpointBarrier(unittest.TestCase):
     delegate-minted checkpoint, identical to a root-minted one; a write-only
     author places no barrier (the reborn tag collides and stays dead)."""
 
-    def _ckpt(self, sk, pub, cut, hlc_ms):
+    def _ckpt(self, sk, pub, cut, hlc_ms, pver=0):
         return A.Op.build(
             author_sk=sk,
             author_pub=pub,
@@ -373,7 +431,54 @@ class TestDelegateCheckpointBarrier(unittest.TestCase):
             authz=b"cert",
             keyepoch=0,
             payload=ctl.checkpoint_body(cut, b"", [], {}, b"", 0, A.HLC(0, 0)),
+            pver=pver,
         )
+
+    def _reborn_world(self, seed):
+        """A history where a checkpoint's barrier decides a reborn tag: k created
+        then deleted below the cut, and a byte-identical recreation above it."""
+        w = World(seed=seed, n_clients=1)
+        c1 = w.cas(
+            0, b"k", A.VERSION_ABSENT, 0, [[A.Guard.ABSENT, b"k"]], [[A.Mutation.SET, b"k", b"v1"]]
+        )
+        v1, a1 = fold.fold([*w.control_ops, c1], w.keyring, w.genesis).lineage(b"k")
+        d = w.cas(0, b"k", v1, a1, [[A.Guard.VERSION_EQ, b"k", v1]], [[A.Mutation.DEL, b"k"]])
+        below = [*w.control_ops, c1, d]
+        cut = _cut(w)
+        base = w._hlc
+        tag = A.compute_slot_tag(w.keyring[0]["slot_secret"], b"k", A.VERSION_ABSENT, 0)
+        c2 = w.data_op(
+            0,
+            txn=A.Txn(
+                (b"k", A.VERSION_ABSENT, 0),
+                [[A.Guard.ABSENT, b"k"]],
+                [[A.Mutation.SET, b"k", b"v2"]],
+            ),
+            slot_tag=tag,
+            hlc=A.HLC(base + 10, 0),
+        )
+        return w, below, cut, base, c2
+
+    def test_finding14_fenced_checkpoint_places_no_barrier(self):
+        # D3 finding 14: a checkpoint stamped op.pver > active folds INVALID, so its
+        # barrier must NOT run. Contrast a valid pver-0 checkpoint (barrier placed,
+        # reborn commits) with a fenced pver-1 one (no barrier, reborn stays dead).
+        w, below, cut, base, c2 = self._reborn_world(45)
+        valid = self._ckpt(w.mgr_sk, w.mgr_pub, cut, base + 5, pver=0)
+        fenced = self._ckpt(w.mgr_sk, w.mgr_pub, cut, base + 5, pver=fold.SUPPORTED_PVER + 1)
+
+        r_valid = fold.fold([*below, valid, c2], w.keyring, w.genesis)
+        self.assertEqual(r_valid.state.get(b"k"), b"v2")  # barrier -> reborn commits
+
+        r_fenced = fold.fold([*below, fenced, c2], w.keyring, w.genesis)
+        self.assertEqual(r_fenced.verdicts[fenced.op_hash], fold.Verdict.INVALID)
+        self.assertNotIn(b"k", r_fenced.state)  # fenced -> NO barrier -> reborn stays dead
+
+        # and the pre-walk itself excludes the fenced cut, includes the valid one
+        ordered = sorted([*below, valid, c2], key=fold._total_order_key)
+        self.assertIn(cut, fold._authorized_cuts(ordered, set(), w.genesis))
+        ordered_f = sorted([*below, fenced, c2], key=fold._total_order_key)
+        self.assertNotIn(cut, fold._authorized_cuts(ordered_f, set(), w.genesis))
 
     def test_delegate_minted_checkpoint_places_the_barrier(self):
         w = World(seed=44, n_clients=1)
