@@ -33,12 +33,12 @@ def _daemon(w, i, roster):
 
 
 def _rpc(peer):
-    """An in-process peer transport: hand `peer.serve` a framed request, frame back."""
+    """In-process peer transport: unframe the request, serve it, return UNFRAMED."""
 
     def rpc(framed):
         payload = wire.read_frame(_bytesource(framed))
         assert payload is not None
-        return wire.frame(peer.serve(payload))
+        return peer.serve(payload)
 
     return rpc
 
@@ -68,6 +68,34 @@ class TestDaemonGossip(unittest.TestCase):
         req = wire.encode_request(N.AcceptReq(op.slot_tag, A.Ballot(1, b"x"), op))
         resp = wire.decode_response(d.serve(req))
         self.assertIsInstance(resp, A.Receipt)
+
+
+class TestDaemonPeerSockets(unittest.TestCase):
+    def test_sync_once_converges_over_real_sockets(self):
+        w = World(seed=7, n_clients=2)
+        roster = [C.SIGNER.public(bytes([200 + i] * 32)) for i in range(2)]
+        with tempfile.TemporaryDirectory() as td:
+            pa, pb = os.path.join(td, "a.sock"), os.path.join(td, "b.sock")
+            a = _daemon(w, 0, roster)
+            b = _daemon(w, 1, roster)
+            a.peers = [pb]  # a pulls from b's socket
+            b.peers = [pa]
+            x = w.blind(0, [], [[A.Mutation.SET, b"x", b"1"]])
+            y = w.blind(1, [], [[A.Mutation.SET, b"y", b"1"]])
+            a.store.append(x)
+            b.store.append(y)
+            for d, path in ((a, pa), (b, pb)):
+                ev = threading.Event()
+                threading.Thread(target=d.serve_forever, args=(path, ev), daemon=True).start()
+                self.assertTrue(ev.wait(2))
+            a.sync_once()  # gossip against b's real socket
+            b.sync_once()
+            for d in (a, b):
+                self.assertIsNotNone(d.store.get_op(x.op_hash))
+                self.assertIsNotNone(d.store.get_op(y.op_hash))
+            a.close()
+            b.close()
+            time.sleep(0.05)
 
 
 class TestDaemonAdoption(unittest.TestCase):

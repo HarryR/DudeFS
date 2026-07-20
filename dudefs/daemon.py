@@ -52,10 +52,12 @@ class NodeDaemon:
         *,
         roster: list[bytes] | None = None,
         manager_pub: bytes,
+        peers: list[str] | None = None,
         clock: Callable[[], int] | None = None,
         epoch: int = 0,
         delta_ms: int = tunables.SIM_DELTA_MS,
     ):
+        self.peers = peers or []  # peer node socket paths for anti-entropy
         self.store = ChainStore(store_path)
         self.acc = Acceptor(sk, pub, self.store, config_epoch=epoch, delta_ms=delta_ms)
         self.pub = pub
@@ -96,10 +98,10 @@ class NodeDaemon:
     def gossip_round(self, peer_rpc: Callable[[bytes], bytes]) -> None:
         """One anti-entropy round against a peer: advertise my SUMMARY (digest
         first), apply the DELTA it owes me. Cut-aware — the peer's reply folds in
-        the sparse below-cut baseline for any author whose retained digest differs."""
-        reply = peer_rpc(wire.frame(_gossip_request(self.summary())))
-        payload = wire.read_frame(_bytesource(reply))
-        if payload is None:
+        the sparse below-cut baseline for any author whose retained digest differs.
+        `peer_rpc` takes a framed request and returns the UNFRAMED reply payload."""
+        payload = peer_rpc(wire.frame(_gossip_request(self.summary())))
+        if not payload:
             return
         gossip.apply_delta(self.store, gossip.decode_delta(payload))
 
@@ -195,6 +197,37 @@ class NodeDaemon:
             "evidence": len(self.store.evidence()),
             "issuance_gapless": self.store.issuance_gapless(),
         }
+
+    # ---- the maintenance driver (gossip + adopt + observe + audit) --------- #
+    def _connect_rpc(self, path: str) -> Callable[[bytes], bytes]:
+        def rpc(framed: bytes) -> bytes:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                s.connect(path)
+                s.sendall(framed)
+                return wire.read_frame(s.recv) or b""
+
+        return rpc
+
+    def sync_once(self, observed_watermarks: list[Watermark] | None = None) -> None:
+        """One maintenance tick: anti-entropy against every reachable peer, then
+        adopt any committed checkpoint, observe recovery fences, and audit for
+        evidence. (A large deployment picks a uniformly random peer per tick — the
+        §9 demo's handful lets us sweep all to the same fixpoint; a down peer is
+        just a missed round.)"""
+        for path in self.peers:
+            try:
+                self.gossip_round(self._connect_rpc(path))
+            except OSError:
+                pass
+        self.adopt_committed_checkpoints()
+        self.observe_fences()
+        self.evidence_cycle(observed_watermarks)
+
+    def run_periodic(self, period_s: float, stop: threading.Event) -> None:
+        """The epidemic cycle on a timer until `stop` — correctness rests on the
+        periodic sweep alone (PROTOCOL §2.2)."""
+        while not stop.wait(period_s):
+            self.sync_once()
 
     # ---- the socket shell (the ONLY I/O; a thin frame loop) ---------------- #
     def serve_forever(self, path: str, ready: threading.Event | None = None) -> None:
