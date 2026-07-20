@@ -1030,6 +1030,19 @@ and A4 as formally stated. Resolutions decided with the design owner; DESIGN
       rewrite; the attribution conflation is recorded here and content is
       intact. This item rides uncommitted in the working tree for the fix
       wave to commit (Opus holds the commit token).
+    - **RE-REVIEW 2026-07-21 (`b176821`): CLEARED — WP2 unlocked.** All
+      four fixes verified: both D3 reproducer vectors re-run green against
+      the fix (A4 holds; fenced checkpoint places no barrier); the diff
+      matches the rulings exactly (prev-retained-only `_mut_meta` with the
+      ⊥-guarded `r.meta` overlay; pre-walk pver view with barrier-position
+      activation; `is_recovery` threaded; atomic adoption). 130 tests
+      green. Both reviewer reproducers are landed as in-repo regression
+      tests (`test_rejected_write_to_dead_key…`, `test_rejected_op_is_not_
+      retained…`, `test_finding14_fenced_checkpoint_places_no_barrier`)
+      plus the dead-key fuzz arm with a performed revert-check — this
+      cycle is the template for the **found-and-fixed log** convention,
+      now standing as IMPLEMENTATION §6.7 (Harry's ruling: reproducers
+      live in the repo as regression tests, never in session memory).
 
 # Not yet built (by design, M2+)
 
