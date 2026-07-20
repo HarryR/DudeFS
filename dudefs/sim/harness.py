@@ -175,6 +175,8 @@ class Sim:
         self._b1 = _B1State()
         self._floors: dict[int, HLC] = {}
         self.runners: list[ClientRunner] = []
+        self._cut: dict[bytes, tuple[int, bytes]] = {}  # active compaction cut (WP2 infra)
+        self._dead: frozenset[bytes] = frozenset()
 
     def _build_nodes(self, n: int, delta: int) -> list[LocalNode]:
         out = []
@@ -290,11 +292,31 @@ class Sim:
 
     def gossip_round(self) -> None:
         """One anti-entropy sweep: each node merges every peer whose DIRECTED link
-        to it is up (partition-respecting) — node i learns from j iff j→i is up."""
+        to it is up (partition-respecting) — node i learns from j iff j→i is up.
+        Cut-aware once a checkpoint is adopted (NOTES 40 infra): the dense tail
+        via merge, the sparse below-cut baseline via pull_baseline over the retained
+        projection (covered ∖ dead), so a compacted mesh still converges."""
         for i in range(self.n):
             for j in range(self.n):
                 if i != j and (self.net is None or (j, i) not in self.net.down):
-                    gossip.merge(self._raw[i].acc.store, self._raw[j].acc.store)
+                    dst, src = self._raw[i].acc.store, self._raw[j].acc.store
+                    gossip.merge(dst, src)
+                    if self._cut:
+                        gossip.pull_baseline(dst, src, self._cut, self._dead)
+
+    def adopt_checkpoint(self, cut, retained, dead, nodes=None) -> None:
+        """Adopt a quorum-committed checkpoint on `nodes` (all by default) — the
+        sim-side of checkpoint adoption (NOTES 40 infra). GC is a SEPARATE step
+        (`gc`), so mixed-laziness (nodes GC'ing at different times) is testable."""
+        for i in range(self.n) if nodes is None else nodes:
+            self._raw[i].acc.store.adopt_checkpoint(cut, retained, list(dead))
+        self._cut, self._dead = cut, frozenset(dead)
+
+    def gc(self, dead, nodes=None) -> None:
+        """Run the checkpoint's GC delta on `nodes` (all by default). Lazy + local:
+        nodes may call this at wildly different times (the mixed-laziness persona)."""
+        for i in range(self.n) if nodes is None else nodes:
+            self._raw[i].acc.store.gc_checkpoint(list(dead))
 
     def start_gossip(self, period_ms: int) -> None:
         """Schedule periodic anti-entropy for the duration of the run."""
@@ -306,9 +328,21 @@ class Sim:
         self.sched.after(period_ms, tick)
 
     def converged(self) -> bool:
-        """Every node holds the same op set — the gossip fixpoint after heal."""
-        sets = [frozenset(o.op_hash for o in nd.acc.store.all_ops()) for nd in self._raw]
-        return all(s == sets[0] for s in sets)
+        """The gossip fixpoint after heal: every node holds the same ops AND the
+        same receipt coverage AND the same QCs (NOTES 40 infra — receipt/QC
+        coverage is what lets any node assemble third-party evidence, e.g. a
+        DOUBLE_VOTE from an equivocator's spread receipts)."""
+
+        def triple(nd) -> tuple:
+            st = nd.acc.store
+            return (
+                frozenset(o.op_hash for o in st.all_ops()),
+                frozenset((r.op_hash, r.signer) for r in st.all_receipts()),
+                frozenset(q.op_hash for q in st.all_qcs()),
+            )
+
+        views = [triple(nd) for nd in self._raw]
+        return all(v == views[0] for v in views)
 
     def evidence(self) -> list:
         """Every portable misbehavior proof any node has minted (B6). Honest nodes

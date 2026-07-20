@@ -6,10 +6,12 @@
 import unittest
 
 from dudefs import artifacts as A
+from dudefs import crypto as C
 from dudefs import fold, gossip
+from dudefs.handlers import control as ctl
 from dudefs.sim.harness import Sim
 from dudefs.sim.personas import EquivocatingAcceptor, FloorPerjurer
-from dudefs.store import EvidenceKind
+from dudefs.store import AppendStatus, ChainStore, EvidenceKind
 from tests._builders import World
 from tests._cluster import creation_op
 
@@ -88,6 +90,40 @@ class TestEquivocator(unittest.TestCase):
         sim.nodes[1].accept(a.slot_tag, ballot, a)
         sim.nodes[1].accept(a.slot_tag, ballot, b)  # would raise if B1 tripped
         self.assertEqual(sim.decided_ops(a.slot_tag), set())
+
+
+class TestSplitView(unittest.TestCase):
+    """WP3.6 (RESILIENCE §3.5, now provable): a root serves two divergent chains
+    from one genesis. Each victim holds one side; when they compare, the fork mints
+    at the divergence seq — upgrading the detection claim from paper to test."""
+
+    def test_two_victims_detect_the_fork_at_the_divergence_seq(self):
+        w = World(seed=30, n_clients=0)
+        pubx = C.SIGNER.public(bytes([1] * 32))
+        puby = C.SIGNER.public(bytes([2] * 32))
+        a = w._mgr_op(ctl.roster_body(0, [pubx], {}))  # chain A, manager seq 0
+        w._mseq, w._mprev = 0, A.GENESIS_PREV  # the root rewinds -> a divergent view
+        b = w._mgr_op(ctl.roster_body(0, [puby], {}))  # chain B, manager seq 0 (a fork)
+        self.assertNotEqual(a.op_hash, b.op_hash)
+
+        v1, v2 = ChainStore(), ChainStore()  # two victims, one side each
+        v1.append(a)
+        v2.append(b)
+        self.assertEqual(v1.evidence(), [])  # neither alone sees a fork
+        self.assertEqual(v2.evidence(), [])
+
+        # the victims compare (§3.5). Gossip's seq-range delta cannot ship a
+        # SAME-seq sibling, so the comparison pulls the peer's head by hash — that
+        # is the split-view detector: appending it reveals the fork at seq 0.
+        peer_head = v2.heads()[w.mgr_pub][1]  # b's op_hash
+        peer_op = v2.get_op(peer_head)
+        assert peer_op is not None
+        res = v1.append(peer_op)
+        self.assertEqual(res.status, AppendStatus.FORK)
+        assert res.evidence is not None
+        self.assertEqual(res.evidence.seq, 0)  # the divergence seq
+        self.assertTrue(res.evidence.verify())
+        self.assertTrue(any(k == EvidenceKind.FORK for k, _ in v1.evidence()))
 
 
 class TestFloorPerjurer(unittest.TestCase):
