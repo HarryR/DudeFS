@@ -8,14 +8,21 @@
 
 import unittest
 
+from dudefs import artifacts as A
 from dudefs import fold
 from dudefs import quorum as Q
 from dudefs.sim.harness import Sim
-from dudefs.transports.memory import Faults
+from dudefs.transports.memory import CLIENT, Faults, Link, NetworkLinks
 from tests._builders import World
 from tests._cluster import creation_op
 
 CHAOS = Faults(loss=0.25, dup=0.2, delay_lo=1, delay_hi=6)
+
+
+def _create(w, ci, key, val):
+    return w.cas(
+        ci, key, A.VERSION_ABSENT, 0, [[A.Guard.ABSENT, key]], [[A.Mutation.SET, key, val]]
+    )
 
 
 def _applied_winner(sim: Sim, w: World, slot: bytes):
@@ -106,6 +113,83 @@ class TestSplitVoteRegression(unittest.TestCase):
         self.assertIn(decided, {op.op_hash for op in ops})
         applied, _ = _applied_winner(sim, w, slot)
         self.assertEqual(applied, [decided])
+
+
+class TestPartitions(unittest.TestCase):
+    """WP2.2: partitions + node↔node gossip heal. Minority writes park, the
+    majority continues, and healing converges (the gossip fixpoint)."""
+
+    def test_minority_parks_majority_commits_then_heal_converges(self):
+        net = NetworkLinks(default=Link(base_ms=2, jitter_ms=1))
+        sim = Sim(seed=5, n=3, net=net)
+        w = World(seed=5, n_clients=2)
+        MAJ, MIN = -2, -1  # two client endpoints, one on each side
+        sim.partition([0], [1, 2])  # node 0 (minority) | {1,2} (majority)
+        net.cut(MIN, 1)
+        net.cut(MIN, 2)  # minority client reaches only node 0
+        net.cut(MAJ, 0)  # majority client reaches only {1,2}
+
+        maj = _create(w, 0, b"maj", b"1")
+        mino = _create(w, 1, b"min", b"1")
+        r_maj = sim.commit(maj, src_id=MAJ)
+        r_min = sim.commit(mino, src_id=MIN, round_timeout_ms=50, max_rounds=4)
+        sim.run()
+
+        self.assertIsInstance(r_maj.outcome, Q.Committed)  # quorum {1,2} decides
+        self.assertNotIsInstance(r_min.outcome, Q.Committed)  # only 1 node -> parks
+        self.assertIsNone(sim._raw[0].acc.store.get_op(maj.op_hash))  # node 0 hasn't seen it
+
+        # heal + anti-entropy: node 0 catches up, every node reaches the union
+        net.down.clear()
+        for _ in range(4):
+            sim.gossip_round()
+        self.assertTrue(sim.converged())
+        self.assertIsNotNone(sim._raw[0].acc.store.get_op(maj.op_hash))
+
+    def test_one_way_link_blocks_gossip_in_the_cut_direction_only(self):
+        net = NetworkLinks(default=Link(base_ms=2, jitter_ms=1))
+        sim = Sim(seed=6, n=3, net=net)
+        w = World(seed=6, n_clients=1)
+        # node 0 alone holds `solo`; cut 0→{1,2} one-way (1→0, 2→0 stay up)
+        solo = _create(w, 0, b"solo", b"1")
+        sim._raw[0].acc.store.append(solo)
+        net.cut(0, 1, both=False)
+        net.cut(0, 2, both=False)
+        sim.gossip_round()
+        # the cut direction blocks it; nodes 1,2 never learn `solo`
+        self.assertIsNone(sim._raw[1].acc.store.get_op(solo.op_hash))
+        self.assertIsNone(sim._raw[2].acc.store.get_op(solo.op_hash))
+        # heal -> it propagates
+        net.heal(0, 1, both=False)
+        net.heal(0, 2, both=False)
+        sim.gossip_round()
+        self.assertIsNotNone(sim._raw[1].acc.store.get_op(solo.op_hash))
+        self.assertTrue(sim.converged())
+
+    def test_flapping_partition_commit_lands_in_a_healed_window(self):
+        net = NetworkLinks(default=Link(base_ms=2, jitter_ms=1))
+        sim = Sim(seed=8, n=3, net=net)
+        w = World(seed=8, n_clients=1)
+
+        # flap the client's links to {1,2}: cut then heal on a 60ms cadence, so the
+        # client oscillates between reaching only node 0 (no quorum) and all three.
+        def flap() -> None:
+            if sim.sched.now > 600:
+                return
+            if (CLIENT, 1) in net.down:
+                net.heal(CLIENT, 1)
+                net.heal(CLIENT, 2)
+            else:
+                net.cut(CLIENT, 1)
+                net.cut(CLIENT, 2)
+            sim.sched.after(60, flap)
+
+        net.cut(CLIENT, 1)
+        net.cut(CLIENT, 2)  # start cut
+        sim.sched.after(60, flap)
+        r = sim.commit(_create(w, 0, b"k", b"1"))
+        sim.run()
+        self.assertIsInstance(r.outcome, Q.Committed)  # retransmit rides a healed window
 
 
 class TestFinalityAndVerdict(unittest.TestCase):

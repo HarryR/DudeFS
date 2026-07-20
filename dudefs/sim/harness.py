@@ -24,7 +24,7 @@ from __future__ import annotations
 import random
 from dataclasses import dataclass, field
 
-from .. import tunables
+from .. import gossip, tunables
 from ..acceptor import Acceptor, AcceptResult, PrepareResult, SubmitResult
 from ..artifacts import (
     HLC,
@@ -41,7 +41,14 @@ from ..crypto import SIGNER
 from ..node import LocalNode
 from ..quorum import Commit, Finalize, QuorumConfig
 from ..store import ChainStore
-from ..transports.memory import ClientRunner, Faults, MemoryTransport, Scheduler
+from ..transports.memory import (
+    CLIENT,
+    ClientRunner,
+    Faults,
+    MemoryTransport,
+    NetworkLinks,
+    Scheduler,
+)
 
 NO_FAULTS = Faults()
 
@@ -140,6 +147,7 @@ class Sim:
         n: int = 3,
         faults: Faults = NO_FAULTS,
         delta: int = tunables.SIM_DELTA_MS,
+        net: NetworkLinks | None = None,
     ):
         self.sched = Scheduler()
         self.n = n
@@ -147,8 +155,11 @@ class Sim:
         self._raw = self._build_nodes(n, delta)
         self.roster = [nd.acc.pub for nd in self._raw]
         self.nodes = [LoggingNode(nd, i, self) for i, nd in enumerate(self._raw)]
+        # `net` (a NetworkLinks) enables per-link faults + partitions + gossip heal
+        # (WP2.2); without it the transport is the uniform per-hop Faults, unchanged.
+        self.net = net
         self.transport = MemoryTransport(
-            self.sched, self.nodes, faults, random.Random(seed ^ 0x5DEECE66)
+            self.sched, self.nodes, faults, random.Random(seed ^ 0x5DEECE66), links=net
         )
         self.trace: list[Transition] = []
         self._b1 = _B1State()
@@ -168,8 +179,10 @@ class Sim:
     def cfg(self, client_pub: bytes, **kw) -> QuorumConfig:
         return QuorumConfig(roster=self.roster, epoch=0, client_fp=fingerprint(client_pub), **kw)
 
-    def commit(self, op: Op, **cfg_kw) -> ClientRunner:
-        r = ClientRunner(Commit(self.cfg(op.author, **cfg_kw), op), self.transport, self.sched)
+    def commit(self, op: Op, *, src_id: int = CLIENT, **cfg_kw) -> ClientRunner:
+        r = ClientRunner(
+            Commit(self.cfg(op.author, **cfg_kw), op), self.transport, self.sched, src_id=src_id
+        )
         r.launch()
         self.runners.append(r)
         return r
@@ -227,6 +240,37 @@ class Sim:
                     f"B2 violated: committed op for slot {slot!r} on "
                     f"{holders} < {self.quorum} nodes"
                 )
+
+    # ---- partitions + gossip heal (WP2.2) --------------------------------- #
+    def partition(self, group_a: list[int], group_b: list[int]) -> None:
+        """Cut every node↔node link between the two groups (both directions). A
+        client is pinned to a side by cutting its src_id↔node links separately."""
+        assert self.net is not None, "partitions require a NetworkLinks (pass net=...)"
+        for a in group_a:
+            for b in group_b:
+                self.net.cut(a, b)
+
+    def gossip_round(self) -> None:
+        """One anti-entropy sweep: each node merges every peer whose DIRECTED link
+        to it is up (partition-respecting) — node i learns from j iff j→i is up."""
+        for i in range(self.n):
+            for j in range(self.n):
+                if i != j and (self.net is None or (j, i) not in self.net.down):
+                    gossip.merge(self._raw[i].acc.store, self._raw[j].acc.store)
+
+    def start_gossip(self, period_ms: int) -> None:
+        """Schedule periodic anti-entropy for the duration of the run."""
+
+        def tick() -> None:
+            self.gossip_round()
+            self.sched.after(period_ms, tick)
+
+        self.sched.after(period_ms, tick)
+
+    def converged(self) -> bool:
+        """Every node holds the same op set — the gossip fixpoint after heal."""
+        sets = [frozenset(o.op_hash for o in nd.acc.store.all_ops()) for nd in self._raw]
+        return all(s == sets[0] for s in sets)
 
     # ---- read helpers for tests ------------------------------------------- #
     def decided_ops(self, slot_tag: bytes) -> set[bytes]:
