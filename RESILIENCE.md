@@ -88,11 +88,24 @@ Across a fence: strong eventual consistency of the salvaged prefix holds; linear
 
 Why exactly f: an op committed to exactly q nodes, all q of which the gorilla destroys (possible once losses exceed f), has no node copy left — which is precisely why salvage step 1 reaches for clients.
 
+### 2.3 The self-inflicted gorilla — mistaken catastrophic recovery (NOTES 35)
+
+The most probable >f event in a small deployment is not a real gorilla but an operator who *believes* one happened: a partition (or a fistful of dead-looking daemons) isolates the manager from a quorum that is in fact alive, and the §2.2 procedure — whose entire premise is "the old quorum no longer exists" — is run against a living system. Root fiat makes this possible by construction, and nothing inside the protocol can prove the *absence* of a quorum (unreachability is not evidence — §1's regime split). Stated honestly, then contained:
+
+- **The divergence is bounded and loud, never silent.** The manager chain does not fork (the fence is an ordinary next op on it); what diverges is the old epoch's continuing commits versus the recovery manifest's cut — two live root-anchored worlds *until the fence propagates*.
+- **Activation is the park.** The §13 recovery exception already means a node activates the recovery epoch on observing the root-signed fence pair alone (no joint certificate). Node-side, that IS the containment rule, and it must be implemented as such: an old-roster node observing a valid recovery fence covering its own epoch immediately stops receipting under that epoch — fail-stop into the fence, the same posture as the lane-2 fold fence (DESIGN §16). On heal, the old world *parks* instead of racing the new one; its clients resync across the fence; its nodes rejoin, if at all, as fresh identities.
+- **The casualties self-report.** Ops committed on the old side between the salvage frontier and heal surface as QC-versus-manifest contradictions — §2.2 step 4's disclosure, with the QCs as cryptographic receipts of the broken promise, attributable to the recovery op itself. Loss is bounded by the partition duration.
+- **Prevention is operational, and the tool owns it** (MANAGER §3): mandatory reachability dwell, hard refusal while a quorum answers, named presumed-dead nodes, printed blast radius — all before the data-loss flag is considered.
+
+The rule of thumb the tool enforces: **recovery is never urgent.** A parked system loses no committed data by staying parked (§2.1); every hour of dwell shrinks the mistaken-recovery window at zero durability cost. The dangerous button is the one that un-parks the world.
+
 ---
 
 ## 3. Evil interactive octopus — Byzantine, adaptive, interactive
 
 The trust model is crash-faults + detect-and-punish (DESIGN §13); this section maps the cliff edges without pretending to move them.
+
+**Deployment-profile weighting (NOTES 35):** in the reference deployment, client nodes run inside TEEs while storage nodes are ordinary machines. The analysis below is therefore weighted toward tentacles on **storage nodes** (§3.1–§3.3); the client-side rows (§3.4, the time-traveller) stay in the model but drop in likelihood and in test priority (IMPLEMENTATION §6). Two corollaries: client-held audit state (fold caches, retained baselines) gains standing as trustworthy evidence, and the §3.5 any-two-victims comparison channel is strengthened — TEE clients comparing artifacts is an audit channel the octopus cannot quietly rot.
 
 **Headline:** *confidentiality and state convergence survive everything below root compromise. Coordination (CAS exclusion) and finality are guaranteed only by an honest quorum — a Byzantine violator cannot be prevented, but every violation necessarily manufactures a portable signed proof of its own occurrence, and even mid-violation, honest clients never diverge on state.*
 

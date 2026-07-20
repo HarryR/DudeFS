@@ -704,6 +704,205 @@ and A4 as formally stated. Resolutions decided with the design owner; DESIGN
       perjurer / time-traveller / amnesiac manager, per RESILIENCE §3), and A4 as
       a property/fuzz test (the fixpoint class a point vector misses).
 
+## R2 design rulings (2026-07-21) — HANDOFF-R2 Q1–Q5 answered
+
+34. **RESOLVED 2026-07-21 — all HANDOFF-R2 rulings landed as DESIGN/PROTOCOL/
+    FORMAL/IMPLEMENTATION edits; this item is the rationale record. Finding 4
+    is GO (land now); findings 1–3 are unblocked; one NEW finding (11) raised.**
+    - **(Q1 — pinned heads: the cut IS the pin.)** No new artifact: the
+      checkpoint's `cut` `{author: (seq, hash)}` is the pinned-head structure,
+      persisted in the store's durability domain on checkpoint adoption (the
+      pin is load-bearing across crash-restart). `heads()` anchors dense runs
+      at `cut_seq + 1` seeded by the pinned hash and reports the pin itself
+      when no tail extends it; `append()` exemption confirmed **as proposed**:
+      accept iff `pred ∈ store` OR `seq ≤ cut_seq[author] + 1` (note the
+      PROTOCOL §2.1 text previously read `seq ≤ cut`, which missed the
+      boundary op at `cut+1` — sharpened). The pin is metadata, not an op row
+      (the boundary op may itself be dead). Per-author `(seq, hash)`
+      granularity RATIFIED; merkle frontier object REJECTED (wrong scale,
+      loses the localize-to-author property). DESIGN §12 bullet added.
+    - **(Q2 — baseline completeness = equality over `covered ∖ dead`.)**
+      Superset-OK is REJECTED as unimplementable: a `(count, digest)`
+      commitment cannot test superset membership. Instead the retained
+      projection is checkpoint-defined: every below-cut digest (`SUMMARY`,
+      `verify_baseline`, `pull_baseline`) is computed over held-covered MINUS
+      the adopted checkpoint's `dead` — which also kills the mirror bug the
+      handoff didn't name: `summary()`/`pull_baseline()` digest raw holdings
+      today, so a GC'd node re-pulls dead envelopes from any lazy peer, every
+      round, forever (finding 3's blast radius includes anti-entropy
+      oscillation, not just intake false-reject). Mismatch at the node layer
+      is a *sync signal* (GC → pull → re-verify); it is a rejection only at
+      bootstrap intake. Deltas apply in checkpoint-chain order; a party
+      missing intermediate checkpoints resyncs the baseline whole. DESIGN §12
+      bullet added.
+    - **(Q3 — cert `epoch` is provenance metadata, NOT a fence.)** Caps are
+      epoch-independent; fold-positional revocation is the only kill switch.
+      Epoch-fencing would make every roster change a mass re-attestation
+      event coupled into the joint-commit window — exactly the in-flight
+      continuity §13 preserves — for zero security gain (a pre-bridge
+      revocation survives the bridge; key material is fenced by `keyepoch`).
+      Do NOT add fold enforcement. Forced re-attestation, if ever wanted, is
+      lane-3. DESIGN §15 edited.
+    - **(Q4 — incremental `dead` by contract.)** The compactor is fed the
+      previous checkpoint's retained set + sidecar (its warm barrier,
+      reconstructed mutations-only) plus the inter-cut tail; assert the
+      precondition (no below-prev-cut input outside prev_retained).
+      `dead = (prev_retained ∪ covered_tail) ∖ new_retained` — never re-list
+      prior dead. Decisive argument: after the first GC anywhere, full
+      history *doesn't exist*, so the current full-recompute signature isn't
+      merely slow — it's incoherent at M7. Diffing against the prior `dead`
+      list is REJECTED (that list is ∝ prior churn and semantically
+      redundant; the retained set is the complete positive statement).
+      Genesis-first checkpoint = degenerate `prev = ∅` case. DESIGN §12
+      bullet + PROTOCOL §3.2 edited.
+    - **(Q5 — `Promise.accepted_hlc` BLESSED; horizon gets an explicit
+      carrier.)** The wire field is correct and minimal: the acceptor holds
+      the envelope; client-side derivation would need a `FETCH` that fails
+      precisely in the GC'd case the guard serves; a signed misreport is
+      portable evidence. Pre-1.0, no compat debt. But the provenance ask
+      exposed a real gap: **no artifact carried the horizon** — the
+      checkpoint op's own `hlc` is UNSOUND as horizon (it sits above `F`;
+      using it voids live tail accepts → double-decide), and max-over-
+      retained under-approximates (a dead op may hold the highest below-cut
+      `hlc`). Ruling: checkpoint schema gains explicit `horizon = F` (the
+      sealing finality frontier); `advance_horizon` and `QuorumConfig.
+      horizon` both source from the latest committed checkpoint. Strictness:
+      void/ignore strictly-below only — at `hlc == F` an op may still newly
+      commit (`hlc == floor` passes the past gate), so `≤` would be a safety
+      hole while `<` costs a measure-zero livelock candidate. Three layers
+      confirmed: acceptor void on prepare + client guard + post-GC receipt
+      floor (§12 backstop, wire at M7). No fourth rule needed — "refuse to
+      report" IS the void rule. DESIGN §8/§12 + PROTOCOL §1.1 edited.
+    - **(Fix 7 verification — CORRECT and COMPLETE.)** The fixpoint closes
+      over exactly the right set. Key lemma: `version` is only ever written
+      by *applied* mutations, so every retained data op (winner or mask) was
+      APPLIED in the full fold — the mutations-only bootstrap replay is
+      faithful for them, and the last retained mutator of any key is that
+      key's version-op. Guards are structurally irrelevant at bootstrap
+      (mutations-only replay never evaluates them), so "a retained winner
+      whose guard references a dead version" cannot leak — there is no
+      second class. The retention obligation is precisely "the version-op of
+      every key any retained op mutates is retained", which the worklist
+      closure computes. (The `version != ⊥` branch in the mask scan is
+      unreachable armor: any key mutated by an applied op has a real
+      version.) FORMAL A4 wording updated to the fixpoint form.
+    - **(Fix 5 verification — CORRECT; placement confirmed.)** Client-side
+      guard + acceptor void is exactly NOTES 27's two-sided ruling; the
+      third layer (receipt floor) was already normative in DESIGN §12 and
+      lands with M7 GC wiring. Boundary: both sides strict-`<` (see Q5).
+    - **(Finding 4 — GO, land immediately.)** `return []` on any FETCH-phase
+      reply that is not the awaited op; the round deadline escalates.
+      Prefer matching on the request (`isinstance(req, FetchOpReq)`) over
+      the payload type — precise, and robust to future response shapes.
+    - **(NEW finding 11, HIGH, latent — `holds_frontier` is a fourth
+      cut-unaware gate.)** DESIGN §13's possession barrier checks per-op
+      holdings (`heads()` reach + exact frontier envelope); after GC, an
+      idle author's frontier entry can name a dead, GC'd envelope, so **no
+      honest node can ever pass the barrier → the first post-GC roster
+      change wedges (B4 liveness)**. Ruling: below the cut, possession =
+      verified baseline completeness (Q2 semantics); the per-op check
+      applies only above the cut. Same fix family and sequencing as
+      findings 1/2 (before or with M7). DESIGN §13 edited.
+    - **(Examined and CLEARED — deps on GC'd ops.)** An op citing a `deps`
+      hash that was GC'd is refused `unknown_dep` forever; this is
+      *correctly strict*: a client only cites recently-observed ops, the cut
+      trails finality by the audit window W, so only a client stale by > W
+      hits it — and the remedy is the ordinary re-read-and-retry. Bounded,
+      intended; no code change. Recorded so it isn't re-litigated.
+    - **(§6 rulings.)** (a) Adversarial personas: YES — first-class sim
+      subclasses (equivocator, floor perjurer, time-traveller, amnesiac
+      manager); `DOUBLE_VOTE`/`FLOOR_PERJURY` evidence minting lands WITH
+      them (it is currently a stub — B6 is claimed, not asserted, for those
+      kinds; the personas are its only honest generators). Equivocator
+      first. (b) False-rejection matrix: YES, standing rule — landed as
+      IMPLEMENTATION §6.5. (c) A4 property fuzz: YES, now — the harness
+      exists and the fixpoint bug was a class; landed as IMPLEMENTATION
+      §6.6. (d) Split-view detection is NOT paper: divergent manager chains
+      from one genesis must fork at some `(author, seq)` (prev-linkage
+      forces it), so two victims exchanging logs mint `FORK` evidence via
+      ordinary `append` — write the two-victims sim test; landed in
+      IMPLEMENTATION §6.4.
+    - **Sequencing:** finding 4 now; findings 1/2/11 as one cut-aware-store
+      change (Q1 spec) + finding 3 (Q2 spec) before or with M7; Q4's
+      incremental compactor before the M7 daemon wires GC; Q5's `horizon`
+      field is a checkpoint schema change — land it with the golden-vector
+      update in the same commit.
+
+35. **R3 framing rulings (2026-07-21) — optimization ledger, threat
+    re-weighting, the fumbling manager.** Issued with HANDOFF-R3.
+    - **(a) The dial ledger is DESIGN §18.** Objectives split into invariants
+      (confidentiality, determinism/SEC, sign-after-fsync, evidence totality,
+      root-offline — never on a dial) and six dials (`n`, gossip cadence,
+      conveyor cadence, `W`, `δ`, delegation breadth). Trilemma honesty:
+      exactly two genuine three-way tensions (replication: durability ×
+      footprint × cost, all riding `n`; compaction: disk floor × delta
+      bandwidth × audit window `W`); the rest are two-way dials. Named
+      non-tensions so they aren't traded by accident: durability and
+      partition tolerance are the SAME dial (`n`); write availability under
+      partition is not a dial (writes park on minority sides by
+      construction, reads continue everywhere — chosen in §1). Two
+      objectives the original list missed: client sync cost (structurally
+      settled) and operator-proofness of recovery (see c).
+    - **(b) Threat re-weighting: TEE clients.** The reference deployment
+      runs client nodes in TEEs, storage nodes bare. Octopus analysis and
+      test priority re-weight toward node-side tentacles (equivocator,
+      floor perjurer, withholder, amnesiac node); client-side rows stay in
+      the model at lower priority. Client-held audit state gains standing;
+      the §3.5 two-victims comparison channel strengthens. RESILIENCE §3
+      intro edited.
+    - **(c) The fumbling manager is a first-class persona — honest-but-
+      confused root, the most probable real >f event.** RESILIENCE §2.3
+      (self-inflicted gorilla): mistaken recovery against a living quorum
+      is possible by construction (absence of a quorum is unprovable);
+      containment is protocolar — **activation-is-the-park** (the §13
+      recovery exception, restated node-side: observing a valid recovery
+      fence for one's own epoch stops receipting under it, fail-stop like
+      the lane-2 fence), casualties self-report as QC-vs-manifest
+      contradictions, loss bounded by partition duration and never silent.
+      Prevention is operational and the TOOL owns it (MANAGER §3: dwell
+      probe, hard refusal while a quorum answers, named presumed-dead list,
+      printed blast radius). Rule of thumb made normative: recovery is
+      never urgent — a parked system loses nothing by staying parked.
+    - **(d) HANDOFF-R3 issued:** WP1 = the item-34 correctness wave
+      (findings 1/2/3/4/11, Q4 incremental compactor, Q5 horizon schema);
+      WP2 = chaos axes (latency incl. heavy-tail + asymmetric, reorder/dup/
+      burst loss, partitions incl. one-way + flapping, time skew incl.
+      drift + step jumps, crash-restart at every persistence boundary);
+      WP3 = node-side personas with DOUBLE_VOTE/FLOOR_PERJURY evidence
+      minting; WP4 = the fumbling-manager suite (crash-at-every-step,
+      double-press, stale frontier, mistaken recovery, button-masher
+      property test).
+
+36. **R3 pushback amendments (2026-07-21, pre-WP1 — implementer review of
+    HANDOFF-R3, all three points accepted).**
+    - **(a) Activation-is-the-park RULED: a restatement of M5's
+      `activate_epoch`, not new machinery** — the same monotone epoch
+      switch with a second validated trigger: the root-signed recovery
+      pair (recovery checkpoint + roster op carrying a `recovery` field
+      that names it) substitutes for the joint certificate. The park is
+      the *emergent effect* of the `e+1` receipt/watermark stamp meeting
+      client-side epoch checks — no separate park rule exists. New surface
+      is exactly one validate-fence-then-activate step, promoted out of
+      the WP4 test package into **WP1.7** with its own unit tests, landed
+      before any persona exercises it. Security ruling attached:
+      recovery-marked roster ops are **root-only** — a delegated
+      `manage-roster` cert must never mint fiat activation, because fiat
+      bypasses the joint-quorum safeguard that makes that delegation safe.
+      Distinct from the possession barrier: the barrier gates *joining*
+      the new roster; the fence parks *everyone who sees it*. DESIGN §13
+      edited; HANDOFF-R3 amended.
+    - **(b) Sequencing gated, not a mega-push:** WP1 fully green → STOP →
+      D3 review of that diff (cut-aware store + compactor rewrite are the
+      two highest-risk changes; WP1.7 is new acceptor surface) → WP2
+      harness alone → WP3/4 personas. HANDOFF-R3 sequencing rewritten.
+    - **(c) Q3's consequence acknowledged explicitly, not left implicit:**
+      rotating the roster expires nobody's capabilities — a
+      distrust-motivated roster change must be PAIRED with explicit
+      revocations; an epoch bridge never re-attests. DESIGN §15 states it
+      as the deliberate choice it is; MANAGER §3 makes the tool print the
+      live cert inventory before roster commands so the
+      bridge-re-attests assumption cannot hide.
+
 # Not yet built (by design, M2+)
 
 QCs are *constructed and verified* (M0) but no acceptor, quorum client, floor,

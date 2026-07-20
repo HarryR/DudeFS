@@ -40,7 +40,9 @@ One binary (working name: `dude`); manager powers come from *which keys are pres
 ## 3. Interlocks (the tool protects the operator)
 
 - `init` refuses over existing state; `recover` demands the explicit data-loss flag; `revoke` stages `rotate` by default.
+- `recover` is the most interlocked verb of all (RESILIENCE §2.3 — the self-inflicted gorilla): a mandatory reachability probe of every roster endpoint over a dwell window (≥ k·δ plus several gossip periods), a **hard refusal while a quorum answers**, an explicit named list of presumed-dead nodes, and a printed blast radius (salvage frontier vs last-known finality frontier) — all before the data-loss flag is even considered. The tool reminds the operator that a parked system is safe: recovery is never urgent, and dwell is free.
 - Roster commands refuse even voting-member counts and un-caught-up learners *client-side* before the node-side barriers would anyway (fail fast, fail near the operator).
+- Roster commands print the **live cert inventory** (subject, caps, issuance epoch) before executing — DESIGN §15: rotation expires no capability, so a distrust-motivated change needs explicit revocations alongside it; the tool puts the list in front of the operator instead of letting the epoch-bridge-re-attests assumption hide.
 - After any crash the tool re-derives where a staged flow stopped (everything is idempotent and observable in the log) and offers `--resume`.
 - The amnesia guard (§1) is not skippable: an accidentally self-forked manager chain is indistinguishable from root compromise (DESIGN §4), so the tool treats chain-head uncertainty as radioactive.
 

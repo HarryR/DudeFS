@@ -21,7 +21,7 @@
 | Verb | Request | Response | Notes |
 |---|---|---|---|
 | `SUBMIT` | **blind** op envelope | `ACCEPTED{receipt}` \| `REJECTED{reason}` | Blind writes only (no slot). A slotted envelope is proposed via `PREPARE`/`ACCEPT`; slotted `SUBMIT` is `REJECTED{needs_ballot}` (rev 5 — the ballot-0 fast path is gone, DESIGN §8). Resubmission re-yields the identical receipt. |
-| `PREPARE` | `{slot_tag, ballot}` | `PROMISE{ballot, accepted?: (ballot, op_hash), sig}` \| `NACK{promised}` | Phase 1 of every slotted proposal (DESIGN §8). Promises are signed — they are evidence, and how a loser learns the decided op. |
+| `PREPARE` | `{slot_tag, ballot}` | `PROMISE{ballot, accepted?: (ballot, op_hash, hlc), sig}` \| `NACK{promised}` | Phase 1 of every slotted proposal (DESIGN §8). Promises are signed — they are evidence, and how a loser learns the decided op. A reported accept carries the accepted op's `hlc` so the proposer can apply the below-horizon no-accept guard (§1.3 step 3) without a fetch round trip. |
 | `ACCEPT` | `{slot_tag, ballot, op}` | `ACCEPTED{receipt@ballot}` \| `NACK{promised}` | Phase 2. Carries the envelope in case the node lacks it. |
 | `FETCH_OP` | `{op_hash}` | envelope + known receipts | |
 | `FRONTIER` | – | signed **frontier bundle**: `sign(node_sk, per-author heads ‖ checkpoint_head ‖ config_epoch ‖ floor)` | The read primitive. Heads and floor are signed *at one instant* — this is what makes quorum reads relay-safe (§7.3). |
@@ -62,7 +62,7 @@ Because frontier bundles are signed atomically, the quorum read is **path-indepe
 
 ### 2.1 Invariants
 
-- **Contiguity:** a node stores `(author, seq)` only if it holds `seq−1` (or `seq ≤` the checkpoint cut — below the cut chains are legitimately **sparse**: a node holds exactly the retained subset, validated against the checkpoint's per-author `(count, digest)` commitment, DESIGN §12). Chains always validate locally; there are no orphan islands. An eager-pushed op that would open a gap triggers an immediate `PULL` of the gap; if the gap can't be filled now, drop the push — the periodic cycle will carry it.
+- **Contiguity:** a node stores `(author, seq)` only if it holds `seq−1` (or `seq ≤ cut_seq[author] + 1` — the exemption covers both the sparse below-cut baseline **and** the first tail op above the boundary, whose `seq−1` predecessor may be dead and GC'd; below the cut chains are legitimately **sparse**: a node holds exactly the retained subset, validated against the checkpoint's per-author `(count, digest)` commitment over the `covered ∖ dead` projection, DESIGN §12). Chains always validate locally; there are no orphan islands. An eager-pushed op that would open a gap triggers an immediate `PULL` of the gap; if the gap can't be filled now, drop the push — the periodic cycle will carry it.
 - **Dep resolution before acceptance:** a node accepts an op only once every `deps`-referenced op is present locally — committed *or merely stored* (floors gate receipts, not storage, so a dep on an uncommitted op is always satisfiable). Unknown deps trigger a `PULL`; if they can't be fetched now, defer (`unknown_dep`) and let the periodic cycle carry them. This is what makes a fork visible at the first node where two branches' observers meet: the pulled branch collides in the store and mints equivocation evidence **at accept time** (DESIGN §4). Ballot `ACCEPT` (recovery) is exempt, like contiguity — completing a decision must never block on context.
 - **The watermark floor never gates gossip.** Floors gate *issuing receipts*; storing and relaying already-receipted material must always proceed, or convergence breaks (DESIGN §8).
 - Deduplicate by hash; validate before storing (signature, authz against the current control-plane view, chain links).
@@ -72,7 +72,7 @@ Because frontier bundles are signed atomically, the quorum read is **path-indepe
 
 | Verb | Payload | Notes |
 |---|---|---|
-| `SUMMARY` | per-author heads · per-author receipt coverage · checkpoint head + retained digests · floor · epoch · evidence digest | Exchanged pairwise; each node runs a periodic epidemic round against a uniformly random peer. |
+| `SUMMARY` | per-author heads · per-author receipt coverage · checkpoint head + retained digests · floor · epoch · evidence digest | Exchanged pairwise; each node runs a periodic epidemic round against a uniformly random peer. Retained digests are over the **`covered ∖ dead` projection** (DESIGN §12) — never raw holdings, or a lazy-GC node and a GC'd one would diff forever; heads at-or-below the cut are pinned by the checkpoint, not served contiguously. |
 | `DELTA` | envelope runs (contiguous above the cut; retained-sparse below) + receipts + QCs + checkpoints + control ops + evidence | Ships exactly the diff the `SUMMARY` exposed, honoring contiguity. |
 | eager push | `{op, my receipt}` on fresh accept, to all peers | Latency optimization only; correctness rests on the periodic cycle alone. |
 
@@ -103,7 +103,7 @@ Crash at any step: everything is idempotent and slot-guarded; resume or retry ve
 Run routinely by the **compactor** — a delegated `compact`-capability identity holding the group key (DESIGN §12/§15); the root key stays offline. The compactor maintains a warm incremental fold; each conveyor step is cheap and proportional to churn.
 
 1. Final quorum read → frontier `F`, entirely final (no straggler can ever sort below it — DESIGN §9/§12), trailing the finality frontier by the audit window `W`.
-2. Incremental tail-fold to `F`; compute the newly-dead set (superseded or deleted ≤ `cut`, honoring the resurrection mask — DESIGN §12 retention rule) and the full retained commitment; build `Checkpoint{cut, state_root, dead, retained, attempts, …}` — kilobytes, ∝ churn. **Tombstones die here** and their lineages restart at `(⊥, 0)`; live-key attempts ride the encrypted sidecar.
+2. Incremental tail-fold to `F` — inputs are contractually the previous checkpoint's retained set + sidecar plus the inter-cut committed tail (DESIGN §12; full history no longer exists after GC); compute the newly-dead set (superseded or deleted ≤ `cut`, honoring the resurrection mask — DESIGN §12 retention rule: `dead = (prev_retained ∪ covered_tail) ∖ new_retained`) and the full retained commitment; build `Checkpoint{cut, horizon: F, state_root, dead, retained, attempts, …}` — kilobytes, ∝ churn. **Tombstones die here** and their lineages restart at `(⊥, 0)`; live-key attempts ride the encrypted sidecar.
 3. `SUBMIT` like any op → QC → the checkpoint is committed.
 4. Nodes, on observing the committed checkpoint, **may** — lazily, locally, at leisure — drop the `dead` ops, drop receipts/QCs ≤ `cut` (the `retained` commitment vouches), drop slot acceptor-state consumed ≤ `cut` (void on `PREPARE` regardless — DESIGN §8), and enforce the receipt floor at the horizon. No coordination needed: the barrier is logical, not physical, so nodes GC'ing at different times is normal operation. Clients apply the same `dead` delta to their caches.
 5. Any full-history client recomputes `state_root` within `W` and shouts on mismatch — compaction stays a *selection* channel, auditable (DESIGN §12 trust surface).
