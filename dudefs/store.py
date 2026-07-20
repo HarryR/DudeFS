@@ -187,6 +187,30 @@ class FloorPerjuryEvidence:
         )
 
 
+class LostCommitEvidence:
+    """A QC that a recovery fence ORPHANED: an op committed at an epoch BELOW the
+    fence's new epoch, yet ABSENT from the recovery checkpoint's `retained` manifest
+    (RESILIENCE §2.2 step 4 — the QC is a cryptographic receipt of the broken
+    durability promise). Not signer misbehavior — an honest-but-mistaken recovery's
+    disclosure, attributable to the recovery op. `verify` needs external context the
+    store does not hold as artifacts: the old-epoch `roster` (to check the QC) and
+    the recovery checkpoint's `retained_hashes` (to prove absence)."""
+
+    __slots__ = ("qc", "recovery_epoch", "recovery_ckpt_hash")
+
+    def __init__(self, qc: QC, recovery_epoch: int, recovery_ckpt_hash: bytes):
+        self.qc = qc
+        self.recovery_epoch = int(recovery_epoch)
+        self.recovery_ckpt_hash = recovery_ckpt_hash
+
+    def verify(self, roster: list[bytes], retained_hashes: frozenset[bytes]) -> bool:
+        return (
+            self.qc.config_epoch < self.recovery_epoch  # below the fence
+            and self.qc.op_hash not in retained_hashes  # absent from the manifest
+            and self.qc.verify(roster)  # a genuine commitment
+        )
+
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS ops (
     op_hash BLOB PRIMARY KEY, author BLOB NOT NULL, seq INTEGER NOT NULL,
@@ -515,9 +539,17 @@ class ChainStore:
 
     def evidence(
         self,
-    ) -> list[tuple[EvidenceKind, ForkEvidence | DoubleVoteEvidence | FloorPerjuryEvidence]]:
+    ) -> list[
+        tuple[
+            EvidenceKind,
+            ForkEvidence | DoubleVoteEvidence | FloorPerjuryEvidence | LostCommitEvidence,
+        ]
+    ]:
         out: list[
-            tuple[EvidenceKind, ForkEvidence | DoubleVoteEvidence | FloorPerjuryEvidence]
+            tuple[
+                EvidenceKind,
+                ForkEvidence | DoubleVoteEvidence | FloorPerjuryEvidence | LostCommitEvidence,
+            ]
         ] = []
         for kind, data in self.db.execute("SELECT kind, data FROM evidence"):
             k = EvidenceKind(kind)
@@ -561,7 +593,46 @@ class ChainStore:
                         ),
                     )
                 )
+            elif k == EvidenceKind.LOST_COMMIT:
+                out.append(
+                    (
+                        k,
+                        LostCommitEvidence(
+                            A.QC.decode(codec.as_bytes(p[0])),
+                            codec.as_int(p[1]),
+                            codec.as_bytes(p[2]),
+                        ),
+                    )
+                )
         return out
+
+    def detect_lost_commits(
+        self, recovery_epoch: int, recovery_ckpt_hash: bytes, retained_hashes: frozenset[bytes]
+    ) -> list[LostCommitEvidence]:
+        """Against a recovery fence (its `recovery_epoch` and the recovery
+        checkpoint's `retained_hashes` manifest), scan held QCs for a commitment
+        that the fence orphaned — below the fence's epoch AND absent from the
+        manifest — and mint + persist a portable LOST_COMMIT record (RESILIENCE §2.2
+        step 4). Idempotent."""
+        seen = {
+            ev.qc.op_hash
+            for k, ev in self.evidence()
+            if k == EvidenceKind.LOST_COMMIT and isinstance(ev, LostCommitEvidence)
+        }
+        found: list[LostCommitEvidence] = []
+        for qc in self.all_qcs():
+            if (
+                qc.config_epoch < recovery_epoch
+                and qc.op_hash not in retained_hashes
+                and qc.op_hash not in seen
+            ):
+                found.append(LostCommitEvidence(qc, recovery_epoch, recovery_ckpt_hash))
+        for ev in found:
+            self._store_evidence(
+                EvidenceKind.LOST_COMMIT,
+                [ev.qc.encode(), ev.recovery_epoch, ev.recovery_ckpt_hash],
+            )
+        return found
 
     def detect_floor_perjury(self, watermarks: list[A.Watermark]) -> list[FloorPerjuryEvidence]:
         """Against a set of observed `watermarks`, scan held receipts + ops for a

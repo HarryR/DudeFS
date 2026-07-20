@@ -11,6 +11,7 @@ from dudefs import crypto as C
 from dudefs import quorum as Q
 from dudefs.handlers import control as ctl
 from dudefs.sim.harness import Sim
+from dudefs.store import EvidenceKind
 from dudefs.transports.memory import Link, NetworkLinks
 from tests._builders import World
 
@@ -102,6 +103,34 @@ class TestMistakenRecovery(unittest.TestCase):
         # contradiction against the recovery manifest, attributable to the recovery op.
         self.assertTrue(r.outcome.qc.verify(sim.roster))
         self.assertLess(r.outcome.qc.config_epoch, sim._raw[1].acc.epoch)
+
+    def test_over_window_commit_mints_lost_commit(self):
+        # ruling 41(b): the over-window e=0 commit — below the recovery fence and
+        # absent from its (empty) manifest — mints a persistent LOST_COMMIT record,
+        # the recovery op's cryptographic receipt of the durability it broke.
+        net = NetworkLinks(default=Link(base_ms=2, jitter_ms=1))
+        sim = Sim(seed=12, n=3, net=net)
+        w = World(seed=12, n_clients=1)
+        msk, mpub = w.mgr_sk, w.mgr_pub
+        MAJ = -2
+        sim.partition([0], [1, 2])
+        net.cut(MAJ, 0)
+        op = _create(w, 0, b"k", b"live")
+        r = sim.commit(op, src_id=MAJ)
+        sim.run()
+        assert isinstance(r.outcome, Q.Committed)
+
+        # the recovery fence (empty manifest — presumes everything lost) activates e+1
+        ckpt, _rop = _recovery_pair(msk, mpub, [sim.roster[0]])
+        # an auditor holds the orphaned QC and the recovery fence; it discloses
+        store = sim._raw[0].acc.store
+        store.put_qc(r.outcome.qc)
+        proofs = store.detect_lost_commits(1, ckpt.op_hash, frozenset())  # retained = {}
+        self.assertEqual(len(proofs), 1)
+        self.assertEqual(proofs[0].qc.op_hash, op.op_hash)
+        self.assertTrue(proofs[0].verify(sim.roster, frozenset()))  # genuine, orphaned
+        self.assertTrue(any(k == EvidenceKind.LOST_COMMIT for k, _ in store.evidence()))
+        self.assertEqual(store.detect_lost_commits(1, ckpt.op_hash, frozenset()), [])  # idempotent
 
     def test_recovery_fence_is_root_only_under_partition(self):
         # a DELEGATE cannot fiat-activate even while partitioned (WP1.7 root-only,
