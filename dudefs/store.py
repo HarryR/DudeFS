@@ -19,6 +19,28 @@ from . import codec
 from .artifacts import BLIND, HLC, QC, Ballot, Heads, Op, Receipt
 
 
+def covered(op: Op, cut: Heads) -> bool:
+    """At-or-below the pinned cut, per-author by seq (DESIGN §12) — the boundary
+    between the sparse baseline and the dense tail. The canonical predicate;
+    gossip (L2) imports it so store and anti-entropy agree on the boundary."""
+    entry = cut.get(op.author)
+    return entry is not None and op.seq <= entry[0]
+
+
+def _encode_pairs(d: dict[bytes, tuple[int, bytes]]) -> bytes:
+    """Serialize a {key: (n, hash)} map (a cut or a retained commitment) for the
+    durable `meta` table."""
+    return codec.encode({a: [n, h] for a, (n, h) in d.items()})
+
+
+def _decode_pairs(raw: bytes) -> dict[bytes, tuple[int, bytes]]:
+    out: dict[bytes, tuple[int, bytes]] = {}
+    for a, entry in codec.as_dict(codec.decode(raw)).items():
+        pair = codec.as_seq(entry, 2)
+        out[a] = (codec.as_int(pair[0]), codec.as_bytes(pair[1]))
+    return out
+
+
 class AppendStatus(StrEnum):
     """append() outcomes (ARCHITECTURE L2: ok | dup | gap | fork-evidence).
     INVALID (bad structure/signature — drop) is distinct from GAP (missing
@@ -147,7 +169,15 @@ class ChainStore:
                 "SELECT 1 FROM ops WHERE author=? AND seq=?", (op.author, op.seq - 1)
             ).fetchone()
             if has_prev is None:
-                return AppendResult(AppendStatus.GAP)
+                # cut exemption (WP1.2 / finding 2, PROTOCOL §2.1): an op whose
+                # predecessor is at-or-below the cut (seq-1 <= cut_seq, i.e.
+                # seq <= cut_seq+1) is contiguous-by-fiat — that predecessor was
+                # legitimately GC'd and the checkpoint's retained commitment
+                # certifies the below-cut prefix. Only a genuine tail gap defers.
+                entry = self.cut().get(op.author)
+                cut_seq = entry[0] if entry else -1
+                if op.seq > cut_seq + 1:
+                    return AppendResult(AppendStatus.GAP)
         self.db.execute(
             "INSERT INTO ops VALUES (?,?,?,?,?,?,?)",
             (
@@ -197,18 +227,28 @@ class ChainStore:
         computed over each author's CONTIGUOUS prefix only. Orphan islands
         (ops stored contiguity-free by a ballot ACCEPT, DESIGN §8) are never
         reported: a signed frontier bundle must not claim a head the node
-        cannot serve as a contiguous run (PROTOCOL §2.1 / NOTES item 16)."""
-        out: Heads = {}
+        cannot serve as a contiguous run (PROTOCOL §2.1 / NOTES item 16).
+
+        Cut-aware (WP1.2 / finding 1): below the cut the log is sparse (below-cut
+        ops may be GC'd), so a cut author's dense-tail run is anchored at its
+        PINNED head (cut_seq, cut_hash) and resumes at cut_seq+1 — never at
+        seq 0, which may be gone. A cut author with no tail reports the pin
+        itself. Authors absent from the cut anchor at the chain root (seq 0), as
+        before — an empty cut is exactly the pre-compaction behavior."""
+        cut = self.cut()
+        # seed each cut author with its pinned head: that IS its frontier below
+        # the cut, and the boundary the tail extends from.
+        out: Heads = dict(cut)
         for author, seq, oh in self.db.execute(
             "SELECT author, seq, op_hash FROM ops ORDER BY author, seq"
         ):
             cur = out.get(author)
             if cur is None:
-                if seq == 0:  # a run must start at the chain root (M6: at the cut)
+                if seq == 0:  # no cut for this author: a run starts at the root
                     out[author] = (seq, oh)
             elif seq == cur[0] + 1:
-                out[author] = (seq, oh)  # contiguous extension
-            # seq == cur[0]: an equivocation sibling — keep the first
+                out[author] = (seq, oh)  # contiguous extension (from pin or root)
+            # seq <= cur[0]: below/at the pin, or an equivocation sibling — skip
             # seq > cur[0] + 1: beyond a gap — not part of the frontier
         return out
 
@@ -270,6 +310,35 @@ class ChainStore:
             sig_list = [codec.as_bytes(x) for x in codec.as_seq(codec.decode(sigs))]
             out.append(A.QC(oh, ep, Ballot.decode(codec.decode(ballot)), bitmap, sig_list))
         return out
+
+    # ---- checkpoint cut (the log-compaction boundary; DESIGN §12) ---------- #
+    def adopt_checkpoint(self, cut: Heads, retained: dict[bytes, tuple[int, bytes]]) -> None:
+        """Persist the active compaction cut + its `retained` commitment on
+        observing a quorum-committed checkpoint (WP1.2). DURABLE — the cut
+        re-parametrizes heads()/append()/possession below it, so it must survive
+        crash-restart exactly like the floor (both `set_meta` writes COMMIT-fsync).
+        GC of the `dead` delta is a separate step (gc_checkpoint); adoption must
+        precede it so the gates never see dropped ops without the cut."""
+        self.set_meta("cut", _encode_pairs(cut))
+        self.set_meta("cut_retained", _encode_pairs(retained))
+
+    def cut(self) -> Heads:
+        """The active compaction cut, or {} when uncompacted (pre-M6 behavior)."""
+        raw = self.get_meta("cut")
+        return _decode_pairs(raw) if raw else {}
+
+    def cut_retained(self) -> dict[bytes, tuple[int, bytes]]:
+        """The checkpoint's signed per-author below-cut commitment (the target a
+        node's own baseline_commitment() must match to prove completeness)."""
+        raw = self.get_meta("cut_retained")
+        return _decode_pairs(raw) if raw else {}
+
+    def baseline_commitment(self) -> dict[bytes, tuple[int, bytes]]:
+        """This node's ACTUAL retained commitment over the below-cut ops it holds
+        — compared per author against cut_retained() to prove baseline
+        completeness (WP1.2 possession, WP1.3 gossip)."""
+        cut = self.cut()
+        return A.retained_commitment([o for o in self.all_ops() if covered(o, cut)])
 
     def gc_checkpoint(self, dead: list[bytes]) -> None:
         """Log-compaction GC (DESIGN §12 rev 6): on observing a quorum-committed

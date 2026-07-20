@@ -26,14 +26,7 @@ from dataclasses import dataclass, field
 from . import artifacts as A
 from .artifacts import HLC, QC, Heads, Op, Receipt
 from .store import ChainStore
-
-
-def _covered(op: Op, cut: Heads) -> bool:
-    """At-or-below the pinned cut, per-author by seq (DESIGN §12) — the boundary
-    between the sparse baseline and the dense tail."""
-    entry = cut.get(op.author)
-    return entry is not None and op.seq <= entry[0]
-
+from .store import covered as _covered  # the canonical cut boundary (store L2)
 
 # --------------------------------------------------------------------------- #
 # Summary — the compact "what I hold" advertisement (PROTOCOL §2.2)            #

@@ -3,13 +3,15 @@
 # state to a full-history client. The resurrection and sidecar vectors MUST fail
 # if their mechanism is removed — that is what proves they are load-bearing.
 
+import os
+import tempfile
 import unittest
 
 from dudefs import artifacts as A
 from dudefs import compactor, crypto, fold, gossip
 from dudefs.acceptor import Acceptor
 from dudefs.handlers import control as ctl
-from dudefs.store import ChainStore
+from dudefs.store import AppendStatus, ChainStore
 from tests._builders import World
 
 BIG_DELTA = 1_000_000
@@ -215,6 +217,132 @@ class TestNodeGC(unittest.TestCase):
         self.assertIsNone(store.get_op(first.op_hash))  # superseded op GC'd
         self.assertIsNotNone(store.get_op(winner.op_hash))  # retained winner kept
         self.assertIsNotNone(store.get_op(control[0].op_hash))  # control liveness kept
+
+
+class TestCutAwareStore(unittest.TestCase):
+    """WP1.2 (findings 1/2/11): the store's heads()/append()/possession gates
+    must stay correct once the below-cut log is sparse (GC'd). Each gate ships
+    with its boundary-valid-ACCEPTED case beside the reject/severed case."""
+
+    def _creates(self, w, ci, n):
+        """n independent creates by client `ci` -> seqs 0..n-1 for that author."""
+        return [
+            w.cas(
+                ci,
+                b"k%d" % i,
+                A.VERSION_ABSENT,
+                0,
+                [[A.Guard.ABSENT, b"k%d" % i]],
+                [[A.Mutation.SET, b"k%d" % i, b"v"]],
+            )
+            for i in range(n)
+        ]
+
+    def test_finding1_heads_serves_dense_tail_after_below_cut_gc(self):
+        w = World(seed=20, n_clients=1)
+        pub = w.clients[0].pub
+        ops = self._creates(w, 0, 4)  # seqs 0,1,2,3
+        cut = {pub: (1, ops[1].op_hash)}  # seqs 0,1 below the cut; 2,3 dense tail
+
+        store = ChainStore()
+        for o in ops:
+            self.assertTrue(store.append(o))
+        store.adopt_checkpoint(cut, {})
+        store.gc_checkpoint([ops[0].op_hash, ops[1].op_hash])  # drop below-cut ops
+
+        # ACCEPT: the tail is anchored at the pin and still reported in full —
+        # seq-0 is gone but the author does NOT vanish (finding 1).
+        self.assertEqual(store.heads()[pub], (3, ops[3].op_hash))
+
+        # boundary: an author whose whole chain is below the cut (fully GC'd,
+        # idle) reports its PIN, not nothing.
+        idle = w.clients[0].pub  # reuse: build a store with only below-cut ops
+        s2 = ChainStore()
+        for o in ops[:2]:
+            s2.append(o)
+        s2.adopt_checkpoint(cut, {})
+        s2.gc_checkpoint([ops[0].op_hash, ops[1].op_hash])
+        self.assertEqual(s2.heads()[idle], (1, ops[1].op_hash))  # the pin itself
+
+    def test_finding2_append_cut_exemption_is_bounded(self):
+        w = World(seed=21, n_clients=1)
+        pub = w.clients[0].pub
+        ops = self._creates(w, 0, 4)  # seqs 0,1,2,3
+        cut = {pub: (1, ops[1].op_hash)}  # cut_seq = 1
+
+        # ACCEPT (exemption): a tail op at cut_seq+1 whose predecessor sits at the
+        # cut (legitimately GC'd, absent) is contiguous-by-fiat, not a gap.
+        s = ChainStore()
+        s.adopt_checkpoint(cut, {})
+        self.assertEqual(s.append(ops[2]).status, AppendStatus.OK)  # pred seq1 <= cut
+
+        # REJECT (genuine gap): one seq further, at cut_seq+2, whose predecessor is
+        # neither present nor below the cut, still defers.
+        s2 = ChainStore()
+        s2.adopt_checkpoint(cut, {})
+        self.assertEqual(s2.append(ops[3]).status, AppendStatus.GAP)  # pred seq2 missing
+
+    def test_finding11_possession_below_cut_is_baseline_completeness(self):
+        # An author's below-cut envelope is GC'd; a possession barrier whose entry
+        # names it must pass via baseline completeness, not wedge on the missing
+        # envelope (finding 11) — the roster change would otherwise never activate.
+        w = World(seed=22, n_clients=1)
+        control = list(w.control_ops)
+        below = list(control)
+        first = w.cas(
+            0, b"k", A.VERSION_ABSENT, 0, [[A.Guard.ABSENT, b"k"]], [[A.Mutation.SET, b"k", b"v1"]]
+        )
+        below.append(first)
+        v, a = fold.fold(below, w.keyring, w.genesis).lineage(b"k")
+        winner = w.cas(
+            0, b"k", v, a, [[A.Guard.VERSION_EQ, b"k", v]], [[A.Mutation.SET, b"k", b"v2"]]
+        )
+        below.append(winner)
+        cut = _cut(w)
+        cr = compactor.compact(below, w.keyring, w.genesis, cut)
+        committed = A.retained_commitment(cr.retained)
+        self.assertIn(first.op_hash, cr.dead)
+
+        store = ChainStore()
+        for o in below:
+            store.append(o)
+        store.adopt_checkpoint(cut, committed)
+        store.gc_checkpoint(cr.dead)
+        self.assertIsNone(store.get_op(first.op_hash))  # the named envelope is gone
+
+        sk = bytes([170] * 32)
+        acc = Acceptor(sk, crypto.SIGNER.public(sk), store, config_epoch=0, delta_ms=BIG_DELTA)
+        # a frontier entry BELOW the cut naming the GC'd (dead) envelope:
+        sf = {w.clients[0].pub: (0, first.op_hash)}
+        # ACCEPT: baseline is complete (winner + control held) -> possession holds
+        self.assertTrue(acc.holds_frontier(sf))
+
+        # REJECT (pair): a node MISSING the retained winner has an incomplete
+        # baseline -> its digest diverges for that author -> possession fails.
+        gap = ChainStore()
+        for o in cr.retained:
+            if o.op_hash != winner.op_hash:
+                gap.put_op_raw(o)
+        gap.adopt_checkpoint(cut, committed)
+        gacc = Acceptor(sk, crypto.SIGNER.public(sk), gap, config_epoch=0, delta_ms=BIG_DELTA)
+        self.assertFalse(gacc.holds_frontier(sf))
+
+    def test_adopted_cut_survives_crash_restart(self):
+        # The cut is in the durability domain (WP1.2): it re-parametrizes the
+        # gates below it, so it must outlive a restart like the floor.
+        w = World(seed=23, n_clients=1)
+        pub = w.clients[0].pub
+        cut = {pub: (2, b"\x11" * 32)}
+        committed = {pub: (1, b"\x22" * 32)}
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "store.db")
+            s = ChainStore(path)
+            s.adopt_checkpoint(cut, committed)
+            s.close()
+            s2 = ChainStore(path)
+            self.assertEqual(s2.cut(), cut)
+            self.assertEqual(s2.cut_retained(), committed)
+            s2.close()
 
 
 class TestCheckpointArtifact(unittest.TestCase):

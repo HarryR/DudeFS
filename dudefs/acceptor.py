@@ -273,15 +273,32 @@ class Acceptor:
 
     def holds_frontier(self, sync_frontier: A.Heads) -> bool:
         """The data-possession barrier (DESIGN §13): does this node hold every
-        committed op at or below `sync_frontier`? Checks that its contiguous head
-        for each author reaches the frontier seq AND that it holds the exact
-        frontier op — so a new-roster node's receipt proves possession, not just
-        agreement. A node that fails this PULLs to baseline and retries."""
+        committed op at or below `sync_frontier`? A new-roster node's receipt
+        must prove possession, not just agreement; a node that fails this PULLs
+        to baseline and retries.
+
+        Cut-aware (WP1.2 / finding 11): a frontier entry AT-OR-BELOW the active
+        cut may name an envelope that was legitimately GC'd, so requiring the
+        exact op there would wedge a roster change forever (an idle author whose
+        whole chain sits below the cut). Below/at the cut, possession = the node
+        holds the COMPLETE below-cut baseline for that author (its retained
+        digest matches the checkpoint commitment); ABOVE the cut, the per-op
+        check stands (contiguous head reaches the seq AND holds the exact op)."""
         heads = self.store.heads()
+        cut = self.store.cut()
+        committed = self.store.cut_retained()
+        have_baseline: dict[bytes, tuple[int, bytes]] | None = None  # computed once, lazily
         for author, (seq, head_hash) in sync_frontier.items():
-            cur = heads.get(author)
-            if cur is None or cur[0] < seq or self.store.get_op(head_hash) is None:
-                return False
+            centry = cut.get(author)
+            if centry is not None and seq <= centry[0]:
+                if have_baseline is None:
+                    have_baseline = self.store.baseline_commitment()
+                if have_baseline.get(author) != committed.get(author):
+                    return False  # incomplete below-cut baseline for this author
+            else:
+                cur = heads.get(author)
+                if cur is None or cur[0] < seq or self.store.get_op(head_hash) is None:
+                    return False
         return True
 
     def on_roster_accept(
