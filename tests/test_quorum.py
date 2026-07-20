@@ -207,6 +207,60 @@ class TestBelowHorizonGuard(unittest.TestCase):
         self.assertEqual(outcome.winner, ancient.op_hash)
 
 
+class TestFetchWindow(unittest.TestCase):
+    def test_late_promise_and_nack_mid_fetch_do_not_abort(self):
+        # WP1.1 / finding 4: rival decided everywhere -> my PREPARE sees it and
+        # enters FETCH. A late hedged Promise and a Nack landing in the FETCH
+        # window must be IGNORED (routed by request type, not phase), never
+        # mistaken for the fetch reply and turned into Failed(EXHAUSTED). The
+        # commit still decides -> the rival wins the slot (LostSlot).
+        nodes, roster = _cluster(3)
+        w = World(seed=2, n_clients=2)
+        rival = _create(w, 0, b"A")
+        mine = _create(w, 1, b"B")
+        _preaccept(nodes, rival, A.Ballot(1, b"\x01"))
+
+        m = Q.Commit(_cfg(roster, mine.author), mine)
+        prep = next(c.req for c in m.start(NOW) if isinstance(c, Q.Send))
+
+        # a quorum of genuine promises (each reports the rival accepted) -> FETCH
+        out: list = []
+        for i in (0, 1):
+            pr = N.dispatch(nodes[i], prep)
+            self.assertIsInstance(pr, A.Promise)
+            out = m.feed(Q.Reply(i, prep, pr, NOW))
+        self.assertIs(m.phase, Q._Phase.FETCH)
+        fetch = next(c.req for c in out if isinstance(c, Q.Send))
+        self.assertIsInstance(fetch, N.FetchOpReq)
+
+        # --- the strays: a late hedged Promise, then a Nack (both to the PREPARE
+        #     request). Each ignored; the machine neither finishes nor leaves FETCH.
+        late = N.dispatch(nodes[2], prep)
+        self.assertEqual(m.feed(Q.Reply(2, prep, late, NOW)), [])
+        self.assertIs(m.phase, Q._Phase.FETCH)
+        self.assertEqual(m.feed(Q.Reply(0, prep, Q.Nack(A.Ballot(9, b"\xff")), NOW)), [])
+        self.assertIs(m.phase, Q._Phase.FETCH)
+
+        # --- the real fetch reply arrives (to the FETCH request) -> ACCEPT begins
+        op = N.dispatch(nodes[0], fetch)
+        self.assertIsInstance(op, A.Op)
+        acc = m.feed(Q.Reply(0, fetch, op, NOW))
+        self.assertIs(m.phase, Q._Phase.ACCEPT)
+        areq = next(c.req for c in acc if isinstance(c, Q.Send))
+
+        # drive ACCEPT to a decision: the commit DECIDES (rival wins), never aborts
+        outcome = None
+        for i in (0, 1):
+            res = m.feed(Q.Reply(i, areq, N.dispatch(nodes[i], areq), NOW))
+            done = [c.outcome for c in res if isinstance(c, Q.Done)]
+            if done:
+                outcome = done[0]
+        self.assertIsInstance(outcome, Q.LostSlot)
+        assert isinstance(outcome, Q.LostSlot)
+        self.assertEqual(outcome.winner, rival.op_hash)
+        self.assertTrue(outcome.qc.verify(roster))
+
+
 class TestBallotFairness(unittest.TestCase):
     def test_per_slot_tiebreak_prevents_starvation(self):
         # NOTES item 24d: a fixed pair of clients (raw fp ordering is constant, so

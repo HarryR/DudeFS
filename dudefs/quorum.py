@@ -268,10 +268,10 @@ class Commit:
                 if now >= self._deadline:
                     return self._escalate(now)
                 return self._fan.on_tick(now) if self._fan else []
-            case Reply(node, _, result, now):
+            case Reply(node, req, result, now):
                 if self._fan is not None:
                     self._fan.record(node, result)
-                return self._on_reply(node, result, now)
+                return self._on_reply(node, req, result, now)
 
     # ---- phase transitions ------------------------------------------------ #
     def _begin_prepare(self, now: int) -> list[Command]:
@@ -332,12 +332,18 @@ class Commit:
         return [Done(outcome)]
 
     # ---- reply handling per phase ----------------------------------------- #
-    def _on_reply(self, node: int, result: Response, now: int) -> list[Command]:
+    def _on_reply(self, node: int, req: Request, result: Response, now: int) -> list[Command]:
+        # Route by the request this reply answers, NOT by the current phase alone
+        # (WP1.1 / finding 4): a late hedged PREPARE Promise or a Nack arriving
+        # during the FETCH window must not be mistaken for the fetch reply and
+        # abort a decidable commit. A fetch reply is processed only while the
+        # fetch is outstanding; anything else in FETCH is ignored (the round
+        # deadline escalates).
+        if isinstance(req, FetchOpReq):
+            return self._on_fetch_reply(result, now) if self.phase is _Phase.FETCH else []
         match self.phase:
             case _Phase.PREPARE:
                 return self._on_prepare_reply(node, result, now)
-            case _Phase.FETCH:
-                return self._on_fetch_reply(result, now)
             case _Phase.ACCEPT:
                 return self._on_accept_reply(node, result, now)
             case _:
@@ -392,7 +398,11 @@ class Commit:
         ):
             self.chosen = result
             return self._begin_accept(now)
-        return self._finish(Failed(CommitFailure.EXHAUSTED))
+        # NOT an abort (WP1.1 / finding 4): a wrong op, a bad signature, or a Nack
+        # from a single bad holder must not sink a decidable commit. Ignore it and
+        # let the round deadline (Wake scheduled when FETCH began) escalate — a
+        # fresh PREPARE round re-derives the highest accepted op and re-fetches.
+        return []
 
     def _on_accept_reply(self, node: int, result: Response, now: int) -> list[Command]:
         if self._is_receipt(result, node, self.chosen.op_hash, self.ballot):
