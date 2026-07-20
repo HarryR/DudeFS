@@ -10,7 +10,7 @@ import unittest
 
 from dudefs import artifacts as A
 from dudefs import compactor, crypto, fold, gossip
-from dudefs.acceptor import Acceptor
+from dudefs.acceptor import Acceptor, Rejected, RejectReason
 from dudefs.handlers import control as ctl
 from dudefs.store import AppendStatus, ChainStore
 from tests._builders import World
@@ -881,6 +881,61 @@ class TestBaselineProjection(unittest.TestCase):
         # the lazy peer — the oscillation the projection fix removes.
         self.assertGreater(gossip.pull_baseline(gc, lazy, cut), 0)
         self.assertIsNotNone(gc.get_op(first.op_hash))  # re-acquired (the bug)
+
+
+class TestReceiptFloorBackstop(unittest.TestCase):
+    """§12 receipt-floor-at-horizon backstop (NOTES 34/Q5 third layer, M7 WP1.3):
+    after GC forgets below-horizon slot state, the acceptor refuses to NEWLY receipt
+    below the sealed horizon — a late contender can't resurrect a spent slot.
+    Isolated from the skew gate (floor kept far below the horizon) to exercise the
+    backstop alone."""
+
+    def _node(self, key=190):
+        nsk = bytes([key] * 32)
+        return Acceptor(
+            nsk, crypto.SIGNER.public(nsk), ChainStore(), config_epoch=0, delta_ms=BIG_DELTA
+        )
+
+    def _op(self, w, key, hlc):
+        tag = A.compute_slot_tag(w.keyring[0]["slot_secret"], key, A.VERSION_ABSENT, 0)
+        return w.data_op(
+            0,
+            txn=A.Txn((key, A.VERSION_ABSENT, 0), [], [[A.Mutation.SET, key, b"v"]]),
+            slot_tag=tag,
+            hlc=hlc,
+        )
+
+    def test_new_receipt_below_horizon_refused_boundary_accepted(self):
+        acc = self._node()
+        w = World(seed=50, n_clients=1)
+        acc.advance_horizon(A.HLC(200, 0))
+        b = A.Ballot(1, b"a")
+        # REJECT: a fresh op strictly below the horizon (skew gate passes — floor<0)
+        below = self._op(w, b"k1", A.HLC(100, 0))
+        assert below.slot_tag is not None
+        r = acc.on_accept(below.slot_tag, b, below, 100)
+        self.assertIsInstance(r, Rejected)
+        assert isinstance(r, Rejected)
+        self.assertEqual(r.reason, RejectReason.BELOW_HORIZON)
+        # ACCEPT (boundary): hlc == horizon is still committable (== floor passes)
+        at = self._op(w, b"k2", A.HLC(200, 0))
+        assert at.slot_tag is not None
+        self.assertIsInstance(acc.on_accept(at.slot_tag, b, at, 100), A.Receipt)
+
+    def test_idempotent_reaccept_below_horizon_is_still_served(self):
+        # an op accepted BEFORE the horizon rose is re-served (serve-from-store),
+        # never blocked by the backstop — a RERECEIPT across a bridge must not wedge.
+        acc = self._node(191)
+        w = World(seed=51, n_clients=1)
+        b = A.Ballot(1, b"a")
+        op = self._op(w, b"k", A.HLC(100, 0))
+        assert op.slot_tag is not None
+        r1 = acc.on_accept(op.slot_tag, b, op, 100)  # horizon 0 -> accepted
+        assert isinstance(r1, A.Receipt)
+        acc.advance_horizon(A.HLC(200, 0))  # horizon now above the op
+        r2 = acc.on_accept(op.slot_tag, b, op, 100)  # re-accept -> served, not blocked
+        assert isinstance(r2, A.Receipt)
+        self.assertEqual(r1.issue_seq, r2.issue_seq)  # serve-from-store, same receipt
 
 
 class TestVoidRule(unittest.TestCase):

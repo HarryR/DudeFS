@@ -1343,6 +1343,25 @@ and A4 as formally stated. Resolutions decided with the design owner; DESIGN
       5. Next coordination artifact: **HANDOFF-R4 (M7 work order)** —
          designer-side, not yet written.
 
+45. **F18 RE-REVIEW (2026-07-21, `9141810`): CLEARED — finding 18
+    CLOSED; the completeness asterisk is OFF (RESILIENCE §3.1 edited);
+    finality is "violable · with proof," unqualified. HANDOFF-R4
+    issued.** Verified: `SeqReuseEvidence` generalizes on
+    `_art_reissue_key` — exactly the right collision semantics (same-op
+    +ballot receipts exempt across epochs; any cross-kind pair is a
+    genuine fork; deterministic signing makes identical-content
+    duplicates byte-identical, excluded by the first check). The
+    issuance LEDGER is the counter (`reserve_issue_seq`: justification
+    + seq in one COMMIT, then deterministic sign): idempotent per
+    justification — repeated same-floor watermarks share one seq;
+    crash between reserve and store re-derives the identical artifact;
+    `issuance_gapless()` is the audit surface. Soundness + completeness
+    both now hold: no honest node accusable, no back-stamp hole. 169
+    green; vectors per §6.7 incl. the revert-checked WM's-own-seq
+    back-stamp and the masher's generalized-detector honest arm.
+    **Next: HANDOFF-R4 (M7 — daemon, CLI, demo) — Fable-authored, in
+    the tree with this item.**
+
 # Not yet built (by design, M2+)
 
 QCs are *constructed and verified* (M0) but no acceptor, quorum client, floor,

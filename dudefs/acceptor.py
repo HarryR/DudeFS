@@ -54,6 +54,7 @@ class RejectReason(Enum):
     UNKNOWN_DEP = auto()  # node lacks a deps-referenced op (SUBMIT only — PROTOCOL §2.1)
     WRONG_EPOCH = auto()
     EQUIVOCATION_GUARD = auto()  # would double-vote a (tag, ballot); refused
+    BELOW_HORIZON = auto()  # op.hlc < checkpoint horizon — §12 receipt-floor backstop
     NEEDS_BALLOT = auto()  # slotted op sent via SUBMIT — propose via PREPARE/ACCEPT (rev 5)
 
 
@@ -229,6 +230,15 @@ class Acceptor:
             # would sign two ops at one (tag, ballot) — the one thing an honest
             # acceptor must never do (DESIGN §8).
             return Rejected(RejectReason.EQUIVOCATION_GUARD)
+        # §12 receipt-floor-at-horizon backstop (NOTES 34/Q5 third layer): after GC
+        # forgets below-horizon slot state, a late contender must NOT win a fresh
+        # receipt for a spent slot. Logically implied by the floor (attested ≥ the
+        # sealed F), but restated as an independent, explicit guard. Strict: hlc ==
+        # horizon is still committable (== floor passes the past gate). Skipped for
+        # an idempotent re-accept of the SAME op (serve-from-store re-issue), so a
+        # RERECEIPT across a bridge is never blocked.
+        if s.accepted_op != op.op_hash and op.hlc < self.horizon:
+            return Rejected(RejectReason.BELOW_HORIZON)
         self.store.put_op_raw(op)  # self-contained, re-proposable
         s.promised = ballot
         s.accepted_ballot = ballot
