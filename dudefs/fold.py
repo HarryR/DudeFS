@@ -340,19 +340,37 @@ def _covered(op: Op, cut: Heads) -> bool:
         return False
 
 
-def _checkpoint_cuts(ops: list[Op], invalid: set[bytes], manager_pub: bytes) -> list[Heads]:
-    """The pinned cuts of every valid checkpoint op, in manager-chain order
-    (seq, then op_hash for determinism against an equivocating manager)."""
-    found: list[tuple[int, bytes, Heads]] = []
-    for op in ops:
-        if op.op_hash in invalid or not op.is_control or op.author != manager_pub:
+def _authorized_cuts(ops_sorted: list[Op], invalid: set[bytes], genesis: Genesis) -> list[Heads]:
+    """The pinned cuts of every AUTHORIZED checkpoint, in total order (NOTES 37 /
+    finding 12). A control-only PRE-WALK: replay control ops in total order against
+    a fresh ControlState and record every checkpoint whose author holds the
+    `compact` capability at THAT position — the root or a compact-delegate.
+
+    The chicken-and-egg the old routine got wrong: barrier placement runs before
+    the main walk, but delegate authorization is fold-positional. It sidestepped it
+    by honoring only `author == manager_pub`, so a delegate-minted checkpoint
+    folded CONTROL (authorized) yet placed NO barrier — its cut, tombstone deaths,
+    attempts, and pver activation all silently dropped. Authorization depends only
+    on prior control ops (certs/revocations), never on data or HLC, so this
+    pre-walk is self-contained, deterministic, and agrees op-for-op with the main
+    walk's CONTROL verdicts."""
+    control = ControlState(
+        genesis["manager_pub"],
+        genesis.get("epoch", 0),
+        genesis.get("keyepoch", 0),
+        genesis.get("pver", 0),
+    )
+    cuts: list[Heads] = []
+    for op in ops_sorted:  # already in _total_order_key order
+        if op.op_hash in invalid or not op.is_control:
             continue
         body = control_handler.decode(op)
-        if body is None or body[control_handler.BK_KIND] != control_handler.ControlKind.CHECKPOINT:
-            continue
-        found.append((op.seq, op.op_hash, body[b"cut"]))
-    found.sort(key=lambda t: (t[0], t[1]))
-    return [cut for _, _, cut in found]
+        if body is None or not control.can_author_control(op.author, body[control_handler.BK_KIND]):
+            continue  # unauthorized -> folds `invalid` in the main walk; no barrier
+        if body[control_handler.BK_KIND] == control_handler.ControlKind.CHECKPOINT:
+            cuts.append(body[b"cut"])
+        control.apply_control(op, body)
+    return cuts
 
 
 def fold(
@@ -406,7 +424,7 @@ def fold(
     # ---- checkpoint partition: fold covered set, barrier, fold tail (§12) --- #
     stages: list[list[Op]] = []
     remaining = ops_sorted
-    for cut in _checkpoint_cuts(ops_sorted, invalid, control.manager_pub):
+    for cut in _authorized_cuts(ops_sorted, invalid, genesis):
         stages.append([o for o in remaining if _covered(o, cut)])
         remaining = [o for o in remaining if not _covered(o, cut)]
     stages.append(remaining)

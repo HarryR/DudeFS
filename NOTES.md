@@ -930,6 +930,16 @@ and A4 as formally stated. Resolutions decided with the design owner; DESIGN
     out-of-model Byzantine-root case (finding 10); the fold processes
     cuts in total order deterministically either way, but one identity
     keeps the conveyor linear.
+    **RESOLVED (WP1.4 wave):** `fold._checkpoint_cuts` replaced by
+    `fold._authorized_cuts` — a control-only pre-walk over a fresh
+    `ControlState` in total order, recording every checkpoint whose author
+    holds `compact` at its own position (agrees op-for-op with the main
+    walk's CONTROL verdicts). Regression
+    `TestDelegateCheckpointBarrier`: a compact-delegate checkpoint places
+    the barrier (a reborn creation tag commits above the cut via the
+    universe reset, state identical to a root-minted checkpoint); a
+    write-only author places none (the reborn tag collides, key stays
+    dead) — barrier semantics, not merely the verdict.
 
 38. **RULED 2026-07-21 — layered payload encryption (application inner
     layer) is a lane-1 payload convention; the visibility ladder is now

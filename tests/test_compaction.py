@@ -354,6 +354,80 @@ class TestA4PropertyFuzz(unittest.TestCase):
             )
 
 
+class TestDelegateCheckpointBarrier(unittest.TestCase):
+    """WP1.4 amendment (finding 12 / NOTES 37): a compact-delegate's checkpoint
+    must place a real BARRIER, not merely fold CONTROL. Asserts barrier semantics
+    (universe reset -> a reborn creation tag commits above the cut) through a
+    delegate-minted checkpoint, identical to a root-minted one; a write-only
+    author places no barrier (the reborn tag collides and stays dead)."""
+
+    def _ckpt(self, sk, pub, cut, hlc_ms):
+        return A.Op.build(
+            author_sk=sk,
+            author_pub=pub,
+            cls_=A.OpClass.CONTROL,
+            seq=0,
+            prev=A.GENESIS_PREV,
+            hlc=A.HLC(hlc_ms, 0),
+            deps=[],
+            authz=b"cert",
+            keyepoch=0,
+            payload=ctl.checkpoint_body(cut, b"", [], {}, b"", 0, A.HLC(0, 0)),
+        )
+
+    def test_delegate_minted_checkpoint_places_the_barrier(self):
+        w = World(seed=44, n_clients=1)
+        dsk, dpub = bytes([90] * 32), crypto.SIGNER.public(bytes([90] * 32))
+        wsk, wpub = bytes([91] * 32), crypto.SIGNER.public(bytes([91] * 32))
+        cert_d = w._mgr_op(ctl.cert_issue_body(dpub, [ctl.Cap.COMPACT], 0))
+        cert_w = w._mgr_op(ctl.cert_issue_body(wpub, [ctl.Cap.WRITE], 0))
+
+        # k created then deleted below the cut: its creation slot T is consumed and
+        # k is dead — the sealed key that must leave the attributable universe.
+        c1 = w.cas(
+            0, b"k", A.VERSION_ABSENT, 0, [[A.Guard.ABSENT, b"k"]], [[A.Mutation.SET, b"k", b"v1"]]
+        )
+        v1, a1 = fold.fold([*w.control_ops, cert_d, cert_w, c1], w.keyring, w.genesis).lineage(b"k")
+        d = w.cas(0, b"k", v1, a1, [[A.Guard.VERSION_EQ, b"k", v1]], [[A.Mutation.DEL, b"k"]])
+        below = [*w.control_ops, cert_d, cert_w, c1, d]
+        cut = _cut(w)  # covers the certs, c1, d (captured before the reborn op)
+        base = w._hlc
+
+        # a reborn creation of k above the cut: byte-identical tag to c1's.
+        tag = A.compute_slot_tag(w.keyring[0]["slot_secret"], b"k", A.VERSION_ABSENT, 0)
+        self.assertEqual(tag, c1.slot_tag)  # the reborn collision the barrier resolves
+        c2 = w.data_op(
+            0,
+            txn=A.Txn(
+                (b"k", A.VERSION_ABSENT, 0),
+                [[A.Guard.ABSENT, b"k"]],
+                [[A.Mutation.SET, b"k", b"v2"]],
+            ),
+            slot_tag=tag,
+            hlc=A.HLC(base + 10, 0),
+        )
+
+        ckpt_del = self._ckpt(dsk, dpub, cut, base + 5)  # compact delegate -> barrier
+        ckpt_write = self._ckpt(wsk, wpub, cut, base + 5)  # write-only -> NO barrier
+        ckpt_mgr = w.checkpoint(cut=cut)  # root baseline
+
+        r_del = fold.fold([*below, ckpt_del, c2], w.keyring, w.genesis)
+        r_mgr = fold.fold([*below, ckpt_mgr, c2], w.keyring, w.genesis)
+        r_write = fold.fold([*below, ckpt_write, c2], w.keyring, w.genesis)
+
+        # the delegate checkpoint is authorized AND places the barrier: the reborn
+        # op commits above the cut (universe reset), exactly as the root's does.
+        self.assertEqual(r_del.verdicts[ckpt_del.op_hash], fold.Verdict.CONTROL)
+        self.assertEqual(r_del.state, r_mgr.state)
+        self.assertEqual(r_del.state.get(b"k"), b"v2")  # reborn committed
+
+        # load-bearing: the write-only author is NOT authorized -> no barrier ->
+        # the reborn tag collides with the sealed decision -> k stays dead.
+        self.assertEqual(r_write.verdicts[ckpt_write.op_hash], fold.Verdict.INVALID)
+        self.assertNotIn(b"k", r_write.state)
+        self.assertNotEqual(r_write.state, r_del.state)
+
+
 class TestNodeGC(unittest.TestCase):
     def test_gc_drops_dead_keeps_retained(self):
         # A node applies a checkpoint's `dead` delta: superseded ops go, the
