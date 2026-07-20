@@ -8,6 +8,7 @@ import unittest
 from dudefs import artifacts as A
 from dudefs import compactor, crypto, fold
 from dudefs.acceptor import Acceptor
+from dudefs.handlers import control as ctl
 from dudefs.store import ChainStore
 from tests._builders import World
 
@@ -190,6 +191,70 @@ class TestNodeGC(unittest.TestCase):
         self.assertIsNone(store.get_op(first.op_hash))  # superseded op GC'd
         self.assertIsNotNone(store.get_op(winner.op_hash))  # retained winner kept
         self.assertIsNotNone(store.get_op(control[0].op_hash))  # control liveness kept
+
+
+class TestCheckpointArtifact(unittest.TestCase):
+    def test_checkpoint_encode_decode_roundtrip(self):
+        # the rev-6 schema round-trips through the wire (golden-vector shape).
+        w = World(seed=9, n_clients=1)
+        below = list(w.control_ops)
+        below.append(
+            w.cas(
+                0,
+                b"k",
+                A.VERSION_ABSENT,
+                0,
+                [[A.Guard.ABSENT, b"k"]],
+                [[A.Mutation.SET, b"k", b"v"]],
+            )
+        )
+        cut = _cut(w)
+        cr = compactor.compact(below, w.keyring, w.genesis, cut)
+        retained = compactor.retained_commitment(cr.retained)
+        ckpt = w.checkpoint(
+            cut=cut, state_root=cr.state_root, dead=cr.dead, retained=retained, attempts=b"ct"
+        )
+        body = ctl.decode(ckpt)
+        assert body is not None
+        self.assertEqual(body[ctl.BK_KIND], ctl.ControlKind.CHECKPOINT)
+        self.assertEqual(body[b"cut"], cut)
+        self.assertEqual(body[b"state_root"], cr.state_root)
+        self.assertEqual(body[b"dead"], cr.dead)
+        self.assertEqual(body[b"retained"], retained)
+        self.assertEqual(body[b"attempts"], b"ct")
+
+    def test_retained_digest_detects_omission_per_author(self):
+        w = World(seed=10, n_clients=2)
+        below = list(w.control_ops)
+        below.append(
+            w.cas(
+                0,
+                b"k",
+                A.VERSION_ABSENT,
+                0,
+                [[A.Guard.ABSENT, b"k"]],
+                [[A.Mutation.SET, b"k", b"v"]],
+            )
+        )
+        below.append(
+            w.cas(
+                1,
+                b"j",
+                A.VERSION_ABSENT,
+                0,
+                [[A.Guard.ABSENT, b"j"]],
+                [[A.Mutation.SET, b"j", b"w"]],
+            )
+        )
+        cut = _cut(w)
+        cr = compactor.compact(below, w.keyring, w.genesis, cut)
+        commit = compactor.retained_commitment(cr.retained)
+        # a node holding the full retained set recomputes the identical digest
+        self.assertEqual(compactor.retained_commitment(cr.retained), commit)
+        # drop one retained op -> only its author's (count, digest) changes
+        dropped = cr.retained[-1]
+        partial = compactor.retained_commitment(cr.retained[:-1])
+        self.assertNotEqual(partial.get(dropped.author), commit.get(dropped.author))
 
 
 class TestVoidRule(unittest.TestCase):
