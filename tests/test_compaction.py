@@ -439,7 +439,12 @@ class TestCheckpointArtifact(unittest.TestCase):
         cr = compactor.compact_genesis(below, w.keyring, w.genesis, cut)
         retained = A.retained_commitment(cr.retained)
         ckpt = w.checkpoint(
-            cut=cut, state_root=cr.state_root, dead=cr.dead, retained=retained, attempts=b"ct"
+            cut=cut,
+            state_root=cr.state_root,
+            dead=cr.dead,
+            retained=retained,
+            attempts=b"ct",
+            horizon=A.HLC(200, 3),
         )
         body = ctl.decode(ckpt)
         assert body is not None
@@ -449,6 +454,7 @@ class TestCheckpointArtifact(unittest.TestCase):
         self.assertEqual(body[b"dead"], cr.dead)
         self.assertEqual(body[b"retained"], retained)
         self.assertEqual(body[b"attempts"], b"ct")
+        self.assertEqual(body[b"horizon"], A.HLC(200, 3))  # WP1.5: F carried on the wire
 
     def test_retained_digest_detects_omission_per_author(self):
         w = World(seed=10, n_clients=2)
@@ -639,6 +645,51 @@ class TestVoidRule(unittest.TestCase):
         after = node.on_prepare(tag, A.Ballot(3, b"y"))
         assert isinstance(after, A.Promise)
         self.assertIsNone(after.accepted_op_hash)  # voided -> fresh slot, reborn op wins
+
+    def _one_accept_node(self, hlc):
+        # a node holding a single decided op at `hlc`; returns (node, tag, op).
+        nsk = bytes([201] * 32)
+        node = Acceptor(nsk, crypto.SIGNER.public(nsk), ChainStore(), 0, BIG_DELTA)
+        w = World(seed=17, n_clients=1)
+        tag = A.compute_slot_tag(w.keyring[0]["slot_secret"], b"k", A.VERSION_ABSENT, 0)
+        op = w.data_op(
+            0,
+            txn=A.Txn((b"k", A.VERSION_ABSENT, 0), [], [[A.Mutation.SET, b"k", b"x"]]),
+            slot_tag=tag,
+            hlc=hlc,
+        )
+        node.on_accept(tag, A.Ballot(1, b"a"), op, 100)
+        return node, tag, op
+
+    def test_accept_at_exactly_horizon_is_not_voided(self):
+        # WP1.5 boundary (DESIGN §8, strict): an accept at exactly hlc == F may
+        # still be newly committable (hlc == floor passes the past gate), so
+        # voiding at equality would be a safety hole. ACCEPT: it survives PREPARE.
+        node, tag, op = self._one_accept_node(A.HLC(100, 0))
+        node.advance_horizon(A.HLC(100, 0))  # F == the op's hlc
+        p = node.on_prepare(tag, A.Ballot(2, b"x"))
+        assert isinstance(p, A.Promise)
+        self.assertEqual(p.accepted_op_hash, op.op_hash)  # NOT voided at equality
+
+        # one tick strictly below -> voided (the reject side of the pair)
+        node.advance_horizon(A.HLC(101, 0))
+        p2 = node.on_prepare(tag, A.Ballot(3, b"y"))
+        assert isinstance(p2, A.Promise)
+        self.assertIsNone(p2.accepted_op_hash)
+
+    def test_horizon_sourced_from_checkpoint_field(self):
+        # WP1.5 wiring: the value the void rule uses IS the checkpoint's `horizon`
+        # field F, decoded and fed to advance_horizon (what the M7 daemon does on
+        # adopting a checkpoint).
+        node, tag, _op = self._one_accept_node(A.HLC(100, 0))
+        w = World(seed=18, n_clients=1)
+        ckpt = w.checkpoint(cut=_cut(w), horizon=A.HLC(150, 0))
+        body = ctl.decode(ckpt)
+        assert body is not None
+        node.advance_horizon(body[b"horizon"])  # sourced from F on the wire
+        p = node.on_prepare(tag, A.Ballot(2, b"z"))
+        assert isinstance(p, A.Promise)
+        self.assertIsNone(p.accepted_op_hash)  # F=150 > 100 -> voided
 
 
 if __name__ == "__main__":

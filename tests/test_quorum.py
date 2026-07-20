@@ -206,6 +206,15 @@ class TestBelowHorizonGuard(unittest.TestCase):
         assert isinstance(outcome, Q.LostSlot)
         self.assertEqual(outcome.winner, ancient.op_hash)
 
+    def test_accept_at_exactly_horizon_is_not_ignored(self):
+        # WP1.5 boundary (strict, symmetric with the acceptor void rule): the
+        # ancient accept sits at hlc == 50; with horizon == 50 it is NOT below the
+        # horizon, so the client does not ignore it and re-proposes it (LostSlot).
+        outcome, ancient, _reborn = self._reborn_scenario(A.HLC(50, 0))
+        self.assertIsInstance(outcome, Q.LostSlot)
+        assert isinstance(outcome, Q.LostSlot)
+        self.assertEqual(outcome.winner, ancient.op_hash)
+
 
 class TestFetchWindow(unittest.TestCase):
     def test_late_promise_and_nack_mid_fetch_do_not_abort(self):

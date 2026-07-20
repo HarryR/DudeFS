@@ -65,6 +65,16 @@ at-the-cut, at-the-horizon (`hlc == F`), first-op-above-the-barrier.
    genesis-first = degenerate `prev = ∅`. **A4 must hold across two
    successive checkpoints** — new vector: an op retained by checkpoint 1
    (winner or mask) that dies in checkpoint 2's delta.
+   **Amended scope (NOTES 37, finding 12):** delegate-minted checkpoints
+   currently authorize but place NO barrier — `fold._checkpoint_cuts`
+   honors only `author == manager_pub` cuts, so the delegated conveyor
+   has zero client-side effect. Fix per the ruling: a **control-only
+   pre-walk** in total order (mirroring `ControlReducer`) records each
+   checkpoint authorized at its own position; those cuts partition the
+   real fold in total-order sequence. Regression: the M5 delegate-cap
+   test extended to assert BARRIER semantics through a delegate-minted
+   checkpoint (tombstone death + attempts sidecar + universe reset), not
+   just the `CONTROL` verdict.
 5. **Horizon carrier (Q5):** checkpoint schema gains `horizon` (HLC);
    golden-vector bump in the same commit; `advance_horizon` and
    `QuorumConfig.horizon` source from the latest committed checkpoint.

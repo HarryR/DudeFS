@@ -12,7 +12,7 @@ from dudefs.handlers import control as ctl
 from dudefs.store import ChainStore
 from tests._builders import World
 
-CP = ctl.checkpoint_body({}, b"", [], {}, b"", 0)  # authz-only body; no cut placed
+CP = ctl.checkpoint_body({}, b"", [], {}, b"", 0, A.HLC(0, 0))  # authz-only; no cut placed
 NOW = 100
 BIG_DELTA = 1_000_000  # skew never bites in these unit tests
 

@@ -94,10 +94,17 @@ class World:
         retained: dict[bytes, tuple[int, bytes]] | None = None,
         attempts: bytes = b"",
         keyepoch: int = 0,
+        horizon: A.HLC | None = None,
     ) -> A.Op:
         op = self._mgr_op(
             ctl.checkpoint_body(
-                cut or {}, state_root, dead or [], retained or {}, attempts, keyepoch
+                cut or {},
+                state_root,
+                dead or [],
+                retained or {},
+                attempts,
+                keyepoch,
+                horizon or A.HLC(0, 0),
             )
         )
         self.control_ops.append(op)

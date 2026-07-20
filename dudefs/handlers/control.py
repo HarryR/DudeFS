@@ -16,7 +16,7 @@ from collections.abc import Callable, Iterable
 from typing import Any
 
 from .. import codec
-from ..artifacts import BytesEnum, Heads, Op
+from ..artifacts import HLC, BytesEnum, Heads, Op
 
 # Body discriminator (a field key, not a value vocabulary).
 BK_KIND = b"kind"
@@ -132,6 +132,9 @@ def _v_checkpoint(b: dict[bytes, codec.Bencodable]) -> dict[bytes, Any]:
         b"retained": _retained(codec.field(b, b"retained")),
         b"attempts": codec.as_bytes(codec.field(b, b"attempts")),
         b"keyepoch": _uint(codec.field(b, b"keyepoch")),
+        # the finality frontier F the cut was sealed at (§9): every op ≤ cut has
+        # hlc ≤ F. THE horizon value for §8's void/below-horizon guards (WP1.5).
+        b"horizon": HLC.decode(codec.field(b, b"horizon")),
     }
 
 
@@ -232,10 +235,12 @@ def checkpoint_body(
     retained: dict[bytes, tuple[int, bytes]],
     attempts: bytes,
     keyepoch: int,
+    horizon: HLC,
 ) -> bytes:
     """A rev-6 checkpoint (DESIGN §12): the pinned `cut`, the `state_root` audit
     anchor, the incremental `dead` delta, the per-author `retained` commitment,
-    and the encrypted `attempts` sidecar. No snapshot blob."""
+    the encrypted `attempts` sidecar, and the `horizon` finality frontier F the
+    cut was sealed at (the void / below-horizon guard value, §8). No snapshot."""
     cut_enc = {a: [s, h] for a, (s, h) in cut.items()}
     retained_enc = {a: [c, d] for a, (c, d) in retained.items()}
     return codec.encode(
@@ -247,6 +252,7 @@ def checkpoint_body(
             b"retained": retained_enc,
             b"attempts": attempts,
             b"keyepoch": int(keyepoch),
+            b"horizon": list(horizon.encode()),
         }
     )
 

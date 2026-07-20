@@ -903,6 +903,62 @@ and A4 as formally stated. Resolutions decided with the design owner; DESIGN
       live cert inventory before roster commands so the
       bridge-re-attests assumption cannot hide.
 
+37. **RAISED 2026-07-21 (finding 12, HIGH, latent) — delegate-minted
+    checkpoints authorize but place NO barrier; ruling: control-only
+    pre-walk. Lands in WP1.4 scope.** `fold._checkpoint_cuts` skips every
+    op with `author != manager_pub`, so a `compact`-delegate's checkpoint
+    folds `CONTROL` (the M5 test asserts exactly this verdict) yet never
+    partitions the walk — no barrier, no tombstone death, no universe
+    reset, no attempts application, no pver activation at its cut. The
+    op's entire semantic payload is dropped; the routine-operation path
+    the docs describe (delegate-minted conveyor, DESIGN §12/§15) has zero
+    client-side effect. Every M6 barrier test uses root-authored
+    checkpoints, which is why it survived. Root cause is a chicken-and-
+    egg: barrier placement runs before the walk, but delegate
+    authorization is fold-positional. **Ruling:** a **control-only
+    pre-walk** — walk the op set in total order applying only control ops
+    to a `ControlState` (what `ControlReducer` already does), recording
+    each checkpoint that is authorized *at its own position*; those cuts
+    partition the real fold, ordered by the checkpoint ops' total-order
+    positions. Control authorization depends only on prior control ops,
+    so the pre-walk is self-contained and deterministic. Regression: the
+    delegate-cap test extended to assert **barrier semantics** (tombstone
+    death + attempts + universe reset via a delegate-minted checkpoint),
+    not just the verdict. Operational note ruled with it: run **one**
+    compactor identity — with multiple authorized cut-minters,
+    non-nested cuts become an honest possibility rather than the
+    out-of-model Byzantine-root case (finding 10); the fold processes
+    cuts in total order deterministically either way, but one identity
+    keeps the conveyor linear.
+
+38. **RULED 2026-07-21 — layered payload encryption (application inner
+    layer) is a lane-1 payload convention; the visibility ladder is now
+    explicit (DESIGN §7).** Harry's deployment intent: storage nodes
+    fully opaque (already structural), AND applications add their own
+    encryption on values (and pseudonymized path components) so that
+    group-keyring holders — manager, compactor, other apps' clients —
+    see *shape* but not fields. Ruled compatible with zero protocol
+    change: the fold interprets key paths only by byte-equality and
+    values not at all, so the inner layer rides inside the Txn as opaque
+    bytes. Constraints (normative, §7): (a) key bytes stable per key —
+    per-app PRF'd paths work verbatim (slot tags + attribution are over
+    path bytes); (b) `value_eq` guards compare inner-CIPHERTEXT —
+    randomized inner encryption breaks them, deterministic leaks
+    equality; the convention for inner-encrypted fields is version-CAS
+    (unaffected: versions are envelope hashes); (c) future rich guard
+    vocabulary (§17) evaluates at the group layer and cannot see through
+    the inner layer — fields wanting such guards stay group-visible by
+    choice. Consequences: the compactor's blast radius drops from "reads
+    data" to "sees shape" (delegation gets cheaper as apps adopt the
+    layer — confirming the §12/§15 delegation posture), and
+    confidentiality of inner-encrypted fields survives even ROOT
+    compromise — the one RESILIENCE §3.7 cell the protocol alone cannot
+    flip. The minimal-oracle observation recorded for later: the
+    compactor needs only key identity, mutation kinds, order, and slot
+    preimages — never values — so a protocol-level structure-key/value-
+    key split is possible future work; v1 gets the same effect as an
+    app-side convention.
+
 # Not yet built (by design, M2+)
 
 QCs are *constructed and verified* (M0) but no acceptor, quorum client, floor,

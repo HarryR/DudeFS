@@ -184,6 +184,18 @@ A slot, once decided, is decided forever — but a decided-and-failed slot only 
 
 Nodes never learn keys or values. They **do** learn structural metadata: that a write happened, by which author, when (`hlc`), its causal links (`deps`), and that two ops contend for the same slot (tag equality). They also see the plaintext control plane (§5) — roster, certs, checkpoints — by design. Compaction (§12) adds one declared increment: the checkpoint's dead-set delta teaches nodes which ops superseded one another (grouping and lifetime structure), and retention itself marks which ciphertexts are live state. Hiding the access pattern is ORAM/mixnet territory — **out of scope** for a config store.
 
+### Layered payload encryption — the application inner layer (NOTES 38)
+
+The group AEAD is the protocol's confidentiality **floor, not its ceiling**: an application may encrypt values (and pseudonymize path components) under its own keys *before* they enter the `Txn` — a **lane-1 payload convention** (§16), invisible to the protocol, because the fold interprets paths only by byte-equality and values not at all. This makes the visibility ladder explicit:
+
+| Party | Sees |
+|---|---|
+| storage nodes / network | envelope metadata + control plane only (structural ZK, above) |
+| group-keyring holders — manager, compactor, every authorized client | the **shape**: key identities (or their app-PRF pseudonyms), mutation kinds, guard structure, value sizes, supersession/churn |
+| the application's own key holders | the fields |
+
+Constraints, stated once: **(a)** key bytes must be stable per key — a per-app PRF of the path works verbatim, since slot tags and fold attribution are computed over path bytes; **(b)** `value_eq` guards compare inner-*ciphertext* bytes — randomized inner encryption breaks them and deterministic inner encryption leaks value-equality, so the convention for inner-encrypted fields is **version-CAS**, which is unaffected (versions are envelope hashes); **(c)** any future rich guard vocabulary (§17) evaluates at the group layer and cannot see through the inner layer — a field wanting such guards stays group-layer-visible by choice. Two consequences worth their weight: the compactor's §12 blast radius drops from "reads data" to "sees shape" — delegation gets cheaper as applications adopt the layer — and confidentiality of inner-encrypted fields survives even **root** compromise, the one cell of RESILIENCE §3.7 the protocol alone cannot flip (app-key custody permitting).
+
 ---
 
 ## 8. Durability & commitment (per-slot ballots, receipts, QC)
@@ -435,7 +447,7 @@ New verbs, receipt/QC/watermark format changes, gossip changes, crypto suites. N
 
 Interaction flows now live in [PROTOCOL.md](PROTOCOL.md); the fault & adversary analysis — including the durable-state inventory and the catastrophic-recovery procedure — in [RESILIENCE.md](RESILIENCE.md); the verification hypotheses and their tool assignments in [FORMAL.md](FORMAL.md).
 
-- Exact `guards` predicate vocabulary (version-CAS, value-equals, exists/absent, numeric comparisons, multi-key transactions).
+- Exact `guards` predicate vocabulary (version-CAS, value-equals, exists/absent, numeric comparisons, multi-key transactions). Note the §7 layered-encryption constraint: guards evaluate at the group layer, so value-shaped predicates cannot apply to inner-layer-encrypted fields — version-CAS is the convention there.
 - Wire formats / serialization and the transport binding(s) beyond HTTP(S).
 - Client watch/subscribe semantics (etcd-style watches over the fold).
 - Key-rotation mechanics: the re-wrapping flow and distribution of the epoch-key history to new clients. (Rev 6 settles the other half: retained winners never re-encrypt — the epoch-key history is load-bearing for as long as any winner from an epoch stays live, and the re-anchor op is the recorded escape hatch — §12 declared costs.)
