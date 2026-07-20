@@ -77,7 +77,7 @@ class TestA4RetainedBootstrap(unittest.TestCase):
             )
         ]
 
-        cr = compactor.compact(below, w.keyring, w.genesis, cut)
+        cr = compactor.compact_genesis(below, w.keyring, w.genesis, cut)
         ckpt = w.checkpoint(cut=cut, state_root=cr.state_root, dead=cr.dead)
         full = fold.fold(below + [ckpt] + tail, w.keyring, w.genesis)
         boot = _boot(w, cr, control, tail, cut)
@@ -102,7 +102,7 @@ class TestA4RetainedBootstrap(unittest.TestCase):
         z = w.blind(0, [], [[A.Mutation.DEL, b"C"]])
         below.append(z)
         cut = _cut(w)
-        cr = compactor.compact(below, w.keyring, w.genesis, cut)
+        cr = compactor.compact_genesis(below, w.keyring, w.genesis, cut)
         ckpt = w.checkpoint(cut=cut, state_root=cr.state_root, dead=cr.dead)
         full = fold.fold(below + [ckpt], w.keyring, w.genesis)
         boot = _boot(w, cr, control, [], cut)
@@ -125,7 +125,7 @@ class TestA4RetainedBootstrap(unittest.TestCase):
         below.append(tomb)
         cut = _cut(w)
 
-        cr = compactor.compact(below, w.keyring, w.genesis, cut)
+        cr = compactor.compact_genesis(below, w.keyring, w.genesis, cut)
         ckpt = w.checkpoint(cut=cut, state_root=cr.state_root, dead=cr.dead)
         full = fold.fold(below + [ckpt], w.keyring, w.genesis)
         self.assertEqual(full.state, {b"A": b"1"})  # B is gone
@@ -173,7 +173,7 @@ class TestA4RetainedBootstrap(unittest.TestCase):
             )
         ]
 
-        cr = compactor.compact(below, w.keyring, w.genesis, cut)
+        cr = compactor.compact_genesis(below, w.keyring, w.genesis, cut)
         self.assertEqual(cr.attempts, {b"k": 1})  # the sidecar carries it
         ckpt = w.checkpoint(cut=cut, state_root=cr.state_root, dead=cr.dead)
         full = fold.fold(below + [ckpt] + tail, w.keyring, w.genesis)
@@ -186,6 +186,81 @@ class TestA4RetainedBootstrap(unittest.TestCase):
         no_sidecar = compactor.barrier_state(data_retained, {}, w.keyring)
         bad = fold.fold(control + tail, w.keyring, w.genesis, barrier=no_sidecar, cut_frontier=cut)
         self.assertNotEqual(bad.state, full.state)  # diverged without the sidecar
+
+
+class TestA4TwoCheckpoints(unittest.TestCase):
+    """WP1.4: A4 must hold across SUCCESSIVE incremental checkpoints, not just a
+    single genesis compaction. The dangerous case the incremental fold's r.meta
+    misses — a mask for a key that died below the previous cut — is carried by the
+    universe-wide _mut_meta scan."""
+
+    def test_mask_carries_across_two_checkpoints(self):
+        w = World(seed=40, n_clients=2)
+        control = list(w.control_ops)
+        below1 = list(control)
+        # W sets A and B; X deletes B -> B dead below cut1, A live (winner W).
+        wop = w.blind(0, [], [[A.Mutation.SET, b"A", b"1"], [A.Mutation.SET, b"B", b"1"]])
+        below1.append(wop)
+        xop = w.blind(1, [], [[A.Mutation.DEL, b"B"]])
+        below1.append(xop)
+        cut1 = _cut(w)
+        ckpt1 = compactor.compact_genesis(below1, w.keyring, w.genesis, cut1)
+        self.assertIn(xop.op_hash, {o.op_hash for o in ckpt1.retained})  # mask in ckpt1
+
+        # tail2: a fresh key D; A/B untouched. cut2 covers it.
+        tail2 = [w.blind(0, [], [[A.Mutation.SET, b"D", b"1"]])]
+        cut2 = _cut(w)
+        ckpt2 = compactor.compact(
+            ckpt1.retained, ckpt1.attempts, cut1, tail2, w.keyring, w.genesis, cut2
+        )
+        # THE carry-forward: X survives into ckpt2 though B died below cut1 (the
+        # incremental fold's r.meta has no B entry — only _mut_meta over the
+        # universe finds the tombstone).
+        self.assertIn(xop.op_hash, {o.op_hash for o in ckpt2.retained})
+
+        # A4 across two checkpoints: bootstrap from ckpt2 == full fold to cut2.
+        full = fold.fold(below1 + tail2, w.keyring, w.genesis)
+        ckpt2_control = [o for o in ckpt2.retained if o.is_control]
+        boot = _boot(w, ckpt2, ckpt2_control, [], cut2)
+        self.assertEqual(boot.state, full.state)
+        self.assertEqual(full.state, {b"A": b"1", b"D": b"1"})  # B stayed dead
+
+        # load-bearing: drop X and bootstrap resurrects B.
+        no_x = [o for o in ckpt2.retained if not o.is_control and o.op_hash != xop.op_hash]
+        self.assertIn(b"B", compactor.barrier_state(no_x, ckpt2.attempts, w.keyring))
+
+    def test_prev_winner_dies_in_next_delta(self):
+        # An op retained by checkpoint 1 (a winner) superseded in checkpoint 2's
+        # tail lands in ckpt2.dead (the incremental GC delta) and bootstrap tracks
+        # the new winner.
+        w = World(seed=41, n_clients=1)
+        control = list(w.control_ops)
+        below1 = list(control)
+        first = w.cas(
+            0, b"k", A.VERSION_ABSENT, 0, [[A.Guard.ABSENT, b"k"]], [[A.Mutation.SET, b"k", b"v1"]]
+        )
+        below1.append(first)
+        cut1 = _cut(w)
+        ckpt1 = compactor.compact_genesis(below1, w.keyring, w.genesis, cut1)
+        self.assertIn(first.op_hash, {o.op_hash for o in ckpt1.retained})  # winner of k
+
+        v, a = fold.fold(below1, w.keyring, w.genesis).lineage(b"k")
+        second = w.cas(
+            0, b"k", v, a, [[A.Guard.VERSION_EQ, b"k", v]], [[A.Mutation.SET, b"k", b"v2"]]
+        )
+        tail2 = [second]
+        cut2 = _cut(w)
+        ckpt2 = compactor.compact(
+            ckpt1.retained, ckpt1.attempts, cut1, tail2, w.keyring, w.genesis, cut2
+        )
+        self.assertIn(first.op_hash, ckpt2.dead)  # prev winner now in the GC delta
+        self.assertIn(second.op_hash, {o.op_hash for o in ckpt2.retained})  # new winner kept
+
+        full = fold.fold(below1 + tail2, w.keyring, w.genesis)
+        ckpt2_control = [o for o in ckpt2.retained if o.is_control]
+        boot = _boot(w, ckpt2, ckpt2_control, [], cut2)
+        self.assertEqual(boot.state, full.state)
+        self.assertEqual(full.state, {b"k": b"v2"})
 
 
 class TestNodeGC(unittest.TestCase):
@@ -205,7 +280,7 @@ class TestNodeGC(unittest.TestCase):
         )
         below.append(winner)
         cut = _cut(w)
-        cr = compactor.compact(below, w.keyring, w.genesis, cut)
+        cr = compactor.compact_genesis(below, w.keyring, w.genesis, cut)
 
         store = ChainStore()
         for op in below:
@@ -299,7 +374,7 @@ class TestCutAwareStore(unittest.TestCase):
         )
         below.append(winner)
         cut = _cut(w)
-        cr = compactor.compact(below, w.keyring, w.genesis, cut)
+        cr = compactor.compact_genesis(below, w.keyring, w.genesis, cut)
         committed = A.retained_commitment(cr.retained)
         self.assertIn(first.op_hash, cr.dead)
 
@@ -361,7 +436,7 @@ class TestCheckpointArtifact(unittest.TestCase):
             )
         )
         cut = _cut(w)
-        cr = compactor.compact(below, w.keyring, w.genesis, cut)
+        cr = compactor.compact_genesis(below, w.keyring, w.genesis, cut)
         retained = A.retained_commitment(cr.retained)
         ckpt = w.checkpoint(
             cut=cut, state_root=cr.state_root, dead=cr.dead, retained=retained, attempts=b"ct"
@@ -399,7 +474,7 @@ class TestCheckpointArtifact(unittest.TestCase):
             )
         )
         cut = _cut(w)
-        cr = compactor.compact(below, w.keyring, w.genesis, cut)
+        cr = compactor.compact_genesis(below, w.keyring, w.genesis, cut)
         commit = A.retained_commitment(cr.retained)
         # a node holding the full retained set recomputes the identical digest
         self.assertEqual(A.retained_commitment(cr.retained), commit)
@@ -438,7 +513,7 @@ class TestBaselineSync(unittest.TestCase):
             )
         )
         cut = _cut(w)
-        cr = compactor.compact(below, w.keyring, w.genesis, cut)
+        cr = compactor.compact_genesis(below, w.keyring, w.genesis, cut)
         committed = A.retained_commitment(cr.retained)  # the checkpoint's `retained` field
 
         # SUMMARY carries the per-author baseline digest + the active checkpoint
@@ -481,7 +556,7 @@ class TestBaselineProjection(unittest.TestCase):
         )
         below.append(winner)
         cut = _cut(w)
-        cr = compactor.compact(below, w.keyring, w.genesis, cut)
+        cr = compactor.compact_genesis(below, w.keyring, w.genesis, cut)
         committed = A.retained_commitment(cr.retained)
         return w, below, cut, cr, committed, first, winner
 
