@@ -1263,6 +1263,86 @@ and A4 as formally stated. Resolutions decided with the design owner; DESIGN
       pair, and a masher arm that calls `detect_floor_perjury` under
       honest chaos and asserts zero proofs.
 
+44. **FINDING-17 FIX REVIEW (2026-07-21, `41fcc4c`): CLEARED —
+    HANDOFF-R3 IS CLOSED. One MEDIUM follow-up (finding 18, completeness
+    not soundness) + the remaining-steps roster (the session-recovery
+    record).**
+    - **Fix verified sound.** The ordered pair (`rcpt.issue_seq >
+      wm.issue_seq`) is the proof; serve-from-store preserves original
+      seqs across resubmission AND cross-epoch RERECEIPT (acceptance-
+      bound seq); `verify_each` correctly reconstructs per-signer QC
+      messages; the masher's honest-chaos arm runs the detector on every
+      node across all seeds and asserts zero false accusations — the
+      finding-17 false-positive class is dead. Crash edge analyzed
+      sound: a receipt row lost between sign and store burns a seq, and
+      the re-request can only re-issue for ops still above the floor
+      (the skew gate runs first), so no false pair is constructible.
+      167 green.
+    - **(18, MEDIUM — back-stamping evades the compact proof;
+      completeness gap, soundness intact.)** A *sophisticated* perjurer
+      controls its own `issue_seq` stamp and can evade the ordered pair:
+      (i) stamp the below-floor receipt with the WM's OWN seq —
+      `SeqReuseEvidence` compares receipts only, so a receipt-vs-
+      watermark collision at one seq mints nothing; or (ii) stamp into a
+      **burned gap** (crash-consumed seq) — the artifact then looks like
+      an honest old receipt and no third party can refute the claimed
+      ordering. No honest node is ever framed (soundness holds — the
+      HIGH part of finding 17 stays fixed); the evasion degrades
+      detection to witness-grade, which is the RESILIENCE §1 policy
+      regime — acceptable interim, but closable: **(a)** cross-kind
+      seq-collision evidence — a receipt and a watermark at one
+      `(signer, issue_seq)` with contradictory content is a signed
+      contradiction; cheap, next wave. **(b)** gap-free issuance —
+      consume the seq and persist its justification (which artifact it
+      was spent on) in ONE transaction, then sign DETERMINISTICALLY
+      (Ed25519 is deterministic: crash-restart re-derives the identical
+      artifact instead of burning the seq); with no gaps, every
+      back-stamp necessarily collides with a genuine occupant, and (a)
+      turns the collision into proof — completeness restored. Lands with
+      M7 (it reshapes the issuance flow the daemon wires anyway). Until
+      (a)+(b): the §3.7 "finality: violable · with proof" cell carries
+      an honest asterisk — proof-grade against straightforward perjury,
+      witness-grade against a back-stamping contortionist.
+    - **HANDOFF-R3 CLOSED.** Full track: WP1 correctness (findings
+      1/2/3/4/11/12 + Q4/Q5 + fence trigger; D3 found+fixed 13–16) →
+      WP2 chaos harness (5 axes; NOTES 40) → WP3 personas (equivocator,
+      floor-perjurer, withholder, amnesiac, mixed-GC, split-view) → WP4
+      fumbling manager (incl. mistaken recovery + button-masher).
+      Evidence kinds wired and asserted: FORK, DOUBLE_VOTE,
+      FLOOR_PERJURY (ordered), SEQ_REUSE, LOST_COMMIT (disclosure).
+      Every finding closed per the §6.7 found-and-fixed log.
+    - **REMAINING-STEPS ROSTER (start here after context loss):**
+      1. **M7 — daemon + CLI + demo** (IMPLEMENTATION §5), absorbing the
+         hooks the track accumulated: GC wiring (checkpoint adoption →
+         `adopt_checkpoint`/`gc_checkpoint`/`advance_horizon` on
+         observation), the §12 receipt-floor-at-horizon backstop,
+         recovery-fence observation as a daemon behavior (today
+         test-driven calls), the epidemic gossip loop (today a test
+         sweep), and finding 18(b) gap-free issuance.
+      2. ~~Finding 18(a) next wave / 18(b) with M7~~ **AMENDED (Harry,
+         2026-07-21): finding 18 closes as a standalone interjection
+         wave BEFORE HANDOFF-R4** — (a) SEQ_REUSE generalizes to the
+         any-kind issuance fork (receipt/WM collisions; the same-op
+         cross-epoch RERECEIPT carve-out stays); (b) gap-free issuance
+         (seq + justification persisted in ONE transaction, then
+         deterministic sign — crash re-derives the identical artifact,
+         no burned seqs, so back-stamps always collide and (a) converts
+         collisions to proof). Vectors: WM's-own-seq back-stamp mints
+         (revert-checked), crash-no-burn, RERECEIPT exemption, masher
+         honest arm on the generalized detector. On Fable's re-review:
+         the §3.7/§3.1 asterisk comes OFF and HANDOFF-R4 cites finding
+         18 as closed. Rationale: 18(b) reshapes the issuance flow M7's
+         daemon builds on — close it before scoping M7.
+      3. Crypto backend swap per CRYPTO.md/NOTES 42 (PyNaCl, one-scheme
+         rule, `aead_suite` parameter collapse) — scheduled with or
+         after M7 at Harry's discretion; `uv` dependency consented.
+      4. Backlog, explicitly non-gating: masher drives manager verbs +
+         inline LOST_COMMIT assertions (NOTES 43); promise `issue_seq`
+         (only if promise-ordering accusations are ever wanted); the
+         M4 same-author-gap property stands recorded (NOTES 43).
+      5. Next coordination artifact: **HANDOFF-R4 (M7 work order)** —
+         designer-side, not yet written.
+
 # Not yet built (by design, M2+)
 
 QCs are *constructed and verified* (M0) but no acceptor, quorum client, floor,

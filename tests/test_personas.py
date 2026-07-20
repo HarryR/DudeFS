@@ -281,6 +281,31 @@ class TestSeqReuse(unittest.TestCase):
         self.assertTrue(any(k == EvidenceKind.SEQ_REUSE for k, _ in store.evidence()))
         self.assertEqual(store.detect_seq_reuse(), [])  # idempotent
 
+    def test_backstamp_onto_watermark_seq_mints_seq_reuse(self):
+        # finding 18a: a perjurer EVADES the ordered pair by stamping its below-floor
+        # receipt with the WATERMARK's OWN issue_seq (so rcpt.issue_seq is not > the
+        # WM's). The ordered-pair detector is fooled; the GENERALIZED seq-reuse
+        # detector catches the receipt-vs-watermark collision at one seq.
+        w = World(seed=6, n_clients=1)
+        op = creation_op(w, 0, b"v")
+        nsk = bytes([252] * 32)
+        npub = C.SIGNER.public(nsk)
+        wm = A.Watermark.issue(nsk, npub, A.HLC(990, 0), 0, 9)  # floor 990 at seq 9
+        rc = A.Receipt.issue(nsk, npub, op.op_hash, 0, A.Ballot(1, b"x"), 9)  # back-stamped to 9
+        self.assertLess(op.hlc.wall_ms, wm.floor.wall_ms)  # the receipt is below the floor
+        store = ChainStore()
+        store.put_op_raw(op)
+        store.put_receipt(rc)
+        # the ordered-pair perjury detector is EVADED (rc.issue_seq 9 not > wm 9)
+        self.assertEqual(store.detect_floor_perjury([wm]), [])
+        # ...but the generalized seq-reuse detector catches the collision (18a)
+        proofs = store.detect_seq_reuse([wm])
+        self.assertEqual(len(proofs), 1)
+        self.assertTrue(proofs[0].verify())
+        self.assertEqual(proofs[0].signer, npub)
+        self.assertTrue(any(k == EvidenceKind.SEQ_REUSE for k, _ in store.evidence()))
+        self.assertEqual(store.detect_seq_reuse([wm]), [])  # idempotent
+
     def test_legitimate_cross_epoch_reissue_is_not_reuse(self):
         # the same op at one issue_seq across two epochs (a RERECEIPT) is NOT reuse.
         w = World(seed=5, n_clients=1)

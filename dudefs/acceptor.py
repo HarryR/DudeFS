@@ -117,8 +117,10 @@ class Acceptor:
         att = self.store.get_attested()
         new_att = fl if att <= fl else att
         self.store._write_attested(new_att)
-        seq = self.store.next_issue_seq()  # this attestation's issuance-chain position
-        self.store.commit()  # fsync before signing (incl. the consumed issue_seq)
+        # reserve the attestation's issuance-chain position + justification (finding
+        # 18b) before signing; the deterministic sign re-derives it after a crash.
+        seq = self.store.reserve_watermark_seq(new_att, self.epoch)
+        self.store.commit()  # fsync before signing
         return A.Watermark.issue(self.sk, self.pub, new_att, self.epoch, seq)
 
     def issue_frontier(self, now_ms: int) -> FrontierBundle:
@@ -254,9 +256,10 @@ class Acceptor:
         existing = self.store.get_receipt(op_hash, ep, ballot, self.pub)
         if existing is not None:
             return existing
-        seq = self.store.acceptance_issue_seq(op_hash, ballot, self.pub)
-        if seq is None:
-            seq = self.store.next_issue_seq()
+        # reserve the acceptance-bound seq + justification atomically (finding 18b),
+        # THEN sign deterministically — a crash before the receipt is stored
+        # re-derives the identical receipt on restart, never a burned seq.
+        seq = self.store.reserve_receipt_seq(op_hash, ballot)
         r = A.Receipt.issue(self.sk, self.pub, op_hash, ep, ballot, seq)
         self.store.put_receipt(r)
         return r

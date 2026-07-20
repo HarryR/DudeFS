@@ -87,6 +87,28 @@ class TestCrashRestart(unittest.TestCase):
             wm2 = acc2.issue_watermark(500)  # earlier clock
             self.assertGreaterEqual(wm2.floor, wm1.floor)  # never regressed
 
+    def test_reserved_issue_seq_survives_crash_no_burn(self):
+        # finding 18(b): a seq is reserved WITH its justification in one COMMIT,
+        # BEFORE signing. A crash after the reservation but before the receipt is
+        # stored re-derives the identical receipt on restart (Ed25519 is
+        # deterministic) and reuses the seq — the issuance chain stays gapless.
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "s.db")
+            w = World(seed=6, n_clients=1)
+            op = _op(w)
+            assert op.slot_tag is not None
+            b = A.Ballot(1, b"x")
+            store = ChainStore(path)
+            seq = store.reserve_receipt_seq(op.op_hash, b)  # committed
+            before = A.Receipt.issue(SK, C.SIGNER.public(SK), op.op_hash, 0, b, seq)
+            store.close()  # CRASH before the receipt is stored
+
+            store2 = ChainStore(path)  # RESTART
+            self.assertEqual(store2.reserve_receipt_seq(op.op_hash, b), seq)  # same seq, no burn
+            after = A.Receipt.issue(SK, C.SIGNER.public(SK), op.op_hash, 0, b, seq)
+            self.assertEqual(before.sig, after.sig)  # deterministic re-derive
+            self.assertTrue(store2.issuance_gapless())  # no gap opened
+
     def test_mid_gc_crash_rolls_back_committed_gc_is_durable(self):
         # gc_checkpoint drops the dead set in ONE COMMIT. A crash BEFORE that commit
         # rolls back (no partial GC); a committed GC survives restart.

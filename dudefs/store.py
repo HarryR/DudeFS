@@ -67,6 +67,34 @@ def _wm_from(p) -> A.Watermark:
     )
 
 
+# --- issuance-chain artifacts (receipts + watermarks share the seq space) ------ #
+# A SEQ_REUSE proof (finding 18a) can pair ANY two: receipt/receipt, receipt/
+# watermark, watermark/watermark. These helpers give a uniform pack/unpack and the
+# reissue-key that distinguishes a genuine collision from a legitimate re-issue.
+
+
+def _art_pack(art) -> tuple[bytes, bytes]:
+    """(kind_tag, raw-blob) for a Receipt or Watermark — its on-wire evidence form."""
+    if isinstance(art, Receipt):
+        return (b"r", art.encode())
+    return (b"w", codec.encode(_wm_fields(art)))
+
+
+def _art_unpack(kind: bytes, raw: bytes):
+    return A.Receipt.decode(raw) if kind == b"r" else _wm_from(codec.as_seq(codec.decode(raw)))
+
+
+def _art_reissue_key(art) -> tuple:
+    """The identity two artifacts at one (signer, issue_seq) may LEGITIMATELY share:
+    two receipts for the same (op_hash, ballot) — a cross-epoch RERECEIPT (different
+    epochs are different messages at one seq). Anything else at one seq is a
+    collision; watermarks key on their content, so two distinct WMs (or a
+    receipt-vs-WM back-stamp) always collide."""
+    if isinstance(art, Receipt):
+        return (b"r", art.op_hash, art.ballot.encode())
+    return (b"w", art.floor.as_tuple(), art.config_epoch)
+
+
 class AppendStatus(StrEnum):
     """append() outcomes (ARCHITECTURE L2: ok | dup | gap | fork-evidence).
     INVALID (bad structure/signature — drop) is distinct from GAP (missing
@@ -198,26 +226,46 @@ class FloorPerjuryEvidence:
 
 
 class SeqReuseEvidence:
-    """One signer's two DIFFERENT receipts at a single issuance-chain position
-    (`issue_seq`) — the issuance-chain analog of a FORK (finding-17). The monotone
-    counter must never be reused; two distinct ops sharing a `(signer, issue_seq)`
-    is a signed contradiction (a legitimate cross-epoch re-issue keeps the same op,
-    so it is NOT reuse). Self-verifying."""
+    """One signer's TWO distinct signed artifacts — receipt/receipt, receipt/
+    watermark, or watermark/watermark — at a single issuance-chain position
+    (`signer, issue_seq`). The issuance-chain FORK (finding 17/18a): the monotone
+    counter must place at most one artifact per seq. Generalizing beyond
+    receipt/receipt closes the back-stamp evasion where a perjurer stamps its
+    below-floor receipt with the WATERMARK's own seq. Carve-out: two receipts for
+    the same (op_hash, ballot) is a legitimate cross-epoch RERECEIPT; identical
+    artifacts are not a contradiction. Self-verifying (both signatures + a real
+    collision)."""
 
-    __slots__ = ("signer", "issue_seq", "rcpt_a", "rcpt_b")
+    __slots__ = ("signer", "issue_seq", "kind_a", "raw_a", "kind_b", "raw_b")
 
-    def __init__(self, signer: bytes, issue_seq: int, rcpt_a: Receipt, rcpt_b: Receipt):
+    def __init__(
+        self,
+        signer: bytes,
+        issue_seq: int,
+        kind_a: bytes,
+        raw_a: bytes,
+        kind_b: bytes,
+        raw_b: bytes,
+    ):
         self.signer = signer
         self.issue_seq = int(issue_seq)
-        self.rcpt_a, self.rcpt_b = rcpt_a, rcpt_b
+        self.kind_a, self.raw_a = kind_a, raw_a
+        self.kind_b, self.raw_b = kind_b, raw_b
 
     def verify(self) -> bool:
+        if (self.kind_a, self.raw_a) == (self.kind_b, self.raw_b):
+            return False  # identical bytes are not a contradiction
+        try:
+            a = _art_unpack(self.kind_a, self.raw_a)
+            b = _art_unpack(self.kind_b, self.raw_b)
+        except Exception:
+            return False
         return (
-            self.rcpt_a.signer == self.rcpt_b.signer == self.signer
-            and self.rcpt_a.issue_seq == self.rcpt_b.issue_seq == self.issue_seq
-            and self.rcpt_a.op_hash != self.rcpt_b.op_hash  # distinct ops at one seq
-            and self.rcpt_a.verify()
-            and self.rcpt_b.verify()
+            a.signer == b.signer == self.signer
+            and a.issue_seq == b.issue_seq == self.issue_seq
+            and _art_reissue_key(a) != _art_reissue_key(b)  # a genuine collision
+            and a.verify()
+            and b.verify()
         )
 
 
@@ -265,6 +313,8 @@ CREATE TABLE IF NOT EXISTS floor (
     hw_wall INTEGER, hw_ctr INTEGER, att_wall INTEGER, att_ctr INTEGER);
 CREATE TABLE IF NOT EXISTS evidence (
     id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, data BLOB);
+CREATE TABLE IF NOT EXISTS issuance (
+    seq INTEGER PRIMARY KEY, kind TEXT, ident BLOB);
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v BLOB);
 """
 
@@ -441,24 +491,56 @@ class ChainStore:
         ).fetchone()
         return self._row_to_receipt(*row) if row else None
 
-    def acceptance_issue_seq(self, op_hash: bytes, ballot: Ballot, signer: bytes) -> int | None:
-        """The ORIGINAL issue_seq this signer bound to accepting (op_hash, ballot),
-        across ANY epoch — so a cross-epoch re-issue (RERECEIPT) reuses it rather
-        than minting a fresh, higher seq that would frame the node (finding-17)."""
-        row = self.db.execute(
-            "SELECT MIN(issue_seq) FROM receipts WHERE op_hash=? AND ballot=? AND signer=?",
-            (op_hash, codec.encode(ballot.encode()), signer),
-        ).fetchone()
-        return int(row[0]) if row and row[0] is not None else None
+    def reserve_issue_seq(self, kind: bytes, ident: bytes) -> int:
+        """Reserve this signer's issuance-chain position for one artifact and record
+        its justification `ident` in ONE COMMIT (finding 18b: gap-free issuance).
 
-    def next_issue_seq(self) -> int:
-        """The signer's next monotone issuance-chain position — durable, never
-        reused (finding-17). Shared by receipts AND watermarks so their relative
-        order is cryptographically carried."""
-        raw = self.get_meta("issue_seq")
-        nxt = (codec.as_int(codec.decode(raw)) if raw else 0) + 1
-        self.set_meta("issue_seq", codec.encode(nxt))
-        return nxt
+        `ident` is the deterministic justification the artifact re-derives from — a
+        receipt's `(op_hash, ballot)` (epoch-independent, so a cross-epoch RERECEIPT
+        reuses the SAME seq), a watermark's `(floor, epoch)`. If `ident` is already
+        reserved, its seq is returned (idempotent — the deterministic re-sign yields
+        the identical artifact after a crash); otherwise the next seq is MAX+1 and
+        the reservation is written atomically. Because the counter IS the ledger, a
+        crash between reserving and signing burns nothing: the seq stays occupied by
+        its justification, re-derivable, so an honest chain has no gaps and every
+        back-stamp collides with a genuine occupant (which detect_seq_reuse proves)."""
+        row = self.db.execute(
+            "SELECT seq FROM issuance WHERE kind=? AND ident=?", (kind, ident)
+        ).fetchone()
+        if row is not None:
+            return int(row[0])
+        mx = self.db.execute("SELECT MAX(seq) FROM issuance").fetchone()[0]
+        seq = (mx or 0) + 1
+        self.db.execute("INSERT INTO issuance VALUES (?,?,?)", (seq, kind, ident))
+        self.db.commit()
+        return seq
+
+    def reserve_receipt_seq(self, op_hash: bytes, ballot: Ballot) -> int:
+        """The acceptance-bound issue_seq for a receipt on (op_hash, ballot) — the
+        same across epochs (RERECEIPT), a fresh seq for a new acceptance."""
+        return self.reserve_issue_seq(b"r", codec.encode([op_hash, ballot.encode()]))
+
+    def reserve_watermark_seq(self, floor: HLC, epoch: int) -> int:
+        """The issue_seq for a watermark attesting `floor` at `epoch`."""
+        return self.reserve_issue_seq(
+            b"w", codec.encode([floor.wall_ms, floor.counter, int(epoch)])
+        )
+
+    def issuance_chain(self) -> list[tuple[int, bytes, bytes]]:
+        """The signer's issuance ledger `(seq, kind, ident)` in order — the audit
+        surface a chain-checking third party (or the node itself) runs. Gapless by
+        construction post-18b."""
+        return [
+            (int(s), k, i)
+            for s, k, i in self.db.execute("SELECT seq, kind, ident FROM issuance ORDER BY seq")
+        ]
+
+    def issuance_gapless(self) -> bool:
+        """The gapless self-check (finding 18b): a well-formed chain is exactly
+        seqs 1..N. A gap is a burned seq — a back-stampable hole — impossible under
+        the single-transaction reserve flow."""
+        seqs = [s for s, _, _ in self.issuance_chain()]
+        return seqs == list(range(1, len(seqs) + 1))
 
     def put_qc(self, qc: QC) -> None:
         self.db.execute(
@@ -681,8 +763,10 @@ class ChainStore:
                         SeqReuseEvidence(
                             codec.as_bytes(p[0]),
                             codec.as_int(p[1]),
-                            A.Receipt.decode(codec.as_bytes(p[2])),
-                            A.Receipt.decode(codec.as_bytes(p[3])),
+                            codec.as_bytes(p[2]),
+                            codec.as_bytes(p[3]),
+                            codec.as_bytes(p[4]),
+                            codec.as_bytes(p[5]),
                         ),
                     )
                 )
@@ -699,38 +783,40 @@ class ChainStore:
                 )
         return out
 
-    def detect_seq_reuse(self) -> list[SeqReuseEvidence]:
-        """Scan held receipts for a signer that bound TWO different ops to one
-        issuance-chain position `(signer, issue_seq)` — the FORK-analog of the
-        issuance chain (finding-17). A legitimate cross-epoch re-issue keeps the same
-        op_hash, so it is not flagged. Mints + persists; idempotent."""
+    def detect_seq_reuse(
+        self, watermarks: list[A.Watermark] | None = None
+    ) -> list[SeqReuseEvidence]:
+        """Scan held receipts + observed `watermarks` for a signer that placed two
+        DISTINCT artifacts at one issuance-chain position (signer, issue_seq) — the
+        generalized issuance fork (finding 18a): receipt/receipt, receipt/watermark
+        (the WM's-own-seq back-stamp), or watermark/watermark. A legitimate
+        cross-epoch RERECEIPT (same op_hash+ballot) is exempt. Watermarks ride the
+        finality path (not stored artifacts), so the caller supplies the observed
+        ones. Mints + persists; idempotent."""
         seen = {
-            (ev.signer, ev.issue_seq, ev.rcpt_a.op_hash, ev.rcpt_b.op_hash)
+            (ev.signer, ev.issue_seq, frozenset({(ev.kind_a, ev.raw_a), (ev.kind_b, ev.raw_b)}))
             for k, ev in self.evidence()
             if k == EvidenceKind.SEQ_REUSE and isinstance(ev, SeqReuseEvidence)
         }
-        by_key: dict[tuple[bytes, int], list[Receipt]] = {}
-        for r in self.all_receipts():
-            by_key.setdefault((r.signer, r.issue_seq), []).append(r)
+        by_key: dict[tuple[bytes, int], list] = {}
+        for art in [*self.all_receipts(), *(watermarks or [])]:
+            by_key.setdefault((art.signer, art.issue_seq), []).append(art)
         found: list[SeqReuseEvidence] = []
-        for (signer, seq), rcpts in by_key.items():
-            for i in range(len(rcpts)):
-                for j in range(i + 1, len(rcpts)):
-                    a, b = rcpts[i], rcpts[j]
-                    if a.op_hash == b.op_hash:
-                        continue  # same op across epochs — a legitimate re-issue
-                    if (signer, seq, a.op_hash, b.op_hash) in seen or (
-                        signer,
-                        seq,
-                        b.op_hash,
-                        a.op_hash,
-                    ) in seen:
+        for (signer, seq), group in by_key.items():
+            for i in range(len(group)):
+                for j in range(i + 1, len(group)):
+                    a, b = group[i], group[j]
+                    if _art_reissue_key(a) == _art_reissue_key(b):
+                        continue  # legitimate re-issue (or identical artifact)
+                    ka, ra = _art_pack(a)
+                    kb, rb = _art_pack(b)
+                    if (signer, seq, frozenset({(ka, ra), (kb, rb)})) in seen:
                         continue
-                    found.append(SeqReuseEvidence(signer, seq, a, b))
+                    found.append(SeqReuseEvidence(signer, seq, ka, ra, kb, rb))
         for ev in found:
             self._store_evidence(
                 EvidenceKind.SEQ_REUSE,
-                [ev.signer, ev.issue_seq, ev.rcpt_a.encode(), ev.rcpt_b.encode()],
+                [ev.signer, ev.issue_seq, ev.kind_a, ev.raw_a, ev.kind_b, ev.raw_b],
             )
         return found
 

@@ -293,8 +293,16 @@ class TestButtonMasher(unittest.TestCase):
                 # run the perjury detector on every node -> zero false accusations.
                 wms = [sim._raw[i].acc.issue_watermark(10_000_000) for i in range(3)]
                 for i in range(3):
-                    fp = sim._raw[i].acc.store.detect_floor_perjury(wms)
-                    self.assertEqual(fp, [], f"seed {seed}: FALSE floor-perjury on honest node {i}")
+                    st = sim._raw[i].acc.store
+                    self.assertEqual(
+                        st.detect_floor_perjury(wms), [], f"seed {seed}: FALSE floor-perjury n{i}"
+                    )
+                    # finding 18a: the generalized seq-reuse detector (receipts +
+                    # observed watermarks) must not fire on an honest gapless chain.
+                    self.assertEqual(
+                        st.detect_seq_reuse(wms), [], f"seed {seed}: FALSE seq-reuse n{i}"
+                    )
+                    self.assertTrue(st.issuance_gapless(), f"seed {seed}: gap in honest chain n{i}")
 
 
 if __name__ == "__main__":
