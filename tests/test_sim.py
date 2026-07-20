@@ -55,19 +55,36 @@ class TestContention(unittest.TestCase):
         self.assertEqual(a.slot_tag, b.slot_tag)  # true contention on one slot
         ra, rb = sim.commit(a), sim.commit(b)
         sim.run()
-        self.assertTrue(ra.done and rb.done)  # both terminate
-        # B1 cross-ballot: exactly one op is ever decided for the slot.
+        # LIVENESS (NOTES item 23, resolved): both duelers terminate — randomized
+        # backoff + a round timeout keep a loser from wedging under loss.
+        self.assertTrue(ra.done and rb.done)
+        # SAFETY (the fast-path regression): exactly one op is ever decided for
+        # the slot, cross-ballot, and it folds `applied`.
         self.assertEqual(len(sim.decided_ops(a.slot_tag)), 1)
         decided = next(iter(sim.decided_ops(a.slot_tag)))
-        outcomes = [ra.outcome, rb.outcome]
-        self.assertTrue(any(isinstance(o, Q.Committed) for o in outcomes))
-        for o in outcomes:  # whoever lost learned the single winner
+        for o in (ra.outcome, rb.outcome):  # any client that decided agrees
             if isinstance(o, Q.LostSlot):
                 self.assertEqual(o.winner, decided)
-        # and the fold's applied winner is that same op:
+            if isinstance(o, Q.Committed):
+                self.assertEqual(o.qc.op_hash, decided)
         applied, r = _applied_winner(sim, w, a.slot_tag)
         self.assertEqual(applied, [decided])
         self.assertEqual(r.state.get(b"k"), b"A" if decided == a.op_hash else b"B")
+
+    def test_B1_contention_always_terminates_single_decree(self):
+        # NOTES item 23: the dueling-proposer liveness fix (backoff + round
+        # timeout) must hold across seeds, not just seed 5. Every scenario:
+        # both clients terminate, and at most one op is ever decided.
+        for seed in range(20):
+            for n in (3, 5):
+                sim = Sim(seed=seed, n=n, faults=CHAOS)
+                w = World(seed=seed, n_clients=2)
+                a, b = creation_op(w, 0, b"A"), creation_op(w, 1, b"B")
+                ra, rb = sim.commit(a), sim.commit(b)
+                sim.run()
+                assert a.slot_tag is not None
+                self.assertTrue(ra.done and rb.done, f"seed={seed} n={n}: a dueler wedged")
+                self.assertLessEqual(len(sim.decided_ops(a.slot_tag)), 1, f"seed={seed} n={n}")
 
 
 class TestSplitVoteRegression(unittest.TestCase):

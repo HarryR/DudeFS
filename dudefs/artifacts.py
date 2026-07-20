@@ -117,6 +117,18 @@ def fingerprint(pubkey: bytes) -> bytes:
     return crypto.h(pubkey)
 
 
+def slot_priority(slot_tag: bytes, client_fp: bytes) -> bytes:
+    """A proposer's per-slot ballot tiebreak: `h(slot_tag ‖ client_fp)`. Replaces
+    the raw `client_fp` as a ballot's low-order component so that WHICH proposer
+    wins same-round ties VARIES per slot (NOTES item 24d) — otherwise the
+    higher-fingerprint client wins every tie and can starve a peer under sustained
+    single-key contention. Deterministic and identical on every node (they all
+    hold `slot_tag` and the fingerprints), so single-decree/quorum-intersection
+    are untouched; it is *not* a VRF — honest clients compute it the same way and
+    a Byzantine node never proposes, so there is nothing to grind (DESIGN §1)."""
+    return crypto.h(slot_tag + client_fp)
+
+
 def quorum_size(n: int) -> int:
     """Majority = floor(n/2)+1 = ceil((n+1)/2) (DESIGN §13).
     n=1->1, 3->2, 5->3, 7->4."""
@@ -173,18 +185,20 @@ class HLC:
 
 @total_ordering
 class Ballot:
-    """DESIGN §8: `ballot = (round, client-id)`, ordered lexicographically;
-    round 0 is the fast path. Blind writes carry the sentinel BLIND = (0, b'')
-    — no slot, always receipted (subject to §9's skew window)."""
+    """DESIGN §8: `ballot = (round, priority)`, ordered lexicographically. A
+    slotted proposer sets `priority = slot_priority(slot_tag, client_fp)` so
+    same-round ties are broken per-slot (NOTES item 24d), not by a fixed global
+    fingerprint order. Blind writes carry the sentinel BLIND = (0, b'') — no slot,
+    always receipted (subject to §9's skew window)."""
 
-    __slots__ = ("round", "client_fp")
+    __slots__ = ("round", "priority")
 
-    def __init__(self, round_: int, client_fp: bytes):
+    def __init__(self, round_: int, priority: bytes):
         self.round = int(round_)
-        self.client_fp = bytes(client_fp)
+        self.priority = bytes(priority)
 
     def encode(self) -> tuple[int, bytes]:
-        return (self.round, self.client_fp)
+        return (self.round, self.priority)
 
     @staticmethod
     def decode(v: Bencodable) -> Ballot:
@@ -192,7 +206,7 @@ class Ballot:
         return Ballot(codec.as_int(items[0]), codec.as_bytes(items[1]))
 
     def as_tuple(self):
-        return (self.round, self.client_fp)
+        return (self.round, self.priority)
 
     def __eq__(self, o):
         return isinstance(o, Ballot) and self.as_tuple() == o.as_tuple()
@@ -207,10 +221,10 @@ class Ballot:
         return hash(self.as_tuple())
 
     def is_blind(self):
-        return self.round == 0 and self.client_fp == b""
+        return self.round == 0 and self.priority == b""
 
     def __repr__(self):
-        return f"Ballot({self.round},{self.client_fp.hex()[:8]})"
+        return f"Ballot({self.round},{self.priority.hex()[:8]})"
 
 
 BLIND = Ballot(0, b"")

@@ -19,8 +19,9 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from typing import TypeGuard
 
+from . import tunables
 from .acceptor import Nack
-from .artifacts import HLC, QC, Ballot, Op, Promise, Receipt, Watermark, quorum_size
+from .artifacts import HLC, QC, Ballot, Op, Promise, Receipt, Watermark, quorum_size, slot_priority
 from .node import AcceptReq, FetchOpReq, PrepareReq, Request, Response, WatermarkReq
 
 # --------------------------------------------------------------------------- #
@@ -37,10 +38,11 @@ class QuorumConfig:
     roster: list[bytes]
     epoch: int
     client_fp: bytes
-    delta_hedge_ms: int = 50
-    max_rounds: int = 8
-    finality_poll_ms: int = 20
-    max_polls: int = 1000
+    delta_hedge_ms: int = tunables.HEDGE_MS
+    round_timeout_ms: int = tunables.ROUND_TIMEOUT_MS
+    max_rounds: int = tunables.MAX_ROUNDS
+    finality_poll_ms: int = tunables.FINALITY_POLL_MS
+    max_polls: int = tunables.MAX_POLLS
 
     @property
     def n(self) -> int:
@@ -49,6 +51,19 @@ class QuorumConfig:
     @property
     def quorum(self) -> int:
         return quorum_size(self.n)
+
+    @property
+    def fanout_order(self) -> list[int]:
+        """The order this client contacts nodes in (PROTOCOL §4; NOTES item 24a) —
+        `range(n)` ROTATED by an offset derived from `client_fp`. Every client
+        using `range(n)` would make them all hammer nodes {0,1} first and collide
+        on the same preferred quorum under contention (a structural phase-lock).
+        Rotation spreads the preferred set across clients; the kernel stays pure
+        (offset is identity, not an RNG)."""
+        if self.n == 0:
+            return []
+        off = int.from_bytes(self.client_fp[:8].ljust(8, b"\x00"), "big") % self.n
+        return [(off + i) % self.n for i in range(self.n)]
 
     @property
     def roster_index(self) -> dict[bytes, int]:
@@ -214,9 +229,12 @@ class Commit:
         self.cfg = cfg
         self.op = op
         self.tag: bytes = op.slot_tag
+        # per-slot ballot tiebreak: WHICH client wins same-round ties varies by
+        # slot, so no client can starve a peer under contention (NOTES item 24d).
+        self.priority = slot_priority(self.tag, cfg.client_fp)
         self.phase = _Phase.PREPARE
         self.round = 0  # _begin_prepare bumps to 1 on start
-        self.ballot = Ballot(1, cfg.client_fp)  # replaced on every _begin_prepare
+        self.ballot = Ballot(1, self.priority)  # replaced on every _begin_prepare
         self.chosen: Op = op  # op to (re-)propose in ACCEPT
         self.fetch_hash: bytes = b""
         self._fan: _Fanout | None = None
@@ -224,6 +242,9 @@ class Commit:
         self._blocked: set[int] = set()  # nodes that can't receipt this ballot
         self._promises: dict[int, Promise] = {}
         self._nacked: set[int] = set()
+        self._pending_prepare = False  # backing off before the next PREPARE fan-out
+        self._prepare_at = 0  # when that backed-off PREPARE fires
+        self._deadline = 0  # when the current round escalates if it hasn't decided
 
     # ---- driver interface ------------------------------------------------- #
     def start(self, now: int) -> list[Command]:
@@ -234,6 +255,17 @@ class Commit:
             return []
         match ev:
             case Tick(now):
+                # a backed-off PREPARE waiting to fire takes precedence over any
+                # other timer (stale hedge/deadline wakes are ignored meanwhile)
+                if self._pending_prepare:
+                    if now >= self._prepare_at:
+                        self._pending_prepare = False
+                        return self._launch_prepare(now)
+                    return []
+                # round timeout -> escalate, even if the Nacks that would have
+                # triggered it were lost (NOTES item 23, root cause 2)
+                if now >= self._deadline:
+                    return self._escalate(now)
                 return self._fan.on_tick(now) if self._fan else []
             case Reply(node, _, result, now):
                 if self._fan is not None:
@@ -246,26 +278,51 @@ class Commit:
         self._promises.clear()
         self._nacked.clear()
         self.round += 1
-        self.ballot = Ballot(self.round, self.cfg.client_fp)
+        self.ballot = Ballot(self.round, self.priority)
         self._fan = _Fanout(
-            list(range(self.cfg.n)),
+            self.cfg.fanout_order,
             PrepareReq(self.tag, self.ballot),
             self.cfg.delta_hedge_ms,
             self.cfg.quorum,
         )
-        return self._fan.start(now)
+        backoff = self._backoff_ms()
+        if backoff <= 0:
+            return self._launch_prepare(now)
+        # randomized backoff (keyed on the per-slot priority + round) desynchronizes
+        # duelers so one gets a clean run at a quorum (DESIGN §8; NOTES item 23, cause 1).
+        self._pending_prepare = True
+        self._prepare_at = now + backoff
+        return [Wake(self._prepare_at)]
+
+    def _launch_prepare(self, now: int) -> list[Command]:
+        self._deadline = now + self.cfg.round_timeout_ms
+        return [*self._fan.start(now), Wake(self._deadline)] if self._fan else []
 
     def _begin_accept(self, now: int) -> list[Command]:
         self.phase = _Phase.ACCEPT
         self._receipts.clear()
         self._blocked.clear()
         self._fan = _Fanout(
-            list(range(self.cfg.n)),
+            self.cfg.fanout_order,
             AcceptReq(self.tag, self.ballot, self.chosen),
             self.cfg.delta_hedge_ms,
             self.cfg.quorum,
         )
-        return self._fan.start(now)
+        self._deadline = now + self.cfg.round_timeout_ms
+        return [*self._fan.start(now), Wake(self._deadline)]
+
+    def _escalate(self, now: int) -> list[Command]:
+        """A round stalled (lost replies) — bump and re-PREPARE, or give up."""
+        if self.round >= self.cfg.max_rounds:
+            return self._finish(Failed(CommitFailure.EXHAUSTED))
+        return self._begin_prepare(now)
+
+    def _backoff_ms(self) -> int:
+        if self.round <= 1:
+            return 0  # first attempt — no contention yet; keep the happy path prompt
+        window = self.cfg.delta_hedge_ms * self.round  # grows with the round
+        salt = int.from_bytes(self.priority[:8], "big")  # per-slot, like the tiebreak
+        return (salt ^ (self.round * 0x9E3779B1)) % max(1, window)
 
     def _finish(self, outcome: CommitOutcome) -> list[Command]:
         self.phase = _Phase.DONE
@@ -287,7 +344,10 @@ class Commit:
 
     def _on_prepare_reply(self, node: int, result: Response, now: int) -> list[Command]:
         if isinstance(result, Promise):
-            if result.verify() and result.signer == self.cfg.roster[node]:
+            # only count promises for THIS round's ballot — a delayed reply from a
+            # superseded round must not fill the current quorum (backoff safety)
+            fresh = result.ballot == self.ballot and result.tag == self.tag
+            if fresh and result.verify() and result.signer == self.cfg.roster[node]:
                 self._promises[node] = result
                 if len(self._promises) >= self.cfg.quorum:
                     return self._choose_and_accept(now)
@@ -311,8 +371,9 @@ class Commit:
         self.phase = _Phase.FETCH
         self.fetch_hash = best[1]
         self._fan = None
+        self._deadline = now + self.cfg.round_timeout_ms  # a lost fetch escalates too
         holder = next(n for n, p in self._promises.items() if p.accepted_op_hash == best[1])
-        return [Send(holder, FetchOpReq(best[1]))]
+        return [Send(holder, FetchOpReq(best[1])), Wake(self._deadline)]
 
     def _on_fetch_reply(self, result: Response, now: int) -> list[Command]:
         if (

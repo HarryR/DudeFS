@@ -62,6 +62,10 @@
    *Amended at rev 5 (item 21):* slotted ballots are `(round ≥ 1, client_fp)`;
    the `(0, ·)` family is reserved for the blind sentinel and a slot's
    unpromised initial state — the ballot-0 fast path no longer exists.
+   *Amended again (item 24d):* the low-order component is `priority =
+   h(slot_tag ‖ client_fp)`, not the raw `client_fp` — a per-slot tiebreak that
+   prevents fixed-pair starvation. Order is still lexicographic `(round,
+   priority)`; the `Ballot` field is renamed `client_fp → priority`.
 
 9. **Control-op authorization** is simplified to "authored by the root manager
    key" for M1. Delegated capabilities (`compact` / `manage-roster` /
@@ -233,6 +237,71 @@ and A4 as formally stated. Resolutions decided with the design owner; DESIGN
       PREPARE round 1 (no SUBMIT phase); sim invariant strengthened to full
       cross-ballot B1; the two collision seeds become regression tests
       asserting exactly one decided op per slot.
+
+## M4 findings (gossip + integration, 2026-07-20)
+
+22. **Nodes must persist the receipts they issue (RESOLVED, code landed).** M2's
+    acceptor issued-and-returned receipts to the requesting client but never
+    stored them — fine for the direct reply path, but PROTOCOL §2.2 / §1.4 need
+    "any node accumulating a quorum of receipts assembles the QC", so gossip must
+    be able to spread a node's own receipts. `on_submit`/`on_accept` now
+    `put_receipt` before returning (`_issue_receipt`); storage is derived from
+    already-fsynced slot state, so it never outlives its justification
+    (RESILIENCE §0). Enables single-push (§1.4) and gossip QC-assembly.
+
+23. **Dueling-proposer liveness stall — RESOLVED 2026-07-20 (code landed).** The
+    contention sim (seed 5, n=3, 25% loss) wedged proposer A at PREPARE round 2
+    forever — it never terminated. **Safety was always intact** (exactly one op
+    decided, cross-ballot B1 held); the gap was purely *liveness*. Exposed (not
+    caused) by tuning RTT 2× → 2.222× one-way, which shifted the deterministic
+    schedule onto a latent bug any seed/tunable could hit.
+    - **Cause 1 — no randomized backoff.** Two proposers stayed phase-locked,
+      each invalidating the other's ballot. DESIGN §8 anticipated this
+      ("randomized backoff suffices — noted"). **Fix:** `Commit._backoff_ms`
+      delays re-PREPARE by a jitter keyed on `(client_fp, round)`, so duelers
+      desynchronize and one gets a clean run. Kernel stays pure — the jitter is a
+      function of identity+round, no RNG. Round 1 has zero backoff (happy path
+      stays prompt).
+    - **Cause 2 — `_maybe_reprepare` optimistic under loss.** It escalated only on
+      *heard* Nacks (`n − len(nacked) ≥ quorum → wait`), so lost Nacks stalled the
+      round bump. **Fix:** a per-round timeout (`round_timeout_ms`, 4·RTT) fires a
+      `Wake`; if the round hasn't decided, `_escalate` bumps the round regardless
+      of heard replies (or gives up at `max_rounds`). Covers PREPARE, ACCEPT, and
+      FETCH. A `(ballot, tag)` guard on promises stops a delayed reply from a
+      superseded round filling the current quorum.
+    - **Verified:** 80/80 contention scenarios (seeds 0–39 × n∈{3,5}, 25% loss)
+      both terminate with exactly one op decided. Sim regression test
+      `test_B1_contention_always_terminates_single_decree` sweeps them.
+
+24. **Phase-sync audit (2026-07-20) — one structural lock fixed, rest catalogued.**
+    Following the item 23 dueling fix, swept every timing/ordering point for
+    synchronized-behavior hazards (independent actors acting in lock-step).
+    - **FIXED — identical fan-out order.** Both `_Fanout`s used `range(n)`, so
+      *every* client contacted nodes {0,1} first and contenders always collided
+      on the same preferred quorum — a structural phase-lock the backoff only
+      partly hid. `QuorumConfig.fanout_order` now rotates `range(n)` by an offset
+      derived from `client_fp` (pure kernel, no RNG). Measured effect over the
+      80-scenario contention sweep: clean LostSlot resolutions 38→43, forced-retry
+      Failed 42→37.
+    - **Noted, not yet fixed** (lower value / different layer / unbuilt):
+      (a) `ClientRunner` retransmit is a fixed interval — synchronized retransmit
+      storms; jitter it in the M7 real driver. (b) `Finalize` polls WATERMARK on a
+      fixed cadence — synchronized but read-only/cheap; jitter later if needed.
+      (c) the gossip driver (unbuilt) MUST use a jittered period + uniformly random
+      peer (PROTOCOL §2.2) when it lands.
+    - **(d) FIXED 2026-07-20 — per-slot ballot tiebreak.** Ballot ties broke by raw
+      `client_fp`, a fixed global order, so for any FIXED pair the higher-fp client
+      won *every* same-round tie and could starve the other under sustained
+      single-key contention (each CAS attempt is a fresh `slot_tag` but the fp
+      order is constant). Ballots are now `(round, priority)` with
+      `priority = slot_priority(slot_tag, client_fp) = h(slot_tag ‖ client_fp)`
+      (amends item 8). WHICH proposer wins ties now varies per slot, so a fixed
+      pair each win ~half — demonstrated: old scheme 2000/2000 (100%, starves) →
+      new 48% (`test_per_slot_tiebreak_prevents_starvation`). Deterministic and
+      identical on every node (all hold the tag + fingerprints), so single-decree
+      / quorum-intersection are untouched — NOT a VRF: honest clients compute it
+      the same and a Byzantine node never proposes, so nothing to grind. The
+      backoff jitter salt is now per-slot too (`priority[:8]`).
 
 # Not yet built (by design, M2+)
 

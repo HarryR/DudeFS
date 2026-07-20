@@ -22,6 +22,7 @@ from __future__ import annotations
 from enum import Enum, auto
 
 from . import artifacts as A
+from . import tunables
 from .artifacts import (
     BLIND,
     HLC,
@@ -38,8 +39,6 @@ from .store import AppendStatus, ChainStore
 type SubmitResult = Receipt | Rejected  # blind writes only (rev 5); slotted -> NEEDS_BALLOT
 type AcceptResult = Receipt | Nack | Rejected
 type PrepareResult = Promise | Nack
-
-DEFAULT_DELTA_MS = 60_000  # skew window δ (DESIGN §9); generous for a config store
 
 
 class RejectReason(Enum):
@@ -85,7 +84,7 @@ class Acceptor:
         node_pub: bytes,
         store: ChainStore,
         config_epoch: int = 0,
-        delta_ms: int = DEFAULT_DELTA_MS,
+        delta_ms: int = tunables.DELTA_MS,
     ):
         self.sk = node_sk
         self.pub = node_pub
@@ -166,7 +165,7 @@ class Acceptor:
         # blind write: always receipted at the BLIND ballot (DESIGN §8).
         self._advance_hw(op)
         self.store.commit()  # fsync before signing
-        return A.Receipt.issue(self.sk, self.pub, op.op_hash, self.epoch, BLIND)
+        return self._issue_receipt(op.op_hash, BLIND)
 
     # ------------------------------------------------------------------ #
     # PREPARE — classic Paxos phase 1 (DESIGN §8 recovery)               #
@@ -209,4 +208,13 @@ class Acceptor:
         self.store._write_slot(tag, s)
         self._advance_hw(op)
         self.store.commit()  # fsync before signing
-        return A.Receipt.issue(self.sk, self.pub, op.op_hash, self.epoch, ballot)
+        return self._issue_receipt(op.op_hash, ballot)
+
+    def _issue_receipt(self, op_hash: bytes, ballot: Ballot) -> Receipt:
+        """Sign a receipt AND persist it. A node holds every receipt it issues so
+        gossip can spread it and any node can assemble the QC from a quorum
+        (PROTOCOL §2.2, §1.4). Storage is derived from the already-fsynced slot
+        state, so it never outlives its justification (RESILIENCE §0)."""
+        r = A.Receipt.issue(self.sk, self.pub, op_hash, self.epoch, ballot)
+        self.store.put_receipt(r)
+        return r

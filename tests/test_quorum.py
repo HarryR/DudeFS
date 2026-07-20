@@ -114,7 +114,9 @@ class TestTwoPhase(unittest.TestCase):
         self.assertIsInstance(outcome, Q.Committed)
         assert isinstance(outcome, Q.Committed)
         self.assertEqual(outcome.qc.op_hash, op.op_hash)
-        self.assertEqual(outcome.qc.ballot, A.Ballot(1, cfg.client_fp))  # round 1, not 0
+        assert op.slot_tag is not None
+        prio = A.slot_priority(op.slot_tag, cfg.client_fp)  # per-slot tiebreak (24d)
+        self.assertEqual(outcome.qc.ballot, A.Ballot(1, prio))  # round 1, not 0
         self.assertTrue(outcome.qc.verify(roster))
         # hedge, don't blast: each phase contacts only a quorum (the same {0,1})
         self.assertEqual(len(set(drv.contacted)), cfg.quorum)
@@ -158,6 +160,23 @@ class TestSplitVote(unittest.TestCase):
         qc = outcome.qc  # type: ignore[union-attr]
         self.assertTrue(qc.verify(roster))
         self.assertIn(qc.op_hash, {opA.op_hash, opB.op_hash, mine.op_hash})
+
+
+class TestBallotFairness(unittest.TestCase):
+    def test_per_slot_tiebreak_prevents_starvation(self):
+        # NOTES item 24d: a fixed pair of clients (raw fp ordering is constant, so
+        # the old scheme let one win EVERY same-round tie and starve the other)
+        # must each win ~half the same-round ties across distinct slots.
+        fp_a = A.fingerprint(C.SIGNER.public(bytes([1] * 32)))
+        fp_b = A.fingerprint(C.SIGNER.public(bytes([2] * 32)))
+        self.assertNotEqual(fp_a > fp_b, fp_a < fp_b)  # one is globally "higher"
+        a_wins = 0
+        n = 1000
+        for i in range(n):
+            tag = C.h(b"lineage/%d" % i)  # a distinct slot per version/attempt
+            if A.slot_priority(tag, fp_a) > A.slot_priority(tag, fp_b):
+                a_wins += 1
+        self.assertTrue(0.4 * n < a_wins < 0.6 * n, f"unfair split: A won {a_wins}/{n}")
 
 
 class TestFinalize(unittest.TestCase):

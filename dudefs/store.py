@@ -231,6 +231,13 @@ class ChainStore:
             out.append(A.Receipt(oh, ep, Ballot.decode(codec.decode(ballot)), signer, sig))
         return out
 
+    def all_receipts(self) -> list[Receipt]:
+        """Every receipt held, for gossip coverage/diff (M4)."""
+        return [
+            A.Receipt(oh, ep, Ballot.decode(codec.decode(ballot)), signer, sig)
+            for oh, ep, ballot, signer, sig in self.db.execute("SELECT * FROM receipts")
+        ]
+
     def put_qc(self, qc: QC) -> None:
         self.db.execute(
             "INSERT OR REPLACE INTO qcs VALUES (?,?,?,?,?)",
@@ -255,6 +262,14 @@ class ChainStore:
         oh, ep, ballot, bitmap, sigs = row
         sig_list = [codec.as_bytes(x) for x in codec.as_seq(codec.decode(sigs))]
         return A.QC(oh, ep, Ballot.decode(codec.decode(ballot)), bitmap, sig_list)
+
+    def all_qcs(self) -> list[QC]:
+        """Every QC held, for gossip coverage/diff (M4)."""
+        out: list[QC] = []
+        for oh, ep, ballot, bitmap, sigs in self.db.execute("SELECT * FROM qcs"):
+            sig_list = [codec.as_bytes(x) for x in codec.as_seq(codec.decode(sigs))]
+            out.append(A.QC(oh, ep, Ballot.decode(codec.decode(ballot)), bitmap, sig_list))
+        return out
 
     # ---- slot acceptor state (DESIGN §8) ---------------------------------- #
     def get_slot(self, tag: bytes) -> SlotState:

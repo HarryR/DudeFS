@@ -27,7 +27,7 @@ from enum import StrEnum
 from typing import Any, NotRequired, TypedDict
 
 from . import artifacts as A
-from . import crypto
+from . import crypto, tunables
 from .artifacts import GENESIS_PREV, VERSION_ABSENT, Heads, Op, Txn
 from .errors import DudeFSError
 from .handlers import control as control_handler
@@ -183,7 +183,7 @@ class ControlState:
 # verification is otherwise re-paid on every re-fold. Bounded to avoid unbounded
 # growth in a long-lived process.
 _SIG_CACHE: dict[bytes, bool] = {}
-_SIG_CACHE_MAX = 100_000
+_SIG_CACHE_MAX = tunables.SIG_CACHE_MAX
 
 
 def _struct_and_sig_ok(op: Op) -> bool:

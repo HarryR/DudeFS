@@ -24,6 +24,7 @@ from __future__ import annotations
 import random
 from dataclasses import dataclass, field
 
+from .. import tunables
 from ..acceptor import Acceptor, AcceptResult, PrepareResult, SubmitResult
 from ..artifacts import (
     HLC,
@@ -138,7 +139,7 @@ class Sim:
         *,
         n: int = 3,
         faults: Faults = NO_FAULTS,
-        delta: int = 10_000,
+        delta: int = tunables.SIM_DELTA_MS,
     ):
         self.sched = Scheduler()
         self.n = n
@@ -181,7 +182,7 @@ class Sim:
         self.runners.append(r)
         return r
 
-    def run(self, deadline_ms: int = 100_000) -> None:
+    def run(self, deadline_ms: int = tunables.SIM_RUN_DEADLINE_MS) -> None:
         """Interleave all launched runners on the one clock until they finish (or
         the deadline). B1/B3 are checked as transitions happen; B2 at the end."""
         while any(not r.done for r in self.runners) and self.sched.step():

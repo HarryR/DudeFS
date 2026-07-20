@@ -29,6 +29,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
+from .. import tunables
 from ..node import NodeAPI, Request, Response, dispatch
 from ..quorum import Command, Done, Event, Reply, Send, Tick, Wake
 
@@ -81,8 +82,8 @@ class Faults:
 
     loss: float = 0.0  # P(drop this hop)
     dup: float = 0.0  # P(deliver a second copy)
-    delay_lo: int = 1  # min hop latency (ms); ≥1 so time always advances
-    delay_hi: int = 3  # max hop latency (ms)
+    delay_lo: int = tunables.SIM_DELAY_LO_MS  # min hop latency; ≥1 so time always advances
+    delay_hi: int = tunables.SIM_DELAY_HI_MS  # max hop latency (reorder from the spread)
 
     def __post_init__(self) -> None:
         assert self.delay_lo >= 1, "hop delay must be ≥1 so simulated time advances"
@@ -153,8 +154,8 @@ class ClientRunner:
         transport: MemoryTransport,
         sched: Scheduler,
         *,
-        retransmit_ms: int = 40,
-        deadline_ms: int = 100_000,
+        retransmit_ms: int = tunables.SIM_RETRANSMIT_MS,
+        deadline_ms: int = tunables.SIM_DRIVE_DEADLINE_MS,
         observer: Observer | None = None,
     ):
         self.machine = machine
@@ -208,8 +209,8 @@ def drive(
     transport: MemoryTransport,
     sched: Scheduler,
     *,
-    retransmit_ms: int = 40,
-    deadline_ms: int = 100_000,
+    retransmit_ms: int = tunables.SIM_RETRANSMIT_MS,
+    deadline_ms: int = tunables.SIM_DRIVE_DEADLINE_MS,
 ) -> object:
     """Run a single machine to its outcome (or None on deadline) — a ClientRunner
     plus the run loop. The sim launches many runners and owns the loop itself."""
