@@ -41,8 +41,10 @@ from .handlers.data import Opaque
 SUPPORTED_PVER = 0
 
 
-class SnapEntry(TypedDict):
-    """A live key materialized into a checkpoint snapshot (DESIGN §12)."""
+class BarrierEntry(TypedDict):
+    """A live key's state at a checkpoint barrier (DESIGN §12). rev 6: there is no
+    snapshot blob — a bootstrap client reconstructs this from the retained winner
+    ops + the attempts sidecar; a full-history client derives it. Same shape."""
 
     value: bytes
     version: bytes
@@ -65,9 +67,9 @@ class Genesis(TypedDict):
     pver: NotRequired[int]
 
 
-# Client-held key material and the checkpoint snapshot base (DESIGN §3, §12).
+# Client-held key material and the checkpoint barrier state (DESIGN §3, §12).
 type Keyring = dict[int, dict[str, bytes]]  # keyepoch -> {data_key, slot_secret}
-type Snapshot = dict[bytes, SnapEntry]  # key -> {value, version, attempt}
+type BarrierState = dict[bytes, BarrierEntry]  # key -> {value, version, attempt}
 
 
 class Verdict(StrEnum):
@@ -357,14 +359,15 @@ def fold(
     committed_ops: list[Op],
     keyring: Keyring,
     genesis: Genesis,
-    snapshot: Snapshot | None = None,
+    barrier: BarrierState | None = None,
     aead_suite: bytes | None = None,
     cut_frontier: Heads | None = None,
 ) -> FoldResult:
     """Deterministic fold of a *committed* op set (FORMAL A1). Any arrival order
     yields identical (state, verdicts) — the walk sorts internally. Pass
-    `snapshot` + `cut_frontier` to fold a checkpoint tail (bootstrap client,
-    DESIGN §12). Raises FoldHalted at a lane-2 fence above SUPPORTED_PVER."""
+    `barrier` + `cut_frontier` to fold a checkpoint tail above a sealed barrier
+    (bootstrap client, DESIGN §12). Raises FoldHalted at a lane-2 fence above
+    SUPPORTED_PVER."""
     if aead_suite is None:
         aead_suite = crypto.AEAD_SUITE
     # The fold is a pure function of the committed *SET* (FORMAL A1): dedupe by
@@ -380,10 +383,10 @@ def fold(
     )
     verdicts: dict[bytes, Verdict] = {}
 
-    # ---- seed state from a snapshot (checkpoint bootstrap, DESIGN §12 / A4) --
+    # ---- seed state from the sealed barrier (checkpoint bootstrap, §12 / A4) --
     state: dict[bytes, KeyMeta] = {}
-    if snapshot is not None:
-        for key, s in snapshot.items():
+    if barrier is not None:
+        for key, s in barrier.items():
             state[key] = KeyMeta(True, s["value"], s["version"], s["attempt"])
 
     ops_sorted = sorted(ops, key=_total_order_key)
@@ -594,19 +597,20 @@ def _apply_checkpoint_barrier(state: dict[bytes, KeyMeta]) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Snapshot (checkpoint bootstrap base, DESIGN §12 / A4)                        #
+# Barrier state (checkpoint bootstrap seed, DESIGN §12 / A4)                   #
 # --------------------------------------------------------------------------- #
 
 
-def make_snapshot(result: FoldResult) -> Snapshot:
-    """Materialize live keys only, each with (value, version, attempt) — the
-    snapshot a checkpoint carries (DESIGN §12). Tombstones are omitted (they
-    die at the barrier)."""
-    snap: Snapshot = {}
+def make_barrier(result: FoldResult) -> BarrierState:
+    """The live-key state at a barrier, each with (value, version, attempt) — what
+    a bootstrap client reconstructs from the retained winners + attempts sidecar,
+    and a full-history client derives (DESIGN §12; rev 6: no snapshot blob).
+    Tombstones are omitted (they die at the barrier)."""
+    out: BarrierState = {}
     for key, m in result.meta.items():
-        if m.present and m.value is not None:  # present => bytes value (narrows for SnapEntry)
-            snap[key] = {"value": m.value, "version": m.version, "attempt": m.attempt}
-    return snap
+        if m.present and m.value is not None:  # present => bytes value (narrows for BarrierEntry)
+            out[key] = {"value": m.value, "version": m.version, "attempt": m.attempt}
+    return out
 
 
 def state_root(result: FoldResult) -> bytes:

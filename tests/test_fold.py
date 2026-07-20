@@ -246,7 +246,7 @@ class TestA4Barrier(unittest.TestCase):
         )
 
         r_below = fold.fold(below, w.keyring, w.genesis)
-        snap = fold.make_snapshot(r_below)
+        snap = fold.make_barrier(r_below)
         # the checkpoint's pinned per-author heads (DESIGN §12) — EVERY author's
         # chain at the cut, including the manager's own (its cert ops are below).
         cut_frontier = {c.pub: (c.seq - 1, c.prev) for c in w.clients if c.seq > 0}
@@ -294,7 +294,7 @@ class TestA4Barrier(unittest.TestCase):
         # bootstrap client: retained control chain + snapshot + tail, prev-
         # validated across the barrier via the pinned frontier.
         boot = fold.fold(
-            control + tail, w.keyring, w.genesis, snapshot=snap, cut_frontier=cut_frontier
+            control + tail, w.keyring, w.genesis, barrier=snap, cut_frontier=cut_frontier
         )
         self.assertEqual(boot.state, full.state)
         self.assertEqual(boot.state, {b"k1": b"c", b"k2": b"reborn", b"k3": b"fresh"})
@@ -318,9 +318,9 @@ class TestA4Barrier(unittest.TestCase):
         self.assertNotIn(KEY, r2.state)
         self.assertNotEqual(r2.lineage(KEY)[0], A.VERSION_ABSENT)  # tombstone anchors lineage
         # snapshot the deleted state -> tombstone is dropped, lineage restarts at ⊥
-        snap = fold.make_snapshot(r2)
+        snap = fold.make_barrier(r2)
         self.assertNotIn(KEY, snap)
-        boot = fold.fold([], w.keyring, w.genesis, snapshot=snap)
+        boot = fold.fold([], w.keyring, w.genesis, barrier=snap)
         self.assertEqual(boot.lineage(KEY), (A.VERSION_ABSENT, 0))
 
 

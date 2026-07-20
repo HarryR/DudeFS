@@ -106,7 +106,7 @@ class TestA4WindowRegression(unittest.TestCase):
         tomb_v, tomb_a = r_below.lineage(KEY)
         self.assertNotEqual(tomb_v, A.VERSION_ABSENT)  # tombstone anchors the lineage
 
-        snap = fold.make_snapshot(r_below)
+        snap = fold.make_barrier(r_below)
         cut = {c.pub: (c.seq - 1, c.prev) for c in w.clients if c.seq > 0}
         cut[w.mgr_pub] = (w._mseq - 1, w._mprev)
 
@@ -123,7 +123,7 @@ class TestA4WindowRegression(unittest.TestCase):
         ckpt = w.checkpoint(cut=cut, snapshot=b"opaque", keyepoch=0)
 
         full = fold.fold(below + [x, ckpt], w.keyring, w.genesis)
-        boot = fold.fold(control + [x], w.keyring, w.genesis, snapshot=snap, cut_frontier=cut)
+        boot = fold.fold(control + [x], w.keyring, w.genesis, barrier=snap, cut_frontier=cut)
         self.assertEqual(full.verdicts[x.op_hash], fold.Verdict.STALE)
         self.assertEqual(boot.verdicts[x.op_hash], fold.Verdict.STALE)
         self.assertEqual(full.state, boot.state)
