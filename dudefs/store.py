@@ -325,7 +325,10 @@ class ChainStore:
     knowledge is structural — the node build has no keyring)."""
 
     def __init__(self, path: str = ":memory:"):
-        self.db = sqlite3.connect(path)
+        # check_same_thread=False: the daemon serves connections on per-request
+        # threads (M7); all store access is serialized by the daemon's lock, so the
+        # single connection is safe to share across them.
+        self.db = sqlite3.connect(path, check_same_thread=False)
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=FULL")  # COMMIT fsyncs (sign-after-fsync)
         self.db.executescript(_SCHEMA)

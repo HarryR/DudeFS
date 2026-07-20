@@ -23,6 +23,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from . import artifacts as A
+from . import codec
 from .artifacts import HLC, QC, Heads, Op, Receipt
 from .store import ChainStore, baseline_digest
 from .store import covered as _covered  # the canonical cut boundary (store L2)
@@ -180,3 +182,60 @@ def verify_baseline(
     localized to the author; the checkpoint signature is verified separately."""
     have = baseline_digest(store.all_ops(), cut, dead)
     return {a for a in set(have) | set(committed) if have.get(a) != committed.get(a)}
+
+
+# --------------------------------------------------------------------------- #
+# Wire codec for the epidemic exchange (M7 WP1.2)                              #
+# --------------------------------------------------------------------------- #
+# A gossip round is one request/response: the initiator sends its Summary, the
+# peer replies with the Delta it owes. Serialization lives here (the daemon shell
+# does the sockets), a thin dispatch over the artifacts' own encoders.
+
+
+def encode_summary(s: Summary) -> bytes:
+    return codec.encode(
+        [
+            dict(s.heads),
+            [[oh, sig] for oh, sig in sorted(s.receipts)],
+            sorted(s.qcs),
+            list(s.floor.encode()),
+            int(s.epoch),
+            s.checkpoint,
+            {a: [c, d] for a, (c, d) in s.retained.items()},
+        ]
+    )
+
+
+def decode_summary(data: bytes) -> Summary:
+    p = codec.as_seq(codec.decode(data))
+    heads = {codec.as_bytes(a): codec.as_int(v) for a, v in codec.as_dict(p[0]).items()}
+    receipts = frozenset(
+        (codec.as_bytes(pair[0]), codec.as_bytes(pair[1]))
+        for pair in (codec.as_seq(x, 2) for x in codec.as_seq(p[1]))
+    )
+    qcs = frozenset(codec.as_bytes(x) for x in codec.as_seq(p[2]))
+    retained: dict[bytes, tuple[int, bytes]] = {}
+    for a, entry in codec.as_dict(p[6]).items():
+        c, dig = codec.as_seq(entry, 2)
+        retained[codec.as_bytes(a)] = (codec.as_int(c), codec.as_bytes(dig))
+    return Summary(
+        heads, receipts, qcs, HLC.decode(p[3]), codec.as_int(p[4]), codec.as_bytes(p[5]), retained
+    )
+
+
+def encode_delta(d: Delta) -> bytes:
+    return codec.encode(
+        [
+            [o.raw for o in d.ops],
+            [r.encode() for r in d.receipts],
+            [qc.encode() for qc in d.qcs],
+        ]
+    )
+
+
+def decode_delta(data: bytes) -> Delta:
+    p = codec.as_seq(codec.decode(data))
+    ops = tuple(A.Op.from_bytes(codec.as_bytes(x)) for x in codec.as_seq(p[0]))
+    receipts = tuple(A.Receipt.decode(codec.as_bytes(x)) for x in codec.as_seq(p[1]))
+    qcs = tuple(A.QC.decode(codec.as_bytes(x)) for x in codec.as_seq(p[2]))
+    return Delta(ops, receipts, qcs)
