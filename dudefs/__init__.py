@@ -4,8 +4,8 @@
 # ARCHITECTURE.md, MANAGER.md, RESILIENCE.md, FORMAL.md. If code and documents
 # disagree, the documents win (IMPLEMENTATION.md).
 #
-# This package is stdlib-only at runtime, plus one vendored file
-# (vendor/ed25519.py). Milestones M0 (codec + crypto + artifacts), M1 (the
+# This package is stdlib-only at runtime, plus one crypto dependency (PyNaCl /
+# libsodium — the L0 backend, CRYPTO.md). Milestones M0 (codec + crypto + artifacts), M1 (the
 # fold), and M2 (store + acceptor) are implemented; the quorum client, gossip,
 # and daemon (M3+) are not yet.
 

@@ -1,13 +1,14 @@
-# M0 — L0 crypto: Ed25519 RFC 8032 vectors, PRF, AEAD auth0, MultiSig list.
+# M0 — L0 crypto: Ed25519 RFC 8032 KATs (SIGNER over PyNaCl), PRF, AEAD auth0,
+# MultiSig list.
 
 import binascii
 import random
 import unittest
 
 from dudefs import crypto as C
-from dudefs.vendor import ed25519
 
-# RFC 8032 §7.1 test vectors (authoritative).
+# RFC 8032 §7.1 test vectors (authoritative). KATs for the SIGNER over PyNaCl —
+# byte-identical to the vendored reference we replaced (the swap is wire-invisible).
 RFC8032 = [
     (
         "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
@@ -35,17 +36,17 @@ class TestEd25519RFC(unittest.TestCase):
         h = binascii.unhexlify
         for sk_h, pk_h, msg_h, sig_h in RFC8032:
             sk, pk, msg, sig = h(sk_h), h(pk_h), h(msg_h), h(sig_h)
-            self.assertEqual(ed25519.publickey(sk), pk)
-            self.assertEqual(ed25519.sign(sk, msg), sig)
-            self.assertTrue(ed25519.verify(pk, msg, sig))
+            self.assertEqual(C.SIGNER.public(sk), pk)
+            self.assertEqual(C.SIGNER.sign(sk, msg), sig)
+            self.assertTrue(C.SIGNER.verify(pk, msg, sig))
 
     def test_tamper_rejected(self):
         h = binascii.unhexlify
         sk_h, pk_h, msg_h, sig_h = RFC8032[1]
         pk, msg, sig = h(pk_h), h(msg_h), h(sig_h)
-        self.assertFalse(ed25519.verify(pk, msg + b"x", sig))
-        self.assertFalse(ed25519.verify(pk, msg, sig[:-1] + bytes([sig[-1] ^ 1])))
-        self.assertFalse(ed25519.verify(bytes(32), msg, sig))
+        self.assertFalse(C.SIGNER.verify(pk, msg + b"x", sig))
+        self.assertFalse(C.SIGNER.verify(pk, msg, sig[:-1] + bytes([sig[-1] ^ 1])))
+        self.assertFalse(C.SIGNER.verify(bytes(32), msg, sig))
 
 
 class TestPRF(unittest.TestCase):

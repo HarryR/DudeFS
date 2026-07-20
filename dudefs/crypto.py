@@ -23,14 +23,31 @@ import hashlib
 import hmac
 from collections.abc import Iterable
 
+import nacl.exceptions
+import nacl.signing
+
 from .errors import DudeFSError
-from .vendor import ed25519
+
+
+def _ed25519_sign(sk: bytes, msg: bytes) -> bytes:
+    return nacl.signing.SigningKey(sk).sign(msg).signature
+
+
+def _ed25519_public(sk: bytes) -> bytes:
+    return bytes(nacl.signing.SigningKey(sk).verify_key)
+
+
+def _ed25519_verify(pk: bytes, msg: bytes, sig: bytes) -> bool:
+    try:
+        nacl.signing.VerifyKey(pk).verify(msg, sig)
+        return True
+    except (nacl.exceptions.BadSignatureError, ValueError):
+        return False
 
 
 class CryptoError(DudeFSError):
     """The crypto module's base error: suite/parameter misuse (unknown suite id,
-    out-of-range signer index). (The vendored Ed25519 raises stdlib ValueError
-    on a malformed key — a programmer error, left as-is to keep it standalone.)"""
+    out-of-range signer index)."""
 
 
 # --------------------------------------------------------------------------- #
@@ -76,22 +93,23 @@ def prf_tag(slot_secret: bytes, preimage: bytes) -> bytes:
 
 
 class Ed25519Signer:
-    """L0 Signer over the vendored RFC 8032 implementation. `sk` is the 32-byte
-    seed; the public key is derived. POC-only (not constant-time)."""
+    """L0 Signer over libsodium (PyNaCl). `sk` is the 32-byte seed; the public key
+    is derived. RFC 8032 deterministic — byte-identical signatures to any
+    conforming implementation (the Rust/Go ports and the KAT vectors)."""
 
     suite_id = SIGNER_SUITE
 
     @staticmethod
     def public(sk: bytes) -> bytes:
-        return ed25519.publickey(sk)
+        return _ed25519_public(sk)
 
     @staticmethod
     def sign(sk: bytes, msg: bytes) -> bytes:
-        return ed25519.sign(sk, msg)
+        return _ed25519_sign(sk, msg)
 
     @staticmethod
     def verify(pk: bytes, msg: bytes, sig: bytes) -> bool:
-        return ed25519.verify(pk, msg, sig)
+        return _ed25519_verify(pk, msg, sig)
 
 
 SIGNER = Ed25519Signer
@@ -143,7 +161,7 @@ class Ed25519ListMultiSig:
 
     @staticmethod
     def sign_share(sk: bytes, msg: bytes) -> bytes:
-        return ed25519.sign(sk, msg)
+        return _ed25519_sign(sk, msg)
 
     @staticmethod
     def combine(shares_by_index: dict[int, bytes], n: int) -> tuple[bytes, list[bytes]]:
@@ -165,7 +183,7 @@ class Ed25519ListMultiSig:
         if len(indices) != len(sigs):
             return False
         for idx, sig in zip(indices, sigs, strict=False):
-            if not ed25519.verify(roster_pubkeys[idx], msg, sig):
+            if not _ed25519_verify(roster_pubkeys[idx], msg, sig):
                 return False
         return True
 
@@ -182,7 +200,7 @@ class Ed25519ListMultiSig:
         if len(indices) != len(sigs) or len(indices) != len(msgs):
             return False
         for idx, sig, msg in zip(indices, sigs, msgs, strict=False):
-            if not ed25519.verify(roster_pubkeys[idx], msg, sig):
+            if not _ed25519_verify(roster_pubkeys[idx], msg, sig):
                 return False
         return True
 

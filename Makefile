@@ -2,9 +2,9 @@
 #
 # FULLY SELF-CONTAINED: uv installs into ./.uv (not ~/.local/bin), its cache is
 # ./.uv/cache, and the venv is ./.venv — nothing touches the system. The RUNTIME
-# stays stdlib-only (IMPLEMENTATION.md §0); everything here is dev-only and lives
-# under the project dir. The venv is VSCode-compatible (.vscode/settings.json
-# points the Python extension at .venv/bin/python).
+# is stdlib + ONE crypto dependency: PyNaCl (libsodium) is the L0 backend
+# (CRYPTO.md / NOTES 46); everything else here is dev-only. The venv is
+# VSCode-compatible (.vscode/settings.json points at .venv/bin/python).
 #
 #   make install     install a project-local uv + create .venv + install tools
 #   make lint        ruff check
@@ -39,7 +39,7 @@ uv-bootstrap:
 # Create the venv (Python 3.12) and install the dev tools into it.
 install: uv-bootstrap
 	"$(UV)" venv "$(VENV)" --python 3.12 --clear
-	"$(UV)" pip install --python "$(PY)" ruff ty
+	"$(UV)" pip install --python "$(PY)" ruff ty pynacl
 	@echo ">> toolchain ready (project-local); 'make check' to run everything"
 
 lint:
