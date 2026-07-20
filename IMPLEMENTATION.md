@@ -26,6 +26,7 @@
 - **Suite `auth0` (launch):** authenticated-unencrypted. `ct = pt`; `tag = blake2b(key=blake2b(key=K, person=b"dude.mac", data=nonce).digest()[:32], data=len(aad)‖aad‖len(ct)‖ct, digest_size=32)`. **Zero-knowledge is suspended — loudly**: `dude status` and the README banner must say so. Every other property (provenance, durability, CAS, finality, detect-and-punish) is exercised for real.
 - **Suite `b2s1` (the "bastard sponge", later):** encrypt-then-MAC from keyed BLAKE2 — `ek = blake2b(key=K, person=b"dude.enc", data=nonce)`; keystream blocks `blake2b(key=ek, person=b"dude.ks", data=le64(i))`; XOR; MAC as in `auth0` with an independent subkey. Honest caveat: a home-rolled composition of a solid PRF — fine for a POC, but before any *real* confidentiality claim, prefer:
 - **Suite `xcp1` (alternative):** vendored single-file pure-Python ChaCha20-Poly1305 — same vendoring posture as Ed25519 if/when wanted.
+- **Production ruling (2026-07-21):** the staging above now terminates in the suites specified in [CRYPTO.md](CRYPTO.md) (NOTES 42) — `xcs1` (XChaCha20-Poly1305 with SIV-derived nonce, PyNaCl backend, vendored code retained as the differential oracle), `sbx1` sealed-box wraps, Ed25519 kept for v1 with BLS12-381 declined-with-door-open and FROST as the threshold-root path. `b2s1` is superseded before ever shipping.
 
 ## 2. Encoding decisions (L1)
 

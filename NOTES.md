@@ -1118,6 +1118,42 @@ and A4 as formally stated. Resolutions decided with the design owner; DESIGN
       scenarios: `converged()` receipt/QC coverage, and checkpoint-aware
       sim plumbing before partitions compose with compaction.
 
+42. **RULED 2026-07-21 — crypto transition spec (CRYPTO.md).** The
+    BLS-vs-PyNaCl / AEAD / AD questions Harry raised, settled:
+    - **Ed25519 stays, BLS12-381 declined for v1** (door open via the
+      genesis suite id). Decisive: rev-6 compaction GCs below-cut
+      receipts/QCs, so aggregation would compress only the dense tail;
+      n≤7 QCs are ~300 B; and the §16 threshold-root hardening is
+      reachable as FROST threshold Ed25519 (RFC 9591) — ordinary
+      signature on the wire — so declining pairings forecloses nothing.
+    - **Payload AEAD = `xcs1`: XChaCha20-Poly1305-IETF with SIV-derived
+      nonce** (`nonce = PRF(nk, AD ‖ H(plaintext))`). Premise correction:
+      PyNaCl ≥1.5 ships real AEAD-with-AD (`nacl.secret.Aead`) — nothing
+      is homebrewed from box/secretbox. MRAE-in-practice is LOAD-BEARING
+      here, not taste: our nonces are deterministic, and an equivocating
+      or crash-retrying author can emit two payloads under one envelope
+      header — naive `nonce = H(AD)` then reuses keystream. Folding the
+      plaintext into the nonce makes reuse structurally impossible;
+      residual is the standard MRAE determinism bound, unreachable
+      honestly. Deoxys-II declined with respect (right shape, proven at
+      Oasis, thin Python support); AES-SIV/AES-GCM-SIV via PyCA
+      recorded as standards-stamped fallbacks — any of them is one
+      keyepoch bump away by construction.
+    - **AD answered:** not strictly necessary (the author signature over
+      the envelope incl. ciphertext already binds) — RETAINED anyway as
+      `H(envelope-minus-payload)`: fail-closed decrypt-before-verify
+      ordering, the nonce-derivation input, transplant fails at the AEAD
+      layer. The derive-a-key-from-AD-with-zero-nonce pattern is
+      REJECTED (same equivocation footgun, no added benefit).
+    - **Wraps = `sbx1` sealed box**, recipient X25519 derived from the
+      member's Ed25519 identity — one keypair per member.
+    - **Backend = PyNaCl (PyCA-maintained); vendored pure-Python stays
+      as the differential-test oracle** (no-native CI lane, byte-for-byte
+      cross-checks). Migration is entirely existing machinery: suites are
+      per-keyepoch, so enabling `xcs1` is a rotate + wrap-set; `b2s1` is
+      superseded before ever shipping. Rust/Go parity verified for every
+      chosen primitive (CRYPTO.md §3).
+
 # Not yet built (by design, M2+)
 
 QCs are *constructed and verified* (M0) but no acceptor, quorum client, floor,

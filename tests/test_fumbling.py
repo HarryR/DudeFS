@@ -4,18 +4,42 @@
 # manifest disclosure. WP4 COMPOSES already-landed mechanisms (WP1.7's fence,
 # WP2.2's partitions) — nothing new is implemented here.
 
+import os
+import tempfile
 import unittest
 
 from dudefs import artifacts as A
 from dudefs import crypto as C
 from dudefs import quorum as Q
+from dudefs.acceptor import Acceptor, Rejected
 from dudefs.handlers import control as ctl
 from dudefs.sim.harness import Sim
-from dudefs.store import EvidenceKind
+from dudefs.store import ChainStore, EvidenceKind
 from dudefs.transports.memory import Link, NetworkLinks
 from tests._builders import World
 
 NOW = 100
+NSK = bytes([220] * 32)
+
+
+def _node(path, delta=10_000):
+    return Acceptor(NSK, C.SIGNER.public(NSK), ChainStore(path), config_epoch=0, delta_ms=delta)
+
+
+def _roster(msk, mpub, roster, seq, prev, epoch=0, hlc=100):
+    return A.Op.build(
+        author_sk=msk,
+        author_pub=mpub,
+        cls_=A.OpClass.CONTROL,
+        seq=seq,
+        prev=prev,
+        hlc=A.HLC(hlc, 0),
+        deps=[],
+        authz=b"root",
+        keyepoch=0,
+        payload=ctl.roster_body(epoch, roster, {}),
+        slot_tag=A.roster_slot_tag(epoch),
+    )
 
 
 def _create(w, ci, key, val):
@@ -142,6 +166,63 @@ class TestMistakenRecovery(unittest.TestCase):
         ckpt, rop = _recovery_pair(dsk, dpub, [sim.roster[0]])  # delegate-signed
         self.assertFalse(sim._raw[0].acc.on_recovery_fence(rop, ckpt, 1, ckpt.op_hash, w.mgr_pub))
         self.assertEqual(sim._raw[0].acc.epoch, 0)  # never activated
+
+
+class TestFumblingManager(unittest.TestCase):
+    """WP4.1/4.3/4.2 — the cheap composition scenarios. Global invariant: ≤1 roster
+    activation per epoch (B4); an abandoned flow never half-activates."""
+
+    def test_retry_storm_is_idempotent_one_activation(self):
+        # the SAME roster op resubmitted N times, with a crash-restart interleaved,
+        # is idempotent: one accepted slot op, one (identical) receipt, one activation.
+        w = World(seed=1, n_clients=0)
+        rop = _roster(w.mgr_sk, w.mgr_pub, [C.SIGNER.public(NSK)], seq=0, prev=A.GENESIS_PREV)
+        assert rop.slot_tag is not None
+        b = A.Ballot(1, b"m")
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "s.db")
+            acc = _node(path)
+            rs = [acc.on_roster_accept(rop.slot_tag, b, rop, {}, 1, NOW) for _ in range(3)]
+            acc.store.close()  # crash mid-storm
+            acc2 = _node(path)  # restart; the storm continues
+            rs.append(acc2.on_roster_accept(rop.slot_tag, b, rop, {}, 1, NOW))
+            self.assertTrue(all(isinstance(r, A.Receipt) for r in rs))
+            self.assertEqual(len({r.sig for r in rs if isinstance(r, A.Receipt)}), 1)  # one receipt
+            self.assertEqual(acc2.store.get_slot(rop.slot_tag).accepted_op, rop.op_hash)
+
+    def test_double_press_exactly_one_activates_across_crash(self):
+        # two DIFFERENT roster ops for one from_epoch (a crashed-and-retried manager
+        # with a new plan): the roster slot decides exactly one (B4); the loser can
+        # never activate out of e=0, and the decision survives a crash.
+        w = World(seed=2, n_clients=0)
+        pubX, pubY = C.SIGNER.public(bytes([1] * 32)), C.SIGNER.public(bytes([2] * 32))
+        a_op = _roster(w.mgr_sk, w.mgr_pub, [pubX], seq=0, prev=A.GENESIS_PREV)
+        b_op = _roster(w.mgr_sk, w.mgr_pub, [pubY], seq=1, prev=a_op.op_hash)  # a new plan
+        assert a_op.slot_tag is not None
+        tag, b = a_op.slot_tag, A.Ballot(1, b"m")
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "s.db")
+            acc = _node(path)
+            self.assertIsInstance(acc.on_roster_accept(tag, b, a_op, {}, 1, NOW), A.Receipt)
+            # B at the same (tag, ballot) on a node that accepted A -> guard
+            self.assertIsInstance(acc.on_roster_accept(tag, b, b_op, {}, 1, NOW), Rejected)
+            acc.store.close()  # crash
+            acc2 = _node(path)  # restart: the decision is durable
+            p = acc2.on_prepare(tag, A.Ballot(2, b"r"))  # recovery MUST re-propose A
+            assert isinstance(p, A.Promise)
+            self.assertEqual(p.accepted_op_hash, a_op.op_hash)  # B can never win
+
+    def test_abandoned_flow_never_half_activates(self):
+        # a roster op accepted at only a MINORITY before the manager crashes never
+        # activates any node — activation needs the joint certificate, not a receipt.
+        sim = Sim(seed=3, n=3)
+        w = World(seed=3, n_clients=0)
+        rop = _roster(w.mgr_sk, w.mgr_pub, [sim.roster[0]], seq=0, prev=A.GENESIS_PREV)
+        assert rop.slot_tag is not None
+        r = sim._raw[0].acc.on_roster_accept(rop.slot_tag, A.Ballot(1, b"m"), rop, {}, 1, NOW)
+        self.assertIsInstance(r, A.Receipt)  # a possession receipt under e+1...
+        # ...but NO node advanced its epoch — the abandoned flow half-activated nothing
+        self.assertEqual([sim._raw[i].acc.epoch for i in range(3)], [0, 0, 0])
 
 
 if __name__ == "__main__":
