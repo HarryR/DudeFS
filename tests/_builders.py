@@ -90,10 +90,16 @@ class World:
         self,
         cut: A.Heads | None = None,
         state_root: bytes = b"",
-        snapshot: bytes = b"",
+        dead: list[bytes] | None = None,
+        retained: dict[bytes, tuple[int, bytes]] | None = None,
+        attempts: bytes = b"",
         keyepoch: int = 0,
     ) -> A.Op:
-        op = self._mgr_op(ctl.checkpoint_body(cut or {}, state_root, snapshot, keyepoch))
+        op = self._mgr_op(
+            ctl.checkpoint_body(
+                cut or {}, state_root, dead or [], retained or {}, attempts, keyepoch
+            )
+        )
         self.control_ops.append(op)
         return op
 

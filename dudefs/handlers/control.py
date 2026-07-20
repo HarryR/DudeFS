@@ -110,14 +110,28 @@ def _v_wrap_set(b: dict[bytes, codec.Bencodable]) -> dict[bytes, Any]:
     }
 
 
+def _retained(v: codec.Bencodable) -> dict[bytes, tuple[int, bytes]]:
+    """Per-author retained-set commitment: {author: (count, digest)} (DESIGN §12
+    rev 6, NOTES 29c). Plaintext — op-hashes are public metadata."""
+    out: dict[bytes, tuple[int, bytes]] = {}
+    for author, entry in codec.as_dict(v).items():
+        pair = codec.as_seq(entry, 2)
+        out[author] = (_uint(pair[0]), codec.as_bytes(pair[1]))
+    return out
+
+
 def _v_checkpoint(b: dict[bytes, codec.Bencodable]) -> dict[bytes, Any]:
+    # rev 6 (DESIGN §12): log-compaction — no snapshot blob. `dead` is the
+    # incremental GC delta; `retained` commits to the FULL retained set ≤ cut;
+    # `attempts` is the encrypted nonzero-attempt sidecar.
     return {
         BK_KIND: ControlKind.CHECKPOINT,
         b"cut": _heads(codec.field(b, b"cut")),
         b"state_root": codec.as_bytes(codec.field(b, b"state_root")),
-        b"snapshot": codec.as_bytes(codec.field(b, b"snapshot")),
+        b"dead": [codec.as_bytes(h) for h in codec.as_seq(codec.field(b, b"dead"))],
+        b"retained": _retained(codec.field(b, b"retained")),
+        b"attempts": codec.as_bytes(codec.field(b, b"attempts")),
         b"keyepoch": _uint(codec.field(b, b"keyepoch")),
-        b"pver": _uint(codec.field(b, b"pver")),
     }
 
 
@@ -212,17 +226,27 @@ def wrap_set_body(keyepoch: int, wraps: dict[bytes, bytes]) -> bytes:
 
 
 def checkpoint_body(
-    cut: Heads, state_root: bytes, snapshot: bytes, keyepoch: int, pver: int = 0
+    cut: Heads,
+    state_root: bytes,
+    dead: list[bytes],
+    retained: dict[bytes, tuple[int, bytes]],
+    attempts: bytes,
+    keyepoch: int,
 ) -> bytes:
+    """A rev-6 checkpoint (DESIGN §12): the pinned `cut`, the `state_root` audit
+    anchor, the incremental `dead` delta, the per-author `retained` commitment,
+    and the encrypted `attempts` sidecar. No snapshot blob."""
     cut_enc = {a: [s, h] for a, (s, h) in cut.items()}
+    retained_enc = {a: [c, d] for a, (c, d) in retained.items()}
     return codec.encode(
         {
             BK_KIND: ControlKind.CHECKPOINT,
             b"cut": cut_enc,
             b"state_root": state_root,
-            b"snapshot": snapshot,
+            b"dead": list(dead),
+            b"retained": retained_enc,
+            b"attempts": attempts,
             b"keyepoch": int(keyepoch),
-            b"pver": int(pver),
         }
     )
 

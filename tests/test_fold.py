@@ -251,7 +251,7 @@ class TestA4Barrier(unittest.TestCase):
         # chain at the cut, including the manager's own (its cert ops are below).
         cut_frontier = {c.pub: (c.seq - 1, c.prev) for c in w.clients if c.seq > 0}
         cut_frontier[w.mgr_pub] = (w._mseq - 1, w._mprev)
-        ckpt = w.checkpoint(cut=cut_frontier, snapshot=b"opaque", keyepoch=0)
+        ckpt = w.checkpoint(cut=cut_frontier, keyepoch=0)
 
         # tail (hlc after the checkpoint via sequential ticks): all lineages fresh
         tail = []

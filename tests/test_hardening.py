@@ -120,7 +120,7 @@ class TestA4WindowRegression(unittest.TestCase):
             [[A.Guard.VERSION_EQ, KEY, tomb_v]],
             [[A.Mutation.SET, KEY, b"reborn"]],
         )
-        ckpt = w.checkpoint(cut=cut, snapshot=b"opaque", keyepoch=0)
+        ckpt = w.checkpoint(cut=cut, keyepoch=0)
 
         full = fold.fold(below + [x, ckpt], w.keyring, w.genesis)
         boot = fold.fold(control + [x], w.keyring, w.genesis, barrier=snap, cut_frontier=cut)
@@ -225,7 +225,7 @@ class TestLane2Fence(unittest.TestCase):
         pv = w._mgr_op(ctl.pver_body(fold.SUPPORTED_PVER + 1))
         ops.append(pv)
         cut = {w.mgr_pub: (w._mseq - 1, w._mprev)}
-        ckpt = w.checkpoint(cut=cut, snapshot=b"", keyepoch=0)
+        ckpt = w.checkpoint(cut=cut, keyepoch=0)
         ops.append(ckpt)
         with self.assertRaises(fold.FoldHalted) as cm:
             fold.fold(ops, w.keyring, w.genesis)
