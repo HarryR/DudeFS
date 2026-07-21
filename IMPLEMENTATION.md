@@ -94,7 +94,7 @@ Durable node state: identity key · epoch + control view · **one floor** · per
 
 ## 8. Non-goals for the POC
 
-BLS12-381 (lane-3 later) · real confidentiality (`auth0` suspends it, loudly) · SSH/XMPP transports (interface proven by `memory` + `tcp`) · `WATCH` (stub returning `unimplemented`) · HSM · performance (pure-Python Ed25519 at ~ms/sig is *fine* at 1–3 clients, n≤7) · packaging polish.
+BLS12-381 (lane-3 later) · SSH/XMPP transports (interface proven by `memory` + `tcp`) · `WATCH` (does not exist — **no stubs anywhere**, NOTES 51; watch *semantics* stays a §17 design question) · HSM · packaging polish. (Historical entries removed as executed: `auth0` died with the crypto swap; pure-Python Ed25519 died with PyNaCl.)
 
 ## 9. Runbook target (the definition of done)
 

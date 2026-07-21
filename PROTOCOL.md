@@ -54,11 +54,13 @@ Because frontier bundles are signed atomically, the quorum read is **path-indepe
 4. Poll `WATERMARK` (it piggybacks on any traffic) until a quorum's floors pass `op.hlc` → **final**. Fold verdict: `applied` → success. `rejected`/`stale` → a guard failed or the lineage moved — re-read, reconsider, maybe retry. Done either way; report which.
 5. **Contention** (`NACK{promised}` or timeout): pick a round above the reported promise and re-run from step 2, after the deterministic per-`(priority, round)` jitter; a per-round timeout escalates the round even when Nacks are lost (DESIGN §8). Real drivers may mix true entropy into these timers — they are policy, not protocol (§4).
 
-### 1.4 Offline / single-push writes
+### 1.4 ~~Offline / single-push writes~~ — STRUCK (NOTES 52)
 
-`SUBMIT` to one node and disconnect (blind writes; a slotted op relays its client-signed `PREPARE`/`ACCEPT` artifacts the same way — §7.3); peers receipt via gossip; any node assembles the QC; poll `GET_QC` later. Convenience, not guarantee: a rogue node can withhold, and the skew window is ticking (DESIGN §9). Push to a quorum when it matters.
+The fire-to-one-node-and-disconnect mode is removed: it was the sole reason δ had to cover gossip-propagation time instead of clock skew, and no supported client profile needs it — the **resident client daemon drives the quorum itself** (hedged fanout, ~2 RTT to durable; CLIENT.md §0), which is what makes the worker API's durability gate fast enough to sit on the critical path. What remains of this section's machinery: **relay (§7.3) stays** — a daemon reaching only one node still commits *synchronously through it* via relayed signed artifacts (online-through-a-narrow-path, not disconnect-and-hope). With the strike, δ = a pure clock-skew bound (~1 s class, DESIGN §17), and the §3.4 time-traveller playground shrinks with it.
 
 ## 2. Node ↔ node (gossip / anti-entropy)
+
+**Purpose, post-§1.4-strike (NOTES 52/53): gossip is the repair-and-dissemination plane — and the connectivity substrate under partial meshes — never an unattended commit path.** Commitment *correctness* never depends on it (artifacts are signed and path-independent; the client daemon drives until it holds a quorum of signed replies, whether the bytes travel direct, via relays §7.3, or with the epidemic mesh as carrier of last resort). Commit *reachability* under a sparse-but-connected topology may ride it — in which case δ is sized to the quorum-path delivery latency (NOTES 53), not to clock skew alone. What gossip owns: (1) **durability amplification and healing** — a commit lands on q nodes; gossip carries it toward all n and re-fills nodes that were down/partitioned/hedge-skipped, which is what makes "any n−f survivors cover everything" true in practice (RESILIENCE §2); gossiped ops are stored, never receipted (floors gate *issuing*, §2.1); (2) **artifact dissemination** — QCs, checkpoints, certs/rosters, recovery fences, and evidence reach every node epidemically (the daemon's adoption/fence/evidence cycles all feed off it); (3) **baseline sync & bootstrap** — the sparse below-cut PULL path and learner catch-up; (4) **client cache freshness** — client daemons pull the same way, which is what keeps `GET local` and `INSPECT`'s foreign-`pending` view current between quorum reads.
 
 ### 2.1 Invariants
 
@@ -129,20 +131,9 @@ Deferred deliberately (DESIGN §17). Whatever binds must preserve: **injective e
 
 The client node is a daemon on the worker's machine (or the same stack embedded as a library on a thread/fibre — identical interface, no socket). It holds the manager-authorized keypair, folds the log, runs quorum logistics, and exposes a deliberately tiny **local API** — Unix domain socket by default, with filesystem permissions as the entire worker-authorization boundary.
 
-### 6.1 Worker verbs
+### 6.1 Worker verbs — canonical surface lives in CLIENT.md (NOTES 50–52)
 
-| Verb | Semantics |
-|---|---|
-| `GET path [level=local\|linear]` | Read at the chosen consistency level (default `linear`). |
-| `LIST path/ [level=…]` | Enumerate children. |
-| `PUT path value [ack=committed\|final]` | Blind LWW write. Returns at the chosen rung of the ladder. |
-| `CAS path expect value [ack=…]` | Guarded write; the client node runs the read–tag–submit–recover dance of §1.3 invisibly. |
-| `DEL path` | Tombstone. |
-| `TXN {guards, mutations} [ack=…]` | Multi-key guarded transaction (vocabulary per DESIGN §17). |
-| `WATCH path/` | Stream fold changes (lane-1 feature; semantics open, DESIGN §17). |
-| `STATUS` | Roster, reachability, finality frontier, lag spread — the client node's view of the world. |
-
-Design rules: workers perform **no cryptography**, hold **no keys**, and know nothing of quorums, ballots, or floors — the three-level ladder (`accepted / committed / final`) surfaces only as the `ack=`/`level=` knobs, which is the entire consistency story a worker ever sees. The wire encoding of this API can be trivially simple (it crosses no trust boundary — the socket's filesystem permissions are the boundary); encoding open in DESIGN §17.
+This sketch is superseded: the resolved surface is **JSON-RPC 2.0** (concurrent `id`-correlated requests, no server push, poll-only, **no stubs**) with verbs `TXN` (the primitive: one contended slot + multi-key guards + atomic mutations) · `PUT`/`CAS` (sugar) · `GET` · `INSPECT` (key-centric recovery: final/provisional/pending-with-decoded-intent) · `LIST` (prefix + delimiter + pending flags) · `STATUS` (per-op debugging). The consistency story is the three-event ladder — `durable` / `provisional`(+may_flip) / `final` — exposed as data on every poll, never as blocking `ack=` knobs. Full contract, ladder rules, and the canonical take→durable-intent→leased-idempotent-work pattern: [CLIENT.md](CLIENT.md). Design rules unchanged: workers perform no cryptography, hold no keys, and know nothing of quorums, ballots, or floors.
 
 ### 6.2 Provenance granularity
 

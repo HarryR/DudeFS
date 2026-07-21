@@ -144,7 +144,7 @@ Caged by two gates and a frontier: the **future gate** (`hlc > now + δ` refused
 - **Back-stamping** reorders only the not-yet-final zone — which is exactly why CAS success is *verdict at finality*, never at QC (DESIGN §9).
 - **Node-assisted travel** is floor perjury (§3.1) — provable, ejectable.
 
-Residual, stated plainly: δ is the traveller's entire playground. Choosing δ trades the playground's size against how long an offline single-push write stays viable — one knob, both directions.
+Residual, stated plainly: δ is the traveller's entire playground — and with offline single-push writes STRUCK (NOTES 52), δ's only job is bounding genuine clock skew, so the playground shrinks to the ~1 s class. The old trade ("playground size vs offline-write viability") is dead; what remains is playground vs honest-skew tolerance, and NTP discipline makes that an easy buy.
 
 ### 3.5 Evil manager
 

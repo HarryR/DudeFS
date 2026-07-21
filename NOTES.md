@@ -1499,6 +1499,235 @@ and A4 as formally stated. Resolutions decided with the design owner; DESIGN
       vestigial generality against the one-scheme rule — collapse to
       the constant.
 
+49. **RULED 2026-07-21 — opaque node-side witness-tag guards: REJECTED;
+    fold-only guards are deliberate and now stated as a ruling (DESIGN
+    §7). The sharpest posit of the project, and the answer is still
+    no.** The observed write/read asymmetry dissolves under the correct
+    framing: **nodes decide WHO OWNS an opaque identity; the fold
+    decides WHAT that ownership MEANT** — even write-side currency is
+    fold-judged (decided-but-stale tags fold `stale`), so no node
+    judges currency anywhere today and the proposal would introduce the
+    first such judgment, not restore symmetry. Three soundness kills,
+    each independently fatal, all ahead of confidentiality:
+    - **(1) Currency is not derivable from slot state.** A node knows
+      decided-or-not; "un-superseded" requires linking a key's
+      successive writes, whose tags are cryptographically UNLINKABLE by
+      design (different (version, attempt) ⇒ independent PRF). Making
+      supersession node-visible means every write exposes its
+      predecessor's tag — the full per-key lineage graph (write
+      frequency, hot keys) leaks to the top-ranked node-side octopus.
+      The posit's "only guarded ops leak an edge" understates the cost
+      by an order of structure.
+    - **(2) Accept-time effect-verdicts race the δ window.** Guards are
+      cross-slot predicates; the only cross-slot linearization point is
+      the fold's total order at finality. Freeze applied-vs-rejected at
+      QC and a legal back-stamped op can still commit below the guarded
+      op's fold position — verdict diverges from fold truth. "Durable ≠
+      applied" is the load-bearing price of offline writes + the skew
+      window (§9/§11 layering; RESILIENCE §3.4 containment).
+    - **(3) A witness refusal is an unprovable, timing-dependent claim.**
+      Honest quorum members legitimately disagree on partial views ⇒
+      non-deterministic acceptance, an accusation surface the issuance
+      chains just closed, and deniable Byzantine censorship
+      ("witness-stale" ≡ lag).
+    - **Scope rulings attached:** the ZK invariant (§18) covers content
+      AND undeclared structure — §7's leakage boundary is a CLOSED list
+      and the lineage linkage graph is inside the invariant (relaxation
+      = lane-3-grade change, never a patch). Two-tier guard vocabulary
+      REJECTED (forks verdict timing across guard kinds — §11
+      don't-conflate; and the "clean" tier, VERSION_EQ, is exactly the
+      currency judgment kill 1 forbids). What the posit wanted is
+      already priced: committed-but-rejected GC cost is bounded ∝
+      churn·W by the conveyor (finding-13 machinery handles their
+      mutations); effect-latency is the **δ knob** (§3.4: one knob,
+      both directions) — the worker API reports `durable` at QC and
+      `applied` at finality as the two real events they are.
+
+50. **RULED 2026-07-21 — worker-API cadence: optimistic pipelining is
+    SOUND (a theorem of the fold, not a hope); δ collapses to a pure
+    skew bound once offline single-push writes are struck (PROPOSED,
+    Harry to confirm — it removes documented PROTOCOL §1.4 surface).**
+    Context: Harry is designing the worker API with stacked dependent
+    ops (not one Txn) and needs fast failure; the finality window
+    looked like a cadence ceiling. Findings:
+    - **Offline single-push writes are canonical text (PROTOCOL §1.4,
+      RESILIENCE §3.4), not invented this session — but they are
+      designer-lineage, and striking them is clean**: nothing else
+      depends on the mode, and δ's only remaining job becomes bounding
+      real clock skew (NTP class: ~1 s with margin, vs
+      offline-viability-inflated values). QC→final collapses to ≈ δ +
+      poll cadence. Strike also shrinks the §3.4 time-traveller
+      playground and deletes §1.4's rogue-node caveat — pure win for
+      the TEE-worker deployment profile.
+    - **The three-event worker API (rides into WP2):** `durable` (QC —
+      can never be lost) → `provisional` (fold of the currently-held
+      committed set — available immediately; the dominant failure,
+      lineage-moved contention, is known NOW and retried without
+      waiting) → `final` (floors ≥ op.hlc — verdict frozen). This is
+      the API telling the truth about three genuinely distinct events.
+    - **The soundness theorem — every provisional flip cascades to
+      `stale`, never to wrongly-applied.** Downstream ops restate exact
+      slot preimages `(k, version, attempt)`; if an ancestor's verdict
+      flips (a δ-window straggler), the restated lineage point no
+      longer obtains and the entire downstream chain folds `stale`,
+      deterministically, all-or-nothing, identically for every client.
+      Retry-on-provisional-rejected cannot double-apply (two attempts
+      restate different lineage points; at most one matches — B1).
+      Optimism costs wasted work on a flip, never corruption. Honest
+      caveat kept honest: provisional verdicts CAN flip both directions
+      within δ (insertions below a position can re-attribute the walk
+      above), which is exactly why `final` remains the only frozen
+      verdict — NOTES 49 stands unchanged; nothing moves truth to QC.
+    - **On Harry's confirm, the doc strikes:** PROTOCOL §1.4 removed
+      (single-push relay machinery for slotted artifacts stays — it
+      serves relay §7.3, not offline-ness); RESILIENCE §3.4 reworded (δ
+      = skew bound, playground shrinks); DESIGN §17's δ open question
+      annotated (value = small multiple of measured NTP dispersion);
+      DESIGN §18 dial ledger row for δ updated (offline-viability
+      column dies).
+
+51. **RULED 2026-07-21 — the worker API surface resolved (Harry's
+    review of the NOTES-50 proposal): polling-only, no stubs anywhere,
+    ticket = op_hash. Two standing rules minted.**
+    - **NO STUBS, anywhere, ever (standing rule, Harry):** a verb/
+      feature is implemented-and-reviewed or it does not exist in code.
+      `WATCH` is deleted from the surface entirely (not stubbed); watch
+      *semantics* remains a DESIGN §17 design question — docs may hold
+      open questions, code may not hold placeholders. IMPLEMENTATION
+      §8's "stub returning unimplemented" language struck.
+    - **POLLING-ONLY surface (AWAIT withdrawn):** blocking verbs break
+      the multiplexed multi-client model (a held connection) and would
+      be the system's ONLY synchronous primitive — polling is the
+      native idiom everywhere else (Finalize, maintenance loop, sans-io
+      drivers), and the poll target is a LOCAL unix socket against
+      state the daemon already holds: zero network cost, nothing to
+      optimize away.
+    - **Ticket = op_hash (NOTES 47 applied to the API):** no ticket
+      registry, no session state — `STATUS(op_hash)` DERIVES the ladder
+      from the daemon's store per poll; connections stateless; any
+      client polls any op; restart loses nothing.
+    - **Final surface (WP2 codes against this):** `PUT`/`CAS` → op_hash
+      immediately · `GET` (level: local|final) → value + (version,
+      attempt) + as_of + tier · `LIST` (prefix, [delimiter], level) →
+      matching keys each with (version, attempt) + as_of + tier ·
+      `STATUS(op_hash)` → phase {in-flight, committed, lost, unknown} +
+      provisional verdict {applied, rejected, stale} + may_flip + final
+      verdict. Contract rules per NOTES 50 (lost = definitive
+      fast-fail; provisional may flip within δ; pipelining on
+      provisional is the fail-safe theorem; unknown is honest
+      tri-state, re-query by op_hash).
+    - **SURFACE v2 (Harry's second review — two corrections accepted):**
+      (a) **`TXN` is the primary verb** — the wire op IS a guarded
+      multi-key transaction (one contended slot lineage + unlimited
+      per-key guards {absent, present, version_eq, value_eq} +
+      unlimited atomic mutations); presenting single-key CAS as primary
+      HID the protocol's capability. `PUT`/`CAS` become sugar over TXN.
+      Transaction graphs: nodes = TXNs, in-edges = version guards on
+      upstream keys, and the pipelining theorem covers the whole graph
+      (ancestor flip ⇒ transitive `stale`, never partial). **The
+      one-contended-lineage-per-op constraint is now stated to Harry
+      for workload evaluation**: multi-lock grabs are slot-on-A +
+      guard-absent-B (asymmetric, livelock-managed by retry jitter or
+      lock-ordering discipline); TRUE multi-slot atomic decree does not
+      exist and would be a major design addition — Harry to confirm
+      guard-edges suffice before WP2 freezes.
+      (b) **`INSPECT(path)` — key-centric state, the recovery verb**:
+      op-hash bookkeeping is bad UX; workers recover STATELESSLY per
+      key. Returns final + provisional (+may_flip) + `pending` = every
+      known not-yet-final op touching the key WITH DECODED INTENT (the
+      daemon holds the keyring — "would: set→w1"), complete for
+      ops submitted through this daemon (the recovery case),
+      best-effort for foreign in-flight until gossip. Identity lives in
+      values (claim=worker-id); exact resubmission is a content-
+      addressed dup. `LIST` gains a per-key `pending` flag for one-call
+      prefix recovery sweeps. `STATUS(op_hash)` demotes to the
+      debugging verb.
+    - **Data model stated (Harry's "looks like a KV store" question):**
+      it IS a flat map — path → opaque value bytes; hierarchy is a
+      PREFIX CONVENTION (no directory objects, no mkdir, no dir
+      metadata; the etcd-v2→v3 lesson adopted deliberately). Multi-path
+      atomicity = multi-key Txn, already exists. **`LIST` is
+      structurally an API-layer verb, never a protocol verb**: ZK means
+      storage nodes cannot enumerate keys even in principle (paths live
+      in ciphertext), so enumeration exists only at the fold — a purely
+      LOCAL prefix scan, zero network, consistent with polling-local.
+      `delimiter` gives S3-style immediate-children. NO prefix-guards
+      (per-key vocabulary only; a real demand becomes a designed §17
+      addition, not an API afterthought — LIST-then-guard-specific-keys
+      is the honest interim).
+    - **Layer clarification (dissolves the §1.4 objection):** the async
+      submit-token-background-push model lives at the WORKER ↔ CLIENT-
+      DAEMON boundary and is kept — it IS the architecture. PROTOCOL
+      §1.4 is the layer below (client daemon ↔ storage cluster): the
+      daemon handing an op to ONE storage node and disconnecting,
+      which is what forces δ ≥ gossip-propagation. The strike makes
+      the resident daemon drive the quorum itself (hedged fanout,
+      ~2 RTT) — worker experience unchanged, δ collapses to skew-only.
+      Strike itself: awaiting Harry's explicit confirm.
+
+52. **RULED 2026-07-21 — §1.4 STRIKE CONFIRMED (via the worked
+    financial-worker use case); CLIENT.md created as the canonical
+    client contract; JSON-RPC 2.0 adopted; gossip reframed as the
+    repair-and-dissemination plane.**
+    - **Alignment established through Harry's actual workload** (take →
+      durable intent → leased idempotent work, funds-grade): the
+      durable-intent gate sits on the critical path before every unit
+      of paid work, which REQUIRES the daemon-drives-quorum model
+      (~2 RTT to `committed`) — §1.4's disconnect-after-one-node would
+      have made that gate gossip-slow. The worker↔daemon async model
+      (submit → token → background push) is untouched; relay §7.3
+      stays. δ = pure skew bound (~1 s class); DESIGN §17/§18 +
+      RESILIENCE §3.4 updated.
+    - **The lease question resolved with zero new machinery:** Harry's
+      own phrasing ("if it lapses another worker will resume") is
+      reader-enforced lapse — renewal PUTs from the worker's own
+      process (liveness-coupled; never the daemon), steal-at-observed-
+      version by policy. Safety NEVER touches the lease (durable intent
+      + idempotence + fencing tokens do safety; the lease is duplicate-
+      effort prevention). No store-side TTL, deliberately.
+    - **CLIENT.md** records: JSON-RPC 2.0 wire (concurrent id-
+      correlated, batch, no server push, poll-only, no stubs), the
+      three-event ladder + contract rules, the TXN-primary verb table
+      (+INSPECT recovery, LIST pending flags, STATUS demoted to
+      debugging), the flat-map/prefix data model, the canonical
+      take-intent-lease pattern with stateless resume, and the
+      deliberately-absent list. PROTOCOL §6.1 now points there.
+    - **Gossip's purpose, post-strike (PROTOCOL §2 preamble):** never a
+      commit path — commit latency and correctness are client-driven.
+      Gossip owns (1) durability amplification q→n + healing (what
+      makes "any n−f survivors cover everything" true — gossiped ops
+      are STORED, never receipted), (2) artifact dissemination (QCs,
+      checkpoints, certs, fences, evidence — the daemon's adoption/
+      fence/evidence cycles feed off it), (3) baseline sync + learner
+      bootstrap, (4) client cache freshness (`GET local`, INSPECT's
+      foreign-pending view).
+
+53. **CORRECTED 2026-07-21 (Harry's partial-connectivity pushback) —
+    gossip's fifth role restored; δ's floor stated honestly.** The
+    design never assumes direct client→quorum reachability — only a
+    CONNECTED mesh (PROTOCOL §7.4), with correctness path-independent
+    because every coordination artifact is signed and self-
+    authenticating (relayed reads §7.3, client-signed PREPARE/ACCEPT
+    forms, multi-transport endpoint records). **What the §1.4 strike
+    changed is the responsibility-and-stopping rule, not topology**:
+    the daemon stays online and DRIVES until it holds a quorum of
+    signed replies — via direct RTTs, through relays, or with the
+    epidemic mesh as carrier of last resort — versus §1.4's
+    disconnect-and-nobody-is-responsible. Gossip's roles are therefore
+    five: repair/amplification, artifact dissemination, baseline sync,
+    client cache freshness, AND **the connectivity substrate for
+    coordination artifacts under partial meshes** (commit correctness
+    never needs it; commit reachability under sparse topology does).
+    **δ refinement:** δ ≥ clock skew + worst-case quorum-path delivery
+    latency FOR THE DEPLOYMENT'S TOPOLOGY — the ~1 s figure is the
+    well-connected case, not a constant; a continuously-partial mesh
+    sizes δ (and hence finality latency and the flip window) to its
+    relay/epidemic path latency. CLIENT.md ladder SEMANTICS are
+    topology-independent; rung TIMINGS are a deployment property. The
+    strike's win restated precisely: δ is sized to a measurable
+    delivery latency you control, not to how long an abandoned op
+    might take to get lucky (unbounded).
+
 # Not yet built (by design, M2+)
 
 QCs are *constructed and verified* (M0) but no acceptor, quorum client, floor,
