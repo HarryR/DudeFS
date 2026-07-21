@@ -19,7 +19,6 @@ import sys
 import time
 
 from . import artifacts as A
-from . import crypto as C
 from . import wire
 from .artifacts import HLC, quorum_size
 from .manager import Manager, ManagerError, ManagerState, RecoverDecision, recover_decision
@@ -110,7 +109,6 @@ def cmd_init(args: argparse.Namespace) -> int:
     print(f"initialized dudefs at {args.dir}")
     print(f"  manager (root): {m.state.manager_pub.hex()}")
     print(f"  node0:          {m.state.roster[0].hex()}")
-    print(f"  zero-knowledge: {'ON' if C.zero_knowledge_active() else 'OFF'}")
     return OK
 
 
@@ -181,7 +179,6 @@ def cmd_node(args: argparse.Namespace) -> int:
 def cmd_status(args: argparse.Namespace) -> int:
     st = ManagerState.load(args.dir)
     print(f"epoch {st.epoch}  keyepoch {st.keyepoch}  roster {len(st.roster)} voting")
-    print(f"zero-knowledge: {'ON' if C.zero_knowledge_active() else 'OFF'}")
     frontier = A.HLC(0, 0)
     reachable = 0
     for i, pub in enumerate(st.roster):
@@ -355,7 +352,7 @@ def build_parser() -> argparse.ArgumentParser:
     npro = node_leaf("promote", "promote a learner to voting")
     npro.add_argument("pubkey")
 
-    mgr("status", cmd_status, "roster/floors/finality + zero-knowledge banner")
+    mgr("status", cmd_status, "roster/floors/finality health")
 
     rec = mgr("recover", cmd_recover, "disaster recovery (heavily interlocked)")
     rec.add_argument("--dwell", type=float, default=2.0, help="reachability dwell window (s)")

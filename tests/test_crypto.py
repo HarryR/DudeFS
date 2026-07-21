@@ -97,9 +97,6 @@ class TestAeadXcs1(unittest.TestCase):
         n2 = C.AeadXcs1.seal(k, aad, b"P2")[:24]
         self.assertNotEqual(n1, n2)
 
-    def test_zero_knowledge_active(self):
-        self.assertTrue(C.zero_knowledge_active())
-
 
 class TestEpochKeyDerivation(unittest.TestCase):
     # K_epoch is THE epoch master (finding 21): the working keys DERIVE via person

@@ -42,7 +42,7 @@ class TestManagerCommands(unittest.TestCase):
             dd = os.path.join(d, "st")
             code, out, _ = _run(["init", "--dir", dd])
             self.assertEqual(code, 0)
-            self.assertIn("zero-knowledge: ON", out)  # xcs1 is live
+            self.assertIn("initialized dudefs", out)
             self.assertTrue(ManagerState.exists(dd))
             # second init is refused (genesis-only interlock)
             code2, _, err2 = _run(["init", "--dir", dd])

@@ -260,7 +260,6 @@ class AeadXcs1:
     recomputes it from the envelope)."""
 
     suite_id = b"xcs1"
-    confidential = True
 
     @staticmethod
     def _nonce(k: bytes, aad: bytes, pt: bytes) -> bytes:
@@ -294,13 +293,6 @@ class AeadXcs1:
 # Recorded fallbacks if a standards-stamped MRAE is ever demanded (CRYPTO.md §2):
 # `dxy2` (Deoxys-II), `AES-SIV`/`AES-GCM-SIV` — each one keyepoch bump away.
 AEAD = AeadXcs1
-
-
-def zero_knowledge_active() -> bool:
-    """True under `xcs1` — payloads are genuinely encrypted (CRYPTO.md §2). The
-    README banner / `dude status` surface this; it was False under the retired
-    authenticated-unencrypted `auth0` launch suite."""
-    return bool(AEAD.confidential)
 
 
 # --------------------------------------------------------------------------- #
