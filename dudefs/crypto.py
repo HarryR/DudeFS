@@ -88,6 +88,23 @@ def prf_tag(slot_secret: bytes, preimage: bytes) -> bytes:
     ).digest()
 
 
+PERSON_SCREEN = b"dude.screen"  # L_msg to_hint — the screening tag domain (TRANSPORT §3)
+SCREEN_TAG_SIZE = 16
+
+
+def screen_tag(node_identity: bytes, sealed: bytes) -> bytes:
+    """The L_msg screening tag `to_hint` (TRANSPORT §3): keyed-BLAKE2 over the
+    sealed bytes, keyed by the TARGET node's IDENTITY pubkey (never the epoch — an
+    epoch-scoped key deadlocks a from-scratch sync), domain-separated `dude.screen`.
+    The sender keys on the target's identity (from its endpoint record); the receiver
+    keys on its OWN identity to test a match — one symmetric hash, no ECDH. A
+    never-member knows no node identity, so it cannot forge a tag and is free-dropped
+    (the cheapest rung of the cost ladder, §4)."""
+    return hashlib.blake2b(
+        sealed, key=node_identity, person=PERSON_SCREEN, digest_size=SCREEN_TAG_SIZE
+    ).digest()
+
+
 # --------------------------------------------------------------------------- #
 # Signer — authors (Ed25519)                                                   #
 # --------------------------------------------------------------------------- #
