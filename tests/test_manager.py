@@ -317,14 +317,30 @@ class TestManagerOps(unittest.TestCase):
             self.assertEqual(rbody[b"recovery"], ckpt.op_hash)  # the pairing
             self.assertEqual(m.state.epoch, 1)
 
+    def test_node_addr_summary_decomposes_and_survives_json_round_trip(self):
+        # node_addrs is the manager's dial SUMMARY (avoids re-folding the log): it stores
+        # the decomposed Endpoint, parsed once from the operator URL, and persists it.
+        with tempfile.TemporaryDirectory() as d:
+            m = Manager.init(d)
+            npub = C.SIGNER.public(bytes([5] * 32))
+            m.node_add(npub, addr="sealed+http://host:8080/dude")
+            ep = m.state.node_addrs[npub.hex()]
+            self.assertEqual(
+                (ep.transport, ep.uri, ep.sealed), (b"http", "http://host:8080/dude", True)
+            )
+            self.assertEqual(ManagerState.load(d).node_addrs[npub.hex()], ep)  # durable summary
+
     def test_probe_roster_with_injected_prober(self):
         # probe I/O is injected -> the dwell/report logic is tested without sockets
+        from dudefs import transports
+
         with tempfile.TemporaryDirectory() as d:
-            m = Manager.init(d)  # roster = [node0], endpoint ""
-            # a synthetic prober answers node0 with a floor — no sockets involved
-            addr0 = m.state.node_addrs[m.state.roster[0].hex()]
-            answers = {addr0: A.HLC(9, 0)}
-            rep = m.probe_roster(lambda _pub, a: answers.get(a), dwell=0.0, sleep=lambda _s: None)
+            m = Manager.init(d)  # roster = [node0], no endpoint
+            # a synthetic prober answers node0's Endpoint with a floor — no sockets
+            ep0 = transports.Endpoint(transports.UNIX, "/n0.sock")
+            m.state.node_addrs[m.state.roster[0].hex()] = ep0
+            answers = {ep0: A.HLC(9, 0)}
+            rep = m.probe_roster(lambda _pub, e: answers.get(e), dwell=0.0, sleep=lambda _s: None)
             self.assertEqual(rep.reachable, [0])
             self.assertEqual(rep.presumed_dead, [])
             self.assertEqual(rep.salvage, A.HLC(9, 0))

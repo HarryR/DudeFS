@@ -13,6 +13,7 @@ import unittest
 
 from dudefs import artifacts as A
 from dudefs import crypto as C
+from dudefs import transports
 from dudefs.acceptor import Acceptor
 from dudefs.artifacts import VERSION_ABSENT
 from dudefs.client import ClientDaemon
@@ -247,7 +248,10 @@ class TestDemoRunbook(unittest.TestCase):
             with tempfile.TemporaryDirectory() as md:
                 m = Manager.init(md)
                 m.state.roster = demo.roster
-                m.state.node_addrs = {demo.roster[i].hex(): demo.paths[i] for i in range(3)}
+                m.state.node_addrs = {
+                    demo.roster[i].hex(): transports.Endpoint(transports.UNIX, demo.paths[i])
+                    for i in range(3)
+                }
                 m.state.save()
                 demo.kill_node(1)
                 demo.kill_node(2)  # only node0 survives -> below quorum

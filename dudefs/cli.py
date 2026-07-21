@@ -62,16 +62,19 @@ def _worker_call(sock_path: str, method: str, params: dict) -> dict:
 
 
 def _mgr_send(
-    st: ManagerState, to_pub: bytes, addr: str, req: Request, timeout: float = 5.0
+    st: ManagerState,
+    to_pub: bytes,
+    ep: transports.Endpoint | None,
+    req: Request,
+    timeout: float = 5.0,
 ) -> Response | None:
     """One enveloped node RPC as the ROOT manager (PROTOCOL §7.5): sign `req` from the
-    manager identity to `to_pub`, round-trip over the L_txport seam, return the node's
-    VERIFIED reply or None. The gate admits root, so the manager's drive passes."""
-    if not addr:
+    manager identity to `to_pub` and Link it over the node's Endpoint (any carrier the
+    ENDPOINT record named — the manager connects like everything else). The gate admits
+    root, so the drive passes. None if the node has no known endpoint."""
+    if ep is None:
         return None
-    ep = transports.Endpoint(transports.UNIX, addr)  # B upgrades node_addrs to carry the Endpoint
-    link = Link(st.root_key, st.manager_pub, to_pub, ep)
-    match link.request(
+    match Link(st.root_key, st.manager_pub, to_pub, ep).request(
         b"", wire.encode_request(req), epoch=st.epoch, ts=int(time.time() * 1000), timeout=timeout
     ):
         case lmsg.Reply(env):
@@ -81,19 +84,19 @@ def _mgr_send(
 
 
 def _probe(
-    st: ManagerState, pub: bytes, addr: str, timeout: float = 1.0
+    st: ManagerState, pub: bytes, ep: transports.Endpoint | None, timeout: float = 1.0
 ) -> A.FrontierBundle | None:
-    """A signed frontier read from node `pub`, or None if unreachable."""
-    resp = _mgr_send(st, pub, addr, FrontierReq(), timeout)
+    """A signed frontier read from node `pub` over its Endpoint, or None if unreachable."""
+    resp = _mgr_send(st, pub, ep, FrontierReq(), timeout)
     return resp if isinstance(resp, A.FrontierBundle) else None
 
 
 def _floor_probe(st: ManagerState):
-    """A `probe(pub, addr) -> floor | None` bound to the manager identity, for
+    """A `probe(pub, endpoint) -> floor | None` bound to the manager identity, for
     probe_roster's dwell loop (the manager signs each FRONTIER read)."""
 
-    def probe(pub: bytes, addr: str) -> HLC | None:
-        fb = _probe(st, pub, addr)
+    def probe(pub: bytes, ep: transports.Endpoint | None) -> HLC | None:
+        fb = _probe(st, pub, ep)
         return fb.floor if fb is not None else None
 
     return probe
@@ -104,7 +107,7 @@ def _node_rpc(st: ManagerState):
     roster-change drive (findings 23/24) talks to nodes by pubkey, enveloped as root."""
 
     def rpc(node_pub: bytes, req: Request) -> Response | None:
-        return _mgr_send(st, node_pub, st.node_addrs.get(node_pub.hex(), ""), req)
+        return _mgr_send(st, node_pub, st.node_addrs.get(node_pub.hex()), req)
 
     return rpc
 
@@ -210,7 +213,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     frontier = A.HLC(0, 0)
     reachable = 0
     for i, pub in enumerate(st.roster):
-        fb = _probe(st, pub, st.node_addrs.get(pub.hex(), ""))
+        fb = _probe(st, pub, st.node_addrs.get(pub.hex()))
         if fb is None:
             print(f"  node{i} {pub.hex()[:16]}…  UNREACHABLE")
             continue

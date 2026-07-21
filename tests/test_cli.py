@@ -13,6 +13,7 @@ import unittest
 
 from dudefs import artifacts as A
 from dudefs import crypto as C
+from dudefs import transports
 from dudefs.cli import ManagerState, main
 from dudefs.client import ClientDaemon
 from dudefs.daemon import NodeDaemon
@@ -153,7 +154,7 @@ class TestRecoverInterlock(unittest.TestCase):
                 threading.Thread(target=nd.serve_forever, args=(path, ev), daemon=True).start()
                 self.assertTrue(ev.wait(2))
                 nodes.append(nd)
-                addrs[roster[i].hex()] = path
+                addrs[roster[i].hex()] = transports.Endpoint(transports.UNIX, path)
             st.roster = roster
             st.node_addrs = addrs
             st.save()

@@ -54,7 +54,7 @@ class ManagerState:
     mhlc: int
     roster: list[bytes]  # voting node pubkeys
     learners: list[bytes]  # added, not yet promoted
-    node_addrs: dict[str, str]  # node pubkey hex -> endpoint (unix socket path)
+    node_addrs: dict[str, transports.Endpoint]  # node pubkey hex -> dial Endpoint (summary)
     masters: dict[int, bytes]  # keyepoch -> 32-byte group master
     certs: list[dict]  # [{subject hex, caps [str], epoch, revoked bool}]
 
@@ -88,7 +88,10 @@ class ManagerState:
             mhlc=s["mhlc"],
             roster=[bytes.fromhex(h) for h in s["roster"]],
             learners=[bytes.fromhex(h) for h in s["learners"]],
-            node_addrs=dict(s["node_addrs"]),
+            node_addrs={
+                h: transports.Endpoint(a["t"].encode(), a["u"], a["s"])
+                for h, a in s["node_addrs"].items()
+            },
             masters={int(k): bytes.fromhex(v) for k, v in s["masters"].items()},
             certs=s["certs"],
         )
@@ -107,7 +110,10 @@ class ManagerState:
             "mhlc": self.mhlc,
             "roster": [p.hex() for p in self.roster],
             "learners": [p.hex() for p in self.learners],
-            "node_addrs": self.node_addrs,
+            "node_addrs": {
+                h: {"t": ep.transport.decode(), "u": ep.uri, "s": ep.sealed}
+                for h, ep in self.node_addrs.items()
+            },
             "masters": {str(k): v.hex() for k, v in self.masters.items()},
             "certs": self.certs,
         }
@@ -226,6 +232,7 @@ class Manager:
             os.open(os.path.join(d, "node0.key"), os.O_WRONLY | os.O_CREAT, 0o600), "wb"
         ) as f:
             f.write(node_key)
+        seed_rec = transports.parse_endpoint(node_addr) if node_addr else None  # decompose ONCE
         st = ManagerState(
             dir=d,
             root_key=root_key,
@@ -237,14 +244,16 @@ class Manager:
             mhlc=0,
             roster=[node_pub],
             learners=[],
-            node_addrs={node_pub.hex(): node_addr},
+            node_addrs=(
+                {node_pub.hex(): transports.Endpoint.from_record(*seed_rec)} if seed_rec else {}
+            ),
             masters={0: os.urandom(32)},  # epoch-0 group master (finding 21 derives from it)
             certs=[],
         )
         st.save()
         m = cls(st)
-        if node_addr:  # genesis seed endpoint — the first record the mesh bootstraps from
-            m.set_endpoint(node_pub, [transports.parse_endpoint(node_addr)])
+        if seed_rec is not None:  # genesis seed endpoint — the mesh's bootstrap record
+            m.set_endpoint(node_pub, [seed_rec])
         return m
 
     @classmethod
@@ -317,11 +326,12 @@ class Manager:
         if pub in self.state.roster or pub in self.state.learners:
             raise ManagerError("already a member/learner")
         self.state.learners.append(pub)
-        if addr:
-            self.state.node_addrs[pub.hex()] = addr
+        rec = transports.parse_endpoint(addr) if addr else None  # decompose ONCE
+        if rec is not None:
+            self.state.node_addrs[pub.hex()] = transports.Endpoint.from_record(*rec)
         self.state.save()
-        if addr:  # publish a control-plane reachability record (PROTOCOL §7)
-            self.set_endpoint(pub, [transports.parse_endpoint(addr)])
+        if rec is not None:  # publish a control-plane reachability record (PROTOCOL §7)
+            self.set_endpoint(pub, [rec])
 
     def set_endpoint(
         self, subject: bytes, addrs: list[tuple[bytes, bytes, dict[bytes, bytes]]]
@@ -428,13 +438,14 @@ class Manager:
     # ---- recovery (interlocked) ----------------------------------------- #
     def probe_roster(
         self,
-        probe: Callable[[bytes, str], HLC | None],
+        probe: Callable[[bytes, transports.Endpoint | None], HLC | None],
         dwell: float,
         sleep: Callable[[float], None],
     ) -> RecoverReport:
-        """Dwell-probe every roster endpoint via the injected `probe(pub, addr) ->
+        """Dwell-probe every roster endpoint via the injected `probe(pub, endpoint) ->
         floor | None` (I/O is the caller's — the CLI passes a real enveloped FRONTIER
-        probe; tests pass a synthetic map). Returns the reachability report."""
+        probe over the node's Endpoint; tests pass a synthetic map). Returns the
+        reachability report."""
         import time
 
         answered: dict[int, HLC] = {}
@@ -444,7 +455,7 @@ class Manager:
             for i, pub in enumerate(self.state.roster):
                 if i in answered:
                     continue
-                floor = probe(pub, self.state.node_addrs.get(pub.hex(), ""))
+                floor = probe(pub, self.state.node_addrs.get(pub.hex()))
                 if floor is not None:
                     answered[i] = floor
             if time.monotonic() >= deadline or len(answered) == n:
