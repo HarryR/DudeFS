@@ -57,6 +57,7 @@ class Demo:
             roster=self.roster,
             manager_pub=self.w.mgr_pub,
             peers=self._peers(i),
+            control_ops=self.w.control_ops,  # the node holds the authz view (request gate)
             clock=now_ms,
             delta_ms=DELTA,
         )

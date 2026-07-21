@@ -168,6 +168,7 @@ class TestClientPassthrough(unittest.TestCase):
                 roster[i],
                 roster=roster,
                 manager_pub=w.mgr_pub,
+                control_ops=w.control_ops,  # the node holds the authz view (request gate)
                 clock=now_ms,
                 delta_ms=DELTA,
             )

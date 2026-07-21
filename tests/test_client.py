@@ -40,6 +40,7 @@ class _Cluster:
                 self.roster[i],
                 roster=self.roster,
                 manager_pub=w.mgr_pub,
+                control_ops=w.control_ops,  # the node holds the authz view (request gate)
                 clock=now_ms,
                 delta_ms=DELTA,
             )
@@ -256,6 +257,60 @@ class TestWorkerAPIProtocol(unittest.TestCase):
         ids = {r["id"] for r in batch}
         self.assertEqual(ids, {1, 2})
         d.close()
+
+
+class TestRequestGate(unittest.TestCase):
+    """The op-author request gate (NOTES 58): a node refuses a non-authorized
+    author's blind write AT THE DOOR (BAD_AUTHZ), best-effort — instead of storing +
+    receipting it and letting the fold mark it invalid (the resource/DoS hole)."""
+
+    def test_authorized_write_served_revoked_refused(self):
+        from dudefs import node as N
+        from dudefs.acceptor import Rejected, RejectReason
+
+        w = World(seed=50, n_clients=2)  # client 0 authorized; revoke client 1
+        control = [*w.control_ops, w.revoke(1)]
+        sk = bytes([200] * 32)
+        nd = NodeDaemon(
+            sk,
+            C.SIGNER.public(sk),
+            roster=[C.SIGNER.public(sk)],
+            manager_pub=w.mgr_pub,
+            control_ops=control,
+            clock=lambda: 100,  # small clock to match World's HLCs (skew gate off)
+            delta_ms=10**9,
+        )
+        ok = w.blind(0, [], [[A.Mutation.SET, b"a", b"1"]])  # authorized author
+        bad = w.blind(1, [], [[A.Mutation.SET, b"b", b"1"]])  # revoked author
+        r_ok = N.dispatch(nd.node, N.SubmitReq(ok))
+        r_bad = N.dispatch(nd.node, N.SubmitReq(bad))
+        self.assertIsInstance(r_ok, A.Receipt)  # false-rejection guard: authorized served
+        assert isinstance(r_bad, Rejected)
+        self.assertEqual(r_bad.reason, RejectReason.BAD_AUTHZ)  # revoked refused at the door
+        nd.close()
+
+    def test_fail_closed_until_the_cert_propagates(self):
+        # a node that has NOT yet heard the author's CERT_ISSUE refuses (fail-closed,
+        # NOTES 59) — the documented bootstrap-latency behavior, not a bug.
+        from dudefs import node as N
+        from dudefs.acceptor import Rejected, RejectReason
+
+        w = World(seed=51, n_clients=1)
+        sk = bytes([201] * 32)
+        nd = NodeDaemon(
+            sk,
+            C.SIGNER.public(sk),
+            roster=[C.SIGNER.public(sk)],
+            manager_pub=w.mgr_pub,
+            control_ops=[],
+            clock=lambda: 100,
+            delta_ms=10**9,
+        )  # NO control ops seeded -> the node knows only the manager
+        op = w.blind(0, [], [[A.Mutation.SET, b"a", b"1"]])  # certed in the log, unheard here
+        r = N.dispatch(nd.node, N.SubmitReq(op))
+        assert isinstance(r, Rejected)
+        self.assertEqual(r.reason, RejectReason.BAD_AUTHZ)
+        nd.close()
 
 
 class TestEndpointConsumption(unittest.TestCase):

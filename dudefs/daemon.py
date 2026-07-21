@@ -18,7 +18,7 @@ from collections.abc import Callable
 from . import codec, gossip, tunables, wire
 from .acceptor import Acceptor
 from .artifacts import Op, Watermark, quorum_size
-from .fold import ControlReducer, endpoints_of
+from .fold import ControlReducer, ControlState, endpoints_of
 from .gossip import Delta
 from .handlers import control as ctl
 from .node import LocalNode, dispatch
@@ -56,20 +56,44 @@ class NodeDaemon:
         roster: list[bytes] | None = None,
         manager_pub: bytes,
         peers: list[str] | None = None,
+        control_ops: list[Op] | None = None,
         clock: Callable[[], int] | None = None,
         epoch: int = 0,
         delta_ms: int = tunables.SIM_DELTA_MS,
     ):
         self.peers = peers or []  # peer node socket paths for anti-entropy
         self.store = ChainStore(store_path)
-        self.acc = Acceptor(sk, pub, self.store, config_epoch=epoch, delta_ms=delta_ms)
-        self.pub = pub
         self.manager_pub = manager_pub
+        for op in control_ops or []:  # seed the authorization view (certs/roster)
+            self.store.put_op_raw(op)
+        # the request gate's authz view (NOTES 58): a ControlState rebuilt from the
+        # control ops we hold, refreshed each maintenance tick as certs gossip in.
+        self._authz = ControlState(manager_pub, epoch)
+        self.acc = Acceptor(
+            sk,
+            pub,
+            self.store,
+            config_epoch=epoch,
+            delta_ms=delta_ms,
+            authz=lambda a: self._authz.is_authorized(a, ctl.Cap.WRITE),
+        )
+        self.pub = pub
         self._clock = clock or (lambda: 0)
         self.node = LocalNode(self.acc, self._clock)
         self.roster = roster or [pub]
         self.quorum = quorum_size(len(self.roster))
         self._lock = threading.Lock()  # serializes store access across conn threads
+        self._rebuild_authz()
+
+    def _rebuild_authz(self) -> None:
+        """Rebuild the request gate's authorization view from the control ops I hold
+        (best-effort — fail-closed until a cert propagates, NOTES 59). Reference swap
+        is atomic; serving threads read the latest without a lock."""
+        r = ControlReducer(self.manager_pub, self.acc.epoch)
+        for op in self.store.all_ops():
+            if op.is_control:
+                r.observe(op)
+        self._authz = r.control
 
     # ---- request serving (socket-facing; also the in-process peer RPC) ------ #
     def serve(self, data: bytes) -> bytes:
@@ -250,6 +274,7 @@ class NodeDaemon:
         self.observe_fences()
         self.evidence_cycle(observed_watermarks)
         self.refresh_peers()  # newly-gossiped ENDPOINT records join next tick's peer set
+        self._rebuild_authz()  # newly-gossiped certs/revocations take effect at the gate
 
     def run_periodic(self, period_s: float, stop: threading.Event) -> None:
         """The epidemic cycle on a timer until `stop` — correctness rests on the

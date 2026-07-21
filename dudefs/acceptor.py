@@ -19,6 +19,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from enum import Enum, auto
 
 from . import artifacts as A
@@ -86,10 +87,17 @@ class Acceptor:
         store: ChainStore,
         config_epoch: int = 0,
         delta_ms: int = tunables.DELTA_MS,
+        authz: Callable[[bytes], bool] | None = None,
     ):
         self.sk = node_sk
         self.pub = node_pub
         self.store = store
+        # the request gate (NOTES 58): `authz(author)` is the node's best-effort view
+        # of whether an author may WRITE. None = ungated (the L4 sim + unit tests);
+        # the daemon injects a live view so a revoked client's SUBMIT is refused AT
+        # THE DOOR, not stored-then-fold-invalid (the resource/DoS hole). The acceptor
+        # stays L6-free — it holds a bool callback, not the control vocabulary.
+        self.authz = authz
         # config epoch restored from the store (finding 20): epoch stamps every
         # receipt/watermark, so a restart must NOT regress it to the constructor
         # seed. `config_epoch` seeds a VIRGIN store only (get_epoch() is None there).
@@ -153,6 +161,12 @@ class Acceptor:
             return Rejected(RejectReason.NEEDS_BALLOT)
         if not (op.verify_structure() and op.verify_sig(op.author)):
             return Rejected(RejectReason.BAD_STRUCTURE)
+        # the request gate (NOTES 58): refuse a non-authorized author's blind write
+        # at the door — best-effort (fail-closed until the author's cert propagates;
+        # NOTES 59), the fold is authoritative. Ballot ACCEPT is deliberately NOT
+        # gated here (recovery must complete — PROTOCOL §2.1; flagged for review).
+        if self.authz is not None and not self.authz(op.author):
+            return Rejected(RejectReason.BAD_AUTHZ)
         skew = self._skew_reason(op, now_ms)
         if skew:
             return Rejected(skew)
