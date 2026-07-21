@@ -183,9 +183,9 @@ A transport promises only "**push a message, get a reply — maybe**": message-o
   L_txport push message → reply, maybe (TCP | HTTPS | WS | XMPP) ← dumb carrier, adds no trust
 ```
 
-**Scope:** L_msg is the **cluster wire only** (client-daemon ↔ node, node ↔ node, manager ↔ node). The worker socket (§6) is exempt — filesystem permissions are its whole boundary and workers hold no keys to sign with.
+**Scope:** L_msg is the **cluster wire only** (client-daemon ↔ node, node ↔ node, manager ↔ node). The worker socket (§6) is the one exempt surface — genuinely local, keyless, bounded by filesystem permissions. Everywhere else **authenticity is the floor**: every packet is signed, always — even over a local unix socket, which is only a test convenience for an inherently remote protocol. Even a carrier that gives a confidential, peer-authenticated link (a `.onion`, an owned TLS tunnel) authenticates the *tunnel endpoint*, never the DUDE identity — so the signed envelope is still required.
 
-No anonymous traffic — every envelope is authenticated, so the gate always has a `from`.
+No anonymous traffic — every envelope is authenticated, so the gate always has a `from`. Sealing is the optional layer on top; the one seam that speaks it is `Link` (dudefs/link.py), and carriers live in `dudefs/transports/` (one per scheme).
 
 **Plain (auth only)** — for carriers already confidential to the peer (Tor `.onion`, owned TLS, trusted LAN):
 
@@ -194,10 +194,10 @@ No anonymous traffic — every envelope is authenticated, so the gate always has
     sig = Ed25519(from_sk, "dude.msg:" ‖ canon(from, to, epoch, ts, nonce, verb, body))
 ```
 
-**Sealed (auth + confidentiality)** — for any untrusted-but-encrypted intermediary (CDN-fronted HTTPS, an XMPP server): **sign-then-seal**, the signed struct wrapped in an `sbx1` anonymous-sender sealed box, so the intermediary sees only `to_hint` + ciphertext — *"a message, to someone"*, not who/verb/tags:
+**Sealed (auth + confidentiality)** — for any untrusted-but-encrypted intermediary (CDN-fronted HTTPS, an XMPP server): **sign-then-seal**, the signed struct + a fresh ephemeral **reply-key** wrapped in an `sbx1` anonymous-sender sealed box, so the intermediary sees only `to_hint` + ciphertext — *"a message, to someone"*, not who/verb/tags. The outer is **always** `[to_hint, sealed]`:
 
 ```
-outer: { to_hint, sbx1_seal(to_pub, [ inner, reply_key ]) }
+outer: [ to_hint, sbx1_seal(to_pub, canon(inner, reply_key)) ]
 inner:   the same signed { from, …, sig }        reply_key: a fresh ephemeral pubkey
 ```
 
@@ -205,14 +205,14 @@ inner:   the same signed { from, …, sig }        reply_key: a fresh ephemeral 
 - **`to`** binds the message to one recipient *inside the seal* — the anti-reflection field; without it a signed request to A is replayable to B.
 - **`epoch` is diagnostic, never a hard gate:** a roster bridge always has an activated party talking to a not-yet-activated one, so an envelope-level `epoch == current` refusal is the over-strict-gate (R1) class. Epoch is enforced by the artifact layer where it is load-bearing (receipts, QCs, RERECEIPT), not at the door.
 - **`ts` (+ optional `nonce`)** is freshness/DoS hygiene, not correctness: verbs are idempotent and replay-protected, so a re-sent message is inert.
-- **Sealed replies** mirror the request mode (an endpoint property, always-mirror): the node seals its signed reply back to the request's `reply_key` — **required in sealed mode, not opt-in** (an optional reply-key is a downgrade lever). Confidential both ways, still no session.
+- **Sealed replies are symmetric:** the node seals its signed reply back to the request's `reply_key`, **also** as `[to_hint, sealed]` (the tag keyed by the reply-key), so the requester screens its own reply for one hash before opening it. The reply-key is **required** in sealed mode (an optional one is a downgrade lever; a sealed request without it is malformed).
 
-**Screening tag `to_hint`** (multiplexed carriers only — a relay, an XMPP MUC, a shared mailbox; a *direct* carrier omits it and `to` stays inside the seal):
+**Screening tag `to_hint` — always present on a sealed packet, checked before the ECDH:**
 
 ```
-to_hint = keyed-BLAKE2(key = target_node_identity, person = "dude.screen", sealed)
+to_hint = keyed-BLAKE2(key = target_identity, person = "dude.screen", 16 bytes)(sealed)
 ```
 
-The sender keys on the target's identity (from its endpoint record); the receiver keys on its **own** identity to test a match — one symmetric hash, no ECDH. **Identity-keyed, deliberately not epoch-keyed:** an epoch-scoped key deadlocks a from-scratch sync (you can't screen the messages that would deliver the epoch key); a node always holds its own long-term identity, so it screens from message zero. This gives a **cost ladder**: internet noise can't produce a valid tag → *free-dropped* at the hash rung (no ECDH spent); a blocked/ex node forges a tag and climbs to the ECDH rung but **dies at the gate** (`from` ∉ current roster); members are served. What rests on roster-secrecy is *only* the free-drop rung and tag-unlinkability (best-effort, graceful degradation); admission and data confidentiality never do.
+The sender keys on the target's identity (from its endpoint record); the receiver keys on its **own** identity to test a match — **one symmetric hash, no ECDH** — so the unseal runs only on a tag hit. This is the DoS **pre-filter on every sealed message**, point-to-point as much as multiplexed (a future relay/MUC carrier reuses the *same* tag to pick its inbound; the reply's own tag does it in reverse — additive, not a mode). Over the non-deterministic ciphertext, so it is per-message and unlinkable. **Identity-keyed, deliberately not epoch-keyed:** an epoch-scoped key deadlocks a from-scratch sync (you can't screen the messages that would deliver the epoch key); a node always holds its own long-term identity, so it screens from message zero. This gives a **cost ladder**: internet noise can't produce a valid tag → *free-dropped* at the hash rung (no ECDH); a blocked/ex node forges a tag, climbs to the ECDH rung, and **dies at the gate** (`from` ∉ current roster); members are served. What rests on roster-secrecy is *only* the free-drop rung and tag-unlinkability (best-effort, graceful degradation); admission and data confidentiality never do.
 
-**The request gate** (L_msg's first consumer), on inbound before any store work: (1) unseal if the endpoint is `sealed`; (2) verify `sig` by `from`; (3) `to == self`, `ts` fresh (epoch is diagnostic only); (4) **check `from` against the live control-plane view** — current roster member / un-revoked cert; (5) dispatch. Steps 1–4 reject revoked/non-members *at the door*, before the fold — the gate authorizes the **requester**, never an artifact's author, so it never blocks an authorized proposer carrying a since-revoked author's op through recovery. **Defence in depth:** gate/seal protect the door and metadata; application values are independently protected by the group *data* key (`xcs1`, DESIGN §7), which rotates on eviction — the layers fail independently. Extended rationale and the eviction/survivor-rekey boundary: [TRANSPORT.md](TRANSPORT.md).
+**The request gate** (L_msg's first consumer), on inbound before any store work: (1) if `sealed`, **screen the `to_hint`** (one hash) and drop on a miss, then unseal — else decode the plain envelope; (2) verify `sig` by `from`; (3) `to == self`, `ts` fresh (epoch is diagnostic only); (4) **check `from` against the live control-plane view** — current roster member / un-revoked cert; (5) dispatch, then sign (and, on a sealed endpoint, seal) the reply. Steps 1–4 reject revoked/non-members *at the door* — the gate authorizes the **requester**, never an artifact's author, so it never blocks an authorized proposer carrying a since-revoked author's op through recovery. A refusal is served **only** to a sender that proved it holds our identity (a valid sig over `to == self`), and it says *why* (`NOT_A_MEMBER` / `STALE_ENVELOPE`, not a generic `BAD_AUTHZ`); anything unproven gets **silence** (the carrier's native nothing — closed frame / no stanza / 404), so a reply never leaks our pubkey. **Defence in depth:** gate/seal protect the door and metadata; application values are independently protected by the group *data* key (`xcs1`, DESIGN §7), which rotates on eviction — the layers fail independently. Extended rationale and the eviction/survivor-rekey boundary: [TRANSPORT.md](TRANSPORT.md).
