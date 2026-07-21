@@ -19,6 +19,7 @@ import queue
 import threading
 import time
 from dataclasses import dataclass
+from typing import Literal, TypedDict
 
 from . import artifacts as A
 from . import fold, lmsg, transports, wire
@@ -63,6 +64,61 @@ class Ladder:
     final: str | None = None  # applied | rejected | stale (frozen)
     may_flip: bool = False
     winner: bytes | None = None  # the rival op_hash, when phase == lost
+
+
+# ---- read-result shapes (CLIENT.md §3) — internal (bytes-valued); the worker API
+# marshals these to JSON. Typed so the type flows through instead of erasing to `dict`.
+
+
+class GetView(TypedDict):
+    value: bytes | None
+    version: bytes
+    attempt: int
+    present: bool
+    as_of: HLC
+    tier: str  # local | final
+
+
+class FinalView(TypedDict):
+    present: bool
+    value: bytes | None
+    version: bytes
+
+
+class ProvView(TypedDict):
+    present: bool
+    value: bytes | None
+    version: bytes
+    attempt: int
+
+
+class PendingOp(TypedDict):
+    op: bytes
+    phase: str
+    would: list[list[bytes]]  # decoded mutation intent
+
+
+class InspectView(TypedDict):
+    final: FinalView
+    provisional: ProvView
+    may_flip: bool
+    pending: list[PendingOp]
+
+
+class PrefixEntry(TypedDict):  # an S3-style common prefix (immediate child group)
+    key: bytes
+    prefix: Literal[True]
+
+
+class KeyEntry(TypedDict):
+    key: bytes
+    prefix: Literal[False]
+    version: bytes
+    attempt: int
+    pending: bool
+
+
+type ListEntry = PrefixEntry | KeyEntry
 
 
 # --------------------------------------------------------------------------- #
@@ -468,7 +524,7 @@ class ClientDaemon:
         op = self.store.get_op(op_hash)
         return op is not None and op.hlc <= self._final_frontier
 
-    def get(self, path: bytes, *, level: str = "local") -> dict:
+    def get(self, path: bytes, *, level: str = "local") -> GetView:
         """The value at `path` + its (version, attempt) fencing token + tier.
         `level=final` folds only the frozen (≤ frontier) set — and syncs a quorum
         read FIRST, so the frozen view is linearizable, not frozen-but-partial."""
@@ -504,12 +560,12 @@ class ClientDaemon:
 
     def list_keys(
         self, prefix: bytes, *, delimiter: bytes | None = None, level: str = "local"
-    ) -> list[dict]:
+    ) -> list[ListEntry]:
         if level == "final":
             self.sync()  # linearizable prefix scan (ZK: enumeration is fold-local)
         with self._lock:
             res = self._fold(final_only=(level == "final"))
-            seen: dict[bytes, dict] = {}
+            seen: dict[bytes, ListEntry] = {}
             for key in res.state:
                 if not key.startswith(prefix):
                     continue
@@ -531,7 +587,7 @@ class ClientDaemon:
                 }
             return [seen[k] for k in sorted(seen)]
 
-    def inspect(self, path: bytes) -> dict:
+    def inspect(self, path: bytes) -> InspectView:
         """Key-centric recovery view (CLIENT.md §3): the frozen `final` verdict, the
         live `provisional` value (+may_flip), and every known not-yet-final op
         touching the key WITH DECODED INTENT (the daemon holds the keyring)."""
@@ -562,11 +618,11 @@ class ClientDaemon:
                 "pending": pending,
             }
 
-    def _pending_for(self, path: bytes) -> list[dict]:
+    def _pending_for(self, path: bytes) -> list[PendingOp]:
         """Every held op touching `path` that is not yet final, with decoded intent.
         Complete for ops authored through this daemon; foreign in-flight arrives via
         gossip (not wired in WP2 — the daemon still decodes whatever it holds)."""
-        out: list[dict] = []
+        out: list[PendingOp] = []
         for o in self.store.all_ops():
             if o.is_control:
                 continue
