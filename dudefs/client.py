@@ -147,7 +147,7 @@ class ClientDaemon:
         pub: bytes,
         *,
         roster: list[bytes],
-        roster_addrs: list[str],
+        roster_addrs: list[transports.Endpoint],
         manager_pub: bytes,
         masters: dict[int, bytes],
         control_ops: list[Op] | None = None,
@@ -209,7 +209,7 @@ class ClientDaemon:
         driver needs only that)."""
         if self._closing.is_set():
             return None
-        path, to_pub = self.roster_addrs[node], self.cfg.roster[node]
+        ep, to_pub = self.roster_addrs[node], self.cfg.roster[node]
         out = lmsg.author(
             self.sk,
             to_pub,
@@ -218,7 +218,7 @@ class ClientDaemon:
             epoch=self.cfg.epoch,
             ts=int(time.time() * 1000),
         ).encode()
-        raw = transports.dial(transports.UNIX, path, out)
+        raw = transports.dial(ep.transport, ep.uri, out)
         match lmsg.classify_reply(raw, expect_from=to_pub, expect_to=self.pub):
             case lmsg.Reply(env):
                 return wire.decode_response(env.body)
@@ -601,17 +601,19 @@ class ClientDaemon:
         touching = [m for m in d.mutations if len(m) >= 2 and m[1] == path]
         return touching or None
 
-    def refresh_addrs(self, transport: bytes = b"unix") -> None:
-        """Derive `roster_addrs` from the ENDPOINT control ops I hold (PROTOCOL §7 /
-        NOTES 58) — the control plane is the node registry. Keeps the existing entry
-        for any roster member with no endpoint record yet (bootstrap fallback)."""
+    def refresh_addrs(self) -> None:
+        """Derive `roster_addrs` (dial Endpoints) from the ENDPOINT control ops I hold
+        (PROTOCOL §7 / NOTES 58) — the control plane is the node registry. Keeps the
+        existing entry for any roster member with no record yet (bootstrap fallback),
+        and dials whatever carrier the record names (a node may be unix or HTTP)."""
         with self._lock:
             book = fold.endpoints_of(self.store.all_ops(), self.manager_pub)
             new = list(self.roster_addrs)
             for i, pub in enumerate(self.cfg.roster):
-                uri = next((u.decode() for (t, u, _o) in book.get(pub, []) if t == transport), None)
-                if uri is not None and i < len(new):
-                    new[i] = uri
+                addrs = book.get(pub, [])
+                if addrs and i < len(new):
+                    t, u, o = addrs[0]  # a node's first advertised address
+                    new[i] = transports.Endpoint.from_record(t, u, o)
             self.roster_addrs = new
 
     def close(self) -> None:

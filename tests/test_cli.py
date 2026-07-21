@@ -18,7 +18,7 @@ from dudefs.client import ClientDaemon
 from dudefs.daemon import NodeDaemon
 from dudefs.handlers import control as ctl
 from dudefs.workerapi import WorkerServer
-from tests._builders import World, now_ms, poll_until
+from tests._builders import World, now_ms, poll_until, unix_eps
 
 MASTER = bytes(range(32))
 DELTA = 150
@@ -212,7 +212,7 @@ class TestClientPassthrough(unittest.TestCase):
             w.clients[0].sk,
             w.clients[0].pub,
             roster=roster,
-            roster_addrs=paths,
+            roster_addrs=unix_eps(paths),
             manager_pub=w.mgr_pub,
             masters={0: MASTER},
             control_ops=w.control_ops,

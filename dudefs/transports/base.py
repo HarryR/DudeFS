@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Protocol
 
 # A request handler: an inbound payload -> the reply payload, or None for "no reply"
@@ -28,6 +29,25 @@ def parse_scheme(scheme: bytes) -> tuple[frozenset[bytes], bytes]:
     carrier. `http` -> (∅, `http`); `sealed+http` -> ({`sealed`}, `http`)."""
     *mods, carrier = scheme.split(b"+")
     return frozenset(mods), carrier
+
+
+@dataclass(frozen=True)
+class Endpoint:
+    """A dial address, decomposed once (transports.parse_endpoint / from_record) and
+    carried as a struct — no code re-parses a composite scheme string. `transport` is
+    the carrier scheme, `uri` its carrier-specific address (a path for unix, a URL for
+    http), `sealed` the stored L_msg profile flag (consumed once sealed-mode is wired
+    into serve; the carrier itself never cares)."""
+
+    transport: bytes
+    uri: str
+    sealed: bool = False
+
+    @staticmethod
+    def from_record(transport: bytes, uri: bytes, opts: dict[bytes, bytes]) -> Endpoint:
+        """Build the dial struct from a stored ENDPOINT-record addr (transport, uri,
+        opts) — the record IS the decomposition, so this is a view, not a re-parse."""
+        return Endpoint(transport, uri.decode(), opts.get(b"lmsg") == b"sealed")
 
 
 class Server(Protocol):

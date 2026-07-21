@@ -139,14 +139,14 @@ class TestJsonRpcContract(unittest.TestCase):
 
     def _daemon(self):
         from dudefs.client import ClientDaemon
-        from tests._builders import World
+        from tests._builders import World, unix_eps
 
         w = World(seed=1, n_clients=1)
         return ClientDaemon(
             w.clients[0].sk,
             w.clients[0].pub,
             roster=[C.SIGNER.public(bytes([1] * 32))],
-            roster_addrs=["/nonexistent.sock"],
+            roster_addrs=unix_eps(["/nonexistent.sock"]),
             manager_pub=w.mgr_pub,
             masters={0: bytes(range(32))},
             control_ops=w.control_ops,

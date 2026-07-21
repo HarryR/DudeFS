@@ -14,11 +14,11 @@ from dudefs import crypto as C
 from dudefs import lmsg, transports, wire
 from dudefs import node as N
 from dudefs.acceptor import Acceptor
-from dudefs.daemon import NodeDaemon
+from dudefs.daemon import NodeDaemon, Peer
 from dudefs.manager import Manager
 from dudefs.node import LocalNode, dispatch
 from dudefs.store import ChainStore
-from tests._builders import World, call_node, enveloped
+from tests._builders import World, call_node, enveloped, unix_peer
 from tests._cluster import creation_op
 
 BIG = 1_000_000
@@ -109,6 +109,45 @@ class TestPeerGate(unittest.TestCase):
         d.close()
 
 
+class TestMixedTransportCluster(unittest.TestCase):
+    def test_unix_and_http_nodes_gossip_across_carriers_and_converge(self):
+        # node A serves over a unix socket, node B over HTTP; they gossip to each other
+        # across DIFFERENT carriers and converge — the seam makes the mesh carrier-agnostic.
+        w = World(seed=15, n_clients=2)
+        roster = [C.SIGNER.public(bytes([200] * 32)), C.SIGNER.public(bytes([201] * 32))]
+        a, b = _daemon(w, 0, roster), _daemon(w, 1, roster)
+        with tempfile.TemporaryDirectory() as td:
+            a_path = os.path.join(td, "a.sock")
+            with socket.socket() as probe:
+                probe.bind(("127.0.0.1", 0))
+                b_uri = f"http://127.0.0.1:{probe.getsockname()[1]}/dude"
+            ev_a, ev_b = threading.Event(), threading.Event()
+            threading.Thread(target=a.serve_forever, args=(a_path, ev_a), daemon=True).start()
+            threading.Thread(
+                target=b.serve_forever,
+                args=(b_uri, ev_b),
+                kwargs={"scheme": transports.HTTP},
+                daemon=True,
+            ).start()
+            self.assertTrue(ev_a.wait(2))
+            self.assertTrue(ev_b.wait(2))
+            # each peers the OTHER over its own carrier
+            a.peers = [Peer(b.pub, transports.Endpoint(transports.HTTP, b_uri))]
+            b.peers = [Peer(a.pub, transports.Endpoint(transports.UNIX, a_path))]
+            x = w.blind(0, [], [[A.Mutation.SET, b"x", b"1"]])
+            y = w.blind(1, [], [[A.Mutation.SET, b"y", b"1"]])
+            a.store.append(x)
+            b.store.append(y)
+            a.sync_once()  # A -> B over HTTP
+            b.sync_once()  # B -> A over unix
+            for d in (a, b):
+                self.assertIsNotNone(d.store.get_op(x.op_hash))  # both hold the union
+                self.assertIsNotNone(d.store.get_op(y.op_hash))
+            a.close()
+            b.close()
+            time.sleep(0.05)
+
+
 class TestHttpCarrier(unittest.TestCase):
     def test_daemon_serves_the_same_gated_wire_over_http(self):
         # cross-transport: the SAME L_msg envelope + peer gate + dispatch, carried over
@@ -184,8 +223,8 @@ class TestDaemonPeerSockets(unittest.TestCase):
             pa, pb = os.path.join(td, "a.sock"), os.path.join(td, "b.sock")
             a = _daemon(w, 0, roster)
             b = _daemon(w, 1, roster)
-            a.peers = [(b.pub, pb)]  # a pulls from b's socket (identity, address)
-            b.peers = [(a.pub, pa)]
+            a.peers = [unix_peer(b.pub, pb)]  # a pulls from b's socket
+            b.peers = [unix_peer(a.pub, pa)]
             x = w.blind(0, [], [[A.Mutation.SET, b"x", b"1"]])
             y = w.blind(1, [], [[A.Mutation.SET, b"y", b"1"]])
             a.store.append(x)

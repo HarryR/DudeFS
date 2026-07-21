@@ -21,7 +21,7 @@ from dudefs.handlers import control as ctl
 from dudefs.manager import Manager
 from dudefs.node import LocalNode, dispatch
 from dudefs.store import ChainStore
-from tests._builders import World, now_ms, poll_until
+from tests._builders import World, now_ms, poll_until, unix_eps, unix_peer
 
 DELTA = 150
 MASTER = bytes(range(32))
@@ -46,7 +46,7 @@ class Demo:
         self.clients = [self._client(w, ci) for ci in range(2)]
 
     def _peers(self, i):
-        return [(self.roster[j], self.paths[j]) for j in range(len(self.paths)) if j != i]
+        return [unix_peer(self.roster[j], self.paths[j]) for j in range(len(self.paths)) if j != i]
 
     def _spawn_node(self, i, sk=None):
         if os.path.exists(self.paths[i]):
@@ -71,7 +71,7 @@ class Demo:
             w.clients[ci].sk,
             w.clients[ci].pub,
             roster=self.roster,
-            roster_addrs=self.paths,
+            roster_addrs=unix_eps(self.paths),
             manager_pub=w.mgr_pub,
             masters={0: MASTER},
             control_ops=w.control_ops,

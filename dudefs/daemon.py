@@ -13,6 +13,7 @@ from __future__ import annotations
 import sqlite3
 import threading
 from collections.abc import Callable
+from dataclasses import dataclass
 
 from . import codec, gossip, lmsg, transports, tunables, wire
 from .acceptor import Acceptor, Rejected, RejectReason
@@ -33,6 +34,15 @@ _REFUSAL_REASON = {
 }
 
 
+@dataclass(frozen=True)
+class Peer:
+    """A gossip peer: its identity (the L_msg `to`) and the Endpoint to reach it —
+    so anti-entropy dials whatever carrier the node's ENDPOINT record names."""
+
+    pub: bytes
+    endpoint: transports.Endpoint
+
+
 def _gossip_request(summ: gossip.Summary) -> bytes:
     return codec.encode([b"gossip", gossip.encode_summary(summ)])
 
@@ -49,13 +59,13 @@ class NodeDaemon:
         *,
         roster: list[bytes] | None = None,
         manager_pub: bytes,
-        peers: list[tuple[bytes, str]] | None = None,
+        peers: list[Peer] | None = None,
         control_ops: list[Op] | None = None,
         clock: Callable[[], int] | None = None,
         epoch: int = 0,
         delta_ms: int = tunables.SIM_DELTA_MS,
     ):
-        self.peers = peers or []  # anti-entropy peers as (pubkey, socket-path) pairs
+        self.peers: list[Peer] = peers or []  # anti-entropy peers (identity + Endpoint)
         self.sk = sk  # the node's identity key — signs L_msg envelopes (PROTOCOL §7.5)
         self.store = ChainStore(store_path)
         self.manager_pub = manager_pub
@@ -162,17 +172,17 @@ class NodeDaemon:
         §7 / NOTES 58) — the control plane IS the peer registry."""
         return endpoints_of(self.store.all_ops(), self.manager_pub, self.acc.epoch)
 
-    def refresh_peers(self, transport: bytes = LOCAL_TRANSPORT) -> None:
-        """Rebuild the anti-entropy peer list from the address book for the current
-        transport (every roster peer's URI but my own). Called after gossip pulls in
-        new ENDPOINT records; seed endpoints in genesis bootstrap the first round."""
-        peers: list[tuple[bytes, str]] = []
+    def refresh_peers(self) -> None:
+        """Rebuild the anti-entropy peer list from the address book (every roster peer
+        but my own). Each Peer keeps its dial Endpoint, so gossip reaches it over
+        whatever carrier its ENDPOINT record names — a mixed mesh just works. Called
+        after gossip pulls in new records; seed endpoints bootstrap the first round."""
+        peers: list[Peer] = []
         for pub, addrs in self.address_book().items():
-            if pub == self.pub:
+            if pub == self.pub or not addrs:
                 continue
-            uri = next((u for (t, u, _o) in addrs if t == transport), None)
-            if uri is not None:
-                peers.append((pub, uri.decode()))  # (identity, address) — L_msg needs `to`
+            t, u, o = addrs[0]  # a node's first advertised address (POC: no failover yet)
+            peers.append(Peer(pub, transports.Endpoint.from_record(t, u, o)))
         if peers:  # supersede the seed/kwarg only ONCE endpoint records exist
             self.peers = peers
 
@@ -342,8 +352,9 @@ class NodeDaemon:
         evidence. (A large deployment picks a uniformly random peer per tick — the
         §9 demo's handful lets us sweep all to the same fixpoint; a down peer is
         just a missed round.)"""
-        for pub, path in self.peers:
-            self.gossip_round(lambda p, uri=path: transports.dial(LOCAL_TRANSPORT, uri, p), pub)
+        for peer in self.peers:
+            ep = peer.endpoint
+            self.gossip_round(lambda p, e=ep: transports.dial(e.transport, e.uri, p), peer.pub)
         self.adopt_committed_checkpoints()
         self.observe_roster_activations()  # adopt a joint-certified roster change
         self.observe_fences()

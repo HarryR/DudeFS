@@ -38,6 +38,24 @@ def poll_until(pred: Callable[[], object], timeout: float = 6.0, step: float = 0
     return val
 
 
+def unix_ep(path: str):
+    """A local-unix dial Endpoint — the common test address since the transport seam."""
+    from dudefs import transports
+
+    return transports.Endpoint(transports.UNIX, path)
+
+
+def unix_eps(paths) -> list:
+    return [unix_ep(p) for p in paths]
+
+
+def unix_peer(pub: bytes, path: str):
+    """A gossip Peer over a local unix socket (identity + Endpoint)."""
+    from dudefs.daemon import Peer
+
+    return Peer(pub, unix_ep(path))
+
+
 def enveloped(sk: bytes, to_pub: bytes, req, *, epoch: int = 0, ts: int | None = None) -> bytes:
     """Wrap a node Request in a signed L_msg envelope — the cluster wire since the
     §7.5 cutover (a bare request no longer reaches a gated daemon)."""

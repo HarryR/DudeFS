@@ -12,11 +12,12 @@ from urllib.parse import urlsplit, urlunsplit
 
 from . import http as _http
 from . import unix as _unix
-from .base import HTTP, SEALED, UNIX, Handler, Server, parse_scheme
+from .base import HTTP, SEALED, UNIX, Endpoint, Handler, Server, parse_scheme
 
 __all__ = [
     "HTTP",
     "UNIX",
+    "Endpoint",
     "Handler",
     "Server",
     "dial",

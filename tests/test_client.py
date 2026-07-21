@@ -18,7 +18,7 @@ from dudefs.client import ClientDaemon
 from dudefs.daemon import NodeDaemon
 from dudefs.handlers import control as ctl
 from dudefs.workerapi import WorkerServer
-from tests._builders import World, now_ms, poll_until
+from tests._builders import World, now_ms, poll_until, unix_eps
 
 DELTA = 150  # ms — small enough that finality sweeps ~DELTA after a write, big
 # enough that same-machine client/node clock jitter never trips the skew gate.
@@ -54,7 +54,7 @@ class _Cluster:
             w.clients[ci].sk,
             w.clients[ci].pub,
             roster=self.roster,
-            roster_addrs=self.paths,
+            roster_addrs=unix_eps(self.paths),
             manager_pub=w.mgr_pub,
             masters={0: MASTER},
             control_ops=w.control_ops,
@@ -218,7 +218,7 @@ class TestWorkerAPIProtocol(unittest.TestCase):
             w.clients[0].sk,
             w.clients[0].pub,
             roster=[C.SIGNER.public(bytes([1] * 32))],
-            roster_addrs=["/nonexistent.sock"],
+            roster_addrs=unix_eps(["/nonexistent.sock"]),
             manager_pub=w.mgr_pub,
             masters={0: MASTER},
             control_ops=w.control_ops,
@@ -333,7 +333,9 @@ class TestEndpointConsumption(unittest.TestCase):
             nd.store.put_op_raw(op)
         nd.refresh_peers()
         # peers are (identity, address) pairs now (L_msg needs `to`); check the addresses
-        self.assertEqual({p for _pub, p in nd.peers}, {"/n1.sock", "/n2.sock"})  # excludes self
+        self.assertEqual(
+            {pr.endpoint.uri for pr in nd.peers}, {"/n1.sock", "/n2.sock"}
+        )  # excludes self
         nd.close()
 
     def test_client_daemon_derives_roster_addrs_from_endpoints(self):
@@ -345,19 +347,21 @@ class TestEndpointConsumption(unittest.TestCase):
             w.clients[0].sk,
             w.clients[0].pub,
             roster=roster,
-            roster_addrs=["seed", "seed", "seed"],
+            roster_addrs=unix_eps(["seed", "seed", "seed"]),
             manager_pub=w.mgr_pub,
             masters={0: MASTER},
             control_ops=[*w.control_ops, *eps],
             epoch=0,
         )
         c.refresh_addrs()
-        self.assertEqual(c.roster_addrs, ["/n0.sock", "/n1.sock", "/n2.sock"])
+        self.assertEqual([e.uri for e in c.roster_addrs], ["/n0.sock", "/n1.sock", "/n2.sock"])
         c.close()
 
-    def test_derivation_prefers_transport_and_keeps_seed_when_missing(self):
-        # node0: multi-transport (https + unix) -> pick unix; node1: only https ->
-        # no unix uri, keep the seed; node2: no endpoint at all -> keep the seed.
+    def test_derivation_takes_first_advertised_address_and_keeps_seed_when_missing(self):
+        # node0: multi-homed (http + unix) -> take the FIRST advertised (http), carrying
+        # its carrier + sealed flag; node1: http only -> taken; node2: no record -> keep
+        # the seed. Since the transport seam a client dials any carrier, so the address
+        # is the node's declared preference order, not a unix filter.
         w = World(seed=42, n_clients=1)
         roster = [C.SIGNER.public(bytes([200 + i] * 32)) for i in range(3)]
         eps = [
@@ -365,25 +369,28 @@ class TestEndpointConsumption(unittest.TestCase):
                 ctl.endpoint_body(
                     roster[0],
                     [
-                        (b"https", b"https://x/dude", {b"lmsg": b"sealed"}),
+                        (b"http", b"http://x/dude", {b"lmsg": b"sealed"}),
                         (b"unix", b"/n0.sock", {}),
                     ],
                 )
             ),
-            w._mgr_op(ctl.endpoint_body(roster[1], [(b"https", b"https://y/dude", {})])),
+            w._mgr_op(ctl.endpoint_body(roster[1], [(b"http", b"http://y/dude", {})])),
         ]
         c = ClientDaemon(
             w.clients[0].sk,
             w.clients[0].pub,
             roster=roster,
-            roster_addrs=["s0", "s1", "s2"],
+            roster_addrs=unix_eps(["s0", "s1", "s2"]),
             manager_pub=w.mgr_pub,
             masters={0: MASTER},
             control_ops=[*w.control_ops, *eps],
             epoch=0,
         )
         c.refresh_addrs()
-        self.assertEqual(c.roster_addrs, ["/n0.sock", "s1", "s2"])  # unix picked; else seed kept
+        n0, n1, n2 = c.roster_addrs
+        self.assertEqual((n0.transport, n0.uri, n0.sealed), (b"http", "http://x/dude", True))
+        self.assertEqual((n1.transport, n1.uri), (b"http", "http://y/dude"))
+        self.assertEqual((n2.transport, n2.uri), (b"unix", "s2"))  # no record -> seed kept
         c.close()
 
 
