@@ -231,6 +231,8 @@ class TestFetchWindow(unittest.TestCase):
             pr = N.dispatch(nodes[i], prep)
             self.assertIsInstance(pr, A.Promise)
             out = m.feed(Q.Reply(i, prep, pr, NOW))
+        # white-box: Q._Phase is the Commit machine's internal state — asserted
+        # to prove the fetch-window transitions, not part of the public surface.
         self.assertIs(m.phase, Q._Phase.FETCH)
         fetch = next(c.req for c in out if isinstance(c, Q.Send))
         self.assertIsInstance(fetch, N.FetchOpReq)

@@ -228,13 +228,13 @@ class TestWorkerAPIProtocol(unittest.TestCase):
         srv = WorkerServer(d)
 
         def line(b):
-            return srv._dispatch_line(b) or b""
+            return srv.dispatch_line(b) or b""
 
         # malformed JSON -> -32700 parse error
         self.assertIn(b'"code":-32700', line(b"not json"))
         # a notification (no id) yields NO reply
         self.assertIsNone(
-            srv._dispatch_line(b'{"jsonrpc":"2.0","method":"GET","params":{"path":"x"}}')
+            srv.dispatch_line(b'{"jsonrpc":"2.0","method":"GET","params":{"path":"x"}}')
         )
         # unknown method -> -32601
         self.assertIn(
@@ -245,7 +245,7 @@ class TestWorkerAPIProtocol(unittest.TestCase):
             b'"code":-32602', line(b'{"jsonrpc":"2.0","id":2,"method":"GET","params":{}}')
         )
         # a batch: one good GET (absent key) + one unknown-method error, id-correlated
-        out = srv._dispatch_line(
+        out = srv.dispatch_line(
             b'[{"jsonrpc":"2.0","id":1,"method":"GET","params":{"path":"absent"}},'
             b'{"jsonrpc":"2.0","id":2,"method":"NOPE","params":{}}]'
         )

@@ -41,19 +41,19 @@ class TestMixedLazinessGC(unittest.TestCase):
         cut = cut_of(w)
         cr = compactor.compact_genesis(below, w.keyring, w.genesis, cut)
         committed = A.retained_commitment(cr.retained)
-        for nd in sim._raw:  # every node holds the full below-cut history
+        for nd in sim.raw:  # every node holds the full below-cut history
             for o in below:
                 nd.acc.store.append(o)
         sim.adopt_checkpoint(cut, committed, cr.dead)
 
         sim.gc(cr.dead, nodes=[0])  # node 0 GCs now; 1,2 stay lazy (mixed laziness)
-        digs = [nd.acc.store.baseline_commitment() for nd in sim._raw]
+        digs = [nd.acc.store.baseline_commitment() for nd in sim.raw]
         self.assertTrue(all(d == committed for d in digs))  # identical despite mixed GC
 
         for _ in range(3):  # cut-aware gossip must not re-introduce the dead `first`
             sim.gossip_round()
-        self.assertIsNone(sim._raw[0].acc.store.get_op(first.op_hash))  # no oscillation
-        digs2 = [nd.acc.store.baseline_commitment() for nd in sim._raw]
+        self.assertIsNone(sim.raw[0].acc.store.get_op(first.op_hash))  # no oscillation
+        digs2 = [nd.acc.store.baseline_commitment() for nd in sim.raw]
         self.assertTrue(all(d == committed for d in digs2))  # still stable
 
         sim.gc(cr.dead, nodes=[1, 2])  # the lazy nodes finally GC

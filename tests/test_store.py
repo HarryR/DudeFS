@@ -56,6 +56,8 @@ class TestFloorDurability(unittest.TestCase):
         if os.path.exists(path):
             os.remove(path)
         s = ChainStore(path)
+        # white-box: _write_hw/_write_attested are the acceptor's floor-persistence
+        # seam; this test seeds durable floor state directly (no public setter).
         s._write_hw(HLC(5000, 3))
         s._write_attested(HLC(4000, 0))
         s.commit()

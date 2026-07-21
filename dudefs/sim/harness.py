@@ -172,9 +172,9 @@ class Sim:
         # jump by construction (the durable attested floor never regresses).
         self._skew = dict(skew or {})
         self._drift = dict(drift or {})
-        self._raw = self._build_nodes(n, delta)
-        self.roster = [nd.acc.pub for nd in self._raw]
-        self.nodes = [LoggingNode(nd, i, self) for i, nd in enumerate(self._raw)]
+        self.raw = self._build_nodes(n, delta)
+        self.roster = [nd.acc.pub for nd in self.raw]
+        self.nodes = [LoggingNode(nd, i, self) for i, nd in enumerate(self.raw)]
         # `net` (a NetworkLinks) enables per-link faults + partitions + gossip heal
         # (WP2.2); without it the transport is the uniform per-hop Faults, unchanged.
         self.net = net
@@ -285,7 +285,7 @@ class Sim:
     def _check_durability(self) -> None:
         for slot, op_hashes in self._b1.decided.items():
             for op_hash in op_hashes:
-                holders = sum(1 for nd in self._raw if nd.fetch_op(op_hash) is not None)
+                holders = sum(1 for nd in self.raw if nd.fetch_op(op_hash) is not None)
                 assert holders >= self.quorum, (
                     f"B2 violated: committed op for slot {slot!r} on "
                     f"{holders} < {self.quorum} nodes"
@@ -309,7 +309,7 @@ class Sim:
         for i in range(self.n):
             for j in range(self.n):
                 if i != j and (self.net is None or (j, i) not in self.net.down):
-                    dst, src = self._raw[i].acc.store, self._raw[j].acc.store
+                    dst, src = self.raw[i].acc.store, self.raw[j].acc.store
                     gossip.merge(dst, src)
                     if self._cut:
                         gossip.pull_baseline(dst, src, self._cut, self._dead)
@@ -319,14 +319,14 @@ class Sim:
         sim-side of checkpoint adoption (NOTES 40 infra). GC is a SEPARATE step
         (`gc`), so mixed-laziness (nodes GC'ing at different times) is testable."""
         for i in range(self.n) if nodes is None else nodes:
-            self._raw[i].acc.store.adopt_checkpoint(cut, retained, list(dead))
+            self.raw[i].acc.store.adopt_checkpoint(cut, retained, list(dead))
         self._cut, self._dead = cut, frozenset(dead)
 
     def gc(self, dead, nodes=None) -> None:
         """Run the checkpoint's GC delta on `nodes` (all by default). Lazy + local:
         nodes may call this at wildly different times (the mixed-laziness persona)."""
         for i in range(self.n) if nodes is None else nodes:
-            self._raw[i].acc.store.gc_checkpoint(list(dead))
+            self.raw[i].acc.store.gc_checkpoint(list(dead))
 
     def start_gossip(self, period_ms: int) -> None:
         """Schedule periodic anti-entropy for the duration of the run."""
@@ -351,7 +351,7 @@ class Sim:
                 frozenset(q.op_hash for q in st.all_qcs()),
             )
 
-        views = [triple(nd) for nd in self._raw]
+        views = [triple(nd) for nd in self.raw]
         return all(v == views[0] for v in views)
 
     def evidence(self) -> list:
@@ -359,7 +359,7 @@ class Sim:
         never violate, so this stays empty across chaos runs; the persona builds
         (WP3) that equivocate are what exercise the minting side of B6. FORK
         (two signed ops at one author/seq) is the one kind wired today."""
-        return [ev for nd in self._raw for ev in nd.acc.store.evidence()]
+        return [ev for nd in self.raw for ev in nd.acc.store.evidence()]
 
     # ---- read helpers for tests ------------------------------------------- #
     def decided_ops(self, slot_tag: bytes) -> set[bytes]:
@@ -368,7 +368,7 @@ class Sim:
         return set(self._b1.decided.get(slot_tag, set()))
 
     def get_op(self, op_hash: bytes) -> Op | None:
-        for nd in self._raw:
+        for nd in self.raw:
             op = nd.fetch_op(op_hash)
             if op is not None:
                 return op

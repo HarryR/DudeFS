@@ -468,6 +468,8 @@ class TestDelegateCheckpointBarrier(unittest.TestCase):
         self.assertNotIn(b"k", r_fenced.state)  # fenced -> NO barrier -> reborn stays dead
 
         # and the pre-walk itself excludes the fenced cut, includes the valid one
+        # white-box: fold._total_order_key / _authorized_cuts are internal fold
+        # helpers, asserted directly to pin the cut-authorization logic.
         ordered = sorted([*below, valid, c2], key=fold._total_order_key)
         self.assertIn(cut, fold._authorized_cuts(ordered, set(), w.genesis))
         ordered_f = sorted([*below, fenced, c2], key=fold._total_order_key)

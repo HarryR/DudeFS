@@ -283,7 +283,7 @@ class WorkerServer:
             return None  # JSON-RPC notification: no reply
         return {"jsonrpc": "2.0", "id": rid, "result": result}
 
-    def _dispatch_line(self, line: bytes) -> bytes | None:
+    def dispatch_line(self, line: bytes) -> bytes | None:
         try:
             payload = json.loads(line)
         except json.JSONDecodeError:
@@ -300,7 +300,7 @@ class WorkerServer:
                 line = line.strip()
                 if not line:
                     continue
-                out = self._dispatch_line(line)
+                out = self.dispatch_line(line)
                 if out is not None:
                     conn.sendall(out + b"\n")
 

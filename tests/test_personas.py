@@ -41,16 +41,16 @@ class TestEquivocator(unittest.TestCase):
 
         # a third party (honest node 1) gossips in the equivocator's ops+receipts
         # and ASSEMBLES the proof (B6): a portable, self-verifying DOUBLE_VOTE.
-        gossip.merge(sim._raw[1].acc.store, sim._raw[0].acc.store)
-        proofs = sim._raw[1].acc.store.detect_double_votes()
+        gossip.merge(sim.raw[1].acc.store, sim.raw[0].acc.store)
+        proofs = sim.raw[1].acc.store.detect_double_votes()
         self.assertEqual(len(proofs), 1)
         self.assertTrue(proofs[0].verify())
         self.assertEqual(proofs[0].signer, sim.roster[0])  # attributed to the equivocator
-        minted = sim._raw[1].acc.store.evidence()
+        minted = sim.raw[1].acc.store.evidence()
         self.assertTrue(any(k == EvidenceKind.DOUBLE_VOTE for k, _ in minted))
 
         # detection is idempotent — re-running mints nothing new
-        self.assertEqual(sim._raw[1].acc.store.detect_double_votes(), [])
+        self.assertEqual(sim.raw[1].acc.store.detect_double_votes(), [])
 
         # CONTAINMENT: a single equivocator never reached a quorum for either op
         # (B1 at the quorum level never fired), and the fold collapses the double
@@ -76,8 +76,8 @@ class TestEquivocator(unittest.TestCase):
         sim.nodes[2].accept(tag, ballot, b)  # this call reaches the 2nd QC; relaxed B1 must pass
         self.assertEqual(sim.decided_ops(tag), {a.op_hash, b.op_hash})  # two decrees, allowed
         # B6's other clauses: proof assemblable + fold still one winner
-        gossip.merge(sim._raw[1].acc.store, sim._raw[0].acc.store)
-        self.assertTrue(sim._raw[1].acc.store.detect_double_votes())
+        gossip.merge(sim.raw[1].acc.store, sim.raw[0].acc.store)
+        self.assertTrue(sim.raw[1].acc.store.detect_double_votes())
         r = fold.fold([*w.all_control(), a, b], w.keyring, w.genesis)
         self.assertIn(r.state.get(b"k"), (b"A", b"B"))
 
@@ -136,12 +136,12 @@ class TestWithholder(unittest.TestCase):
         w = World(seed=42, n_clients=1)
         op = creation_op(w, 0, b"v")
         # nodes 1,2 hold the committed op; node 0 is eclipsed (withheld from it)
-        sim._raw[1].acc.store.append(op)
-        sim._raw[2].acc.store.append(op)
-        self.assertIsNone(sim._raw[0].acc.store.get_op(op.op_hash))  # victim lacks it
+        sim.raw[1].acc.store.append(op)
+        sim.raw[2].acc.store.append(op)
+        self.assertIsNone(sim.raw[0].acc.store.get_op(op.op_hash))  # victim lacks it
         # a single honest contact (anti-entropy from node 1) heals the victim
-        gossip.merge(sim._raw[0].acc.store, sim._raw[1].acc.store)
-        self.assertIsNotNone(sim._raw[0].acc.store.get_op(op.op_hash))
+        gossip.merge(sim.raw[0].acc.store, sim.raw[1].acc.store)
+        self.assertIsNotNone(sim.raw[0].acc.store.get_op(op.op_hash))
 
 
 class TestSplitView(unittest.TestCase):
@@ -188,7 +188,7 @@ class TestFloorPerjurer(unittest.TestCase):
         w = World(seed=1, n_clients=1)
         op = creation_op(w, 0, b"v")  # small hlc
         assert op.slot_tag is not None
-        perjurer = sim._raw[0].acc
+        perjurer = sim.raw[0].acc
 
         wm = perjurer.issue_watermark(1000)  # attests floor ~990
         self.assertGreater(wm.floor.wall_ms, op.hlc.wall_ms)  # op is beneath the sworn floor
@@ -196,13 +196,13 @@ class TestFloorPerjurer(unittest.TestCase):
         # the perjurer receipts the below-floor op; an HONEST node rejects it (B3).
         rc = perjurer.on_accept(op.slot_tag, A.Ballot(1, b"x"), op, 1000)
         self.assertIsInstance(rc, A.Receipt)
-        honest = sim._raw[1].acc
+        honest = sim.raw[1].acc
         honest.issue_watermark(1000)
         hr = honest.on_accept(op.slot_tag, A.Ballot(1, b"y"), op, 1000)
         self.assertNotIsInstance(hr, A.Receipt)  # BELOW_FLOOR
 
         # a third party assembles the proof (B6) from the watermark + receipt + op
-        store = sim._raw[2].acc.store
+        store = sim.raw[2].acc.store
         store.put_op_raw(op)
         assert isinstance(rc, A.Receipt)
         store.put_receipt(rc)
@@ -223,14 +223,14 @@ class TestFloorPerjurer(unittest.TestCase):
         w = World(seed=2, n_clients=1)
         op = creation_op(w, 0, b"v")
         assert op.slot_tag is not None
-        honest = sim._raw[0].acc
+        honest = sim.raw[0].acc
         rc = honest.on_accept(op.slot_tag, A.Ballot(1, b"x"), op, 100)  # floor(100) < 0 -> legal
         assert isinstance(rc, A.Receipt)
         wm = honest.issue_watermark(1_000_000)  # floor rises far above op.hlc; a LATER seq
         self.assertGreater(wm.floor.wall_ms, op.hlc.wall_ms)  # op below the (later) floor
         self.assertLess(rc.issue_seq, wm.issue_seq)  # ...but receipted BEFORE attesting
 
-        store = sim._raw[1].acc.store
+        store = sim.raw[1].acc.store
         store.put_op_raw(op)
         store.put_receipt(rc)
         self.assertEqual(store.detect_floor_perjury([wm]), [])  # NOT convicted
@@ -244,7 +244,7 @@ class TestFloorPerjurer(unittest.TestCase):
         w = World(seed=3, n_clients=1)
         op = creation_op(w, 0, b"v")
         assert op.slot_tag is not None
-        acc = sim._raw[0].acc
+        acc = sim.raw[0].acc
         r1 = acc.on_accept(op.slot_tag, A.Ballot(1, b"x"), op, 100)
         r2 = acc.on_accept(op.slot_tag, A.Ballot(1, b"x"), op, 100)  # resubmission
         assert isinstance(r1, A.Receipt) and isinstance(r2, A.Receipt)

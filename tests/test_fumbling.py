@@ -102,20 +102,20 @@ class TestMistakenRecovery(unittest.TestCase):
         # the minority manager runs recovery: a root-signed fence activates e+1 on
         # node 0 only (no joint QC — a quorum is presumed gone).
         ckpt, rop = _recovery_pair(msk, mpub, [sim.roster[0]])
-        self.assertTrue(sim._raw[0].acc.on_recovery_fence(rop, ckpt, 1, ckpt.op_hash, mpub))
+        self.assertTrue(sim.raw[0].acc.on_recovery_fence(rop, ckpt, 1, ckpt.op_hash, mpub))
         # PRE-HEAL: divergence bounded to the partition — only node 0 advanced.
-        self.assertEqual([sim._raw[i].acc.epoch for i in range(3)], [1, 0, 0])
+        self.assertEqual([sim.raw[i].acc.epoch for i in range(3)], [1, 0, 0])
 
         # HEAL: the fence propagates; everyone who SEES it parks the old epoch.
         net.down.clear()
         for i in (1, 2):
-            self.assertTrue(sim._raw[i].acc.on_recovery_fence(rop, ckpt, 1, ckpt.op_hash, mpub))
-        self.assertEqual([sim._raw[i].acc.epoch for i in range(3)], [1, 1, 1])  # parked
+            self.assertTrue(sim.raw[i].acc.on_recovery_fence(rop, ckpt, 1, ckpt.op_hash, mpub))
+        self.assertEqual([sim.raw[i].acc.epoch for i in range(3)], [1, 1, 1])  # parked
 
         # old-epoch receipting stops: a fresh accept on a majority node stamps e+1.
         op2 = create(w, 0, b"k2", b"x")
         assert op2.slot_tag is not None
-        rc = sim._raw[1].acc.on_accept(op2.slot_tag, A.Ballot(1, b"z"), op2, NOW)
+        rc = sim.raw[1].acc.on_accept(op2.slot_tag, A.Ballot(1, b"z"), op2, NOW)
         assert isinstance(rc, A.Receipt)
         self.assertEqual(rc.config_epoch, 1)
 
@@ -123,7 +123,7 @@ class TestMistakenRecovery(unittest.TestCase):
         # B2) and its QC verifies at the now-PARKED epoch 0 < active 1 — a
         # contradiction against the recovery manifest, attributable to the recovery op.
         self.assertTrue(r.outcome.qc.verify(sim.roster))
-        self.assertLess(r.outcome.qc.config_epoch, sim._raw[1].acc.epoch)
+        self.assertLess(r.outcome.qc.config_epoch, sim.raw[1].acc.epoch)
 
     def test_over_window_commit_mints_lost_commit(self):
         # ruling 41(b): the over-window e=0 commit — below the recovery fence and
@@ -144,7 +144,7 @@ class TestMistakenRecovery(unittest.TestCase):
         # the recovery fence (empty manifest — presumes everything lost) activates e+1
         ckpt, _rop = _recovery_pair(msk, mpub, [sim.roster[0]])
         # an auditor holds the orphaned QC and the recovery fence; it discloses
-        store = sim._raw[0].acc.store
+        store = sim.raw[0].acc.store
         store.put_qc(r.outcome.qc)
         proofs = store.detect_lost_commits(1, ckpt.op_hash, frozenset())  # retained = {}
         self.assertEqual(len(proofs), 1)
@@ -161,8 +161,8 @@ class TestMistakenRecovery(unittest.TestCase):
         dsk = bytes([123] * 32)
         dpub = C.SIGNER.public(dsk)
         ckpt, rop = _recovery_pair(dsk, dpub, [sim.roster[0]])  # delegate-signed
-        self.assertFalse(sim._raw[0].acc.on_recovery_fence(rop, ckpt, 1, ckpt.op_hash, w.mgr_pub))
-        self.assertEqual(sim._raw[0].acc.epoch, 0)  # never activated
+        self.assertFalse(sim.raw[0].acc.on_recovery_fence(rop, ckpt, 1, ckpt.op_hash, w.mgr_pub))
+        self.assertEqual(sim.raw[0].acc.epoch, 0)  # never activated
 
 
 class TestFumblingManager(unittest.TestCase):
@@ -216,10 +216,10 @@ class TestFumblingManager(unittest.TestCase):
         w = World(seed=3, n_clients=0)
         rop = _roster(w.mgr_sk, w.mgr_pub, [sim.roster[0]], seq=0, prev=A.GENESIS_PREV)
         assert rop.slot_tag is not None
-        r = sim._raw[0].acc.on_roster_accept(rop.slot_tag, A.Ballot(1, b"m"), rop, {}, 1, NOW)
+        r = sim.raw[0].acc.on_roster_accept(rop.slot_tag, A.Ballot(1, b"m"), rop, {}, 1, NOW)
         self.assertIsInstance(r, A.Receipt)  # a possession receipt under e+1...
         # ...but NO node advanced its epoch — the abandoned flow half-activated nothing
-        self.assertEqual([sim._raw[i].acc.epoch for i in range(3)], [0, 0, 0])
+        self.assertEqual([sim.raw[i].acc.epoch for i in range(3)], [0, 0, 0])
 
 
 class TestAmnesiacManager(unittest.TestCase):
@@ -277,7 +277,7 @@ class TestButtonMasher(unittest.TestCase):
             self.assertTrue(sim.converged(), f"seed {seed}: heal did not converge")
             # every assembled double vote is a TRUE accusation against the persona;
             # an all-honest run mints nothing.
-            for pf in sim._raw[1].acc.store.detect_double_votes():
+            for pf in sim.raw[1].acc.store.detect_double_votes():
                 self.assertTrue(pf.verify())
                 self.assertEqual(pf.signer, sim.roster[0])
             if not has_persona:
@@ -285,9 +285,9 @@ class TestButtonMasher(unittest.TestCase):
                 # finding-17 arm: honest nodes' below-floor receipts (legally issued
                 # then re-issued forever) must NOT convict. Attest high floors and
                 # run the perjury detector on every node -> zero false accusations.
-                wms = [sim._raw[i].acc.issue_watermark(10_000_000) for i in range(3)]
+                wms = [sim.raw[i].acc.issue_watermark(10_000_000) for i in range(3)]
                 for i in range(3):
-                    st = sim._raw[i].acc.store
+                    st = sim.raw[i].acc.store
                     self.assertEqual(
                         st.detect_floor_perjury(wms), [], f"seed {seed}: FALSE floor-perjury n{i}"
                     )
