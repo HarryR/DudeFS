@@ -241,7 +241,10 @@ class Manager:
             certs=[],
         )
         st.save()
-        return cls(st)
+        m = cls(st)
+        if node_addr:  # genesis seed endpoint — the first record the mesh bootstraps from
+            m.set_endpoint(node_pub, [(b"unix", node_addr.encode(), {})])
+        return m
 
     @classmethod
     def load(cls, d: str) -> Manager:
@@ -308,6 +311,17 @@ class Manager:
         if addr:
             self.state.node_addrs[pub.hex()] = addr
         self.state.save()
+        if addr:  # publish a control-plane reachability record (PROTOCOL §7)
+            self.set_endpoint(pub, [(b"unix", addr.encode(), {})])
+
+    def set_endpoint(
+        self, subject: bytes, addrs: list[tuple[bytes, bytes, dict[bytes, bytes]]]
+    ) -> Op:
+        """Author a root-signed ENDPOINT record for `subject` (PROTOCOL §7 / NOTES
+        58): latest-wins per subject; empty `addrs` removes the node. Root-only."""
+        op = self.state.author_control(ctl.endpoint_body(subject, addrs))
+        self.state.save()
+        return op
 
     def node_promote(self, pub: bytes, rpc: NodeRPC) -> RosterChange:
         """Promote a learner to voting. Refuses an even voting roster client-side

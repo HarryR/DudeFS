@@ -16,6 +16,7 @@ from dudefs import crypto as C
 from dudefs.artifacts import VERSION_ABSENT
 from dudefs.client import ClientDaemon
 from dudefs.daemon import NodeDaemon
+from dudefs.handlers import control as ctl
 from dudefs.workerapi import WorkerServer
 from tests._builders import World, now_ms, poll_until
 
@@ -255,6 +256,79 @@ class TestWorkerAPIProtocol(unittest.TestCase):
         ids = {r["id"] for r in batch}
         self.assertEqual(ids, {1, 2})
         d.close()
+
+
+class TestEndpointConsumption(unittest.TestCase):
+    """The control plane IS the peer registry (NOTES 58): node daemons derive gossip
+    peers and client daemons derive roster_addrs from ENDPOINT control ops."""
+
+    def _endpoints(self, w, roster):
+        return [
+            w._mgr_op(ctl.endpoint_body(roster[i], [(b"unix", f"/n{i}.sock".encode(), {})]))
+            for i in range(len(roster))
+        ]
+
+    def test_node_daemon_derives_peers_from_endpoints(self):
+        w = World(seed=40, n_clients=0)
+        sks = [bytes([200 + i] * 32) for i in range(3)]
+        roster = [C.SIGNER.public(s) for s in sks]
+        eps = self._endpoints(w, roster)
+        nd = NodeDaemon(sks[0], roster[0], roster=roster, manager_pub=w.mgr_pub, delta_ms=10**9)
+        for op in [*w.control_ops, *eps]:
+            nd.store.put_op_raw(op)
+        nd.refresh_peers()
+        self.assertEqual(set(nd.peers), {"/n1.sock", "/n2.sock"})  # excludes self (roster[0])
+        nd.close()
+
+    def test_client_daemon_derives_roster_addrs_from_endpoints(self):
+        w = World(seed=41, n_clients=1)
+        sks = [bytes([200 + i] * 32) for i in range(3)]
+        roster = [C.SIGNER.public(s) for s in sks]
+        eps = self._endpoints(w, roster)
+        c = ClientDaemon(
+            w.clients[0].sk,
+            w.clients[0].pub,
+            roster=roster,
+            roster_addrs=["seed", "seed", "seed"],
+            manager_pub=w.mgr_pub,
+            masters={0: MASTER},
+            control_ops=[*w.control_ops, *eps],
+            epoch=0,
+        )
+        c.refresh_addrs()
+        self.assertEqual(c.roster_addrs, ["/n0.sock", "/n1.sock", "/n2.sock"])
+        c.close()
+
+    def test_derivation_prefers_transport_and_keeps_seed_when_missing(self):
+        # node0: multi-transport (https + unix) -> pick unix; node1: only https ->
+        # no unix uri, keep the seed; node2: no endpoint at all -> keep the seed.
+        w = World(seed=42, n_clients=1)
+        roster = [C.SIGNER.public(bytes([200 + i] * 32)) for i in range(3)]
+        eps = [
+            w._mgr_op(
+                ctl.endpoint_body(
+                    roster[0],
+                    [
+                        (b"https", b"https://x/dude", {b"lmsg": b"sealed"}),
+                        (b"unix", b"/n0.sock", {}),
+                    ],
+                )
+            ),
+            w._mgr_op(ctl.endpoint_body(roster[1], [(b"https", b"https://y/dude", {})])),
+        ]
+        c = ClientDaemon(
+            w.clients[0].sk,
+            w.clients[0].pub,
+            roster=roster,
+            roster_addrs=["s0", "s1", "s2"],
+            manager_pub=w.mgr_pub,
+            masters={0: MASTER},
+            control_ops=[*w.control_ops, *eps],
+            epoch=0,
+        )
+        c.refresh_addrs()
+        self.assertEqual(c.roster_addrs, ["/n0.sock", "s1", "s2"])  # unix picked; else seed kept
+        c.close()
 
 
 class TestWorkerAPIWire(unittest.TestCase):

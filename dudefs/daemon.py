@@ -18,11 +18,13 @@ from collections.abc import Callable
 from . import codec, gossip, tunables, wire
 from .acceptor import Acceptor
 from .artifacts import Op, Watermark, quorum_size
-from .fold import ControlReducer
+from .fold import ControlReducer, endpoints_of
 from .gossip import Delta
 from .handlers import control as ctl
 from .node import LocalNode, dispatch
 from .store import ChainStore, covered
+
+LOCAL_TRANSPORT = b"unix"  # the POC carrier; ENDPOINT addrs are (transport, uri, opts)
 
 
 def _gossip_request(summ: gossip.Summary) -> bytes:
@@ -95,6 +97,25 @@ class NodeDaemon:
             self.store.get_meta("checkpoint") or b"",
             self.store.cut_dead(),
         )
+
+    def address_book(self) -> dict[bytes, list[tuple[bytes, bytes, dict[bytes, bytes]]]]:
+        """Node reachability derived from the ENDPOINT control ops I hold (PROTOCOL
+        §7 / NOTES 58) — the control plane IS the peer registry."""
+        return endpoints_of(self.store.all_ops(), self.manager_pub, self.acc.epoch)
+
+    def refresh_peers(self, transport: bytes = LOCAL_TRANSPORT) -> None:
+        """Rebuild the anti-entropy peer list from the address book for the current
+        transport (every roster peer's URI but my own). Called after gossip pulls in
+        new ENDPOINT records; seed endpoints in genesis bootstrap the first round."""
+        peers: list[str] = []
+        for pub, addrs in self.address_book().items():
+            if pub == self.pub:
+                continue
+            uri = next((u for (t, u, _o) in addrs if t == transport), None)
+            if uri is not None:
+                peers.append(uri.decode())
+        if peers:  # supersede the seed/kwarg only ONCE endpoint records exist
+            self.peers = peers
 
     def gossip_round(self, peer_rpc: Callable[[bytes], bytes]) -> None:
         """One anti-entropy round against a peer: advertise my SUMMARY (digest
@@ -228,6 +249,7 @@ class NodeDaemon:
         self.adopt_committed_checkpoints()
         self.observe_fences()
         self.evidence_cycle(observed_watermarks)
+        self.refresh_peers()  # newly-gossiped ENDPOINT records join next tick's peer set
 
     def run_periodic(self, period_s: float, stop: threading.Event) -> None:
         """The epidemic cycle on a timer until `stop` — correctness rests on the

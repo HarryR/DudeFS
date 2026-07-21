@@ -404,6 +404,7 @@ class ClientDaemon:
     def _refresh_loop(self) -> None:
         while not self._closing.wait(REFRESH_MS / 1000.0):
             try:
+                self.refresh_addrs()  # pick up ENDPOINT records for the roster
                 self.sync()
             except OSError:
                 pass  # a transient unreachability; the next tick retries
@@ -589,6 +590,19 @@ class ClientDaemon:
             return None
         touching = [m for m in d.mutations if len(m) >= 2 and m[1] == path]
         return touching or None
+
+    def refresh_addrs(self, transport: bytes = b"unix") -> None:
+        """Derive `roster_addrs` from the ENDPOINT control ops I hold (PROTOCOL §7 /
+        NOTES 58) — the control plane is the node registry. Keeps the existing entry
+        for any roster member with no endpoint record yet (bootstrap fallback)."""
+        with self._lock:
+            book = fold.endpoints_of(self.store.all_ops(), self.manager_pub)
+            new = list(self.roster_addrs)
+            for i, pub in enumerate(self.cfg.roster):
+                uri = next((u.decode() for (t, u, _o) in book.get(pub, []) if t == transport), None)
+                if uri is not None and i < len(new):
+                    new[i] = uri
+            self.roster_addrs = new
 
     def close(self) -> None:
         """Signal in-flight drives to abort, let them wind down, then close the

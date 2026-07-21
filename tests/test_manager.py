@@ -151,6 +151,29 @@ class TestManagerOps(unittest.TestCase):
             with self.assertRaises(ManagerError):
                 m.node_add(m.state.roster[0])  # already a voting member
 
+    def _control_log(self, d):
+        with open(f"{d}/control.log") as f:
+            return [A.Op.from_bytes(bytes.fromhex(line.strip())) for line in f]
+
+    def test_node_add_with_addr_authors_an_endpoint(self):
+        with tempfile.TemporaryDirectory() as d:
+            m = Manager.init(d)
+            npub = C.SIGNER.public(bytes([5] * 32))
+            m.node_add(npub, addr="/run/node5.sock")
+            body = ctl.decode(self._control_log(d)[-1])
+            assert body is not None
+            self.assertEqual(body[ctl.BK_KIND], ctl.ControlKind.ENDPOINT)
+            self.assertEqual(body[b"subject"], npub)
+            self.assertEqual(body[b"addrs"], [(b"unix", b"/run/node5.sock", {})])
+
+    def test_init_seeds_the_genesis_endpoint(self):
+        from dudefs import fold
+
+        with tempfile.TemporaryDirectory() as d:
+            m = Manager.init(d, node_addr="/run/node0.sock")
+            book = fold.endpoints_of(self._control_log(d), m.state.manager_pub)
+            self.assertEqual(book[m.state.roster[0]], [(b"unix", b"/run/node0.sock", {})])
+
     def test_cert_issue_rejects_unknown_kind(self):
         with tempfile.TemporaryDirectory() as d:
             m = Manager.init(d)

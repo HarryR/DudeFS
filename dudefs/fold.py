@@ -751,3 +751,16 @@ class ControlReducer:
             # nodes never fold data, so a high pver never halts them.
             self.control.activate_pending_pver()
         return True
+
+
+def endpoints_of(
+    ops: list[Op], manager_pub: bytes, epoch: int = 0
+) -> dict[bytes, list[tuple[bytes, bytes, dict[bytes, bytes]]]]:
+    """Reduce ENDPOINT control ops to `{node_pub: addrs}` (latest-wins in manager-
+    chain order — PROTOCOL §7 / NOTES 58). The node and client daemons derive their
+    address books from this instead of taking addresses as kwargs."""
+    reducer = ControlReducer(manager_pub, epoch)
+    for op in sorted(ops, key=lambda o: (o.hlc.as_tuple(), o.op_hash)):
+        if op.is_control:
+            reducer.observe(op)
+    return reducer.control.endpoints
