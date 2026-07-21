@@ -210,6 +210,35 @@ MULTISIG = Ed25519ListMultiSig
 
 
 # --------------------------------------------------------------------------- #
+# Epoch key derivation — K_epoch master -> working keys (CRYPTO.md §2 / NOTES  #
+# 48, finding 21). The wrap-set seals ONE 32-byte master per epoch; every      #
+# working key is a keyed-BLAKE2b subkey under a fixed person domain. One wrap  #
+# distributes all; rotation/escrow hold one secret. Never wrap the pair.       #
+# --------------------------------------------------------------------------- #
+
+PERSON_ENC = b"dude.enc"  # data_key — the xcs1 AEAD key (payload confidentiality)
+PERSON_SLOT = b"dude.slot"  # slot_secret — the PRF key for slot tags (§7)
+PERSON_NONCE = b"dude.nonce"  # nk — the xcs1 SIV nonce subkey (derived under data_key)
+
+
+def _epoch_subkey(master: bytes, person: bytes) -> bytes:
+    """A 32-byte keyed-BLAKE2b subkey of `master` under a person domain. The
+    person separates the working keys so no two are ever equal, and knowledge of
+    one never yields another (domain separation)."""
+    return hashlib.blake2b(b"", key=master, person=person, digest_size=DIGEST_SIZE).digest()
+
+
+def derive_data_key(master: bytes) -> bytes:
+    """The xcs1 AEAD key for `master` (K_epoch), `person=b"dude.enc"`."""
+    return _epoch_subkey(master, PERSON_ENC)
+
+
+def derive_slot_secret(master: bytes) -> bytes:
+    """The slot-tag PRF secret for `master` (K_epoch), `person=b"dude.slot"`."""
+    return _epoch_subkey(master, PERSON_SLOT)
+
+
+# --------------------------------------------------------------------------- #
 # AEAD — data payloads (DESIGN §5, staged per IMPLEMENTATION §1)               #
 # --------------------------------------------------------------------------- #
 
@@ -235,11 +264,12 @@ class AeadXcs1:
 
     @staticmethod
     def _nonce(k: bytes, aad: bytes, pt: bytes) -> bytes:
-        # SIV nonce (CRYPTO.md §2). nk: 32-byte keyed-BLAKE2b subkey under a fixed
-        # personalization; nonce: 24-byte keyed digest over AD ‖ H(plaintext), so
-        # two plaintexts under one header get independent nonces. These vectors are
-        # the construction's canonical reference (KATs; the Rust/Go ports match).
-        nk = hashlib.blake2b(b"", key=k, person=b"dude.nonce", digest_size=32).digest()
+        # SIV nonce (CRYPTO.md §2). nk: the `dude.nonce` subkey of the AEAD key `k`
+        # (which is itself K_epoch's `dude.enc` subkey, finding 21); nonce: 24-byte
+        # keyed digest over AD ‖ H(plaintext), so two plaintexts under one header get
+        # independent nonces. These vectors are the construction's canonical
+        # reference (KATs; the Rust/Go ports match).
+        nk = _epoch_subkey(k, PERSON_NONCE)
         return hashlib.blake2b(aad + h(pt), key=nk, digest_size=NONCE_SIZE).digest()
 
     @classmethod
@@ -258,25 +288,19 @@ class AeadXcs1:
             return None  # authentication failure — decrypt fails loudly (⊥)
 
 
-AEAD_SUITES = {
-    b"xcs1": AeadXcs1,
-    # runner-ups if a standards-stamped MRAE is demanded (CRYPTO.md §2): `dxy2`
-    # (Deoxys-II), `AES-SIV`/`AES-GCM-SIV` — each one keyepoch bump away.
-}
+# ONE payload scheme, no suite menu (NOTES 42 — agility is a downgrade surface).
+# The AEAD is the constant `AEAD`, not a registry lookup: a scheme change is a
+# lane-2 pver fence + keyepoch rotation, never a per-op suite id (NOTES 48 nit).
+# Recorded fallbacks if a standards-stamped MRAE is ever demanded (CRYPTO.md §2):
+# `dxy2` (Deoxys-II), `AES-SIV`/`AES-GCM-SIV` — each one keyepoch bump away.
+AEAD = AeadXcs1
 
 
-def get_aead(suite_id: bytes = AEAD_SUITE) -> type[AeadXcs1]:
-    try:
-        return AEAD_SUITES[suite_id]
-    except KeyError:
-        raise CryptoError(f"unknown AEAD suite {suite_id!r}") from None
-
-
-def zero_knowledge_active(aead_suite_id: bytes = AEAD_SUITE) -> bool:
+def zero_knowledge_active() -> bool:
     """True under `xcs1` — payloads are genuinely encrypted (CRYPTO.md §2). The
     README banner / `dude status` surface this; it was False under the retired
     authenticated-unencrypted `auth0` launch suite."""
-    return bool(get_aead(aead_suite_id).confidential)
+    return bool(AEAD.confidential)
 
 
 # --------------------------------------------------------------------------- #

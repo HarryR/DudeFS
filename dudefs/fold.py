@@ -72,6 +72,23 @@ type Keyring = dict[int, dict[str, bytes]]  # keyepoch -> {data_key, slot_secret
 type BarrierState = dict[bytes, BarrierEntry]  # key -> {value, version, attempt}
 
 
+def keyring_from_masters(masters: dict[int, bytes]) -> Keyring:
+    """Build a Keyring by DERIVING each epoch's working keys from its 32-byte master
+    K_epoch (finding 21 / CRYPTO.md §2): `data_key` = the `dude.enc` subkey, the
+    xcs1 AEAD key; `slot_secret` = the `dude.slot` subkey, the slot-tag PRF key. The
+    master is what the wrap-set distributes and escrow holds — a client unwraps ONE
+    secret per epoch and derives the rest here (a deterministic view; the dict shape
+    is kept so every consumer's `ring["data_key"]` / `ring["slot_secret"]` is
+    unchanged)."""
+    return {
+        e: {
+            "data_key": crypto.derive_data_key(k),
+            "slot_secret": crypto.derive_slot_secret(k),
+        }
+        for e, k in masters.items()
+    }
+
+
 class Verdict(StrEnum):
     """Per-op fold outcome (DESIGN §6). Frozen at finality (§9)."""
 

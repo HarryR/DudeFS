@@ -1465,6 +1465,40 @@ and A4 as formally stated. Resolutions decided with the design owner; DESIGN
       swap wave alongside finding 19 (same fix family, same commit is
       fine).
 
+48. **CRYPTO-SWAP WAVE REVIEW (2026-07-21, `3e49ca1..38e7a1e`): CLEARED
+    — WP2/WP3 are GO (parallel). One latent finding (21) ruled for WP2;
+    one nit. 190 green, and the suite dropped 27s → 2.9s (libsodium
+    retired the pure-Python Ed25519 bottleneck).**
+    - Verified: commit 1's invisibility claim is proven by absence (no
+      golden file touched); `xcs1` conforms to CRYPTO.md §2 exactly —
+      and carrying the nonce in the blob rather than re-deriving at
+      open is ACCEPTED with rationale on record: the fold never
+      re-encrypts (A1 determinism lives in committed bytes), and a
+      tampered nonce fails the Poly1305 tag; an author choosing a
+      non-derived nonce only randomizes its own ciphertext, which
+      nothing depends on. Deletion sweep clean (vendored ed25519 gone,
+      auth0 gone, `aead_suite` threading collapsed). `sbx1` primitives
+      + real wrap bodies at the ruled Option-A scope. Findings 19/20
+      exactly per ruling, both regression pairs revert-checked.
+    - **(21, MEDIUM, latent — the wrap distributes HALF the key
+      material.)** `fold.Keyring` needs TWO working secrets per epoch
+      (`data_key`, `slot_secret`); `sealed_wrap_set_body` seals ONE.
+      Bites at WP2's keyring bootstrap (the unwrap-and-install flow).
+      **Ruling: K_epoch becomes THE epoch master secret; working keys
+      DERIVE** via keyed-BLAKE2 `person` domains (`dude.enc`,
+      `dude.slot`, `dude.nonce` — CRYPTO.md §2 as amended). One wrap
+      distributes everything; rotation generates one secret; escrow
+      holds one. Wrapping the pair independently REJECTED (doubles the
+      distribution/rotation/escrow surface for nothing). Lands with its
+      WP2 consumer: `fold.Keyring` entries become derived-from-master
+      (or the type collapses to `{keyepoch: K}` with derivation at the
+      call sites — implementer's shape call), with the World builders
+      updated so tests exercise the derivation.
+    - **Nit (WP2 housekeeping):** the one-entry AEAD suite registry
+      (`get_aead(suite_id)` / `zero_knowledge_active(suite_id)`) is
+      vestigial generality against the one-scheme rule — collapse to
+      the constant.
+
 # Not yet built (by design, M2+)
 
 QCs are *constructed and verified* (M0) but no acceptor, quorum client, floor,

@@ -436,6 +436,35 @@ class TestWrapSet(unittest.TestCase):
         outsider = bytes([200] * 32)
         self.assertIsNone(ctl.unwrap_group_key(body, outsider))
 
+    def test_unwrap_then_derive_installs_the_working_keyring(self):
+        # the finding-21 loop: ONE master is wrapped/unwrapped, then BOTH working
+        # keys derive from it (data_key + slot_secret) — the client never receives
+        # them over the wire, it derives them locally.
+        sk = bytes([60] * 32)
+        member = C.SIGNER.public(sk)
+        k_epoch = bytes([0xC3] * 32)
+        body = ctl.decode(
+            A.Op.build(
+                author_sk=bytes([1] * 32),
+                author_pub=C.SIGNER.public(bytes([1] * 32)),
+                cls_=A.OpClass.CONTROL,
+                seq=0,
+                prev=A.GENESIS_PREV,
+                hlc=A.HLC(NOW, 0),
+                deps=[],
+                authz=b"root",
+                keyepoch=2,
+                payload=ctl.sealed_wrap_set_body(2, k_epoch, [member]),
+            )
+        )
+        assert body is not None
+        recovered = ctl.unwrap_group_key(body, sk)
+        assert recovered is not None
+        self.assertEqual(recovered, k_epoch)
+        ring = fold.keyring_from_masters({2: recovered})
+        self.assertEqual(ring[2]["data_key"], C.derive_data_key(k_epoch))
+        self.assertEqual(ring[2]["slot_secret"], C.derive_slot_secret(k_epoch))
+
 
 class TestEpochPersistence(unittest.TestCase):
     """Finding 20 (finding 19's twin): the config epoch stamps every receipt/

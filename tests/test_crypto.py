@@ -98,7 +98,37 @@ class TestAeadXcs1(unittest.TestCase):
         self.assertNotEqual(n1, n2)
 
     def test_zero_knowledge_active(self):
-        self.assertTrue(C.zero_knowledge_active(b"xcs1"))
+        self.assertTrue(C.zero_knowledge_active())
+
+
+class TestEpochKeyDerivation(unittest.TestCase):
+    # K_epoch is THE epoch master (finding 21): the working keys DERIVE via person
+    # domains, they are not distributed. Canonical KATs for master = 00..1f — the
+    # Rust/Go ports MUST reproduce these exact subkeys.
+    KAT_MASTER = bytes(range(32))
+    KAT_DATA_KEY = binascii.unhexlify(
+        "1522919474e9234bbcb572caa1937517d999a2cec896d0c936b4e7ce04bb4774"
+    )
+    KAT_SLOT_SECRET = binascii.unhexlify(
+        "8bac258c8b84cc47efacb70a3d912955041ac2b3621938081ff19124ee94de6b"
+    )
+
+    def test_derivation_kat_is_canonical(self):
+        self.assertEqual(C.derive_data_key(self.KAT_MASTER), self.KAT_DATA_KEY)
+        self.assertEqual(C.derive_slot_secret(self.KAT_MASTER), self.KAT_SLOT_SECRET)
+
+    def test_domain_separation_and_determinism(self):
+        K = bytes([7] * 32)
+        dk, ss = C.derive_data_key(K), C.derive_slot_secret(K)
+        self.assertEqual(len(dk), 32)
+        self.assertEqual(len(ss), 32)
+        # each working key is distinct from the master and from every sibling
+        self.assertNotEqual(dk, ss)
+        self.assertNotEqual(dk, K)
+        self.assertNotEqual(ss, K)
+        # deterministic; a different master gives entirely different subkeys
+        self.assertEqual(C.derive_data_key(K), dk)
+        self.assertNotEqual(C.derive_data_key(bytes([8] * 32)), dk)
 
 
 class TestSealedBoxSbx1(unittest.TestCase):

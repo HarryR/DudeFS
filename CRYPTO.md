@@ -99,6 +99,15 @@ suite xcs1 (XChaCha-SIV):
   C, tag = XChaCha20-Poly1305-IETF(key=K_epoch, nonce, ad=AD, plaintext=P)
 ```
 
+**K_epoch is THE epoch secret — subkeys derive, they are not distributed
+(NOTES 48, finding 21).** The keyring needs two working keys per epoch (the
+data key and the slot-tag secret), but the wrap-set seals exactly ONE 32-byte
+master: `data_key = blake2b(key=K_epoch, person=b"dude.enc")`, `slot_secret =
+blake2b(key=K_epoch, person=b"dude.slot")` (and `nk` above). One wrap
+distributes everything; rotation generates one secret; escrow holds one
+secret. Wrapping the two working keys independently is REJECTED — it doubles
+the distribution/rotation/escrow surface for zero gain.
+
 With the plaintext folded into the nonce, reuse is structurally impossible:
 two payloads under one header get independent nonces. Residual leakage is the
 standard MRAE bound — determinism (identical `(key, header, plaintext)` ⇒

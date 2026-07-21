@@ -406,7 +406,7 @@ class Op:
         authentication failure (⊥). Control ops carry plaintext payloads and
         must not be opened this way. AD = envelope-minus-payload, recomputed from
         the envelope; the SIV nonce travels inside the sealed blob (CRYPTO.md §2)."""
-        return crypto.get_aead().open(data_key, self.aad_hash(), self.payload)
+        return crypto.AEAD.open(data_key, self.aad_hash(), self.payload)
 
     # ---- construction ----------------------------------------------------- #
     @classmethod
@@ -498,7 +498,7 @@ class Op:
         if slot_tag is not None:
             base[Field.SLOT_TAG] = slot_tag
         aad = crypto.h(codec.encode(base))  # envelope-minus-payload-minus-sig
-        payload = crypto.get_aead().seal(data_key, aad, txn_bytes)  # nonce ‖ ct ‖ tag
+        payload = crypto.AEAD.seal(data_key, aad, txn_bytes)  # nonce ‖ ct ‖ tag
         return cls.build(
             author_sk=author_sk,
             author_pub=author_pub,
