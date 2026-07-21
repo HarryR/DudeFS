@@ -5,6 +5,11 @@
 # authorization boundary, and no node verb is reachable here (distinct listener,
 # distinct dispatch table — CLIENT.md §0, Harry's p2p/local-must-not-bleed rule).
 #
+# This is the ONE unauthenticated surface (no L_msg): it is genuinely local and
+# keyless. The p2p wire is authenticated ALWAYS — even its unix socket, which is only
+# a test convenience for an inherently remote protocol. Auth is the floor everywhere
+# but here (PROTOCOL §7.5).
+#
 # Framing: newline-delimited JSON (one request object or batch array per line).
 # Every verb returns IMMEDIATELY from state the ClientDaemon already holds — poll
 # is the only idiom, nothing blocks, there is no server push (CLIENT.md §1). A

@@ -82,40 +82,41 @@ def author(
 # --------------------------------------------------------------------------- #
 
 
-def seal_request(env: Envelope, to_pub: bytes, reply_key: bytes, *, hinted: bool) -> bytes:
+def seal_request(env: Envelope, to_pub: bytes, reply_key: bytes) -> bytes:
     """Seal a fully-signed `env` (+ a REQUIRED fresh ephemeral reply-key) to `to_pub`.
     `reply_key` is the requester's ephemeral PUBLIC key; the node seals its reply back
-    to it (confidential both ways, still no session). Required in sealed mode — an
-    optional reply-key is a downgrade lever (⟦F⟧). `hinted` emits the screening tag
-    for a MULTIPLEXED carrier (§3); a direct carrier passes hinted=False (empty tag,
-    `to` stays inside the seal). The outer wire is [to_hint, sealed]."""
+    to it (confidential both ways, still no session). The outer wire is ALWAYS
+    `[to_hint, sealed]` — a sealed packet is always hinted (TRANSPORT §3): the cheap
+    keyed-BLAKE2 tag is the ECDH pre-filter, on every sealed message, point-to-point or
+    multiplexed. No un-hinted variant."""
     if not reply_key:
         raise ValueError("sealed mode requires a reply-key (no downgrade lever, TRANSPORT §2)")
     inner = codec.encode([env.encode(), reply_key])
     sealed = C.seal_to(to_pub, inner)
-    tag = C.screen_tag(to_pub, sealed) if hinted else b""
-    return codec.encode([tag, sealed])
+    return codec.encode([C.screen_tag(to_pub, sealed), sealed])
 
 
 def matches_tag(self_pub: bytes, outer: bytes) -> bool:
-    """Screen an inbound sealed message off a MULTIPLEXED carrier WITHOUT unsealing
-    (TRANSPORT §3): an empty tag means 'not hinted' — a direct carrier, always mine to
-    trial-open; a present tag is mine iff it keys under MY identity. A never-member
-    cannot forge the tag, so its noise free-drops here before any ECDH (§4)."""
+    """Screen a sealed `[to_hint, sealed]` WITHOUT unsealing: it is for me iff the tag
+    keys under MY identity (TRANSPORT §3). One keyed hash, no ECDH — the DoS pre-filter
+    before any unseal. A never-member can't forge the tag, so its noise screens out
+    here (§4); a malformed outer screens out too."""
     try:
         parts = codec.as_seq(codec.decode(outer), length=2)
         tag, sealed = codec.as_bytes(parts[0]), codec.as_bytes(parts[1])
     except (ValueError, IndexError, codec.CodecError):
         return False  # malformed -> not mine, screen out
-    if not tag:
-        return True
     return hmac.compare_digest(tag, C.screen_tag(self_pub, sealed))
 
 
 def unseal_request(sk: bytes, outer: bytes) -> tuple[Envelope, bytes] | None:
     """Open a sealed request with `sk`; return (inner envelope, reply_key), or None if
-    it wasn't sealed to me / is malformed. Does NOT verify the sig or gate — the
-    AEAD tag already proves it was sealed to my key; the caller runs `gate` next."""
+    the tag isn't mine / it wasn't sealed to me / is malformed. The keyed tag is
+    checked FIRST (one hash) so the ECDH runs only on a hit — the pre-filter (§4). Does
+    NOT verify the sig or gate; the caller runs `gate` next."""
+    self_pub = C.SIGNER.public(sk)
+    if not matches_tag(self_pub, outer):
+        return None  # wrong tag -> not mine, dropped for one hash (no ECDH)
     try:
         parts = codec.as_seq(codec.decode(outer), length=2)
         opened = C.open_sealed(sk, codec.as_bytes(parts[1]))
@@ -128,14 +129,25 @@ def unseal_request(sk: bytes, outer: bytes) -> tuple[Envelope, bytes] | None:
 
 
 def seal_reply(env: Envelope, reply_key: bytes) -> bytes:
-    """Seal a node's signed reply back to the requester's ephemeral `reply_key`."""
-    return C.seal_to(reply_key, env.encode())
+    """Seal a node's signed reply back to the requester's ephemeral `reply_key`,
+    symmetric with the request: `[to_hint, sealed]` so the requester can O(1)-screen
+    its reply (keyed by its reply-key) before the ECDH — the reverse-direction hint."""
+    sealed = C.seal_to(reply_key, env.encode())
+    return codec.encode([C.screen_tag(reply_key, sealed), sealed])
 
 
-def unseal_reply(reply_sk: bytes, sealed: bytes) -> Envelope | None:
-    """Open a sealed reply with the requester's ephemeral reply secret."""
-    opened = C.open_sealed(reply_sk, sealed)
-    return Envelope.decode(opened) if opened is not None else None
+def unseal_reply(reply_sk: bytes, outer: bytes) -> Envelope | None:
+    """Open a sealed reply with the requester's ephemeral reply secret — tag pre-filter
+    (keyed by the reply-key pub) FIRST, then the ECDH only on a hit."""
+    reply_pub = C.SIGNER.public(reply_sk)
+    if not matches_tag(reply_pub, outer):
+        return None
+    try:
+        parts = codec.as_seq(codec.decode(outer), length=2)
+        opened = C.open_sealed(reply_sk, codec.as_bytes(parts[1]))
+        return Envelope.decode(opened) if opened is not None else None
+    except (ValueError, IndexError, codec.CodecError):
+        return None
 
 
 # --------------------------------------------------------------------------- #

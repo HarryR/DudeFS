@@ -51,7 +51,7 @@ class TestSealedEnvelope(unittest.TestCase):
     def test_sign_then_seal_round_trip_hides_everything_but_the_hint(self):
         rsk, rpub = self._reply_kp()
         env = lmsg.author(A_SK, B, b"SUBMIT", b"top-secret", epoch=0, ts=NOW)
-        outer = lmsg.seal_request(env, B, rpub, hinted=True)
+        outer = lmsg.seal_request(env, B, rpub)
         # the intermediary sees neither the verb, the from, nor the body
         self.assertNotIn(b"SUBMIT", outer)
         self.assertNotIn(b"top-secret", outer)
@@ -66,14 +66,14 @@ class TestSealedEnvelope(unittest.TestCase):
     def test_only_the_addressee_can_unseal(self):
         rsk, rpub = self._reply_kp()
         env = lmsg.author(A_SK, B, b"GET", b"q", epoch=0, ts=NOW)
-        outer = lmsg.seal_request(env, B, rpub, hinted=True)
+        outer = lmsg.seal_request(env, B, rpub)
         self.assertIsNone(lmsg.unseal_request(X_SK, outer))  # wrong recipient key
         self.assertIsNone(lmsg.unseal_request(B_SK, outer[:-1] + bytes([outer[-1] ^ 1])))  # tamper
 
     def test_sealed_mode_requires_a_reply_key(self):
         env = lmsg.author(A_SK, B, b"GET", b"q", epoch=0, ts=NOW)
         with self.assertRaises(ValueError):
-            lmsg.seal_request(env, B, b"", hinted=True)  # no downgrade lever
+            lmsg.seal_request(env, B, b"")  # no downgrade lever
 
     def test_sealed_reply_round_trips_to_the_ephemeral_key(self):
         rsk, rpub = self._reply_kp()
@@ -89,18 +89,9 @@ class TestScreeningTag(unittest.TestCase):
     def test_hint_matches_only_the_target_identity(self):
         rpub = C.SIGNER.public(bytes([77] * 32))
         env = lmsg.author(A_SK, B, b"SUBMIT", b"x", epoch=0, ts=NOW)
-        outer = lmsg.seal_request(env, B, rpub, hinted=True)
+        outer = lmsg.seal_request(env, B, rpub)
         self.assertTrue(lmsg.matches_tag(B, outer))  # the addressee screens IN
         self.assertFalse(lmsg.matches_tag(X, outer))  # a bystander node screens OUT
-
-    def test_direct_carrier_has_no_hint_so_everyone_trial_opens(self):
-        # hinted=False -> empty tag -> matches_tag True for anyone (the trial-decrypt
-        # fallback on a direct carrier; `to` still lives inside the seal).
-        rpub = C.SIGNER.public(bytes([77] * 32))
-        env = lmsg.author(A_SK, B, b"SUBMIT", b"x", epoch=0, ts=NOW)
-        outer = lmsg.seal_request(env, B, rpub, hinted=False)
-        self.assertTrue(lmsg.matches_tag(B, outer))
-        self.assertTrue(lmsg.matches_tag(X, outer))
 
     def test_the_tag_is_identity_keyed_so_a_wrong_key_diverges(self):
         # the free-drop rung: the tag is keyed by the TARGET identity, so a party
@@ -110,10 +101,24 @@ class TestScreeningTag(unittest.TestCase):
 
         rpub = C.SIGNER.public(bytes([77] * 32))
         env = lmsg.author(A_SK, B, b"SUBMIT", b"x", epoch=0, ts=NOW)
-        outer = lmsg.seal_request(env, B, rpub, hinted=True)
+        outer = lmsg.seal_request(env, B, rpub)
         tag, sealed = (codec.as_bytes(p) for p in codec.as_seq(codec.decode(outer), length=2))
         self.assertEqual(tag, C.screen_tag(B, sealed))  # the addressee reproduces it
         self.assertNotEqual(tag, C.screen_tag(X, sealed))  # any other key diverges
+
+    def test_wrong_tag_drops_before_the_ecdh(self):
+        # the pre-filter: a box GENUINELY sealed to B but re-tagged for X is dropped at
+        # the tag — B never reaches the (would-succeed) unseal. Proves the tag gates the
+        # ECDH, not the other way round.
+        from dudefs import codec
+
+        rpub = C.SIGNER.public(bytes([77] * 32))
+        env = lmsg.author(A_SK, B, b"SUBMIT", b"x", epoch=0, ts=NOW)
+        outer = lmsg.seal_request(env, B, rpub)  # correctly sealed + tagged for B
+        _tag, sealed = (codec.as_bytes(p) for p in codec.as_seq(codec.decode(outer), length=2))
+        forged = codec.encode([C.screen_tag(X, sealed), sealed])  # same box, wrong tag
+        self.assertIsNone(lmsg.unseal_request(B_SK, forged))  # dropped at the tag
+        self.assertIsNotNone(lmsg.unseal_request(B_SK, outer))  # right tag -> opens
 
 
 class TestRequestGate(unittest.TestCase):

@@ -39,7 +39,7 @@ class Link:
             )
             return lmsg.classify_reply(raw, expect_from=self.to_pub, expect_to=self.self_pub)
         reply_sk = os.urandom(32)  # ephemeral reply-key, sealed INSIDE the request
-        sealed = lmsg.seal_request(env, self.to_pub, C.SIGNER.public(reply_sk), hinted=False)
+        sealed = lmsg.seal_request(env, self.to_pub, C.SIGNER.public(reply_sk))
         raw = transports.dial(self.endpoint.transport, self.endpoint.uri, sealed, timeout=timeout)
         return lmsg.classify_sealed_reply(
             raw, reply_sk=reply_sk, expect_from=self.to_pub, expect_to=self.self_pub
