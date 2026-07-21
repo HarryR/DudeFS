@@ -17,7 +17,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from enum import Enum
 from functools import total_ordering
-from typing import Self
+from typing import NamedTuple, Self
 
 from . import codec, crypto
 from .codec import Bencodable
@@ -129,7 +129,17 @@ def slot_priority(slot_tag: bytes, client_fp: bytes) -> bytes:
     return crypto.h(slot_tag + client_fp)
 
 
-def retained_commitment(retained: list[Op]) -> dict[bytes, tuple[int, bytes]]:
+class RetainedEntry(NamedTuple):
+    """A per-author retained-set commitment (DESIGN §12 rev 6): how many op-hashes are
+    retained below the cut, and a digest over them. A NamedTuple (still a tuple, so it
+    compares equal to the wire pair) — named access beats `entry[0]`/`entry[1]`. (Field
+    is `size`, not `count`, since `tuple.count` is a method.)"""
+
+    size: int
+    digest: bytes
+
+
+def retained_commitment(retained: list[Op]) -> dict[bytes, RetainedEntry]:
     """The per-author `(count, digest)` over retained op-hashes (DESIGN §12 rev 6,
     NOTES 29c) — carried by a checkpoint's `retained` field and by gossip SUMMARY.
     Plaintext (hashes are public metadata). Below the cut it does double duty: the
@@ -139,7 +149,9 @@ def retained_commitment(retained: list[Op]) -> dict[bytes, tuple[int, bytes]]:
     by_author: dict[bytes, list[bytes]] = {}
     for op in retained:
         by_author.setdefault(op.author, []).append(op.op_hash)
-    return {a: (len(hs), crypto.h(b"".join(sorted(hs)))) for a, hs in by_author.items()}
+    return {
+        a: RetainedEntry(len(hs), crypto.h(b"".join(sorted(hs)))) for a, hs in by_author.items()
+    }
 
 
 def roster_slot_tag(epoch: int) -> bytes:

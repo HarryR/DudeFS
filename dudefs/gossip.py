@@ -21,6 +21,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 from . import artifacts as A
@@ -49,7 +50,7 @@ class Summary:
     floor: HLC
     epoch: int
     checkpoint: bytes = b""  # the active checkpoint op_hash (b"" = no compaction)
-    retained: dict[bytes, tuple[int, bytes]] = field(default_factory=dict)  # baseline digest
+    retained: dict[bytes, A.RetainedEntry] = field(default_factory=dict)  # baseline digest
 
 
 def summary(
@@ -170,7 +171,7 @@ def pull_baseline(
 def verify_baseline(
     store: ChainStore,
     cut: Heads,
-    committed: dict[bytes, tuple[int, bytes]],
+    committed: Mapping[bytes, tuple[int, bytes]],
     dead: frozenset[bytes] = frozenset(),
 ) -> set[bytes]:
     """Verify a node/client holds the FULL below-cut baseline against the
@@ -214,10 +215,10 @@ def decode_summary(data: bytes) -> Summary:
         for pair in (codec.as_seq(x, 2) for x in codec.as_seq(p[1]))
     )
     qcs = frozenset(codec.as_bytes(x) for x in codec.as_seq(p[2]))
-    retained: dict[bytes, tuple[int, bytes]] = {}
+    retained: dict[bytes, A.RetainedEntry] = {}
     for a, entry in codec.as_dict(p[6]).items():
         c, dig = codec.as_seq(entry, 2)
-        retained[codec.as_bytes(a)] = (codec.as_int(c), codec.as_bytes(dig))
+        retained[codec.as_bytes(a)] = A.RetainedEntry(codec.as_int(c), codec.as_bytes(dig))
     return Summary(
         heads, receipts, qcs, HLC.decode(p[3]), codec.as_int(p[4]), codec.as_bytes(p[5]), retained
     )

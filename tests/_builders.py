@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import random
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
 from dudefs import artifacts as A
@@ -177,7 +177,7 @@ class World:
         cut: A.Heads | None = None,
         state_root: bytes = b"",
         dead: list[bytes] | None = None,
-        retained: dict[bytes, tuple[int, bytes]] | None = None,
+        retained: Mapping[bytes, tuple[int, bytes]] | None = None,
         attempts: bytes = b"",
         keyepoch: int = 0,
         horizon: A.HLC | None = None,

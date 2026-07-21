@@ -12,12 +12,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
 from .. import codec, crypto
-from ..artifacts import HLC, BytesEnum, Heads, Op
+from ..artifacts import HLC, BytesEnum, Heads, Op, RetainedEntry
 
 # Body discriminator (a field key, not a value vocabulary).
 BK_KIND = b"kind"
@@ -97,7 +97,7 @@ class Checkpoint:
     cut: Heads
     state_root: bytes
     dead: list[bytes]
-    retained: dict[bytes, tuple[int, bytes]]  # author -> (count, digest)
+    retained: dict[bytes, RetainedEntry]  # author -> (count, digest)
     attempts: bytes
     keyepoch: int
     horizon: HLC  # the finality frontier F the cut was sealed at (§9)
@@ -179,13 +179,13 @@ def _v_wrap_set(b: dict[bytes, codec.Bencodable]) -> WrapSet:
     )
 
 
-def _retained(v: codec.Bencodable) -> dict[bytes, tuple[int, bytes]]:
-    """Per-author retained-set commitment: {author: (count, digest)} (DESIGN §12
+def _retained(v: codec.Bencodable) -> dict[bytes, RetainedEntry]:
+    """Per-author retained-set commitment: {author: (size, digest)} (DESIGN §12
     rev 6, NOTES 29c). Plaintext — op-hashes are public metadata."""
-    out: dict[bytes, tuple[int, bytes]] = {}
+    out: dict[bytes, RetainedEntry] = {}
     for author, entry in codec.as_dict(v).items():
         pair = codec.as_seq(entry, 2)
-        out[author] = (_uint(pair[0]), codec.as_bytes(pair[1]))
+        out[author] = RetainedEntry(_uint(pair[0]), codec.as_bytes(pair[1]))
     return out
 
 
@@ -341,7 +341,7 @@ def checkpoint_body(
     cut: Heads,
     state_root: bytes,
     dead: list[bytes],
-    retained: dict[bytes, tuple[int, bytes]],
+    retained: Mapping[bytes, tuple[int, bytes]],
     attempts: bytes,
     keyepoch: int,
     horizon: HLC,

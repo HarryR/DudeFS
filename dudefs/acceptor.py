@@ -377,7 +377,7 @@ class Acceptor:
         heads = self.store.heads()
         cut = self.store.cut()
         committed = self.store.cut_retained()
-        have_baseline: dict[bytes, tuple[int, bytes]] | None = None  # computed once, lazily
+        have_baseline: dict[bytes, A.RetainedEntry] | None = None  # computed once, lazily
         for author, (seq, head_hash) in sync_frontier.items():
             centry = cut.get(author)
             if centry is not None and seq <= centry[0]:

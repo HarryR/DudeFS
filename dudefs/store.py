@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Mapping
 from enum import StrEnum
 
 from . import artifacts as A
@@ -29,7 +30,7 @@ def covered(op: Op, cut: Heads) -> bool:
 
 def baseline_digest(
     ops: list[Op], cut: Heads, dead: frozenset[bytes]
-) -> dict[bytes, tuple[int, bytes]]:
+) -> dict[bytes, A.RetainedEntry]:
     """The per-author commitment over the RETAINED below-cut projection —
     `covered ∖ dead` (DESIGN §12 / NOTES 34, Q2). Excluding `dead` is what makes
     a lazy-GC node (still holding superseded ops) agree with a GC'd node and with
@@ -38,7 +39,7 @@ def baseline_digest(
     return A.retained_commitment([o for o in ops if covered(o, cut) and o.op_hash not in dead])
 
 
-def _encode_pairs(d: dict[bytes, tuple[int, bytes]]) -> bytes:
+def _encode_pairs(d: Mapping[bytes, tuple[int, bytes]]) -> bytes:
     """Serialize a {key: (n, hash)} map (a cut or a retained commitment) for the
     durable `meta` table."""
     return codec.encode({a: [n, h] for a, (n, h) in d.items()})
@@ -585,7 +586,7 @@ class ChainStore:
     def adopt_checkpoint(
         self,
         cut: Heads,
-        retained: dict[bytes, tuple[int, bytes]],
+        retained: Mapping[bytes, tuple[int, bytes]],
         dead: list[bytes] = [],  # noqa: B006 (read-only default; never mutated)
         horizon: HLC | None = None,
     ) -> None:
@@ -621,11 +622,11 @@ class ChainStore:
         raw = self.get_meta("cut")
         return _decode_pairs(raw) if raw else {}
 
-    def cut_retained(self) -> dict[bytes, tuple[int, bytes]]:
+    def cut_retained(self) -> dict[bytes, A.RetainedEntry]:
         """The checkpoint's signed per-author below-cut commitment (the target a
         node's own baseline_commitment() must match to prove completeness)."""
         raw = self.get_meta("cut_retained")
-        return _decode_pairs(raw) if raw else {}
+        return {a: A.RetainedEntry(*p) for a, p in _decode_pairs(raw).items()} if raw else {}
 
     def cut_dead(self) -> frozenset[bytes]:
         """The active checkpoint's `dead` set — masked out of the retained
@@ -658,7 +659,7 @@ class ChainStore:
         receipt is signed under the new epoch."""
         self.set_meta("epoch", codec.encode(int(epoch)))
 
-    def baseline_commitment(self) -> dict[bytes, tuple[int, bytes]]:
+    def baseline_commitment(self) -> dict[bytes, A.RetainedEntry]:
         """This node's ACTUAL commitment over the RETAINED below-cut projection
         (covered ∖ dead) — compared per author against cut_retained() to prove
         baseline completeness (WP1.2 possession, WP1.3 gossip). Excluding `dead`
