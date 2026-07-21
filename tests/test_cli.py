@@ -67,9 +67,8 @@ class TestManagerCommands(unittest.TestCase):
             with open(os.path.join(d, "control.log")) as f:
                 raw = bytes.fromhex(f.readlines()[-1].strip())
             body = ctl.decode(A.Op.from_bytes(raw))
-            assert body is not None
-            self.assertEqual(body[ctl.BK_KIND], ctl.ControlKind.CERT_ISSUE)
-            self.assertEqual(body[b"subject"], client_pub)
+            assert isinstance(body, ctl.CertIssue)
+            self.assertEqual(body.subject, client_pub)
 
     def test_revoke_stages_rotate_and_bumps_keyepoch(self):
         with tempfile.TemporaryDirectory() as d:
@@ -183,9 +182,8 @@ class TestRecoverInterlock(unittest.TestCase):
             with open(os.path.join(d, "control.log")) as f:
                 raw = bytes.fromhex(f.readlines()[-1].strip())
             body = ctl.decode(A.Op.from_bytes(raw))
-            assert body is not None
-            self.assertEqual(body[ctl.BK_KIND], ctl.ControlKind.ROSTER)
-            self.assertIsNotNone(body[b"recovery"])  # names the recovery checkpoint
+            assert isinstance(body, ctl.Roster)
+            self.assertIsNotNone(body.recovery)  # names the recovery checkpoint
             self.assertEqual(ManagerState.load(d).epoch, 1)  # epoch advanced
 
 

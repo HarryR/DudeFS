@@ -264,8 +264,8 @@ class TestDemoRunbook(unittest.TestCase):
                 self.assertIs(recover_decision(report, data_loss_ack=True), RecoverDecision.PROCEED)
                 ckpt, rop = m.author_recovery_fence(report)
                 rbody = ctl.decode(rop)
-                assert rbody is not None
-                self.assertEqual(rbody[b"recovery"], ckpt.op_hash)  # the recovery pairing
+                assert isinstance(rbody, ctl.Roster)
+                self.assertEqual(rbody.recovery, ckpt.op_hash)  # the recovery pairing
             demo.close()
 
 

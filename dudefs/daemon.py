@@ -248,10 +248,10 @@ class NodeDaemon:
         for op in sorted(self.store.all_ops(), key=lambda o: (o.hlc.as_tuple(), o.op_hash)):
             if op.is_control:
                 reducer.observe(op)  # authorization state up to here
-        best = None
+        best: tuple[Op, ctl.Checkpoint] | None = None
         for op in self.store.all_ops():
             body = ctl.decode(op) if op.is_control else None
-            if body is None or body[ctl.BK_KIND] != ctl.ControlKind.CHECKPOINT:
+            if not isinstance(body, ctl.Checkpoint):
                 continue
             if self.store.get_qc(op.op_hash) is None:  # not quorum-committed
                 continue
@@ -261,23 +261,19 @@ class NodeDaemon:
                 best = (op, body)
         if best is None:
             return
-        op, body = best
+        op, ckpt = best
         if self.store.get_meta("checkpoint") == op.op_hash:
             return  # already adopted this one
         # only adopt once my below-cut baseline satisfies the signed retained digests
         # — projected over the CHECKPOINT's dead (not the store's still-empty one).
-        if gossip.verify_baseline(
-            self.store, body[b"cut"], body[b"retained"], frozenset(body[b"dead"])
-        ):
+        if gossip.verify_baseline(self.store, ckpt.cut, ckpt.retained, frozenset(ckpt.dead)):
             return  # missing baseline — defer to a later round
         # persist cut + retained + dead + horizon in ONE atomic COMMIT (finding 19):
         # the horizon must survive crash-restart alongside the cut, else the void
         # rule + backstop go inert on the reborn op after a restart.
-        self.store.adopt_checkpoint(
-            body[b"cut"], body[b"retained"], body[b"dead"], body[b"horizon"]
-        )
-        self.acc.advance_horizon(body[b"horizon"])
-        self.store.gc_checkpoint(body[b"dead"])
+        self.store.adopt_checkpoint(ckpt.cut, ckpt.retained, ckpt.dead, ckpt.horizon)
+        self.acc.advance_horizon(ckpt.horizon)
+        self.store.gc_checkpoint(ckpt.dead)
         self.store.set_meta("checkpoint", op.op_hash)
 
     # ---- recovery-fence observation (WP1.4) -------------------------------- #
@@ -288,14 +284,12 @@ class NodeDaemon:
         ckpts = {o.op_hash: o for o in self.store.all_ops() if o.is_control}
         for op in self.store.all_ops():
             body = ctl.decode(op) if op.is_control else None
-            if body is None or body[ctl.BK_KIND] != ctl.ControlKind.ROSTER:
+            if not isinstance(body, ctl.Roster):
                 continue
-            rec = body.get(b"recovery")
+            rec = body.recovery
             if rec is None or rec not in ckpts:
                 continue
-            self.acc.on_recovery_fence(
-                op, ckpts[rec], body[b"from_epoch"] + 1, rec, self.manager_pub
-            )
+            self.acc.on_recovery_fence(op, ckpts[rec], body.from_epoch + 1, rec, self.manager_pub)
 
     # ---- joint-certificate activation (findings 23/24 follow-up) ----------- #
     def observe_roster_activations(self) -> None:
@@ -318,11 +312,11 @@ class NodeDaemon:
         by_from: dict[int, list[tuple[Op, list[bytes]]]] = {}
         for op in self.store.all_ops():
             body = ctl.decode(op) if op.is_control else None
-            if body is None or body[ctl.BK_KIND] != ctl.ControlKind.ROSTER:
+            if not isinstance(body, ctl.Roster):
                 continue
-            if body.get(b"recovery") is not None:
+            if body.recovery is not None:
                 continue  # the recovery path is observe_fences, not the joint cert
-            by_from.setdefault(body[b"from_epoch"], []).append((op, body[b"roster"]))
+            by_from.setdefault(body.from_epoch, []).append((op, body.roster))
         while cands := by_from.get(self.acc.epoch):
             e = self.acc.epoch
             for op, new_roster in cands:

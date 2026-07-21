@@ -712,14 +712,13 @@ class TestCheckpointArtifact(unittest.TestCase):
             horizon=A.HLC(200, 3),
         )
         body = ctl.decode(ckpt)
-        assert body is not None
-        self.assertEqual(body[ctl.BK_KIND], ctl.ControlKind.CHECKPOINT)
-        self.assertEqual(body[b"cut"], cut)
-        self.assertEqual(body[b"state_root"], cr.state_root)
-        self.assertEqual(body[b"dead"], cr.dead)
-        self.assertEqual(body[b"retained"], retained)
-        self.assertEqual(body[b"attempts"], b"ct")
-        self.assertEqual(body[b"horizon"], A.HLC(200, 3))  # WP1.5: F carried on the wire
+        assert isinstance(body, ctl.Checkpoint)
+        self.assertEqual(body.cut, cut)
+        self.assertEqual(body.state_root, cr.state_root)
+        self.assertEqual(body.dead, cr.dead)
+        self.assertEqual(body.retained, retained)
+        self.assertEqual(body.attempts, b"ct")
+        self.assertEqual(body.horizon, A.HLC(200, 3))  # WP1.5: F carried on the wire
 
     def test_retained_digest_detects_omission_per_author(self):
         w = World(seed=10, n_clients=2)
@@ -1005,8 +1004,8 @@ class TestVoidRule(unittest.TestCase):
         w = World(seed=18, n_clients=1)
         ckpt = w.checkpoint(cut=cut_of(w), horizon=A.HLC(150, 0))
         body = ctl.decode(ckpt)
-        assert body is not None
-        node.advance_horizon(body[b"horizon"])  # sourced from F on the wire
+        assert isinstance(body, ctl.Checkpoint)
+        node.advance_horizon(body.horizon)  # sourced from F on the wire
         p = node.on_prepare(tag, A.Ballot(2, b"z"))
         assert isinstance(p, A.Promise)
         self.assertIsNone(p.accepted_op_hash)  # F=150 > 100 -> voided

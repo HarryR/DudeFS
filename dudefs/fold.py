@@ -24,7 +24,7 @@
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Any, NotRequired, TypedDict
+from typing import NotRequired, TypedDict
 
 from . import artifacts as A
 from . import crypto, tunables
@@ -152,13 +152,10 @@ _CAP_FOR_KIND: dict[control_handler.ControlKind, control_handler.Cap] = {
 }
 
 
-def _is_recovery_roster(body: dict[bytes, Any]) -> bool:
+def _is_recovery_roster(body: control_handler.ControlBody) -> bool:
     """A ROSTER op carrying a `recovery` field is the fiat recovery trigger
     (NOTES 36a / WP1.7) — root-only, never delegable."""
-    return (
-        body[control_handler.BK_KIND] == control_handler.ControlKind.ROSTER
-        and body.get(b"recovery") is not None
-    )
+    return isinstance(body, control_handler.Roster) and body.recovery is not None
 
 
 class ControlState:
@@ -212,34 +209,32 @@ class ControlState:
         checkpoint barrier (DESIGN §16)."""
         self.pver = max(self.pver, self.pending_pver)
 
-    def apply_control(self, op: Op, body: dict[bytes, Any]) -> None:
-        # `body` is schema-validated per kind by control_handler.decode —
-        # field access here is safe by construction (NOTES item 17).
-        kind = body[control_handler.BK_KIND]
-        if kind == control_handler.ControlKind.CERT_ISSUE:
-            self.certs[body[b"subject"]] = {
-                "caps": set(body[b"caps"]),
-                "revoked": False,
-            }
-        elif kind == control_handler.ControlKind.CERT_REVOKE:
-            c = self.certs.get(body[b"subject"])
-            if c:
-                c["revoked"] = True
-            else:
-                self.certs[body[b"subject"]] = {"caps": set(), "revoked": True}
-        elif kind == control_handler.ControlKind.ROTATE:
-            self.active_keyepoch = body[b"keyepoch"]
-        elif kind == control_handler.ControlKind.ROSTER:
-            self.epoch = body[b"from_epoch"] + 1
-            self.roster = list(body[b"roster"])
-        elif kind == control_handler.ControlKind.PVER_ACTIVATE:
-            self.pending_pver = max(self.pending_pver, body[b"pver"])
-        elif kind == control_handler.ControlKind.ENDPOINT:
-            addrs = body[b"addrs"]
-            if addrs:  # latest-wins; empty addrs = removal (NOTES 58)
-                self.endpoints[body[b"subject"]] = addrs
-            else:
-                self.endpoints.pop(body[b"subject"], None)
+    def apply_control(self, op: Op, body: control_handler.ControlBody) -> None:
+        # `body` is the typed, schema-validated control body — match on its kind.
+        # WrapSet / Checkpoint have no ControlState effect here (the `_` arm).
+        match body:
+            case control_handler.CertIssue() as c:
+                self.certs[c.subject] = {"caps": set(c.caps), "revoked": False}
+            case control_handler.CertRevoke() as c:
+                existing = self.certs.get(c.subject)
+                if existing:
+                    existing["revoked"] = True
+                else:
+                    self.certs[c.subject] = {"caps": set(), "revoked": True}
+            case control_handler.Rotate() as r:
+                self.active_keyepoch = r.keyepoch
+            case control_handler.Roster() as r:
+                self.epoch = r.from_epoch + 1
+                self.roster = list(r.roster)
+            case control_handler.PverActivate() as p:
+                self.pending_pver = max(self.pending_pver, p.pver)
+            case control_handler.EndpointRecord() as e:
+                if e.addrs:  # latest-wins; empty addrs = removal (NOTES 58)
+                    self.endpoints[e.subject] = e.addrs
+                else:
+                    self.endpoints.pop(e.subject, None)
+            case _:
+                pass
         # ControlKind.CHECKPOINT: no control-state change here — its cut places
         # the barrier in the walk (fold) / activates pending pver (reducer).
         # ControlKind.WRAP_SET: no control-state change.
@@ -426,12 +421,12 @@ def _authorized_cuts(ops_sorted: list[Op], invalid: set[bytes], genesis: Genesis
             continue  # lane-2 fence: INVALID in the main walk -> no state, no barrier
         body = control_handler.decode(op)
         if body is None or not control.can_author_control(
-            op.author, body[control_handler.BK_KIND], _is_recovery_roster(body)
+            op.author, body.KIND, _is_recovery_roster(body)
         ):
             continue  # unauthorized -> folds `invalid` in the main walk; no barrier
-        if body[control_handler.BK_KIND] == control_handler.ControlKind.CHECKPOINT:
-            cuts.append(body[b"cut"])
-            pending_barrier = body[b"cut"]  # its barrier activates pending downstream
+        if isinstance(body, control_handler.Checkpoint):
+            cuts.append(body.cut)
+            pending_barrier = body.cut  # its barrier activates pending downstream
         control.apply_control(op, body)
     return cuts
 
@@ -525,7 +520,7 @@ def fold(
             if op.is_control:
                 body = control_handler.decode(op)
                 if body is None or not control.can_author_control(
-                    op.author, body[control_handler.BK_KIND], _is_recovery_roster(body)
+                    op.author, body.KIND, _is_recovery_roster(body)
                 ):
                     verdicts[op.op_hash] = Verdict.INVALID
                     _consume_invalid_slot(op, keyring, universe, state)
@@ -741,12 +736,10 @@ class ControlReducer:
         # best-effort capability filter (DESIGN §15): the node profile is
         # order-independent, so revocation isn't fold-positional here — the full
         # fold is authoritative. Enough to recognize a delegate's control op.
-        if not self.control.can_author_control(
-            op.author, body[control_handler.BK_KIND], _is_recovery_roster(body)
-        ):
+        if not self.control.can_author_control(op.author, body.KIND, _is_recovery_roster(body)):
             return False
         self.control.apply_control(op, body)
-        if body[control_handler.BK_KIND] == control_handler.ControlKind.CHECKPOINT:
+        if isinstance(body, control_handler.Checkpoint):
             # observing a committed checkpoint IS the node's barrier (§16);
             # nodes never fold data, so a high pver never halts them.
             self.control.activate_pending_pver()

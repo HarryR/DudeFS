@@ -427,9 +427,8 @@ class TestWrapSet(unittest.TestCase):
                 payload=ctl.sealed_wrap_set_body(1, k_epoch, members),
             )
         )
-        assert body is not None
-        self.assertEqual(body[ctl.BK_KIND], ctl.ControlKind.WRAP_SET)
-        self.assertEqual(body[b"keyepoch"], 1)
+        assert isinstance(body, ctl.WrapSet)
+        self.assertEqual(body.keyepoch, 1)
         # each member recovers K_epoch; a non-member gets nothing
         for sk in sks:
             self.assertEqual(ctl.unwrap_group_key(body, sk), k_epoch)
@@ -457,7 +456,7 @@ class TestWrapSet(unittest.TestCase):
                 payload=ctl.sealed_wrap_set_body(2, k_epoch, [member]),
             )
         )
-        assert body is not None
+        assert isinstance(body, ctl.WrapSet)
         recovered = ctl.unwrap_group_key(body, sk)
         assert recovered is not None
         self.assertEqual(recovered, k_epoch)

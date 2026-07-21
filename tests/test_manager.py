@@ -101,10 +101,9 @@ class TestManagerOps(unittest.TestCase):
             sub = C.SIGNER.public(bytes([9] * 32))
             op = m.cert_issue("client", sub, C.prove_possession(bytes([9] * 32)))
             body = ctl.decode(op)
-            assert body is not None
-            self.assertEqual(body[ctl.BK_KIND], ctl.ControlKind.CERT_ISSUE)
-            self.assertEqual(body[b"subject"], sub)
-            self.assertEqual(body[b"caps"], [ctl.Cap.WRITE])
+            assert isinstance(body, ctl.CertIssue)
+            self.assertEqual(body.subject, sub)
+            self.assertEqual(body.caps, [ctl.Cap.WRITE])
 
     def test_cert_issue_refuses_a_bad_proof_of_possession(self):
         # the manager never certifies an unheld key (NOTES 58): a pop signed by a
@@ -140,10 +139,9 @@ class TestManagerOps(unittest.TestCase):
             self.assertIn(1, m.state.masters)
             # the revoked subject is NOT wrapped into the new epoch; the roster is
             wrap_body = ctl.decode(ops[1])
-            assert wrap_body is not None
-            self.assertEqual(wrap_body[ctl.BK_KIND], ctl.ControlKind.WRAP_SET)
-            self.assertIn(m.state.roster[0], wrap_body[b"wraps"])
-            self.assertNotIn(sub, wrap_body[b"wraps"])  # revoked -> excluded
+            assert isinstance(wrap_body, ctl.WrapSet)
+            self.assertIn(m.state.roster[0], wrap_body.wraps)
+            self.assertNotIn(sub, wrap_body.wraps)  # revoked -> excluded
 
     def test_no_rotate_leaves_keyepoch(self):
         with tempfile.TemporaryDirectory() as d:
@@ -183,10 +181,9 @@ class TestManagerOps(unittest.TestCase):
             npub = C.SIGNER.public(bytes([5] * 32))
             m.node_add(npub, addr="/run/node5.sock")
             body = ctl.decode(self._control_log(d)[-1])
-            assert body is not None
-            self.assertEqual(body[ctl.BK_KIND], ctl.ControlKind.ENDPOINT)
-            self.assertEqual(body[b"subject"], npub)
-            self.assertEqual(body[b"addrs"], [(b"unix", b"/run/node5.sock", {})])
+            assert isinstance(body, ctl.EndpointRecord)
+            self.assertEqual(body.subject, npub)
+            self.assertEqual(body.addrs, [(b"unix", b"/run/node5.sock", {})])
 
     def test_init_seeds_the_genesis_endpoint(self):
         from dudefs import fold
@@ -235,8 +232,8 @@ class TestManagerOps(unittest.TestCase):
             self.assertEqual(m.state.roster, pubs)
             self.assertEqual(m.state.epoch, 1)
             body = ctl.decode(change.op)
-            assert body is not None
-            self.assertTrue(body[b"sync_frontier"])  # F23: the barrier has real teeth
+            assert isinstance(body, ctl.Roster)
+            self.assertTrue(body.sync_frontier)  # F23: the barrier has real teeth
 
     def test_change_roster_refused_when_new_node_lacks_possession(self):
         # F23 regression, via the REAL manager flow: a new-roster node that has NOT
@@ -310,11 +307,10 @@ class TestManagerOps(unittest.TestCase):
             ckpt, rop = m.author_recovery_fence(rep)
             cbody = ctl.decode(ckpt)
             rbody = ctl.decode(rop)
-            assert cbody is not None and rbody is not None
-            self.assertEqual(cbody[ctl.BK_KIND], ctl.ControlKind.CHECKPOINT)
-            self.assertEqual(cbody[b"horizon"], A.HLC(500, 0))  # salvage frontier = fiat horizon
-            self.assertEqual(rbody[ctl.BK_KIND], ctl.ControlKind.ROSTER)
-            self.assertEqual(rbody[b"recovery"], ckpt.op_hash)  # the pairing
+            assert isinstance(cbody, ctl.Checkpoint)
+            assert isinstance(rbody, ctl.Roster)
+            self.assertEqual(cbody.horizon, A.HLC(500, 0))  # salvage frontier = fiat horizon
+            self.assertEqual(rbody.recovery, ckpt.op_hash)  # the pairing
             self.assertEqual(m.state.epoch, 1)
 
     def test_node_addr_summary_decomposes_and_survives_json_round_trip(self):
