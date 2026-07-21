@@ -71,7 +71,7 @@ class TestManagerCommands(unittest.TestCase):
             self.assertEqual(ManagerState.load(d).keyepoch, 0)
             code, out, _ = _run(["cert", "revoke", sub.hex(), "--dir", d])
             self.assertEqual(code, 0)
-            self.assertIn("rotated to keyepoch 1", out)
+            self.assertIn("staged rotate -> keyepoch 1", out)
             st = ManagerState.load(d)
             self.assertEqual(st.keyepoch, 1)
             self.assertIn(1, st.masters)  # a fresh group master exists for the new epoch

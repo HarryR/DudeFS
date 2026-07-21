@@ -1,13 +1,13 @@
-# DudeFS — the `dude` CLI (M7 WP3, MANAGER.md). Manager powers come from WHICH
-# KEYS are present, not which binary: the same tool authors root-signed control ops
-# (init/cert/rotate/node) against an on-disk state dir AND passes plain worker verbs
-# (get/set/cas/wheres/status) through to a running client daemon's JSON-RPC socket.
+# DudeFS — the `dude` CLI (M7 WP3, MANAGER.md). A THIN parse-and-delegate shell:
+# manager verbs call the tested `manager.Manager` library (which owns all the
+# delicate, protocol-specific logic — authoring control ops, revoke→rotate staging,
+# wrap-sets, roster validation, the recovery interlock decision + fence authoring),
+# and client verbs pass through to a running client daemon's JSON-RPC worker socket.
+# Any programmatic automation calls the same libraries — the logic is never CLI-only.
 #
-# The interlocks (MANAGER §3) are load-bearing, not decoration — `recover` HARD-
-# REFUSES while a quorum still answers (RESILIENCE §2.3, the self-inflicted gorilla),
-# `init` refuses over existing state, `revoke` stages `rotate`. These are tested.
-#
-# No stubs (NOTES 51): every subcommand below is implemented and reviewed.
+# The CLI's own job is argparse, socket probing (status/recover I/O), human
+# formatting (the `wheres` renderer), and mapping ManagerError/decisions to exit
+# codes. No stubs (NOTES 51): every subcommand is implemented and reviewed.
 
 from __future__ import annotations
 
@@ -17,138 +17,19 @@ import os
 import socket
 import sys
 import time
-from dataclasses import dataclass
 
 from . import artifacts as A
 from . import crypto as C
 from . import wire
-from .artifacts import quorum_size
-from .handlers import control as ctl
+from .artifacts import HLC, quorum_size
+from .manager import Manager, ManagerError, ManagerState, RecoverDecision, recover_decision
 from .node import FrontierReq
 
 # ---- exit codes -------------------------------------------------------------- #
 OK = 0
-ERR = 1  # usage / runtime error
+ERR = 1  # usage / runtime error (incl. ManagerError preconditions)
 REFUSE_EXISTING = 2  # init over existing state
 REFUSE_RECOVER = 3  # recover while a quorum answers (the load-bearing interlock)
-
-
-# --------------------------------------------------------------------------- #
-# Manager state — the on-disk durable set (MANAGER §1)                         #
-# --------------------------------------------------------------------------- #
-
-
-@dataclass
-class ManagerState:
-    """The manager's durable set under a state dir: the root key, genesis identity,
-    the roster + endpoints, per-keyepoch group masters, the issued-cert inventory,
-    and the manager's own control-chain head. Everything is idempotent + resumable
-    (MANAGER §2): the control log is the append-only record."""
-
-    dir: str
-    root_key: bytes
-    manager_pub: bytes
-    epoch: int
-    keyepoch: int
-    mseq: int
-    mprev: bytes
-    mhlc: int
-    roster: list[bytes]  # voting node pubkeys
-    learners: list[bytes]  # added, not yet promoted
-    node_addrs: dict[str, str]  # node pubkey hex -> endpoint (unix socket path)
-    masters: dict[int, bytes]  # keyepoch -> 32-byte group master
-    certs: list[dict]  # [{subject hex, caps [str], epoch, revoked bool}]
-
-    # ---- persistence ---------------------------------------------------- #
-    @staticmethod
-    def _paths(d: str) -> tuple[str, str, str]:
-        return (
-            os.path.join(d, "state.json"),
-            os.path.join(d, "root.key"),
-            os.path.join(d, "control.log"),
-        )
-
-    @staticmethod
-    def exists(d: str) -> bool:
-        return os.path.exists(ManagerState._paths(d)[0])
-
-    @classmethod
-    def load(cls, d: str) -> ManagerState:
-        state_p, key_p, _ = cls._paths(d)
-        with open(key_p, "rb") as f:
-            root_key = f.read()
-        with open(state_p) as f:
-            s = json.load(f)
-        return cls(
-            dir=d,
-            root_key=root_key,
-            manager_pub=bytes.fromhex(s["manager_pub"]),
-            epoch=s["epoch"],
-            keyepoch=s["keyepoch"],
-            mseq=s["mseq"],
-            mprev=bytes.fromhex(s["mprev"]),
-            mhlc=s["mhlc"],
-            roster=[bytes.fromhex(h) for h in s["roster"]],
-            learners=[bytes.fromhex(h) for h in s["learners"]],
-            node_addrs=dict(s["node_addrs"]),
-            masters={int(k): bytes.fromhex(v) for k, v in s["masters"].items()},
-            certs=s["certs"],
-        )
-
-    def save(self) -> None:
-        state_p, key_p, _ = self._paths(self.dir)
-        if not os.path.exists(key_p):
-            with open(os.open(key_p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb") as f:
-                f.write(self.root_key)
-        blob = {
-            "manager_pub": self.manager_pub.hex(),
-            "epoch": self.epoch,
-            "keyepoch": self.keyepoch,
-            "mseq": self.mseq,
-            "mprev": self.mprev.hex(),
-            "mhlc": self.mhlc,
-            "roster": [p.hex() for p in self.roster],
-            "learners": [p.hex() for p in self.learners],
-            "node_addrs": self.node_addrs,
-            "masters": {str(k): v.hex() for k, v in self.masters.items()},
-            "certs": self.certs,
-        }
-        tmp = state_p + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(blob, f, indent=2)
-        os.replace(tmp, state_p)  # atomic
-
-    # ---- control-op authoring (root-signed) ----------------------------- #
-    def author_control(self, payload: bytes) -> A.Op:
-        """Build, persist, and record one root-signed control op, advancing the
-        manager chain. Appended to control.log (the distribution/audit record)."""
-        self.mhlc += 1
-        op = A.Op.build(
-            author_sk=self.root_key,
-            author_pub=self.manager_pub,
-            cls_=A.OpClass.CONTROL,
-            seq=self.mseq,
-            prev=self.mprev,
-            hlc=A.HLC(self.mhlc, 0),
-            deps=[],
-            authz=b"root",
-            keyepoch=self.keyepoch,
-            payload=payload,
-        )
-        self.mseq += 1
-        self.mprev = op.op_hash
-        with open(self._paths(self.dir)[2], "a") as f:
-            f.write(op.raw.hex() + "\n")
-        return op
-
-    def members(self) -> list[bytes]:
-        """Everyone a wrap-set must reach: voting nodes, learners, and un-revoked
-        cert subjects (DESIGN §3)."""
-        subs = [bytes.fromhex(c["subject"]) for c in self.certs if not c["revoked"]]
-        seen: dict[bytes, None] = {}
-        for m in [*self.roster, *self.learners, *subs]:
-            seen.setdefault(m, None)
-        return list(seen)
 
 
 # --------------------------------------------------------------------------- #
@@ -182,6 +63,8 @@ def _worker_call(sock_path: str, method: str, params: dict) -> dict:
 
 def _probe(addr: str, timeout: float = 1.0) -> A.FrontierBundle | None:
     """A signed frontier read from one node endpoint, or None if unreachable."""
+    if not addr:
+        return None
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
             s.settimeout(timeout)
@@ -196,72 +79,15 @@ def _probe(addr: str, timeout: float = 1.0) -> A.FrontierBundle | None:
         return None
 
 
-# --------------------------------------------------------------------------- #
-# Commands — manager (control-op authoring)                                    #
-# --------------------------------------------------------------------------- #
-
-
-def cmd_init(args: argparse.Namespace) -> int:
-    d = args.dir
-    os.makedirs(d, exist_ok=True)
-    if ManagerState.exists(d):  # interlock: never clobber a genesis (MANAGER §3)
-        print(f"refusing: state already exists at {d} (init is genesis-only)", file=sys.stderr)
-        return REFUSE_EXISTING
-    root_key = os.urandom(32)
-    manager_pub = C.SIGNER.public(root_key)
-    node_key = os.urandom(32)
-    node_pub = C.SIGNER.public(node_key)
-    with open(os.open(os.path.join(d, "node0.key"), os.O_WRONLY | os.O_CREAT, 0o600), "wb") as f:
-        f.write(node_key)
-    st = ManagerState(
-        dir=d,
-        root_key=root_key,
-        manager_pub=manager_pub,
-        epoch=0,
-        keyepoch=0,
-        mseq=0,
-        mprev=A.GENESIS_PREV,
-        mhlc=0,
-        roster=[node_pub],  # n=1 genesis roster
-        learners=[],
-        node_addrs={node_pub.hex(): args.node_addr or ""},
-        masters={0: os.urandom(32)},  # the epoch-0 group master (finding 21 derives from it)
-        certs=[],
-    )
-    st.save()
-    print(f"initialized dudefs at {d}")
-    print(f"  manager (root): {manager_pub.hex()}")
-    print(f"  node0:          {node_pub.hex()}")
-    print(f"  zero-knowledge: {'ON' if C.zero_knowledge_active() else 'OFF'}")
-    return OK
-
-
-_CAP_FOR = {"client": [ctl.Cap.WRITE], "node": [ctl.Cap.STORE], "compactor": [ctl.Cap.COMPACT]}
-
-
-def cmd_cert_issue(args: argparse.Namespace) -> int:
-    st = ManagerState.load(args.dir)
-    kind = args.kind
-    subject = bytes.fromhex(args.pubkey)
-    caps = _CAP_FOR[kind]
-    op = st.author_control(ctl.cert_issue_body(subject, caps, st.epoch))
-    st.certs.append(
-        {
-            "subject": subject.hex(),
-            "caps": [c.decode() for c in caps],
-            "epoch": st.epoch,
-            "revoked": False,
-        }
-    )
-    st.save()
-    print(f"issued {kind} cert to {subject.hex()} (caps: {', '.join(c.decode() for c in caps)})")
-    print(f"  control op: {op.op_hash.hex()}")
-    return OK
+def _probe_floor(addr: str) -> HLC | None:
+    fb = _probe(addr)
+    return fb.floor if fb is not None else None
 
 
 def _print_cert_inventory(st: ManagerState) -> None:
-    # roster commands must show the live inventory first (MANAGER §3 / NOTES 36c):
-    # rotation expires NO capability, so a distrust change needs explicit revokes.
+    # roster/rotate commands must show the live inventory first (MANAGER §3 / NOTES
+    # 36c): rotation expires NO capability, so a distrust change needs explicit
+    # revokes — put the list in front of the operator.
     print("cert inventory (rotation expires nothing — revoke explicitly to distrust):")
     if not st.certs:
         print("  (none)")
@@ -270,96 +96,86 @@ def _print_cert_inventory(st: ManagerState) -> None:
         print(f"  {c['subject'][:16]}…  caps={','.join(c['caps'])}  epoch={c['epoch']}{flag}")
 
 
-def cmd_cert_revoke(args: argparse.Namespace) -> int:
-    st = ManagerState.load(args.dir)
-    subject = bytes.fromhex(args.fingerprint)
-    op = st.author_control(ctl.cert_revoke_body(subject))
-    for c in st.certs:
-        if c["subject"] == subject.hex():
-            c["revoked"] = True
-    st.save()
-    print(f"revoked {subject.hex()}")
+# --------------------------------------------------------------------------- #
+# Commands — manager (thin wrappers over Manager)                              #
+# --------------------------------------------------------------------------- #
+
+
+def cmd_init(args: argparse.Namespace) -> int:
+    try:
+        m = Manager.init(args.dir, node_addr=args.node_addr)
+    except ManagerError as e:
+        print(f"refusing: {e}", file=sys.stderr)
+        return REFUSE_EXISTING
+    print(f"initialized dudefs at {args.dir}")
+    print(f"  manager (root): {m.state.manager_pub.hex()}")
+    print(f"  node0:          {m.state.roster[0].hex()}")
+    print(f"  zero-knowledge: {'ON' if C.zero_knowledge_active() else 'OFF'}")
+    return OK
+
+
+def cmd_cert_issue(args: argparse.Namespace) -> int:
+    m = Manager.load(args.dir)
+    try:
+        op = m.cert_issue(args.kind, bytes.fromhex(args.pubkey))
+    except ManagerError as e:
+        print(f"refusing: {e}", file=sys.stderr)
+        return ERR
+    caps = ", ".join(m.state.certs[-1]["caps"])
+    print(f"issued {args.kind} cert to {args.pubkey} (caps: {caps})")
     print(f"  control op: {op.op_hash.hex()}")
+    return OK
+
+
+def cmd_cert_revoke(args: argparse.Namespace) -> int:
+    m = Manager.load(args.dir)
+    subject = bytes.fromhex(args.fingerprint)
+    ops = m.cert_revoke(subject, rotate=not args.no_rotate)
+    print(f"revoked {args.fingerprint}")
+    print(f"  revoke op: {ops[0].op_hash.hex()}")
     if args.no_rotate:
         print("  WARNING: --no-rotate given; the revoked key still opens the current group key")
         print("           until you `dude rotate` (revocation without rotation is a foot-gun)")
         return OK
-    print("  staging rotate (revocation without rotation is a foot-gun — MANAGER §2):")
-    return _do_rotate(st)
-
-
-def _do_rotate(st: ManagerState) -> int:
-    new_ke = st.keyepoch + 1
-    master = os.urandom(32)
-    members = st.members()
-    st.masters[new_ke] = master
-    wrap_op = st.author_control(ctl.sealed_wrap_set_body(new_ke, master, members))
-    st.keyepoch = new_ke
-    rot_op = st.author_control(ctl.rotate_body(new_ke))
-    st.save()
-    print(f"  rotated to keyepoch {new_ke}: sealed group key to {len(members)} member(s)")
-    print(f"    wrap-set op: {wrap_op.op_hash.hex()}")
-    print(f"    rotate op:   {rot_op.op_hash.hex()}")
+    print(f"  staged rotate -> keyepoch {m.state.keyepoch}: wrap-set {ops[1].op_hash.hex()}")
     return OK
 
 
 def cmd_rotate(args: argparse.Namespace) -> int:
-    st = ManagerState.load(args.dir)
-    _print_cert_inventory(st)
-    return _do_rotate(st)
+    m = Manager.load(args.dir)
+    _print_cert_inventory(m.state)
+    ops = m.rotate()
+    n_members = len(m.state.members())
+    print(f"rotated to keyepoch {m.state.keyepoch}: sealed group key to {n_members} member(s)")
+    print(f"  wrap-set op: {ops[0].op_hash.hex()}   rotate op: {ops[1].op_hash.hex()}")
+    return OK
 
 
 def cmd_node(args: argparse.Namespace) -> int:
-    st = ManagerState.load(args.dir)
-    if args.node_cmd == "spawn":
-        key = os.urandom(32)
-        pub = C.SIGNER.public(key)
-        keyfile = os.path.join(args.dir, f"node-{pub.hex()[:8]}.key")
-        with open(os.open(keyfile, os.O_WRONLY | os.O_CREAT, 0o600), "wb") as f:
-            f.write(key)
-        print(f"spawned node identity {pub.hex()} (key: {keyfile})")
-        print(f"  add it as a learner:  dude node add {pub.hex()} --addr <endpoint>")
-        return OK
-    if args.node_cmd == "add":  # learner-add (not yet a voting member)
-        pub = bytes.fromhex(args.pubkey)
-        if pub in st.roster or pub in st.learners:
-            print("already a member/learner", file=sys.stderr)
-            return ERR
-        st.learners.append(pub)
-        if args.addr:
-            st.node_addrs[pub.hex()] = args.addr
-        st.save()
-        print(f"added learner {pub.hex()} (promote it once it has caught up)")
-        return OK
-    if args.node_cmd == "promote":
-        _print_cert_inventory(st)
-        pub = bytes.fromhex(args.pubkey)
-        if pub not in st.learners:
-            print("not a learner — add it first", file=sys.stderr)
-            return ERR
-        new_roster = [*st.roster, pub]
-        if len(new_roster) % 2 == 0:  # client-side pre-check (fail near the operator)
-            print(
-                f"refusing: promoting yields an EVEN voting roster ({len(new_roster)}); "
-                "quorum intersection needs odd n (MANAGER §3)",
-                file=sys.stderr,
-            )
-            return ERR
-        op = st.author_control(ctl.roster_body(st.epoch, new_roster, {}))
-        st.roster = new_roster
-        st.learners.remove(pub)
-        st.epoch += 1
-        st.save()
-        print(f"promoted {pub.hex()} -> epoch {st.epoch}, roster size {len(new_roster)}")
-        print(f"  roster op: {op.op_hash.hex()}")
-        return OK
+    m = Manager.load(args.dir)
+    try:
+        if args.node_cmd == "spawn":
+            pub, keyfile = m.node_spawn()
+            print(f"spawned node identity {pub.hex()} (key: {keyfile})")
+            print(f"  add it as a learner:  dude node add {pub.hex()} --addr <endpoint>")
+            return OK
+        if args.node_cmd == "add":
+            pub = bytes.fromhex(args.pubkey)
+            m.node_add(pub, args.addr)
+            print(f"added learner {pub.hex()} (promote it once it has caught up)")
+            return OK
+        if args.node_cmd == "promote":
+            _print_cert_inventory(m.state)
+            op = m.node_promote(bytes.fromhex(args.pubkey))
+            size = len(m.state.roster)
+            print(f"promoted {args.pubkey} -> epoch {m.state.epoch}, roster size {size}")
+            print(f"  roster op: {op.op_hash.hex()}")
+            return OK
+    except ManagerError as e:
+        print(f"refusing: {e}", file=sys.stderr)
+        return ERR
     print(f"unknown node subcommand {args.node_cmd!r}", file=sys.stderr)
     return ERR
-
-
-# --------------------------------------------------------------------------- #
-# Commands — telemetry + recovery (probe the cluster)                          #
-# --------------------------------------------------------------------------- #
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -369,8 +185,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     frontier = A.HLC(0, 0)
     reachable = 0
     for i, pub in enumerate(st.roster):
-        addr = st.node_addrs.get(pub.hex(), "")
-        fb = _probe(addr) if addr else None
+        fb = _probe(st.node_addrs.get(pub.hex(), ""))
         if fb is None:
             print(f"  node{i} {pub.hex()[:16]}…  UNREACHABLE")
             continue
@@ -383,46 +198,28 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 
 def cmd_recover(args: argparse.Namespace) -> int:
-    """The most interlocked verb (MANAGER §3 / RESILIENCE §2.3). Dwell-probe every
-    roster endpoint; HARD-REFUSE while a quorum answers; name the presumed-dead;
-    print the blast radius; and remind the operator that a parked system is safe."""
-    st = ManagerState.load(args.dir)
-    n = len(st.roster)
-    q = quorum_size(n)
-    print(f"recovery reachability probe — dwell {args.dwell}s over {n} roster endpoints")
+    """A thin wrapper: probe the roster (I/O here), then let the LIBRARY's pure
+    `recover_decision` rule the interlock and author the fence. The delicate
+    decision is tested directly in test_manager, not just through this path."""
+    m = Manager.load(args.dir)
+    print(f"recovery reachability probe — dwell {args.dwell}s over {len(m.state.roster)} endpoints")
     print("(a parked system is SAFE; recovery is never urgent, and dwell is free.)")
+    report = m.probe_roster(_probe_floor, args.dwell, time.sleep)
+    print(f"reachable: {len(report.reachable)}/{report.n}  (quorum {report.quorum})")
+    dead = ", ".join(f"node{i}" for i in report.presumed_dead) or "(none)"
+    print(f"presumed-dead nodes: {dead}")
+    print(f"blast radius: salvage frontier {report.salvage.as_tuple()} vs last-known finality")
 
-    answered: dict[int, A.HLC] = {}
-    deadline = time.monotonic() + args.dwell
-    while True:
-        for i, pub in enumerate(st.roster):
-            if i in answered:
-                continue
-            fb = _probe(st.node_addrs.get(pub.hex(), ""))
-            if fb is not None:
-                answered[i] = fb.floor
-        if time.monotonic() >= deadline or len(answered) == n:
-            break
-        time.sleep(min(0.2, max(0.0, deadline - time.monotonic())))
-
-    presumed_dead = [i for i in range(n) if i not in answered]
-    salvage = max((f for f in answered.values()), default=A.HLC(0, 0), key=lambda h: h.as_tuple())
-    print(f"reachable: {len(answered)}/{n}  (quorum {q})")
-    print("presumed-dead nodes: " + (", ".join(f"node{i}" for i in presumed_dead) or "(none)"))
-    print(
-        f"blast radius: salvage frontier {salvage.as_tuple()} vs last-known finality (see status)"
-    )
-
-    if len(answered) >= q:  # THE load-bearing interlock — hard refusal
+    decision = recover_decision(report, args.i_understand_data_loss)
+    if decision is RecoverDecision.REFUSE_QUORUM:
         print(
-            f"\nREFUSING recovery: a quorum ({len(answered)} ≥ {q}) still answers.\n"
-            "The cluster is not dead. Recovery would fork it. Park and wait — "
+            f"\nREFUSING recovery: a quorum ({len(report.reachable)} ≥ {report.quorum}) still "
+            "answers.\nThe cluster is not dead. Recovery would fork it. Park and wait — "
             "recovery is never urgent (RESILIENCE §2.3).",
             file=sys.stderr,
         )
         return REFUSE_RECOVER
-
-    if not args.i_understand_data_loss:
+    if decision is RecoverDecision.NEED_ACK:
         print(
             "\nA quorum is NOT answering, so recovery is possible — but it DISCARDS "
             "everything above the salvage frontier.\nRe-run with --i-understand-data-loss "
@@ -430,21 +227,10 @@ def cmd_recover(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return ERR
-
-    # data-loss acknowledged AND no quorum answers -> AUTHOR the fence for real (no
-    # placeholder once every interlock has passed). The pair is a fiat recovery
-    # checkpoint + a recovery-marked roster op naming it — exactly what a node's
-    # on_recovery_fence recognizes to park the old epoch and activate the new one
-    # (NOTES 36a / RESILIENCE §2.2). The salvage frontier is the fiat cut's horizon.
-    survivors = [st.roster[i] for i in sorted(answered)] or st.roster
-    ckpt = st.author_control(ctl.checkpoint_body({}, b"", [], {}, b"", st.keyepoch, salvage))
-    rop = st.author_control(ctl.roster_body(st.epoch, survivors, {}, recovery=ckpt.op_hash))
-    st.epoch += 1
-    st.roster = survivors
-    st.save()
+    ckpt, rop = m.author_recovery_fence(report)
     print("\ndata-loss acknowledged — recovery fence AUTHORED:")
-    print(f"  recovery checkpoint: {ckpt.op_hash.hex()}  (horizon {salvage.as_tuple()})")
-    print(f"  recovery roster op:  {rop.op_hash.hex()}  -> epoch {st.epoch}")
+    print(f"  recovery checkpoint: {ckpt.op_hash.hex()}  (horizon {report.salvage.as_tuple()})")
+    print(f"  recovery roster op:  {rop.op_hash.hex()}  -> epoch {m.state.epoch}")
     print("  distribute control.log to the survivors; they park the old epoch on sight.")
     return OK
 
@@ -538,7 +324,7 @@ def build_parser() -> argparse.ArgumentParser:
     init = mgr("init", cmd_init, "mint root key + genesis (refuses over existing state)")
     init.add_argument("--node-addr", default="", help="endpoint for the genesis node")
 
-    ci = mgr("cert", None, "issue/revoke capability certs")
+    ci = sub.add_parser("cert", help="issue/revoke capability certs")
     csub = ci.add_subparsers(dest="cert_cmd", required=True)
     issue = csub.add_parser("issue", help="issue a cert")
     issue.add_argument("kind", choices=["client", "node", "compactor"])
@@ -547,9 +333,7 @@ def build_parser() -> argparse.ArgumentParser:
     issue.set_defaults(fn=cmd_cert_issue)
     rev = csub.add_parser("revoke", help="revoke a cert (stages rotate)")
     rev.add_argument("fingerprint")
-    rev.add_argument(
-        "--no-rotate", action="store_true", help="skip the staged rotate (loud foot-gun)"
-    )
+    rev.add_argument("--no-rotate", action="store_true", help="skip the staged rotate (loud)")
     rev.add_argument("--dir", default=os.environ.get("DUDE_DIR", ".dude"))
     rev.set_defaults(fn=cmd_cert_revoke)
 
@@ -597,8 +381,6 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    # `dude cert` with no sub-subcommand handled by required=True; `node` dispatches
-    # on node_cmd inside cmd_node.
     fn = getattr(args, "fn", None)
     if fn is None:
         print("no command", file=sys.stderr)
