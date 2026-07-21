@@ -1728,6 +1728,53 @@ and A4 as formally stated. Resolutions decided with the design owner; DESIGN
     delivery latency you control, not to how long an abandoned op
     might take to get lucky (unbounded).
 
+54. **WP2 REVIEW (2026-07-21, `49f788e..49245e7`): CLEARED with one
+    finding (22) that GATES the WP4 demo; CRYPTO.md §2 retagged; the
+    `dude wheres` verb ruled into WP3.**
+    - **Verified faithful to CLIENT.md:** the daemon drives quorums via
+      the sans-io machines over real sockets (the ClientRunner twin);
+      ladder derived per poll from the held set (ticket = op_hash, no
+      session state — `_chain_head()` even re-derives the author
+      lineage from the store, the persist-commitments principle applied
+      to the client); `lost` detected both from the drive outcome AND
+      by rival-QC scan; JSON-RPC 2.0 id-correlated, node verbs refused
+      with -32601 (no socket bleed), notifications handled, no stubs.
+      `keyring_from_masters` is finding 21 genuinely wired (working
+      keys never cross the wire). 198 green.
+    - **(22, MEDIUM — the client daemon has NO read-side sync; bites
+      the moment a second client writes.)** The daemon's fold ranges
+      over ops it holds: its own authored ops + control ops + rivals
+      learned via LostSlot. It never runs the §1.2 quorum read and no
+      gossip pull is wired client-side — so `GET`/`LIST`/`INSPECT`
+      from daemon B cannot see daemon A's committed writes AT ALL, and
+      `level=final` returns frozen-but-PARTIAL truth. Single-client
+      tests can't catch it; **the WP4 demo (2 client nodes) will.**
+      **Ruling:** wire the designed primitive — PROTOCOL §1.2
+      FRONTIER + PULL + GET_QC — as (a) an on-demand sync before
+      `level=final` reads (linearizable truth), and (b) a periodic
+      background refresh for `local`/`INSPECT` freshness (cadence =
+      client policy, lane 1). Foreign-`pending` completeness improves
+      with the same wire. Lands before or with WP4; WP3 is not
+      blocked. Minor nits (non-gating, fold into the same change):
+      `INSPECT.may_flip` forces False for absent-but-not-yet-final
+      states (`present and …` — an uncommitted-displaceable delete can
+      still flip absence); blind commits don't retransmit (one 5s
+      window then `unknown` — the slotted path retries via the machine,
+      the blind path should too).
+    - **CRYPTO.md §2 retagged** (Opus's doc flag): the xcs1 block now
+      shows the finding-21 key chain explicitly — AEAD key =
+      `data_key` (K_epoch's `dude.enc` subkey), `nk` under `data_key`
+      — vectors unchanged; this block is the Rust/Go conformance
+      reference.
+    - **`dude wheres` (Harry): ruled into WP3** — a human-friendly
+      key-status verb: `dude wheres my car` → joins args with `/` →
+      renders `INSPECT my/car` for humans (present/value, tier +
+      finality, fencing token, pending ops with decoded intent, lock-
+      holder-style info when the value carries one). An INSPECT
+      renderer, not new daemon surface — the CLI formats, the API
+      answers. (`status` stays the machine-facing per-op verb;
+      `wheres` is per-key and for people.)
+
 # Not yet built (by design, M2+)
 
 QCs are *constructed and verified* (M0) but no acceptor, quorum client, floor,

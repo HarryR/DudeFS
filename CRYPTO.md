@@ -92,12 +92,16 @@ failure class Harry flagged (and why Deoxys-II appealed). The fix costs one
 hash:
 
 ```
-suite xcs1 (XChaCha-SIV):
-  AD     = blake2b(envelope-minus-payload)                      # as today
-  nk     = blake2b(key=K_epoch, person=b"dude.nonce")           # nonce subkey
+suite xcs1 (XChaCha-SIV) — key chain per finding 21 (K_epoch is the MASTER):
+  data_key    = blake2b(key=K_epoch,  person=b"dude.enc")    # THE AEAD key
+  slot_secret = blake2b(key=K_epoch,  person=b"dude.slot")   # slot-tag PRF secret
+  AD     = blake2b(envelope-minus-payload)                   # as today
+  nk     = blake2b(key=data_key, person=b"dude.nonce")       # nonce subkey (under data_key)
   nonce  = blake2b(key=nk, data=AD ‖ blake2b(P), digest_size=24)  # SIV: covers the PLAINTEXT
-  C, tag = XChaCha20-Poly1305-IETF(key=K_epoch, nonce, ad=AD, plaintext=P)
+  C, tag = XChaCha20-Poly1305-IETF(key=data_key, nonce, ad=AD, plaintext=P)
 ```
+(Retagged post-finding-21 — vectors unchanged, the implementation always used
+`data_key`; this block is the Rust/Go conformance reference, NOTES 54.)
 
 **K_epoch is THE epoch secret — subkeys derive, they are not distributed
 (NOTES 48, finding 21).** The keyring needs two working keys per epoch (the
