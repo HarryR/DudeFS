@@ -21,11 +21,76 @@ from __future__ import annotations
 import json
 import socket
 import threading
-from typing import Any, cast
+from typing import Any, NotRequired, TypedDict, cast
 
 from . import artifacts as A
 from .artifacts import VERSION_ABSENT
 from .client import ClientDaemon, Ladder
+
+# ---- JSON result shapes (CLIENT.md §3) — the wire contract, typed ------------ #
+
+
+class WriteResult(TypedDict):
+    op: str  # the op_hash ticket, hex
+
+
+class GetResult(TypedDict):
+    value: str | None
+    version: str | None
+    attempt: int
+    present: bool
+    as_of: list[int]  # [wall_ms, counter]
+    tier: str
+
+
+class PrefixRow(TypedDict):
+    prefix: str
+
+
+class KeyRow(TypedDict):
+    key: str
+    version: str | None
+    attempt: int
+    pending: bool
+
+
+class ListResult(TypedDict):
+    keys: list[PrefixRow | KeyRow]
+
+
+class KeyView(TypedDict):
+    present: bool
+    value: str | None
+    version: str | None
+
+
+class ProvView(TypedDict):
+    present: bool
+    value: str | None
+    version: str | None
+    attempt: int
+
+
+class PendingEntry(TypedDict):
+    op: str
+    phase: str
+    would: list[str]
+
+
+class InspectResult(TypedDict):
+    final: KeyView
+    provisional: ProvView
+    may_flip: bool
+    pending: list[PendingEntry]
+
+
+class LadderResult(TypedDict):
+    phase: str
+    may_flip: bool
+    provisional: NotRequired[str]
+    final: NotRequired[str]
+    winner: NotRequired[str]
+
 
 _COND = {
     "absent": A.Guard.ABSENT,
@@ -139,8 +204,8 @@ def _intent_str(mutations: list[list[bytes]]) -> list[str]:
     return out
 
 
-def _ladder_out(l: Ladder) -> dict:
-    d: dict = {"phase": l.phase, "may_flip": l.may_flip}
+def _ladder_out(l: Ladder) -> LadderResult:
+    d: LadderResult = {"phase": l.phase, "may_flip": l.may_flip}
     if l.provisional is not None:
         d["provisional"] = l.provisional
     if l.final is not None:
@@ -168,18 +233,18 @@ class WorkerAPI:
         return fn(params)
 
     # ---- writes (op_hash ticket, immediately) ------------------------------ #
-    def _v_txn(self, p: dict[str, Any]) -> dict:
+    def _v_txn(self, p: dict[str, Any]) -> WriteResult:
         op = self.d.submit(
             _slot(p.get("slot")), _guards(p.get("guards")), _mutations(p.get("mutations"))
         )
         return {"op": op.hex()}
 
-    def _v_put(self, p: dict[str, Any]) -> dict:
+    def _v_put(self, p: dict[str, Any]) -> WriteResult:
         muts = [[A.Mutation.SET, _b(p["path"]), _b(p["value"])]]
         op = self.d.submit(None, _guards(p.get("guards")), muts)
         return {"op": op.hex()}
 
-    def _v_cas(self, p: dict[str, Any]) -> dict:
+    def _v_cas(self, p: dict[str, Any]) -> WriteResult:
         path = _b(p["path"])
         expect = p.get("expect")
         if expect in (None, "absent"):
@@ -194,7 +259,7 @@ class WorkerAPI:
         return {"op": op.hex()}
 
     # ---- reads (folded, local & cheap) ------------------------------------- #
-    def _v_get(self, p: dict[str, Any]) -> dict:
+    def _v_get(self, p: dict[str, Any]) -> GetResult:
         r = self.d.get(_b(p["path"]), level=p.get("level", "local"))
         return {
             "value": _val_out(r["value"]),
@@ -205,14 +270,14 @@ class WorkerAPI:
             "tier": r["tier"],
         }
 
-    def _v_list(self, p: dict[str, Any]) -> dict:
+    def _v_list(self, p: dict[str, Any]) -> ListResult:
         delim = p.get("delimiter")
         rows = self.d.list_keys(
             _b(p["prefix"]),
             delimiter=_b(delim) if delim else None,
             level=p.get("level", "local"),
         )
-        out = []
+        out: list[PrefixRow | KeyRow] = []
         for row in rows:
             if row["prefix"]:
                 out.append({"prefix": row["key"].decode("utf-8", "replace")})
@@ -227,7 +292,7 @@ class WorkerAPI:
                 )
         return {"keys": out}
 
-    def _v_inspect(self, p: dict[str, Any]) -> dict:
+    def _v_inspect(self, p: dict[str, Any]) -> InspectResult:
         r = self.d.inspect(_b(p["path"]))
         return {
             "final": {
@@ -248,7 +313,7 @@ class WorkerAPI:
             ],
         }
 
-    def _v_status(self, p: dict[str, Any]) -> dict:
+    def _v_status(self, p: dict[str, Any]) -> LadderResult:
         return _ladder_out(self.d.status(_unhex(p["op"])))
 
 
