@@ -189,6 +189,88 @@ class TestReadSideSync(unittest.TestCase):
             cl.close()
 
 
+class TestCasUpdate(unittest.TestCase):
+    def test_version_cas_update_and_stale_cas_loses(self):
+        # the guarded-UPDATE path (VERSION_EQ), distinct from create contention: a
+        # CAS from the current version wins; a second CAS from the now-stale version
+        # contends the already-decided slot and is `lost` (can't update from stale).
+        w = World(seed=8, n_clients=1)
+        with tempfile.TemporaryDirectory() as tmp:
+            cl = _Cluster(tmp, w)
+            c = cl.client(w)
+            create = c.submit(
+                (b"k", VERSION_ABSENT, 0), [[A.Guard.ABSENT, b"k"]], [[A.Mutation.SET, b"k", b"v1"]]
+            )
+            self.assertTrue(_until(lambda: c.status(create).phase == "committed"))
+            v1 = c.get(b"k")["version"]  # the created version (op_hash)
+
+            upd = c.submit(
+                (b"k", v1, 0), [[A.Guard.VERSION_EQ, b"k", v1]], [[A.Mutation.SET, b"k", b"v2"]]
+            )
+            self.assertTrue(_until(lambda: c.status(upd).phase == "committed"))
+            self.assertEqual(c.get(b"k")["value"], b"v2")
+
+            stale = c.submit(
+                (b"k", v1, 0), [[A.Guard.VERSION_EQ, b"k", v1]], [[A.Mutation.SET, b"k", b"v3"]]
+            )
+            self.assertTrue(_until(lambda: c.status(stale).phase == "lost"))
+            self.assertEqual(c.get(b"k")["value"], b"v2")  # unchanged
+            c.close()
+            cl.close()
+
+
+class TestWorkerAPIProtocol(unittest.TestCase):
+    """The JSON-RPC 2.0 wire edges — pure, no cluster needed (they resolve before or
+    at the verb layer): parse errors, notifications, batches, param validation."""
+
+    def _daemon(self):
+        w = World(seed=9, n_clients=1)
+        # roster present but endpoints unreachable — reads fold locally, no RPC needed
+        return ClientDaemon(
+            w.clients[0].sk,
+            w.clients[0].pub,
+            roster=[C.SIGNER.public(bytes([1] * 32))],
+            roster_addrs=["/nonexistent.sock"],
+            manager_pub=w.mgr_pub,
+            masters={0: MASTER},
+            control_ops=w.control_ops,
+            epoch=0,
+        )
+
+    def test_parse_error_notification_batch_and_bad_params(self):
+        d = self._daemon()
+        srv = WorkerServer(d)
+
+        def line(b):
+            return srv._dispatch_line(b) or b""
+
+        # malformed JSON -> -32700 parse error
+        self.assertIn(b'"code":-32700', line(b"not json"))
+        # a notification (no id) yields NO reply
+        self.assertIsNone(
+            srv._dispatch_line(b'{"jsonrpc":"2.0","method":"GET","params":{"path":"x"}}')
+        )
+        # unknown method -> -32601
+        self.assertIn(
+            b'"code":-32601', line(b'{"jsonrpc":"2.0","id":1,"method":"NOPE","params":{}}')
+        )
+        # missing required param -> -32602 invalid params
+        self.assertIn(
+            b'"code":-32602', line(b'{"jsonrpc":"2.0","id":2,"method":"GET","params":{}}')
+        )
+        # a batch: one good GET (absent key) + one unknown-method error, id-correlated
+        out = srv._dispatch_line(
+            b'[{"jsonrpc":"2.0","id":1,"method":"GET","params":{"path":"absent"}},'
+            b'{"jsonrpc":"2.0","id":2,"method":"NOPE","params":{}}]'
+        )
+        assert out is not None
+        batch = json.loads(out)
+        self.assertEqual(len(batch), 2)
+        ids = {r["id"] for r in batch}
+        self.assertEqual(ids, {1, 2})
+        d.close()
+
+
 class TestWorkerAPIWire(unittest.TestCase):
     def test_json_rpc_txn_status_get_over_the_socket(self):
         w = World(seed=5, n_clients=1)

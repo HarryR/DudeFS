@@ -108,6 +108,22 @@ class TestManagerOps(unittest.TestCase):
                 m.node_promote(npub)  # -> 2 voting = even
             self.assertEqual(len(m.state.roster), 1)  # unchanged
 
+    def test_node_add_rejects_duplicate(self):
+        with tempfile.TemporaryDirectory() as d:
+            m = Manager.init(d)
+            npub = C.SIGNER.public(bytes([5] * 32))
+            m.node_add(npub)
+            with self.assertRaises(ManagerError):
+                m.node_add(npub)  # already a learner
+            with self.assertRaises(ManagerError):
+                m.node_add(m.state.roster[0])  # already a voting member
+
+    def test_cert_issue_rejects_unknown_kind(self):
+        with tempfile.TemporaryDirectory() as d:
+            m = Manager.init(d)
+            with self.assertRaises(ManagerError):
+                m.cert_issue("wizard", C.SIGNER.public(bytes([9] * 32)))
+
     def test_promote_requires_a_learner(self):
         with tempfile.TemporaryDirectory() as d:
             m = Manager.init(d)
