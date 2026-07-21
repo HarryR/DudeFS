@@ -13,11 +13,14 @@ import unittest
 
 from dudefs import artifacts as A
 from dudefs import crypto as C
+from dudefs.acceptor import Acceptor
 from dudefs.artifacts import VERSION_ABSENT
 from dudefs.client import ClientDaemon
 from dudefs.daemon import NodeDaemon
 from dudefs.handlers import control as ctl
 from dudefs.manager import Manager
+from dudefs.node import LocalNode, dispatch
+from dudefs.store import ChainStore
 from tests._builders import World
 
 DELTA = 150
@@ -202,24 +205,36 @@ class TestDemoRunbook(unittest.TestCase):
             demo.close()
 
     def test_disk_wipe_identity_retirement_via_replace(self):
-        # a wiped node's key is untrusted: revoke it + swap a fresh identity into the
-        # roster in ONE replace (voting count unchanged, stays odd). Control-plane op.
+        # a wiped node's key is untrusted: revoke it + swap a fresh (caught-up)
+        # identity into the roster via the REAL §13 joint-cert drive — decided on the
+        # old roster, possession-gated on the new roster (findings 23/24).
+        w = World(seed=13, n_clients=1)
+        base = w.blind(0, [], [[A.Mutation.SET, b"k", b"v"]])
         with tempfile.TemporaryDirectory() as d:
             m = Manager.init(d)
-            # a 3-node cluster (single-promote can't grow 1->3; set the pre-state)
-            n1, n2 = C.SIGNER.public(bytes([21] * 32)), C.SIGNER.public(bytes([22] * 32))
-            m.state.roster = [m.state.roster[0], n1, n2]
-            old = n2
+            keys = [(C.SIGNER.public(bytes([i] * 32)), bytes([i] * 32)) for i in (21, 22, 23)]
+            roster = [k[0] for k in keys]
+            m.state.roster = list(roster)
+            old = roster[2]
             m.cert_issue("node", old)  # the retiring node had a STORE cert
-            fresh, _ = m.node_spawn()  # disk wiped -> brand-new identity
             m.cert_revoke(old, rotate=False)  # the old key is untrusted
-            op = m.node_replace(old, fresh)
+
+            fresh_sk = bytes([24] * 32)
+            fresh = C.SIGNER.public(fresh_sk)
+            # in-process cluster: old roster + the fresh node, all holding `base` (the
+            # fresh replacement caught up via gossip before joining)
+            nodes = {}
+            for pub, sk in [*keys, (fresh, fresh_sk)]:
+                acc = Acceptor(sk, pub, ChainStore(), 0, 10**9)
+                acc.store.append(base)
+                nodes[pub] = LocalNode(acc, lambda: 100)
+            change = m.node_replace(old, fresh, lambda pub, req: dispatch(nodes[pub], req))
+
             self.assertIn(fresh, m.state.roster)
             self.assertNotIn(old, m.state.roster)
             self.assertEqual(len(m.state.roster), 3)  # odd, unchanged
-            self.assertEqual(m.state.epoch, 1)
-            body = ctl.decode(op)
-            assert body is not None
+            self.assertTrue(change.new_qc.verify(m.state.roster))  # possession-gated
+            self.assertEqual(change.op.slot_tag, A.roster_slot_tag(0))
 
     def test_recovery_drill_authors_fence_when_quorum_is_dead(self):
         # kill a QUORUM (2 of 3); a lone survivor cannot make progress, so recovery is

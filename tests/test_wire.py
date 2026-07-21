@@ -52,6 +52,9 @@ class TestRequestCodec(unittest.TestCase):
             N.SubmitReq(op),
             N.PrepareReq(op.slot_tag, b),
             N.AcceptReq(op.slot_tag, b, op),
+            N.RosterAcceptReq(
+                A.roster_slot_tag(0), b, op, {op.author: (0, op.op_hash)}, 1
+            ),  # the §13 roster verb (findings 23/24) — sync_frontier survives the wire
             N.FrontierReq(),
             N.WatermarkReq(),
             N.FetchOpReq(op.op_hash),

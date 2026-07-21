@@ -31,6 +31,7 @@ from ..artifacts import (
     QC,
     Ballot,
     FrontierBundle,
+    Heads,
     Op,
     Receipt,
     Watermark,
@@ -96,6 +97,15 @@ class LoggingNode:
     def accept(self, tag: bytes, ballot: Ballot, op: Op) -> AcceptResult:
         r = self.inner.accept(tag, ballot, op)
         self.sim._trace(self.idx, "accept", r)
+        if isinstance(r, Receipt) and op.slot_tag is not None:
+            self.sim._on_receipt(op.slot_tag, r.ballot, op.op_hash, self.idx)
+        return r
+
+    def roster_accept(
+        self, tag: bytes, ballot: Ballot, op: Op, sync_frontier: Heads, new_epoch: int
+    ) -> AcceptResult:
+        r = self.inner.roster_accept(tag, ballot, op, sync_frontier, new_epoch)
+        self.sim._trace(self.idx, "roster_accept", r)
         if isinstance(r, Receipt) and op.slot_tag is not None:
             self.sim._on_receipt(op.slot_tag, r.ballot, op.op_hash, self.idx)
         return r

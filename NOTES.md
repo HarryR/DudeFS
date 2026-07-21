@@ -1831,6 +1831,81 @@ and A4 as formally stated. Resolutions decided with the design owner; DESIGN
       local = PA/EL (available, possibly stale, non-monotone within δ)
       — the tier tag means consistency is never traded silently.
 
+57. **POST-M7 REVIEW (2026-07-21, `6bd4682..836dc61`) — M7/HANDOFF-R4
+    CLOSED (228 green, first end-to-end encrypted run). Two findings in
+    the production manager path (the unit-tested-but-bypassed class) +
+    THE PRE-REFACTOR TEST-IMPROVEMENT LIST (Harry's ask; the refactor's
+    safety net).**
+    - WP4 verified: the §9 runbook is an asserted test (storm/kill/
+      wipe/recovery, xcs1 throughout); `node_replace` is state-sound
+      (count-preserving, §13+NOTES 32f cover replacement); the quiet
+      connection-drop on OSError is correct daemon behavior.
+    - **(23, MEDIUM — manager roster ops carry an EMPTY sync_frontier.)**
+      `promote`/`node_replace` pass `{}`, so the §13 data-possession
+      barrier is VACUOUS in the production flow — a new-roster node's
+      receipt proves agreement but not possession. Ruling: the manager
+      performs the §3.1 final quorum read (probe machinery exists) and
+      populates SF; regression = a not-caught-up node's receipt refused
+      via the real manager flow.
+    - **(24, MEDIUM-HIGH — manager roster ops carry NO slot_tag: B4 is
+      bypassed on the production path.)** `author_control` never sets
+      the public roster slot, so at-most-one-roster-change-per-epoch is
+      enforced ONLY in the M5 unit tests that hand-build slotted ops —
+      a crashed-and-retried manager double-press through manager.py has
+      no wire-level serialization (the exact fumbling scenario WP4
+      asserts, but asserted against hand-built ops, not this module).
+      Related: daemon epoch activation rides ControlReducer observation
+      rather than the joint certificate. Containment today: single
+      honest root serializes itself. Ruling: roster ops author WITH
+      `roster_slot_tag(epoch)` and are DECIDED on the old roster (the
+      §13 flow); the NOTES-43 masher-drives-manager-verbs backlog is
+      PROMOTED — driving the real manager module is exactly what would
+      have caught this. Findings 23+24 = one small wave, before or
+      early in the refactor.
+    - **THE TEST-IMPROVEMENT LIST (pre-refactor hardening; priority
+      order — items 1–5 are the net, 6–10 are the polish):**
+      1. **Golden-pin every wire artifact.** Only op/slot-tag/receipt-
+         message have byte goldens; Promise/Watermark/FrontierBundle/
+         QC/Summary/Delta/frames are roundtrip-only — a refactor can
+         silently change bytes and roundtrips stay green. Pin all, plus
+         one JSON-RPC request/response example pair per verb.
+      2. **Kill the unit-tested-but-bypassed class.** Rule: every
+         safety assertion must ALSO be driven through the production
+         module (manager.py/cli/daemon), not only hand-built ops —
+         findings 23/24 are the proof of need. Concretely: the fumbling
+         suite gains a manager.py-driven variant of each scenario.
+      3. **White-box audit.** ~64 private-attr accesses in tests
+         (`_raw`, `_lock`, `_fold`…): inventory each as either migrate-
+         to-public-surface or explicit `# white-box:` blessing — so
+         refactor breakage separates test-debt from regression.
+      4. **Consolidate duplicated test builders** (`_cut`, `_create`,
+         recovery-pair builders appear per-file) into `_builders.py` —
+         the refactor then touches one place.
+      5. **Coverage baseline + ratchet** (`make coverage`): record the
+         number, list untested branches BEFORE refactoring — uncovered
+         code cannot fail loudly when broken.
+      6. **Speed split**: mark socket/demo suites as the slow lane
+         (`make check-fast` for the refactor loop, full `make check`
+         as the gate).
+      7. **Total-decode fuzz for every decoder** incl. wire.py frames
+         and the JSON-RPC handler (malformed JSON, wrong types, huge
+         ids) — error paths are what hygiene refactors break first.
+      8. **CLIENT.md §2.1 as table-driven contract tests** — each
+         documented guarantee (may_flip semantics, tier labeling, no-
+         lost-updates, ladder transitions) gets a named test; ditto a
+         checklist test that every NOTES finding's named regression
+         still exists (the found-and-fixed log, §6.7, made executable).
+      9. **Two-process determinism harness**: byte-identical
+         state_root + artifacts across fresh interpreter runs (catches
+         iteration-order/dict-order bugs — the classic hygiene-refactor
+         breakage).
+      10. **One-off mutation-testing pass** (e.g. mutmut) before the
+         refactor to find assertion-free code; not a standing gate.
+    - **Refactor ground rules (standing):** behavior-change = separate
+      commit from style-change, never mixed; goldens must not move in
+      style commits (a moved golden IS a behavior change); `make check`
+      green per commit as always.
+
 # Not yet built (by design, M2+)
 
 QCs are *constructed and verified* (M0) but no acceptor, quorum client, floor,

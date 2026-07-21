@@ -9,6 +9,7 @@ import unittest
 
 from dudefs import artifacts as A
 from dudefs import crypto as C
+from dudefs.acceptor import Acceptor, Rejected, RejectReason
 from dudefs.artifacts import quorum_size
 from dudefs.handlers import control as ctl
 from dudefs.manager import (
@@ -20,8 +21,40 @@ from dudefs.manager import (
     RecoverReport,
     recover_decision,
 )
+from dudefs.node import LocalNode, dispatch
+from dudefs.store import ChainStore
+from tests._builders import World
 
 ZERO = HLC(0, 0)
+NOW = 100
+BIG = 10**9
+
+
+def NOP_RPC(_pub, _req):
+    return None  # roster-precondition refusals fire before any node I/O
+
+
+def _nk(i):
+    sk = bytes([i] * 32)
+    return C.SIGNER.public(sk), sk
+
+
+def _roster_cluster(node_keys, base, holders):
+    """In-process acceptors keyed by pubkey + an rpc(pub, req) driving them via the
+    real node dispatch — so the manager's §13 flow is exercised end to end (barrier,
+    slot, joint cert) without sockets. `holders` store `base` (possession)."""
+    nodes = {}
+    for pub, sk in node_keys:
+        acc = Acceptor(sk, pub, ChainStore(), 0, BIG)
+        if pub in holders:
+            acc.store.append(base)
+        nodes[pub] = LocalNode(acc, lambda: NOW)
+
+    def rpc(pub, req):
+        ln = nodes.get(pub)
+        return dispatch(ln, req) if ln is not None else None
+
+    return nodes, rpc
 
 
 def _report(n, reachable, salvage=ZERO):
@@ -105,7 +138,7 @@ class TestManagerOps(unittest.TestCase):
             npub = C.SIGNER.public(bytes([5] * 32))
             m.node_add(npub)
             with self.assertRaises(ManagerError):
-                m.node_promote(npub)  # -> 2 voting = even
+                m.node_promote(npub, NOP_RPC)  # -> 2 voting = even (refused before I/O)
             self.assertEqual(len(m.state.roster), 1)  # unchanged
 
     def test_node_add_rejects_duplicate(self):
@@ -128,41 +161,100 @@ class TestManagerOps(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             m = Manager.init(d)
             with self.assertRaises(ManagerError):
-                m.node_promote(C.SIGNER.public(bytes([7] * 32)))  # never added
+                m.node_promote(C.SIGNER.public(bytes([7] * 32)), NOP_RPC)  # never added
 
-    def test_promote_to_odd_roster_authors_roster_op_and_bumps_epoch(self):
-        # single-promote from an odd roster always hits an even intermediate (refused);
-        # the success path needs an even STARTING roster (reached only via batch/replace,
-        # out of WP3 scope). Simulate that pre-state directly to exercise the odd path.
-        with tempfile.TemporaryDirectory() as d:
-            m = Manager.init(d)  # roster = 1
-            extra = C.SIGNER.public(bytes([6] * 32))
-            m.state.roster.append(extra)  # roster now 2 (even) — a mid-replace state
-            cand = C.SIGNER.public(bytes([5] * 32))
-            m.node_add(cand)
-            op = m.node_promote(cand)  # 2 -> 3 (odd) succeeds
-            self.assertEqual(len(m.state.roster), 3)
-            self.assertEqual(m.state.epoch, 1)
-            body = ctl.decode(op)
-            assert body is not None
-            self.assertEqual(body[ctl.BK_KIND], ctl.ControlKind.ROSTER)
+    # ---- the §13 roster-change drive (findings 23/24), through the REAL manager -- #
+    def _base(self, seed=1):
+        w = World(seed=seed, n_clients=1)
+        return w.blind(0, [], [[A.Mutation.SET, b"k", b"v"]])
 
-    def test_node_replace_swaps_in_one_op_keeping_count(self):
+    def test_change_roster_1_to_3_drives_the_joint_certificate(self):
+        # the real growth path (single-promote can't leave an odd roster): 1 -> 3 as
+        # ONE roster op, decided on the OLD roster (old QC) + possession-gated on the
+        # NEW roster (new QC). Findings 23 (non-empty SF) + 24 (public roster slot).
         with tempfile.TemporaryDirectory() as d:
             m = Manager.init(d)
-            n1, n2 = C.SIGNER.public(bytes([1] * 32)), C.SIGNER.public(bytes([2] * 32))
-            m.state.roster = [m.state.roster[0], n1, n2]  # pre-state: 3 voting
-            fresh = C.SIGNER.public(bytes([3] * 32))
-            op = m.node_replace(n2, fresh)
-            self.assertEqual(len(m.state.roster), 3)  # unchanged (stays odd)
+            keys = [_nk(50), _nk(51), _nk(52)]
+            pubs = [k[0] for k in keys]
+            m.state.roster = [pubs[0]]
+            base = self._base()
+            _, rpc = _roster_cluster(keys, base, holders=set(pubs))  # all caught up
+            change = m.change_roster(pubs, rpc)
+
+            self.assertEqual(change.op.slot_tag, A.roster_slot_tag(0))  # F24: on the slot
+            self.assertEqual(change.old_qc.config_epoch, 0)
+            self.assertEqual(change.new_qc.config_epoch, 1)
+            self.assertTrue(change.new_qc.verify(pubs))  # possession-gated new QC
+            self.assertEqual(m.state.roster, pubs)
+            self.assertEqual(m.state.epoch, 1)
+            body = ctl.decode(change.op)
+            assert body is not None
+            self.assertTrue(body[b"sync_frontier"])  # F23: the barrier has real teeth
+
+    def test_change_roster_refused_when_new_node_lacks_possession(self):
+        # F23 regression, via the REAL manager flow: a new-roster node that has NOT
+        # caught up to the sync frontier is refused by the possession barrier, so the
+        # new-roster QC can't form and the change aborts (no partial commit).
+        with tempfile.TemporaryDirectory() as d:
+            m = Manager.init(d)
+            keys = [_nk(50), _nk(51), _nk(52)]
+            pubs = [k[0] for k in keys]
+            m.state.roster = [pubs[0]]
+            base = self._base()
+            _, rpc = _roster_cluster(keys, base, holders={pubs[0]})  # only n0 caught up
+            with self.assertRaises(ManagerError):
+                m.change_roster(pubs, rpc)  # n1, n2 fail the barrier -> no new quorum
+            self.assertEqual(m.state.roster, [pubs[0]])  # unchanged
+            self.assertEqual(m.state.epoch, 0)
+
+    def test_roster_op_is_serialized_on_the_public_slot(self):
+        # F24 (B4): the manager's roster op sits on roster_slot_tag(epoch), so a
+        # crashed-and-retried double-press — a rival op at the same (tag, ballot) — is
+        # refused by the old roster's equivocation guard (at most one change/epoch).
+        with tempfile.TemporaryDirectory() as d:
+            m = Manager.init(d)
+            keys = [_nk(50), _nk(51), _nk(52)]
+            pubs = [k[0] for k in keys]
+            m.state.roster = [pubs[0]]
+            base = self._base()
+            nodes, rpc = _roster_cluster(keys, base, holders=set(pubs))
+            change = m.change_roster(pubs, rpc)
+
+            tag = A.roster_slot_tag(0)
+            ballot = A.Ballot(1, A.slot_priority(tag, m.state.manager_pub))
+            rival = A.Op.build(
+                author_sk=bytes([99] * 32),
+                author_pub=C.SIGNER.public(bytes([99] * 32)),
+                cls_=A.OpClass.CONTROL,
+                seq=0,
+                prev=A.GENESIS_PREV,
+                hlc=A.HLC(2, 0),
+                deps=[],
+                authz=b"root",
+                keyepoch=0,
+                payload=ctl.roster_body(0, [pubs[0]], {}),
+                slot_tag=tag,
+            )
+            self.assertNotEqual(rival.op_hash, change.op.op_hash)
+            r = nodes[pubs[0]].accept(tag, ballot, rival)  # same slot, same ballot
+            assert isinstance(r, Rejected)
+            self.assertEqual(r.reason, RejectReason.EQUIVOCATION_GUARD)
+
+    def test_node_replace_drives_joint_cert_and_refuses_non_member(self):
+        with tempfile.TemporaryDirectory() as d:
+            m = Manager.init(d)
+            keys = [_nk(50), _nk(51), _nk(52), _nk(53)]  # n0,n1,n2 + fresh
+            n0, n1, n2, fresh = (k[0] for k in keys)
+            m.state.roster = [n0, n1, n2]
+            base = self._base()
+            _, rpc = _roster_cluster(keys, base, holders={n0, n1, n2, fresh})
+            change = m.node_replace(n2, fresh, rpc)
+            self.assertEqual(len(m.state.roster), 3)  # count preserved (stays odd)
             self.assertIn(fresh, m.state.roster)
             self.assertNotIn(n2, m.state.roster)
-            self.assertEqual(m.state.epoch, 1)
-            body = ctl.decode(op)
-            assert body is not None
-            self.assertEqual(body[ctl.BK_KIND], ctl.ControlKind.ROSTER)
+            self.assertEqual(change.op.slot_tag, A.roster_slot_tag(0))
             with self.assertRaises(ManagerError):
-                m.node_replace(C.SIGNER.public(bytes([9] * 32)), fresh)  # old not a member
+                m.node_replace(C.SIGNER.public(bytes([200] * 32)), fresh, NOP_RPC)  # old absent
 
     def test_fence_authoring_produces_the_recovery_pair(self):
         with tempfile.TemporaryDirectory() as d:

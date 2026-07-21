@@ -83,6 +83,27 @@ def _probe_floor(addr: str) -> HLC | None:
     return fb.floor if fb is not None else None
 
 
+def _node_rpc(node_addrs: dict[str, str]):
+    """A `rpc(node_pub, req) -> Response | None` over the p2p wire — the manager's
+    roster-change drive (findings 23/24) talks to nodes by pubkey through this."""
+
+    def rpc(node_pub: bytes, req):
+        addr = node_addrs.get(node_pub.hex(), "")
+        if not addr:
+            return None
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                s.settimeout(5.0)
+                s.connect(addr)
+                s.sendall(wire.frame(wire.encode_request(req)))
+                payload = wire.read_frame(s.recv)
+            return wire.decode_response(payload) if payload is not None else None
+        except OSError:
+            return None
+
+    return rpc
+
+
 def _print_cert_inventory(st: ManagerState) -> None:
     # roster/rotate commands must show the live inventory first (MANAGER §3 / NOTES
     # 36c): rotation expires NO capability, so a distrust change needs explicit
@@ -164,10 +185,11 @@ def cmd_node(args: argparse.Namespace) -> int:
             return OK
         if args.node_cmd == "promote":
             _print_cert_inventory(m.state)
-            op = m.node_promote(bytes.fromhex(args.pubkey))
+            change = m.node_promote(bytes.fromhex(args.pubkey), _node_rpc(m.state.node_addrs))
             size = len(m.state.roster)
             print(f"promoted {args.pubkey} -> epoch {m.state.epoch}, roster size {size}")
-            print(f"  roster op: {op.op_hash.hex()}")
+            print(f"  roster op:  {change.op.op_hash.hex()} (on the public roster slot)")
+            print("  joint certificate: old-roster QC + possession-gated new-roster QC")
             return OK
     except ManagerError as e:
         print(f"refusing: {e}", file=sys.stderr)

@@ -15,8 +15,14 @@ from enum import Enum, auto
 
 from . import artifacts as A
 from . import crypto as C
-from .artifacts import HLC, Op, quorum_size
+from .artifacts import HLC, QC, FrontierBundle, Heads, Op, Receipt, quorum_size
 from .handlers import control as ctl
+from .node import AcceptReq, FrontierReq, PutQCReq, Request, Response, RosterAcceptReq
+
+# rpc(node_pub, req) -> the node's response (or None if unreachable) — the injected
+# node transport (the CLI wires sockets over node_addrs; tests wire in-process
+# acceptors). Keying by pubkey, not index, lets old and new rosters differ.
+type NodeRPC = Callable[[bytes, Request], Response | None]
 
 
 class ManagerError(Exception):
@@ -109,9 +115,11 @@ class ManagerState:
             json.dump(blob, f, indent=2)
         os.replace(tmp, state_p)  # atomic
 
-    def author_control(self, payload: bytes) -> Op:
+    def author_control(self, payload: bytes, slot_tag: bytes | None = None) -> Op:
         """Build, persist, and record one root-signed control op, advancing the
-        manager chain. Appended to control.log (the distribution/audit record)."""
+        manager chain. Appended to control.log (the distribution/audit record). A
+        `slot_tag` puts the op on a public slot (e.g. the roster slot, B4) so the
+        old roster's single-decree machinery serializes crash-retries."""
         self.mhlc += 1
         op = A.Op.build(
             author_sk=self.root_key,
@@ -124,6 +132,7 @@ class ManagerState:
             authz=b"root",
             keyepoch=self.keyepoch,
             payload=payload,
+            slot_tag=slot_tag,
         )
         self.mseq += 1
         self.mprev = op.op_hash
@@ -165,6 +174,17 @@ class RecoverDecision(Enum):
     REFUSE_QUORUM = auto()  # a quorum still answers — the cluster is not dead
     NEED_ACK = auto()  # recovery is possible but --i-understand-data-loss is required
     PROCEED = auto()  # safe + acknowledged: author the fence
+
+
+@dataclass(frozen=True)
+class RosterChange:
+    """The joint certificate of a roster change (DESIGN §13): the slotted roster op,
+    the OLD-roster QC (agreement, epoch e), and the possession-gated NEW-roster QC
+    (epoch e+1). Both QCs together authorize activation."""
+
+    op: Op
+    old_qc: QC
+    new_qc: QC
 
 
 def recover_decision(report: RecoverReport, data_loss_ack: bool) -> RecoverDecision:
@@ -289,9 +309,10 @@ class Manager:
             self.state.node_addrs[pub.hex()] = addr
         self.state.save()
 
-    def node_promote(self, pub: bytes) -> Op:
+    def node_promote(self, pub: bytes, rpc: NodeRPC) -> RosterChange:
         """Promote a learner to voting. Refuses an even voting roster client-side
-        (quorum intersection needs odd n — fail near the operator, MANAGER §3)."""
+        (quorum intersection needs odd n — fail near the operator, MANAGER §3), then
+        DRIVES the §13 joint-certificate flow (findings 23/24)."""
         if pub not in self.state.learners:
             raise ManagerError("not a learner — add it first")
         new_roster = [*self.state.roster, pub]
@@ -300,28 +321,86 @@ class Manager:
                 f"promoting yields an EVEN voting roster ({len(new_roster)}); "
                 "quorum intersection needs odd n"
             )
-        op = self.state.author_control(ctl.roster_body(self.state.epoch, new_roster, {}))
-        self.state.roster = new_roster
+        change = self.change_roster(new_roster, rpc)
         self.state.learners.remove(pub)
-        self.state.epoch += 1
         self.state.save()
-        return op
+        return change
 
-    def node_replace(self, old: bytes, new: bytes) -> Op:
-        """Retire a node and swap in a replacement in ONE roster op — the voting
-        count is UNCHANGED (stays odd), so it never trips the even-roster guard. Used
-        for disk-wipe identity retirement (the old key is untrusted; revoke its cert
-        separately). One atomic membership change (MANAGER §2 `replace`)."""
+    def node_replace(self, old: bytes, new: bytes, rpc: NodeRPC) -> RosterChange:
+        """Retire a node and swap in a replacement — the voting count is UNCHANGED
+        (stays odd), so it never trips the even-roster guard. Used for disk-wipe
+        identity retirement (the old key is untrusted; revoke its cert separately).
+        Drives the §13 joint flow like any roster change."""
         if old not in self.state.roster:
             raise ManagerError("not a voting member")
         if new in self.state.roster or new in self.state.learners:
             raise ManagerError("replacement is already a member/learner")
         new_roster = [new if p == old else p for p in self.state.roster]
-        op = self.state.author_control(ctl.roster_body(self.state.epoch, new_roster, {}))
+        return self.change_roster(new_roster, rpc)
+
+    # ---- the §13 roster-change drive (findings 23/24) ------------------- #
+    def read_sync_frontier(self, roster: list[bytes], rpc: NodeRPC) -> Heads:
+        """The §3.1 final quorum read (finding 23): read signed FRONTIERs from a
+        quorum of the OLD roster and union their heads into the sync frontier a
+        joining node must possess before its receipt counts — an empty SF makes the
+        possession barrier vacuous, which is exactly the bug this closes."""
+        bundles: list[FrontierBundle] = []
+        for pub in roster:
+            r = rpc(pub, FrontierReq())
+            if isinstance(r, FrontierBundle):
+                bundles.append(r)
+        if len(bundles) < quorum_size(len(roster)):
+            raise ManagerError("could not read a quorum frontier for the sync barrier")
+        sf: Heads = {}
+        for fb in bundles:
+            for author, (seq, hh) in fb.heads.items():
+                if author not in sf or seq > sf[author][0]:
+                    sf[author] = (seq, hh)
+        return sf
+
+    def change_roster(self, new_roster: list[bytes], rpc: NodeRPC) -> RosterChange:
+        """Drive a roster change through the §13 joint-certificate flow (findings
+        23+24): read the sync frontier, author the roster op ON THE PUBLIC ROSTER
+        SLOT (B4 serialization — a crash-retry contends the same slot and the old
+        roster decides at most one), get it DECIDED on the OLD roster (old QC, epoch
+        e), and gather POSSESSION-GATED receipts from the NEW roster (new QC, epoch
+        e+1). Raises if either roster fails to ratify — e.g. a new node that has not
+        caught up to the frontier is refused by the barrier."""
+        old_roster = self.state.roster
+        epoch, new_epoch = self.state.epoch, self.state.epoch + 1
+        sf = self.read_sync_frontier(old_roster, rpc)
+        tag = A.roster_slot_tag(epoch)
+        op = self.state.author_control(ctl.roster_body(epoch, new_roster, sf), slot_tag=tag)
+        ballot = A.Ballot(1, A.slot_priority(tag, self.state.manager_pub))
+
+        old_qc = self._gather(
+            old_roster,
+            lambda pub: rpc(pub, AcceptReq(tag, ballot, op)),
+            "old roster did not ratify the roster change",
+        )
+        new_qc = self._gather(
+            new_roster,
+            lambda pub: rpc(pub, RosterAcceptReq(tag, ballot, op, sf, new_epoch)),
+            "new roster did not ratify (possession barrier / unreachable)",
+        )
+        for pub in {*old_roster, *new_roster}:  # distribute the joint certificate
+            rpc(pub, PutQCReq(new_qc))
         self.state.roster = new_roster
-        self.state.epoch += 1
+        self.state.epoch = new_epoch
         self.state.save()
-        return op
+        return RosterChange(op, old_qc, new_qc)
+
+    @staticmethod
+    def _gather(roster: list[bytes], accept: Callable[[bytes], Response | None], err: str) -> QC:
+        idx = {p: i for i, p in enumerate(roster)}
+        recs: list[Receipt] = []
+        for pub in roster:
+            r = accept(pub)
+            if isinstance(r, Receipt):
+                recs.append(r)
+        if len(recs) < quorum_size(len(roster)):
+            raise ManagerError(err)
+        return QC.assemble(recs, len(roster), idx)
 
     # ---- recovery (interlocked) ----------------------------------------- #
     def probe_roster(

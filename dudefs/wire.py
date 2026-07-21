@@ -22,9 +22,24 @@ from .node import (
     PutQCReq,
     Request,
     Response,
+    RosterAcceptReq,
     SubmitReq,
     WatermarkReq,
 )
+
+
+def _encode_heads(heads: dict[bytes, tuple[int, bytes]]) -> list:
+    """Sync-frontier / Heads as a canonical sorted list of [author, seq, hash]."""
+    return [[a, s, h] for a, (s, h) in sorted(heads.items())]
+
+
+def _decode_heads(v: codec.Bencodable) -> dict[bytes, tuple[int, bytes]]:
+    out: dict[bytes, tuple[int, bytes]] = {}
+    for entry in codec.as_seq(v):
+        t = codec.as_seq(entry, 3)
+        out[codec.as_bytes(t[0])] = (codec.as_int(t[1]), codec.as_bytes(t[2]))
+    return out
+
 
 # --------------------------------------------------------------------------- #
 # Length-prefix framing                                                       #
@@ -69,6 +84,8 @@ def encode_request(req: Request) -> bytes:
             body = [b"prepare", tag, ballot.encode()]
         case AcceptReq(tag, ballot, op):
             body = [b"accept", tag, ballot.encode(), op.raw]
+        case RosterAcceptReq(tag, ballot, op, sf, new_epoch):
+            body = [b"roster_accept", tag, ballot.encode(), op.raw, _encode_heads(sf), new_epoch]
         case FrontierReq():
             body = [b"frontier"]
         case WatermarkReq():
@@ -92,6 +109,11 @@ def decode_request(data: bytes) -> Request:
     if tag == b"accept":
         op = Op.from_bytes(codec.as_bytes(p[3]))
         return AcceptReq(codec.as_bytes(p[1]), Ballot.decode(p[2]), op)
+    if tag == b"roster_accept":
+        op = Op.from_bytes(codec.as_bytes(p[3]))
+        return RosterAcceptReq(
+            codec.as_bytes(p[1]), Ballot.decode(p[2]), op, _decode_heads(p[4]), codec.as_int(p[5])
+        )
     if tag == b"frontier":
         return FrontierReq()
     if tag == b"watermark":

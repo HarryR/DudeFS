@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from .acceptor import Acceptor, AcceptResult, PrepareResult, SubmitResult
-from .artifacts import QC, Ballot, FrontierBundle, Op, Watermark
+from .artifacts import QC, Ballot, FrontierBundle, Heads, Op, Watermark
 
 # --------------------------------------------------------------------------- #
 # Request vocabulary — the PROTOCOL §1.1 verbs, as data the client sends.      #
@@ -40,6 +40,20 @@ class AcceptReq:
     tag: bytes
     ballot: Ballot
     op: Op
+
+
+@dataclass(frozen=True)
+class RosterAcceptReq:
+    """A new-roster node accepting a roster op under the data-possession barrier
+    (DESIGN §13 step 4): `sync_frontier` + `new_epoch` ride the wire so the acceptor
+    stays free of the L6 control vocabulary. The manager drives this to gather the
+    joint certificate's new-roster half."""
+
+    tag: bytes
+    ballot: Ballot
+    op: Op
+    sync_frontier: Heads
+    new_epoch: int
 
 
 @dataclass(frozen=True)
@@ -71,6 +85,7 @@ type Request = (
     SubmitReq
     | PrepareReq
     | AcceptReq
+    | RosterAcceptReq
     | FrontierReq
     | WatermarkReq
     | FetchOpReq
@@ -94,6 +109,9 @@ class NodeAPI(Protocol):
     def submit(self, op: Op) -> SubmitResult: ...
     def prepare(self, tag: bytes, ballot: Ballot) -> PrepareResult: ...
     def accept(self, tag: bytes, ballot: Ballot, op: Op) -> AcceptResult: ...
+    def roster_accept(
+        self, tag: bytes, ballot: Ballot, op: Op, sync_frontier: Heads, new_epoch: int
+    ) -> AcceptResult: ...
     def frontier(self) -> FrontierBundle: ...
     def watermark(self) -> Watermark: ...
     def fetch_op(self, op_hash: bytes) -> Op | None: ...
@@ -111,6 +129,8 @@ def dispatch(node: NodeAPI, req: Request) -> Response:
             return node.prepare(tag, ballot)
         case AcceptReq(tag, ballot, op):
             return node.accept(tag, ballot, op)
+        case RosterAcceptReq(tag, ballot, op, sf, new_epoch):
+            return node.roster_accept(tag, ballot, op, sf, new_epoch)
         case FrontierReq():
             return node.frontier()
         case WatermarkReq():
@@ -145,6 +165,11 @@ class LocalNode:
 
     def accept(self, tag: bytes, ballot: Ballot, op: Op) -> AcceptResult:
         return self.acc.on_accept(tag, ballot, op, self.clock())
+
+    def roster_accept(
+        self, tag: bytes, ballot: Ballot, op: Op, sync_frontier: Heads, new_epoch: int
+    ) -> AcceptResult:
+        return self.acc.on_roster_accept(tag, ballot, op, sync_frontier, new_epoch, self.clock())
 
     def frontier(self) -> FrontierBundle:
         return self.acc.issue_frontier(self.clock())
