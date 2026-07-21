@@ -27,7 +27,7 @@ from enum import StrEnum
 from typing import NotRequired, TypedDict
 
 from . import artifacts as A
-from . import crypto, tunables
+from . import crypto, transports, tunables
 from .artifacts import GENESIS_PREV, VERSION_ABSENT, Heads, Op, Txn
 from .errors import DudeFSError
 from .handlers import control as control_handler
@@ -174,7 +174,7 @@ class ControlState:
         self.certs: dict[bytes, Cert] = {}  # subject_pub -> {caps, revoked}
         # node reachability (PROTOCOL §7 / NOTES 58): subject_pub -> addrs, latest-
         # wins in the walk; an ENDPOINT with empty addrs removes the node.
-        self.endpoints: dict[bytes, list[tuple[bytes, bytes, dict[bytes, bytes]]]] = {}
+        self.endpoints: dict[bytes, list[transports.Endpoint]] = {}
 
     def is_authorized(self, pub: bytes, cap: bytes) -> bool:
         if pub == self.manager_pub:
@@ -230,7 +230,10 @@ class ControlState:
                 self.pending_pver = max(self.pending_pver, p.pver)
             case control_handler.EndpointRecord() as e:
                 if e.addrs:  # latest-wins; empty addrs = removal (NOTES 58)
-                    self.endpoints[e.subject] = e.addrs
+                    # decompose the record's (transport, uri, opts) into dial structs here
+                    self.endpoints[e.subject] = [
+                        transports.Endpoint.from_record(*a) for a in e.addrs
+                    ]
                 else:
                     self.endpoints.pop(e.subject, None)
             case _:
@@ -748,10 +751,10 @@ class ControlReducer:
 
 def endpoints_of(
     ops: list[Op], manager_pub: bytes, epoch: int = 0
-) -> dict[bytes, list[tuple[bytes, bytes, dict[bytes, bytes]]]]:
-    """Reduce ENDPOINT control ops to `{node_pub: addrs}` (latest-wins in manager-
-    chain order — PROTOCOL §7 / NOTES 58). The node and client daemons derive their
-    address books from this instead of taking addresses as kwargs."""
+) -> dict[bytes, list[transports.Endpoint]]:
+    """Reduce ENDPOINT control ops to `{node_pub: [Endpoint, …]}` (latest-wins in
+    manager-chain order — PROTOCOL §7 / NOTES 58). The node and client daemons derive
+    their address books from this instead of taking addresses as kwargs."""
     reducer = ControlReducer(manager_pub, epoch)
     for op in sorted(ops, key=lambda o: (o.hlc.as_tuple(), o.op_hash)):
         if op.is_control:

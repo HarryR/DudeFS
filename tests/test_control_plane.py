@@ -8,7 +8,7 @@ import unittest
 
 from dudefs import artifacts as A
 from dudefs import crypto as C
-from dudefs import fold, gossip
+from dudefs import fold, gossip, transports
 from dudefs.acceptor import Acceptor, Rejected, RejectReason
 from dudefs.handlers import control as ctl
 from dudefs.store import ChainStore
@@ -478,9 +478,11 @@ class TestEndpointRecords(unittest.TestCase):
         e1 = w._mgr_op(ctl.endpoint_body(node, self.ADDRS1))
         e2 = w._mgr_op(ctl.endpoint_body(node, self.ADDRS2))  # supersedes e1
         res = fold.fold([*w.control_ops, e1, e2], w.keyring, w.genesis)
-        self.assertEqual(res.control.endpoints[node], self.ADDRS2)  # latest wins
-        # the per-addr opts (the L_msg profile) survive the round trip
-        self.assertEqual(res.control.endpoints[node][0][2], {b"lmsg": b"plain"})
+        # decoded to dial Endpoints; latest wins, and the L_msg profile survives
+        self.assertEqual(
+            res.control.endpoints[node], [transports.Endpoint(b"tor", "http://x.onion/dude", False)]
+        )
+        self.assertFalse(res.control.endpoints[node][0].sealed)  # plain profile survived
 
         e3 = w._mgr_op(ctl.endpoint_body(node, []))  # empty addrs = removal
         res2 = fold.fold([*w.control_ops, e1, e2, e3], w.keyring, w.genesis)

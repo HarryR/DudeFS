@@ -186,12 +186,14 @@ class TestManagerOps(unittest.TestCase):
             self.assertEqual(body.addrs, [(b"unix", b"/run/node5.sock", {})])
 
     def test_init_seeds_the_genesis_endpoint(self):
-        from dudefs import fold
+        from dudefs import fold, transports
 
         with tempfile.TemporaryDirectory() as d:
             m = Manager.init(d, node_addr="/run/node0.sock")
             book = fold.endpoints_of(self._control_log(d), m.state.manager_pub)
-            self.assertEqual(book[m.state.roster[0]], [(b"unix", b"/run/node0.sock", {})])
+            self.assertEqual(
+                book[m.state.roster[0]], [transports.Endpoint(b"unix", "/run/node0.sock", False)]
+            )
 
     def test_cert_issue_rejects_unknown_kind(self):
         with tempfile.TemporaryDirectory() as d:

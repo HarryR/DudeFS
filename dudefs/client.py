@@ -19,7 +19,7 @@ import queue
 import threading
 import time
 from dataclasses import dataclass
-from typing import Literal, TypedDict
+from typing import TypedDict
 
 from . import artifacts as A
 from . import fold, lmsg, transports, wire
@@ -105,14 +105,17 @@ class InspectView(TypedDict):
     pending: list[PendingOp]
 
 
-class PrefixEntry(TypedDict):  # an S3-style common prefix (immediate child group)
+# list_keys rows are a genuine heterogeneous union -> dataclasses, discriminated by
+# TYPE (isinstance narrows cleanly in every checker; the flat views above stay
+# TypedDicts because they're indexed and need no narrowing).
+@dataclass(frozen=True)
+class PrefixEntry:  # an S3-style common prefix (immediate child group)
     key: bytes
-    prefix: Literal[True]
 
 
-class KeyEntry(TypedDict):
+@dataclass(frozen=True)
+class KeyEntry:  # a concrete key
     key: bytes
-    prefix: Literal[False]
     version: bytes
     attempt: int
     pending: bool
@@ -575,16 +578,15 @@ class ClientDaemon:
                     idx = rest.find(delimiter)
                     if idx >= 0:  # S3-style common prefix (immediate child group)
                         name = prefix + rest[: idx + 1]
-                        seen.setdefault(name, {"key": name, "prefix": True})
+                        seen.setdefault(name, PrefixEntry(key=name))
                         continue
                 version, attempt = res.lineage(key)
-                seen[name] = {
-                    "key": key,
-                    "prefix": False,
-                    "version": version,
-                    "attempt": attempt,
-                    "pending": not self._version_final(version),
-                }
+                seen[name] = KeyEntry(
+                    key=key,
+                    version=version,
+                    attempt=attempt,
+                    pending=not self._version_final(version),
+                )
             return [seen[k] for k in sorted(seen)]
 
     def inspect(self, path: bytes) -> InspectView:
@@ -663,8 +665,7 @@ class ClientDaemon:
             for i, pub in enumerate(self.cfg.roster):
                 addrs = book.get(pub, [])
                 if addrs and i < len(new):
-                    t, u, o = addrs[0]  # a node's first advertised address
-                    new[i] = transports.Endpoint.from_record(t, u, o)
+                    new[i] = addrs[0]  # a node's first advertised address
             self.roster_addrs = new
 
     def close(self) -> None:

@@ -188,7 +188,7 @@ class NodeDaemon:
             self.store.cut_dead(),
         )
 
-    def address_book(self) -> dict[bytes, list[tuple[bytes, bytes, dict[bytes, bytes]]]]:
+    def address_book(self) -> dict[bytes, list[transports.Endpoint]]:
         """Node reachability derived from the ENDPOINT control ops I hold (PROTOCOL
         §7 / NOTES 58) — the control plane IS the peer registry."""
         return endpoints_of(self.store.all_ops(), self.manager_pub, self.acc.epoch)
@@ -202,8 +202,7 @@ class NodeDaemon:
         for pub, addrs in self.address_book().items():
             if pub == self.pub or not addrs:
                 continue
-            t, u, o = addrs[0]  # a node's first advertised address (POC: no failover yet)
-            peers.append(Peer(pub, transports.Endpoint.from_record(t, u, o)))
+            peers.append(Peer(pub, addrs[0]))  # a node's first advertised address (no failover yet)
         if peers:  # supersede the seed/kwarg only ONCE endpoint records exist
             self.peers = peers
 

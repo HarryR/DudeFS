@@ -25,7 +25,7 @@ from typing import Any, NotRequired, TypedDict, cast
 
 from . import artifacts as A
 from .artifacts import VERSION_ABSENT
-from .client import ClientDaemon, Ladder
+from .client import ClientDaemon, KeyEntry, Ladder
 
 # ---- JSON result shapes (CLIENT.md §3) — the wire contract, typed ------------ #
 
@@ -278,18 +278,18 @@ class WorkerAPI:
             level=p.get("level", "local"),
         )
         out: list[PrefixRow | KeyRow] = []
-        for row in rows:
-            if row["prefix"]:
-                out.append({"prefix": row["key"].decode("utf-8", "replace")})
-            else:
+        for row in rows:  # PrefixEntry | KeyEntry — isinstance narrows in any checker
+            if isinstance(row, KeyEntry):  # a concrete key
                 out.append(
                     {
-                        "key": row["key"].decode("utf-8", "replace"),
-                        "version": _ver_out(row["version"]),
-                        "attempt": row["attempt"],
-                        "pending": row["pending"],
+                        "key": row.key.decode("utf-8", "replace"),
+                        "version": _ver_out(row.version),
+                        "attempt": row.attempt,
+                        "pending": row.pending,
                     }
                 )
+            else:  # a common-prefix group (PrefixEntry)
+                out.append({"prefix": row.key.decode("utf-8", "replace")})
         return {"keys": out}
 
     def _v_inspect(self, p: dict[str, Any]) -> InspectResult:

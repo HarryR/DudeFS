@@ -14,7 +14,7 @@ import unittest
 from dudefs import artifacts as A
 from dudefs import crypto as C
 from dudefs.artifacts import VERSION_ABSENT
-from dudefs.client import ClientDaemon
+from dudefs.client import ClientDaemon, KeyEntry
 from dudefs.daemon import NodeDaemon
 from dudefs.handlers import control as ctl
 from dudefs.workerapi import WorkerServer
@@ -131,7 +131,7 @@ class TestClientLadder(unittest.TestCase):
                 )
                 self.assertTrue(poll_until(lambda o=op: c.status(o).phase == "committed"))
             rows = c.list_keys(b"q/items/", delimiter=b"/")
-            keys = {r["key"] for r in rows if not r["prefix"]}
+            keys = {r.key for r in rows if isinstance(r, KeyEntry)}
             self.assertEqual(keys, {b"q/items/1", b"q/items/2"})
             insp = c.inspect(b"q/items/1")
             self.assertTrue(insp["provisional"]["present"])
