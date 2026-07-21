@@ -14,7 +14,7 @@ import sqlite3
 import threading
 from collections.abc import Callable
 
-from . import codec, gossip, lmsg, transport, tunables, wire
+from . import codec, gossip, lmsg, transports, tunables, wire
 from .acceptor import Acceptor, Rejected, RejectReason
 from .artifacts import Op, Watermark, quorum_size
 from .fold import ControlReducer, ControlState, endpoints_of
@@ -23,7 +23,7 @@ from .handlers import control as ctl
 from .node import LocalNode, dispatch
 from .store import ChainStore, covered
 
-LOCAL_TRANSPORT = transport.UNIX  # the POC carrier; ENDPOINT addrs are (transport, uri, opts)
+LOCAL_TRANSPORT = transports.UNIX  # the POC carrier; ENDPOINT addrs are (transport, uri, opts)
 
 # the signed 'no' says WHY (PROTOCOL §7.5): the specific door check the caller failed,
 # not a generic BAD_AUTHZ — the requester already holds our identity, so it leaks nothing.
@@ -343,7 +343,7 @@ class NodeDaemon:
         §9 demo's handful lets us sweep all to the same fixpoint; a down peer is
         just a missed round.)"""
         for pub, path in self.peers:
-            self.gossip_round(lambda p, uri=path: transport.dial(LOCAL_TRANSPORT, uri, p), pub)
+            self.gossip_round(lambda p, uri=path: transports.dial(LOCAL_TRANSPORT, uri, p), pub)
         self.adopt_committed_checkpoints()
         self.observe_roster_activations()  # adopt a joint-certified roster change
         self.observe_fences()
@@ -365,7 +365,7 @@ class NodeDaemon:
         envelopes until `close`. The transport owns the accept loop + framing; we supply
         only the pure `serve`, so the same gated wire runs over unix, HTTP, or any
         carrier the ENDPOINT names."""
-        self._server = transport.open_server(scheme)
+        self._server = transports.open_server(scheme)
         self._server.serve(uri, self.serve, ready)
 
     def close(self) -> None:

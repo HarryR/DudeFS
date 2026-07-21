@@ -11,7 +11,7 @@ import unittest
 
 from dudefs import artifacts as A
 from dudefs import crypto as C
-from dudefs import lmsg, transport, wire
+from dudefs import lmsg, transports, wire
 from dudefs import node as N
 from dudefs.acceptor import Acceptor
 from dudefs.daemon import NodeDaemon
@@ -123,7 +123,7 @@ class TestHttpCarrier(unittest.TestCase):
         threading.Thread(
             target=d.serve_forever,
             args=(uri, ready),
-            kwargs={"scheme": transport.HTTP},
+            kwargs={"scheme": transports.HTTP},
             daemon=True,
         ).start()
         self.assertTrue(ready.wait(2))
@@ -132,7 +132,7 @@ class TestHttpCarrier(unittest.TestCase):
         out = enveloped(
             w.clients[0].sk, d.pub, N.AcceptReq(op.slot_tag, A.Ballot(1, b"x"), op), ts=d._clock()
         )
-        raw = transport.dial(transport.HTTP, uri, out)
+        raw = transports.dial(transports.HTTP, uri, out)
         match lmsg.classify_reply(raw, expect_from=d.pub, expect_to=w.clients[0].pub):
             case lmsg.Reply(env):
                 resp = wire.decode_response(env.body)
@@ -154,7 +154,7 @@ class TestHttpCarrier(unittest.TestCase):
         threading.Thread(
             target=d.serve_forever,
             args=(uri, ready),
-            kwargs={"scheme": transport.HTTP},
+            kwargs={"scheme": transports.HTTP},
             daemon=True,
         ).start()
         self.assertTrue(ready.wait(2))
@@ -170,7 +170,7 @@ class TestHttpCarrier(unittest.TestCase):
             ts=d._clock(),
         )
         self.assertEqual(
-            transport.dial(transport.HTTP, uri, wrong_to), b""
+            transports.dial(transports.HTTP, uri, wrong_to), b""
         )  # silence rendered as 404
         d.close()
         time.sleep(0.05)

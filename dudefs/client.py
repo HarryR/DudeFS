@@ -21,7 +21,7 @@ import time
 from dataclasses import dataclass
 
 from . import artifacts as A
-from . import fold, lmsg, transport, wire
+from . import fold, lmsg, transports, wire
 from .artifacts import BLIND, HLC, QC, Op, Receipt, Txn, compute_slot_tag
 from .handlers import data as data_handler
 from .node import FetchOpReq, FrontierReq, GetQCReq, PutQCReq, Request, Response, SubmitReq
@@ -218,7 +218,7 @@ class ClientDaemon:
             epoch=self.cfg.epoch,
             ts=int(time.time() * 1000),
         ).encode()
-        raw = transport.dial(transport.UNIX, path, out)
+        raw = transports.dial(transports.UNIX, path, out)
         match lmsg.classify_reply(raw, expect_from=to_pub, expect_to=self.pub):
             case lmsg.Reply(env):
                 return wire.decode_response(env.body)
