@@ -4,6 +4,7 @@
 # — a distinct thing; the transport/transports proximity is flagged for review.)
 
 import os
+import socket
 import tempfile
 import threading
 import time
@@ -46,6 +47,35 @@ class TestUnixCarrier(unittest.TestCase):
         # an unknown carrier is a real misconfiguration -> KeyError, never a silent no-op
         with self.assertRaises(KeyError):
             transport.dial(b"carrier-pigeon", "somewhere", b"x")
+
+
+class TestHttpCarrier(unittest.TestCase):
+    def _serve(self, handler):
+        with socket.socket() as probe:  # a free port, then serve HTTP on it
+            probe.bind(("127.0.0.1", 0))
+            uri = f"http://127.0.0.1:{probe.getsockname()[1]}/dude"
+        srv = transport.open_server(transport.HTTP)
+        ready = threading.Event()
+        threading.Thread(target=srv.serve, args=(uri, handler, ready), daemon=True).start()
+        self.assertTrue(ready.wait(2))
+        return srv, uri
+
+    def test_dial_serve_round_trip_over_http(self):
+        # HTTP's Content-Length is the framing; the payload is the raw POST body
+        srv, uri = self._serve(lambda payload: b"echo:" + payload)
+        self.assertEqual(transport.dial(transport.HTTP, uri, b"hello"), b"echo:hello")
+        srv.close()
+
+    def test_none_renders_http_404_as_silence(self):
+        srv, uri = self._serve(lambda _payload: None)
+        self.assertEqual(transport.dial(transport.HTTP, uri, b"x"), b"")  # 404 -> b""
+        srv.close()
+
+    def test_unreachable_http_dials_to_empty(self):
+        with socket.socket() as probe:  # a port nobody is listening on
+            probe.bind(("127.0.0.1", 0))
+            uri = f"http://127.0.0.1:{probe.getsockname()[1]}/dude"
+        self.assertEqual(transport.dial(transport.HTTP, uri, b"x", timeout=0.3), b"")
 
 
 if __name__ == "__main__":

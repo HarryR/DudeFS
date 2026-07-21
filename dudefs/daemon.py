@@ -358,10 +358,14 @@ class NodeDaemon:
             self.sync_once()
 
     # ---- the listening carrier (the transport owns the I/O; §7 seam) ------- #
-    def serve_forever(self, uri: str, ready: threading.Event | None = None) -> None:
-        """Listen on the local carrier and serve gated envelopes until `close`. The
-        transport owns the accept loop + framing; we supply only the pure `serve`."""
-        self._server = transport.open_server(LOCAL_TRANSPORT)
+    def serve_forever(
+        self, uri: str, ready: threading.Event | None = None, *, scheme: bytes = LOCAL_TRANSPORT
+    ) -> None:
+        """Listen on a carrier (`scheme`, default the local unix socket) and serve gated
+        envelopes until `close`. The transport owns the accept loop + framing; we supply
+        only the pure `serve`, so the same gated wire runs over unix, HTTP, or any
+        carrier the ENDPOINT names."""
+        self._server = transport.open_server(scheme)
         self._server.serve(uri, self.serve, ready)
 
     def close(self) -> None:

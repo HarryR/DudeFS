@@ -11,7 +11,7 @@ import unittest
 
 from dudefs import artifacts as A
 from dudefs import crypto as C
-from dudefs import lmsg, wire
+from dudefs import lmsg, transport, wire
 from dudefs import node as N
 from dudefs.acceptor import Acceptor
 from dudefs.daemon import NodeDaemon
@@ -107,6 +107,73 @@ class TestPeerGate(unittest.TestCase):
         assert isinstance(resp, Rejected)
         self.assertIs(resp.reason, RejectReason.STALE_ENVELOPE)  # distinct why
         d.close()
+
+
+class TestHttpCarrier(unittest.TestCase):
+    def test_daemon_serves_the_same_gated_wire_over_http(self):
+        # cross-transport: the SAME L_msg envelope + peer gate + dispatch, carried over
+        # HTTP instead of a unix socket — the seam proves the wire is carrier-agnostic.
+        w = World(seed=12, n_clients=1)
+        roster = [C.SIGNER.public(bytes([200] * 32))]
+        d = _daemon(w, 0, roster)  # clock=100, delta=BIG, clients certed
+        with socket.socket() as probe:  # grab a free port, then serve HTTP on it
+            probe.bind(("127.0.0.1", 0))
+            uri = f"http://127.0.0.1:{probe.getsockname()[1]}/dude"
+        ready = threading.Event()
+        threading.Thread(
+            target=d.serve_forever,
+            args=(uri, ready),
+            kwargs={"scheme": transport.HTTP},
+            daemon=True,
+        ).start()
+        self.assertTrue(ready.wait(2))
+        op = creation_op(w, 0, b"v")
+        assert op.slot_tag is not None
+        out = enveloped(
+            w.clients[0].sk, d.pub, N.AcceptReq(op.slot_tag, A.Ballot(1, b"x"), op), ts=d._clock()
+        )
+        raw = transport.dial(transport.HTTP, uri, out)
+        match lmsg.classify_reply(raw, expect_from=d.pub, expect_to=w.clients[0].pub):
+            case lmsg.Reply(env):
+                resp = wire.decode_response(env.body)
+            case _:
+                resp = None
+        self.assertIsInstance(resp, A.Receipt)  # full stack over HTTP
+        d.close()
+        time.sleep(0.05)
+
+    def test_http_carrier_silence_when_non_member(self):
+        # a non-member over HTTP: the node Dropped it (silence) -> HTTP 404 -> b"" -> None
+        w = World(seed=14, n_clients=1)
+        roster = [C.SIGNER.public(bytes([200] * 32))]
+        d = _daemon(w, 0, roster)
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            uri = f"http://127.0.0.1:{probe.getsockname()[1]}/dude"
+        ready = threading.Event()
+        threading.Thread(
+            target=d.serve_forever,
+            args=(uri, ready),
+            kwargs={"scheme": transport.HTTP},
+            daemon=True,
+        ).start()
+        self.assertTrue(ready.wait(2))
+        # a stranger addressing us by pubkey -> Refused is SIGNED (says why); but a
+        # reflection to a wrong `to` -> Dropped -> 404 -> b"". Use the wrong-to probe:
+        stranger = bytes([222] * 32)
+        op = creation_op(w, 0, b"v")
+        assert op.slot_tag is not None
+        wrong_to = enveloped(
+            stranger,
+            C.SIGNER.public(bytes([1] * 32)),
+            N.AcceptReq(op.slot_tag, A.Ballot(1, b"x"), op),
+            ts=d._clock(),
+        )
+        self.assertEqual(
+            transport.dial(transport.HTTP, uri, wrong_to), b""
+        )  # silence rendered as 404
+        d.close()
+        time.sleep(0.05)
 
 
 class TestDaemonPeerSockets(unittest.TestCase):
