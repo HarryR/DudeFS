@@ -27,7 +27,7 @@
 | Payload AEAD (`xcs1`) | **XChaCha20-Poly1305-IETF with SIV-style derived nonce** (misuse-resistant in practice; below) |
 | Wrap-sets (`sbx1`) | **libsodium sealed box** (X25519-XSalsa20-Poly1305, anonymous), recipient key **derived from the member's Ed25519 identity** (`crypto_sign_ed25519_pk_to_curve25519`) — one identity keypair per member, nothing new to distribute or rotate separately |
 | PRF / hashing / KDF | **keyed BLAKE2b** everywhere, domain-separated via `person` (`dude.tag`, `dude.nonce`, merkle domains) — unchanged from POC |
-| Backend | **PyNaCl (libsodium; PyCA-maintained)** — the single `uv`-managed crypto dependency on top of stdlib; the **vendored pure-Python implementations are retained as the differential-test oracle only** (a no-native CI lane cross-checks byte-for-byte; never a runtime alternative) |
+| Backend | **PyNaCl (libsodium; PyCA-maintained)** — the single `uv`-managed crypto dependency on top of stdlib. **No vendored oracle, no no-native lane** (NOTES 46 de-hedge): libsodium does not need our differential testing — RFC 8032 and self-generated `xcs1` golden vectors are the conformance surface; `vendor/ed25519.py` is deleted with the swap |
 
 The internal names (`xcs1`, `sbx1`) label the constructions in code and docs;
 they are **not** wire-visible selectors — the active `pver` implies them. The
@@ -127,24 +127,40 @@ keyepoch bump away, by construction.
   have it (`ed25519-dalek`/`x25519-dalek`, `filippo.io/edwards25519`). ✓
 - **FROST (future threshold root):** Rust `frost-ed25519` (Zcash Foundation);
   Go implementations exist and mature. Not v1 code; recorded path only.
+  **Practice caveats, recorded (2026-07-21):** FROST's real-world failure
+  modes are (i) round-1 **nonce state** — must be treated like key material
+  (single-use, never snapshotted/restored; deterministic nonces are
+  *insecure* here — an adversarial co-signer replays them against two
+  binding factors and extracts the share), (ii) identifiable-abort without
+  robustness (one bad share-holder griefs the session; ROAST is the
+  liveness wrapper if ever needed), (iii) DKG operational complexity (or a
+  trusted dealer's ceremony-time single point). The headline threshold-sig
+  breaks (TSSHOCK, BitForge) were threshold-**ECDSA**, not FROST. Our
+  profile is unusually favorable — an offline root signing rarely and
+  SERIALLY, so concurrent-session attack surface and abort-liveness both
+  shrink to ceremony hygiene. Requirements when scheduled: RFC 9591 via an
+  audited library, nonce-state discipline in the tooling, an explicit
+  dealer-vs-DKG decision, and a fresh CVE sweep at that date.
 
-## 4. Migration plan (dev scaffolding out, one scheme in)
+## 4. Migration plan — EXECUTING as the M7 swap wave (NOTES 46, option A)
 
-1. Land the PyNaCl backend behind the existing L0 `Signer`/`AEAD` boundary;
-   the vendored implementations become the differential oracle (a CI lane runs
-   the suite on both; artifacts must be byte-identical).
-2. **`xcs1`/`sbx1` become THE scheme at the code level** — the `aead_suite`
-   parameter threaded through `fold`/`compact` collapses to the
-   pver-determined constant (implementation cleanup for the implementer,
-   post-WP3/4; test hooks may keep an internal injection point, never a wire
-   one). `auth0` moves to the test tree as oracle scaffolding; no shipped
-   deployment ever mints it.
-3. Dev deployments that used `auth0` are torn down with their logs — there is
-   no auth0-legacy-decode obligation because no shipped log contains it. The
-   `dude status` zero-knowledge banner exists only in dev builds.
-4. Slot tags, state roots, op hashes: unchanged (keyed/plain BLAKE2b) — no
-   artifact format changes anywhere in this transition. A future scheme change
-   is a lane-2 `pver` fence + rotation, per the one-scheme rule above.
+One wave, before the client daemon (WP2) is built, so the keyring's first
+daemon consumer lands on real crypto and the demo runs encrypted:
+
+1. `uv add pynacl`. `crypto.SIGNER` → `nacl.signing` (RFC 8032 is
+   deterministic — the signature golden vectors must not change); `xcs1` per
+   §2; sealed-box wrap/unwrap with the Ed25519→X25519 conversion, and
+   wrap-set bodies become REAL sealed boxes.
+2. **Deletions, not relocations** (the de-hedge): `vendor/ed25519.py`,
+   `auth0` and every suite remnant, and the `aead_suite` parameter threading
+   through `fold`/`compact` (collapses to the constant). Tests run the real
+   scheme; there is no oracle lane and no dev-crypto mode.
+3. Payload golden vectors bump once (ciphertexts change op hashes). KATs: RFC
+   8032 via PyNaCl, self-generated `xcs1` vectors, sealed-box roundtrip +
+   wrong-recipient failure. The A4/fuzz suites now exercise real ciphertext.
+4. Slot tags, state roots, hashing: unchanged (keyed/plain BLAKE2b, stdlib).
+   A future scheme change is a lane-2 `pver` fence + rotation, per the
+   one-scheme rule above.
 
 ## 5. What this closes and what stays open
 

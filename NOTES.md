@@ -1362,6 +1362,109 @@ and A4 as formally stated. Resolutions decided with the design owner; DESIGN
     **Next: HANDOFF-R4 (M7 — daemon, CLI, demo) — Fable-authored, in
     the tree with this item.**
 
+46. **M7 WP1 REVIEW (2026-07-21, `9141810..3e49ca1`): CLEARED with one
+    finding — plus the CRYPTO SWAP decision (option A) and the
+    SMALLEST-CORRECT de-hedge ruling (Harry's directive).**
+    - **WP1 verdict:** clean composition, NOTES 36(b) honored (the
+      backstop landed first as its own ruled step, exactly per the work
+      order; everything else is recognition + kernel-verb invocation).
+      Adoption pipeline verified crash-safe in ordering (adopt-txn
+      before GC; idempotent re-entry; baseline verified against the
+      CHECKPOINT's dead, not the store's pre-adoption empty set — a
+      correct Q2 subtlety). Accepted deviations: constructor-kwargs
+      config (the file format lands with its WP3 consumer — endorsed as
+      the pattern); lock-serialized `check_same_thread=False` (smallest
+      correct; no store-owning thread demanded). 181 green.
+    - **(19, MEDIUM — the horizon does not survive restart.)**
+      `advance_horizon` writes only the in-memory `Acceptor.horizon`;
+      after crash-restart the adoption pipeline early-returns on the
+      stored checkpoint hash, so the horizon stays 0 until a NEW
+      checkpoint arrives — void rule and receipt-floor backstop inert,
+      re-opening the NOTES-27 reborn-tag window. **Fix:** persist the
+      horizon at adoption (alongside the cut, same transaction) and
+      restore it on store/acceptor init. Regression: adopt → reopen →
+      fresh below-horizon accept still `BELOW_HORIZON`, void rule
+      fires, `hlc == horizon` still accepted (the pair).
+    - **CRYPTO SWAP = OPTION A, NOW (Harry's call — B is dead).** The
+      A/B was: (A) swap before WP2/3 so the client daemon (the
+      keyring's first daemon consumer) is BUILT on real crypto and the
+      demo runs encrypted, vs (B) freeze the crypto variable through
+      the demo and swap at M8 — hedging daemon-composition risk that
+      WP1's clean landing has now retired. The swap wave slots BEFORE
+      WP2, bundled with the finding-19 fix.
+    - **THE DE-HEDGE RULING (smallest-correct, per Harry).** Withdrawn
+      as hedges, effective with the swap wave: (1) the vendored
+      pure-Python crypto as "differential oracle" — GONE; libsodium
+      does not need our differential testing, RFC/golden vectors
+      suffice; `vendor/ed25519.py` is DELETED and the "no-native CI
+      lane" open question closes as *there is no such lane* (the
+      differential-oracle concept remains only where it earns its keep:
+      the fold vs the future Lean reference, FORMAL §5). (2) `auth0`
+      DELETED outright — not "moved to the test tree"; tests run the
+      real scheme. (3) the `aead_suite` parameter threading collapses
+      to the constant (NOTES 42's cleanup, now scheduled). (4) eager
+      push on fresh accept — STRUCK from v1, not "easy to add later";
+      the periodic sweep is the correctness story and stays the whole
+      story until demo latency data says otherwise. (5) the
+      `H(summary)` digest-first short-circuit — STRUCK from v1, same
+      rationale (bandwidth opt with no data demanding it). Recorded
+      runner-ups (AES-GCM-SIV, BLS suite id) are rationale, not code —
+      they stay.
+    - **SWAP-WAVE WORK ORDER (before WP2):** `uv add pynacl`;
+      `crypto.SIGNER` → `nacl.signing` (RFC 8032 deterministic — the
+      signature golden vectors must NOT change); `xcs1` AEAD per
+      CRYPTO.md §2 (SIV-derived 24-byte nonce, keyed-BLAKE2 `person`
+      domains); sealed-box wrap/unwrap helpers (Ed25519→X25519
+      conversion) and REAL wrap-set bodies; DELETE vendored ed25519 +
+      auth0 + suite threading; payload golden vectors bump once (op
+      hashes change with ciphertexts); KATs: RFC 8032 vectors via
+      PyNaCl, self-generated `xcs1` vectors, sealed-box roundtrip +
+      wrong-recipient failure; the A4/fuzz suites now exercise REAL
+      ciphertext. Finding-19 fix rides in the same wave. My review,
+      then WP2/WP3 in parallel, then WP4 — the demo runs encrypted.
+    - **Wrap-set scope ruling (2026-07-21): Option A** — primitives +
+      real sealed-box bodies in the swap wave (after it, NO crypto in
+      the system is scaffolding), while the unwrap-and-install client
+      flow waits for its consumers (WP2 keyring bootstrap, WP3
+      cert/rotate) per the config-with-consumer pattern. B rejected
+      (reopens settled keyring surface mid-swap); C rejected (leaves
+      fake crypto in the wire format, contradicting the de-hedge).
+      Blessed with the wave: the SIV-determinism invariant is
+      load-bearing for A1 (deterministic encryption is what keeps the
+      fold a pure function — a random nonce would break A1, not just
+      taste); golden triage confirmed (OP_HASH bumps once; slot-tag and
+      receipt-message goldens carry no payload and must not move).
+
+47. **RULED 2026-07-21 — persist commitments, derive views (Harry's
+    in-memory-frontier question) + finding 20 (epoch is finding 19's
+    twin).** Should the frontier be logged to the local DB for crash
+    resilience? **No — the instinct that it's a footgun is correct**,
+    and the rule is now DESIGN §8: a value is durable iff it JUSTIFIES
+    a signature (slot state, attested floor, issuance ledger, adopted
+    cut + horizon, config epoch); everything frontier-shaped is a
+    derived view recomputed from the durable base. A materialized
+    frontier has many writers (append/GC/adopt) — one missed co-update
+    and the node SIGNS a false frontier bundle, manufacturing the
+    indistinguishable-from-misbehavior surface the evidence system
+    exists to avoid; derivation cannot skew and is a cheap indexed scan
+    at the post-GC scale. Materialization is allowed only single-writer
+    + same-transaction-as-base (the finding-19 horizon pattern).
+    - **(20, MEDIUM, latent — `Acceptor.epoch` does not survive
+      restart.)** Epoch is signature-justification state (it stamps
+      every receipt/watermark) yet lives in memory, restored only from
+      the constructor: a post-activation restart regresses the stamp,
+      epoch-checking clients reject the node's fresh receipts, and it
+      parks until re-observation — which exists for recovery fences
+      (`observe_fences` re-fires from stored ops) but NOT for
+      joint-certificate activation (no daemon observer yet), so a
+      restarted post-roster-change node stays wedged. **Fix (the
+      finding-19 shape):** persist epoch in `activate_epoch` (its sole
+      mutator — single-writer materialization), restore on init.
+      Regression pair: activate → reopen → fresh receipts still stamp
+      `e+1`; constructor epoch only seeds a virgin store. Rides the
+      swap wave alongside finding 19 (same fix family, same commit is
+      fine).
+
 # Not yet built (by design, M2+)
 
 QCs are *constructed and verified* (M0) but no acceptor, quorum client, floor,

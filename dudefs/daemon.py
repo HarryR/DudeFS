@@ -154,7 +154,12 @@ class NodeDaemon:
             self.store, body[b"cut"], body[b"retained"], frozenset(body[b"dead"])
         ):
             return  # missing baseline — defer to a later round
-        self.store.adopt_checkpoint(body[b"cut"], body[b"retained"], body[b"dead"])
+        # persist cut + retained + dead + horizon in ONE atomic COMMIT (finding 19):
+        # the horizon must survive crash-restart alongside the cut, else the void
+        # rule + backstop go inert on the reborn op after a restart.
+        self.store.adopt_checkpoint(
+            body[b"cut"], body[b"retained"], body[b"dead"], body[b"horizon"]
+        )
         self.acc.advance_horizon(body[b"horizon"])
         self.store.gc_checkpoint(body[b"dead"])
         self.store.set_meta("checkpoint", op.op_hash)

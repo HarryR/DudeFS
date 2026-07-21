@@ -587,17 +587,21 @@ class ChainStore:
         cut: Heads,
         retained: dict[bytes, tuple[int, bytes]],
         dead: list[bytes] = [],  # noqa: B006 (read-only default; never mutated)
+        horizon: HLC | None = None,
     ) -> None:
-        """Persist the active compaction cut, its `retained` commitment, and the
-        `dead` set on observing a quorum-committed checkpoint (WP1.2/1.3). DURABLE
-        — the cut re-parametrizes heads()/append()/possession below it, and `dead`
-        is the RETAINED-projection mask (covered ∖ dead) the possession and
-        completeness checks run against while GC is still lazy; all must survive
-        crash-restart like the floor (`set_meta` COMMIT-fsyncs). Physical GC of
-        `dead` is a separate step (gc_checkpoint); adoption must precede it so the
-        gates never see dropped ops without the cut. Atomic (finding 16): the
-        three writes are ONE transaction/COMMIT, so a crash can never leave the cut
-        adopted without its retained/dead companions (nothing re-runs adoption)."""
+        """Persist the active compaction cut, its `retained` commitment, the `dead`
+        set, and the checkpoint `horizon` F on observing a quorum-committed
+        checkpoint (WP1.2/1.3). DURABLE — the cut re-parametrizes heads()/append()/
+        possession below it, `dead` is the RETAINED-projection mask (covered ∖ dead)
+        the possession and completeness checks run against while GC is still lazy,
+        and the horizon is §8's void / receipt-floor-backstop guard value; all must
+        survive crash-restart like the floor (`set_meta` COMMIT-fsyncs). Physical GC
+        of `dead` is a separate step (gc_checkpoint); adoption must precede it so the
+        gates never see dropped ops without the cut. Atomic (finding 16 / finding
+        19): the writes are ONE transaction/COMMIT, so a crash can never leave the
+        cut adopted without its retained/dead/horizon companions — otherwise the
+        void rule + backstop would go inert against a below-horizon reborn op after
+        a restart (nothing re-runs adoption)."""
         self.db.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", ("cut", _encode_pairs(cut)))
         self.db.execute(
             "INSERT OR REPLACE INTO meta VALUES (?,?)", ("cut_retained", _encode_pairs(retained))
@@ -605,7 +609,12 @@ class ChainStore:
         self.db.execute(
             "INSERT OR REPLACE INTO meta VALUES (?,?)", ("cut_dead", codec.encode(list(dead)))
         )
-        self.db.commit()  # one atomic COMMIT for all three
+        if horizon is not None:
+            self.db.execute(
+                "INSERT OR REPLACE INTO meta VALUES (?,?)",
+                ("horizon", codec.encode(list(horizon.encode()))),
+            )
+        self.db.commit()  # one atomic COMMIT for all writes
 
     def cut(self) -> Heads:
         """The active compaction cut, or {} when uncompacted (pre-M6 behavior)."""
@@ -626,6 +635,28 @@ class ChainStore:
         if not raw:
             return frozenset()
         return frozenset(codec.as_bytes(h) for h in codec.as_seq(codec.decode(raw)))
+
+    def get_horizon(self) -> HLC:
+        """The persisted checkpoint horizon F (finding 19) — the void-rule /
+        receipt-floor-backstop guard the Acceptor restores at startup so it does
+        NOT go inert after a crash-restart. HLC(0, 0) when no checkpoint adopted."""
+        raw = self.get_meta("horizon")
+        return HLC.decode(codec.decode(raw)) if raw else HLC(0, 0)
+
+    def get_epoch(self) -> int | None:
+        """The persisted config epoch (finding 20), or None on a VIRGIN store —
+        the Acceptor then falls back to its constructor `config_epoch` (the genesis
+        seed). Epoch stamps every receipt/watermark, so it is signature-justifying
+        state and must survive restart, else a post-activation node regresses its
+        stamp and epoch-checking clients reject its fresh receipts."""
+        raw = self.get_meta("epoch")
+        return codec.as_int(codec.decode(raw)) if raw else None
+
+    def set_epoch(self, epoch: int) -> None:
+        """Persist the config epoch (single-writer: `Acceptor.activate_epoch` is its
+        sole mutator — the finding-20 materialization). COMMIT-fsyncs before any
+        receipt is signed under the new epoch."""
+        self.set_meta("epoch", codec.encode(int(epoch)))
 
     def baseline_commitment(self) -> dict[bytes, tuple[int, bytes]]:
         """This node's ACTUAL commitment over the RETAINED below-cut projection

@@ -1017,5 +1017,66 @@ class TestVoidRule(unittest.TestCase):
         self.assertIsNone(p.accepted_op_hash)  # F=150 > 100 -> voided
 
 
+class TestHorizonPersistence(unittest.TestCase):
+    """Finding 19: the checkpoint horizon must survive crash-restart. Persisted in
+    the adopt_checkpoint transaction and restored on Acceptor init — otherwise the
+    void rule + receipt-floor backstop reset to HLC(0,0) and go inert against a
+    below-horizon reborn op after a restart."""
+
+    def _op(self, w, key, hlc):
+        tag = A.compute_slot_tag(w.keyring[0]["slot_secret"], key, A.VERSION_ABSENT, 0)
+        return w.data_op(
+            0,
+            txn=A.Txn((key, A.VERSION_ABSENT, 0), [], [[A.Mutation.SET, key, b"v"]]),
+            slot_tag=tag,
+            hlc=hlc,
+        )
+
+    def test_horizon_restored_backstop_and_void_survive_restart(self):
+        w = World(seed=190, n_clients=1)
+        nsk = bytes([190] * 32)
+        cut = {w.mgr_pub: (0, b"\x00" * 32)}
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "store.db")
+            # adopt a checkpoint sealing F=200, then simulate a crash (close+reopen)
+            s = ChainStore(path)
+            s.adopt_checkpoint(cut, {}, [], A.HLC(200, 0))
+            self.assertEqual(s.get_horizon(), A.HLC(200, 0))
+            s.close()
+
+            s2 = ChainStore(path)
+            acc = Acceptor(nsk, crypto.SIGNER.public(nsk), s2, 0, BIG_DELTA)
+            self.assertEqual(acc.horizon, A.HLC(200, 0))  # restored, not reset to 0
+
+            # backstop: a fresh op strictly below the restored horizon is refused
+            below = self._op(w, b"k1", A.HLC(100, 0))
+            assert below.slot_tag is not None
+            r = acc.on_accept(below.slot_tag, A.Ballot(1, b"a"), below, 100)
+            assert isinstance(r, Rejected)
+            self.assertEqual(r.reason, RejectReason.BELOW_HORIZON)
+            # boundary: hlc == horizon is still committable
+            at = self._op(w, b"k2", A.HLC(200, 0))
+            assert at.slot_tag is not None
+            self.assertIsInstance(acc.on_accept(at.slot_tag, A.Ballot(1, b"a"), at, 100), A.Receipt)
+            s2.close()
+
+    def test_without_persistence_horizon_would_reset(self):
+        # the negative control: a store that NEVER adopted a horizon restores to
+        # HLC(0,0), so the backstop lets the below-horizon op through — this is
+        # exactly the inertness finding 19 removes once a horizon IS persisted.
+        w = World(seed=191, n_clients=1)
+        nsk = bytes([191] * 32)
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "store.db")
+            s = ChainStore(path)
+            self.assertEqual(s.get_horizon(), A.HLC(0, 0))
+            acc = Acceptor(nsk, crypto.SIGNER.public(nsk), s, 0, BIG_DELTA)
+            op = self._op(w, b"k", A.HLC(100, 0))
+            assert op.slot_tag is not None
+            # no horizon adopted -> the op commits (backstop inert, correctly)
+            self.assertIsInstance(acc.on_accept(op.slot_tag, A.Ballot(1, b"a"), op, 100), A.Receipt)
+            s.close()
+
+
 if __name__ == "__main__":
     unittest.main()

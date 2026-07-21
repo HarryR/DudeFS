@@ -90,9 +90,16 @@ class Acceptor:
         self.sk = node_sk
         self.pub = node_pub
         self.store = store
-        self.epoch = config_epoch
+        # config epoch restored from the store (finding 20): epoch stamps every
+        # receipt/watermark, so a restart must NOT regress it to the constructor
+        # seed. `config_epoch` seeds a VIRGIN store only (get_epoch() is None there).
+        persisted_epoch = self.store.get_epoch()
+        self.epoch = config_epoch if persisted_epoch is None else persisted_epoch
         self.delta_ms = delta_ms
-        self.horizon = HLC(0, 0)  # checkpoint horizon (DESIGN §12); no checkpoint yet
+        # checkpoint horizon (DESIGN §12) restored from the store (finding 19): a
+        # crash-restart must NOT reset it to 0, or the void rule + receipt-floor
+        # backstop go inert against a below-horizon reborn op. HLC(0,0) pre-adoption.
+        self.horizon = self.store.get_horizon()
 
     # ------------------------------------------------------------------ #
     # Finality floor (DESIGN §9): floor = max(hw, now) − δ, monotone.     #
@@ -281,9 +288,13 @@ class Acceptor:
         """Switch config epochs on holding a roster op's joint certificate. Slot
         acceptor state `(promised, accepted_ballot, accepted_op)` is UNTOUCHED — it
         carries across epochs unchanged; the node simply issues receipts, promises,
-        and watermarks under `new_epoch` from now on (DESIGN §13)."""
+        and watermarks under `new_epoch` from now on (DESIGN §13). Monotone, and
+        DURABLE (finding 20): the new epoch is persisted before any receipt is
+        stamped under it, so a restart resumes e+1 instead of regressing to the
+        constructor seed and wedging."""
         if new_epoch > self.epoch:
             self.epoch = new_epoch
+            self.store.set_epoch(new_epoch)  # single-writer materialization
 
     def on_recovery_fence(
         self,

@@ -2,6 +2,8 @@
 # validates the CAPABILITY a delegate holds, not root identity (upgrades NOTES
 # item 9's M1 root-only shortcut). Revocation is fold-positional.
 
+import os
+import tempfile
 import unittest
 
 from dudefs import artifacts as A
@@ -433,6 +435,43 @@ class TestWrapSet(unittest.TestCase):
             self.assertEqual(ctl.unwrap_group_key(body, sk), k_epoch)
         outsider = bytes([200] * 32)
         self.assertIsNone(ctl.unwrap_group_key(body, outsider))
+
+
+class TestEpochPersistence(unittest.TestCase):
+    """Finding 20 (finding 19's twin): the config epoch stamps every receipt/
+    watermark, so it must survive crash-restart. Persisted in activate_epoch
+    (single-writer) and restored on Acceptor init — a virgin store falls back to
+    the constructor seed."""
+
+    def _acc(self, store, config_epoch=0):
+        sk = bytes([170] * 32)
+        return Acceptor(sk, C.SIGNER.public(sk), store, config_epoch, BIG_DELTA)
+
+    def test_epoch_survives_restart_and_stamps_fresh_watermark(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "store.db")
+            s = ChainStore(path)
+            acc = self._acc(s, config_epoch=0)
+            acc.activate_epoch(1)
+            self.assertEqual(acc.epoch, 1)
+            self.assertEqual(s.get_epoch(), 1)  # persisted single-writer
+            s.close()
+
+            # reopen: the constructor seed (0) is IGNORED — persisted epoch 1 wins,
+            # and a fresh watermark stamps e=1 (the receipt clients would reject at 0)
+            s2 = ChainStore(path)
+            acc2 = self._acc(s2, config_epoch=0)
+            self.assertEqual(acc2.epoch, 1)
+            wm = acc2.issue_watermark(NOW)
+            self.assertEqual(wm.config_epoch, 1)
+            s2.close()
+
+    def test_virgin_store_uses_constructor_seed(self):
+        with tempfile.TemporaryDirectory() as d:
+            s = ChainStore(os.path.join(d, "store.db"))
+            self.assertIsNone(s.get_epoch())  # nothing activated yet
+            self.assertEqual(self._acc(s, config_epoch=2).epoch, 2)  # seed wins on virgin
+            s.close()
 
 
 if __name__ == "__main__":
