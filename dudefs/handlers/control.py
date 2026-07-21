@@ -15,7 +15,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable
 from typing import Any
 
-from .. import codec
+from .. import codec, crypto
 from ..artifacts import HLC, BytesEnum, Heads, Op
 
 # Body discriminator (a field key, not a value vocabulary).
@@ -230,6 +230,8 @@ def rotate_body(keyepoch: int) -> bytes:
 
 
 def wrap_set_body(keyepoch: int, wraps: dict[bytes, bytes]) -> bytes:
+    """Low-level encoder: `wraps` maps each member's public key to its already-
+    sealed group-key ciphertext. Use `sealed_wrap_set_body` to build `wraps`."""
     return codec.encode(
         {
             BK_KIND: ControlKind.WRAP_SET,
@@ -237,6 +239,25 @@ def wrap_set_body(keyepoch: int, wraps: dict[bytes, bytes]) -> bytes:
             b"wraps": dict(wraps),
         }
     )
+
+
+def sealed_wrap_set_body(keyepoch: int, group_key: bytes, members: list[bytes]) -> bytes:
+    """Build a WRAP_SET distributing `group_key` (K_epoch) to each member: an
+    `sbx1` sealed box per member public key (DESIGN §3 / §15). Only that member's
+    secret key opens its wrap; the enclosing control op's signature authenticates
+    the distribution. `members` are Ed25519 public keys (roster + client certs)."""
+    wraps = {m: crypto.seal_to(m, group_key) for m in members}
+    return wrap_set_body(keyepoch, wraps)
+
+
+def unwrap_group_key(body: dict[bytes, Any], member_sk: bytes) -> bytes | None:
+    """Member-side: recover K_epoch from a decoded WRAP_SET body, or None if this
+    member has no wrap in the set (or it fails to open). `body` is `decode(op)`'s
+    output for a WRAP_SET op."""
+    sealed = body[b"wraps"].get(crypto.SIGNER.public(member_sk))
+    if sealed is None:
+        return None
+    return crypto.open_sealed(member_sk, sealed)
 
 
 def checkpoint_body(

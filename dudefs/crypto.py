@@ -23,6 +23,7 @@ import hashlib
 from collections.abc import Iterable
 
 import nacl.exceptions
+import nacl.public
 import nacl.secret
 import nacl.signing
 
@@ -276,3 +277,32 @@ def zero_knowledge_active(aead_suite_id: bytes = AEAD_SUITE) -> bool:
     README banner / `dude status` surface this; it was False under the retired
     authenticated-unencrypted `auth0` launch suite."""
     return bool(get_aead(aead_suite_id).confidential)
+
+
+# --------------------------------------------------------------------------- #
+# Sealed box — group-key distribution (wrap-sets, DESIGN §3 / §15)             #
+# --------------------------------------------------------------------------- #
+
+WRAPSET_SUITE = b"sbx1"
+
+
+def seal_to(recipient_pub: bytes, msg: bytes) -> bytes:
+    """Suite `sbx1`: an anonymous libsodium sealed box (crypto_box_seal) to a
+    member's *Ed25519 identity*, converted to its X25519 agreement key. Used to
+    wrap the per-keyepoch group key K_epoch to each roster/client member (the
+    WRAP_SET control op, DESIGN §3). An ephemeral sender keypair per seal means
+    there is no sender authentication (the enclosing control op's signature
+    provides provenance) and the ciphertext is NON-deterministic — so `sbx1` has
+    no byte-pinned KAT, only a functional one (member opens; others cannot)."""
+    xpk = nacl.signing.VerifyKey(recipient_pub).to_curve25519_public_key()
+    return bytes(nacl.public.SealedBox(xpk).encrypt(msg))
+
+
+def open_sealed(recipient_sk: bytes, sealed: bytes) -> bytes | None:
+    """Open an `sbx1` sealed box addressed to this member's Ed25519 seed (via its
+    X25519 agreement key), or None if it was sealed to someone else / tampered."""
+    try:
+        xsk = nacl.signing.SigningKey(recipient_sk).to_curve25519_private_key()
+        return bytes(nacl.public.SealedBox(xsk).decrypt(sealed))
+    except (nacl.exceptions.CryptoError, ValueError):
+        return None

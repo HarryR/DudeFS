@@ -403,5 +403,37 @@ class TestRosterActivation(unittest.TestCase):
         self.assertTrue(all(nd.epoch == 1 for nd in nodes))
 
 
+class TestWrapSet(unittest.TestCase):
+    """A WRAP_SET distributes the group key K_epoch to each member via `sbx1`
+    sealed boxes (DESIGN §3). Only the addressed member unwraps its own copy."""
+
+    def test_sealed_wrap_set_roundtrips_per_member(self):
+        sks = [bytes([50 + i] * 32) for i in range(3)]
+        members = [C.SIGNER.public(s) for s in sks]
+        k_epoch = bytes(range(32))
+        body = ctl.decode(
+            A.Op.build(
+                author_sk=bytes([1] * 32),
+                author_pub=C.SIGNER.public(bytes([1] * 32)),
+                cls_=A.OpClass.CONTROL,
+                seq=0,
+                prev=A.GENESIS_PREV,
+                hlc=A.HLC(NOW, 0),
+                deps=[],
+                authz=b"root",
+                keyepoch=1,
+                payload=ctl.sealed_wrap_set_body(1, k_epoch, members),
+            )
+        )
+        assert body is not None
+        self.assertEqual(body[ctl.BK_KIND], ctl.ControlKind.WRAP_SET)
+        self.assertEqual(body[b"keyepoch"], 1)
+        # each member recovers K_epoch; a non-member gets nothing
+        for sk in sks:
+            self.assertEqual(ctl.unwrap_group_key(body, sk), k_epoch)
+        outsider = bytes([200] * 32)
+        self.assertIsNone(ctl.unwrap_group_key(body, outsider))
+
+
 if __name__ == "__main__":
     unittest.main()

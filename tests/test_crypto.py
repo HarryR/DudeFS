@@ -101,6 +101,25 @@ class TestAeadXcs1(unittest.TestCase):
         self.assertTrue(C.zero_knowledge_active(b"xcs1"))
 
 
+class TestSealedBoxSbx1(unittest.TestCase):
+    # sbx1 seals to an Ed25519 identity via its X25519 agreement key. Ephemeral
+    # sender keypair => non-deterministic ciphertext, so the KAT is FUNCTIONAL:
+    # the addressed member opens it; nobody else can.
+    def test_member_opens_wrong_recipient_fails(self):
+        sk_a, sk_b = bytes([9] * 32), bytes([10] * 32)
+        pub_a = C.SIGNER.public(sk_a)
+        secret = b"K_epoch: a 32-byte group key!!!!"
+        sealed = C.seal_to(pub_a, secret)
+        self.assertNotIn(secret, sealed)  # actually sealed
+        self.assertEqual(C.open_sealed(sk_a, sealed), secret)  # addressee opens
+        self.assertIsNone(C.open_sealed(sk_b, sealed))  # wrong recipient -> None
+        self.assertIsNone(C.open_sealed(sk_a, sealed[:-1] + bytes([sealed[-1] ^ 1])))  # tamper
+
+    def test_ephemeral_sender_is_nondeterministic(self):
+        pub = C.SIGNER.public(bytes([11] * 32))
+        self.assertNotEqual(C.seal_to(pub, b"k"), C.seal_to(pub, b"k"))
+
+
 class TestMultiSigList(unittest.TestCase):
     def test_combine_verify_and_tamper(self):
         rng = random.Random(3)
