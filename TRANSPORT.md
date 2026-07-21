@@ -1,9 +1,12 @@
 # DudeFS transport & the L_msg envelope
 
 > **Status:** RATIFIED AS AMENDED (Fable, 2026-07-21 — NOTES 59; amendments
-> inline, marked ⟦F⟧). Normative under ARCHITECTURE / PROTOCOL §7 (transports,
-> endpoints, discovery, relay). If code and this design disagree, the design
-> wins. **Scope ⟦F⟧: L_msg covers the CLUSTER wire only** (client-daemon ↔ node,
+> inline, marked ⟦F⟧), then **FOLDED INTO PROTOCOL §7.5 as normative text**
+> (2026-07-21, Harry-approved: verified + minimal). PROTOCOL §7.5 is now the
+> normative statement; **this document is the extended rationale** it points to
+> (the "why not Noise/TLS" argument, the cost ladder, and the eviction /
+> survivor-rekey boundary). If code and the design disagree, the design wins.
+> **Scope ⟦F⟧: L_msg covers the CLUSTER wire only** (client-daemon ↔ node,
 > node ↔ node, manager ↔ node). The worker socket is exempt — filesystem
 > permissions are its entire boundary and workers hold no keys, so they cannot
 > sign envelopes (CLIENT.md §1).
@@ -221,14 +224,16 @@ is *the first consumer of L_msg*, so "refuse revoked/non-members at the door" fa
 out of "the door now knows who is knocking", on every transport, without ever
 assuming a stream or owning the TLS.
 
-## 9. Open items for Fable
+## 9. Open items — RESOLVED (folded into PROTOCOL §7.5)
 
-- Ratify the layer split and the plain/sealed envelope as PROTOCOL §7 normative
-  text; fix the canonical `canon(...)` encoding for `sig`.
-- Rule the `dude.screen` tag: identity-keyed (agreed) — confirm the person string
-  and that it is emitted **only** on multiplexed endpoints.
-- Confirm the reply-key mechanism for sealed replies (opt-in via a reply-key inside
-  the request, vs always-mirror).
-- Where L_msg meets the existing NOTES-58 wave: the gate, endpoint records, on-node
-  keygen + PoP, and joint-cert activation are the *consumers*; this doc is the
-  substrate they share.
+- ~~Ratify the layer split and the plain/sealed envelope as PROTOCOL §7 normative
+  text; fix the canonical `canon(...)` encoding for `sig`.~~ **Done — PROTOCOL §7.5;
+  `canon` = the existing canonical bencode with a `dude.msg:` signature domain.**
+- ~~Rule the `dude.screen` tag.~~ **Identity-keyed, `person = "dude.screen"`, 16-byte
+  digest, emitted only on multiplexed endpoints (direct carriers omit it).**
+- ~~Confirm the reply-key mechanism for sealed replies.~~ **Always-mirror; the reply
+  key is REQUIRED inside a sealed request (no opt-in downgrade lever).**
+- Consumers of this substrate: the request gate, endpoint records, on-node keygen +
+  PoP, and joint-cert activation (NOTES 58, all landed). The live-wire cutover
+  (envelope-wrapping the cluster RPCs + peer-gating the daemon serve path) is the
+  6b sub-wave.

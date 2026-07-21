@@ -145,6 +145,8 @@ Ops are authored by the *client node's* identity — that is what the log attrib
 
 Each storage node's reachability is described by an **endpoint record** in the control plane — a manager-signed op mapping `node_id → [(transport, uri, opts), …]`: multiple access methods per node (HTTP at two addresses, SSH, JSON-RPC over XMPP or any other intermediated transport), updated by ordinary control ops as infrastructure moves. Because records are manager-signed and log-carried, **a rogue node cannot redirect clients toward itself** — endpoint spoofing would require the root key. (Endpoints are plaintext control-plane metadata: inside the declared leakage boundary, DESIGN §7.)
 
+Each address's `opts` carries its **L_msg profile** — `{lmsg: plain}` or `{lmsg: sealed}` (§7.5) — a *server-side* property of the endpoint, never a per-message negotiation: the endpoint expects exactly one message shape and rejects everything else, so misconfiguration has nothing to mis-negotiate. Because the record is manager-signed, a hostile intermediary **cannot downgrade `sealed → plain`**.
+
 A **transport** is anything that can move a request/response pair or a bag of artifacts. Since every protocol message is (or carries) a self-authenticating artifact, transports add no trust — the plugin interface is a pure black box beneath the §1/§2 verbs, chosen per-peer and hedged across a node's addresses like any other fan-out (§4).
 
 ### 7.2 Bootstrap & discovery (from one reachable node)
@@ -170,3 +172,47 @@ When a client node can reach only a subset of the roster, the protocol degrades 
 ### 7.4 Partial, heterogeneous meshes (gorilla-survivability)
 
 Storage nodes likewise need not be pairwise-connected, nor share a common transport: gossip (§2) requires only that the reachability graph is **connected** — eventually, through any composition of transports — and convergence time scales with graph diameter, not degree. Disparate transports per link are a survivability feature: an outage that severs one transport class (HTTP blocked, DNS dead) leaves the mesh connected through another (SSH, an intermediated relay). The manager's endpoint records are the map; gossip finds the path.
+
+### 7.5 The L_msg envelope (message-level authentication ± confidentiality)
+
+A transport promises only "**push a message, get a reply — maybe**": message-oriented, sessionless, and often intermediated (XMPP through a server we don't run, HTTPS terminating at a CDN). Channel security (Noise/TLS) is therefore the wrong layer — it can't run on message carriers, and where it runs it authenticates *the stream to the intermediary*, not "this request came from node X", the one fact the request gate needs. So authentication and confidentiality live in the **message**. Three layers:
+
+```
+  L_msg    authenticated (± sealed) request/reply envelope   ← peer identity + the gate
+  L_art    self-authenticating artifacts (ops, receipts, QCs)  ← integrity (§0)
+  L_txport push message → reply, maybe (TCP | HTTPS | WS | XMPP) ← dumb carrier, adds no trust
+```
+
+**Scope:** L_msg is the **cluster wire only** (client-daemon ↔ node, node ↔ node, manager ↔ node). The worker socket (§6) is exempt — filesystem permissions are its whole boundary and workers hold no keys to sign with.
+
+No anonymous traffic — every envelope is authenticated, so the gate always has a `from`.
+
+**Plain (auth only)** — for carriers already confidential to the peer (Tor `.onion`, owned TLS, trusted LAN):
+
+```
+{ from, to, epoch, ts, nonce, verb, body, sig }
+    sig = Ed25519(from_sk, "dude.msg:" ‖ canon(from, to, epoch, ts, nonce, verb, body))
+```
+
+**Sealed (auth + confidentiality)** — for any untrusted-but-encrypted intermediary (CDN-fronted HTTPS, an XMPP server): **sign-then-seal**, the signed struct wrapped in an `sbx1` anonymous-sender sealed box, so the intermediary sees only `to_hint` + ciphertext — *"a message, to someone"*, not who/verb/tags:
+
+```
+outer: { to_hint, sbx1_seal(to_pub, [ inner, reply_key ]) }
+inner:   the same signed { from, …, sig }        reply_key: a fresh ephemeral pubkey
+```
+
+- **`canon(…)`** is the existing canonical bencode (§0/§5) — injective, golden-pinned; no new encoding. The `dude.msg:` domain prefix keeps an envelope signature disjoint from an op signature or a proof-of-possession.
+- **`to`** binds the message to one recipient *inside the seal* — the anti-reflection field; without it a signed request to A is replayable to B.
+- **`epoch` is diagnostic, never a hard gate:** a roster bridge always has an activated party talking to a not-yet-activated one, so an envelope-level `epoch == current` refusal is the over-strict-gate (R1) class. Epoch is enforced by the artifact layer where it is load-bearing (receipts, QCs, RERECEIPT), not at the door.
+- **`ts` (+ optional `nonce`)** is freshness/DoS hygiene, not correctness: verbs are idempotent and replay-protected, so a re-sent message is inert.
+- **Sealed replies** mirror the request mode (an endpoint property, always-mirror): the node seals its signed reply back to the request's `reply_key` — **required in sealed mode, not opt-in** (an optional reply-key is a downgrade lever). Confidential both ways, still no session.
+
+**Screening tag `to_hint`** (multiplexed carriers only — a relay, an XMPP MUC, a shared mailbox; a *direct* carrier omits it and `to` stays inside the seal):
+
+```
+to_hint = keyed-BLAKE2(key = target_node_identity, person = "dude.screen", sealed)
+```
+
+The sender keys on the target's identity (from its endpoint record); the receiver keys on its **own** identity to test a match — one symmetric hash, no ECDH. **Identity-keyed, deliberately not epoch-keyed:** an epoch-scoped key deadlocks a from-scratch sync (you can't screen the messages that would deliver the epoch key); a node always holds its own long-term identity, so it screens from message zero. This gives a **cost ladder**: internet noise can't produce a valid tag → *free-dropped* at the hash rung (no ECDH spent); a blocked/ex node forges a tag and climbs to the ECDH rung but **dies at the gate** (`from` ∉ current roster); members are served. What rests on roster-secrecy is *only* the free-drop rung and tag-unlinkability (best-effort, graceful degradation); admission and data confidentiality never do.
+
+**The request gate** (L_msg's first consumer), on inbound before any store work: (1) unseal if the endpoint is `sealed`; (2) verify `sig` by `from`; (3) `to == self`, `ts` fresh (epoch is diagnostic only); (4) **check `from` against the live control-plane view** — current roster member / un-revoked cert; (5) dispatch. Steps 1–4 reject revoked/non-members *at the door*, before the fold — the gate authorizes the **requester**, never an artifact's author, so it never blocks an authorized proposer carrying a since-revoked author's op through recovery. **Defence in depth:** gate/seal protect the door and metadata; application values are independently protected by the group *data* key (`xcs1`, DESIGN §7), which rotates on eviction — the layers fail independently. Extended rationale and the eviction/survivor-rekey boundary: [TRANSPORT.md](TRANSPORT.md).
