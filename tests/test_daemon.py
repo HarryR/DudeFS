@@ -37,33 +37,9 @@ def _daemon(w, i, roster):
     )
 
 
-def _rpc(peer):
-    """In-process peer transport: a payload-level `dial` (no framing — that's the real
-    carrier's job). Renders L_msg's silence (None) as this carrier's empty reply."""
-
-    def dial(payload):
-        reply = peer.serve(payload)
-        return reply if reply is not None else b""
-
-    return dial
-
-
 class TestDaemonGossip(unittest.TestCase):
-    def test_two_daemons_converge_via_anti_entropy(self):
-        w = World(seed=1, n_clients=2)
-        roster = [C.SIGNER.public(bytes([200 + i] * 32)) for i in range(2)]
-        a, b = _daemon(w, 0, roster), _daemon(w, 1, roster)
-        x = w.blind(0, [], [[A.Mutation.SET, b"x", b"1"]])
-        y = w.blind(1, [], [[A.Mutation.SET, b"y", b"1"]])
-        a.store.append(x)
-        b.store.append(y)
-        # one round each direction -> both hold the union (gossip fixpoint)
-        a.gossip_round(_rpc(b), b.pub)
-        b.gossip_round(_rpc(a), a.pub)
-        for d in (a, b):
-            self.assertIsNotNone(d.store.get_op(x.op_hash))
-            self.assertIsNotNone(d.store.get_op(y.op_hash))
-
+    # Gossip end-to-end over real carriers is covered by TestDaemonPeerSockets (unix)
+    # and TestMixedTransportCluster (unix↔http); gossip_round now dials via a Link.
     def test_serve_dispatches_node_verbs(self):
         w = World(seed=2, n_clients=1)
         roster = [C.SIGNER.public(bytes([200] * 32))]

@@ -24,6 +24,7 @@ from . import artifacts as A
 from . import fold, lmsg, transports, wire
 from .artifacts import BLIND, HLC, QC, Op, Receipt, Txn, compute_slot_tag
 from .handlers import data as data_handler
+from .link import Link
 from .node import FetchOpReq, FrontierReq, GetQCReq, PutQCReq, Request, Response, SubmitReq
 from .quorum import (
     Commit,
@@ -210,16 +211,10 @@ class ClientDaemon:
         if self._closing.is_set():
             return None
         ep, to_pub = self.roster_addrs[node], self.cfg.roster[node]
-        out = lmsg.author(
-            self.sk,
-            to_pub,
-            b"",
-            wire.encode_request(req),
-            epoch=self.cfg.epoch,
-            ts=int(time.time() * 1000),
-        ).encode()
-        raw = transports.dial(ep.transport, ep.uri, out)
-        match lmsg.classify_reply(raw, expect_from=to_pub, expect_to=self.pub):
+        link = Link(self.sk, self.pub, to_pub, ep)
+        match link.request(
+            b"", wire.encode_request(req), epoch=self.cfg.epoch, ts=int(time.time() * 1000)
+        ):
             case lmsg.Reply(env):
                 return wire.decode_response(env.body)
             case _fault:  # NoReply / MalformedReply / WrongPeer — the why is here to log later

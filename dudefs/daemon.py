@@ -21,6 +21,7 @@ from .artifacts import Op, Watermark, quorum_size
 from .fold import ControlReducer, ControlState, endpoints_of
 from .gossip import Delta
 from .handlers import control as ctl
+from .link import Link
 from .node import LocalNode, dispatch
 from .store import ChainStore, covered
 
@@ -186,21 +187,15 @@ class NodeDaemon:
         if peers:  # supersede the seed/kwarg only ONCE endpoint records exist
             self.peers = peers
 
-    def gossip_round(self, dial: Callable[[bytes], bytes], to_pub: bytes) -> None:
-        """One anti-entropy round against a peer: advertise my SUMMARY (digest first)
-        inside a signed L_msg envelope addressed to `to_pub`, apply the DELTA it owes
-        me. Cut-aware — the peer's reply folds in the sparse below-cut baseline for any
-        author whose retained digest differs. `dial` takes a request PAYLOAD and returns
-        the reply payload — the transport owns the sockets + framing (sans-io)."""
-        out = lmsg.author(
-            self.sk,
-            to_pub,
-            b"gossip",
-            _gossip_request(self.summary()),
-            epoch=self.acc.epoch,
-            ts=self._clock(),
-        ).encode()
-        match lmsg.classify_reply(dial(out), expect_from=to_pub, expect_to=self.pub):
+    def gossip_round(self, peer: Peer) -> None:
+        """One anti-entropy round against `peer`: advertise my SUMMARY (digest first)
+        over a Link (L_msg envelope + the peer's carrier), apply the DELTA it owes me.
+        Cut-aware — the peer's reply folds in the sparse below-cut baseline for any
+        author whose retained digest differs."""
+        link = Link(self.sk, self.pub, peer.pub, peer.endpoint)
+        match link.request(
+            b"gossip", _gossip_request(self.summary()), epoch=self.acc.epoch, ts=self._clock()
+        ):
             case lmsg.Reply(env):
                 gossip.apply_delta(self.store, gossip.decode_delta(env.body))
             case _fault:  # NoReply / MalformedReply / WrongPeer — a missed round
@@ -353,8 +348,7 @@ class NodeDaemon:
         §9 demo's handful lets us sweep all to the same fixpoint; a down peer is
         just a missed round.)"""
         for peer in self.peers:
-            ep = peer.endpoint
-            self.gossip_round(lambda p, e=ep: transports.dial(e.transport, e.uri, p), peer.pub)
+            self.gossip_round(peer)
         self.adopt_committed_checkpoints()
         self.observe_roster_activations()  # adopt a joint-certified roster change
         self.observe_fences()

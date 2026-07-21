@@ -21,6 +21,7 @@ import time
 from . import artifacts as A
 from . import lmsg, transports, wire
 from .artifacts import HLC, quorum_size
+from .link import Link
 from .manager import Manager, ManagerError, ManagerState, RecoverDecision, recover_decision
 from .node import FrontierReq, Request, Response
 
@@ -68,16 +69,11 @@ def _mgr_send(
     VERIFIED reply or None. The gate admits root, so the manager's drive passes."""
     if not addr:
         return None
-    out = lmsg.author(
-        st.root_key,
-        to_pub,
-        b"",
-        wire.encode_request(req),
-        epoch=st.epoch,
-        ts=int(time.time() * 1000),
-    ).encode()
-    raw = transports.dial(transports.UNIX, addr, out, timeout=timeout)
-    match lmsg.classify_reply(raw, expect_from=to_pub, expect_to=st.manager_pub):
+    ep = transports.Endpoint(transports.UNIX, addr)  # B upgrades node_addrs to carry the Endpoint
+    link = Link(st.root_key, st.manager_pub, to_pub, ep)
+    match link.request(
+        b"", wire.encode_request(req), epoch=st.epoch, ts=int(time.time() * 1000), timeout=timeout
+    ):
         case lmsg.Reply(env):
             return wire.decode_response(env.body)
         case _fault:  # NoReply / MalformedReply / WrongPeer — the why is here to log later
