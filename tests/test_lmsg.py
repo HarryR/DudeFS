@@ -218,6 +218,16 @@ class TestClassifyReply(unittest.TestCase):
         assert isinstance(out, lmsg.WrongPeer)
         self.assertEqual(out.frm, X)  # names who actually signed it
 
+    def test_sealed_reply_opens_with_the_ephemeral_key_only(self):
+        rsk = bytes([77] * 32)
+        reply = lmsg.author(B_SK, A, b"V", b"body", epoch=0, ts=NOW)  # B -> A
+        sealed = lmsg.seal_reply(reply, C.SIGNER.public(rsk))
+        got = lmsg.classify_sealed_reply(sealed, reply_sk=rsk, expect_from=B, expect_to=A)
+        self.assertIsInstance(got, lmsg.Reply)
+        # a different reply-key cannot open it -> not our reply
+        bad = lmsg.classify_sealed_reply(sealed, reply_sk=X_SK, expect_from=B, expect_to=A)
+        self.assertIsInstance(bad, lmsg.MalformedReply)
+
 
 if __name__ == "__main__":
     unittest.main()

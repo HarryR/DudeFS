@@ -15,6 +15,7 @@ from dudefs import lmsg, transports, wire
 from dudefs import node as N
 from dudefs.acceptor import Acceptor
 from dudefs.daemon import NodeDaemon, Peer
+from dudefs.link import Link
 from dudefs.manager import Manager
 from dudefs.node import LocalNode, dispatch
 from dudefs.store import ChainStore
@@ -122,6 +123,69 @@ class TestMixedTransportCluster(unittest.TestCase):
             a.close()
             b.close()
             time.sleep(0.05)
+
+
+class TestSealedMode(unittest.TestCase):
+    def _serve_sealed(self, d):
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            uri = f"http://127.0.0.1:{probe.getsockname()[1]}/dude"
+        ready = threading.Event()
+        threading.Thread(
+            target=d.serve_forever,
+            args=(uri, ready),
+            kwargs={"scheme": transports.HTTP, "sealed": True},
+            daemon=True,
+        ).start()
+        self.assertTrue(ready.wait(2))
+        return uri
+
+    def test_sealed_endpoint_round_trips_the_gated_wire(self):
+        # a node on a SEALED http endpoint: the request is sign-then-sealed, the reply
+        # sealed back to the ephemeral key — full L_msg + gate + dispatch, encrypted.
+        w = World(seed=16, n_clients=1)
+        d = _daemon(w, 0, [C.SIGNER.public(bytes([200] * 32))])
+        uri = self._serve_sealed(d)
+        op = creation_op(w, 0, b"v")
+        assert op.slot_tag is not None
+        link = Link(
+            w.clients[0].sk,
+            w.clients[0].pub,
+            d.pub,
+            transports.Endpoint(transports.HTTP, uri, sealed=True),
+        )
+        out = link.request(
+            b"",
+            wire.encode_request(N.AcceptReq(op.slot_tag, A.Ballot(1, b"x"), op)),
+            epoch=0,
+            ts=d._clock(),
+        )
+        self.assertIsInstance(out, lmsg.Reply)
+        assert isinstance(out, lmsg.Reply)
+        self.assertIsInstance(wire.decode_response(out.env.body), A.Receipt)  # sealed, end-to-end
+        d.close()
+        time.sleep(0.05)
+
+    def test_plain_request_to_a_sealed_endpoint_is_silence(self):
+        # §8: an endpoint expects ONE shape. A plain envelope can't be unsealed -> the
+        # node reveals nothing (silence), and the plain caller reads NoReply.
+        w = World(seed=17, n_clients=1)
+        d = _daemon(w, 0, [C.SIGNER.public(bytes([200] * 32))])
+        uri = self._serve_sealed(d)
+        op = creation_op(w, 0, b"v")
+        assert op.slot_tag is not None
+        plain = Link(  # a PLAIN link to the sealed endpoint (mismatched profile)
+            w.clients[0].sk, w.clients[0].pub, d.pub, transports.Endpoint(transports.HTTP, uri)
+        )
+        out = plain.request(
+            b"",
+            wire.encode_request(N.AcceptReq(op.slot_tag, A.Ballot(1, b"x"), op)),
+            epoch=0,
+            ts=d._clock(),
+        )
+        self.assertIsInstance(out, lmsg.NoReply)
+        d.close()
+        time.sleep(0.05)
 
 
 class TestHttpCarrier(unittest.TestCase):

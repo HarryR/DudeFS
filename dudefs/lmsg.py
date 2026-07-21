@@ -216,21 +216,29 @@ class Dropped:
 type Inbound = Gated | Refused | Dropped
 
 
-def classify_inbound(
-    data: bytes, *, self_pub: bytes, now: int, delta: int, authorized: Callable[[bytes], bool]
+def gate_envelope(
+    env: Envelope, *, self_pub: bytes, now: int, delta: int, authorized: Callable[[bytes], bool]
 ) -> Inbound:
-    """Decode + gate one inbound request frame into a typed outcome — PURE, no I/O.
-    The transport matches on the result and renders it (reply / silence)."""
-    try:
-        env = Envelope.decode(data)
-    except (codec.CodecError, ValueError, IndexError):
-        return Dropped("malformed")
+    """Gate an ALREADY-decoded envelope into a typed outcome — PURE. The plain path
+    (classify_inbound) decodes first; the sealed path unseals first and calls this."""
     verdict = gate(env, self_pub=self_pub, now=now, delta=delta, authorized=authorized)
     if verdict is Gate.OK:
         return Gated(env)
     if verdict in (Gate.BAD_SIG, Gate.WRONG_RECIPIENT):
         return Dropped(verdict.name.lower())  # unproven identity -> reveal nothing
     return Refused(env, verdict)  # STALE / NOT_A_MEMBER -> authenticated 'no' is safe
+
+
+def classify_inbound(
+    data: bytes, *, self_pub: bytes, now: int, delta: int, authorized: Callable[[bytes], bool]
+) -> Inbound:
+    """Decode + gate one PLAIN inbound request frame — PURE, no I/O. The transport
+    matches on the result and renders it (reply / silence)."""
+    try:
+        env = Envelope.decode(data)
+    except (codec.CodecError, ValueError, IndexError):
+        return Dropped("malformed")
+    return gate_envelope(env, self_pub=self_pub, now=now, delta=delta, authorized=authorized)
 
 
 @dataclass(frozen=True)
@@ -265,18 +273,35 @@ class WrongPeer:
 type ReplyOutcome = Reply | NoReply | MalformedReply | WrongPeer
 
 
+def _check_reply(env: Envelope, expect_from: bytes, expect_to: bytes) -> ReplyOutcome:
+    """The verify half shared by plain + sealed reply classification."""
+    if not env.verify_sig():
+        return MalformedReply()  # unsigned / tampered -> not a verifiable reply
+    if env.frm != expect_from or env.to != expect_to:
+        return WrongPeer(env.frm)
+    return Reply(env)
+
+
 def classify_reply(data: bytes, *, expect_from: bytes, expect_to: bytes) -> ReplyOutcome:
-    """Validate an inbound REPLY frame against the peer we addressed — PURE, no I/O.
-    Returns a cause-named outcome; a reply not signed by `expect_from` back to
-    `expect_to` is not our reply."""
+    """Validate a PLAIN inbound REPLY frame against the peer we addressed — PURE, no
+    I/O. A reply not signed by `expect_from` back to `expect_to` is not our reply."""
     if not data:
         return NoReply()
     try:
         env = Envelope.decode(data)
     except (codec.CodecError, ValueError, IndexError):
         return MalformedReply()
-    if not env.verify_sig():
-        return MalformedReply()  # unsigned / tampered -> not a verifiable reply
-    if env.frm != expect_from or env.to != expect_to:
-        return WrongPeer(env.frm)
-    return Reply(env)
+    return _check_reply(env, expect_from, expect_to)
+
+
+def classify_sealed_reply(
+    data: bytes, *, reply_sk: bytes, expect_from: bytes, expect_to: bytes
+) -> ReplyOutcome:
+    """Validate a SEALED inbound reply: open it with the ephemeral `reply_sk` from the
+    request, then the same verify as plain. Un-openable bytes are 'not our reply'."""
+    if not data:
+        return NoReply()
+    env = unseal_reply(reply_sk, data)
+    if env is None:
+        return MalformedReply()  # couldn't open with our reply-key -> not ours
+    return _check_reply(env, expect_from, expect_to)

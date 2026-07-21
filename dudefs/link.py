@@ -7,8 +7,10 @@
 # behind a callback — it calls transports.dial directly and returns a typed outcome.
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
+from . import crypto as C
 from . import lmsg, transports
 
 
@@ -28,9 +30,17 @@ class Link:
     ) -> lmsg.ReplyOutcome:
         """Author an L_msg request to the peer, dial it over the endpoint's carrier, and
         return the verified reply outcome (Reply / NoReply / MalformedReply / WrongPeer).
-        Plain mode; sealing keys off `endpoint.sealed` (step C)."""
+        Seals iff `endpoint.sealed` — sign-then-seal to the peer with a fresh ephemeral
+        reply-key, and open the reply with it; otherwise plain."""
         env = lmsg.author(self.sk, self.to_pub, verb, body, epoch=epoch, ts=ts)
-        raw = transports.dial(
-            self.endpoint.transport, self.endpoint.uri, env.encode(), timeout=timeout
+        if not self.endpoint.sealed:
+            raw = transports.dial(
+                self.endpoint.transport, self.endpoint.uri, env.encode(), timeout=timeout
+            )
+            return lmsg.classify_reply(raw, expect_from=self.to_pub, expect_to=self.self_pub)
+        reply_sk = os.urandom(32)  # ephemeral reply-key, sealed INSIDE the request
+        sealed = lmsg.seal_request(env, self.to_pub, C.SIGNER.public(reply_sk), hinted=False)
+        raw = transports.dial(self.endpoint.transport, self.endpoint.uri, sealed, timeout=timeout)
+        return lmsg.classify_sealed_reply(
+            raw, reply_sk=reply_sk, expect_from=self.to_pub, expect_to=self.self_pub
         )
-        return lmsg.classify_reply(raw, expect_from=self.to_pub, expect_to=self.self_pub)

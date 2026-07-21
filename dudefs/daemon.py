@@ -68,6 +68,7 @@ class NodeDaemon:
     ):
         self.peers: list[Peer] = peers or []  # anti-entropy peers (identity + Endpoint)
         self.sk = sk  # the node's identity key — signs L_msg envelopes (PROTOCOL §7.5)
+        self._sealed = False  # inbound profile; serve_forever(sealed=True) unseals first
         self.store = ChainStore(store_path)
         self.manager_pub = manager_pub
         for op in control_ops or []:  # seed the authorization view (certs/roster)
@@ -113,28 +114,47 @@ class NodeDaemon:
         store error so the transport stays a dumb pipe."""
         with self._lock:
             try:
-                match lmsg.classify_inbound(
-                    data,
-                    self_pub=self.pub,
-                    now=self._clock(),
-                    delta=self.acc.delta_ms,
-                    authorized=self._peer_authorized,
-                ):
+                # sealed endpoint: unseal FIRST (a party that can't seal to us never
+                # yields an envelope -> silence, the seal IS the screen); else plain.
+                reply_key: bytes | None = None
+                if self._sealed:
+                    opened = lmsg.unseal_request(self.sk, data)
+                    if opened is None:
+                        return None  # not sealed to me / malformed -> reveal nothing
+                    env0, reply_key = opened
+                    outcome: lmsg.Inbound = lmsg.gate_envelope(
+                        env0,
+                        self_pub=self.pub,
+                        now=self._clock(),
+                        delta=self.acc.delta_ms,
+                        authorized=self._peer_authorized,
+                    )
+                else:
+                    outcome = lmsg.classify_inbound(
+                        data,
+                        self_pub=self.pub,
+                        now=self._clock(),
+                        delta=self.acc.delta_ms,
+                        authorized=self._peer_authorized,
+                    )
+                match outcome:
                     case lmsg.Gated(env):
-                        return self._reply(env, self._dispatch(env.body))  # gate passed
+                        return self._reply(env, self._dispatch(env.body), reply_key)
                     case lmsg.Refused(env, reason):
                         refusal = Rejected(_REFUSAL_REASON[reason])  # the signed 'no' says WHY
-                        return self._reply(env, wire.encode_response(refusal))
+                        return self._reply(env, wire.encode_response(refusal), reply_key)
                     case lmsg.Dropped(_reason):
                         return None  # unproven identity / malformed -> reveal nothing
             except sqlite3.Error:
                 return None  # store closed under us (node killed) -> carrier silence
 
-    def _reply(self, env: lmsg.Envelope, body: bytes) -> bytes:
-        """Seal a signed reply back to the requester (mirrors the request's verb)."""
-        return lmsg.author(
+    def _reply(self, env: lmsg.Envelope, body: bytes, reply_key: bytes | None) -> bytes:
+        """A signed reply back to the requester (mirrors the request's verb); sealed to
+        the requester's ephemeral reply-key when the inbound was sealed."""
+        reply = lmsg.author(
             self.sk, env.frm, env.verb, body, epoch=self.acc.epoch, ts=self._clock()
-        ).encode()
+        )
+        return lmsg.seal_reply(reply, reply_key) if reply_key is not None else reply.encode()
 
     def _peer_authorized(self, frm: bytes) -> bool:
         """The peer gate's policy: a current roster node (gossip / ballots), a certed
@@ -364,12 +384,19 @@ class NodeDaemon:
 
     # ---- the listening carrier (the transport owns the I/O; §7 seam) ------- #
     def serve_forever(
-        self, uri: str, ready: threading.Event | None = None, *, scheme: bytes = LOCAL_TRANSPORT
+        self,
+        uri: str,
+        ready: threading.Event | None = None,
+        *,
+        scheme: bytes = LOCAL_TRANSPORT,
+        sealed: bool = False,
     ) -> None:
         """Listen on a carrier (`scheme`, default the local unix socket) and serve gated
         envelopes until `close`. The transport owns the accept loop + framing; we supply
         only the pure `serve`, so the same gated wire runs over unix, HTTP, or any
-        carrier the ENDPOINT names."""
+        carrier the ENDPOINT names. `sealed` = this endpoint's L_msg profile: inbound is
+        unsealed (and replies sealed back) instead of read plain."""
+        self._sealed = sealed
         self._server = transports.open_server(scheme)
         self._server.serve(uri, self.serve, ready)
 
