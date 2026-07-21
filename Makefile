@@ -22,10 +22,10 @@ TY    := $(VENV)/bin/ty
 # Keep uv's cache inside the project too, so `make` creates nothing under $HOME.
 export UV_CACHE_DIR := $(TOOLS)/cache
 
-.PHONY: help install uv-bootstrap lint format format-check typecheck test check clean distclean
+.PHONY: help install uv-bootstrap lint format format-check typecheck test coverage check clean distclean
 
 help:
-	@echo "targets: install | lint | format | format-check | typecheck | test | check | clean | distclean"
+	@echo "targets: install | lint | format | format-check | typecheck | test | coverage | check | clean | distclean"
 
 # Install uv as a standalone binary INTO THE PROJECT (./.uv), never touching
 # ~/.local/bin or shell profiles (UV_NO_MODIFY_PATH=1). No-op if already present.
@@ -39,7 +39,7 @@ uv-bootstrap:
 # Create the venv (Python 3.12) and install the dev tools into it.
 install: uv-bootstrap
 	"$(UV)" venv "$(VENV)" --python 3.12 --clear
-	"$(UV)" pip install --python "$(PY)" ruff ty pynacl
+	"$(UV)" pip install --python "$(PY)" ruff ty pynacl coverage
 	@echo ">> toolchain ready (project-local); 'make check' to run everything"
 
 lint:
@@ -56,6 +56,13 @@ typecheck:
 
 test:
 	"$(PY)" -m unittest discover -s tests
+
+# Coverage baseline + ratchet (NOTES 57 item 5): the pre-refactor floor is 93%
+# (see COVERAGE-BASELINE.txt for the per-file missing lines the refactor diffs
+# against). --fail-under is a RATCHET: a hygiene refactor must not drop coverage.
+coverage:
+	"$(PY)" -m coverage run --source=dudefs -m unittest discover -s tests
+	"$(PY)" -m coverage report -m --fail-under=90
 
 # CI-style gate: no writes, fails on any issue.
 check: lint format-check typecheck test

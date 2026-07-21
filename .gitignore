@@ -20,3 +20,7 @@ __pycache__/
 # OS / editor cruft
 .DS_Store
 *~
+
+# coverage data (baseline report is COVERAGE-BASELINE.txt, committed)
+.coverage
+htmlcov/
