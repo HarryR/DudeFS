@@ -155,7 +155,11 @@ def gate(
     env: Envelope, *, self_pub: bytes, now: int, delta: int, authorized: Callable[[bytes], bool]
 ) -> Gate:
     """The request gate over an ALREADY-unsealed envelope (TRANSPORT §5). Cheap door
-    checks first, membership last. `epoch` is DIAGNOSTIC and deliberately NOT gated
+    checks first, membership last. **Check ORDER is load-bearing** (`classify_inbound`
+    relies on it): sig THEN recipient come first, so a BAD_SIG / WRONG_RECIPIENT verdict
+    marks a sender that has NOT proven it holds our identity — those are classified
+    `Dropped` (no reply) so a signed 'no' never leaks our pubkey (TRANSPORT §3/§4).
+    `epoch` is DIAGNOSTIC and deliberately NOT gated
     (⟦F⟧): a roster bridge always has an activated party talking to a not-yet-activated
     one, so a hard `epoch == current` refusal is the R1 over-strict-gate class — the
     artifact layer already enforces epoch where it is load-bearing (receipts, QCs,
@@ -171,3 +175,91 @@ def gate(
     if not authorized(env.frm):
         return Gate.NOT_A_MEMBER
     return Gate.OK
+
+
+# --------------------------------------------------------------------------- #
+# Typed outcomes — the encoding layer CLASSIFIES; the transport renders. No I/O,   #
+# no blocking, no None: an inbound frame maps to exactly one of these, and the      #
+# transport (socket / XMPP / HTTP) decides how to carry each (send a reply, or its  #
+# carrier-native silence — a closed frame, no stanza, a 404).                       #
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class Gated:
+    """The requester passed the gate: authentic, addressed to us, fresh, authorized.
+    The transport dispatches `env.body` and seals a reply back to `env.frm`."""
+
+    env: Envelope
+
+
+@dataclass(frozen=True)
+class Refused:
+    """Authentic AND addressed to us (so the sender already holds our identity), but
+    failed freshness/membership. The transport MAY reply with a signed refusal — it
+    leaks nothing new. `reason` is STALE or NOT_A_MEMBER."""
+
+    env: Envelope
+    reason: Gate
+
+
+@dataclass(frozen=True)
+class Dropped:
+    """The sender did NOT prove it holds our identity (malformed, bad sig, or a probe
+    addressed to a pubkey it doesn't hold). The transport renders carrier-native
+    SILENCE — no reply — so we never leak our pubkey. `reason` is for the node's own
+    logs only; it is never emitted (else it becomes a pubkey-guess oracle)."""
+
+    reason: str
+
+
+type Inbound = Gated | Refused | Dropped
+
+
+def classify_inbound(
+    data: bytes, *, self_pub: bytes, now: int, delta: int, authorized: Callable[[bytes], bool]
+) -> Inbound:
+    """Decode + gate one inbound request frame into a typed outcome — PURE, no I/O.
+    The transport matches on the result and renders it (reply / silence)."""
+    try:
+        env = Envelope.decode(data)
+    except (codec.CodecError, ValueError, IndexError):
+        return Dropped("malformed")
+    verdict = gate(env, self_pub=self_pub, now=now, delta=delta, authorized=authorized)
+    if verdict is Gate.OK:
+        return Gated(env)
+    if verdict in (Gate.BAD_SIG, Gate.WRONG_RECIPIENT):
+        return Dropped(verdict.name.lower())  # unproven identity -> reveal nothing
+    return Refused(env, verdict)  # STALE / NOT_A_MEMBER -> authenticated 'no' is safe
+
+
+@dataclass(frozen=True)
+class Reply:
+    """A verified reply from the peer we addressed. `env.body` is the response payload."""
+
+    env: Envelope
+
+
+@dataclass(frozen=True)
+class Unusable:
+    """No usable reply: absent, malformed, unsigned, or not from the addressed peer.
+    `reason` lets the driver distinguish an authenticated refusal from an unreachable
+    peer (never collapse them — they demand different handling)."""
+
+    reason: str
+
+
+def classify_reply(data: bytes, *, expect_from: bytes, expect_to: bytes) -> Reply | Unusable:
+    """Validate an inbound REPLY frame against the peer we addressed — PURE, no I/O.
+    A reply that isn't signed by `expect_from` back to `expect_to` is no reply."""
+    if not data:
+        return Unusable("absent")
+    try:
+        env = Envelope.decode(data)
+    except (codec.CodecError, ValueError, IndexError):
+        return Unusable("malformed")
+    if not env.verify_sig():
+        return Unusable("bad_sig")
+    if env.frm != expect_from or env.to != expect_to:
+        return Unusable("wrong_peer")  # a reply from someone other than who I addressed
+    return Reply(env)

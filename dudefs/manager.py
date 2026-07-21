@@ -426,11 +426,14 @@ class Manager:
 
     # ---- recovery (interlocked) ----------------------------------------- #
     def probe_roster(
-        self, probe: Callable[[str], HLC | None], dwell: float, sleep: Callable[[float], None]
+        self,
+        probe: Callable[[bytes, str], HLC | None],
+        dwell: float,
+        sleep: Callable[[float], None],
     ) -> RecoverReport:
-        """Dwell-probe every roster endpoint via the injected `probe(addr) -> floor
-        | None` (I/O is the caller's — the CLI passes a real FRONTIER probe; tests
-        pass a synthetic map). Returns the reachability report."""
+        """Dwell-probe every roster endpoint via the injected `probe(pub, addr) ->
+        floor | None` (I/O is the caller's — the CLI passes a real enveloped FRONTIER
+        probe; tests pass a synthetic map). Returns the reachability report."""
         import time
 
         answered: dict[int, HLC] = {}
@@ -440,7 +443,7 @@ class Manager:
             for i, pub in enumerate(self.state.roster):
                 if i in answered:
                     continue
-                floor = probe(self.state.node_addrs.get(pub.hex(), ""))
+                floor = probe(pub, self.state.node_addrs.get(pub.hex(), ""))
                 if floor is not None:
                     answered[i] = floor
             if time.monotonic() >= deadline or len(answered) == n:

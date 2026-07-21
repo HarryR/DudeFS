@@ -332,7 +332,8 @@ class TestEndpointConsumption(unittest.TestCase):
         for op in [*w.control_ops, *eps]:
             nd.store.put_op_raw(op)
         nd.refresh_peers()
-        self.assertEqual(set(nd.peers), {"/n1.sock", "/n2.sock"})  # excludes self (roster[0])
+        # peers are (identity, address) pairs now (L_msg needs `to`); check the addresses
+        self.assertEqual({p for _pub, p in nd.peers}, {"/n1.sock", "/n2.sock"})  # excludes self
         nd.close()
 
     def test_client_daemon_derives_roster_addrs_from_endpoints(self):

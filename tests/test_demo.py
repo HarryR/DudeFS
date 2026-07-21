@@ -46,7 +46,7 @@ class Demo:
         self.clients = [self._client(w, ci) for ci in range(2)]
 
     def _peers(self, i):
-        return [self.paths[j] for j in range(len(self.paths)) if j != i]
+        return [(self.roster[j], self.paths[j]) for j in range(len(self.paths)) if j != i]
 
     def _spawn_node(self, i, sk=None):
         if os.path.exists(self.paths[i]):
@@ -252,10 +252,10 @@ class TestDemoRunbook(unittest.TestCase):
                 demo.kill_node(1)
                 demo.kill_node(2)  # only node0 survives -> below quorum
 
-                from dudefs.cli import _probe_floor
+                from dudefs.cli import _floor_probe
                 from dudefs.manager import RecoverDecision, recover_decision
 
-                report = m.probe_roster(_probe_floor, dwell=0.4, sleep=time.sleep)
+                report = m.probe_roster(_floor_probe(m.state), dwell=0.4, sleep=time.sleep)
                 self.assertLess(len(report.reachable), report.quorum)  # quorum is dead
                 self.assertIs(recover_decision(report, data_loss_ack=True), RecoverDecision.PROCEED)
                 ckpt, rop = m.author_recovery_fence(report)

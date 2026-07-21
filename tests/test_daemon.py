@@ -11,14 +11,14 @@ import unittest
 
 from dudefs import artifacts as A
 from dudefs import crypto as C
+from dudefs import lmsg, wire
 from dudefs import node as N
-from dudefs import wire
 from dudefs.acceptor import Acceptor
 from dudefs.daemon import NodeDaemon, _bytesource
 from dudefs.manager import Manager
 from dudefs.node import LocalNode, dispatch
 from dudefs.store import ChainStore
-from tests._builders import World
+from tests._builders import World, call_node, enveloped
 from tests._cluster import creation_op
 
 BIG = 1_000_000
@@ -31,18 +31,21 @@ def _daemon(w, i, roster):
         C.SIGNER.public(sk),
         roster=roster,
         manager_pub=w.mgr_pub,
+        control_ops=w.control_ops,  # certs the clients so the peer gate admits them
         clock=lambda: 100,
         delta_ms=BIG,
     )
 
 
 def _rpc(peer):
-    """In-process peer transport: unframe the request, serve it, return UNFRAMED."""
+    """In-process peer transport: unframe the request, serve it, return UNFRAMED —
+    rendering L_msg's silence (None) as this carrier's empty (an absent reply)."""
 
     def rpc(framed):
         payload = wire.read_frame(_bytesource(framed))
         assert payload is not None
-        return peer.serve(payload)
+        reply = peer.serve(payload)
+        return reply if reply is not None else b""
 
     return rpc
 
@@ -57,8 +60,8 @@ class TestDaemonGossip(unittest.TestCase):
         a.store.append(x)
         b.store.append(y)
         # one round each direction -> both hold the union (gossip fixpoint)
-        a.gossip_round(_rpc(b))
-        b.gossip_round(_rpc(a))
+        a.gossip_round(_rpc(b), b.pub)
+        b.gossip_round(_rpc(a), a.pub)
         for d in (a, b):
             self.assertIsNotNone(d.store.get_op(x.op_hash))
             self.assertIsNotNone(d.store.get_op(y.op_hash))
@@ -69,8 +72,7 @@ class TestDaemonGossip(unittest.TestCase):
         d = _daemon(w, 0, roster)
         op = creation_op(w, 0, b"v")
         assert op.slot_tag is not None
-        req = wire.encode_request(N.AcceptReq(op.slot_tag, A.Ballot(1, b"x"), op))
-        resp = wire.decode_response(d.serve(req))
+        resp = call_node(d, w.clients[0].sk, N.AcceptReq(op.slot_tag, A.Ballot(1, b"x"), op))
         self.assertIsInstance(resp, A.Receipt)
 
 
@@ -82,8 +84,8 @@ class TestDaemonPeerSockets(unittest.TestCase):
             pa, pb = os.path.join(td, "a.sock"), os.path.join(td, "b.sock")
             a = _daemon(w, 0, roster)
             b = _daemon(w, 1, roster)
-            a.peers = [pb]  # a pulls from b's socket
-            b.peers = [pa]
+            a.peers = [(b.pub, pb)]  # a pulls from b's socket (identity, address)
+            b.peers = [(a.pub, pa)]
             x = w.blind(0, [], [[A.Mutation.SET, b"x", b"1"]])
             y = w.blind(1, [], [[A.Mutation.SET, b"y", b"1"]])
             a.store.append(x)
@@ -218,12 +220,20 @@ class TestDaemonSocket(unittest.TestCase):
             assert op.slot_tag is not None
             cli = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             cli.connect(path)
-            cli.sendall(
-                wire.frame(wire.encode_request(N.AcceptReq(op.slot_tag, A.Ballot(1, b"x"), op)))
+            out = enveloped(
+                w.clients[0].sk,
+                d.pub,
+                N.AcceptReq(op.slot_tag, A.Ballot(1, b"x"), op),
+                ts=d._clock(),
             )
+            cli.sendall(wire.frame(out))
             reply = wire.read_frame(cli.recv)
             assert reply is not None
-            resp = wire.decode_response(reply)
+            match lmsg.classify_reply(reply, expect_from=d.pub, expect_to=w.clients[0].pub):
+                case lmsg.Reply(env):
+                    resp = wire.decode_response(env.body)
+                case _:
+                    resp = None
             self.assertIsInstance(resp, A.Receipt)
             cli.close()
             d.close()

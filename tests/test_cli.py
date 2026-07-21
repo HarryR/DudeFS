@@ -132,7 +132,6 @@ class TestRecoverInterlock(unittest.TestCase):
     def test_recover_hard_refuses_while_a_quorum_answers(self):
         # THE load-bearing interlock (MANAGER §3 / RESILIENCE §2.3): a reachable
         # quorum must hard-refuse recovery — the cluster is not dead.
-        w = World(seed=1, n_clients=0)
         with tempfile.TemporaryDirectory() as d:
             _run(["init", "--dir", d])
             st = ManagerState.load(d)
@@ -146,7 +145,7 @@ class TestRecoverInterlock(unittest.TestCase):
                     sks[i],
                     roster[i],
                     roster=roster,
-                    manager_pub=w.mgr_pub,
+                    manager_pub=st.manager_pub,  # nodes trust the CLI root -> probe passes
                     clock=now_ms,
                     delta_ms=DELTA,
                 )

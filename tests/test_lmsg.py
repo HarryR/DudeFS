@@ -158,5 +158,64 @@ class TestRequestGate(unittest.TestCase):
             self.assertIs(g, lmsg.Gate.OK)  # epoch never decides admission
 
 
+class TestClassifyInbound(unittest.TestCase):
+    """The typed inbound outcome the transport renders (no None, no exceptions)."""
+
+    def _env(self, *, frm_sk=A_SK, to=B, verb=b"SUBMIT", body=b"b", epoch=0, ts=NOW):
+        return lmsg.author(frm_sk, to, verb, body, epoch=epoch, ts=ts)
+
+    def _classify(self, env):
+        return lmsg.classify_inbound(
+            env.encode(), self_pub=B, now=NOW, delta=DELTA, authorized=_member(A)
+        )
+
+    def test_member_is_gated(self):
+        self.assertIsInstance(self._classify(self._env()), lmsg.Gated)
+
+    def test_non_member_is_refused_not_dropped(self):
+        out = lmsg.classify_inbound(
+            self._env().encode(), self_pub=B, now=NOW, delta=DELTA, authorized=_member(X)
+        )
+        self.assertIsInstance(out, lmsg.Refused)  # authenticated + addressed to us
+        assert isinstance(out, lmsg.Refused)
+        self.assertIs(out.reason, lmsg.Gate.NOT_A_MEMBER)
+
+    def test_stale_is_refused(self):
+        out = self._classify(self._env(ts=NOW - DELTA - 1))
+        self.assertIsInstance(out, lmsg.Refused)
+
+    def test_wrong_recipient_and_bad_sig_and_garbage_are_dropped(self):
+        import dataclasses
+
+        # addressed elsewhere -> hasn't proven it holds OUR identity -> Dropped (silence)
+        self.assertIsInstance(self._classify(self._env(to=X)), lmsg.Dropped)
+        # a tampered sig -> Dropped
+        forged = dataclasses.replace(self._env(), body=b"swapped")
+        self.assertIsInstance(self._classify(forged), lmsg.Dropped)
+        # a non-envelope frame -> Dropped, never a crash
+        self.assertIsInstance(self._classify_raw(b"not-bencode"), lmsg.Dropped)
+
+    def _classify_raw(self, raw):
+        return lmsg.classify_inbound(raw, self_pub=B, now=NOW, delta=DELTA, authorized=_member(A))
+
+
+class TestClassifyReply(unittest.TestCase):
+    def test_valid_reply_from_the_addressed_peer(self):
+        reply = lmsg.author(B_SK, A, b"SUBMIT", b"receipt", epoch=0, ts=NOW)
+        out = lmsg.classify_reply(reply.encode(), expect_from=B, expect_to=A)
+        self.assertIsInstance(out, lmsg.Reply)
+
+    def test_absent_and_wrong_peer_and_garbage_are_unusable(self):
+        self.assertIsInstance(lmsg.classify_reply(b"", expect_from=B, expect_to=A), lmsg.Unusable)
+        self.assertIsInstance(
+            lmsg.classify_reply(b"junk", expect_from=B, expect_to=A), lmsg.Unusable
+        )
+        # a well-formed reply, but from a peer I didn't address -> not my reply
+        other = lmsg.author(X_SK, A, b"SUBMIT", b"r", epoch=0, ts=NOW)
+        self.assertIsInstance(
+            lmsg.classify_reply(other.encode(), expect_from=B, expect_to=A), lmsg.Unusable
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

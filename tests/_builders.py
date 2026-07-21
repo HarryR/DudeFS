@@ -38,6 +38,37 @@ def poll_until(pred: Callable[[], object], timeout: float = 6.0, step: float = 0
     return val
 
 
+def enveloped(sk: bytes, to_pub: bytes, req, *, epoch: int = 0, ts: int | None = None) -> bytes:
+    """Wrap a node Request in a signed L_msg envelope — the cluster wire since the
+    §7.5 cutover (a bare request no longer reaches a gated daemon)."""
+    from dudefs import lmsg, wire
+
+    return lmsg.author(
+        sk,
+        to_pub,
+        b"",
+        wire.encode_request(req),
+        epoch=epoch,
+        ts=ts if ts is not None else now_ms(),
+    ).encode()
+
+
+def call_node(daemon, sk: bytes, req, *, epoch: int = 0, ts: int | None = None):
+    """Drive one enveloped node RPC in-process: sign `req` from `sk` to `daemon.pub`,
+    serve it, and return the verified Response (or None if refused / silently dropped)."""
+    from dudefs import lmsg, wire
+
+    ts = daemon._clock() if ts is None else ts  # stamp within the target's freshness window
+    reply = daemon.serve(enveloped(sk, daemon.pub, req, epoch=epoch, ts=ts))
+    if reply is None:
+        return None
+    match lmsg.classify_reply(reply, expect_from=daemon.pub, expect_to=C.SIGNER.public(sk)):
+        case lmsg.Reply(env):
+            return wire.decode_response(env.body)
+        case lmsg.Unusable(_reason):
+            return None
+
+
 def cut_of(w: World) -> A.Heads:
     """The frontier of everything authored so far (per-author (seq, prev))."""
     cut = {c.pub: (c.seq - 1, c.prev) for c in w.clients if c.seq > 0}

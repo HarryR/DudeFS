@@ -22,7 +22,7 @@ import time
 from dataclasses import dataclass
 
 from . import artifacts as A
-from . import fold, wire
+from . import fold, lmsg, wire
 from .artifacts import BLIND, HLC, QC, Op, Receipt, Txn, compute_slot_tag
 from .handlers import data as data_handler
 from .node import FetchOpReq, FrontierReq, GetQCReq, PutQCReq, Request, Response, SubmitReq
@@ -202,18 +202,35 @@ class ClientDaemon:
 
     # ---- node RPC (real sockets; the p2p wire) ----------------------------- #
     def _rpc(self, node: int, req: Request) -> Response | None:
+        """Send `req` to a node inside a signed L_msg envelope and return its verified
+        reply (PROTOCOL §7.5). The transport owns the socket I/O; `lmsg` does the pure
+        encode/verify. A reply that isn't signed by the addressed node is no reply —
+        `None` here means 'no usable response from this node this round' (the reason is
+        available for logging in a later pass, but the quorum driver needs only that)."""
         if self._closing.is_set():
             return None
-        path = self.roster_addrs[node]
+        path, to_pub = self.roster_addrs[node], self.cfg.roster[node]
+        out = lmsg.author(
+            self.sk,
+            to_pub,
+            b"",
+            wire.encode_request(req),
+            epoch=self.cfg.epoch,
+            ts=int(time.time() * 1000),
+        ).encode()
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
                 s.settimeout(5.0)
                 s.connect(path)
-                s.sendall(wire.frame(wire.encode_request(req)))
-                payload = wire.read_frame(s.recv)
-            return wire.decode_response(payload) if payload is not None else None
+                s.sendall(wire.frame(out))
+                raw = wire.read_frame(s.recv) or b""
         except OSError:
             return None
+        match lmsg.classify_reply(raw, expect_from=to_pub, expect_to=self.pub):
+            case lmsg.Reply(env):
+                return wire.decode_response(env.body)
+            case lmsg.Unusable(_reason):
+                return None
 
     def _push_qc(self, qc: QC) -> None:
         for node in self.cfg.fanout_order:

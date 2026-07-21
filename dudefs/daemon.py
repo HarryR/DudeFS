@@ -15,8 +15,8 @@ import sqlite3
 import threading
 from collections.abc import Callable
 
-from . import codec, gossip, tunables, wire
-from .acceptor import Acceptor
+from . import codec, gossip, lmsg, tunables, wire
+from .acceptor import Acceptor, Rejected, RejectReason
 from .artifacts import Op, Watermark, quorum_size
 from .fold import ControlReducer, ControlState, endpoints_of
 from .gossip import Delta
@@ -25,6 +25,7 @@ from .node import LocalNode, dispatch
 from .store import ChainStore, covered
 
 LOCAL_TRANSPORT = b"unix"  # the POC carrier; ENDPOINT addrs are (transport, uri, opts)
+_REFUSED_BODY = wire.encode_response(Rejected(RejectReason.BAD_AUTHZ))  # signed 'no' body
 
 
 def _gossip_request(summ: gossip.Summary) -> bytes:
@@ -55,13 +56,14 @@ class NodeDaemon:
         *,
         roster: list[bytes] | None = None,
         manager_pub: bytes,
-        peers: list[str] | None = None,
+        peers: list[tuple[bytes, str]] | None = None,
         control_ops: list[Op] | None = None,
         clock: Callable[[], int] | None = None,
         epoch: int = 0,
         delta_ms: int = tunables.SIM_DELTA_MS,
     ):
-        self.peers = peers or []  # peer node socket paths for anti-entropy
+        self.peers = peers or []  # anti-entropy peers as (pubkey, socket-path) pairs
+        self.sk = sk  # the node's identity key — signs L_msg envelopes (PROTOCOL §7.5)
         self.store = ChainStore(store_path)
         self.manager_pub = manager_pub
         for op in control_ops or []:  # seed the authorization view (certs/roster)
@@ -96,13 +98,47 @@ class NodeDaemon:
         self._authz = r.control
 
     # ---- request serving (socket-facing; also the in-process peer RPC) ------ #
-    def serve(self, data: bytes) -> bytes:
+    def serve(self, data: bytes) -> bytes | None:
+        """Process one inbound L_msg envelope (PROTOCOL §7.5) and return the reply
+        bytes, or None to render carrier-native SILENCE. That is an Option (reply /
+        no-reply) — the single bit the transport needs — not a collapse of errors: the
+        specific outcome is matched here, and only a requester that PROVED it holds our
+        identity (a valid sig over `to == self`) ever draws a reply, so a signed 'no'
+        never leaks our pubkey to a party that didn't already have it."""
         with self._lock:
-            return self._serve(data)
+            match lmsg.classify_inbound(
+                data,
+                self_pub=self.pub,
+                now=self._clock(),
+                delta=self.acc.delta_ms,
+                authorized=self._peer_authorized,
+            ):
+                case lmsg.Gated(env):
+                    return self._reply(env, self._dispatch(env.body))  # gate passed
+                case lmsg.Refused(env, _reason):
+                    return self._reply(env, _REFUSED_BODY)  # authenticated 'no'
+                case lmsg.Dropped(_reason):
+                    return None  # unproven identity / malformed -> reveal nothing
 
-    def _serve(self, data: bytes) -> bytes:
-        """Serve one framed payload: a gossip exchange (I return the DELTA I owe) or
-        a node RPC verb (I dispatch to the acceptor). Idempotent, local-only."""
+    def _reply(self, env: lmsg.Envelope, body: bytes) -> bytes:
+        """Seal a signed reply back to the requester (mirrors the request's verb)."""
+        return lmsg.author(
+            self.sk, env.frm, env.verb, body, epoch=self.acc.epoch, ts=self._clock()
+        ).encode()
+
+    def _peer_authorized(self, frm: bytes) -> bool:
+        """The peer gate's policy: a current roster node (gossip / ballots), a certed
+        client (writes), or the root manager (control-plane drive). Requester-based —
+        a revoked client / never-member is none of these and is refused."""
+        return (
+            frm in self.roster
+            or self._authz.is_authorized(frm, ctl.Cap.WRITE)
+            or frm == self.manager_pub
+        )
+
+    def _dispatch(self, data: bytes) -> bytes:
+        """Dispatch a gated inner payload: a gossip exchange (return the DELTA I owe)
+        or a node RPC verb (dispatch to the acceptor). Idempotent, local-only."""
         first = codec.as_seq(codec.decode(data))[0]
         if codec.as_bytes(first) == b"gossip":
             summ = gossip.decode_summary(codec.as_bytes(codec.as_seq(codec.decode(data))[1]))
@@ -131,25 +167,37 @@ class NodeDaemon:
         """Rebuild the anti-entropy peer list from the address book for the current
         transport (every roster peer's URI but my own). Called after gossip pulls in
         new ENDPOINT records; seed endpoints in genesis bootstrap the first round."""
-        peers: list[str] = []
+        peers: list[tuple[bytes, str]] = []
         for pub, addrs in self.address_book().items():
             if pub == self.pub:
                 continue
             uri = next((u for (t, u, _o) in addrs if t == transport), None)
             if uri is not None:
-                peers.append(uri.decode())
+                peers.append((pub, uri.decode()))  # (identity, address) — L_msg needs `to`
         if peers:  # supersede the seed/kwarg only ONCE endpoint records exist
             self.peers = peers
 
-    def gossip_round(self, peer_rpc: Callable[[bytes], bytes]) -> None:
-        """One anti-entropy round against a peer: advertise my SUMMARY (digest
-        first), apply the DELTA it owes me. Cut-aware — the peer's reply folds in
-        the sparse below-cut baseline for any author whose retained digest differs.
-        `peer_rpc` takes a framed request and returns the UNFRAMED reply payload."""
-        payload = peer_rpc(wire.frame(_gossip_request(self.summary())))
-        if not payload:
-            return
-        gossip.apply_delta(self.store, gossip.decode_delta(payload))
+    def gossip_round(self, peer_rpc: Callable[[bytes], bytes], to_pub: bytes) -> None:
+        """One anti-entropy round against a peer: advertise my SUMMARY (digest first)
+        inside a signed L_msg envelope addressed to `to_pub`, apply the DELTA it owes
+        me. Cut-aware — the peer's reply folds in the sparse below-cut baseline for any
+        author whose retained digest differs. `peer_rpc` takes a framed request and
+        returns the UNFRAMED reply payload (the transport owns the I/O)."""
+        out = lmsg.author(
+            self.sk,
+            to_pub,
+            b"gossip",
+            _gossip_request(self.summary()),
+            epoch=self.acc.epoch,
+            ts=self._clock(),
+        ).encode()
+        match lmsg.classify_reply(
+            peer_rpc(wire.frame(out)), expect_from=to_pub, expect_to=self.pub
+        ):
+            case lmsg.Reply(env):
+                gossip.apply_delta(self.store, gossip.decode_delta(env.body))
+            case lmsg.Unusable(_reason):
+                pass  # no usable reply this round (unreachable / refused) — a missed round
 
     def _baseline_ops_for(self, peer: gossip.Summary) -> list[Op]:
         """The below-cut RETAINED winners I hold for any author whose retained digest
@@ -306,9 +354,9 @@ class NodeDaemon:
         evidence. (A large deployment picks a uniformly random peer per tick — the
         §9 demo's handful lets us sweep all to the same fixpoint; a down peer is
         just a missed round.)"""
-        for path in self.peers:
+        for pub, path in self.peers:
             try:
-                self.gossip_round(self._connect_rpc(path))
+                self.gossip_round(self._connect_rpc(path), pub)
             except OSError:
                 pass
         self.adopt_committed_checkpoints()
@@ -346,7 +394,10 @@ class NodeDaemon:
                     payload = wire.read_frame(conn.recv)
                     if payload is None:
                         return
-                    conn.sendall(wire.frame(self.serve(payload)))
+                    reply = self.serve(payload)
+                    if reply is None:
+                        return  # L_msg chose silence -> close the conn (this carrier's 'nothing')
+                    conn.sendall(wire.frame(reply))
                 except (OSError, sqlite3.Error):
                     return  # peer vanished, or the store closed under us (node killed)
 

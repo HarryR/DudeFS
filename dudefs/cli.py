@@ -19,10 +19,10 @@ import sys
 import time
 
 from . import artifacts as A
-from . import wire
+from . import lmsg, wire
 from .artifacts import HLC, quorum_size
 from .manager import Manager, ManagerError, ManagerState, RecoverDecision, recover_decision
-from .node import FrontierReq
+from .node import FrontierReq, Request, Response
 
 # ---- exit codes -------------------------------------------------------------- #
 OK = 0
@@ -60,46 +60,62 @@ def _worker_call(sock_path: str, method: str, params: dict) -> dict:
 # --------------------------------------------------------------------------- #
 
 
-def _probe(addr: str, timeout: float = 1.0) -> A.FrontierBundle | None:
-    """A signed frontier read from one node endpoint, or None if unreachable."""
+def _mgr_send(
+    st: ManagerState, to_pub: bytes, addr: str, req: Request, timeout: float = 5.0
+) -> Response | None:
+    """One enveloped node RPC as the ROOT manager (PROTOCOL §7.5): sign `req` from the
+    manager identity to `to_pub`, socket round-trip, return the node's VERIFIED reply
+    or None. The gate admits root, so the manager's control-plane drive passes."""
     if not addr:
         return None
+    out = lmsg.author(
+        st.root_key,
+        to_pub,
+        b"",
+        wire.encode_request(req),
+        epoch=st.epoch,
+        ts=int(time.time() * 1000),
+    ).encode()
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
             s.settimeout(timeout)
             s.connect(addr)
-            s.sendall(wire.frame(wire.encode_request(FrontierReq())))
-            payload = wire.read_frame(s.recv)
-        if payload is None:
-            return None
-        resp = wire.decode_response(payload)
-        return resp if isinstance(resp, A.FrontierBundle) else None
+            s.sendall(wire.frame(out))
+            raw = wire.read_frame(s.recv) or b""
     except OSError:
         return None
+    match lmsg.classify_reply(raw, expect_from=to_pub, expect_to=st.manager_pub):
+        case lmsg.Reply(env):
+            return wire.decode_response(env.body)
+        case lmsg.Unusable(_reason):
+            return None
 
 
-def _probe_floor(addr: str) -> HLC | None:
-    fb = _probe(addr)
-    return fb.floor if fb is not None else None
+def _probe(
+    st: ManagerState, pub: bytes, addr: str, timeout: float = 1.0
+) -> A.FrontierBundle | None:
+    """A signed frontier read from node `pub`, or None if unreachable."""
+    resp = _mgr_send(st, pub, addr, FrontierReq(), timeout)
+    return resp if isinstance(resp, A.FrontierBundle) else None
 
 
-def _node_rpc(node_addrs: dict[str, str]):
+def _floor_probe(st: ManagerState):
+    """A `probe(pub, addr) -> floor | None` bound to the manager identity, for
+    probe_roster's dwell loop (the manager signs each FRONTIER read)."""
+
+    def probe(pub: bytes, addr: str) -> HLC | None:
+        fb = _probe(st, pub, addr)
+        return fb.floor if fb is not None else None
+
+    return probe
+
+
+def _node_rpc(st: ManagerState):
     """A `rpc(node_pub, req) -> Response | None` over the p2p wire — the manager's
-    roster-change drive (findings 23/24) talks to nodes by pubkey through this."""
+    roster-change drive (findings 23/24) talks to nodes by pubkey, enveloped as root."""
 
-    def rpc(node_pub: bytes, req):
-        addr = node_addrs.get(node_pub.hex(), "")
-        if not addr:
-            return None
-        try:
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-                s.settimeout(5.0)
-                s.connect(addr)
-                s.sendall(wire.frame(wire.encode_request(req)))
-                payload = wire.read_frame(s.recv)
-            return wire.decode_response(payload) if payload is not None else None
-        except OSError:
-            return None
+    def rpc(node_pub: bytes, req: Request) -> Response | None:
+        return _mgr_send(st, node_pub, st.node_addrs.get(node_pub.hex(), ""), req)
 
     return rpc
 
@@ -186,7 +202,7 @@ def cmd_node(args: argparse.Namespace) -> int:
             return OK
         if args.node_cmd == "promote":
             _print_cert_inventory(m.state)
-            change = m.node_promote(bytes.fromhex(args.pubkey), _node_rpc(m.state.node_addrs))
+            change = m.node_promote(bytes.fromhex(args.pubkey), _node_rpc(m.state))
             size = len(m.state.roster)
             print(f"promoted {args.pubkey} -> epoch {m.state.epoch}, roster size {size}")
             print(f"  roster op:  {change.op.op_hash.hex()} (on the public roster slot)")
@@ -205,7 +221,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     frontier = A.HLC(0, 0)
     reachable = 0
     for i, pub in enumerate(st.roster):
-        fb = _probe(st.node_addrs.get(pub.hex(), ""))
+        fb = _probe(st, pub, st.node_addrs.get(pub.hex(), ""))
         if fb is None:
             print(f"  node{i} {pub.hex()[:16]}…  UNREACHABLE")
             continue
@@ -224,7 +240,7 @@ def cmd_recover(args: argparse.Namespace) -> int:
     m = Manager.load(args.dir)
     print(f"recovery reachability probe — dwell {args.dwell}s over {len(m.state.roster)} endpoints")
     print("(a parked system is SAFE; recovery is never urgent, and dwell is free.)")
-    report = m.probe_roster(_probe_floor, args.dwell, time.sleep)
+    report = m.probe_roster(_floor_probe(m.state), args.dwell, time.sleep)
     print(f"reachable: {len(report.reachable)}/{report.n}  (quorum {report.quorum})")
     dead = ", ".join(f"node{i}" for i in report.presumed_dead) or "(none)"
     print(f"presumed-dead nodes: {dead}")

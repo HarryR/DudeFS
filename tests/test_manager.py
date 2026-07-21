@@ -324,7 +324,7 @@ class TestManagerOps(unittest.TestCase):
             # a synthetic prober answers node0 with a floor — no sockets involved
             addr0 = m.state.node_addrs[m.state.roster[0].hex()]
             answers = {addr0: A.HLC(9, 0)}
-            rep = m.probe_roster(lambda a: answers.get(a), dwell=0.0, sleep=lambda _s: None)
+            rep = m.probe_roster(lambda _pub, a: answers.get(a), dwell=0.0, sleep=lambda _s: None)
             self.assertEqual(rep.reachable, [0])
             self.assertEqual(rep.presumed_dead, [])
             self.assertEqual(rep.salvage, A.HLC(9, 0))
