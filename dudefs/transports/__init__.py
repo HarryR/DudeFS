@@ -8,12 +8,49 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from urllib.parse import urlsplit, urlunsplit
 
 from . import http as _http
 from . import unix as _unix
-from .base import HTTP, UNIX, Handler, Server
+from .base import HTTP, SEALED, UNIX, Handler, Server, parse_scheme
 
-__all__ = ["HTTP", "UNIX", "Handler", "Server", "dial", "open_server"]
+__all__ = [
+    "HTTP",
+    "UNIX",
+    "Handler",
+    "Server",
+    "dial",
+    "open_server",
+    "parse_endpoint",
+    "parse_scheme",
+]
+
+
+def parse_endpoint(spec: str) -> tuple[bytes, bytes, dict[bytes, bytes]]:
+    """Decompose an operator-supplied endpoint into the STORED struct
+    `(transport, uri, opts)` — ONCE, at the edge (the CLI). Internally we carry the
+    struct and never re-parse the URL. Accepts a custom composite scheme so an operator
+    types one URL instead of a pile of flags; a bare path defaults to a local unix
+    socket. Examples:
+
+        /run/n.sock              -> (b"unix", b"/run/n.sock", {})
+        unix:/run/n.sock         -> (b"unix", b"/run/n.sock", {})
+        http://host:8080/dude    -> (b"http", b"http://host:8080/dude", {})
+        sealed+http://host/dude  -> (b"http", b"http://host/dude", {b"lmsg": b"sealed"})
+    """
+    parts = urlsplit(spec)
+    if not parts.scheme:  # a bare path -> a local unix socket
+        return UNIX, spec.encode(), {}
+    mods, carrier = parse_scheme(parts.scheme.encode())
+    opts: dict[bytes, bytes] = {b"lmsg": b"sealed"} if SEALED in mods else {}
+    if carrier == UNIX:
+        uri = parts.path.encode()  # the unix carrier connects to the raw path
+    else:  # a networked carrier keeps its base URL (its dial urlsplits it)
+        uri = urlunsplit(
+            (carrier.decode(), parts.netloc, parts.path, parts.query, parts.fragment)
+        ).encode()
+    return carrier, uri, opts
+
 
 _DIALERS: dict[bytes, Callable[..., bytes]] = {UNIX: _unix.dial, HTTP: _http.dial}
 _SERVERS: dict[bytes, Callable[[], Server]] = {UNIX: _unix.UnixServer, HTTP: _http.HttpServer}

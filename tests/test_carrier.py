@@ -78,5 +78,34 @@ class TestHttpCarrier(unittest.TestCase):
         self.assertEqual(transports.dial(transports.HTTP, uri, b"x", timeout=0.3), b"")
 
 
+class TestParseEndpoint(unittest.TestCase):
+    """The edge decomposer: an operator URL -> the stored (transport, uri, opts) struct,
+    parsed ONCE. Custom composite schemes let one URL replace a pile of flags."""
+
+    def test_bare_path_defaults_to_unix(self):
+        self.assertEqual(transports.parse_endpoint("/run/n.sock"), (b"unix", b"/run/n.sock", {}))
+
+    def test_explicit_unix_scheme_strips_to_the_path(self):
+        self.assertEqual(
+            transports.parse_endpoint("unix:/run/n.sock"), (b"unix", b"/run/n.sock", {})
+        )
+
+    def test_http_url_keeps_its_base_url(self):
+        self.assertEqual(
+            transports.parse_endpoint("http://host:8080/dude"),
+            (b"http", b"http://host:8080/dude", {}),
+        )
+
+    def test_composite_sealed_http_decomposes_carrier_and_profile(self):
+        self.assertEqual(
+            transports.parse_endpoint("sealed+http://host/dude"),
+            (b"http", b"http://host/dude", {b"lmsg": b"sealed"}),
+        )
+
+    def test_parse_scheme_splits_modifiers_from_the_carrier(self):
+        self.assertEqual(transports.parse_scheme(b"sealed+http"), (frozenset({b"sealed"}), b"http"))
+        self.assertEqual(transports.parse_scheme(b"http"), (frozenset(), b"http"))
+
+
 if __name__ == "__main__":
     unittest.main()

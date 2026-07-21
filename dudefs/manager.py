@@ -15,6 +15,7 @@ from enum import Enum, auto
 
 from . import artifacts as A
 from . import crypto as C
+from . import transports
 from .artifacts import HLC, QC, FrontierBundle, Heads, Op, Receipt, quorum_size
 from .handlers import control as ctl
 from .node import AcceptReq, FrontierReq, PutQCReq, Request, Response, RosterAcceptReq
@@ -243,7 +244,7 @@ class Manager:
         st.save()
         m = cls(st)
         if node_addr:  # genesis seed endpoint — the first record the mesh bootstraps from
-            m.set_endpoint(node_pub, [(b"unix", node_addr.encode(), {})])
+            m.set_endpoint(node_pub, [transports.parse_endpoint(node_addr)])
         return m
 
     @classmethod
@@ -320,7 +321,7 @@ class Manager:
             self.state.node_addrs[pub.hex()] = addr
         self.state.save()
         if addr:  # publish a control-plane reachability record (PROTOCOL §7)
-            self.set_endpoint(pub, [(b"unix", addr.encode(), {})])
+            self.set_endpoint(pub, [transports.parse_endpoint(addr)])
 
     def set_endpoint(
         self, subject: bytes, addrs: list[tuple[bytes, bytes, dict[bytes, bytes]]]

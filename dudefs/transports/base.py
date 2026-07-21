@@ -18,6 +18,17 @@ type Handler = Callable[[bytes], bytes | None]
 UNIX = b"unix"  # a local unix-domain socket
 HTTP = b"http"  # a plain-HTTP endpoint (LAN / behind a trusted terminator or Tor)
 
+SEALED = b"sealed"  # the L_msg profile modifier (seal the envelope before dialing)
+
+
+def parse_scheme(scheme: bytes) -> tuple[frozenset[bytes], bytes]:
+    """A composite carrier scheme `modifier+…+carrier` -> (modifiers, carrier). The
+    TRAILING token is the carrier (the pipe); the leading `+`-joined tokens are L_msg
+    profile modifiers (e.g. `sealed`), applied to the PAYLOAD and orthogonal to the
+    carrier. `http` -> (∅, `http`); `sealed+http` -> ({`sealed`}, `http`)."""
+    *mods, carrier = scheme.split(b"+")
+    return frozenset(mods), carrier
+
 
 class Server(Protocol):
     """A listening carrier. `serve` blocks until `close` (from another thread) tears
