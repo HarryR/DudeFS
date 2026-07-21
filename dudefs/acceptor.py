@@ -57,6 +57,10 @@ class RejectReason(Enum):
     EQUIVOCATION_GUARD = auto()  # would double-vote a (tag, ballot); refused
     BELOW_HORIZON = auto()  # op.hlc < checkpoint horizon — §12 receipt-floor backstop
     NEEDS_BALLOT = auto()  # slotted op sent via SUBMIT — propose via PREPARE/ACCEPT (rev 5)
+    # L_msg peer-gate refusals (PROTOCOL §7.5) — the requester, not the op. Specific
+    # so the refusal says WHY: not "bad authz" but which door check the caller failed.
+    NOT_A_MEMBER = auto()  # `from` ∉ current roster / revoked cert — get re-certed, or you're out
+    STALE_ENVELOPE = auto()  # envelope ts outside δ — resync your clock, or it was a replay
 
 
 # ---- non-receipt outcomes ------------------------------------------------- #

@@ -145,13 +145,53 @@ missing); shape is the codec's job.
   acceptable for genuinely fine-grained, minor variants that no one branches on
   (e.g. the many `CodecError` bencode-parse messages) — don't over-fragment those
   into leaves.
-- **Result-shaped "errors" are not exceptions.** An acceptor rejection is an
-  expected outcome, so it's *returned* (`Rejected(RejectReason)`), not raised —
-  a `Result`-style variant. Its reason is a typed enum, not a string.
+- **Result-shaped "errors" are not exceptions.** An expected outcome is
+  *returned*, not raised — a `Result`-style variant. Exceptions are for genuine,
+  unexpected errors (a broken invariant, a bug): those deserve a real signal (a
+  stack trace), never a quiet `None`. A garbled frame *from the wire* is expected
+  (attackers send garbage) → a returned `Dropped`/`MalformedReply` variant; a
+  garbled value from a trusted in-process caller is a bug → let it raise.
+- **A `Result` can have many variants; absence is `Option`, never a lossy
+  `None`.** `bytes | None` is fine when `None` is a *clean* Option the caller
+  needs one bit of ("reply / no-reply", `daemon.serve`). But do **not** collapse
+  several *distinct* causes into one `None`/one umbrella — that erases the *why*.
+  Model the outcome as a union of cause-named variants:
+  `lmsg.classify_inbound → Gated | Refused | Dropped`,
+  `lmsg.classify_reply → Reply | NoReply | MalformedReply | WrongPeer`
+  (not a single `Unusable(reason: str)` we removed).
+- **Say why, not what** (intent-based nominative determinism). A status, variant,
+  or reason is named for its **cause**, not its category. `"is not a string"` →
+  `"expected an int in range"`. A peer-gate refusal is `Rejected(NOT_A_MEMBER)` /
+  `Rejected(STALE_ENVELOPE)` — the door check that failed — not a generic
+  `BAD_AUTHZ`. The *why* must flow back unambiguously at the boundary so it *can*
+  be logged (whether we log now is a separate choice); a caught-all reason that
+  says only "it didn't work" is a bug in the API, not a convenience.
 - Vendored code (`vendor/ed25519.py`) stays standalone and may raise stdlib
   `ValueError` on misuse — it is deliberately not coupled to this hierarchy.
 
-## 5. Small things
+## 5. I/O lives at the edges — a pure core, sans-io
+
+The encoding/logic layer does **no I/O**: no sockets, no blocking, no timeouts, no
+threads. It takes bytes/values and returns bytes/typed-values, and is trivially
+testable without a network. The **transport** owns the I/O — it opens the socket,
+sets the timeout, retries — and *renders* the pure layer's typed outcome into its
+carrier: a reply to send, or that carrier's native "nothing" (a closed frame, no
+XMPP stanza, an HTTP 404).
+
+- A function that both **encodes and sends** is the smell — split it. The codec
+  builds the bytes; the transport moves them.
+- Don't hide I/O behind a callback to fake purity. *Anti-pattern we deleted:*
+  `peerwire.call(send=lambda …)` took a send-callback and orchestrated
+  send → block → recv — I/O smuggled into the codec layer, which also forced a
+  synchronous request/reply shape onto a "push a message, get a reply — maybe"
+  transport. The fix: `lmsg` is pure (`author`/`gate`/`classify_*`), and
+  `daemon`/`client`/`cli` own the sockets and render the outcomes.
+- Message-oriented transports are **event-driven**: emit an envelope, handle the
+  reply as a later inbound event (or via gossip, keyed by request-hash). The pure
+  layer must not *assume* a synchronous reply — a unix socket may await inline, but
+  that's the transport's private business, not the codec's contract.
+
+## 6. Small things
 
 - Docstrings cite the normative doc section (`DESIGN §6`, `PROTOCOL §1.1`) — the
   code is an implementation *of* the design; keep the trace.

@@ -65,7 +65,7 @@ def call_node(daemon, sk: bytes, req, *, epoch: int = 0, ts: int | None = None):
     match lmsg.classify_reply(reply, expect_from=daemon.pub, expect_to=C.SIGNER.public(sk)):
         case lmsg.Reply(env):
             return wire.decode_response(env.body)
-        case lmsg.Unusable(_reason):
+        case _fault:  # NoReply / MalformedReply / WrongPeer
             return None
 
 

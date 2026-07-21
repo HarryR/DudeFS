@@ -205,16 +205,18 @@ class TestClassifyReply(unittest.TestCase):
         out = lmsg.classify_reply(reply.encode(), expect_from=B, expect_to=A)
         self.assertIsInstance(out, lmsg.Reply)
 
-    def test_absent_and_wrong_peer_and_garbage_are_unusable(self):
-        self.assertIsInstance(lmsg.classify_reply(b"", expect_from=B, expect_to=A), lmsg.Unusable)
+    def test_each_fault_is_named_for_its_cause(self):
+        # say WHY, not a vague "unusable": absent / malformed / wrong-peer are distinct
+        self.assertIsInstance(lmsg.classify_reply(b"", expect_from=B, expect_to=A), lmsg.NoReply)
         self.assertIsInstance(
-            lmsg.classify_reply(b"junk", expect_from=B, expect_to=A), lmsg.Unusable
+            lmsg.classify_reply(b"junk", expect_from=B, expect_to=A), lmsg.MalformedReply
         )
         # a well-formed reply, but from a peer I didn't address -> not my reply
         other = lmsg.author(X_SK, A, b"SUBMIT", b"r", epoch=0, ts=NOW)
-        self.assertIsInstance(
-            lmsg.classify_reply(other.encode(), expect_from=B, expect_to=A), lmsg.Unusable
-        )
+        out = lmsg.classify_reply(other.encode(), expect_from=B, expect_to=A)
+        self.assertIsInstance(out, lmsg.WrongPeer)
+        assert isinstance(out, lmsg.WrongPeer)
+        self.assertEqual(out.frm, X)  # names who actually signed it
 
 
 if __name__ == "__main__":

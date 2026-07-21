@@ -229,7 +229,7 @@ class ClientDaemon:
         match lmsg.classify_reply(raw, expect_from=to_pub, expect_to=self.pub):
             case lmsg.Reply(env):
                 return wire.decode_response(env.body)
-            case lmsg.Unusable(_reason):
+            case _fault:  # NoReply / MalformedReply / WrongPeer — the why is here to log later
                 return None
 
     def _push_qc(self, qc: QC) -> None:

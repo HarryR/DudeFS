@@ -76,6 +76,41 @@ class TestDaemonGossip(unittest.TestCase):
         self.assertIsInstance(resp, A.Receipt)
 
 
+class TestPeerGate(unittest.TestCase):
+    """The L_msg peer gate (PROTOCOL §7.5): its signed refusal says WHY — the specific
+    door check the REQUESTER failed, distinct from the acceptor's op-author BAD_AUTHZ."""
+
+    def test_non_member_requester_is_refused_with_not_a_member(self):
+        from dudefs.acceptor import Rejected, RejectReason
+
+        w = World(seed=8, n_clients=1)
+        roster = [C.SIGNER.public(bytes([200] * 32))]
+        d = _daemon(w, 0, roster)
+        stranger = bytes([222] * 32)  # neither a roster node, a certed client, nor root
+        op = creation_op(w, 0, b"v")
+        assert op.slot_tag is not None
+        resp = call_node(d, stranger, N.AcceptReq(op.slot_tag, A.Ballot(1, b"x"), op))
+        assert isinstance(resp, Rejected)
+        self.assertIs(resp.reason, RejectReason.NOT_A_MEMBER)  # says WHY, not BAD_AUTHZ
+        d.close()
+
+    def test_stale_envelope_is_refused_with_stale_envelope(self):
+        from dudefs.acceptor import Rejected, RejectReason
+
+        w = World(seed=9, n_clients=1)
+        roster = [C.SIGNER.public(bytes([200] * 32))]
+        d = _daemon(w, 0, roster)  # clock = 100, delta = BIG
+        op = creation_op(w, 0, b"v")
+        assert op.slot_tag is not None
+        # a member's request, but stamped far outside δ -> stale, not unauthorized
+        resp = call_node(
+            d, w.clients[0].sk, N.AcceptReq(op.slot_tag, A.Ballot(1, b"x"), op), ts=100 + BIG + 1
+        )
+        assert isinstance(resp, Rejected)
+        self.assertIs(resp.reason, RejectReason.STALE_ENVELOPE)  # distinct why
+        d.close()
+
+
 class TestDaemonPeerSockets(unittest.TestCase):
     def test_sync_once_converges_over_real_sockets(self):
         w = World(seed=7, n_clients=2)

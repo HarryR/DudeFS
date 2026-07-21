@@ -235,31 +235,48 @@ def classify_inbound(
 
 @dataclass(frozen=True)
 class Reply:
-    """A verified reply from the peer we addressed. `env.body` is the response payload."""
+    """A verified reply from the peer we addressed. `env.body` is the response payload
+    — a Receipt, a Rejected(reason), etc.: the node's OWN 'why' rides inside it."""
 
     env: Envelope
 
 
 @dataclass(frozen=True)
-class Unusable:
-    """No usable reply: absent, malformed, unsigned, or not from the addressed peer.
-    `reason` lets the driver distinguish an authenticated refusal from an unreachable
-    peer (never collapse them — they demand different handling)."""
-
-    reason: str
+class NoReply:
+    """The peer returned nothing — a silent drop (we weren't proven) or an unreachable
+    peer. Indistinguishable at this layer; the cause is simply 'no reply came back'."""
 
 
-def classify_reply(data: bytes, *, expect_from: bytes, expect_to: bytes) -> Reply | Unusable:
+@dataclass(frozen=True)
+class MalformedReply:
+    """Bytes came back, but not a verifiable signed envelope (corrupt or injected)."""
+
+
+@dataclass(frozen=True)
+class WrongPeer:
+    """A valid envelope, but signed by someone OTHER than the peer we addressed — a
+    reflection or a misdelivery, never our reply. `frm` is who actually signed it."""
+
+    frm: bytes
+
+
+# Named per cause (say WHY, not "unusable"): the caller can log exactly what went
+# wrong, and a driver can act on it (an authenticated refusal ≠ an unreachable peer).
+type ReplyOutcome = Reply | NoReply | MalformedReply | WrongPeer
+
+
+def classify_reply(data: bytes, *, expect_from: bytes, expect_to: bytes) -> ReplyOutcome:
     """Validate an inbound REPLY frame against the peer we addressed — PURE, no I/O.
-    A reply that isn't signed by `expect_from` back to `expect_to` is no reply."""
+    Returns a cause-named outcome; a reply not signed by `expect_from` back to
+    `expect_to` is not our reply."""
     if not data:
-        return Unusable("absent")
+        return NoReply()
     try:
         env = Envelope.decode(data)
     except (codec.CodecError, ValueError, IndexError):
-        return Unusable("malformed")
+        return MalformedReply()
     if not env.verify_sig():
-        return Unusable("bad_sig")
+        return MalformedReply()  # unsigned / tampered -> not a verifiable reply
     if env.frm != expect_from or env.to != expect_to:
-        return Unusable("wrong_peer")  # a reply from someone other than who I addressed
+        return WrongPeer(env.frm)
     return Reply(env)

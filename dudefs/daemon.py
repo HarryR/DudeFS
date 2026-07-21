@@ -25,7 +25,13 @@ from .node import LocalNode, dispatch
 from .store import ChainStore, covered
 
 LOCAL_TRANSPORT = b"unix"  # the POC carrier; ENDPOINT addrs are (transport, uri, opts)
-_REFUSED_BODY = wire.encode_response(Rejected(RejectReason.BAD_AUTHZ))  # signed 'no' body
+
+# the signed 'no' says WHY (PROTOCOL §7.5): the specific door check the caller failed,
+# not a generic BAD_AUTHZ — the requester already holds our identity, so it leaks nothing.
+_REFUSAL_REASON = {
+    lmsg.Gate.NOT_A_MEMBER: RejectReason.NOT_A_MEMBER,
+    lmsg.Gate.STALE: RejectReason.STALE_ENVELOPE,
+}
 
 
 def _gossip_request(summ: gossip.Summary) -> bytes:
@@ -115,8 +121,9 @@ class NodeDaemon:
             ):
                 case lmsg.Gated(env):
                     return self._reply(env, self._dispatch(env.body))  # gate passed
-                case lmsg.Refused(env, _reason):
-                    return self._reply(env, _REFUSED_BODY)  # authenticated 'no'
+                case lmsg.Refused(env, reason):
+                    refusal = Rejected(_REFUSAL_REASON[reason])  # the signed 'no' says WHY
+                    return self._reply(env, wire.encode_response(refusal))
                 case lmsg.Dropped(_reason):
                     return None  # unproven identity / malformed -> reveal nothing
 
@@ -196,8 +203,8 @@ class NodeDaemon:
         ):
             case lmsg.Reply(env):
                 gossip.apply_delta(self.store, gossip.decode_delta(env.body))
-            case lmsg.Unusable(_reason):
-                pass  # no usable reply this round (unreachable / refused) — a missed round
+            case _fault:  # NoReply / MalformedReply / WrongPeer — a missed round
+                pass
 
     def _baseline_ops_for(self, peer: gossip.Summary) -> list[Op]:
         """The below-cut RETAINED winners I hold for any author whose retained digest
