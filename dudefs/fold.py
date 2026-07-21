@@ -175,6 +175,9 @@ class ControlState:
         self.pver = pver  # ACTIVE fold-semantics version (gates op.pver)
         self.pending_pver = pver  # activates at the next checkpoint barrier (§16)
         self.certs: dict[bytes, Cert] = {}  # subject_pub -> {caps, revoked}
+        # node reachability (PROTOCOL §7 / NOTES 58): subject_pub -> addrs, latest-
+        # wins in the walk; an ENDPOINT with empty addrs removes the node.
+        self.endpoints: dict[bytes, list[tuple[bytes, bytes, dict[bytes, bytes]]]] = {}
 
     def is_authorized(self, pub: bytes, cap: bytes) -> bool:
         if pub == self.manager_pub:
@@ -231,9 +234,15 @@ class ControlState:
             self.roster = list(body[b"roster"])
         elif kind == control_handler.ControlKind.PVER_ACTIVATE:
             self.pending_pver = max(self.pending_pver, body[b"pver"])
+        elif kind == control_handler.ControlKind.ENDPOINT:
+            addrs = body[b"addrs"]
+            if addrs:  # latest-wins; empty addrs = removal (NOTES 58)
+                self.endpoints[body[b"subject"]] = addrs
+            else:
+                self.endpoints.pop(body[b"subject"], None)
         # ControlKind.CHECKPOINT: no control-state change here — its cut places
         # the barrier in the walk (fold) / activates pending pver (reducer).
-        # ControlKind.WRAP_SET / ENDPOINT: no control-state change.
+        # ControlKind.WRAP_SET: no control-state change.
 
 
 # --------------------------------------------------------------------------- #

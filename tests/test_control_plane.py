@@ -466,6 +466,40 @@ class TestWrapSet(unittest.TestCase):
         self.assertEqual(ring[2]["slot_secret"], C.derive_slot_secret(k_epoch))
 
 
+class TestEndpointRecords(unittest.TestCase):
+    """ENDPOINT records (PROTOCOL §7 / NOTES 58): root-signed node reachability,
+    latest-wins per subject, empty-addrs = removal, root-only authoring."""
+
+    ADDRS1 = [(b"https", b"https://a/dude", {b"lmsg": b"sealed"})]
+    ADDRS2 = [(b"tor", b"http://x.onion/dude", {b"lmsg": b"plain"})]
+
+    def test_folds_latest_wins_and_removal(self):
+        w = World(seed=30, n_clients=0)
+        node = C.SIGNER.public(bytes([70] * 32))
+        e1 = w._mgr_op(ctl.endpoint_body(node, self.ADDRS1))
+        e2 = w._mgr_op(ctl.endpoint_body(node, self.ADDRS2))  # supersedes e1
+        res = fold.fold([*w.control_ops, e1, e2], w.keyring, w.genesis)
+        self.assertEqual(res.control.endpoints[node], self.ADDRS2)  # latest wins
+        # the per-addr opts (the L_msg profile) survive the round trip
+        self.assertEqual(res.control.endpoints[node][0][2], {b"lmsg": b"plain"})
+
+        e3 = w._mgr_op(ctl.endpoint_body(node, []))  # empty addrs = removal
+        res2 = fold.fold([*w.control_ops, e1, e2, e3], w.keyring, w.genesis)
+        self.assertNotIn(node, res2.control.endpoints)
+
+    def test_endpoint_is_root_only(self):
+        # a WRITE-cert delegate cannot author an ENDPOINT — it stays root-only, so
+        # the record is not applied (the reducer's endpoint map is unchanged).
+        w = World(seed=31, n_clients=1)
+        delegate = w.clients[0]
+        node = C.SIGNER.public(bytes([71] * 32))
+        ep = _ctl(
+            delegate.sk, delegate.pub, 0, A.GENESIS_PREV, 100, ctl.endpoint_body(node, self.ADDRS1)
+        )
+        res = fold.fold([*w.control_ops, ep], w.keyring, w.genesis)
+        self.assertNotIn(node, res.control.endpoints)  # unauthorized -> ignored
+
+
 class TestEpochPersistence(unittest.TestCase):
     """Finding 20 (finding 19's twin): the config epoch stamps every receipt/
     watermark, so it must survive crash-restart. Persisted in activate_epoch

@@ -148,9 +148,18 @@ def _v_pver(b: dict[bytes, codec.Bencodable]) -> dict[bytes, Any]:
     return {BK_KIND: ControlKind.PVER_ACTIVATE, b"pver": _uint(codec.field(b, b"pver"))}
 
 
-def _v_endpoint(_b: dict[bytes, codec.Bencodable]) -> dict[bytes, Any]:
-    # Schema open until M5 (PROTOCOL §7.1); accepted as an inert body.
-    return {BK_KIND: ControlKind.ENDPOINT}
+def _v_endpoint(b: dict[bytes, codec.Bencodable]) -> dict[bytes, Any]:
+    # Node reachability (PROTOCOL §7.1, NOTES 58): a root-signed record mapping a
+    # node's pubkey -> its access methods. `addrs` is a list of (transport, uri,
+    # opts) — opts carries the L_msg profile (`lmsg: plain|sealed`, NOTES 59).
+    # Latest-wins per subject in manager-chain order; an EMPTY addrs list is removal.
+    subject = codec.as_bytes(codec.field(b, b"subject"))
+    addrs: list[tuple[bytes, bytes, dict[bytes, bytes]]] = []
+    for entry in codec.as_seq(codec.field(b, b"addrs")):
+        e = codec.as_seq(entry, 3)
+        opts = {k: codec.as_bytes(v) for k, v in codec.as_dict(e[2]).items()}
+        addrs.append((codec.as_bytes(e[0]), codec.as_bytes(e[1]), opts))
+    return {BK_KIND: ControlKind.ENDPOINT, b"subject": subject, b"addrs": addrs}
 
 
 _VALIDATORS: dict[ControlKind, Callable[[dict[bytes, codec.Bencodable]], dict[bytes, Any]]] = {
@@ -227,6 +236,19 @@ def roster_body(
 
 def rotate_body(keyepoch: int) -> bytes:
     return codec.encode({BK_KIND: ControlKind.ROTATE, b"keyepoch": int(keyepoch)})
+
+
+def endpoint_body(subject: bytes, addrs: list[tuple[bytes, bytes, dict[bytes, bytes]]]) -> bytes:
+    """A root-signed node reachability record (PROTOCOL §7.1 / NOTES 58): `subject`
+    is the node pubkey, `addrs` a list of (transport, uri, opts) — opts carries the
+    L_msg profile. Latest-wins per subject; an EMPTY `addrs` removes the node."""
+    return codec.encode(
+        {
+            BK_KIND: ControlKind.ENDPOINT,
+            b"subject": subject,
+            b"addrs": [[t, u, dict(o)] for (t, u, o) in addrs],
+        }
+    )
 
 
 def wrap_set_body(keyepoch: int, wraps: dict[bytes, bytes]) -> bytes:

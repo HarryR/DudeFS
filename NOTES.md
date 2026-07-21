@@ -1906,9 +1906,89 @@ and A4 as formally stated. Resolutions decided with the design owner; DESIGN
       style commits (a moved golden IS a behavior change); `make check`
       green per commit as always.
 
-# Not yet built (by design, M2+)
+58. **RULED 2026-07-21 — identity, blacklisting & discovery (Harry's
+    general questions): three answered-by-the-log, one wiring gap, one
+    design gap. Nothing structural changes.**
+    - **Keygen: keys generate where they live; the manager signs
+      PUBKEYS only** (a cert is authz over subject_pubkey — the root
+      never holds an sk). Posture fixes: `dude node spawn` must move to
+      on-node keygen (current CLI-side generation is demo conflation),
+      and cert requests gain an Ed25519 **proof-of-possession**
+      (subject signs a challenge) so the manager never certifies an
+      unheld key — the §3 BLS-PoP principle, two lines in Ed25519.
+    - **Client blacklist = CERT_REVOKE, separable from rotation**
+      (revoke = may-no-longer-act; rotate = may-no-longer-read).
+      Authoritative enforcement is fold-positional and exists. **Wiring
+      gap: nodes don't refuse a revoked client's requests** — store+
+      receipt then fold-invalid = a resource/DoS hole. Ruling: the
+      acceptor gates SUBMIT/ACCEPT on the reducer's
+      `is_authorized(author, WRITE)` → REJECTED{bad_authz} — best-
+      effort is CORRECT here (an unheard node does no harm; the fold
+      settles it), no new protocol/artifact. Read-gating = optional
+      policy (post-rotation ciphertext leaks nothing new to a revoked
+      holder of old keys).
+    - **Node blacklist = roster-exclusion + cert-revoke + endpoint
+      removal — all existing ops; NO duty to inform the ejected**
+      (outside the system; joint cert needs only old+new quorums;
+      receipts stop counting via roster-at-epoch checks with zero
+      cooperation). Gossip intake stays un-gated (salvage path);
+      connection-refusal is policy, meaningful only once p2p
+      authenticates peers (M8 TCP).
+    - **Client discovery: the log IS the registry** — CERT_ISSUE +
+      WRAP_SET → the client self-bootstraps from genesis (manager_pub +
+      seed endpoints, TOFU) via ANY one reachable node (PROTOCOL
+      §7.2); no node holds a client list (the reducer's cert state
+      doubles as the filter state). Confirmed as-designed; no change.
+    - **Node discovery: the genuine gap — ENDPOINT ops are inert**
+      (schema-free, ignored; daemons take addresses as kwargs).
+      RULING: schema = root-signed `{subject: node_pub, addrs:
+      [(transport, uri), …]}`, latest-wins per subject in manager-chain
+      order; node daemons consume → gossip address book, client
+      daemons → roster_addrs; genesis carries seed endpoints; removal
+      = a record omitting the node; root signature is what makes
+      §7.1's no-rogue-redirect claim enforceable. **One work wave**
+      (post-test-net, refactor-adjacent): ENDPOINT schema + validators
+      + daemon/client consumption + `dude node add --addr` authoring
+      the op + on-node keygen/PoP + the client-request gate above +
+      daemon joint-cert epoch activation (the flagged 23/24 follow-up
+      — same "daemon consumes the control plane properly" family).
 
-QCs are *constructed and verified* (M0) but no acceptor, quorum client, floor,
-watermark collection, gossip, roster activation, or compaction *flow* exists
-yet — those are M2–M6. The fold already consumes a committed set as its
-precondition (FORMAL's assume/guarantee seam), so M1 stands alone.
+59. **RULED 2026-07-21 — TRANSPORT.md RATIFIED AS AMENDED (the L_msg
+    layer): thesis, layer split, plain/sealed envelope, screening tag,
+    cost ladder, and gate order are all normative. Four amendments
+    (⟦F⟧ inline in the doc):**
+    - **(a) Roster-secrecy reframed — the doc overclaimed.** Only the
+      free-drop rung + tag unlinkability rest on roster secrecy;
+      admission (gate) and data confidentiality (xcs1) never do. A
+      roster leak degrades gracefully to observer tag-labelling (which
+      a network-positioned adversary largely has via traffic analysis
+      anyway) — never entry, never data. Roster-secrecy-from-outsiders
+      = best-effort posture (control plane travels confidential
+      paths), NOT an invariant; the DESIGN §7 members-side leakage
+      boundary stands unchanged.
+    - **(b) Envelope `epoch` is diagnostic, never a hard gate** — a
+      hard `epoch == current` check false-refuses legitimate
+      roster-bridge-window traffic (the R1 over-strict-gate class);
+      the artifact layer enforces epoch where load-bearing. False-
+      rejection pair required.
+    - **(c) Sealed replies: always-mirror the endpoint profile; the
+      ephemeral reply-key is REQUIRED in sealed requests** (optional =
+      a downgrade lever; sealed-without-reply-key is malformed).
+    - **(d) Scope: L_msg covers the CLUSTER wire only** — the worker
+      socket stays filesystem-permission-bounded (workers are keyless
+      and cannot sign envelopes).
+    - Confirmations: `canon` = the existing canonical bencode (no new
+      encoding); `dude.screen` person string; `to_hint` emitted ONLY on
+      multiplexed endpoints; the replay-inertness claim VERIFIED per
+      verb (dup SUBMIT → identical receipt; stale PREPARE → Nack; reads
+      idempotent) so `ts` is genuinely hygiene-only; ENDPOINT records
+      (NOTES 58 schema) carry the `lmsg` profile in per-addr opts —
+      manager-signed = no downgrade. Documented behavior, not a bug: a
+      freshly-certified client may be gate-refused until its
+      CERT_ISSUE propagates — fail-closed + retry, bootstrap latency =
+      gossip cadence. Identity-keyed (not epoch-keyed) screening
+      ratified for the bootstrap-deadlock reason as written; survivor
+      re-key as the ex-member tag-stripping lever ratified as a
+      planned operation. **L_msg is the shared substrate of the
+      NOTES-58 wave** (gate, endpoints, PoP, joint-cert activation
+      ride on it); implementation sequencing stays with that wave.
