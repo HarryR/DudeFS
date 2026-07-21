@@ -19,7 +19,7 @@ import sys
 import time
 
 from . import artifacts as A
-from . import lmsg, wire
+from . import lmsg, transport, wire
 from .artifacts import HLC, quorum_size
 from .manager import Manager, ManagerError, ManagerState, RecoverDecision, recover_decision
 from .node import FrontierReq, Request, Response
@@ -64,8 +64,8 @@ def _mgr_send(
     st: ManagerState, to_pub: bytes, addr: str, req: Request, timeout: float = 5.0
 ) -> Response | None:
     """One enveloped node RPC as the ROOT manager (PROTOCOL §7.5): sign `req` from the
-    manager identity to `to_pub`, socket round-trip, return the node's VERIFIED reply
-    or None. The gate admits root, so the manager's control-plane drive passes."""
+    manager identity to `to_pub`, round-trip over the L_txport seam, return the node's
+    VERIFIED reply or None. The gate admits root, so the manager's drive passes."""
     if not addr:
         return None
     out = lmsg.author(
@@ -76,14 +76,7 @@ def _mgr_send(
         epoch=st.epoch,
         ts=int(time.time() * 1000),
     ).encode()
-    try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-            s.settimeout(timeout)
-            s.connect(addr)
-            s.sendall(wire.frame(out))
-            raw = wire.read_frame(s.recv) or b""
-    except OSError:
-        return None
+    raw = transport.dial(transport.UNIX, addr, out, timeout=timeout)
     match lmsg.classify_reply(raw, expect_from=to_pub, expect_to=st.manager_pub):
         case lmsg.Reply(env):
             return wire.decode_response(env.body)

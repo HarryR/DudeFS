@@ -16,13 +16,12 @@
 from __future__ import annotations
 
 import queue
-import socket
 import threading
 import time
 from dataclasses import dataclass
 
 from . import artifacts as A
-from . import fold, lmsg, wire
+from . import fold, lmsg, transport, wire
 from .artifacts import BLIND, HLC, QC, Op, Receipt, Txn, compute_slot_tag
 from .handlers import data as data_handler
 from .node import FetchOpReq, FrontierReq, GetQCReq, PutQCReq, Request, Response, SubmitReq
@@ -200,13 +199,14 @@ class ClientDaemon:
             self._hlc_ctr += 1
         return HLC(self._hlc_wall, self._hlc_ctr)
 
-    # ---- node RPC (real sockets; the p2p wire) ----------------------------- #
+    # ---- node RPC (the p2p wire, over the L_txport seam) ------------------- #
     def _rpc(self, node: int, req: Request) -> Response | None:
         """Send `req` to a node inside a signed L_msg envelope and return its verified
-        reply (PROTOCOL §7.5). The transport owns the socket I/O; `lmsg` does the pure
-        encode/verify. A reply that isn't signed by the addressed node is no reply —
-        `None` here means 'no usable response from this node this round' (the reason is
-        available for logging in a later pass, but the quorum driver needs only that)."""
+        reply (PROTOCOL §7.5). The TRANSPORT owns the socket I/O + framing; `lmsg` does
+        the pure encode/verify. A reply that isn't signed by the addressed node is no
+        reply — `None` here means 'no usable response from this node this round' (the
+        cause-named fault is available for logging in a later pass, but the quorum
+        driver needs only that)."""
         if self._closing.is_set():
             return None
         path, to_pub = self.roster_addrs[node], self.cfg.roster[node]
@@ -218,14 +218,7 @@ class ClientDaemon:
             epoch=self.cfg.epoch,
             ts=int(time.time() * 1000),
         ).encode()
-        try:
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-                s.settimeout(5.0)
-                s.connect(path)
-                s.sendall(wire.frame(out))
-                raw = wire.read_frame(s.recv) or b""
-        except OSError:
-            return None
+        raw = transport.dial(transport.UNIX, path, out)
         match lmsg.classify_reply(raw, expect_from=to_pub, expect_to=self.pub):
             case lmsg.Reply(env):
                 return wire.decode_response(env.body)

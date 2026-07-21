@@ -14,7 +14,7 @@ from dudefs import crypto as C
 from dudefs import lmsg, wire
 from dudefs import node as N
 from dudefs.acceptor import Acceptor
-from dudefs.daemon import NodeDaemon, _bytesource
+from dudefs.daemon import NodeDaemon
 from dudefs.manager import Manager
 from dudefs.node import LocalNode, dispatch
 from dudefs.store import ChainStore
@@ -38,16 +38,14 @@ def _daemon(w, i, roster):
 
 
 def _rpc(peer):
-    """In-process peer transport: unframe the request, serve it, return UNFRAMED —
-    rendering L_msg's silence (None) as this carrier's empty (an absent reply)."""
+    """In-process peer transport: a payload-level `dial` (no framing — that's the real
+    carrier's job). Renders L_msg's silence (None) as this carrier's empty reply."""
 
-    def rpc(framed):
-        payload = wire.read_frame(_bytesource(framed))
-        assert payload is not None
+    def dial(payload):
         reply = peer.serve(payload)
         return reply if reply is not None else b""
 
-    return rpc
+    return dial
 
 
 class TestDaemonGossip(unittest.TestCase):

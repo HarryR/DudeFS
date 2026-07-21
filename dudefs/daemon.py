@@ -10,12 +10,11 @@
 
 from __future__ import annotations
 
-import socket
 import sqlite3
 import threading
 from collections.abc import Callable
 
-from . import codec, gossip, lmsg, tunables, wire
+from . import codec, gossip, lmsg, transport, tunables, wire
 from .acceptor import Acceptor, Rejected, RejectReason
 from .artifacts import Op, Watermark, quorum_size
 from .fold import ControlReducer, ControlState, endpoints_of
@@ -24,7 +23,7 @@ from .handlers import control as ctl
 from .node import LocalNode, dispatch
 from .store import ChainStore, covered
 
-LOCAL_TRANSPORT = b"unix"  # the POC carrier; ENDPOINT addrs are (transport, uri, opts)
+LOCAL_TRANSPORT = transport.UNIX  # the POC carrier; ENDPOINT addrs are (transport, uri, opts)
 
 # the signed 'no' says WHY (PROTOCOL §7.5): the specific door check the caller failed,
 # not a generic BAD_AUTHZ — the requester already holds our identity, so it leaks nothing.
@@ -36,18 +35,6 @@ _REFUSAL_REASON = {
 
 def _gossip_request(summ: gossip.Summary) -> bytes:
     return codec.encode([b"gossip", gossip.encode_summary(summ)])
-
-
-def _bytesource(data: bytes) -> Callable[[int], bytes]:
-    pos = 0
-
-    def recv(n: int) -> bytes:
-        nonlocal pos
-        chunk = data[pos : pos + n]
-        pos += len(chunk)
-        return chunk
-
-    return recv
 
 
 class NodeDaemon:
@@ -110,22 +97,27 @@ class NodeDaemon:
         no-reply) — the single bit the transport needs — not a collapse of errors: the
         specific outcome is matched here, and only a requester that PROVED it holds our
         identity (a valid sig over `to == self`) ever draws a reply, so a signed 'no'
-        never leaks our pubkey to a party that didn't already have it."""
+        never leaks our pubkey to a party that didn't already have it. A vanished store
+        (this node being killed mid-request) yields silence — the handler owns its own
+        store error so the transport stays a dumb pipe."""
         with self._lock:
-            match lmsg.classify_inbound(
-                data,
-                self_pub=self.pub,
-                now=self._clock(),
-                delta=self.acc.delta_ms,
-                authorized=self._peer_authorized,
-            ):
-                case lmsg.Gated(env):
-                    return self._reply(env, self._dispatch(env.body))  # gate passed
-                case lmsg.Refused(env, reason):
-                    refusal = Rejected(_REFUSAL_REASON[reason])  # the signed 'no' says WHY
-                    return self._reply(env, wire.encode_response(refusal))
-                case lmsg.Dropped(_reason):
-                    return None  # unproven identity / malformed -> reveal nothing
+            try:
+                match lmsg.classify_inbound(
+                    data,
+                    self_pub=self.pub,
+                    now=self._clock(),
+                    delta=self.acc.delta_ms,
+                    authorized=self._peer_authorized,
+                ):
+                    case lmsg.Gated(env):
+                        return self._reply(env, self._dispatch(env.body))  # gate passed
+                    case lmsg.Refused(env, reason):
+                        refusal = Rejected(_REFUSAL_REASON[reason])  # the signed 'no' says WHY
+                        return self._reply(env, wire.encode_response(refusal))
+                    case lmsg.Dropped(_reason):
+                        return None  # unproven identity / malformed -> reveal nothing
+            except sqlite3.Error:
+                return None  # store closed under us (node killed) -> carrier silence
 
     def _reply(self, env: lmsg.Envelope, body: bytes) -> bytes:
         """Seal a signed reply back to the requester (mirrors the request's verb)."""
@@ -184,12 +176,12 @@ class NodeDaemon:
         if peers:  # supersede the seed/kwarg only ONCE endpoint records exist
             self.peers = peers
 
-    def gossip_round(self, peer_rpc: Callable[[bytes], bytes], to_pub: bytes) -> None:
+    def gossip_round(self, dial: Callable[[bytes], bytes], to_pub: bytes) -> None:
         """One anti-entropy round against a peer: advertise my SUMMARY (digest first)
         inside a signed L_msg envelope addressed to `to_pub`, apply the DELTA it owes
         me. Cut-aware — the peer's reply folds in the sparse below-cut baseline for any
-        author whose retained digest differs. `peer_rpc` takes a framed request and
-        returns the UNFRAMED reply payload (the transport owns the I/O)."""
+        author whose retained digest differs. `dial` takes a request PAYLOAD and returns
+        the reply payload — the transport owns the sockets + framing (sans-io)."""
         out = lmsg.author(
             self.sk,
             to_pub,
@@ -198,9 +190,7 @@ class NodeDaemon:
             epoch=self.acc.epoch,
             ts=self._clock(),
         ).encode()
-        match lmsg.classify_reply(
-            peer_rpc(wire.frame(out)), expect_from=to_pub, expect_to=self.pub
-        ):
+        match lmsg.classify_reply(dial(out), expect_from=to_pub, expect_to=self.pub):
             case lmsg.Reply(env):
                 gossip.apply_delta(self.store, gossip.decode_delta(env.body))
             case _fault:  # NoReply / MalformedReply / WrongPeer — a missed round
@@ -346,15 +336,6 @@ class NodeDaemon:
         }
 
     # ---- the maintenance driver (gossip + adopt + observe + audit) --------- #
-    def _connect_rpc(self, path: str) -> Callable[[bytes], bytes]:
-        def rpc(framed: bytes) -> bytes:
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-                s.connect(path)
-                s.sendall(framed)
-                return wire.read_frame(s.recv) or b""
-
-        return rpc
-
     def sync_once(self, observed_watermarks: list[Watermark] | None = None) -> None:
         """One maintenance tick: anti-entropy against every reachable peer, then
         adopt any committed checkpoint, observe recovery fences, and audit for
@@ -362,10 +343,7 @@ class NodeDaemon:
         §9 demo's handful lets us sweep all to the same fixpoint; a down peer is
         just a missed round.)"""
         for pub, path in self.peers:
-            try:
-                self.gossip_round(self._connect_rpc(path), pub)
-            except OSError:
-                pass
+            self.gossip_round(lambda p, uri=path: transport.dial(LOCAL_TRANSPORT, uri, p), pub)
         self.adopt_committed_checkpoints()
         self.observe_roster_activations()  # adopt a joint-certified roster change
         self.observe_fences()
@@ -379,37 +357,15 @@ class NodeDaemon:
         while not stop.wait(period_s):
             self.sync_once()
 
-    # ---- the socket shell (the ONLY I/O; a thin frame loop) ---------------- #
-    def serve_forever(self, path: str, ready: threading.Event | None = None) -> None:
-        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        srv.bind(path)
-        srv.listen(16)
-        self._srv = srv
-        if ready is not None:
-            ready.set()
-        while True:
-            try:
-                conn, _ = srv.accept()
-            except OSError:
-                return  # socket closed -> shutdown
-            threading.Thread(target=self._handle_conn, args=(conn,), daemon=True).start()
-
-    def _handle_conn(self, conn: socket.socket) -> None:
-        with conn:
-            while True:
-                try:
-                    payload = wire.read_frame(conn.recv)
-                    if payload is None:
-                        return
-                    reply = self.serve(payload)
-                    if reply is None:
-                        return  # L_msg chose silence -> close the conn (this carrier's 'nothing')
-                    conn.sendall(wire.frame(reply))
-                except (OSError, sqlite3.Error):
-                    return  # peer vanished, or the store closed under us (node killed)
+    # ---- the listening carrier (the transport owns the I/O; §7 seam) ------- #
+    def serve_forever(self, uri: str, ready: threading.Event | None = None) -> None:
+        """Listen on the local carrier and serve gated envelopes until `close`. The
+        transport owns the accept loop + framing; we supply only the pure `serve`."""
+        self._server = transport.open_server(LOCAL_TRANSPORT)
+        self._server.serve(uri, self.serve, ready)
 
     def close(self) -> None:
-        srv = getattr(self, "_srv", None)
-        if srv is not None:
-            srv.close()
+        server = getattr(self, "_server", None)
+        if server is not None:
+            server.close()
         self.store.close()
