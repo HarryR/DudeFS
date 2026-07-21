@@ -22,7 +22,7 @@ from dudefs.manager import (
     recover_decision,
 )
 from dudefs.node import LocalNode, dispatch
-from dudefs.store import ChainStore
+from dudefs.store import AppendStatus, ChainStore
 from tests._builders import World
 
 ZERO = HLC(0, 0)
@@ -290,6 +290,84 @@ class TestManagerOps(unittest.TestCase):
             self.assertEqual(reloaded.manager_pub, m.state.manager_pub)
             self.assertEqual(reloaded.mseq, m.state.mseq)
             self.assertEqual(len(reloaded.certs), 1)
+
+
+class TestManagerFumbling(unittest.TestCase):
+    """The fumbling-manager safety properties driven through the REAL manager module
+    (NOTES 57 item 2 / the findings-23-24 lesson): a property proven only on
+    hand-built ops can be bypassed by the production path, so it must ALSO be proven
+    through manager.py authoring."""
+
+    def test_retry_before_save_is_idempotent(self):
+        # crash AFTER authoring but BEFORE persisting the chain head: on restart the
+        # manager re-derives the IDENTICAL op (same seq/prev/hlc/payload -> same hash),
+        # so a node sees a content-addressed dup, never a second logical change.
+        with tempfile.TemporaryDirectory() as d:
+            m = Manager.init(d)
+            pre = (m.state.mseq, m.state.mprev, m.state.mhlc)
+            sub = C.SIGNER.public(bytes([9] * 32))
+            first = m.cert_issue("client", sub)
+            m.state.mseq, m.state.mprev, m.state.mhlc = pre  # amnesia: head not saved
+            m.state.certs.pop()
+            retry = m.cert_issue("client", sub)  # same payload at the same head
+            self.assertEqual(first.op_hash, retry.op_hash)  # identical -> idempotent
+            st = ChainStore()
+            self.assertEqual(st.append(first).status, AppendStatus.OK)
+            self.assertEqual(st.append(retry).status, AppendStatus.DUP)  # no double-apply
+
+    def test_amnesia_reused_seq_forks_the_control_chain(self):
+        # chain-head uncertainty is radioactive (MANAGER §3): a manager that forgets
+        # it advanced and authors a DIFFERENT op at the same (author, seq) FORKS — a
+        # node holding both mints portable evidence. The honest fresh-seq path doesn't.
+        with tempfile.TemporaryDirectory() as d:
+            m = Manager.init(d)
+            pre = (m.state.mseq, m.state.mprev, m.state.mhlc)
+            a = m.cert_issue("client", C.SIGNER.public(bytes([1] * 32)))
+            m.state.mseq, m.state.mprev, m.state.mhlc = pre  # amnesia
+            m.state.certs.pop()
+            b = m.cert_issue("client", C.SIGNER.public(bytes([2] * 32)))  # DIFFERENT payload
+            self.assertNotEqual(a.op_hash, b.op_hash)
+            self.assertEqual((a.author, a.seq), (b.author, b.seq))  # collide on the chain slot
+            st = ChainStore()
+            st.append(a)
+            res = st.append(b)
+            self.assertEqual(res.status, AppendStatus.FORK)
+            self.assertIsNotNone(res.evidence)  # portable FORK proof
+
+    def test_double_press_roster_change_serializes_to_one(self):
+        # a double-pressed roster change (crash-retry) contends the SAME public roster
+        # slot; the old roster's single-decree machinery decides at most one (B4),
+        # driven through the real change_roster authoring.
+        with tempfile.TemporaryDirectory() as d:
+            m = Manager.init(d)
+            keys = [_nk(50), _nk(51), _nk(52)]
+            pubs = [k[0] for k in keys]
+            m.state.roster = [pubs[0]]
+            base = World(seed=1, n_clients=1).blind(0, [], [[A.Mutation.SET, b"k", b"v"]])
+            nodes, rpc = _roster_cluster(keys, base, holders=set(pubs))
+            change = m.change_roster(pubs, rpc)
+
+            tag = A.roster_slot_tag(0)
+            ballot = A.Ballot(1, A.slot_priority(tag, m.state.manager_pub))
+            # a competing press: a different roster op on the same slot/ballot is
+            # refused by the node that already decided the first (equivocation guard)
+            rival = A.Op.build(
+                author_sk=bytes([99] * 32),
+                author_pub=C.SIGNER.public(bytes([99] * 32)),
+                cls_=A.OpClass.CONTROL,
+                seq=0,
+                prev=A.GENESIS_PREV,
+                hlc=A.HLC(2, 0),
+                deps=[],
+                authz=b"root",
+                keyepoch=0,
+                payload=ctl.roster_body(0, [pubs[0]], {}),
+                slot_tag=tag,
+            )
+            r = nodes[pubs[0]].accept(tag, ballot, rival)
+            assert isinstance(r, Rejected)
+            self.assertEqual(r.reason, RejectReason.EQUIVOCATION_GUARD)
+            self.assertEqual(change.op.slot_tag, tag)
 
 
 if __name__ == "__main__":
