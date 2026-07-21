@@ -1803,6 +1803,34 @@ and A4 as formally stated. Resolutions decided with the design owner; DESIGN
       recover-fence wiring above. Then WP4: the encrypted demo, which
       gates on it (two client nodes must see each other's writes).
 
+56. **F22-WAVE REVIEW (2026-07-21, `6bd4682`): CLEARED — WP4 (the
+    encrypted demo) is GO. CLIENT.md §2.1 added: the consistency
+    contract (Harry's may_flip question).**
+    - Verified: `sync()` is the §1.2/§9 math done right — quorum of
+      SIGNED frontiers, union heads, chain-walk PULL of op+QC, frontier
+      = q-th-highest attested floor, and fail-safe on a short quorum
+      (leave the view, never guess). On-demand before `level=final` +
+      500 ms background refresh, per ruling; the two-daemon headline
+      regression is revert-checked. may_flip-on-absent fixed
+      (unfrozen absence with a pending presence-maker flips); blind
+      commits retransmit under a budget (SUBMIT idempotent); `recover
+      --fence` authors the real recovery pair once interlocks clear —
+      no narration survives. NOTES 55's closure item closed. 207 green.
+    - **CLIENT.md §2.1 (the durable answer to "what must a worker know
+      to build a transactional surface"):** one serial history (SEC),
+      trailing ~δ still settling, frontier immutable; `may_flip:false`
+      ⇔ the answer IS final (and doubles as the cheap finality signal —
+      poll provisional, act when it goes false); flips happen only via
+      earlier-hlc commits within δ; durability/lost/final never flip.
+      The transactional floor: NO lost updates, NO dirty writes at any
+      tier (fencing converts every optimism-miss into an explicit
+      `stale` retry). The judgment rule: inside the store pipeline on
+      provisional freely; outside the store buy `final` or idempotence.
+      CAP stated exactly: CP with a LABELED stale-read escape hatch —
+      final = PC/EC (linearizable at the frontier via on-demand sync),
+      local = PA/EL (available, possibly stale, non-monotone within δ)
+      — the tier tag means consistency is never traded silently.
+
 # Not yet built (by design, M2+)
 
 QCs are *constructed and verified* (M0) but no acceptor, quorum client, floor,

@@ -52,6 +52,51 @@ construction**: dependents restate exact lineage points, so a flipped
 ancestor cascades every dependent to `stale` — never a wrong-apply, never a
 partial (NOTES 50). `unknown` is honest tri-state; re-poll resolves it.
 
+### 2.1 The consistency contract — what `may_flip` means, precisely
+
+Every client converges on **one serial history** (the fold's total order —
+SEC). The trailing ~δ of that history is still *settling*: a write with a
+slightly-behind clock can still commit into it and re-attribute everything
+that sorts above it. Everything older than the finality frontier is carved
+in stone (§9). `may_flip` is the boolean that tells you which side of that
+line your answer came from:
+
+- **`may_flip: false` ⇒ this answer IS final** — every op it derives from
+  sits at/below the quorum-attested frontier. It will never change, and it
+  is monotone across polls. (This makes `may_flip` the cheap finality
+  signal: poll `provisional` and act when it goes false — typically ~δ +
+  poll cadence after commit — without ever asking for `final` explicitly.)
+- **`may_flip: true` ⇒ the answer can change, in exactly one way**: a new
+  commit with an *earlier* hlc (bounded by δ — floors refuse anything
+  older) re-runs the walk above it. Verdicts can flip `applied↔rejected↔
+  stale`; values and absence can flip with them. What can NEVER flip:
+  `committed` (durability), `lost`, anything already `final`.
+
+**What never breaks, even on flips — the transactional floor:** no lost
+updates and no dirty writes, ever, at any tier. Any write you base on a
+provisional read carries that read's fencing token; if the basis flips,
+your write folds `stale` — an *explicit retry signal*, never a silent
+overwrite. Inside the store, optimism is free.
+
+**The one rule that needs your judgment — external side effects:** a
+provisional read used for a *non-CAS* decision (act on a config value, pay
+an invoice) can be based on state that flips, and the store cannot fence
+the outside world. So: **inside the store, pipeline on provisional freely;
+outside the store, buy `final` (wait for `may_flip:false`) or buy
+idempotence (the durable-intent pattern, §5).**
+
+**CAP/PACELC, stated exactly:** this is a **CP** system with a labeled
+stale-read escape hatch. Writes need a quorum — a minority partition
+*parks* (unavailable), never answers wrong. Reads: `level=final` performs
+an on-demand quorum sync → linearizable at the frontier (CP; PC/EC).
+`level=local` answers from the cached fold → available under any partition
+but possibly stale and non-monotone within the δ window (PA/EL). **The tier
+tag on every answer tells you which trade you got — the system never
+trades consistency silently; it labels.** Cross-client visibility:
+read-your-writes is immediate through your own daemon; another daemon's
+writes appear at `final` reads always (the sync), at `local` reads within
+the refresh cadence.
+
 ## 3. Verbs
 
 | Verb | Params | Returns |

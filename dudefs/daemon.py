@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import socket
+import sqlite3
 import threading
 from collections.abc import Callable
 
@@ -252,10 +253,13 @@ class NodeDaemon:
     def _handle_conn(self, conn: socket.socket) -> None:
         with conn:
             while True:
-                payload = wire.read_frame(conn.recv)
-                if payload is None:
-                    return
-                conn.sendall(wire.frame(self.serve(payload)))
+                try:
+                    payload = wire.read_frame(conn.recv)
+                    if payload is None:
+                        return
+                    conn.sendall(wire.frame(self.serve(payload)))
+                except (OSError, sqlite3.Error):
+                    return  # peer vanished, or the store closed under us (node killed)
 
     def close(self) -> None:
         srv = getattr(self, "_srv", None)

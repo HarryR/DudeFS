@@ -147,6 +147,23 @@ class TestManagerOps(unittest.TestCase):
             assert body is not None
             self.assertEqual(body[ctl.BK_KIND], ctl.ControlKind.ROSTER)
 
+    def test_node_replace_swaps_in_one_op_keeping_count(self):
+        with tempfile.TemporaryDirectory() as d:
+            m = Manager.init(d)
+            n1, n2 = C.SIGNER.public(bytes([1] * 32)), C.SIGNER.public(bytes([2] * 32))
+            m.state.roster = [m.state.roster[0], n1, n2]  # pre-state: 3 voting
+            fresh = C.SIGNER.public(bytes([3] * 32))
+            op = m.node_replace(n2, fresh)
+            self.assertEqual(len(m.state.roster), 3)  # unchanged (stays odd)
+            self.assertIn(fresh, m.state.roster)
+            self.assertNotIn(n2, m.state.roster)
+            self.assertEqual(m.state.epoch, 1)
+            body = ctl.decode(op)
+            assert body is not None
+            self.assertEqual(body[ctl.BK_KIND], ctl.ControlKind.ROSTER)
+            with self.assertRaises(ManagerError):
+                m.node_replace(C.SIGNER.public(bytes([9] * 32)), fresh)  # old not a member
+
     def test_fence_authoring_produces_the_recovery_pair(self):
         with tempfile.TemporaryDirectory() as d:
             m = Manager.init(d)

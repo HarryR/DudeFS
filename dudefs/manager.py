@@ -307,6 +307,22 @@ class Manager:
         self.state.save()
         return op
 
+    def node_replace(self, old: bytes, new: bytes) -> Op:
+        """Retire a node and swap in a replacement in ONE roster op — the voting
+        count is UNCHANGED (stays odd), so it never trips the even-roster guard. Used
+        for disk-wipe identity retirement (the old key is untrusted; revoke its cert
+        separately). One atomic membership change (MANAGER §2 `replace`)."""
+        if old not in self.state.roster:
+            raise ManagerError("not a voting member")
+        if new in self.state.roster or new in self.state.learners:
+            raise ManagerError("replacement is already a member/learner")
+        new_roster = [new if p == old else p for p in self.state.roster]
+        op = self.state.author_control(ctl.roster_body(self.state.epoch, new_roster, {}))
+        self.state.roster = new_roster
+        self.state.epoch += 1
+        self.state.save()
+        return op
+
     # ---- recovery (interlocked) ----------------------------------------- #
     def probe_roster(
         self, probe: Callable[[str], HLC | None], dwell: float, sleep: Callable[[float], None]
