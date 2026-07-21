@@ -13,7 +13,11 @@ from dudefs import artifacts as A
 from dudefs import crypto as C
 from dudefs import node as N
 from dudefs import wire
+from dudefs.acceptor import Acceptor
 from dudefs.daemon import NodeDaemon, _bytesource
+from dudefs.manager import Manager
+from dudefs.node import LocalNode, dispatch
+from dudefs.store import ChainStore
 from tests._builders import World
 from tests._cluster import creation_op
 
@@ -224,6 +228,101 @@ class TestDaemonSocket(unittest.TestCase):
             cli.close()
             d.close()
             time.sleep(0.05)
+
+
+class TestJointCertActivation(unittest.TestCase):
+    """The findings 23/24 follow-up: a daemon adopts a roster change once it holds
+    the JOINT CERTIFICATE (old-roster QC at e + new-roster QC at e+1), and refuses
+    to activate on either half alone."""
+
+    def _joint_cert(self, m):
+        """Drive a real epoch-0 roster change on an in-process cluster; return
+        (RosterChange, old_roster, new_roster). node2 -> a fresh (caught-up) node."""
+        w = World(seed=7, n_clients=1)
+        base = w.blind(0, [], [[A.Mutation.SET, b"k", b"v"]])  # the sync frontier
+        old_sks = [bytes([200 + i] * 32) for i in range(3)]
+        old = [C.SIGNER.public(s) for s in old_sks]
+        m.state.roster = list(old)
+        fresh_sk, fresh = bytes([210] * 32), C.SIGNER.public(bytes([210] * 32))
+        new = [old[0], old[1], fresh]
+        nodes = {}
+        for pub, sk in zip([*old, fresh], [*old_sks, fresh_sk], strict=True):
+            acc = Acceptor(sk, pub, ChainStore(), 0, BIG)
+            acc.store.append(base)
+            nodes[pub] = LocalNode(acc, lambda: 100)
+        rc = m.change_roster(new, lambda pub, req: dispatch(nodes[pub], req))
+        return rc, old, old_sks, new
+
+    def _fresh_daemon(self, m, old, old_sks):
+        return NodeDaemon(
+            old_sks[0],
+            old[0],
+            roster=list(old),
+            manager_pub=m.state.manager_pub,
+            clock=lambda: 100,
+            delta_ms=BIG,
+        )
+
+    def test_activates_on_the_full_joint_certificate(self):
+        with tempfile.TemporaryDirectory() as d:
+            m = Manager.init(d)
+            rc, old, old_sks, new = self._joint_cert(m)
+            nd = self._fresh_daemon(m, old, old_sks)
+            nd.store.append(rc.op)
+            nd.store.put_qc(rc.old_qc)  # old-roster half (epoch 0)
+            nd.store.put_qc(rc.new_qc)  # new-roster half (epoch 1, possession-gated)
+            self.assertEqual(nd.acc.epoch, 0)
+            nd.observe_roster_activations()
+            self.assertEqual(nd.acc.epoch, 1)  # activated
+            self.assertEqual(nd.roster, new)  # and adopted the new configuration
+            self.assertEqual(nd.quorum, A.quorum_size(len(new)))
+            nd.observe_roster_activations()  # monotone: a second pass is a no-op
+            self.assertEqual(nd.acc.epoch, 1)
+
+    def test_activation_survives_a_contended_roster_slot(self):
+        # B4: a crash-retry re-authors the SAME roster slot, so the store can hold an
+        # undecided contender (no QC) beside the joint-certified op. Activation must
+        # pick the certified one, never let the contender starve it.
+        from dudefs.handlers import control as ctl
+
+        with tempfile.TemporaryDirectory() as d:
+            m = Manager.init(d)
+            rc, old, old_sks, new = self._joint_cert(m)
+            other = C.SIGNER.public(bytes([211] * 32))
+            contender = m.state.author_control(
+                ctl.roster_body(0, [old[0], old[1], other], {}),
+                slot_tag=A.roster_slot_tag(0),
+            )
+            nd = self._fresh_daemon(m, old, old_sks)
+            nd.store.append(contender)  # the contender sits FIRST in the store
+            nd.store.append(rc.op)
+            nd.store.put_qc(rc.old_qc)
+            nd.store.put_qc(rc.new_qc)
+            nd.observe_roster_activations()
+            self.assertEqual(nd.acc.epoch, 1)  # certified op wins, not starved
+            self.assertEqual(nd.roster, new)
+
+    def test_will_not_activate_on_the_new_half_alone(self):
+        with tempfile.TemporaryDirectory() as d:
+            m = Manager.init(d)
+            rc, old, old_sks, _new = self._joint_cert(m)
+            nd = self._fresh_daemon(m, old, old_sks)
+            nd.store.append(rc.op)
+            nd.store.put_qc(rc.new_qc)  # new half only -> not a joint cert
+            nd.observe_roster_activations()
+            self.assertEqual(nd.acc.epoch, 0)  # no activation
+            self.assertEqual(nd.roster, old)
+
+    def test_will_not_activate_on_the_old_half_alone(self):
+        with tempfile.TemporaryDirectory() as d:
+            m = Manager.init(d)
+            rc, old, old_sks, _new = self._joint_cert(m)
+            nd = self._fresh_daemon(m, old, old_sks)
+            nd.store.append(rc.op)
+            nd.store.put_qc(rc.old_qc)  # old half only -> the new roster never ratified
+            nd.observe_roster_activations()
+            self.assertEqual(nd.acc.epoch, 0)  # no activation
+            self.assertEqual(nd.roster, old)
 
 
 if __name__ == "__main__":

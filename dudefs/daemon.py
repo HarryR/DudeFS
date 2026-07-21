@@ -227,6 +227,47 @@ class NodeDaemon:
                 op, ckpts[rec], body[b"from_epoch"] + 1, rec, self.manager_pub
             )
 
+    # ---- joint-certificate activation (findings 23/24 follow-up) ----------- #
+    def observe_roster_activations(self) -> None:
+        """Adopt a roster change once I hold its JOINT CERTIFICATE (DESIGN §13): a
+        committed ROSTER op plus BOTH halves — an old-roster QC at epoch e (the old
+        configuration decided the change) AND a new-roster QC at e+1 (possession-
+        gated: the new configuration holds the data and agrees). Both gate the epoch
+        bump so a node never activates on a forged or half-ratified change. Ordered +
+        monotone: I only advance FROM my current epoch, verifying the old half against
+        the roster I hold for it, so a lagging node catches up one epoch per round
+        (chained within this pass as `activate_epoch` moves me forward). Distinct from
+        observe_fences — that is the ROOT-signed recovery substitute when the quorum
+        is dead and there is no new-roster QC to be had."""
+        qcs = {(qc.op_hash, qc.config_epoch): qc for qc in self.store.all_qcs()}
+        # roster-change ops grouped by the epoch they advance FROM. A slot may be
+        # CONTENDED (B4: a crash-retry re-authors the same roster slot), so an epoch
+        # can hold several candidate ops of which the old roster decided at most one;
+        # keep them all and pick the joint-certified one below (never let an undecided
+        # contender starve the activation).
+        by_from: dict[int, list[tuple[Op, list[bytes]]]] = {}
+        for op in self.store.all_ops():
+            body = ctl.decode(op) if op.is_control else None
+            if body is None or body[ctl.BK_KIND] != ctl.ControlKind.ROSTER:
+                continue
+            if body.get(b"recovery") is not None:
+                continue  # the recovery path is observe_fences, not the joint cert
+            by_from.setdefault(body[b"from_epoch"], []).append((op, body[b"roster"]))
+        while cands := by_from.get(self.acc.epoch):
+            e = self.acc.epoch
+            for op, new_roster in cands:
+                old_qc, new_qc = qcs.get((op.op_hash, e)), qcs.get((op.op_hash, e + 1))
+                if old_qc is None or new_qc is None:
+                    continue  # incomplete joint cert for THIS candidate
+                if not old_qc.verify(self.roster) or not new_qc.verify(new_roster):
+                    continue  # a half that does not ratify -> not a valid activation
+                self.acc.activate_epoch(e + 1)  # monotone + durable (finding 20)
+                self.roster = new_roster
+                self.quorum = quorum_size(len(new_roster))
+                break  # advanced one epoch; the while re-reads at the new epoch
+            else:
+                break  # no candidate at this epoch carried a full joint cert -> done
+
     # ---- evidence duty-cycle (WP1.5) --------------------------------------- #
     def evidence_cycle(self, observed_watermarks: list[Watermark] | None = None) -> int:
         """Run every detector over held artifacts (+ observed watermarks) and persist
@@ -271,6 +312,7 @@ class NodeDaemon:
             except OSError:
                 pass
         self.adopt_committed_checkpoints()
+        self.observe_roster_activations()  # adopt a joint-certified roster change
         self.observe_fences()
         self.evidence_cycle(observed_watermarks)
         self.refresh_peers()  # newly-gossiped ENDPOINT records join next tick's peer set
