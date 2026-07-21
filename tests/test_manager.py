@@ -99,18 +99,40 @@ class TestManagerOps(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             m = Manager.init(d)
             sub = C.SIGNER.public(bytes([9] * 32))
-            op = m.cert_issue("client", sub)
+            op = m.cert_issue("client", sub, C.prove_possession(bytes([9] * 32)))
             body = ctl.decode(op)
             assert body is not None
             self.assertEqual(body[ctl.BK_KIND], ctl.ControlKind.CERT_ISSUE)
             self.assertEqual(body[b"subject"], sub)
             self.assertEqual(body[b"caps"], [ctl.Cap.WRITE])
 
+    def test_cert_issue_refuses_a_bad_proof_of_possession(self):
+        # the manager never certifies an unheld key (NOTES 58): a pop signed by a
+        # DIFFERENT key is refused, and nothing is authored for the subject.
+        with tempfile.TemporaryDirectory() as d:
+            m = Manager.init(d)
+            sub = C.SIGNER.public(bytes([9] * 32))
+            forged = C.prove_possession(bytes([8] * 32))  # possession of the WRONG key
+            with self.assertRaises(ManagerError):
+                m.cert_issue("client", sub, forged)
+            self.assertNotIn(sub.hex(), [c["subject"] for c in m.state.certs])
+
+    def test_node_spawn_emits_a_verifiable_pop_for_the_held_key(self):
+        with tempfile.TemporaryDirectory() as d:
+            m = Manager.init(d)
+            pub, keyfile, pop = m.node_spawn()
+            self.assertTrue(C.verify_possession(pub, pop))  # the pop matches the pubkey
+            with open(keyfile, "rb") as f:
+                self.assertEqual(C.SIGNER.public(f.read()), pub)  # and the local key is the sk
+            # the pop the node hands over actually certifies it
+            op = m.cert_issue("node", pub, pop)
+            self.assertIsNotNone(ctl.decode(op))
+
     def test_revoke_stages_rotate_bumps_keyepoch_and_wraps_all_members(self):
         with tempfile.TemporaryDirectory() as d:
             m = Manager.init(d)
             sub = C.SIGNER.public(bytes([9] * 32))
-            m.cert_issue("client", sub)
+            m.cert_issue("client", sub, C.prove_possession(bytes([9] * 32)))
             self.assertEqual(m.state.keyepoch, 0)
             ops = m.cert_revoke(sub)  # rotate staged by default
             self.assertEqual(len(ops), 3)  # revoke + wrap-set + rotate
@@ -127,7 +149,7 @@ class TestManagerOps(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             m = Manager.init(d)
             sub = C.SIGNER.public(bytes([9] * 32))
-            m.cert_issue("client", sub)
+            m.cert_issue("client", sub, C.prove_possession(bytes([9] * 32)))
             ops = m.cert_revoke(sub, rotate=False)
             self.assertEqual(len(ops), 1)  # revoke only
             self.assertEqual(m.state.keyepoch, 0)
@@ -178,7 +200,9 @@ class TestManagerOps(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             m = Manager.init(d)
             with self.assertRaises(ManagerError):
-                m.cert_issue("wizard", C.SIGNER.public(bytes([9] * 32)))
+                m.cert_issue(
+                    "wizard", C.SIGNER.public(bytes([9] * 32)), C.prove_possession(bytes([9] * 32))
+                )
 
     def test_promote_requires_a_learner(self):
         with tempfile.TemporaryDirectory() as d:
@@ -308,7 +332,9 @@ class TestManagerOps(unittest.TestCase):
     def test_state_roundtrips_through_disk(self):
         with tempfile.TemporaryDirectory() as d:
             m = Manager.init(d)
-            m.cert_issue("client", C.SIGNER.public(bytes([9] * 32)))
+            m.cert_issue(
+                "client", C.SIGNER.public(bytes([9] * 32)), C.prove_possession(bytes([9] * 32))
+            )
             reloaded = ManagerState.load(d)
             self.assertEqual(reloaded.manager_pub, m.state.manager_pub)
             self.assertEqual(reloaded.mseq, m.state.mseq)
@@ -329,10 +355,12 @@ class TestManagerFumbling(unittest.TestCase):
             m = Manager.init(d)
             pre = (m.state.mseq, m.state.mprev, m.state.mhlc)
             sub = C.SIGNER.public(bytes([9] * 32))
-            first = m.cert_issue("client", sub)
+            first = m.cert_issue("client", sub, C.prove_possession(bytes([9] * 32)))
             m.state.mseq, m.state.mprev, m.state.mhlc = pre  # amnesia: head not saved
             m.state.certs.pop()
-            retry = m.cert_issue("client", sub)  # same payload at the same head
+            retry = m.cert_issue(
+                "client", sub, C.prove_possession(bytes([9] * 32))
+            )  # same payload at the same head
             self.assertEqual(first.op_hash, retry.op_hash)  # identical -> idempotent
             st = ChainStore()
             self.assertEqual(st.append(first).status, AppendStatus.OK)
@@ -345,10 +373,14 @@ class TestManagerFumbling(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             m = Manager.init(d)
             pre = (m.state.mseq, m.state.mprev, m.state.mhlc)
-            a = m.cert_issue("client", C.SIGNER.public(bytes([1] * 32)))
+            a = m.cert_issue(
+                "client", C.SIGNER.public(bytes([1] * 32)), C.prove_possession(bytes([1] * 32))
+            )
             m.state.mseq, m.state.mprev, m.state.mhlc = pre  # amnesia
             m.state.certs.pop()
-            b = m.cert_issue("client", C.SIGNER.public(bytes([2] * 32)))  # DIFFERENT payload
+            b = m.cert_issue(
+                "client", C.SIGNER.public(bytes([2] * 32)), C.prove_possession(bytes([2] * 32))
+            )  # DIFFERENT payload
             self.assertNotEqual(a.op_hash, b.op_hash)
             self.assertEqual((a.author, a.seq), (b.author, b.seq))  # collide on the chain slot
             st = ChainStore()

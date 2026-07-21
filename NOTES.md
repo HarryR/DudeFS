@@ -1992,3 +1992,31 @@ and A4 as formally stated. Resolutions decided with the design owner; DESIGN
       planned operation. **L_msg is the shared substrate of the
       NOTES-58 wave** (gate, endpoints, PoP, joint-cert activation
       ride on it); implementation sequencing stays with that wave.
+
+60. **RULED 2026-07-21 — request-gate scope (Opus's on_accept
+    question): Option 1, sharpened into the standing principle. NOTES
+    58's "gate SUBMIT/ACCEPT" wording was imprecise (Fable's error) —
+    corrected here.**
+    - **The principle: the gate authorizes the REQUESTER at the door;
+      it NEVER evaluates an artifact's AUTHOR.** Author authorization
+      is fold-positional (DESIGN §15); decision-completion paths
+      (PREPARE/ACCEPT re-proposals) are exempt from author-level
+      gating per PROTOCOL §2.1 — the recovery wedge Opus identified is
+      real (a revoked author's accepted op MUST be re-proposable by
+      other clients or the slot wedges), and RESILIENCE §3.4 already
+      prices the residual (one burned attempt beats a permanent wedge,
+      the same call the fold layer made at rev 2).
+    - **Step 3 ships as Option 1:** `on_submit` gated by author (for a
+      blind write the submitter IS the author, so the proxy is sound
+      pre-L_msg); `on_prepare`/`on_accept` ungated. Option 2 rejected
+      (fresh-vs-recovery is unlabelable at a node that missed the
+      original accept — an intent-guessing gate, the R1 class).
+      Option 3 rejected (reintroduces completion-blocks-on-authz).
+    - **Step 6 (L_msg) closes the residual structurally:** the door
+      then gates by envelope `from` on EVERY verb — requester-based,
+      author-never — so a revoked client cannot deliver even its own
+      re-proposals (refused as a requester), while any authorized
+      proposer still carries a revoked author's op through recovery:
+      the one case that must survive, surviving. Post-L_msg the
+      slotted path is "ungated" only with respect to artifact authors,
+      which is correct permanently, not a compromise.

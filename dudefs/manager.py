@@ -253,9 +253,14 @@ class Manager:
     # ---- identity ------------------------------------------------------- #
     _CAP_FOR = {"client": [ctl.Cap.WRITE], "node": [ctl.Cap.STORE], "compactor": [ctl.Cap.COMPACT]}
 
-    def cert_issue(self, kind: str, subject: bytes) -> Op:
+    def cert_issue(self, kind: str, subject: bytes, pop: bytes) -> Op:
+        """Certify `subject`'s capability — after verifying its PROOF-OF-POSSESSION
+        (NOTES 58): the manager signs pubkeys only and never certifies an unheld
+        key, so an invalid/missing pop is refused before any op is authored."""
         if kind not in self._CAP_FOR:
             raise ManagerError(f"unknown cert kind {kind!r}")
+        if not C.verify_possession(subject, pop):
+            raise ManagerError("proof-of-possession failed: subject does not hold the key")
         caps = self._CAP_FOR[kind]
         op = self.state.author_control(ctl.cert_issue_body(subject, caps, self.state.epoch))
         self.state.certs.append(
@@ -295,14 +300,17 @@ class Manager:
         return [wrap_op, rot_op]
 
     # ---- membership ----------------------------------------------------- #
-    def node_spawn(self) -> tuple[bytes, str]:
-        """Mint a node identity, returning (pubkey, keyfile path)."""
+    def node_spawn(self) -> tuple[bytes, str, bytes]:
+        """Mint a node identity, returning (pubkey, keyfile path, proof-of-possession).
+        Keys generate where they live (NOTES 58) — the key stays in the node's keyfile;
+        only the pubkey + pop travel to the manager for `cert issue`. (In the POC the
+        CLI stands in for the node; the sk never reaches the manager.)"""
         key = os.urandom(32)
         pub = C.SIGNER.public(key)
         keyfile = os.path.join(self.state.dir, f"node-{pub.hex()[:8]}.key")
         with open(os.open(keyfile, os.O_WRONLY | os.O_CREAT, 0o600), "wb") as f:
             f.write(key)
-        return pub, keyfile
+        return pub, keyfile, C.prove_possession(key)
 
     def node_add(self, pub: bytes, addr: str = "") -> None:
         if pub in self.state.roster or pub in self.state.learners:

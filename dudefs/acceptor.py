@@ -161,10 +161,14 @@ class Acceptor:
             return Rejected(RejectReason.NEEDS_BALLOT)
         if not (op.verify_structure() and op.verify_sig(op.author)):
             return Rejected(RejectReason.BAD_STRUCTURE)
-        # the request gate (NOTES 58): refuse a non-authorized author's blind write
-        # at the door — best-effort (fail-closed until the author's cert propagates;
-        # NOTES 59), the fold is authoritative. Ballot ACCEPT is deliberately NOT
-        # gated here (recovery must complete — PROTOCOL §2.1; flagged for review).
+        # the request gate (NOTES 58/60): refuse a non-authorized REQUESTER at the
+        # door — best-effort, fail-closed until the cert propagates (NOTES 59), the
+        # fold is authoritative. For SUBMIT the requester IS the author, so gating on
+        # the author is exact here. PREPARE/ACCEPT stay ungated: the gate authorizes
+        # the requester, never an artifact's author, so it must not block a proposer
+        # carrying a (possibly since-revoked) author's op through recovery (PROTOCOL
+        # §2.1; RESILIENCE §3.4 makes the same trade at the fold). L_msg (step 6)
+        # makes every verb requester-gated on the envelope `from` — wedge-free.
         if self.authz is not None and not self.authz(op.author):
             return Rejected(RejectReason.BAD_AUTHZ)
         skew = self._skew_reason(op, now_ms)

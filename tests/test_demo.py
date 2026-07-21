@@ -206,7 +206,7 @@ class TestDemoRunbook(unittest.TestCase):
             roster = [k[0] for k in keys]
             m.state.roster = list(roster)
             old = roster[2]
-            m.cert_issue("node", old)  # the retiring node had a STORE cert
+            m.cert_issue("node", old, C.prove_possession(keys[2][1]))  # retiring node had STORE
             m.cert_revoke(old, rotate=False)  # the old key is untrusted
 
             fresh_sk = bytes([24] * 32)

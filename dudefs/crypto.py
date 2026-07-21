@@ -117,6 +117,30 @@ SIGNER = Ed25519Signer
 
 
 # --------------------------------------------------------------------------- #
+# Proof-of-possession (NOTES 58): the manager signs pubkeys only and never       #
+# certifies an unheld key — the subject proves it holds the sk by signing a      #
+# domain-separated self-attestation over its own pubkey. Non-interactive (no     #
+# challenge round trip); replay-safe because the pop is bound to THAT pubkey and #
+# cannot be transplanted to another. The `dude.pop:` prefix keeps it disjoint    #
+# from every real signed artifact (ops sign an envelope, never this message).    #
+# --------------------------------------------------------------------------- #
+
+_POP_PREFIX = b"dude.pop:"
+
+
+def prove_possession(sk: bytes) -> bytes:
+    """The subject's self-attestation that it holds `sk` (keys generate where they
+    live; only pubkey + pop travel to the manager)."""
+    pub = SIGNER.public(sk)
+    return SIGNER.sign(sk, _POP_PREFIX + pub)
+
+
+def verify_possession(pub: bytes, pop: bytes) -> bool:
+    """The manager's check before certifying `pub` — never certify an unheld key."""
+    return SIGNER.verify(pub, _POP_PREFIX + pub, pop)
+
+
+# --------------------------------------------------------------------------- #
 # Signer-set bitmap (which nodes signed — DESIGN §8)                           #
 # --------------------------------------------------------------------------- #
 

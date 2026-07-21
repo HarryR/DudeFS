@@ -49,7 +49,18 @@ class TestManagerCommands(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             _run(["init", "--dir", d])
             client_pub = C.SIGNER.public(bytes([9] * 32))
-            code, out, _ = _run(["cert", "issue", "client", client_pub.hex(), "--dir", d])
+            code, out, _ = _run(
+                [
+                    "cert",
+                    "issue",
+                    "client",
+                    client_pub.hex(),
+                    "--pop",
+                    C.prove_possession(bytes([9] * 32)).hex(),
+                    "--dir",
+                    d,
+                ]
+            )
             self.assertEqual(code, 0)
             # the control.log holds a decodable CERT_ISSUE naming the subject
             with open(os.path.join(d, "control.log")) as f:
@@ -63,7 +74,18 @@ class TestManagerCommands(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             _run(["init", "--dir", d])
             sub = C.SIGNER.public(bytes([9] * 32))
-            _run(["cert", "issue", "client", sub.hex(), "--dir", d])
+            _run(
+                [
+                    "cert",
+                    "issue",
+                    "client",
+                    sub.hex(),
+                    "--pop",
+                    C.prove_possession(bytes([9] * 32)).hex(),
+                    "--dir",
+                    d,
+                ]
+            )
             self.assertEqual(ManagerState.load(d).keyepoch, 0)
             code, out, _ = _run(["cert", "revoke", sub.hex(), "--dir", d])
             self.assertEqual(code, 0)
@@ -77,7 +99,18 @@ class TestManagerCommands(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             _run(["init", "--dir", d])
             sub = C.SIGNER.public(bytes([9] * 32))
-            _run(["cert", "issue", "client", sub.hex(), "--dir", d])
+            _run(
+                [
+                    "cert",
+                    "issue",
+                    "client",
+                    sub.hex(),
+                    "--pop",
+                    C.prove_possession(bytes([9] * 32)).hex(),
+                    "--dir",
+                    d,
+                ]
+            )
             code, out, _ = _run(["cert", "revoke", sub.hex(), "--no-rotate", "--dir", d])
             self.assertEqual(code, 0)
             self.assertIn("WARNING", out)

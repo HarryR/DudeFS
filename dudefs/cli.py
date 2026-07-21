@@ -136,7 +136,7 @@ def cmd_init(args: argparse.Namespace) -> int:
 def cmd_cert_issue(args: argparse.Namespace) -> int:
     m = Manager.load(args.dir)
     try:
-        op = m.cert_issue(args.kind, bytes.fromhex(args.pubkey))
+        op = m.cert_issue(args.kind, bytes.fromhex(args.pubkey), bytes.fromhex(args.pop))
     except ManagerError as e:
         print(f"refusing: {e}", file=sys.stderr)
         return ERR
@@ -174,9 +174,10 @@ def cmd_node(args: argparse.Namespace) -> int:
     m = Manager.load(args.dir)
     try:
         if args.node_cmd == "spawn":
-            pub, keyfile = m.node_spawn()
+            pub, keyfile, pop = m.node_spawn()
             print(f"spawned node identity {pub.hex()} (key: {keyfile})")
             print(f"  add it as a learner:  dude node add {pub.hex()} --addr <endpoint>")
+            print(f"  then certify it:      dude cert issue node {pub.hex()} --pop {pop.hex()}")
             return OK
         if args.node_cmd == "add":
             pub = bytes.fromhex(args.pubkey)
@@ -348,6 +349,9 @@ def build_parser() -> argparse.ArgumentParser:
     issue = csub.add_parser("issue", help="issue a cert")
     issue.add_argument("kind", choices=["client", "node", "compactor"])
     issue.add_argument("pubkey")
+    issue.add_argument(
+        "--pop", required=True, help="subject's proof-of-possession (from `dude node spawn`)"
+    )
     issue.add_argument("--dir", default=os.environ.get("DUDE_DIR", ".dude"))
     issue.set_defaults(fn=cmd_cert_issue)
     rev = csub.add_parser("revoke", help="revoke a cert (stages rotate)")

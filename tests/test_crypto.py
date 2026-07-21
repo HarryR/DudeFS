@@ -147,6 +147,23 @@ class TestSealedBoxSbx1(unittest.TestCase):
         self.assertNotEqual(C.seal_to(pub, b"k"), C.seal_to(pub, b"k"))
 
 
+class TestProofOfPossession(unittest.TestCase):
+    # NOTES 58: the manager certifies a pubkey only after the subject proves it holds
+    # the sk. Non-interactive self-attestation bound to THAT pubkey.
+    def test_round_trip_and_forgery(self):
+        sk = bytes([9] * 32)
+        pub = C.SIGNER.public(sk)
+        pop = C.prove_possession(sk)
+        self.assertTrue(C.verify_possession(pub, pop))
+        # a pop from a DIFFERENT key does not prove possession of `pub`
+        self.assertFalse(C.verify_possession(pub, C.prove_possession(bytes([8] * 32))))
+        # ...nor can THIS pop be transplanted onto another pubkey (bound to `pub`)
+        other = C.SIGNER.public(bytes([8] * 32))
+        self.assertFalse(C.verify_possession(other, pop))
+        # tamper -> reject
+        self.assertFalse(C.verify_possession(pub, pop[:-1] + bytes([pop[-1] ^ 1])))
+
+
 class TestMultiSigList(unittest.TestCase):
     def test_combine_verify_and_tamper(self):
         rng = random.Random(3)
