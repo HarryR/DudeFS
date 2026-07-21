@@ -139,6 +139,26 @@ class TestRecoverInterlock(unittest.TestCase):
                 nd.close()
             time.sleep(0.05)
 
+    def test_recover_fence_authors_when_no_quorum_answers(self):
+        # once every interlock passes (no quorum answers + data-loss acknowledged),
+        # --fence PERFORMS the recovery — authors the checkpoint + recovery-marked
+        # roster op, no placeholder narration (NOTES 55 closure item).
+        with tempfile.TemporaryDirectory() as d:
+            _run(["init", "--dir", d])  # roster = 1 node, NO endpoint -> unreachable
+            code, out, _ = _run(
+                ["recover", "--dir", d, "--dwell", "0.2", "--i-understand-data-loss"]
+            )
+            self.assertEqual(code, 0)
+            self.assertIn("recovery fence AUTHORED", out)
+            # the control.log's last op is a ROSTER carrying the recovery pairing
+            with open(os.path.join(d, "control.log")) as f:
+                raw = bytes.fromhex(f.readlines()[-1].strip())
+            body = ctl.decode(A.Op.from_bytes(raw))
+            assert body is not None
+            self.assertEqual(body[ctl.BK_KIND], ctl.ControlKind.ROSTER)
+            self.assertIsNotNone(body[b"recovery"])  # names the recovery checkpoint
+            self.assertEqual(ManagerState.load(d).epoch, 1)  # epoch advanced
+
 
 class TestClientPassthrough(unittest.TestCase):
     def _cluster(self, d, w):

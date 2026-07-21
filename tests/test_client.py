@@ -152,6 +152,43 @@ class TestClientLadder(unittest.TestCase):
             cl.close()
 
 
+class TestReadSideSync(unittest.TestCase):
+    def test_second_client_sees_first_clients_committed_write(self):
+        # Finding 22: the daemon's fold ranges over ops it HOLDS, so without a
+        # read-side quorum sync, client B cannot see client A's committed writes AT
+        # ALL. This fails against pre-sync code; the §1.2 quorum read fixes it.
+        w = World(seed=6, n_clients=2)
+        with tempfile.TemporaryDirectory() as tmp:
+            cl = _Cluster(tmp, w)
+            a, b = cl.client(w, 0), cl.client(w, 1)
+            op = a.submit(
+                (b"shared/x", VERSION_ABSENT, 0),
+                [[A.Guard.ABSENT, b"shared/x"]],
+                [[A.Mutation.SET, b"shared/x", b"from-A"]],
+            )
+            self.assertTrue(_until(lambda: a.status(op).phase == "committed"))
+
+            # B pulls the quorum read -> sees A's committed write at `local`
+            self.assertTrue(
+                _until(lambda: (b.sync(), b.get(b"shared/x").get("value"))[1] == b"from-A")
+            )
+            # and `level=final` auto-syncs to the quorum-attested FROZEN truth
+            self.assertTrue(
+                _until(
+                    lambda: (
+                        b.get(b"shared/x", level="final")["value"] == b"from-A"
+                        and b.get(b"shared/x", level="final")["tier"] == "final"
+                    )
+                )
+            )
+            insp = b.inspect(b"shared/x")
+            self.assertTrue(insp["provisional"]["present"])
+            self.assertEqual(insp["provisional"]["value"], b"from-A")
+            a.close()
+            b.close()
+            cl.close()
+
+
 class TestWorkerAPIWire(unittest.TestCase):
     def test_json_rpc_txn_status_get_over_the_socket(self):
         w = World(seed=5, n_clients=1)

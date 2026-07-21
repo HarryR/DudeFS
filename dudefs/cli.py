@@ -431,8 +431,21 @@ def cmd_recover(args: argparse.Namespace) -> int:
         )
         return ERR
 
-    print("\ndata-loss acknowledged; a real recover --fence would now mint the recovery")
-    print("checkpoint + fresh roster. (Fence authoring is the manager control path.)")
+    # data-loss acknowledged AND no quorum answers -> AUTHOR the fence for real (no
+    # placeholder once every interlock has passed). The pair is a fiat recovery
+    # checkpoint + a recovery-marked roster op naming it — exactly what a node's
+    # on_recovery_fence recognizes to park the old epoch and activate the new one
+    # (NOTES 36a / RESILIENCE §2.2). The salvage frontier is the fiat cut's horizon.
+    survivors = [st.roster[i] for i in sorted(answered)] or st.roster
+    ckpt = st.author_control(ctl.checkpoint_body({}, b"", [], {}, b"", st.keyepoch, salvage))
+    rop = st.author_control(ctl.roster_body(st.epoch, survivors, {}, recovery=ckpt.op_hash))
+    st.epoch += 1
+    st.roster = survivors
+    st.save()
+    print("\ndata-loss acknowledged — recovery fence AUTHORED:")
+    print(f"  recovery checkpoint: {ckpt.op_hash.hex()}  (horizon {salvage.as_tuple()})")
+    print(f"  recovery roster op:  {rop.op_hash.hex()}  -> epoch {st.epoch}")
+    print("  distribute control.log to the survivors; they park the old epoch on sight.")
     return OK
 
 

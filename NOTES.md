@@ -1775,6 +1775,34 @@ and A4 as formally stated. Resolutions decided with the design owner; DESIGN
       answers. (`status` stays the machine-facing per-op verb;
       `wheres` is per-key and for people.)
 
+55. **WP3 REVIEW (2026-07-21, `49245e7..34ed301`): CLEARED with one
+    closure item; finding-22 wave is GO as its own step before WP4.**
+    - Verified: the recover interlock chain is real, correctly ordered
+      (dwell-probe → HARD-REFUSE at ≥q with exit 3 → presumed-dead →
+      blast radius → `--i-understand-data-loss` → never-urgent nag) and
+      tested AS BEHAVIOR against a live 3-node cluster — the RESILIENCE
+      §2.3 requirement met as written. `revoke` stages `rotate` with
+      the loud `--no-rotate` warning; `rotate` prints the cert
+      inventory first (NOTES 36c) and seals a fresh master to every
+      member; `promote` refuses even rosters client-side; `wheres` is
+      the INSPECT renderer as ruled. compact/evidence/verify are
+      DEFERRED-not-stubbed (docs hold them) — consistent with the
+      no-stubs rule. 205 green.
+    - **Closure item (fold into the F22 wave): `recover`'s tail
+      narrates fence-minting instead of performing it** ("a real
+      recover --fence would now mint…") — a printed placeholder, which
+      the no-stubs spirit forbids once every interlock has passed. The
+      machinery exists (the recovery-pair builders WP4.7 exercises):
+      wire `--fence` to author the recovery checkpoint + recovery-
+      marked roster op and submit them, or remove the narration. Wire
+      it — the WP4 demo's recovery drill wants it anyway.
+    - **GO: the finding-22 wave next, as its own focused step** —
+      client read-side sync (§1.2 quorum read on-demand for
+      `level=final`, periodic background refresh for local/INSPECT) +
+      the two nits (may_flip-on-absent, blind-commit retransmit) + the
+      recover-fence wiring above. Then WP4: the encrypted demo, which
+      gates on it (two client nodes must see each other's writes).
+
 # Not yet built (by design, M2+)
 
 QCs are *constructed and verified* (M0) but no acceptor, quorum client, floor,

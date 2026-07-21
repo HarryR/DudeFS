@@ -25,7 +25,7 @@ from . import artifacts as A
 from . import fold, wire
 from .artifacts import BLIND, HLC, QC, Op, Receipt, Txn, compute_slot_tag
 from .handlers import data as data_handler
-from .node import PutQCReq, Request, Response, SubmitReq
+from .node import FetchOpReq, FrontierReq, GetQCReq, PutQCReq, Request, Response, SubmitReq
 from .quorum import (
     Commit,
     Committed,
@@ -44,6 +44,8 @@ from .store import ChainStore
 # A driver deadline: the sans-io machine terminates itself on max_rounds/max_polls,
 # but a hopeless drive (no quorum reachable at all) needs a wall-clock backstop.
 DRIVE_DEADLINE_MS = 30_000
+BLIND_DEADLINE_S = 5.0  # blind SUBMIT retransmit budget (idempotent — PROTOCOL §0)
+REFRESH_MS = 500  # background read-side sync cadence (local/INSPECT freshness, lane 1)
 
 
 type Slot = tuple[bytes, bytes, int]  # (path, version, attempt)
@@ -173,6 +175,10 @@ class ClientDaemon:
         for op in control_ops or []:  # the authorization chain (certs/genesis)
             self.store.put_op_raw(op)
         self._seq, self._prev = self._chain_head()
+        # read-side freshness (finding 22): a background quorum-read pull keeps
+        # `local`/`INSPECT` current with OTHER clients' committed writes; `final`
+        # reads sync on demand (below). Correctness never depends on the cadence.
+        threading.Thread(target=self._refresh_loop, daemon=True).start()
 
     # ---- chain head + clock ------------------------------------------------ #
     def _chain_head(self) -> tuple[int, bytes]:
@@ -285,7 +291,9 @@ class ClientDaemon:
     def _commit_blind(self, op: Op) -> QC | None:
         """Slotless (blind) writes race no slot: SUBMIT to the roster, assemble a QC
         from a quorum of BLIND receipts. No PREPARE/ACCEPT — there is nothing to
-        contend."""
+        contend. RETRANSMITS to still-unanswered nodes until a quorum answers or the
+        budget expires (SUBMIT is idempotent, PROTOCOL §0 — the slotted path retries
+        via its machine, so the blind path must too, NOTES 54 nit)."""
         receipts: dict[int, Receipt] = {}
         lock = threading.Lock()
 
@@ -295,17 +303,19 @@ class ClientDaemon:
                 with lock:
                     receipts[node] = r
 
-        threads = [
-            threading.Thread(target=one, args=(n,), daemon=True) for n in self.cfg.fanout_order
-        ]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join(timeout=5.0)
-        if len(receipts) < self.cfg.quorum:
-            return None
-        chosen = list(receipts.values())[: self.cfg.quorum]
-        return QC.assemble(chosen, self.cfg.n, self.cfg.roster_index)
+        deadline = time.monotonic() + BLIND_DEADLINE_S
+        while time.monotonic() < deadline and not self._closing.is_set():
+            pending = [n for n in self.cfg.fanout_order if n not in receipts]
+            threads = [threading.Thread(target=one, args=(n,), daemon=True) for n in pending]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=2.0)
+            if len(receipts) >= self.cfg.quorum:
+                chosen = list(receipts.values())[: self.cfg.quorum]
+                return QC.assemble(chosen, self.cfg.n, self.cfg.roster_index)
+            time.sleep(0.05)  # brief backoff before retransmitting to non-responders
+        return None
 
     def _finalize(self, target: HLC) -> None:
         outcome = _drive(Finalize(self.cfg, target), self._rpc, stop=self._closing)
@@ -313,6 +323,90 @@ class ClientDaemon:
             with self._lock:
                 if outcome.frontier > self._final_frontier:
                     self._final_frontier = outcome.frontier
+
+    # ---- read-side sync — the §1.2 quorum read (finding 22) ---------------- #
+    def sync(self) -> None:
+        """Read a quorum of signed FRONTIERs, PULL every committed op they name that
+        we lack (walking each author's chain, fetching op + QC), and advance the
+        finality frontier to the one a quorum attests. This is what lets client B
+        see client A's committed writes — the daemon's fold ranges over ops it
+        HOLDS, so it must pull the rest (PROTOCOL §1.2)."""
+        bundles = self._quorum_frontiers()
+        if len(bundles) < self.cfg.quorum:
+            return  # couldn't read a quorum — leave the view as-is (never guess)
+        heads: dict[bytes, tuple[int, bytes]] = {}
+        for fb in bundles:
+            for author, (seq, hh) in fb.heads.items():
+                if author not in heads or seq > heads[author][0]:
+                    heads[author] = (seq, hh)
+        for _, head_hash in heads.values():
+            self._pull_chain(head_hash)
+        # the highest hlc a quorum attests final = the q-th highest floor (DESIGN §9)
+        floors = sorted((fb.floor for fb in bundles), key=lambda h: h.as_tuple(), reverse=True)
+        qfloor = floors[self.cfg.quorum - 1]
+        with self._lock:
+            if qfloor > self._final_frontier:
+                self._final_frontier = qfloor
+
+    def _quorum_frontiers(self) -> list:
+        bundles: list = []
+        lock = threading.Lock()
+
+        def one(node: int) -> None:
+            r = self._rpc(node, FrontierReq())
+            if isinstance(r, A.FrontierBundle):
+                with lock:
+                    bundles.append(r)
+
+        threads = [
+            threading.Thread(target=one, args=(n,), daemon=True) for n in self.cfg.fanout_order
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=2.0)
+        return bundles
+
+    def _pull_chain(self, head_hash: bytes) -> None:
+        """Walk an author's chain back from `head_hash`, fetching each op + its QC we
+        lack, until we reach an op we already hold (below is present) or GENESIS."""
+        h = head_hash
+        while h and h != A.GENESIS_PREV:
+            with self._lock:
+                op = self.store.get_op(h)
+            have = op is not None
+            if op is None:
+                fetched = self._one_of(FetchOpReq(h))
+                if not isinstance(fetched, Op):
+                    return  # gap we can't fill now; a later round retries
+                op = fetched
+                with self._lock:
+                    self.store.put_op_raw(op)
+            with self._lock:
+                have_qc = self.store.get_qc(h) is not None
+            if not have_qc:
+                qc = self._one_of(GetQCReq(h))
+                if isinstance(qc, QC):
+                    with self._lock:
+                        self.store.put_qc(qc)
+            if have:
+                return  # we already held this op — the rest of the chain is present
+            h = op.prev
+
+    def _one_of(self, req: Request) -> Response | None:
+        """Try each reachable node in fanout order; return the first real response."""
+        for node in self.cfg.fanout_order:
+            r = self._rpc(node, req)
+            if r is not None:
+                return r
+        return None
+
+    def _refresh_loop(self) -> None:
+        while not self._closing.wait(REFRESH_MS / 1000.0):
+            try:
+                self.sync()
+            except OSError:
+                pass  # a transient unreachability; the next tick retries
 
     # ---- the folded read model (STATUS/GET/LIST/INSPECT derive from here) --- #
     def _committed_ops(self, *, final_only: bool = False) -> list[Op]:
@@ -370,7 +464,10 @@ class ClientDaemon:
 
     def get(self, path: bytes, *, level: str = "local") -> dict:
         """The value at `path` + its (version, attempt) fencing token + tier.
-        `level=final` folds only the frozen (≤ frontier) set."""
+        `level=final` folds only the frozen (≤ frontier) set — and syncs a quorum
+        read FIRST, so the frozen view is linearizable, not frozen-but-partial."""
+        if level == "final":
+            self.sync()  # on-demand §1.2 read (outside the lock — it takes it itself)
         with self._lock:
             final_only = level == "final"
             res = self._fold(final_only=final_only)
@@ -402,6 +499,8 @@ class ClientDaemon:
     def list_keys(
         self, prefix: bytes, *, delimiter: bytes | None = None, level: str = "local"
     ) -> list[dict]:
+        if level == "final":
+            self.sync()  # linearizable prefix scan (ZK: enumeration is fold-local)
         with self._lock:
             res = self._fold(final_only=(level == "final"))
             seen: dict[bytes, dict] = {}
@@ -449,7 +548,11 @@ class ClientDaemon:
                     "version": version,
                     "attempt": attempt,
                 },
-                "may_flip": present and not self._version_final(version),
+                # may_flip is TRUE whenever the view isn't frozen — including an
+                # ABSENT key with a not-yet-final op that could make it present (an
+                # uncommitted-displaceable delete flips absence, NOTES 54 nit), not
+                # only a present-but-unfrozen value.
+                "may_flip": bool(pending) or (present and not self._version_final(version)),
                 "pending": pending,
             }
 
