@@ -15,16 +15,10 @@ from dudefs import quorum as Q
 from dudefs.sim.harness import Sim
 from dudefs.store import AppendStatus
 from dudefs.transports.memory import CLIENT, Faults, Link, NetworkLinks
-from tests._builders import World
+from tests._builders import World, create
 from tests._cluster import creation_op
 
 CHAOS = Faults(loss=0.25, dup=0.2, delay_lo=1, delay_hi=6)
-
-
-def _create(w, ci, key, val):
-    return w.cas(
-        ci, key, A.VERSION_ABSENT, 0, [[A.Guard.ABSENT, key]], [[A.Mutation.SET, key, val]]
-    )
 
 
 def _applied_winner(sim: Sim, w: World, slot: bytes):
@@ -131,8 +125,8 @@ class TestPartitions(unittest.TestCase):
         net.cut(MIN, 2)  # minority client reaches only node 0
         net.cut(MAJ, 0)  # majority client reaches only {1,2}
 
-        maj = _create(w, 0, b"maj", b"1")
-        mino = _create(w, 1, b"min", b"1")
+        maj = create(w, 0, b"maj", b"1")
+        mino = create(w, 1, b"min", b"1")
         r_maj = sim.commit(maj, src_id=MAJ)
         r_min = sim.commit(mino, src_id=MIN, round_timeout_ms=50, max_rounds=4)
         sim.run()
@@ -153,7 +147,7 @@ class TestPartitions(unittest.TestCase):
         sim = Sim(seed=6, n=3, net=net)
         w = World(seed=6, n_clients=1)
         # node 0 alone holds `solo`; cut 0→{1,2} one-way (1→0, 2→0 stay up)
-        solo = _create(w, 0, b"solo", b"1")
+        solo = create(w, 0, b"solo", b"1")
         sim._raw[0].acc.store.append(solo)
         net.cut(0, 1, both=False)
         net.cut(0, 2, both=False)
@@ -189,7 +183,7 @@ class TestPartitions(unittest.TestCase):
         net.cut(CLIENT, 1)
         net.cut(CLIENT, 2)  # start cut
         sim.sched.after(60, flap)
-        r = sim.commit(_create(w, 0, b"k", b"1"))
+        r = sim.commit(create(w, 0, b"k", b"1"))
         sim.run()
         self.assertIsInstance(r.outcome, Q.Committed)  # retransmit rides a healed window
 
@@ -218,7 +212,7 @@ class TestTimeSkew(unittest.TestCase):
         # normal op's hlc, so its PAST gate rejects an accept the in-sync node takes.
         sim = Sim(seed=4, n=3, delta=10, skew={2: 300})
         w = World(seed=4, n_clients=1)
-        op = _create(w, 0, b"k", b"1")
+        op = create(w, 0, b"k", b"1")
         assert op.slot_tag is not None
         b = A.Ballot(1, b"x")
         self.assertIsInstance(sim.nodes[0].accept(op.slot_tag, b, op), A.Receipt)  # in sync
@@ -228,7 +222,7 @@ class TestTimeSkew(unittest.TestCase):
         # nodes skewed ±50ms with δ=200 (within tolerance) still reach agreement.
         sim = Sim(seed=7, n=3, delta=200, skew={0: 50, 1: -50})
         w = World(seed=7, n_clients=1)
-        r = sim.commit(_create(w, 0, b"k", b"1"))
+        r = sim.commit(create(w, 0, b"k", b"1"))
         sim.run()
         self.assertIsInstance(r.outcome, Q.Committed)
 

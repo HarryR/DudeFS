@@ -7,12 +7,49 @@
 from __future__ import annotations
 
 import random
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from dudefs import artifacts as A
 from dudefs import crypto as C
 from dudefs import fold
 from dudefs.handlers import control as ctl
+
+# --------------------------------------------------------------------------- #
+# Shared test helpers (NOTES 57 item 4) — consolidated so the refactor touches  #
+# one place instead of a copy per file.                                        #
+# --------------------------------------------------------------------------- #
+
+
+def now_ms() -> int:
+    """Wall-clock ms — the real clock socket/daemon tests inject as `now_ms`."""
+    return int(time.time() * 1000)
+
+
+def poll_until(pred: Callable[[], object], timeout: float = 6.0, step: float = 0.02):
+    """Poll `pred()` until truthy (returns it) or timeout (returns the last value) —
+    the socket tests' async settle loop."""
+    deadline = time.monotonic() + timeout
+    val = pred()
+    while not val and time.monotonic() < deadline:
+        time.sleep(step)
+        val = pred()
+    return val
+
+
+def cut_of(w: World) -> A.Heads:
+    """The frontier of everything authored so far (per-author (seq, prev))."""
+    cut = {c.pub: (c.seq - 1, c.prev) for c in w.clients if c.seq > 0}
+    cut[w.mgr_pub] = (w._mseq - 1, w._mprev)
+    return cut
+
+
+def create(w: World, ci: int, key: bytes, val: bytes) -> A.Op:
+    """A creation CAS (absent -> val) on `key` by client `ci`."""
+    return w.cas(
+        ci, key, A.VERSION_ABSENT, 0, [[A.Guard.ABSENT, key]], [[A.Mutation.SET, key, val]]
+    )
 
 
 def _seed_keypair(rng: random.Random) -> tuple[bytes, bytes]:

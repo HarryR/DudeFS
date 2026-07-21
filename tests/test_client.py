@@ -17,25 +17,11 @@ from dudefs.artifacts import VERSION_ABSENT
 from dudefs.client import ClientDaemon
 from dudefs.daemon import NodeDaemon
 from dudefs.workerapi import WorkerServer
-from tests._builders import World
+from tests._builders import World, now_ms, poll_until
 
 DELTA = 150  # ms — small enough that finality sweeps ~DELTA after a write, big
 # enough that same-machine client/node clock jitter never trips the skew gate.
 MASTER = bytes(range(32))  # the epoch-0 group master (finding 21 derives from it)
-
-
-def _now() -> int:
-    return int(time.time() * 1000)
-
-
-def _until(pred, timeout=6.0, step=0.01):
-    """Poll `pred()` until truthy (returns it) or timeout (returns the last value)."""
-    deadline = time.monotonic() + timeout
-    val = pred()
-    while not val and time.monotonic() < deadline:
-        time.sleep(step)
-        val = pred()
-    return val
 
 
 class _Cluster:
@@ -53,7 +39,7 @@ class _Cluster:
                 self.roster[i],
                 roster=self.roster,
                 manager_pub=w.mgr_pub,
-                clock=_now,
+                clock=now_ms,
                 delta_ms=DELTA,
             )
             ev = threading.Event()
@@ -91,11 +77,11 @@ class TestClientLadder(unittest.TestCase):
                 [[A.Mutation.SET, b"k", b"v1"]],
             )
             # in-flight -> committed (~2 RTT), provisional applied, then GET sees it
-            self.assertTrue(_until(lambda: c.status(op).phase == "committed"))
+            self.assertTrue(poll_until(lambda: c.status(op).phase == "committed"))
             self.assertEqual(c.status(op).provisional, "applied")
             self.assertEqual(c.get(b"k")["value"], b"v1")
             # the daemon finishes the job: pursues §9 finality -> frozen verdict
-            self.assertTrue(_until(lambda: c.status(op).final == "applied"))
+            self.assertTrue(poll_until(lambda: c.status(op).final == "applied"))
             self.assertFalse(c.status(op).may_flip)
             self.assertEqual(c.get(b"k", level="final")["tier"], "final")
             c.close()
@@ -111,8 +97,8 @@ class TestClientLadder(unittest.TestCase):
             oa = a.submit(slot, guard, [[A.Mutation.SET, b"k", b"A"]])
             ob = b.submit(slot, guard, [[A.Mutation.SET, b"k", b"B"]])
             # both resolve; exactly one is committed, the other is `lost` (definitive)
-            self.assertTrue(_until(lambda: a.status(oa).phase in ("committed", "lost")))
-            self.assertTrue(_until(lambda: b.status(ob).phase in ("committed", "lost")))
+            self.assertTrue(poll_until(lambda: a.status(oa).phase in ("committed", "lost")))
+            self.assertTrue(poll_until(lambda: b.status(ob).phase in ("committed", "lost")))
             phases = {a.status(oa).phase, b.status(ob).phase}
             self.assertEqual(phases, {"committed", "lost"})
             a.close()
@@ -125,7 +111,7 @@ class TestClientLadder(unittest.TestCase):
             cl = _Cluster(tmp, w)
             c = cl.client(w)
             op = c.submit(None, [], [[A.Mutation.SET, b"log/1", b"hello"]])  # slotless PUT
-            self.assertTrue(_until(lambda: c.status(op).phase == "committed"))
+            self.assertTrue(poll_until(lambda: c.status(op).phase == "committed"))
             self.assertEqual(c.get(b"log/1")["value"], b"hello")
             c.close()
             cl.close()
@@ -141,7 +127,7 @@ class TestClientLadder(unittest.TestCase):
                     [[A.Guard.ABSENT, key]],
                     [[A.Mutation.SET, key, val]],
                 )
-                self.assertTrue(_until(lambda o=op: c.status(o).phase == "committed"))
+                self.assertTrue(poll_until(lambda o=op: c.status(o).phase == "committed"))
             rows = c.list_keys(b"q/items/", delimiter=b"/")
             keys = {r["key"] for r in rows if not r["prefix"]}
             self.assertEqual(keys, {b"q/items/1", b"q/items/2"})
@@ -166,15 +152,15 @@ class TestReadSideSync(unittest.TestCase):
                 [[A.Guard.ABSENT, b"shared/x"]],
                 [[A.Mutation.SET, b"shared/x", b"from-A"]],
             )
-            self.assertTrue(_until(lambda: a.status(op).phase == "committed"))
+            self.assertTrue(poll_until(lambda: a.status(op).phase == "committed"))
 
             # B pulls the quorum read -> sees A's committed write at `local`
             self.assertTrue(
-                _until(lambda: (b.sync(), b.get(b"shared/x").get("value"))[1] == b"from-A")
+                poll_until(lambda: (b.sync(), b.get(b"shared/x").get("value"))[1] == b"from-A")
             )
             # and `level=final` auto-syncs to the quorum-attested FROZEN truth
             self.assertTrue(
-                _until(
+                poll_until(
                     lambda: (
                         b.get(b"shared/x", level="final")["value"] == b"from-A"
                         and b.get(b"shared/x", level="final")["tier"] == "final"
@@ -201,19 +187,19 @@ class TestCasUpdate(unittest.TestCase):
             create = c.submit(
                 (b"k", VERSION_ABSENT, 0), [[A.Guard.ABSENT, b"k"]], [[A.Mutation.SET, b"k", b"v1"]]
             )
-            self.assertTrue(_until(lambda: c.status(create).phase == "committed"))
+            self.assertTrue(poll_until(lambda: c.status(create).phase == "committed"))
             v1 = c.get(b"k")["version"]  # the created version (op_hash)
 
             upd = c.submit(
                 (b"k", v1, 0), [[A.Guard.VERSION_EQ, b"k", v1]], [[A.Mutation.SET, b"k", b"v2"]]
             )
-            self.assertTrue(_until(lambda: c.status(upd).phase == "committed"))
+            self.assertTrue(poll_until(lambda: c.status(upd).phase == "committed"))
             self.assertEqual(c.get(b"k")["value"], b"v2")
 
             stale = c.submit(
                 (b"k", v1, 0), [[A.Guard.VERSION_EQ, b"k", v1]], [[A.Mutation.SET, b"k", b"v3"]]
             )
-            self.assertTrue(_until(lambda: c.status(stale).phase == "lost"))
+            self.assertTrue(poll_until(lambda: c.status(stale).phase == "lost"))
             self.assertEqual(c.get(b"k")["value"], b"v2")  # unchanged
             c.close()
             cl.close()
@@ -314,7 +300,7 @@ class TestWorkerAPIWire(unittest.TestCase):
             def committed():
                 return rpc("STATUS", {"op": op_hex}, rid=2)["result"]["phase"] == "committed"
 
-            self.assertTrue(_until(committed))
+            self.assertTrue(poll_until(committed))
             got = rpc("GET", {"path": "k"}, rid=3)["result"]
             self.assertEqual(got["value"], "v1")
             self.assertEqual(got["tier"], "local")

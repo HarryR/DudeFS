@@ -18,7 +18,7 @@ from dudefs.sim.harness import Sim
 from dudefs.sim.personas import EquivocatingAcceptor
 from dudefs.store import AppendStatus, ChainStore, EvidenceKind
 from dudefs.transports.memory import Link, NetworkLinks
-from tests._builders import World
+from tests._builders import World, create
 from tests._cluster import creation_op
 
 NOW = 100
@@ -42,12 +42,6 @@ def _roster(msk, mpub, roster, seq, prev, epoch=0, hlc=100):
         keyepoch=0,
         payload=ctl.roster_body(epoch, roster, {}),
         slot_tag=A.roster_slot_tag(epoch),
-    )
-
-
-def _create(w, ci, key, val):
-    return w.cas(
-        ci, key, A.VERSION_ABSENT, 0, [[A.Guard.ABSENT, key]], [[A.Mutation.SET, key, val]]
     )
 
 
@@ -98,7 +92,7 @@ class TestMistakenRecovery(unittest.TestCase):
 
         # the live majority keeps committing at e=0 — the data the manager wrongly
         # presumes lost (this is what makes the recovery "mistaken").
-        op = _create(w, 0, b"k", b"live")
+        op = create(w, 0, b"k", b"live")
         r = sim.commit(op, src_id=MAJ)
         sim.run()
         self.assertIsInstance(r.outcome, Q.Committed)
@@ -119,7 +113,7 @@ class TestMistakenRecovery(unittest.TestCase):
         self.assertEqual([sim._raw[i].acc.epoch for i in range(3)], [1, 1, 1])  # parked
 
         # old-epoch receipting stops: a fresh accept on a majority node stamps e+1.
-        op2 = _create(w, 0, b"k2", b"x")
+        op2 = create(w, 0, b"k2", b"x")
         assert op2.slot_tag is not None
         rc = sim._raw[1].acc.on_accept(op2.slot_tag, A.Ballot(1, b"z"), op2, NOW)
         assert isinstance(rc, A.Receipt)
@@ -142,7 +136,7 @@ class TestMistakenRecovery(unittest.TestCase):
         MAJ = -2
         sim.partition([0], [1, 2])
         net.cut(MAJ, 0)
-        op = _create(w, 0, b"k", b"live")
+        op = create(w, 0, b"k", b"live")
         r = sim.commit(op, src_id=MAJ)
         sim.run()
         assert isinstance(r.outcome, Q.Committed)

@@ -10,15 +10,9 @@ from dudefs.crypto import SIGNER
 from dudefs.sim.harness import Sim
 from dudefs.store import ChainStore
 from dudefs.transports.memory import Link, NetworkLinks
-from tests._builders import World
+from tests._builders import World, cut_of
 
 NOW = 100
-
-
-def _cut(w):
-    cut = {c.pub: (c.seq - 1, c.prev) for c in w.clients if c.seq > 0}
-    cut[w.mgr_pub] = (w._mseq - 1, w._mprev)
-    return cut
 
 
 def _overwrite(w):
@@ -44,7 +38,7 @@ class TestMixedLazinessGC(unittest.TestCase):
         sim = Sim(seed=20, n=3, net=net)
         w = World(seed=20, n_clients=1)
         below, first, _winner = _overwrite(w)
-        cut = _cut(w)
+        cut = cut_of(w)
         cr = compactor.compact_genesis(below, w.keyring, w.genesis, cut)
         committed = A.retained_commitment(cr.retained)
         for nd in sim._raw:  # every node holds the full below-cut history
@@ -76,7 +70,7 @@ class TestStaleFrontierRoster(unittest.TestCase):
     def test_stale_frontier_below_cut_does_not_wedge(self):
         w = World(seed=21, n_clients=1)
         below, first, _winner = _overwrite(w)
-        cut = _cut(w)
+        cut = cut_of(w)
         cr = compactor.compact_genesis(below, w.keyring, w.genesis, cut)
         committed = A.retained_commitment(cr.retained)
 

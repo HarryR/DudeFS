@@ -18,7 +18,7 @@ from dudefs.client import ClientDaemon
 from dudefs.daemon import NodeDaemon
 from dudefs.handlers import control as ctl
 from dudefs.workerapi import WorkerServer
-from tests._builders import World
+from tests._builders import World, now_ms, poll_until
 
 MASTER = bytes(range(32))
 DELTA = 150
@@ -30,10 +30,6 @@ def _run(argv):
     with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
         code = main(argv)
     return code, out.getvalue(), err.getvalue()
-
-
-def _now():
-    return int(time.time() * 1000)
 
 
 class TestManagerCommands(unittest.TestCase):
@@ -118,7 +114,7 @@ class TestRecoverInterlock(unittest.TestCase):
                     roster[i],
                     roster=roster,
                     manager_pub=w.mgr_pub,
-                    clock=_now,
+                    clock=now_ms,
                     delta_ms=DELTA,
                 )
                 ev = threading.Event()
@@ -168,7 +164,12 @@ class TestClientPassthrough(unittest.TestCase):
         nodes = []
         for i in range(3):
             nd = NodeDaemon(
-                sks[i], roster[i], roster=roster, manager_pub=w.mgr_pub, clock=_now, delta_ms=DELTA
+                sks[i],
+                roster[i],
+                roster=roster,
+                manager_pub=w.mgr_pub,
+                clock=now_ms,
+                delta_ms=DELTA,
             )
             ev = threading.Event()
             threading.Thread(target=nd.serve_forever, args=(paths[i], ev), daemon=True).start()
@@ -204,7 +205,7 @@ class TestClientPassthrough(unittest.TestCase):
                 _, o, _ = _run(["get", "my/car", "--sock", wsock])
                 return "parked" in o
 
-            self.assertTrue(_until(committed))
+            self.assertTrue(poll_until(committed))
 
             # `dude wheres my car` joins with '/' and renders INSPECT for a human
             code, out, _ = _run(["wheres", "my", "car", "--sock", wsock])
@@ -218,15 +219,6 @@ class TestClientPassthrough(unittest.TestCase):
             for nd in nodes:
                 nd.close()
             time.sleep(0.05)
-
-
-def _until(pred, timeout=6.0, step=0.02):
-    deadline = time.monotonic() + timeout
-    val = pred()
-    while not val and time.monotonic() < deadline:
-        time.sleep(step)
-        val = pred()
-    return val
 
 
 if __name__ == "__main__":

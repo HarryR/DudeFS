@@ -21,23 +21,10 @@ from dudefs.handlers import control as ctl
 from dudefs.manager import Manager
 from dudefs.node import LocalNode, dispatch
 from dudefs.store import ChainStore
-from tests._builders import World
+from tests._builders import World, now_ms, poll_until
 
 DELTA = 150
 MASTER = bytes(range(32))
-
-
-def _now():
-    return int(time.time() * 1000)
-
-
-def _until(pred, timeout=8.0, step=0.02):
-    deadline = time.monotonic() + timeout
-    val = pred()
-    while not val and time.monotonic() < deadline:
-        time.sleep(step)
-        val = pred()
-    return val
 
 
 def _k(s: str) -> bytes:
@@ -70,7 +57,7 @@ class Demo:
             roster=self.roster,
             manager_pub=self.w.mgr_pub,
             peers=self._peers(i),
-            clock=_now,
+            clock=now_ms,
             delta_ms=DELTA,
         )
         ev = threading.Event()
@@ -159,14 +146,16 @@ class TestDemoRunbook(unittest.TestCase):
             )
 
             for who, op in mine:
-                self.assertTrue(_until(lambda w=who, o=op: w.status(o).phase == "committed"))
+                self.assertTrue(poll_until(lambda w=who, o=op: w.status(o).phase == "committed"))
             self.assertTrue(
-                _until(lambda: {a.status(la).phase, b.status(lb).phase} == {"committed", "lost"})
+                poll_until(
+                    lambda: {a.status(la).phase, b.status(lb).phase} == {"committed", "lost"}
+                )
             )
 
             # cross-client convergence: after sync each sees the other's writes + agrees
             self.assertTrue(
-                _until(lambda: (a.sync(), b.sync(), a.get(_k("b/0"))["value"])[2] == b"B")
+                poll_until(lambda: (a.sync(), b.sync(), a.get(_k("b/0"))["value"])[2] == b"B")
             )
             for i in range(K):
                 self.assertEqual(a.get(_k(f"b/{i}"))["value"], b"B")  # A sees B's writes
@@ -184,7 +173,7 @@ class TestDemoRunbook(unittest.TestCase):
                 [[A.Guard.ABSENT, b"jobs/1"]],
                 [[A.Mutation.SET, b"jobs/1", b"v"]],
             )
-            self.assertTrue(_until(lambda: a.status(pre).phase == "committed"))
+            self.assertTrue(poll_until(lambda: a.status(pre).phase == "committed"))
 
             demo.kill_node(2)  # chaos, mid-traffic
             # commits STILL land on the surviving quorum (2 of 3)
@@ -193,14 +182,14 @@ class TestDemoRunbook(unittest.TestCase):
                 [[A.Guard.ABSENT, b"jobs/2"]],
                 [[A.Mutation.SET, b"jobs/2", b"v"]],
             )
-            self.assertTrue(_until(lambda: a.status(during).phase == "committed"))
+            self.assertTrue(poll_until(lambda: a.status(during).phase == "committed"))
 
             # the restarted node re-joins via gossip and re-acquires the missed commit
             demo.restart_node(2)
             demo.gossip_all()
             n2 = demo.nodes[2]
             assert n2 is not None
-            self.assertTrue(_until(lambda: n2.store.get_op(during) is not None, timeout=3))
+            self.assertTrue(poll_until(lambda: n2.store.get_op(during) is not None, timeout=3))
             self.assertIsNotNone(n2.store.get_qc(during))  # + the commit proof
             demo.close()
 
@@ -248,7 +237,7 @@ class TestDemoRunbook(unittest.TestCase):
                 [[A.Guard.ABSENT, b"kept"]],
                 [[A.Mutation.SET, b"kept", b"v"]],
             )
-            self.assertTrue(_until(lambda: a.status(op).phase == "committed"))
+            self.assertTrue(poll_until(lambda: a.status(op).phase == "committed"))
             for c in demo.clients:
                 c.close()
             demo.clients = []

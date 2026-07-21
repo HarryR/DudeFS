@@ -14,7 +14,7 @@ from dudefs import node as N
 from dudefs import quorum as Q
 from dudefs.acceptor import Acceptor
 from dudefs.store import ChainStore
-from tests._builders import World
+from tests._builders import World, create
 
 NOW = 100
 BIG_DELTA = 10_000  # sidestep the skew gate in these unit tests
@@ -94,18 +94,11 @@ def _preaccept(nodes, op, ballot):
         assert isinstance(r, A.Receipt)
 
 
-def _create(w: World, ci: int, val: bytes) -> A.Op:
-    """A creation CAS on key `k` (absent -> val) authored by client `ci`."""
-    return w.cas(
-        ci, b"k", A.VERSION_ABSENT, 0, [[A.Guard.ABSENT, b"k"]], [[A.Mutation.SET, b"k", val]]
-    )
-
-
 class TestTwoPhase(unittest.TestCase):
     def test_happy_path_prepare_accept_hedge_not_blast(self):
         nodes, roster = _cluster(3)
         w = World(seed=1, n_clients=1)
-        op = _create(w, 0, b"v")
+        op = create(w, 0, b"k", b"v")
         cfg = _cfg(roster, op.author)
         drv = _Driver(nodes)
         outcome = drv.run(Q.Commit(cfg, op))
@@ -126,8 +119,8 @@ class TestContention(unittest.TestCase):
     def test_conflict_recovers_to_the_decided_rival(self):
         nodes, roster = _cluster(3)
         w = World(seed=2, n_clients=2)
-        rival = _create(w, 0, b"A")
-        mine = _create(w, 1, b"B")
+        rival = create(w, 0, b"k", b"A")
+        mine = create(w, 1, b"k", b"B")
         self.assertEqual(rival.slot_tag, mine.slot_tag)  # same lineage -> same tag
         _preaccept(nodes, rival, A.Ballot(1, b"\x01"))  # rival decided at (1,·) everywhere
 
@@ -147,11 +140,11 @@ class TestSplitVote(unittest.TestCase):
         # node 4 uncommitted. A recoverer decides the slot for exactly one op.
         nodes, roster = _cluster(5)
         w = World(seed=3, n_clients=3)
-        opA = _create(w, 0, b"A")
-        opB = _create(w, 1, b"B")
+        opA = create(w, 0, b"k", b"A")
+        opB = create(w, 1, b"k", b"B")
         _preaccept(nodes[0:2], opA, A.Ballot(1, b"\x01"))
         _preaccept(nodes[2:4], opB, A.Ballot(1, b"\x02"))
-        mine = _create(w, 2, b"C")
+        mine = create(w, 2, b"k", b"C")
 
         outcome = _Driver(nodes).run(Q.Commit(_cfg(roster, mine.author), mine))
         # a winner emerges (recovery converges — no deadlock); its QC is valid and
@@ -225,8 +218,8 @@ class TestFetchWindow(unittest.TestCase):
         # commit still decides -> the rival wins the slot (LostSlot).
         nodes, roster = _cluster(3)
         w = World(seed=2, n_clients=2)
-        rival = _create(w, 0, b"A")
-        mine = _create(w, 1, b"B")
+        rival = create(w, 0, b"k", b"A")
+        mine = create(w, 1, b"k", b"B")
         _preaccept(nodes, rival, A.Ballot(1, b"\x01"))
 
         m = Q.Commit(_cfg(roster, mine.author), mine)

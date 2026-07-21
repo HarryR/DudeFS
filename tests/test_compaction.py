@@ -13,16 +13,9 @@ from dudefs import compactor, crypto, fold, gossip
 from dudefs.acceptor import Acceptor, Rejected, RejectReason
 from dudefs.handlers import control as ctl
 from dudefs.store import AppendStatus, ChainStore
-from tests._builders import World
+from tests._builders import World, cut_of
 
 BIG_DELTA = 1_000_000
-
-
-def _cut(w):
-    """The frontier of everything authored so far (per-author (seq, hash))."""
-    cut = {c.pub: (c.seq - 1, c.prev) for c in w.clients if c.seq > 0}
-    cut[w.mgr_pub] = (w._mseq - 1, w._mprev)
-    return cut
 
 
 def _boot(w, cr, control_below, tail, cut):
@@ -64,7 +57,7 @@ class TestA4RetainedBootstrap(unittest.TestCase):
                 [[A.Mutation.SET, b"k2", b"w1"]],
             )
         )
-        cut = _cut(w)
+        cut = cut_of(w)
 
         v2, a2 = fold.fold(below, w.keyring, w.genesis).lineage(b"k1")
         tail = [
@@ -102,7 +95,7 @@ class TestA4RetainedBootstrap(unittest.TestCase):
         below.append(w.blind(0, [], [[A.Mutation.DEL, b"B"], [A.Mutation.SET, b"C", b"1"]]))
         z = w.blind(0, [], [[A.Mutation.DEL, b"C"]])
         below.append(z)
-        cut = _cut(w)
+        cut = cut_of(w)
         cr = compactor.compact_genesis(below, w.keyring, w.genesis, cut)
         ckpt = w.checkpoint(cut=cut, state_root=cr.state_root, dead=cr.dead)
         full = fold.fold(below + [ckpt], w.keyring, w.genesis)
@@ -124,7 +117,7 @@ class TestA4RetainedBootstrap(unittest.TestCase):
         below.append(winner)
         tomb = w.blind(1, [], [[A.Mutation.DEL, b"B"]])  # B dies below the cut
         below.append(tomb)
-        cut = _cut(w)
+        cut = cut_of(w)
 
         cr = compactor.compact_genesis(below, w.keyring, w.genesis, cut)
         ckpt = w.checkpoint(cut=cut, state_root=cr.state_root, dead=cr.dead)
@@ -164,7 +157,7 @@ class TestA4RetainedBootstrap(unittest.TestCase):
                 1, b"k", v, a, [[A.Guard.VALUE_EQ, b"k", b"wrong"]], [[A.Mutation.SET, b"k", b"x"]]
             )
         )
-        cut = _cut(w)
+        cut = cut_of(w)
 
         v1, a1 = fold.fold(below, w.keyring, w.genesis).lineage(b"k")
         self.assertEqual(a1, 1)  # the slot was consumed
@@ -206,7 +199,7 @@ class TestA4RejectedOps(unittest.TestCase):
         below.append(w.blind(1, [], [[A.Mutation.DEL, b"B"]]))
         rej = w.blind(0, [[A.Guard.PRESENT, b"B"]], [[A.Mutation.SET, b"B", b"resurrect"]])
         below.append(rej)
-        cut = _cut(w)
+        cut = cut_of(w)
         cr = compactor.compact_genesis(below, w.keyring, w.genesis, cut)
         full = fold.fold(below, w.keyring, w.genesis)
         boot = _boot(w, cr, control, [], cut)
@@ -228,7 +221,7 @@ class TestA4RejectedOps(unittest.TestCase):
             0, [[A.Guard.PRESENT, b"C"]], [[A.Mutation.DEL, b"C"], [A.Mutation.SET, b"D", b"1"]]
         )
         below.append(rej)  # rejected (C absent): neither the del nor the set apply
-        cut = _cut(w)
+        cut = cut_of(w)
         cr = compactor.compact_genesis(below, w.keyring, w.genesis, cut)
         full = fold.fold(below, w.keyring, w.genesis)
         boot = _boot(w, cr, control, [], cut)
@@ -253,13 +246,13 @@ class TestA4TwoCheckpoints(unittest.TestCase):
         below1.append(wop)
         xop = w.blind(1, [], [[A.Mutation.DEL, b"B"]])
         below1.append(xop)
-        cut1 = _cut(w)
+        cut1 = cut_of(w)
         ckpt1 = compactor.compact_genesis(below1, w.keyring, w.genesis, cut1)
         self.assertIn(xop.op_hash, {o.op_hash for o in ckpt1.retained})  # mask in ckpt1
 
         # tail2: a fresh key D; A/B untouched. cut2 covers it.
         tail2 = [w.blind(0, [], [[A.Mutation.SET, b"D", b"1"]])]
-        cut2 = _cut(w)
+        cut2 = cut_of(w)
         ckpt2 = compactor.compact(
             ckpt1.retained, ckpt1.attempts, cut1, tail2, w.keyring, w.genesis, cut2
         )
@@ -290,7 +283,7 @@ class TestA4TwoCheckpoints(unittest.TestCase):
             0, b"k", A.VERSION_ABSENT, 0, [[A.Guard.ABSENT, b"k"]], [[A.Mutation.SET, b"k", b"v1"]]
         )
         below1.append(first)
-        cut1 = _cut(w)
+        cut1 = cut_of(w)
         ckpt1 = compactor.compact_genesis(below1, w.keyring, w.genesis, cut1)
         self.assertIn(first.op_hash, {o.op_hash for o in ckpt1.retained})  # winner of k
 
@@ -299,7 +292,7 @@ class TestA4TwoCheckpoints(unittest.TestCase):
             0, b"k", v, a, [[A.Guard.VERSION_EQ, b"k", v]], [[A.Mutation.SET, b"k", b"v2"]]
         )
         tail2 = [second]
-        cut2 = _cut(w)
+        cut2 = cut_of(w)
         ckpt2 = compactor.compact(
             ckpt1.retained, ckpt1.attempts, cut1, tail2, w.keyring, w.genesis, cut2
         )
@@ -363,7 +356,7 @@ class TestA4PropertyFuzz(unittest.TestCase):
             n_below = rng.randint(4, 14)
             for _ in range(n_below):
                 self._gen(rng, w, below)
-            cut = _cut(w)
+            cut = cut_of(w)
             seg = len(below)
             for _ in range(rng.randint(0, 8)):
                 self._gen(rng, w, below)
@@ -386,11 +379,11 @@ class TestA4PropertyFuzz(unittest.TestCase):
             below1 = list(w.control_ops)
             for _ in range(rng.randint(3, 10)):
                 self._gen(rng, w, below1)
-            cut1 = _cut(w)
+            cut1 = cut_of(w)
             seg1 = len(below1)
             for _ in range(rng.randint(1, 6)):
                 self._gen(rng, w, below1)
-            cut2 = _cut(w)
+            cut2 = cut_of(w)
             seg2 = len(below1)
             for _ in range(rng.randint(0, 6)):
                 self._gen(rng, w, below1)
@@ -444,7 +437,7 @@ class TestDelegateCheckpointBarrier(unittest.TestCase):
         v1, a1 = fold.fold([*w.control_ops, c1], w.keyring, w.genesis).lineage(b"k")
         d = w.cas(0, b"k", v1, a1, [[A.Guard.VERSION_EQ, b"k", v1]], [[A.Mutation.DEL, b"k"]])
         below = [*w.control_ops, c1, d]
-        cut = _cut(w)
+        cut = cut_of(w)
         base = w._hlc
         tag = A.compute_slot_tag(w.keyring[0]["slot_secret"], b"k", A.VERSION_ABSENT, 0)
         c2 = w.data_op(
@@ -495,7 +488,7 @@ class TestDelegateCheckpointBarrier(unittest.TestCase):
         v1, a1 = fold.fold([*w.control_ops, cert_d, cert_w, c1], w.keyring, w.genesis).lineage(b"k")
         d = w.cas(0, b"k", v1, a1, [[A.Guard.VERSION_EQ, b"k", v1]], [[A.Mutation.DEL, b"k"]])
         below = [*w.control_ops, cert_d, cert_w, c1, d]
-        cut = _cut(w)  # covers the certs, c1, d (captured before the reborn op)
+        cut = cut_of(w)  # covers the certs, c1, d (captured before the reborn op)
         base = w._hlc
 
         # a reborn creation of k above the cut: byte-identical tag to c1's.
@@ -549,7 +542,7 @@ class TestNodeGC(unittest.TestCase):
             0, b"k", v, a, [[A.Guard.VERSION_EQ, b"k", v]], [[A.Mutation.SET, b"k", b"v2"]]
         )
         below.append(winner)
-        cut = _cut(w)
+        cut = cut_of(w)
         cr = compactor.compact_genesis(below, w.keyring, w.genesis, cut)
 
         store = ChainStore()
@@ -643,7 +636,7 @@ class TestCutAwareStore(unittest.TestCase):
             0, b"k", v, a, [[A.Guard.VERSION_EQ, b"k", v]], [[A.Mutation.SET, b"k", b"v2"]]
         )
         below.append(winner)
-        cut = _cut(w)
+        cut = cut_of(w)
         cr = compactor.compact_genesis(below, w.keyring, w.genesis, cut)
         committed = A.retained_commitment(cr.retained)
         self.assertIn(first.op_hash, cr.dead)
@@ -705,7 +698,7 @@ class TestCheckpointArtifact(unittest.TestCase):
                 [[A.Mutation.SET, b"k", b"v"]],
             )
         )
-        cut = _cut(w)
+        cut = cut_of(w)
         cr = compactor.compact_genesis(below, w.keyring, w.genesis, cut)
         retained = A.retained_commitment(cr.retained)
         ckpt = w.checkpoint(
@@ -749,7 +742,7 @@ class TestCheckpointArtifact(unittest.TestCase):
                 [[A.Mutation.SET, b"j", b"w"]],
             )
         )
-        cut = _cut(w)
+        cut = cut_of(w)
         cr = compactor.compact_genesis(below, w.keyring, w.genesis, cut)
         commit = A.retained_commitment(cr.retained)
         # a node holding the full retained set recomputes the identical digest
@@ -788,7 +781,7 @@ class TestBaselineSync(unittest.TestCase):
                 [[A.Mutation.SET, b"j", b"w"]],
             )
         )
-        cut = _cut(w)
+        cut = cut_of(w)
         cr = compactor.compact_genesis(below, w.keyring, w.genesis, cut)
         committed = A.retained_commitment(cr.retained)  # the checkpoint's `retained` field
 
@@ -831,7 +824,7 @@ class TestBaselineProjection(unittest.TestCase):
             0, b"k", v, a, [[A.Guard.VERSION_EQ, b"k", v]], [[A.Mutation.SET, b"k", b"v2"]]
         )
         below.append(winner)
-        cut = _cut(w)
+        cut = cut_of(w)
         cr = compactor.compact_genesis(below, w.keyring, w.genesis, cut)
         committed = A.retained_commitment(cr.retained)
         return w, below, cut, cr, committed, first, winner
@@ -1008,7 +1001,7 @@ class TestVoidRule(unittest.TestCase):
         # adopting a checkpoint).
         node, tag, _op = self._one_accept_node(A.HLC(100, 0))
         w = World(seed=18, n_clients=1)
-        ckpt = w.checkpoint(cut=_cut(w), horizon=A.HLC(150, 0))
+        ckpt = w.checkpoint(cut=cut_of(w), horizon=A.HLC(150, 0))
         body = ctl.decode(ckpt)
         assert body is not None
         node.advance_horizon(body[b"horizon"])  # sourced from F on the wire
