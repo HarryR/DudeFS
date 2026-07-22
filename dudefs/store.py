@@ -29,7 +29,7 @@ from contextlib import contextmanager
 from enum import StrEnum
 
 from . import artifacts as A
-from . import codec
+from . import codec, tunables
 from .artifacts import BLIND, HLC, QC, Ballot, Heads, Op, Receipt
 from .errors import DudeFSError
 
@@ -1006,7 +1006,9 @@ class ChainStore:
     `with store.write_txn() as tx`. Knows nothing of slots-as-predicates or payloads:
     a slot_tag is opaque bytes, a data payload is opaque ciphertext."""
 
-    def __init__(self, path: str = ":memory:", *, busy_timeout_ms: int = 5000):
+    def __init__(
+        self, path: str = ":memory:", *, busy_timeout_ms: int = tunables.STORE_BUSY_TIMEOUT_MS
+    ):
         # A file path opens a reader connection + a writer connection (HANDOFF-R5):
         # WAL gives the reader a committed snapshot while the writer holds a
         # transaction. ":memory:" has no WAL (and shared-cache uses table locks that
@@ -1031,7 +1033,9 @@ class ChainStore:
         self._writer.commit()
 
     @staticmethod
-    def _connect(dsn: str, wal: bool, busy_timeout_ms: int = 5000) -> sqlite3.Connection:
+    def _connect(
+        dsn: str, wal: bool, busy_timeout_ms: int = tunables.STORE_BUSY_TIMEOUT_MS
+    ) -> sqlite3.Connection:
         c = sqlite3.connect(dsn, check_same_thread=False, isolation_level=None)
         if wal:
             # journal_mode SILENTLY falls back (no error) when the filesystem can't do

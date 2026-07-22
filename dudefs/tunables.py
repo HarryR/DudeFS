@@ -62,6 +62,15 @@ RETRANSMIT_MS = _RETRANSMIT_RTTS * _PROD_RTT  # 500
 # A coarse give-up backstop, not a latency — patience, not a round-trip count.
 DRIVE_DEADLINE_MS = 100_000
 
+# Store — cross-process writer contention (HANDOFF-R5). `BEGIN IMMEDIATE` waits this
+# long for ANOTHER OS PROCESS's write lock before raising StoreBusy. A coarse patience
+# backstop, NOT a latency: it must outlast a normal write transaction (a few statements
+# + an fsync) yet fail well before a caller's own deadline, so a genuinely stuck peer
+# degrades to a retryable StoreBusy (or carrier silence) instead of an unbounded stall.
+# Bounded above by DRIVE_DEADLINE_MS; a serving thread blocks at most this long before
+# yielding carrier silence, so it must stay ≪ the client's drive deadline.
+STORE_BUSY_TIMEOUT_MS = 5_000
+
 # Fold — verification memo cache (performance, regime-independent).
 SIG_CACHE_MAX = 100_000
 
