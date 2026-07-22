@@ -409,6 +409,37 @@ class TestDaemonEvidence(unittest.TestCase):
         self.assertGreaterEqual(d.status()["evidence"], 1)
         self.assertEqual(d.evidence_cycle(), 0)  # idempotent
 
+    def test_evidence_duty_cycle_mints_a_real_floor_perjury(self):
+        # PRODUCTION PATH: the node IS a floor-perjurer via acceptor_cls. It issues a
+        # watermark attesting floor F (real issue_watermark), then receipts an op
+        # BENEATH F through the real on_accept (its dropped past-gate lets it); the
+        # watermark + that below-floor receipt are the FLOOR_PERJURY proof evidence_cycle
+        # mints — the perjurer PRODUCES it on production code, not a hand-planted receipt.
+        from dudefs.sim.personas import FloorPerjurer
+
+        w = World(seed=1, n_clients=1)
+        nsk = bytes([200] * 32)
+        npub = C.SIGNER.public(nsk)
+        d = NodeDaemon(
+            nsk,
+            npub,
+            roster=[npub],
+            manager_pub=w.mgr_pub,
+            control_ops=w.control_ops,
+            clock=lambda: 1000,
+            delta_ms=10,  # small: floor = now - delta ~ 990 sits ABOVE the op's small hlc
+            acceptor_cls=FloorPerjurer,
+        )
+        op = creation_op(w, 0, b"v")  # small hlc, beneath the sworn floor
+        assert op.slot_tag is not None
+        wm = d.acc.issue_watermark(1000)  # attests floor ~990
+        self.assertGreater(wm.floor.wall_ms, op.hlc.wall_ms)  # op is beneath the floor
+        rc = d.acc.on_accept(op.slot_tag, A.Ballot(1, b"x"), op, 1000)
+        self.assertIsInstance(rc, A.Receipt)  # perjures: signs beneath its own sworn floor
+        self.assertEqual(d.evidence_cycle(observed_watermarks=[wm]), 1)  # FLOOR_PERJURY minted
+        self.assertGreaterEqual(d.status()["evidence"], 1)
+        self.assertEqual(d.evidence_cycle(observed_watermarks=[wm]), 0)  # idempotent
+
 
 class TestDaemonSocket(unittest.TestCase):
     def test_real_unix_socket_serves_a_verb(self):
