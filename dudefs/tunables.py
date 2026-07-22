@@ -29,6 +29,8 @@ _HEDGE_RTTS = 1  # trickle the rest of the fan-out after ~1 RTT of silence (QueP
 _RETRANSMIT_RTTS = 10  # resend an un-acked verb after ~10 RTT — a reply is lost, not merely late
 _FINALITY_POLL_RTTS = 1  # re-poll watermarks about once per RTT (no point polling faster)
 _ROUND_TIMEOUT_RTTS = 4  # a ballot round escalates if it neither decides nor is nacked-out in this
+_REFRESH_RTTS = 10  # a client re-syncs its read-side view about once per ~10 RTT (freshness,
+# not latency-critical) — also the AUDIT CADENCE the compaction cut-lag W trails (DESIGN §12)
 
 
 def _rtt(one_way_ms: int) -> int:
@@ -56,11 +58,14 @@ MAX_ROUNDS = 8  # recovery ballot rounds before a Commit gives up — a COUNT, r
 MAX_POLLS = 1_000  # finality poll attempts before a Finalize gives up — a COUNT
 
 # Client driver — at-least-once reliability (PROTOCOL §0: idempotent verbs).
-# RESERVED for the M7/M8 real driver (the in-sim driver uses SIM_* below); it
-# will likely add randomized backoff (DESIGN §8) atop this base period.
+# The resident client daemon (client.py) IS the real driver; it may add randomized
+# backoff (DESIGN §8) atop these base periods.
 RETRANSMIT_MS = _RETRANSMIT_RTTS * _PROD_RTT  # 500
-# A coarse give-up backstop, not a latency — patience, not a round-trip count.
-DRIVE_DEADLINE_MS = 100_000
+REFRESH_MS = _REFRESH_RTTS * _PROD_RTT  # 500 — background read-side sync cadence
+BLIND_DEADLINE_MS = 10 * RETRANSMIT_MS  # 5_000 — a blind SUBMIT's idempotent retransmit budget
+# A coarse give-up backstop for a slotted drive when NO quorum is reachable — patience,
+# not a round-trip count (the sans-io machine gives up earlier via max_rounds/max_polls).
+DRIVE_DEADLINE_MS = 30_000
 
 # Store — cross-process writer contention (HANDOFF-R5). `BEGIN IMMEDIATE` waits this
 # long for ANOTHER OS PROCESS's write lock before raising StoreBusy. A coarse patience

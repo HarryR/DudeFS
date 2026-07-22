@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from typing import TypedDict
 
 from . import artifacts as A
-from . import compactor, fold, lmsg, transports, wire
+from . import compactor, fold, lmsg, transports, tunables, wire
 from .artifacts import BLIND, HLC, QC, Op, Receipt, Txn, compute_slot_tag
 from .handlers import control as ctl
 from .handlers import data as data_handler
@@ -43,11 +43,10 @@ from .quorum import (
 )
 from .store import ChainStore, ReadTxn, StoreClosed, covered
 
-# A driver deadline: the sans-io machine terminates itself on max_rounds/max_polls,
-# but a hopeless drive (no quorum reachable at all) needs a wall-clock backstop.
-DRIVE_DEADLINE_MS = 30_000
-BLIND_DEADLINE_S = 5.0  # blind SUBMIT retransmit budget (idempotent — PROTOCOL §0)
-REFRESH_MS = 500  # background read-side sync cadence (local/INSPECT freshness, lane 1)
+# Timing lives in tunables.py (single-place visibility): DRIVE_DEADLINE_MS is the
+# no-quorum-reachable wall-clock backstop (the sans-io machine gives up earlier via
+# max_rounds/max_polls); BLIND_DEADLINE_MS the idempotent blind-SUBMIT retransmit
+# budget; REFRESH_MS the background read-side sync cadence.
 
 
 type Slot = tuple[bytes, bytes, int]  # (path, version, attempt)
@@ -135,7 +134,7 @@ def _drive(
     rpc,
     *,
     stop: threading.Event | None = None,
-    deadline_ms: int = DRIVE_DEADLINE_MS,
+    deadline_ms: int = tunables.DRIVE_DEADLINE_MS,
 ) -> object:
     """Run a sans-io quorum machine (Commit/Finalize) over real node RPCs. Sends
     fan out on worker threads (node verbs are idempotent, PROTOCOL §0); Wakes arm
@@ -384,7 +383,7 @@ class ClientDaemon:
                 with lock:
                     receipts[node] = r
 
-        deadline = time.monotonic() + BLIND_DEADLINE_S
+        deadline = time.monotonic() + tunables.BLIND_DEADLINE_MS / 1000
         while time.monotonic() < deadline and not self._closing.is_set():
             pending = [n for n in self.cfg.fanout_order if n not in receipts]
             threads = [threading.Thread(target=one, args=(n,), daemon=True) for n in pending]
@@ -483,7 +482,7 @@ class ClientDaemon:
         return None
 
     def _refresh_loop(self) -> None:
-        while not self._closing.wait(REFRESH_MS / 1000.0):
+        while not self._closing.wait(tunables.REFRESH_MS / 1000.0):
             try:
                 self.refresh_addrs()  # pick up ENDPOINT records for the roster
                 self.sync()
