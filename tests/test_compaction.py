@@ -19,9 +19,13 @@ BIG_DELTA = 1_000_000
 
 
 def _boot(w, cr, control_below, tail, cut):
-    """Bootstrap fold: barrier from the retained winners + sidecar, then the tail."""
+    """Bootstrap fold: barrier from the retained winners + the sidecar UNSEALED off the
+    wire (seal->open, the PRODUCTION codec — not a cleartext dict handed in), then the
+    tail. Exercises the real sidecar path in every A4 vector."""
     data_retained = [o for o in cr.retained if not o.is_control]
-    barrier = compactor.barrier_state(data_retained, cr.attempts, w.keyring)
+    dk = w.keyring[0]["data_key"]
+    attempts = compactor.open_attempts(compactor.seal_attempts(cr.attempts, dk), dk)
+    barrier = compactor.barrier_state(data_retained, attempts, w.keyring)
     return fold.fold(control_below + tail, w.keyring, w.genesis, barrier=barrier, cut_frontier=cut)
 
 
@@ -180,6 +184,67 @@ class TestA4RetainedBootstrap(unittest.TestCase):
         no_sidecar = compactor.barrier_state(data_retained, {}, w.keyring)
         bad = fold.fold(control + tail, w.keyring, w.genesis, barrier=no_sidecar, cut_frontier=cut)
         self.assertNotEqual(bad.state, full.state)  # diverged without the sidecar
+
+
+class TestAttemptsSidecar(unittest.TestCase):
+    """WP-A: the attempts sidecar seals into a real checkpoint op's `attempts` field and
+    unseals on bootstrap — the PRODUCTION wire path, not a cleartext dict handed in. A
+    nonzero-attempt live key survives byte-identically (A4); the ciphertext hides the
+    keys; a tampered sidecar opens loud."""
+
+    def _nonzero_attempt(self, w, key=b"k"):
+        """A live `key` at attempt 1: a create, then a guard-failing CAS that consumes
+        the slot (rejected, but the attempt counter advances)."""
+        below = list(w.control_ops)
+        below.append(
+            w.cas(
+                0, key, A.VERSION_ABSENT, 0, [[A.Guard.ABSENT, key]], [[A.Mutation.SET, key, b"v1"]]
+            )
+        )
+        v, a = fold.fold(below, w.keyring, w.genesis).lineage(key)
+        below.append(
+            w.cas(1, key, v, a, [[A.Guard.VALUE_EQ, key, b"wrong"]], [[A.Mutation.SET, key, b"x"]])
+        )
+        return below
+
+    def test_sidecar_roundtrips_through_a_real_checkpoint_op(self):
+        w = World(seed=30, n_clients=2)
+        below = self._nonzero_attempt(w)
+        cut = cut_of(w)
+        cr = compactor.compact_genesis(below, w.keyring, w.genesis, cut)
+        self.assertEqual(cr.attempts, {b"k": 1})  # a live key at a nonzero attempt
+
+        dk = w.keyring[0]["data_key"]
+        # AUTHOR: seal the sidecar INTO a real checkpoint op's attempts field
+        sealed = compactor.seal_attempts(cr.attempts, dk)
+        ckpt_op = w.checkpoint(cut=cut, state_root=cr.state_root, dead=cr.dead, attempts=sealed)
+        # BOOTSTRAP: decode the op off the wire, unseal ITS field, rebuild the barrier
+        ckpt = ctl.decode(ckpt_op)
+        assert isinstance(ckpt, ctl.Checkpoint)
+        attempts = compactor.open_attempts(ckpt.attempts, dk)
+        data_retained = [o for o in cr.retained if not o.is_control]
+        barrier = compactor.barrier_state(data_retained, attempts, w.keyring)
+        self.assertEqual(barrier[b"k"]["attempt"], 1)  # survived the wire (A4)
+
+    def test_sealed_sidecar_hides_the_keys(self):
+        w = World(seed=31, n_clients=2)
+        key = b"top/secret/attempt/keyname"
+        cr = compactor.compact_genesis(
+            self._nonzero_attempt(w, key), w.keyring, w.genesis, cut_of(w)
+        )
+        sealed = compactor.seal_attempts(cr.attempts, w.keyring[0]["data_key"])
+        self.assertNotEqual(sealed, b"")
+        self.assertNotIn(key, sealed)  # the key path is confidential, not in cleartext
+
+    def test_tampered_sidecar_opens_loud_empty_stays_empty(self):
+        w = World(seed=32, n_clients=2)
+        cr = compactor.compact_genesis(self._nonzero_attempt(w), w.keyring, w.genesis, cut_of(w))
+        dk = w.keyring[0]["data_key"]
+        blob = bytearray(compactor.seal_attempts(cr.attempts, dk))
+        blob[-1] ^= 0xFF  # flip a tag byte
+        with self.assertRaises(compactor.CompactError):
+            compactor.open_attempts(bytes(blob), dk)
+        self.assertEqual(compactor.open_attempts(b"", dk), {})  # no sidecar -> {}
 
 
 class TestA4RejectedOps(unittest.TestCase):

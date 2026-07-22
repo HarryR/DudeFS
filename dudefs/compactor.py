@@ -17,10 +17,44 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from . import artifacts as A
-from . import fold
+from . import codec, crypto, fold
 from .artifacts import VERSION_ABSENT, Heads, Op
+from .errors import DudeFSError
 from .handlers import data as data_handler
 from .handlers.data import Opaque
+
+
+class CompactError(DudeFSError):
+    """Base for compaction failures (errors.py hierarchy) — e.g. a checkpoint whose
+    sealed sidecar will not open (wrong keyepoch / tampered)."""
+
+
+# The attempts sidecar (DESIGN §12) travels the checkpoint encrypted under the group
+# data_key — the same xcs1 AEAD as data payloads — because it maps KEYS (paths, which
+# are content) to their CAS attempt counters, and confidentiality covers content +
+# structure. `dude.ckpt.attempts` domain-separates it from payload ciphertext.
+_ATTEMPTS_AAD = b"dude.ckpt.attempts"
+
+
+def seal_attempts(attempts: dict[bytes, int], data_key: bytes) -> bytes:
+    """Encrypt the attempts sidecar for the checkpoint's `attempts` field. Deterministic
+    (SIV), so a reproducible checkpoint reproduces identical bytes. An empty sidecar
+    carries nothing (b"")."""
+    if not attempts:
+        return b""
+    return crypto.AEAD.seal(data_key, _ATTEMPTS_AAD, codec.encode(attempts))
+
+
+def open_attempts(sealed: bytes, data_key: bytes) -> dict[bytes, int]:
+    """The bootstrap inverse of `seal_attempts`: b"" -> {} (no sidecar). A failed open
+    (wrong keyepoch / tamper) raises CompactError — LOUD, never a silently-empty dict,
+    which would zero live keys' attempts and break A4."""
+    if not sealed:
+        return {}
+    pt = crypto.AEAD.open(data_key, _ATTEMPTS_AAD, sealed)
+    if pt is None:
+        raise CompactError("attempts sidecar failed to open (wrong keyepoch or tampered)")
+    return {codec.as_bytes(k): codec.as_int(v) for k, v in codec.as_dict(codec.decode(pt)).items()}
 
 
 @dataclass(frozen=True)
