@@ -22,8 +22,9 @@ from dataclasses import dataclass
 from typing import TypedDict
 
 from . import artifacts as A
-from . import fold, lmsg, transports, wire
+from . import compactor, fold, lmsg, transports, wire
 from .artifacts import BLIND, HLC, QC, Op, Receipt, Txn, compute_slot_tag
+from .handlers import control as ctl
 from .handlers import data as data_handler
 from .link import Link
 from .node import FetchOpReq, FrontierReq, GetQCReq, PutQCReq, Request, Response, SubmitReq
@@ -40,7 +41,7 @@ from .quorum import (
     Tick,
     Wake,
 )
-from .store import ChainStore, ReadTxn, StoreClosed
+from .store import ChainStore, ReadTxn, StoreClosed, covered
 
 # A driver deadline: the sans-io machine terminates itself on max_rounds/max_polls,
 # but a hopeless drive (no quorum reachable at all) needs a wall-clock backstop.
@@ -508,8 +509,55 @@ class ClientDaemon:
                 out.append(o)
         return out
 
+    @staticmethod
+    def _checkpoint(op: Op) -> ctl.Checkpoint | None:
+        if not op.is_control:
+            return None
+        body = ctl.decode(op)
+        return body if isinstance(body, ctl.Checkpoint) else None
+
+    def _bootstrap_barrier(
+        self, tx: ReadTxn, ops: list[Op]
+    ) -> tuple[fold.BarrierState, A.Heads] | None:
+        """The reconstructed barrier for the latest QC-committed checkpoint whose below-
+        cut band I no longer fully hold (WP-C). Returns None — a full-history fold —
+        when no compaction has happened OR I still hold the whole covered band (that
+        fold is already checkpoint-aware and correct). When the band IS sparse (GC'd),
+        fold the RETAINED winners I hold + the unsealed attempts sidecar into the
+        barrier and VERIFY the checkpoint's state_root against it (WP-A/B), so a GC'd or
+        freshly-bootstrapped client reads byte-identically to full history (A4)."""
+        latest: tuple[Op, ctl.Checkpoint] | None = None
+        for o in ops:
+            ck = self._checkpoint(o)
+            if ck is not None and ck.cut and tx.get_qc(o.op_hash) is not None:
+                if latest is None or o.hlc > latest[0].hlc:
+                    latest = (o, ck)
+        if latest is None:
+            return None
+        ck = latest[1]
+        if all(tx.get_op(h) is not None for h in ck.dead):
+            return None  # I still hold the full covered band -> a full fold is correct
+        # sparse: the below-cut data ops I hold ARE the retained winners (dead is GC'd).
+        retained = [o for o in ops if not o.is_control and covered(o, ck.cut)]
+        dk = self.keyring[ck.keyepoch]["data_key"]
+        barrier = compactor.barrier_state(
+            retained, compactor.open_attempts(ck.attempts, dk), self.keyring
+        )
+        compactor.verify_state_root(ck.state_root, barrier)  # loud on a forged checkpoint
+        return barrier, ck.cut
+
     def _fold(self, tx: ReadTxn, *, final_only: bool = False) -> fold.FoldResult:
-        return fold.fold(self._committed_ops(tx, final_only=final_only), self.keyring, self.genesis)
+        ops = self._committed_ops(tx, final_only=final_only)
+        boot = self._bootstrap_barrier(tx, ops)
+        if boot is None:
+            return fold.fold(ops, self.keyring, self.genesis)  # full history (unchanged)
+        barrier, cut = boot
+        # atop the reconstructed barrier: the below-cut CONTROL chain (authz) + all
+        # above-cut ops, EXCLUDING checkpoint ops (their effect IS the barrier).
+        tail = [
+            o for o in ops if self._checkpoint(o) is None and (o.is_control or not covered(o, cut))
+        ]
+        return fold.fold(tail, self.keyring, self.genesis, barrier=barrier, cut_frontier=cut)
 
     def _slot_winner(self, tx: ReadTxn, slot_tag: bytes) -> bytes | None:
         """The op_hash committed (QC'd) for a slot tag, if any."""

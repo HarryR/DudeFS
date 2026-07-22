@@ -12,13 +12,15 @@ import time
 import unittest
 
 from dudefs import artifacts as A
+from dudefs import compactor
 from dudefs import crypto as C
+from dudefs import fold as F
 from dudefs.artifacts import VERSION_ABSENT
 from dudefs.client import ClientDaemon, KeyEntry
 from dudefs.daemon import NodeDaemon
 from dudefs.handlers import control as ctl
 from dudefs.workerapi import WorkerServer
-from tests._builders import World, now_ms, poll_until, unix_eps
+from tests._builders import World, cut_of, now_ms, poll_until, unix_eps
 
 DELTA = 150  # ms — small enough that finality sweeps ~DELTA after a write, big
 # enough that same-machine client/node clock jitter never trips the skew gate.
@@ -464,6 +466,92 @@ class TestWorkerAPIWire(unittest.TestCase):
             srv.close()
             c.close()
             cl.close()
+
+
+class TestBootstrapConsumer(unittest.TestCase):
+    """WP-C: a client whose below-cut band is GC'd (holds only the retained winners +
+    the checkpoint + the tail, NOT the dead ops) reconstructs the barrier from the
+    unsealed sidecar and reads BYTE-IDENTICALLY to a full-history client (A4) — the real
+    client._fold path, verifying state_root at intake (WP-B)."""
+
+    def _client(self, w):
+        c = ClientDaemon(
+            w.clients[0].sk,
+            w.clients[0].pub,
+            roster=[C.SIGNER.public(bytes([1] * 32))],
+            roster_addrs=unix_eps(["/nonexistent.sock"]),  # reads fold locally, no RPC
+            manager_pub=w.mgr_pub,
+            masters={0: MASTER},
+            control_ops=w.control_ops,
+            epoch=0,
+        )
+        c.keyring, c.genesis = w.keyring, w.genesis  # align with the World's op keys
+        return c
+
+    @staticmethod
+    def _qc(op):
+        # a minimal 1-node QC — the fold only checks a QC is PRESENT (committed)
+        nsk = bytes([200] * 32)
+        npub = C.SIGNER.public(nsk)
+        r = A.Receipt.issue(nsk, npub, op.op_hash, 0, A.BLIND, 1)
+        return A.QC.assemble([r], 1, {npub: 0})
+
+    def test_gc_d_client_bootstraps_from_checkpoint_equals_full_history(self):
+        w = World(seed=70, n_clients=1)
+        below = list(w.control_ops)
+        below.append(
+            w.cas(
+                0,
+                b"k1",
+                VERSION_ABSENT,
+                0,
+                [[A.Guard.ABSENT, b"k1"]],
+                [[A.Mutation.SET, b"k1", b"v1"]],
+            )
+        )
+        v, a = F.fold(below, w.keyring, w.genesis).lineage(b"k1")
+        below.append(
+            w.cas(
+                0, b"k1", v, a, [[A.Guard.VERSION_EQ, b"k1", v]], [[A.Mutation.SET, b"k1", b"v2"]]
+            )
+        )  # supersedes v1 -> v1 becomes dead (GC'd)
+        below.append(
+            w.cas(
+                0,
+                b"k2",
+                VERSION_ABSENT,
+                0,
+                [[A.Guard.ABSENT, b"k2"]],
+                [[A.Mutation.SET, b"k2", b"w1"]],
+            )
+        )
+        cut = cut_of(w)
+        cr = compactor.compact_genesis(below, w.keyring, w.genesis, cut)
+        sealed = compactor.seal_attempts(cr.attempts, w.keyring[0]["data_key"])
+        ckpt = w.checkpoint(cut=cut, state_root=cr.state_root, dead=cr.dead, attempts=sealed)
+        v2, a2 = F.fold(below, w.keyring, w.genesis).lineage(b"k1")
+        tail = w.cas(
+            0, b"k1", v2, a2, [[A.Guard.VERSION_EQ, b"k1", v2]], [[A.Mutation.SET, b"k1", b"v3"]]
+        )
+
+        full = F.fold(below + [ckpt, tail], w.keyring, w.genesis)
+        self.assertEqual(full.state, {b"k1": b"v3", b"k2": b"w1"})
+
+        c = self._client(w)
+        try:
+            retained_data = [o for o in cr.retained if not o.is_control]
+            with c.store.write_txn() as tx:
+                for op in w.control_ops:  # authz chain (control ops fold without a QC)
+                    tx.put_op_raw(op)
+                for op in [*retained_data, ckpt, tail]:  # committed; the DEAD ops are absent
+                    tx.put_op_raw(op)
+                    tx.put_qc(self._qc(op))
+            with c.store.read_txn() as tx:
+                self.assertTrue(any(tx.get_op(h) is None for h in cr.dead))  # really sparse
+                boot = c._fold(tx)
+            self.assertEqual(boot.state, full.state)  # A4: sparse bootstrap == full history
+        finally:
+            c.close()
 
 
 if __name__ == "__main__":
