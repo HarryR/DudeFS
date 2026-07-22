@@ -273,7 +273,14 @@ class NodeDaemon:
                 body = ctl.decode(op) if op.is_control else None
                 if not isinstance(body, ctl.Checkpoint):
                     continue
-                if tx.get_qc(op.op_hash) is None:  # not quorum-committed
+                qc = tx.get_qc(op.op_hash)
+                if qc is None:  # not quorum-committed
+                    continue
+                # VERIFY the QC, don't just note its presence (WP-F(b), finding #5):
+                # put_qc stores whatever is gossiped in, so a forged / sub-quorum /
+                # wrong-epoch QC would otherwise drive a GC on a lie. Mirror the roster
+                # path — a MAJORITY of THIS epoch's roster must have signed it.
+                if qc.config_epoch != self.acc.epoch or not qc.verify(self.roster):
                     continue
                 if not reducer.control.can_author_control(op.author, ctl.ControlKind.CHECKPOINT):
                     continue  # unauthorized minter — never adopt

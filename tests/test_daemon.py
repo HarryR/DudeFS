@@ -367,6 +367,55 @@ class TestDaemonAdoption(unittest.TestCase):
             self.assertEqual(tx.get_meta("checkpoint"), ckpt.op_hash)  # adopted
             self.assertEqual(tx.get_horizon(), A.HLC(500, 0))  # horizon advanced to F
             self.assertIsNone(tx.get_op(first.op_hash))  # dead GC'd
+
+    def test_forged_qc_checkpoint_is_not_adopted(self):
+        # WP-F(b) / finding #5: put_qc stores whatever gossips in, so adoption must
+        # VERIFY the checkpoint QC, not just note its presence — else a forged QC drives
+        # a GC on a lie. Same checkpoint, but its QC is signed by keys that are NOT the
+        # roster: it must be refused (no adoption, no horizon advance, no GC).
+        from dudefs import compactor, fold
+
+        w = World(seed=8, n_clients=1)
+        roster = [C.SIGNER.public(bytes([200 + i] * 32)) for i in range(3)]
+        d = _daemon(w, 0, roster)
+        below = list(w.control_ops)
+        first = w.cas(
+            0, b"k", A.VERSION_ABSENT, 0, [[A.Guard.ABSENT, b"k"]], [[A.Mutation.SET, b"k", b"v1"]]
+        )
+        below.append(first)
+        v, at = fold.fold(below, w.keyring, w.genesis).lineage(b"k")
+        winner = w.cas(
+            0, b"k", v, at, [[A.Guard.VERSION_EQ, b"k", v]], [[A.Mutation.SET, b"k", b"v2"]]
+        )
+        below.append(winner)
+        cut = {c.pub: (c.seq - 1, c.prev) for c in w.clients if c.seq > 0}
+        cut[w.mgr_pub] = (w._mseq - 1, w._mprev)
+        cr = compactor.compact_genesis(below, w.keyring, w.genesis, cut)
+        ckpt = w.checkpoint(
+            cut=cut,
+            state_root=cr.state_root,
+            dead=cr.dead,
+            retained=A.retained_commitment(cr.retained),
+            horizon=A.HLC(500, 0),
+        )
+        with d.store.write_txn() as tx:
+            for o in [*below, ckpt]:
+                tx.append(o)
+        # a FORGED QC: a full bitmap, but the signers are NOT the roster
+        fake = [bytes([100 + i] * 32) for i in range(3)]
+        fake_pubs = [C.SIGNER.public(s) for s in fake]
+        recs = [
+            A.Receipt.issue(fake[i], fake_pubs[i], ckpt.op_hash, 0, A.Ballot(1, b"c"), 1)
+            for i in range(3)
+        ]
+        with d.store.write_txn() as tx:
+            tx.put_qc(A.QC.assemble(recs, 3, {p: i for i, p in enumerate(fake_pubs)}))
+
+        d.adopt_committed_checkpoints()
+        with d.store.read_txn() as tx:
+            self.assertIsNone(tx.get_meta("checkpoint"))  # NOT adopted
+            self.assertEqual(tx.get_horizon(), A.HLC(0, 0))  # horizon not advanced
+            self.assertIsNotNone(tx.get_op(first.op_hash))  # dead NOT GC'd
             self.assertIsNotNone(tx.get_op(winner.op_hash))  # winner retained
 
 
