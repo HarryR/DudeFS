@@ -26,6 +26,7 @@ from typing import Any, NotRequired, TypedDict, cast
 from . import artifacts as A
 from .artifacts import VERSION_ABSENT
 from .client import ClientDaemon, KeyEntry, Ladder
+from .errors import DudeFSError
 
 # ---- JSON result shapes (CLIENT.md §3) — the wire contract, typed ------------ #
 
@@ -349,6 +350,12 @@ class WorkerServer:
             return _err(rid, e.code, e.message)
         except (KeyError, ValueError, TypeError) as e:
             return _err(rid, -32602, f"invalid params: {e}")
+        except DudeFSError as e:
+            # OUR error, recognized and handled: a known DudeFS condition (a closing
+            # store at shutdown, a crypto/fold/artifact failure) — report it as a
+            # JSON-RPC internal error rather than crash the connection thread. Anything
+            # NOT in the hierarchy is an unexpected bug and is left to propagate.
+            return _err(rid, -32603, f"internal error: {e}")
         if rid is None:
             return None  # JSON-RPC notification: no reply
         return {"jsonrpc": "2.0", "id": rid, "result": result}
@@ -365,14 +372,17 @@ class WorkerServer:
         return _dump(reply) if reply is not None else None
 
     def _handle_conn(self, conn: socket.socket) -> None:
-        with conn, conn.makefile("rb") as rf:
-            for line in rf:
-                line = line.strip()
-                if not line:
-                    continue
-                out = self.dispatch_line(line)
-                if out is not None:
-                    conn.sendall(out + b"\n")
+        try:
+            with conn, conn.makefile("rb") as rf:
+                for line in rf:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    out = self.dispatch_line(line)
+                    if out is not None:
+                        conn.sendall(out + b"\n")
+        except OSError:
+            return  # worker hung up / broken pipe — normal transport teardown, not a crash
 
     def serve_forever(self, path: str, ready: threading.Event | None = None) -> None:
         srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)

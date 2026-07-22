@@ -258,6 +258,17 @@ class TestWorkerAPIProtocol(unittest.TestCase):
         self.assertEqual(ids, {1, 2})
         d.close()
 
+    def test_a_dudefs_error_becomes_a_json_rpc_internal_error_not_a_crash(self):
+        # A known DudeFS condition raised WHILE handling a request (here the store is
+        # closed under us at shutdown) travels the single `except DudeFSError` path and
+        # is reported as JSON-RPC -32603 — never a crashed connection thread.
+        d = self._daemon()
+        srv = WorkerServer(d)
+        d.close()  # the client store is now closed -> GET's read_txn raises StoreClosed
+        out = srv.dispatch_line(b'{"jsonrpc":"2.0","id":1,"method":"GET","params":{"path":"k"}}')
+        assert out is not None
+        self.assertIn(b'"code":-32603', out)
+
 
 class TestRequestGate(unittest.TestCase):
     """The op-author request gate (NOTES 58): a node refuses a non-authorized
