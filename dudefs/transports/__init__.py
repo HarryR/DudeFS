@@ -11,16 +11,19 @@ from collections.abc import Callable
 from urllib.parse import urlsplit, urlunsplit
 
 from . import http as _http
+from . import inproc
 from . import unix as _unix
-from .base import HTTP, SEALED, UNIX, Endpoint, Handler, Server, parse_scheme
+from .base import HTTP, INPROC, SEALED, UNIX, Endpoint, Handler, Server, parse_scheme
 
 __all__ = [
     "HTTP",
+    "INPROC",
     "UNIX",
     "Endpoint",
     "Handler",
     "Server",
     "dial",
+    "inproc",
     "open_server",
     "parse_endpoint",
     "parse_scheme",
@@ -53,8 +56,16 @@ def parse_endpoint(spec: str) -> tuple[bytes, bytes, dict[bytes, bytes]]:
     return carrier, uri, opts
 
 
-_DIALERS: dict[bytes, Callable[..., bytes]] = {UNIX: _unix.dial, HTTP: _http.dial}
-_SERVERS: dict[bytes, Callable[[], Server]] = {UNIX: _unix.UnixServer, HTTP: _http.HttpServer}
+_DIALERS: dict[bytes, Callable[..., bytes]] = {
+    UNIX: _unix.dial,
+    HTTP: _http.dial,
+    INPROC: inproc.dial,
+}
+_SERVERS: dict[bytes, Callable[[], Server]] = {
+    UNIX: _unix.UnixServer,
+    HTTP: _http.HttpServer,
+    INPROC: inproc.InprocServer,
+}
 
 
 def dial(scheme: bytes, uri: str, payload: bytes, *, timeout: float = 5.0) -> bytes:

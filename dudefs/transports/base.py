@@ -18,6 +18,8 @@ type Handler = Callable[[bytes], bytes | None]
 # Carrier schemes — the `transport` field of an ENDPOINT record (transport, uri, opts).
 UNIX = b"unix"  # a local unix-domain socket
 HTTP = b"http"  # a plain-HTTP endpoint (LAN / behind a trusted terminator or Tor)
+INPROC = b"inproc"  # an in-process carrier: dial() calls the target's Handler directly
+# (no sockets) — drives the REAL serve/gossip path in one thread for deterministic tests
 
 SEALED = b"sealed"  # the L_msg profile modifier (seal the envelope before dialing)
 

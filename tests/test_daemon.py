@@ -38,6 +38,39 @@ def _daemon(w, i, roster):
     )
 
 
+class TestInprocCluster(unittest.TestCase):
+    def test_real_gossip_converges_over_the_inproc_carrier(self):
+        # WP-I: drive the REAL serve -> gossip_round -> apply_delta path of 3 daemons
+        # wired together in ONE thread over the inproc carrier (no sockets, no threads,
+        # deterministic). A submit to node 0 propagates to 1 and 2 through PRODUCTION
+        # gossip — not the sim's direct store merge. This is the seam compaction
+        # lifecycle tests move onto (adopt/gossip driven through the real daemon).
+        w = World(seed=20, n_clients=1)
+        roster = [C.SIGNER.public(bytes([200 + i] * 32)) for i in range(3)]
+        daemons = [_daemon(w, i, roster) for i in range(3)]
+        for i, d in enumerate(daemons):
+            transports.inproc.register(roster[i].hex(), d.serve)
+        for i, d in enumerate(daemons):
+            d.peers = [
+                Peer(roster[j], transports.Endpoint(transports.INPROC, roster[j].hex()))
+                for j in range(3)
+                if j != i
+            ]
+        try:
+            op = w.blind(0, [], [[A.Mutation.SET, b"k", b"v"]])
+            self.assertIsInstance(daemons[0].acc.on_submit(op, 100), A.Receipt)
+            for _ in range(3):  # sweep to a fixpoint
+                for d in daemons:
+                    d.sync_once()
+            for d in daemons[1:]:  # the other two acquired the op via real gossip
+                with d.store.read_txn() as tx:
+                    self.assertIsNotNone(tx.get_op(op.op_hash))
+        finally:
+            for i, d in enumerate(daemons):
+                transports.inproc.unregister(roster[i].hex())
+                d.close()
+
+
 class TestDaemonGossip(unittest.TestCase):
     # Gossip end-to-end over real carriers is covered by TestDaemonPeerSockets (unix)
     # and TestMixedTransportCluster (unix↔http); gossip_round now dials via a Link.
