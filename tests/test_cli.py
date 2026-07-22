@@ -11,7 +11,6 @@ import threading
 import time
 import unittest
 
-from dudefs import artifacts as A
 from dudefs import crypto as C
 from dudefs import transports
 from dudefs.cli import ManagerState, main
@@ -63,10 +62,11 @@ class TestManagerCommands(unittest.TestCase):
                 ]
             )
             self.assertEqual(code, 0)
-            # the control.log holds a decodable CERT_ISSUE naming the subject
-            with open(os.path.join(d, "control.log")) as f:
-                raw = bytes.fromhex(f.readlines()[-1].strip())
-            body = ctl.decode(A.Op.from_bytes(raw))
+            # the control log (now the manager ChainStore) holds a decodable CERT_ISSUE
+            st = ManagerState.load(d)
+            with st.store.read_txn() as tx:
+                last = max(tx.all_ops(), key=lambda o: o.seq)
+            body = ctl.decode(last)
             assert isinstance(body, ctl.CertIssue)
             self.assertEqual(body.subject, client_pub)
 
@@ -138,7 +138,7 @@ class TestRecoverInterlock(unittest.TestCase):
             # stand up a real 3-node roster on sockets and point the state at them
             sks = [bytes([200 + i] * 32) for i in range(3)]
             roster = [C.SIGNER.public(s) for s in sks]
-            nodes, addrs = [], {}
+            nodes = []
             for i in range(3):
                 path = os.path.join(d, f"node{i}.sock")
                 nd = NodeDaemon(
@@ -153,10 +153,10 @@ class TestRecoverInterlock(unittest.TestCase):
                 threading.Thread(target=nd.serve_forever, args=(path, ev), daemon=True).start()
                 self.assertTrue(ev.wait(2))
                 nodes.append(nd)
-                addrs[roster[i].hex()] = transports.Endpoint(transports.UNIX, path)
-            st.roster = roster
-            st.node_addrs = addrs
-            st.save()
+                # publish a durable ENDPOINT op so the reloaded CLI manager can dial it
+                rec = [(transports.UNIX, path.encode(), {})]
+                st.author_control(ctl.endpoint_body(roster[i], rec))
+            st._set_meta(roster_seed=[p.hex() for p in roster])  # seat the genesis roster
 
             code, out, err = _run(["recover", "--dir", d, "--dwell", "0.3"])
             self.assertEqual(code, 3)  # REFUSE_RECOVER
@@ -178,10 +178,11 @@ class TestRecoverInterlock(unittest.TestCase):
             )
             self.assertEqual(code, 0)
             self.assertIn("recovery fence AUTHORED", out)
-            # the control.log's last op is a ROSTER carrying the recovery pairing
-            with open(os.path.join(d, "control.log")) as f:
-                raw = bytes.fromhex(f.readlines()[-1].strip())
-            body = ctl.decode(A.Op.from_bytes(raw))
+            # the log's last op is a ROSTER carrying the recovery pairing
+            st = ManagerState.load(d)
+            with st.store.read_txn() as tx:
+                last = max(tx.all_ops(), key=lambda o: o.seq)
+            body = ctl.decode(last)
             assert isinstance(body, ctl.Roster)
             self.assertIsNotNone(body.recovery)  # names the recovery checkpoint
             self.assertEqual(ManagerState.load(d).epoch, 1)  # epoch advanced

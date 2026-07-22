@@ -259,7 +259,7 @@ def cmd_recover(args: argparse.Namespace) -> int:
     print("\ndata-loss acknowledged — recovery fence AUTHORED:")
     print(f"  recovery checkpoint: {ckpt.op_hash.hex()}  (horizon {report.salvage.as_tuple()})")
     print(f"  recovery roster op:  {rop.op_hash.hex()}  -> epoch {m.state.epoch}")
-    print("  distribute control.log to the survivors; they park the old epoch on sight.")
+    print("  gossip the recovery ops to the survivors; they park the old epoch on sight.")
     return OK
 
 

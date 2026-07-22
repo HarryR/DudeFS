@@ -15,10 +15,11 @@ from enum import Enum, auto
 
 from . import artifacts as A
 from . import crypto as C
-from . import transports
+from . import fold, transports
 from .artifacts import HLC, QC, FrontierBundle, Heads, Op, Receipt, quorum_size
 from .handlers import control as ctl
 from .node import AcceptReq, FrontierReq, PutQCReq, Request, Response, RosterAcceptReq
+from .store import ChainStore, ReadTxn
 
 # rpc(node_pub, req) -> the node's response (or None if unreachable) — the injected
 # node transport (the CLI wires sockets over node_addrs; tests wire in-process
@@ -37,114 +38,142 @@ class ManagerError(Exception):
 # --------------------------------------------------------------------------- #
 
 
-@dataclass
 class ManagerState:
-    """The manager's durable set under a state dir: the root key, genesis identity,
-    the roster + endpoints, per-keyepoch group masters, the issued-cert inventory,
-    and the manager's own control-chain head. Idempotent + resumable (MANAGER §2):
-    the control log is the append-only record."""
+    """The manager's durable set under a state dir. The control log lives in a
+    `ChainStore` (`control.db`) — the authoritative, transactional, append-only record
+    (WP-0). The VIEW (roster/epoch/keyepoch/certs/node_addrs/chain-head) is DERIVED by
+    folding that log with the same `ControlState` nodes use, so it can never hand-
+    diverge from the log. Only the non-derivable state persists outside the fold:
+    `masters` (secret) and `learners` (local intent) in the store's `meta` table
+    (transactional with the log), and `root_key` in a 0600 file. Idempotent + resumable
+    (MANAGER §2): reload re-folds the log to the same view."""
 
-    dir: str
-    root_key: bytes
-    manager_pub: bytes
-    epoch: int
-    keyepoch: int
-    mseq: int
-    mprev: bytes
-    mhlc: int
-    roster: list[bytes]  # voting node pubkeys
-    learners: list[bytes]  # added, not yet promoted
-    node_addrs: dict[str, transports.Endpoint]  # node pubkey hex -> dial Endpoint (summary)
-    masters: dict[int, bytes]  # keyepoch -> 32-byte group master
-    certs: list[dict]  # [{subject hex, caps [str], epoch, revoked bool}]
+    def __init__(self, dir: str, store: ChainStore, root_key: bytes, manager_pub: bytes):
+        self.dir = dir
+        self.store = store
+        self.root_key = root_key
+        self.manager_pub = manager_pub
+        self._refold()
 
     @staticmethod
-    def _paths(d: str) -> tuple[str, str, str]:
-        return (
-            os.path.join(d, "state.json"),
-            os.path.join(d, "root.key"),
-            os.path.join(d, "control.log"),
-        )
+    def _paths(d: str) -> tuple[str, str]:
+        return os.path.join(d, "control.db"), os.path.join(d, "root.key")
 
     @staticmethod
     def exists(d: str) -> bool:
-        return os.path.exists(ManagerState._paths(d)[0])
+        return os.path.exists(ManagerState._paths(d)[1])
 
     @classmethod
     def load(cls, d: str) -> ManagerState:
-        state_p, key_p, _ = cls._paths(d)
+        db_p, key_p = cls._paths(d)
         with open(key_p, "rb") as f:
             root_key = f.read()
-        with open(state_p) as f:
-            s = json.load(f)
-        return cls(
-            dir=d,
-            root_key=root_key,
-            manager_pub=bytes.fromhex(s["manager_pub"]),
-            epoch=s["epoch"],
-            keyepoch=s["keyepoch"],
-            mseq=s["mseq"],
-            mprev=bytes.fromhex(s["mprev"]),
-            mhlc=s["mhlc"],
-            roster=[bytes.fromhex(h) for h in s["roster"]],
-            learners=[bytes.fromhex(h) for h in s["learners"]],
-            node_addrs={
-                h: transports.Endpoint(a["t"].encode(), a["u"], a["s"])
-                for h, a in s["node_addrs"].items()
-            },
-            masters={int(k): bytes.fromhex(v) for k, v in s["masters"].items()},
-            certs=s["certs"],
+        return cls(d, ChainStore(db_p), root_key, C.SIGNER.public(root_key))
+
+    # ---- non-derivable persistence (secrets + local intent) in store meta --- #
+    @staticmethod
+    def _meta[T](tx: ReadTxn, key: str, default: T) -> T:
+        raw = tx.get_meta(key)
+        return json.loads(raw) if raw else default
+
+    def _set_meta(self, **kv: object) -> None:
+        """Persist one or more meta values (JSON) in a single transaction, then
+        re-derive the view."""
+        with self.store.write_txn() as tx:
+            for k, v in kv.items():
+                tx.set_meta(k, json.dumps(v).encode())
+        self._refold()
+
+    # ---- the folded view (never hand-mutated) ----------------------------- #
+    def _refold(self) -> None:
+        cs = fold.ControlState(self.manager_pub)
+        certs: list[dict] = []
+        with self.store.read_txn() as tx:
+            # the manager is the sole author, so its ops fold in hlc (= authoring) order.
+            ops = sorted(tx.all_ops(), key=lambda o: (o.hlc.as_tuple(), o.op_hash))
+            for op in ops:
+                body = ctl.decode(op) if op.is_control else None
+                if body is None:
+                    continue
+                cs.apply_control(op, body)
+                if isinstance(body, ctl.CertIssue):
+                    certs.append(
+                        {
+                            "subject": body.subject.hex(),
+                            "caps": [c.decode() for c in body.caps],
+                            "epoch": body.epoch,
+                            "revoked": False,
+                        }
+                    )
+                elif isinstance(body, ctl.CertRevoke):
+                    for c in certs:
+                        if c["subject"] == body.subject.hex():
+                            c["revoked"] = True
+            roster_seed = self._meta(tx, "roster_seed", [])
+            self.masters = {
+                int(k): bytes.fromhex(v) for k, v in self._meta(tx, "masters", {}).items()
+            }
+            self.learners = [bytes.fromhex(h) for h in self._meta(tx, "learners", [])]
+            head = max(ops, key=lambda o: o.seq, default=None)
+        # roster comes from ROSTER ops once any exist; before that, the genesis seed.
+        self.roster = (
+            list(cs.roster) if cs.roster is not None else [bytes.fromhex(h) for h in roster_seed]
         )
+        self.epoch = cs.epoch
+        self.keyepoch = cs.active_keyepoch
+        self.certs = certs
+        # node_addrs: the first advertised dial Endpoint per node (matches the daemon/
+        # client "take the first" preference), keyed by pubkey hex.
+        self.node_addrs = {pub.hex(): eps[0] for pub, eps in cs.endpoints.items() if eps}
+        if head is not None:
+            self.mseq, self.mprev, self.mhlc = head.seq + 1, head.op_hash, head.hlc.wall_ms
+        else:
+            self.mseq, self.mprev, self.mhlc = 0, A.GENESIS_PREV, 0
 
-    def save(self) -> None:
-        state_p, key_p, _ = self._paths(self.dir)
-        if not os.path.exists(key_p):
-            with open(os.open(key_p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb") as f:
-                f.write(self.root_key)
-        blob = {
-            "manager_pub": self.manager_pub.hex(),
-            "epoch": self.epoch,
-            "keyepoch": self.keyepoch,
-            "mseq": self.mseq,
-            "mprev": self.mprev.hex(),
-            "mhlc": self.mhlc,
-            "roster": [p.hex() for p in self.roster],
-            "learners": [p.hex() for p in self.learners],
-            "node_addrs": {
-                h: {"t": ep.transport.decode(), "u": ep.uri, "s": ep.sealed}
-                for h, ep in self.node_addrs.items()
-            },
-            "masters": {str(k): v.hex() for k, v in self.masters.items()},
-            "certs": self.certs,
-        }
-        tmp = state_p + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(blob, f, indent=2)
-        os.replace(tmp, state_p)  # atomic
-
-    def author_control(self, payload: bytes, slot_tag: bytes | None = None) -> Op:
-        """Build, persist, and record one root-signed control op, advancing the
-        manager chain. Appended to control.log (the distribution/audit record). A
-        `slot_tag` puts the op on a public slot (e.g. the roster slot, B4) so the
-        old roster's single-decree machinery serializes crash-retries."""
-        self.mhlc += 1
-        op = A.Op.build(
+    def build_control(self, payload: bytes, slot_tag: bytes | None = None) -> Op:
+        """Build one root-signed control op from the current chain head WITHOUT
+        persisting it. A roster change builds its op to send to nodes for ratification,
+        but persists to the manager's own log only once the joint cert succeeds — an
+        unratified change must not flip the derived view. `slot_tag` puts the op on a
+        public slot (the roster slot, B4) so the old roster's single-decree machinery
+        serializes crash-retries (a retry rebuilds the identical op — head is unchanged
+        until persist)."""
+        return A.Op.build(
             author_sk=self.root_key,
             author_pub=self.manager_pub,
             cls_=A.OpClass.CONTROL,
             seq=self.mseq,
             prev=self.mprev,
-            hlc=A.HLC(self.mhlc, 0),
+            hlc=A.HLC(self.mhlc + 1, 0),
             deps=[],
             authz=b"root",
             keyepoch=self.keyepoch,
             payload=payload,
             slot_tag=slot_tag,
         )
-        self.mseq += 1
-        self.mprev = op.op_hash
-        with open(self._paths(self.dir)[2], "a") as f:
-            f.write(op.raw.hex() + "\n")
+
+    def persist(self, op: Op, *, meta: dict[str, object] | None = None) -> None:
+        """Commit an op to the log — plus any `meta` (secret/intent that must land
+        atomically with it, e.g. a rotate's new master) — in ONE write transaction, then
+        re-derive the view. A crash leaves log and view consistent because the view IS
+        the log."""
+        with self.store.write_txn() as tx:
+            tx.put_op_raw(op)
+            for k, v in (meta or {}).items():
+                tx.set_meta(k, json.dumps(v).encode())
+        self._refold()
+
+    def author_control(
+        self,
+        payload: bytes,
+        slot_tag: bytes | None = None,
+        *,
+        meta: dict[str, object] | None = None,
+    ) -> Op:
+        """Build + persist one root-signed control op (the common case: the op is
+        effective the moment it is authored — certs, endpoints, rotate, fiat recovery)."""
+        op = self.build_control(payload, slot_tag)
+        self.persist(op, meta=meta)
         return op
 
     def members(self) -> list[bytes]:
@@ -232,26 +261,16 @@ class Manager:
             os.open(os.path.join(d, "node0.key"), os.O_WRONLY | os.O_CREAT, 0o600), "wb"
         ) as f:
             f.write(node_key)
+        db_p, key_p = ManagerState._paths(d)
+        with open(os.open(key_p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb") as f:
+            f.write(root_key)
+        store = ChainStore(db_p)
+        with store.write_txn() as tx:  # seed the non-derivable genesis state (one txn)
+            tx.set_meta("masters", json.dumps({"0": os.urandom(32).hex()}).encode())  # finding 21
+            tx.set_meta("learners", json.dumps([]).encode())
+            tx.set_meta("roster_seed", json.dumps([node_pub.hex()]).encode())  # genesis roster
+        m = cls(ManagerState(d, store, root_key, C.SIGNER.public(root_key)))
         seed_rec = transports.parse_endpoint(node_addr) if node_addr else None  # decompose ONCE
-        st = ManagerState(
-            dir=d,
-            root_key=root_key,
-            manager_pub=C.SIGNER.public(root_key),
-            epoch=0,
-            keyepoch=0,
-            mseq=0,
-            mprev=A.GENESIS_PREV,
-            mhlc=0,
-            roster=[node_pub],
-            learners=[],
-            node_addrs=(
-                {node_pub.hex(): transports.Endpoint.from_record(*seed_rec)} if seed_rec else {}
-            ),
-            masters={0: os.urandom(32)},  # epoch-0 group master (finding 21 derives from it)
-            certs=[],
-        )
-        st.save()
-        m = cls(st)
         if seed_rec is not None:  # genesis seed endpoint — the mesh's bootstrap record
             m.set_endpoint(node_pub, [seed_rec])
         return m
@@ -272,26 +291,13 @@ class Manager:
         if not C.verify_possession(subject, pop):
             raise ManagerError("proof-of-possession failed: subject does not hold the key")
         caps = self._CAP_FOR[kind]
-        op = self.state.author_control(ctl.cert_issue_body(subject, caps, self.state.epoch))
-        self.state.certs.append(
-            {
-                "subject": subject.hex(),
-                "caps": [c.decode() for c in caps],
-                "epoch": self.state.epoch,
-                "revoked": False,
-            }
-        )
-        self.state.save()
-        return op
+        # the CERT_ISSUE op IS the record; the certs view re-derives from the log.
+        return self.state.author_control(ctl.cert_issue_body(subject, caps, self.state.epoch))
 
     def cert_revoke(self, subject: bytes, *, rotate: bool = True) -> list[Op]:
         """Revoke a cert; STAGE a rotation by default (revocation without rotation is
         a foot-gun — the revoked key still opens the current group key, MANAGER §2)."""
         ops = [self.state.author_control(ctl.cert_revoke_body(subject))]
-        for c in self.state.certs:
-            if c["subject"] == subject.hex():
-                c["revoked"] = True
-        self.state.save()
         if rotate:
             ops += self.rotate()
         return ops
@@ -302,11 +308,13 @@ class Manager:
         new_ke = self.state.keyepoch + 1
         master = os.urandom(32)
         members = self.state.members()
-        self.state.masters[new_ke] = master
-        wrap_op = self.state.author_control(ctl.sealed_wrap_set_body(new_ke, master, members))
-        self.state.keyepoch = new_ke
-        rot_op = self.state.author_control(ctl.rotate_body(new_ke))
-        self.state.save()
+        masters = {str(k): v.hex() for k, v in {**self.state.masters, new_ke: master}.items()}
+        # the new master (secret) lands ATOMICALLY with its wrap-set op — a crash never
+        # leaves a wrap-set whose master the manager forgot (or vice versa).
+        wrap_op = self.state.author_control(
+            ctl.sealed_wrap_set_body(new_ke, master, members), meta={"masters": masters}
+        )
+        rot_op = self.state.author_control(ctl.rotate_body(new_ke))  # keyepoch derives from it
         return [wrap_op, rot_op]
 
     # ---- membership ----------------------------------------------------- #
@@ -325,11 +333,10 @@ class Manager:
     def node_add(self, pub: bytes, addr: str = "") -> None:
         if pub in self.state.roster or pub in self.state.learners:
             raise ManagerError("already a member/learner")
-        self.state.learners.append(pub)
+        # learners are local intent (no control op); node_addrs derives from the
+        # ENDPOINT op published below.
+        self.state._set_meta(learners=[p.hex() for p in [*self.state.learners, pub]])
         rec = transports.parse_endpoint(addr) if addr else None  # decompose ONCE
-        if rec is not None:
-            self.state.node_addrs[pub.hex()] = transports.Endpoint.from_record(*rec)
-        self.state.save()
         if rec is not None:  # publish a control-plane reachability record (PROTOCOL §7)
             self.set_endpoint(pub, [rec])
 
@@ -338,9 +345,7 @@ class Manager:
     ) -> Op:
         """Author a root-signed ENDPOINT record for `subject` (PROTOCOL §7 / NOTES
         58): latest-wins per subject; empty `addrs` removes the node. Root-only."""
-        op = self.state.author_control(ctl.endpoint_body(subject, addrs))
-        self.state.save()
-        return op
+        return self.state.author_control(ctl.endpoint_body(subject, addrs))
 
     def node_promote(self, pub: bytes, rpc: NodeRPC) -> RosterChange:
         """Promote a learner to voting. Refuses an even voting roster client-side
@@ -355,8 +360,7 @@ class Manager:
                 "quorum intersection needs odd n"
             )
         change = self.change_roster(new_roster, rpc)
-        self.state.learners.remove(pub)
-        self.state.save()
+        self.state._set_meta(learners=[p.hex() for p in self.state.learners if p != pub])
         return change
 
     def node_replace(self, old: bytes, new: bytes, rpc: NodeRPC) -> RosterChange:
@@ -403,7 +407,9 @@ class Manager:
         epoch, new_epoch = self.state.epoch, self.state.epoch + 1
         sf = self.read_sync_frontier(old_roster, rpc)
         tag = A.roster_slot_tag(epoch)
-        op = self.state.author_control(ctl.roster_body(epoch, new_roster, sf), slot_tag=tag)
+        # BUILD the op for ratification; persist to the manager log only once BOTH QCs
+        # assemble — an unratified change must not flip the derived roster/epoch view.
+        op = self.state.build_control(ctl.roster_body(epoch, new_roster, sf), slot_tag=tag)
         ballot = A.Ballot(1, A.slot_priority(tag, self.state.manager_pub))
 
         old_qc = self._gather(
@@ -418,9 +424,7 @@ class Manager:
         )
         for pub in {*old_roster, *new_roster}:  # distribute the joint certificate
             rpc(pub, PutQCReq(new_qc))
-        self.state.roster = new_roster
-        self.state.epoch = new_epoch
-        self.state.save()
+        self.state.persist(op)  # ratified: NOW record it -> roster + epoch derive from it
         return RosterChange(op, old_qc, new_qc)
 
     @staticmethod
@@ -489,7 +493,5 @@ class Manager:
         rop = self.state.author_control(
             ctl.roster_body(self.state.epoch, survivors, {}, recovery=ckpt.op_hash)
         )
-        self.state.epoch += 1
-        self.state.roster = survivors
-        self.state.save()
+        # epoch + roster derive from the recovery ROSTER op — no hand-set.
         return [ckpt, rop]

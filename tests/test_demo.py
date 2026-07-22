@@ -211,7 +211,7 @@ class TestDemoRunbook(unittest.TestCase):
             m = Manager.init(d)
             keys = [(C.SIGNER.public(bytes([i] * 32)), bytes([i] * 32)) for i in (21, 22, 23)]
             roster = [k[0] for k in keys]
-            m.state.roster = list(roster)
+            m.state._set_meta(roster_seed=[p.hex() for p in roster])  # seat genesis roster
             old = roster[2]
             m.cert_issue("node", old, C.prove_possession(keys[2][1]))  # retiring node had STORE
             m.cert_revoke(old, rotate=False)  # the old key is untrusted
@@ -254,12 +254,9 @@ class TestDemoRunbook(unittest.TestCase):
             # a manager whose state points at the (now mostly-dead) cluster
             with tempfile.TemporaryDirectory() as md:
                 m = Manager.init(md)
-                m.state.roster = demo.roster
-                m.state.node_addrs = {
-                    demo.roster[i].hex(): transports.Endpoint(transports.UNIX, demo.paths[i])
-                    for i in range(3)
-                }
-                m.state.save()
+                m.state._set_meta(roster_seed=[p.hex() for p in demo.roster])  # genesis roster
+                for i in range(3):  # publish real ENDPOINT ops -> node_addrs derives
+                    m.set_endpoint(demo.roster[i], [(transports.UNIX, demo.paths[i].encode(), {})])
                 demo.kill_node(1)
                 demo.kill_node(2)  # only node0 survives -> below quorum
 

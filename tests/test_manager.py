@@ -173,8 +173,10 @@ class TestManagerOps(unittest.TestCase):
                 m.node_add(m.state.roster[0])  # already a voting member
 
     def _control_log(self, d):
-        with open(f"{d}/control.log") as f:
-            return [A.Op.from_bytes(bytes.fromhex(line.strip())) for line in f]
+        # the control log is the manager ChainStore now; return ops in authoring order
+        st = ManagerState.load(d)
+        with st.store.read_txn() as tx:
+            return sorted(tx.all_ops(), key=lambda o: o.seq)
 
     def test_node_add_with_addr_authors_an_endpoint(self):
         with tempfile.TemporaryDirectory() as d:
