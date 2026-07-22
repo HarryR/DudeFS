@@ -147,7 +147,11 @@ class TestEpochBridge(unittest.TestCase):
         tag, b = op.slot_tag, A.Ballot(1, b"x")
         for nd in nodes:
             self.assertIsInstance(nd.on_accept(tag, b, op, NOW), A.Receipt)
-        qc0 = A.QC.assemble([nd.store.receipts_for(op.op_hash)[0] for nd in nodes], 3, idx)
+        recs0 = []
+        for nd in nodes:
+            with nd.store.read_txn() as tx:
+                recs0.append(tx.receipts_for(op.op_hash)[0])
+        qc0 = A.QC.assemble(recs0, 3, idx)
         self.assertEqual(qc0.config_epoch, 0)
         self.assertTrue(qc0.verify(roster))
 
@@ -159,7 +163,8 @@ class TestEpochBridge(unittest.TestCase):
         self.assertEqual(qc1.config_epoch, 1)
         self.assertTrue(qc1.verify(roster))  # fresh single-epoch QC under e+1
         for nd in nodes:  # slot state carried across the epoch untouched
-            self.assertEqual(nd.store.get_slot(tag).accepted_op, op.op_hash)
+            with nd.store.read_txn() as tx:
+                self.assertEqual(tx.get_slot(tag).accepted_op, op.op_hash)
 
 
 class TestRecoveryFence(unittest.TestCase):
@@ -304,7 +309,8 @@ class TestPossessionBarrier(unittest.TestCase):
         w = World(seed=3, n_clients=1)
         base = w.blind(0, [], [[A.Mutation.SET, b"k", b"v"]])  # a committed op ≤ the frontier
         sf = {base.author: (0, base.op_hash)}
-        nodes[0].store.append(base)  # node 0 is caught up; node 1 is not
+        with nodes[0].store.write_txn() as tx:
+            tx.append(base)  # node 0 is caught up; node 1 is not
         self.assertTrue(nodes[0].holds_frontier(sf))
         self.assertFalse(nodes[1].holds_frontier(sf))
 
@@ -327,7 +333,8 @@ class TestPossessionBarrier(unittest.TestCase):
         w = World(seed=6, n_clients=1)
         base = w.blind(0, [], [[A.Mutation.SET, b"k", b"v"]])
         sf = {base.author: (0, base.op_hash)}
-        nodes[0].store.append(base)  # the incumbent holds the frontier
+        with nodes[0].store.write_txn() as tx:
+            tx.append(base)  # the incumbent holds the frontier
         self.assertFalse(nodes[1].holds_frontier(sf))  # fresh learner: empty
         gossip.merge(nodes[1].store, nodes[0].store)  # anti-entropy catch-up
         self.assertTrue(nodes[1].holds_frontier(sf))  # now honestly caught up
@@ -374,7 +381,8 @@ class TestRosterActivation(unittest.TestCase):
         base = w.blind(0, [], [[A.Mutation.SET, b"k", b"v"]])
         sf = {base.author: (0, base.op_hash)}
         for nd in nodes:  # every new-roster node is caught up to the sync frontier
-            nd.store.append(base)
+            with nd.store.write_txn() as tx:
+                tx.append(base)
 
         msk, mpub = _key(90)
         rop = _roster_op(msk, mpub, roster3, sf)
@@ -518,7 +526,8 @@ class TestEpochPersistence(unittest.TestCase):
             acc = self._acc(s, config_epoch=0)
             acc.activate_epoch(1)
             self.assertEqual(acc.epoch, 1)
-            self.assertEqual(s.get_epoch(), 1)  # persisted single-writer
+            with s.read_txn() as tx:
+                self.assertEqual(tx.get_epoch(), 1)  # persisted single-writer
             s.close()
 
             # reopen: the constructor seed (0) is IGNORED — persisted epoch 1 wins,
@@ -533,7 +542,8 @@ class TestEpochPersistence(unittest.TestCase):
     def test_virgin_store_uses_constructor_seed(self):
         with tempfile.TemporaryDirectory() as d:
             s = ChainStore(os.path.join(d, "store.db"))
-            self.assertIsNone(s.get_epoch())  # nothing activated yet
+            with s.read_txn() as tx:
+                self.assertIsNone(tx.get_epoch())  # nothing activated yet
             self.assertEqual(self._acc(s, config_epoch=2).epoch, 2)  # seed wins on virgin
             s.close()
 

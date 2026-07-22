@@ -145,13 +145,16 @@ class TestMistakenRecovery(unittest.TestCase):
         ckpt, _rop = _recovery_pair(msk, mpub, [sim.roster[0]])
         # an auditor holds the orphaned QC and the recovery fence; it discloses
         store = sim.raw[0].acc.store
-        store.put_qc(r.outcome.qc)
-        proofs = store.detect_lost_commits(1, ckpt.op_hash, frozenset())  # retained = {}
+        with store.write_txn() as tx:
+            tx.put_qc(r.outcome.qc)
+            proofs = tx.detect_lost_commits(1, ckpt.op_hash, frozenset())  # retained = {}
         self.assertEqual(len(proofs), 1)
         self.assertEqual(proofs[0].qc.op_hash, op.op_hash)
         self.assertTrue(proofs[0].verify(sim.roster, frozenset()))  # genuine, orphaned
-        self.assertTrue(any(k == EvidenceKind.LOST_COMMIT for k, _ in store.evidence()))
-        self.assertEqual(store.detect_lost_commits(1, ckpt.op_hash, frozenset()), [])  # idempotent
+        with store.read_txn() as tx:
+            self.assertTrue(any(k == EvidenceKind.LOST_COMMIT for k, _ in tx.evidence()))
+        with store.write_txn() as tx:
+            self.assertEqual(tx.detect_lost_commits(1, ckpt.op_hash, frozenset()), [])  # idempotent
 
     def test_recovery_fence_is_root_only_under_partition(self):
         # a DELEGATE cannot fiat-activate even while partitioned (WP1.7 root-only,
@@ -185,7 +188,8 @@ class TestFumblingManager(unittest.TestCase):
             rs.append(acc2.on_roster_accept(rop.slot_tag, b, rop, {}, 1, NOW))
             self.assertTrue(all(isinstance(r, A.Receipt) for r in rs))
             self.assertEqual(len({r.sig for r in rs if isinstance(r, A.Receipt)}), 1)  # one receipt
-            self.assertEqual(acc2.store.get_slot(rop.slot_tag).accepted_op, rop.op_hash)
+            with acc2.store.read_txn() as tx:
+                self.assertEqual(tx.get_slot(rop.slot_tag).accepted_op, rop.op_hash)
 
     def test_double_press_exactly_one_activates_across_crash(self):
         # two DIFFERENT roster ops for one from_epoch (a crashed-and-retried manager
@@ -232,13 +236,15 @@ class TestAmnesiacManager(unittest.TestCase):
         o0 = w._mgr_op(ctl.roster_body(0, [px], {}))  # seq 0
         o1 = w._mgr_op(ctl.roster_body(1, [py], {}))  # seq 1 — the amnesia PROCEDURE
         store = ChainStore()
-        self.assertTrue(store.append(o0))
-        self.assertTrue(store.append(o1))
-        self.assertEqual(store.evidence(), [])  # fresh-seq continuation: no fork
+        with store.write_txn() as tx:
+            self.assertTrue(tx.append(o0))
+            self.assertTrue(tx.append(o1))
+            self.assertEqual(tx.evidence(), [])  # fresh-seq continuation: no fork
 
         w._mseq, w._mprev = 0, A.GENESIS_PREV  # WITHOUT the procedure: forget + rewind
         o0b = w._mgr_op(ctl.roster_body(0, [pz], {}))  # seq 0 again, different -> FORK
-        res = store.append(o0b)
+        with store.write_txn() as tx:
+            res = tx.append(o0b)
         self.assertEqual(res.status, AppendStatus.FORK)
         assert res.evidence is not None
         self.assertEqual(res.evidence.seq, 0)
@@ -277,7 +283,9 @@ class TestButtonMasher(unittest.TestCase):
             self.assertTrue(sim.converged(), f"seed {seed}: heal did not converge")
             # every assembled double vote is a TRUE accusation against the persona;
             # an all-honest run mints nothing.
-            for pf in sim.raw[1].acc.store.detect_double_votes():
+            with sim.raw[1].acc.store.write_txn() as _tx:
+                _dvs = _tx.detect_double_votes()
+            for pf in _dvs:
                 self.assertTrue(pf.verify())
                 self.assertEqual(pf.signer, sim.roster[0])
             if not has_persona:
@@ -288,15 +296,20 @@ class TestButtonMasher(unittest.TestCase):
                 wms = [sim.raw[i].acc.issue_watermark(10_000_000) for i in range(3)]
                 for i in range(3):
                     st = sim.raw[i].acc.store
-                    self.assertEqual(
-                        st.detect_floor_perjury(wms), [], f"seed {seed}: FALSE floor-perjury n{i}"
-                    )
-                    # finding 18a: the generalized seq-reuse detector (receipts +
-                    # observed watermarks) must not fire on an honest gapless chain.
-                    self.assertEqual(
-                        st.detect_seq_reuse(wms), [], f"seed {seed}: FALSE seq-reuse n{i}"
-                    )
-                    self.assertTrue(st.issuance_gapless(), f"seed {seed}: gap in honest chain n{i}")
+                    with st.write_txn() as tx:
+                        self.assertEqual(
+                            tx.detect_floor_perjury(wms),
+                            [],
+                            f"seed {seed}: FALSE floor-perjury n{i}",
+                        )
+                        # finding 18a: the generalized seq-reuse detector (receipts +
+                        # observed watermarks) must not fire on an honest gapless chain.
+                        self.assertEqual(
+                            tx.detect_seq_reuse(wms), [], f"seed {seed}: FALSE seq-reuse n{i}"
+                        )
+                        self.assertTrue(
+                            tx.issuance_gapless(), f"seed {seed}: gap in honest chain n{i}"
+                        )
 
 
 if __name__ == "__main__":

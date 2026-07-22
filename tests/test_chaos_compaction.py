@@ -42,18 +42,26 @@ class TestMixedLazinessGC(unittest.TestCase):
         cr = compactor.compact_genesis(below, w.keyring, w.genesis, cut)
         committed = A.retained_commitment(cr.retained)
         for nd in sim.raw:  # every node holds the full below-cut history
-            for o in below:
-                nd.acc.store.append(o)
+            with nd.acc.store.write_txn() as tx:
+                for o in below:
+                    tx.append(o)
         sim.adopt_checkpoint(cut, committed, cr.dead)
 
         sim.gc(cr.dead, nodes=[0])  # node 0 GCs now; 1,2 stay lazy (mixed laziness)
-        digs = [nd.acc.store.baseline_commitment() for nd in sim.raw]
+        digs = []
+        for nd in sim.raw:
+            with nd.acc.store.read_txn() as tx:
+                digs.append(tx.baseline_commitment())
         self.assertTrue(all(d == committed for d in digs))  # identical despite mixed GC
 
         for _ in range(3):  # cut-aware gossip must not re-introduce the dead `first`
             sim.gossip_round()
-        self.assertIsNone(sim.raw[0].acc.store.get_op(first.op_hash))  # no oscillation
-        digs2 = [nd.acc.store.baseline_commitment() for nd in sim.raw]
+        with sim.raw[0].acc.store.read_txn() as tx:
+            self.assertIsNone(tx.get_op(first.op_hash))  # no oscillation
+        digs2 = []
+        for nd in sim.raw:
+            with nd.acc.store.read_txn() as tx:
+                digs2.append(tx.baseline_commitment())
         self.assertTrue(all(d == committed for d in digs2))  # still stable
 
         sim.gc(cr.dead, nodes=[1, 2])  # the lazy nodes finally GC
@@ -76,11 +84,13 @@ class TestStaleFrontierRoster(unittest.TestCase):
 
         nsk = bytes([230] * 32)
         acc = Acceptor(nsk, SIGNER.public(nsk), ChainStore(), config_epoch=0, delta_ms=10_000)
-        for o in below:
-            acc.store.append(o)
-        acc.store.adopt_checkpoint(cut, committed, list(cr.dead))
-        acc.store.gc_checkpoint(list(cr.dead))
-        self.assertIsNone(acc.store.get_op(first.op_hash))  # first is GC'd
+        with acc.store.write_txn() as tx:
+            for o in below:
+                tx.append(o)
+            tx.adopt_checkpoint(cut, committed, list(cr.dead))
+            tx.gc_checkpoint(list(cr.dead))
+        with acc.store.read_txn() as tx:
+            self.assertIsNone(tx.get_op(first.op_hash))  # first is GC'd
 
         rop = A.Op.build(
             author_sk=w.mgr_sk,

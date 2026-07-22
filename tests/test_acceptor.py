@@ -45,7 +45,8 @@ class TestSubmitRejectsSlotted(unittest.TestCase):
         r = self.acc.on_submit(op, NOW)
         assert isinstance(r, Rejected)  # rev 5: no fast path — propose via ballot
         self.assertEqual(r.reason, RejectReason.NEEDS_BALLOT)
-        self.assertIsNone(self.acc.store.get_op(op.op_hash))  # not stored either
+        with self.acc.store.read_txn() as tx:
+            self.assertIsNone(tx.get_op(op.op_hash))  # not stored either
 
     def test_accept_then_idempotent(self):
         # the two-phase accept path is the only way in; re-accepting the same op
@@ -127,9 +128,11 @@ class TestSkewAndFloor(unittest.TestCase):
         # advance the floor via a watermark, then a lower now must not lower it
         wm1 = self.acc.issue_watermark(NOW)
         self.assertTrue(wm1.verify())
-        f1 = self.acc.floor(NOW)
+        with self.acc.store.read_txn() as tx:
+            f1 = self.acc.floor(tx, NOW)
         wm2 = self.acc.issue_watermark(NOW - 5 * DELTA)  # clock jumps backward
-        self.assertGreaterEqual(self.acc.store.get_attested().as_tuple(), f1.as_tuple())
+        with self.acc.store.read_txn() as tx:
+            self.assertGreaterEqual(tx.get_attested().as_tuple(), f1.as_tuple())
         self.assertTrue(wm2.floor >= f1)  # never regresses
 
 
@@ -172,11 +175,12 @@ class TestSingleDecree(unittest.TestCase):
                     best = (p.accepted_ballot, p.accepted_op_hash)
         assert best is not None  # the split guarantees at least one accepted op
         chosen_hash = best[1]
-        chosen = (
-            nodes[quorum[0]].store.get_op(chosen_hash)
-            or nodes[quorum[1]].store.get_op(chosen_hash)
-            or nodes[quorum[2]].store.get_op(chosen_hash)
-        )
+
+        def _getop(nd):
+            with nd.store.read_txn() as tx:
+                return tx.get_op(chosen_hash)
+
+        chosen = _getop(nodes[quorum[0]]) or _getop(nodes[quorum[1]]) or _getop(nodes[quorum[2]])
         receipts = []
         for i in quorum:
             r = nodes[i].on_accept(tag, b, chosen, NOW)

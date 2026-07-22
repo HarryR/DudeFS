@@ -40,7 +40,7 @@ from .quorum import (
     Tick,
     Wake,
 )
-from .store import ChainStore
+from .store import ChainStore, ReadTxn, StoreClosed
 
 # A driver deadline: the sans-io machine terminates itself on max_rounds/max_polls,
 # but a hopeless drive (no quorum reachable at all) needs a wall-clock backstop.
@@ -231,19 +231,22 @@ class ClientDaemon:
         self._final_frontier = HLC(0, 0)
         self._hlc_wall = 0
         self._hlc_ctr = 0
-        for op in control_ops or []:  # the authorization chain (certs/genesis)
-            self.store.put_op_raw(op)
+        with self.store.write_txn() as tx:
+            for op in control_ops or []:  # the authorization chain (certs/genesis)
+                tx.put_op_raw(op)
         self._seq, self._prev = self._chain_head()
         # read-side freshness (finding 22): a background quorum-read pull keeps
         # `local`/`INSPECT` current with OTHER clients' committed writes; `final`
         # reads sync on demand (below). Correctness never depends on the cadence.
-        threading.Thread(target=self._refresh_loop, daemon=True).start()
+        self._refresh_thread = threading.Thread(target=self._refresh_loop, daemon=True)
+        self._refresh_thread.start()
 
     # ---- chain head + clock ------------------------------------------------ #
     def _chain_head(self) -> tuple[int, bytes]:
         """This client's next (seq, prev) — derived from its own ops in the store
         so a restart resumes the lineage (no session state)."""
-        mine = [o for o in self.store.all_ops() if o.author == self.pub]
+        with self.store.read_txn() as tx:
+            mine = [o for o in tx.all_ops() if o.author == self.pub]
         if not mine:
             return 0, A.GENESIS_PREV
         head = max(mine, key=lambda o: o.seq)
@@ -310,9 +313,15 @@ class ClientDaemon:
                 txn_bytes=txn.encode(),
                 slot_tag=slot_tag,
             )
+            with self.store.write_txn() as tx:
+                tx.put_op_raw(op)  # hold our own op so the ladder can see in-flight
+            # advance the chain head ONLY after the op is durable: a rolled-back
+            # write_txn (disk-full, store closed mid-write, lock timeout) must not leave
+            # seq/prev pointing at a never-stored op, which would GAP every later op and
+            # permanently stall the write lineage (and disagree with _chain_head on
+            # restart).
             self._seq += 1
             self._prev = op.op_hash
-            self.store.put_op_raw(op)  # hold our own op so the ladder can see in-flight
         return op
 
     # ---- the public submit path (returns immediately, drives in bg) -------- #
@@ -329,6 +338,13 @@ class ClientDaemon:
         return op.op_hash
 
     def _drive_to_final(self, op: Op) -> None:
+        try:
+            self._drive_to_final_inner(op)
+        except StoreClosed:
+            if not self._closing.is_set():
+                raise  # a genuine closed-store bug; only the shutdown race is benign
+
+    def _drive_to_final_inner(self, op: Op) -> None:
         if op.slot_tag is not None:
             outcome = _drive(Commit(self.cfg, op), self._rpc, stop=self._closing)
             if isinstance(outcome, Committed):
@@ -348,8 +364,8 @@ class ClientDaemon:
         self._finalize(op.hlc)
 
     def _store_qc(self, qc: QC) -> None:
-        with self._lock:
-            self.store.put_qc(qc)
+        with self.store.write_txn() as tx:  # store-only; the store serializes its writes
+            tx.put_qc(qc)
         self._push_qc(qc)  # best-effort: durability of the commit proof (outside the lock)
 
     def _commit_blind(self, op: Op) -> QC | None:
@@ -436,23 +452,23 @@ class ClientDaemon:
         lack, until we reach an op we already hold (below is present) or GENESIS."""
         h = head_hash
         while h and h != A.GENESIS_PREV:
-            with self._lock:
-                op = self.store.get_op(h)
+            with self.store.read_txn() as tx:  # store-only walk; RPCs happen outside any txn
+                op = tx.get_op(h)
             have = op is not None
             if op is None:
                 fetched = self._one_of(FetchOpReq(h))
                 if not isinstance(fetched, Op):
                     return  # gap we can't fill now; a later round retries
                 op = fetched
-                with self._lock:
-                    self.store.put_op_raw(op)
-            with self._lock:
-                have_qc = self.store.get_qc(h) is not None
+                with self.store.write_txn() as tx:
+                    tx.put_op_raw(op)
+            with self.store.read_txn() as tx:
+                have_qc = tx.get_qc(h) is not None
             if not have_qc:
                 qc = self._one_of(GetQCReq(h))
                 if isinstance(qc, QC):
-                    with self._lock:
-                        self.store.put_qc(qc)
+                    with self.store.write_txn() as tx:
+                        tx.put_qc(qc)
             if have:
                 return  # we already held this op — the rest of the chain is present
             h = op.prev
@@ -474,36 +490,41 @@ class ClientDaemon:
                 pass  # a transient unreachability; the next tick retries
 
     # ---- the folded read model (STATUS/GET/LIST/INSPECT derive from here) --- #
-    def _committed_ops(self, *, final_only: bool = False) -> list[Op]:
+    # Every read helper takes the caller's `tx` (one snapshot per public read) rather
+    # than opening its own: a compound view (get/list/inspect/status) folds and fences
+    # over ONE consistent snapshot, so a background _pull_chain/_store_qc committing
+    # mid-read can never make `final ⊄ provisional` or pair a value with a later fence.
+    def _committed_ops(self, tx: ReadTxn, *, final_only: bool = False) -> list[Op]:
         """The committed set the daemon holds: all control ops (the authorization
         chain) + every data op that carries a QC. `final_only` keeps only data ops
         at/under the finality frontier (the frozen view)."""
         out: list[Op] = []
-        for o in self.store.all_ops():
+        for o in tx.all_ops():
             if o.is_control:
                 out.append(o)
-            elif self.store.get_qc(o.op_hash) is not None:
+            elif tx.get_qc(o.op_hash) is not None:
                 if final_only and o.hlc > self._final_frontier:
                     continue
                 out.append(o)
         return out
 
-    def _fold(self, *, final_only: bool = False) -> fold.FoldResult:
-        return fold.fold(self._committed_ops(final_only=final_only), self.keyring, self.genesis)
+    def _fold(self, tx: ReadTxn, *, final_only: bool = False) -> fold.FoldResult:
+        return fold.fold(self._committed_ops(tx, final_only=final_only), self.keyring, self.genesis)
 
-    def _slot_winner(self, slot_tag: bytes) -> bytes | None:
+    def _slot_winner(self, tx: ReadTxn, slot_tag: bytes) -> bytes | None:
         """The op_hash committed (QC'd) for a slot tag, if any."""
-        for o in self.store.all_ops():
-            if o.slot_tag == slot_tag and self.store.get_qc(o.op_hash) is not None:
+        for o in tx.all_ops():
+            if o.slot_tag == slot_tag and tx.get_qc(o.op_hash) is not None:
                 return o.op_hash
         return None
 
     def status(self, op_hash: bytes) -> Ladder:
-        with self._lock:
-            qc = self.store.get_qc(op_hash)
+        with self._lock, self.store.read_txn() as tx:
+            qc = tx.get_qc(op_hash)
+            op = tx.get_op(op_hash)
             if qc is not None:
-                prov = self._fold().verdicts.get(op_hash)
-                is_final = qc.op_hash == op_hash and self._is_final(op_hash)
+                prov = self._fold(tx).verdicts.get(op_hash)
+                is_final = qc.op_hash == op_hash and self._is_final(tx, op_hash)
                 pv = prov.value if prov is not None else None
                 return Ladder(
                     phase="committed",
@@ -514,17 +535,16 @@ class ClientDaemon:
             lost_to = self._lost.get(op_hash)
             if lost_to is not None:
                 return Ladder(phase="lost", winner=lost_to)
-            op = self.store.get_op(op_hash)
             if op is not None and op.slot_tag is not None:
-                winner = self._slot_winner(op.slot_tag)
+                winner = self._slot_winner(tx, op.slot_tag)
                 if winner is not None and winner != op_hash:
                     return Ladder(phase="lost", winner=winner)
             if op_hash in self._exhausted:
                 return Ladder(phase="unknown")
             return Ladder(phase="in-flight")
 
-    def _is_final(self, op_hash: bytes) -> bool:
-        op = self.store.get_op(op_hash)
+    def _is_final(self, tx: ReadTxn, op_hash: bytes) -> bool:
+        op = tx.get_op(op_hash)
         return op is not None and op.hlc <= self._final_frontier
 
     def get(self, path: bytes, *, level: str = "local") -> GetView:
@@ -533,31 +553,31 @@ class ClientDaemon:
         read FIRST, so the frozen view is linearizable, not frozen-but-partial."""
         if level == "final":
             self.sync()  # on-demand §1.2 read (outside the lock — it takes it itself)
-        with self._lock:
+        with self._lock, self.store.read_txn() as tx:
             final_only = level == "final"
-            res = self._fold(final_only=final_only)
+            res = self._fold(tx, final_only=final_only)
             version, attempt = res.lineage(path)
             present = path in res.state
-            tier = "final" if (present and self._version_final(version)) else "local"
+            tier = "final" if (present and self._version_final(tx, version)) else "local"
             return {
                 "value": res.state.get(path),
                 "version": version,
                 "attempt": attempt,
                 "present": present,
-                "as_of": self._final_frontier if final_only else self._held_frontier(),
+                "as_of": self._final_frontier if final_only else self._held_frontier(tx),
                 "tier": tier,
             }
 
-    def _version_final(self, version: bytes) -> bool:
+    def _version_final(self, tx: ReadTxn, version: bytes) -> bool:
         if version == A.VERSION_ABSENT:
             return False
-        setter = self.store.get_op(version)
+        setter = tx.get_op(version)
         return setter is not None and setter.hlc <= self._final_frontier
 
-    def _held_frontier(self) -> HLC:
+    def _held_frontier(self, tx: ReadTxn) -> HLC:
         hi = HLC(0, 0)
-        for o in self.store.all_ops():
-            if not o.is_control and self.store.get_qc(o.op_hash) is not None and o.hlc > hi:
+        for o in tx.all_ops():
+            if not o.is_control and tx.get_qc(o.op_hash) is not None and o.hlc > hi:
                 hi = o.hlc
         return hi
 
@@ -566,8 +586,8 @@ class ClientDaemon:
     ) -> list[ListEntry]:
         if level == "final":
             self.sync()  # linearizable prefix scan (ZK: enumeration is fold-local)
-        with self._lock:
-            res = self._fold(final_only=(level == "final"))
+        with self._lock, self.store.read_txn() as tx:
+            res = self._fold(tx, final_only=(level == "final"))
             seen: dict[bytes, ListEntry] = {}
             for key in res.state:
                 if not key.startswith(prefix):
@@ -585,7 +605,7 @@ class ClientDaemon:
                     key=key,
                     version=version,
                     attempt=attempt,
-                    pending=not self._version_final(version),
+                    pending=not self._version_final(tx, version),
                 )
             return [seen[k] for k in sorted(seen)]
 
@@ -593,13 +613,13 @@ class ClientDaemon:
         """Key-centric recovery view (CLIENT.md §3): the frozen `final` verdict, the
         live `provisional` value (+may_flip), and every known not-yet-final op
         touching the key WITH DECODED INTENT (the daemon holds the keyring)."""
-        with self._lock:
-            res = self._fold()
+        with self._lock, self.store.read_txn() as tx:
+            res = self._fold(tx)
             version, attempt = res.lineage(path)
             present = path in res.state
-            final_res = self._fold(final_only=True)
+            final_res = self._fold(tx, final_only=True)
             fpresent = path in final_res.state
-            pending = self._pending_for(path)
+            pending = self._pending_for(tx, path)
             return {
                 "final": {
                     "present": fpresent,
@@ -616,31 +636,32 @@ class ClientDaemon:
                 # ABSENT key with a not-yet-final op that could make it present (an
                 # uncommitted-displaceable delete flips absence, NOTES 54 nit), not
                 # only a present-but-unfrozen value.
-                "may_flip": bool(pending) or (present and not self._version_final(version)),
+                "may_flip": bool(pending) or (present and not self._version_final(tx, version)),
                 "pending": pending,
             }
 
-    def _pending_for(self, path: bytes) -> list[PendingOp]:
+    def _pending_for(self, tx: ReadTxn, path: bytes) -> list[PendingOp]:
         """Every held op touching `path` that is not yet final, with decoded intent.
         Complete for ops authored through this daemon; foreign in-flight arrives via
         gossip (not wired in WP2 — the daemon still decodes whatever it holds)."""
         out: list[PendingOp] = []
-        for o in self.store.all_ops():
+        for o in tx.all_ops():
             if o.is_control:
                 continue
-            if self._is_final(o.op_hash):
+            if self._is_final(tx, o.op_hash):
                 continue
             intent = self._decode_intent(o, path)
             if intent is None:
                 continue
-            out.append({"op": o.op_hash, "phase": self._phase_nolock(o), "would": intent})
+            out.append({"op": o.op_hash, "phase": self._phase_nolock(tx, o), "would": intent})
         return out
 
-    def _phase_nolock(self, op: Op) -> str:
-        if self.store.get_qc(op.op_hash) is not None:
+    def _phase_nolock(self, tx: ReadTxn, op: Op) -> str:
+        committed = tx.get_qc(op.op_hash) is not None
+        if committed:
             return "committed"
         if op.slot_tag is not None:
-            w = self._slot_winner(op.slot_tag)
+            w = self._slot_winner(tx, op.slot_tag)
             if w is not None and w != op.op_hash:
                 return "lost"
         return "unknown" if op.op_hash in self._exhausted else "in-flight"
@@ -659,8 +680,10 @@ class ClientDaemon:
         (PROTOCOL §7 / NOTES 58) — the control plane is the node registry. Keeps the
         existing entry for any roster member with no record yet (bootstrap fallback),
         and dials whatever carrier the record names (a node may be unix or HTTP)."""
-        with self._lock:
-            book = fold.endpoints_of(self.store.all_ops(), self.manager_pub)
+        with self.store.read_txn() as tx:
+            ops = tx.all_ops()
+        book = fold.endpoints_of(ops, self.manager_pub)
+        with self._lock:  # guards the in-memory roster_addrs swap
             new = list(self.roster_addrs)
             for i, pub in enumerate(self.cfg.roster):
                 addrs = book.get(pub, [])
@@ -669,8 +692,11 @@ class ClientDaemon:
             self.roster_addrs = new
 
     def close(self) -> None:
-        """Signal in-flight drives to abort, let them wind down, then close the
-        store (so a lingering finalize thread never touches a closed DB)."""
+        """Signal in-flight drives + the refresh loop to abort, JOIN the refresh loop
+        (the main background store writer) so it is never mid-write when we close, then
+        close the store. Straggler drive threads are stop-aware daemons that abort
+        without a store write; the store's closed-guard turns any late txn into a clean
+        RuntimeError rather than a bare ProgrammingError / lost-QC-as-crash."""
         self._closing.set()
-        time.sleep(0.15)
+        self._refresh_thread.join(timeout=2.0)
         self.store.close()

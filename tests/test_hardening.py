@@ -279,7 +279,8 @@ class TestSubmitGates(unittest.TestCase):
         r = acc.on_submit(op, NOW)
         assert isinstance(r, Rejected)
         self.assertEqual(r.reason, RejectReason.NEEDS_BALLOT)
-        self.assertEqual(acc.store.heads(), {})  # nothing stored via SUBMIT
+        with acc.store.read_txn() as tx:
+            self.assertEqual(tx.heads(), {})  # nothing stored via SUBMIT
 
     def test_blind_submit_with_gap_is_rejected(self):
         w = World(seed=18, n_clients=1)
@@ -289,11 +290,13 @@ class TestSubmitGates(unittest.TestCase):
         r = acc.on_submit(op1, NOW)
         assert isinstance(r, Rejected)
         self.assertEqual(r.reason, RejectReason.UNKNOWN_PREV)
-        self.assertEqual(acc.store.heads(), {})  # nothing claimed
+        with acc.store.read_txn() as tx:
+            self.assertEqual(tx.heads(), {})  # nothing claimed
         # push the predecessor, then the op is accepted
         assert isinstance(acc.on_submit(op0, NOW), A.Receipt)
         assert isinstance(acc.on_submit(op1, NOW), A.Receipt)
-        self.assertEqual(acc.store.heads()[w.clients[0].pub][0], 1)
+        with acc.store.read_txn() as tx:
+            self.assertEqual(tx.heads()[w.clients[0].pub][0], 1)
 
     def test_ballot_accept_orphan_is_stored_but_not_a_head(self):
         w = World(seed=19, n_clients=1)
@@ -303,8 +306,9 @@ class TestSubmitGates(unittest.TestCase):
         b = Ballot(1, b"recoverer")
         assert isinstance(acc.on_prepare(tag, b), A.Promise)
         assert isinstance(acc.on_accept(tag, b, op1, NOW), A.Receipt)
-        self.assertIsNotNone(acc.store.get_op(op1.op_hash))  # stored (re-proposable)
-        self.assertEqual(acc.store.heads(), {})  # but never a frontier claim
+        with acc.store.read_txn() as tx:
+            self.assertIsNotNone(tx.get_op(op1.op_hash))  # stored (re-proposable)
+            self.assertEqual(tx.heads(), {})  # but never a frontier claim
 
 
 class TestDepsAcceptGate(unittest.TestCase):

@@ -113,13 +113,16 @@ class TestMixedTransportCluster(unittest.TestCase):
             b.peers = [Peer(a.pub, transports.Endpoint(transports.UNIX, a_path))]
             x = w.blind(0, [], [[A.Mutation.SET, b"x", b"1"]])
             y = w.blind(1, [], [[A.Mutation.SET, b"y", b"1"]])
-            a.store.append(x)
-            b.store.append(y)
+            with a.store.write_txn() as tx:
+                tx.append(x)
+            with b.store.write_txn() as tx:
+                tx.append(y)
             a.sync_once()  # A -> B over HTTP
             b.sync_once()  # B -> A over unix
             for d in (a, b):
-                self.assertIsNotNone(d.store.get_op(x.op_hash))  # both hold the union
-                self.assertIsNotNone(d.store.get_op(y.op_hash))
+                with d.store.read_txn() as tx:
+                    self.assertIsNotNone(tx.get_op(x.op_hash))  # both hold the union
+                    self.assertIsNotNone(tx.get_op(y.op_hash))
             a.close()
             b.close()
             time.sleep(0.05)
@@ -267,8 +270,10 @@ class TestDaemonPeerSockets(unittest.TestCase):
             b.peers = [unix_peer(a.pub, pa)]
             x = w.blind(0, [], [[A.Mutation.SET, b"x", b"1"]])
             y = w.blind(1, [], [[A.Mutation.SET, b"y", b"1"]])
-            a.store.append(x)
-            b.store.append(y)
+            with a.store.write_txn() as tx:
+                tx.append(x)
+            with b.store.write_txn() as tx:
+                tx.append(y)
             for d, path in ((a, pa), (b, pb)):
                 ev = threading.Event()
                 threading.Thread(target=d.serve_forever, args=(path, ev), daemon=True).start()
@@ -276,8 +281,9 @@ class TestDaemonPeerSockets(unittest.TestCase):
             a.sync_once()  # gossip against b's real socket
             b.sync_once()
             for d in (a, b):
-                self.assertIsNotNone(d.store.get_op(x.op_hash))
-                self.assertIsNotNone(d.store.get_op(y.op_hash))
+                with d.store.read_txn() as tx:
+                    self.assertIsNotNone(tx.get_op(x.op_hash))
+                    self.assertIsNotNone(tx.get_op(y.op_hash))
             a.close()
             b.close()
             time.sleep(0.05)
@@ -311,21 +317,24 @@ class TestDaemonAdoption(unittest.TestCase):
             retained=committed,
             horizon=A.HLC(500, 0),
         )
-        for o in [*below, ckpt]:  # the node holds the full history + the checkpoint op
-            d.store.append(o)
+        with d.store.write_txn() as tx:
+            for o in [*below, ckpt]:  # the node holds the full history + the checkpoint op
+                tx.append(o)
         # a quorum-committed checkpoint: a QC over its op_hash from the roster
         sks = [bytes([200 + i] * 32) for i in range(3)]
         recs = [
             A.Receipt.issue(sks[i], roster[i], ckpt.op_hash, 0, A.Ballot(1, b"c"), 1)
             for i in range(3)
         ]
-        d.store.put_qc(A.QC.assemble(recs, 3, {p: i for i, p in enumerate(roster)}))
+        with d.store.write_txn() as tx:
+            tx.put_qc(A.QC.assemble(recs, 3, {p: i for i, p in enumerate(roster)}))
 
         d.adopt_committed_checkpoints()
-        self.assertEqual(d.store.get_meta("checkpoint"), ckpt.op_hash)  # adopted
-        self.assertEqual(d.acc.horizon, A.HLC(500, 0))  # horizon advanced to F
-        self.assertIsNone(d.store.get_op(first.op_hash))  # dead GC'd
-        self.assertIsNotNone(d.store.get_op(winner.op_hash))  # winner retained
+        with d.store.read_txn() as tx:
+            self.assertEqual(tx.get_meta("checkpoint"), ckpt.op_hash)  # adopted
+            self.assertEqual(tx.get_horizon(), A.HLC(500, 0))  # horizon advanced to F
+            self.assertIsNone(tx.get_op(first.op_hash))  # dead GC'd
+            self.assertIsNotNone(tx.get_op(winner.op_hash))  # winner retained
 
 
 class TestDaemonFence(unittest.TestCase):
@@ -359,8 +368,9 @@ class TestDaemonFence(unittest.TestCase):
             keyepoch=0,
             payload=ctl.roster_body(0, roster, {}, recovery=rckpt.op_hash),
         )
-        d.store.append(rckpt)
-        d.store.append(rop)
+        with d.store.write_txn() as tx:
+            tx.append(rckpt)
+            tx.append(rop)
         self.assertEqual(d.acc.epoch, 0)
         d.observe_fences()
         self.assertEqual(d.acc.epoch, 1)  # the fence propagated -> parked
@@ -375,10 +385,11 @@ class TestDaemonEvidence(unittest.TestCase):
         nsk = bytes([250] * 32)
         npub = C.SIGNER.public(nsk)
         ballot = A.Ballot(1, b"x")
-        d.store.put_op_raw(a)
-        d.store.put_op_raw(b)
-        d.store.put_receipt(A.Receipt.issue(nsk, npub, a.op_hash, 0, ballot, 1))
-        d.store.put_receipt(A.Receipt.issue(nsk, npub, b.op_hash, 0, ballot, 2))
+        with d.store.write_txn() as tx:
+            tx.put_op_raw(a)
+            tx.put_op_raw(b)
+            tx.put_receipt(A.Receipt.issue(nsk, npub, a.op_hash, 0, ballot, 1))
+            tx.put_receipt(A.Receipt.issue(nsk, npub, b.op_hash, 0, ballot, 2))
         self.assertEqual(d.evidence_cycle(), 1)  # DOUBLE_VOTE minted
         self.assertGreaterEqual(d.status()["evidence"], 1)
         self.assertEqual(d.evidence_cycle(), 0)  # idempotent
@@ -437,7 +448,8 @@ class TestJointCertActivation(unittest.TestCase):
         nodes = {}
         for pub, sk in zip([*old, fresh], [*old_sks, fresh_sk], strict=True):
             acc = Acceptor(sk, pub, ChainStore(), 0, BIG)
-            acc.store.append(base)
+            with acc.store.write_txn() as tx:
+                tx.append(base)
             nodes[pub] = LocalNode(acc, lambda: 100)
         rc = m.change_roster(new, lambda pub, req: dispatch(nodes[pub], req))
         return rc, old, old_sks, new
@@ -457,9 +469,10 @@ class TestJointCertActivation(unittest.TestCase):
             m = Manager.init(d)
             rc, old, old_sks, new = self._joint_cert(m)
             nd = self._fresh_daemon(m, old, old_sks)
-            nd.store.append(rc.op)
-            nd.store.put_qc(rc.old_qc)  # old-roster half (epoch 0)
-            nd.store.put_qc(rc.new_qc)  # new-roster half (epoch 1, possession-gated)
+            with nd.store.write_txn() as tx:
+                tx.append(rc.op)
+                tx.put_qc(rc.old_qc)  # old-roster half (epoch 0)
+                tx.put_qc(rc.new_qc)  # new-roster half (epoch 1, possession-gated)
             self.assertEqual(nd.acc.epoch, 0)
             nd.observe_roster_activations()
             self.assertEqual(nd.acc.epoch, 1)  # activated
@@ -483,10 +496,11 @@ class TestJointCertActivation(unittest.TestCase):
                 slot_tag=A.roster_slot_tag(0),
             )
             nd = self._fresh_daemon(m, old, old_sks)
-            nd.store.append(contender)  # the contender sits FIRST in the store
-            nd.store.append(rc.op)
-            nd.store.put_qc(rc.old_qc)
-            nd.store.put_qc(rc.new_qc)
+            with nd.store.write_txn() as tx:
+                tx.append(contender)  # the contender sits FIRST in the store
+                tx.append(rc.op)
+                tx.put_qc(rc.old_qc)
+                tx.put_qc(rc.new_qc)
             nd.observe_roster_activations()
             self.assertEqual(nd.acc.epoch, 1)  # certified op wins, not starved
             self.assertEqual(nd.roster, new)
@@ -496,8 +510,9 @@ class TestJointCertActivation(unittest.TestCase):
             m = Manager.init(d)
             rc, old, old_sks, _new = self._joint_cert(m)
             nd = self._fresh_daemon(m, old, old_sks)
-            nd.store.append(rc.op)
-            nd.store.put_qc(rc.new_qc)  # new half only -> not a joint cert
+            with nd.store.write_txn() as tx:
+                tx.append(rc.op)
+                tx.put_qc(rc.new_qc)  # new half only -> not a joint cert
             nd.observe_roster_activations()
             self.assertEqual(nd.acc.epoch, 0)  # no activation
             self.assertEqual(nd.roster, old)
@@ -507,8 +522,9 @@ class TestJointCertActivation(unittest.TestCase):
             m = Manager.init(d)
             rc, old, old_sks, _new = self._joint_cert(m)
             nd = self._fresh_daemon(m, old, old_sks)
-            nd.store.append(rc.op)
-            nd.store.put_qc(rc.old_qc)  # old half only -> the new roster never ratified
+            with nd.store.write_txn() as tx:
+                tx.append(rc.op)
+                tx.put_qc(rc.old_qc)  # old half only -> the new roster never ratified
             nd.observe_roster_activations()
             self.assertEqual(nd.acc.epoch, 0)  # no activation
             self.assertEqual(nd.roster, old)

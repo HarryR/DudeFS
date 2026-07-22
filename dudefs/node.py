@@ -178,10 +178,13 @@ class LocalNode:
         return self.acc.issue_watermark(self.clock())
 
     def fetch_op(self, op_hash: bytes) -> Op | None:
-        return self.acc.store.get_op(op_hash)
+        with self.acc.store.read_txn() as tx:
+            return tx.get_op(op_hash)
 
     def get_qc(self, op_hash: bytes) -> QC | None:
-        return self.acc.store.get_qc(op_hash)
+        with self.acc.store.read_txn() as tx:
+            return tx.get_qc(op_hash)
 
     def put_qc(self, qc: QC) -> None:
-        self.acc.store.put_qc(qc)
+        with self.acc.store.write_txn() as tx:
+            tx.put_qc(qc)

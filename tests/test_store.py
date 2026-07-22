@@ -22,12 +22,13 @@ class TestContiguity(unittest.TestCase):
         w = World(seed=1, n_clients=1)
         s = ChainStore()
         ops = _mk_ops(w, 0, 3)
-        self.assertEqual(s.append(ops[0]).status, AppendStatus.OK)
-        self.assertEqual(s.append(ops[2]).status, AppendStatus.GAP)  # seq2 before seq1
-        self.assertEqual(s.append(ops[1]).status, AppendStatus.OK)
-        self.assertEqual(s.append(ops[2]).status, AppendStatus.OK)  # now contiguous
-        self.assertEqual(s.append(ops[1]).status, AppendStatus.DUP)  # idempotent
-        heads = s.heads()
+        with s.write_txn() as tx:
+            self.assertEqual(tx.append(ops[0]).status, AppendStatus.OK)
+            self.assertEqual(tx.append(ops[2]).status, AppendStatus.GAP)  # seq2 before seq1
+            self.assertEqual(tx.append(ops[1]).status, AppendStatus.OK)
+            self.assertEqual(tx.append(ops[2]).status, AppendStatus.OK)  # now contiguous
+            self.assertEqual(tx.append(ops[1]).status, AppendStatus.DUP)  # idempotent
+            heads = tx.heads()
         self.assertEqual(heads[w.clients[0].pub], (2, ops[2].op_hash))
         s.close()
 
@@ -40,12 +41,13 @@ class TestContiguity(unittest.TestCase):
         w.clients[0].prev = A.GENESIS_PREV
         b = w.blind(0, [], [[A.Mutation.SET, b"k", b"2"]])  # client0 seq0 again, different
         self.assertNotEqual(a.op_hash, b.op_hash)
-        self.assertEqual(s.append(a).status, AppendStatus.OK)
-        res = s.append(b)
-        self.assertEqual(res.status, AppendStatus.FORK)
-        assert res.evidence is not None  # FORK always carries evidence
-        self.assertTrue(res.evidence.verify())  # portable equivocation proof
-        self.assertEqual(len(s.evidence()), 1)
+        with s.write_txn() as tx:
+            self.assertEqual(tx.append(a).status, AppendStatus.OK)
+            res = tx.append(b)
+            self.assertEqual(res.status, AppendStatus.FORK)
+            assert res.evidence is not None  # FORK always carries evidence
+            self.assertTrue(res.evidence.verify())  # portable equivocation proof
+            self.assertEqual(len(tx.evidence()), 1)
         s.close()
 
 
@@ -56,16 +58,17 @@ class TestFloorDurability(unittest.TestCase):
         if os.path.exists(path):
             os.remove(path)
         s = ChainStore(path)
-        # white-box: _write_hw/_write_attested are the acceptor's floor-persistence
+        # white-box: write_hw/write_attested are the acceptor's floor-persistence
         # seam; this test seeds durable floor state directly (no public setter).
-        s._write_hw(HLC(5000, 3))
-        s._write_attested(HLC(4000, 0))
-        s.commit()
+        with s.write_txn() as tx:
+            tx.write_hw(HLC(5000, 3))
+            tx.write_attested(HLC(4000, 0))
         s.close()
         # reopen == process restart: persisted floor/hw must survive (RESILIENCE §0)
         s2 = ChainStore(path)
-        self.assertEqual(s2.get_hw(), HLC(5000, 3))
-        self.assertEqual(s2.get_attested(), HLC(4000, 0))
+        with s2.read_txn() as tx:
+            self.assertEqual(tx.get_hw(), HLC(5000, 3))
+            self.assertEqual(tx.get_attested(), HLC(4000, 0))
         s2.close()
         os.remove(path)
 
@@ -77,12 +80,15 @@ class TestReceiptsQCs(unittest.TestCase):
         w = World(seed=3, n_clients=1)
         s = ChainStore()
         op = w.blind(0, [], [[A.Mutation.SET, b"k", b"v"]])
-        s.append(op)
+        with s.write_txn() as tx:
+            tx.append(op)
         nsk = bytes([5] * 32)
         npub = C.SIGNER.public(nsk)
         r = A.Receipt.issue(nsk, npub, op.op_hash, 0, A.BLIND, 1)
-        s.put_receipt(r)
-        got = s.receipts_for(op.op_hash)
+        with s.write_txn() as tx:
+            tx.put_receipt(r)
+        with s.read_txn() as tx:
+            got = tx.receipts_for(op.op_hash)
         self.assertEqual(len(got), 1)
         self.assertTrue(got[0].verify())
         s.close()

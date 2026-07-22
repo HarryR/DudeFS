@@ -49,14 +49,16 @@ class TestRelayRead(unittest.TestCase):
         idx = {p: i for i, p in enumerate(roster)}
         recs = []
         for nd in nodes:
-            for op in control:
-                nd.store.append(op)
+            with nd.store.write_txn() as tx:
+                for op in control:
+                    tx.append(op)
             r = nd.on_submit(write, SUBMIT)
             assert isinstance(r, A.Receipt)
             recs.append(r)
         qc = A.QC.assemble(recs, len(nodes), idx)
         for nd in nodes:
-            nd.store.put_qc(qc)
+            with nd.store.write_txn() as tx:
+                tx.put_qc(qc)
         for i in attest:
             nodes[i].issue_watermark(READ)  # floor = READ − δ ≥ write.hlc
         return w, control, write, qc
@@ -89,7 +91,9 @@ class TestRelayRead(unittest.TestCase):
         for op in control:
             gossip.pull_op(reader, relay.store, op.op_hash)
         gossip.pull_op(reader, relay.store, write.op_hash)
-        r = fold.fold(reader.all_ops(), w.keyring, w.genesis)
+        with reader.read_txn() as tx:
+            reader_ops = tx.all_ops()
+        r = fold.fold(reader_ops, w.keyring, w.genesis)
         self.assertEqual(r.state[b"k"], b"V")
 
         # 5. path independence: a DIRECT quorum read yields the identical frontier.

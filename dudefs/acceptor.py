@@ -34,7 +34,7 @@ from .artifacts import (
     Receipt,
     Watermark,
 )
-from .store import AppendStatus, ChainStore
+from .store import AppendStatus, ChainStore, ReadTxn, WriteTxn
 
 # Any node-side response to a coordination verb (DESIGN §8 / PROTOCOL §1.1).
 type SubmitResult = Receipt | Rejected  # blind writes only (rev 5); slotted -> NEEDS_BALLOT
@@ -102,58 +102,78 @@ class Acceptor:
         # THE DOOR, not stored-then-fold-invalid (the resource/DoS hole). The acceptor
         # stays L6-free — it holds a bool callback, not the control vocabulary.
         self.authz = authz
-        # config epoch restored from the store (finding 20): epoch stamps every
-        # receipt/watermark, so a restart must NOT regress it to the constructor
-        # seed. `config_epoch` seeds a VIRGIN store only (get_epoch() is None there).
-        persisted_epoch = self.store.get_epoch()
-        self.epoch = config_epoch if persisted_epoch is None else persisted_epoch
+        # config epoch (finding 20): the DB is the single source of truth. `get_epoch()`
+        # is None only on a VIRGIN store, so we MATERIALIZE the genesis `config_epoch`
+        # into the store at construction — after this, every authoritative read (receipt
+        # /watermark/frontier stamping, the §8 guards) uses `tx.get_epoch()` and can
+        # never regress to a constructor seed. `self.epoch` remains ONLY as the advisory
+        # wire cache (NOTES 59: the envelope epoch is diagnostic-never-gate), refreshed
+        # after each activation commit; it never justifies a signature or a reject.
+        # The checkpoint horizon (finding 19) is likewise read durably at each use
+        # (`tx.get_horizon()`), so there is no in-memory horizon to lag a committed
+        # adoption.
+        with self.store.read_txn() as tx:
+            persisted_epoch = tx.get_epoch()
+        if persisted_epoch is None:
+            persisted_epoch = config_epoch
+            with self.store.write_txn() as tx:
+                tx.set_epoch(persisted_epoch)  # virgin store: seat the genesis epoch
+        self.epoch = persisted_epoch
         self.delta_ms = delta_ms
-        # checkpoint horizon (DESIGN §12) restored from the store (finding 19): a
-        # crash-restart must NOT reset it to 0, or the void rule + receipt-floor
-        # backstop go inert against a below-horizon reborn op. HLC(0,0) pre-adoption.
-        self.horizon = self.store.get_horizon()
+
+    def _epoch(self, tx: ReadTxn) -> int:
+        """The authoritative config epoch, read from the txn's snapshot. Never None:
+        the constructor materializes it on a virgin store and it is monotone thereafter
+        (finding 20). Used for every signature-justifying / gating read."""
+        e = tx.get_epoch()
+        assert e is not None, "epoch is materialized at construction (finding 20)"
+        return e
 
     # ------------------------------------------------------------------ #
     # Finality floor (DESIGN §9): floor = max(hw, now) − δ, monotone.     #
     # ------------------------------------------------------------------ #
-    def floor(self, now_ms: int) -> HLC:
-        hw = self.store.get_hw()
+    def floor(self, tx: ReadTxn, now_ms: int) -> HLC:
+        hw = tx.get_hw()
         computed = HLC(max(hw.wall_ms, now_ms) - self.delta_ms, 0)
-        attested = self.store.get_attested()  # never below what we attested
+        attested = tx.get_attested()  # never below what we attested
         return computed if attested <= computed else attested
 
-    def _skew_reason(self, op: Op, now_ms: int) -> RejectReason | None:
+    def _skew_reason(self, tx: ReadTxn, op: Op, now_ms: int) -> RejectReason | None:
         # future gate and past gate on NEW receipts (DESIGN §9)
         if op.hlc.wall_ms > now_ms + self.delta_ms:
             return RejectReason.FUTURE_HLC
-        if op.hlc < self.floor(now_ms):
+        if op.hlc < self.floor(tx, now_ms):
             return RejectReason.BELOW_FLOOR
         return None
 
     def issue_watermark(self, now_ms: int) -> Watermark:
         """Advance and attest the floor (monotone & durable): a node never signs
         a floor below one it has signed before (DESIGN §9)."""
-        fl = self.floor(now_ms)
-        att = self.store.get_attested()
-        new_att = fl if att <= fl else att
-        self.store._write_attested(new_att)
-        # reserve the attestation's issuance-chain position + justification (finding
-        # 18b) before signing; the deterministic sign re-derives it after a crash.
-        seq = self.store.reserve_watermark_seq(new_att, self.epoch)
-        self.store.commit()  # fsync before signing
-        return A.Watermark.issue(self.sk, self.pub, new_att, self.epoch, seq)
+        with self.store.write_txn() as tx:
+            fl = self.floor(tx, now_ms)
+            att = tx.get_attested()
+            new_att = fl if att <= fl else att
+            tx.write_attested(new_att)
+            # reserve the attestation's issuance-chain position + justification
+            # (finding 18b) inside the txn; the deterministic sign after COMMIT
+            # re-derives the identical watermark on a crash (it is not stored). Capture
+            # the epoch IN the txn so the seq's justification and the signed epoch are
+            # the same value — a concurrent activation cannot slip between them.
+            ep = self._epoch(tx)
+            seq = tx.reserve_watermark_seq(new_att, ep)
+        return A.Watermark.issue(self.sk, self.pub, new_att, ep, seq)
 
     def issue_frontier(self, now_ms: int) -> FrontierBundle:
         """The signed read primitive (PROTOCOL §1): per-author heads + floor +
         epoch, all signed at one instant (relay-safe, PROTOCOL §7.3)."""
-        return A.FrontierBundle.issue(
-            self.sk, self.pub, self.store.heads(), None, self.epoch, self.floor(now_ms)
-        )
+        with self.store.read_txn() as tx:
+            heads, fl, ep = tx.heads(), self.floor(tx, now_ms), self._epoch(tx)
+        return A.FrontierBundle.issue(self.sk, self.pub, heads, None, ep, fl)
 
-    def _advance_hw(self, op: Op) -> None:
-        hw = self.store.get_hw()
+    def _advance_hw(self, tx: WriteTxn, op: Op) -> None:
+        hw = tx.get_hw()
         if hw < op.hlc:
-            self.store._write_hw(op.hlc)
+            tx.write_hw(op.hlc)
 
     # ------------------------------------------------------------------ #
     # SUBMIT — blind-write accept at the BLIND ballot (DESIGN §8, rev 5)  #
@@ -175,65 +195,69 @@ class Acceptor:
         # makes every verb requester-gated on the envelope `from` — wedge-free.
         if self.authz is not None and not self.authz(op.author):
             return Rejected(RejectReason.BAD_AUTHZ)
-        skew = self._skew_reason(op, now_ms)
-        if skew:
-            return Rejected(skew)
-
-        # deps resolve before acceptance (DESIGN §4 / PROTOCOL §2.1): every
-        # referenced op must be present locally — committed or merely stored.
-        # M2 rejects; M4 upgrades this to PULL-then-accept. Ballot ACCEPT is
-        # exempt (recovery must complete; NOTES item 20).
-        for dep in op.deps:
-            if self.store.get_op(A.codec.as_bytes(dep)) is None:
-                return Rejected(RejectReason.UNKNOWN_DEP)
-
-        # contiguity-checked store for blind writes (PROTOCOL §1.1 `unknown_prev`
-        # / §2.1; NOTES item 16) — only a ballot ACCEPT may store an envelope
-        # contiguity-free (re-proposal, on_accept below).
-        res = self.store.append(op)
-        if res.status == AppendStatus.GAP:
-            return Rejected(RejectReason.UNKNOWN_PREV)
-        if res.status in (AppendStatus.FORK, AppendStatus.INVALID):
-            return Rejected(RejectReason.BAD_STRUCTURE)  # fork evidence stored by append
-
-        # blind write: always receipted at the BLIND ballot (DESIGN §8).
-        self._advance_hw(op)
-        self.store.commit()  # fsync before signing
-        return self._issue_receipt(op.op_hash, BLIND)
+        # skew check, dep resolution, the contiguity-checked store, and the receipt
+        # are ONE write transaction — the COMMIT fsyncs before the receipt is returned
+        # (sign-after-fsync), and the receipt lands atomically with the op it attests.
+        with self.store.write_txn() as tx:
+            skew = self._skew_reason(tx, op, now_ms)
+            if skew:
+                return Rejected(skew)
+            # deps resolve before acceptance (DESIGN §4 / PROTOCOL §2.1): every
+            # referenced op must be present locally — committed or merely stored.
+            # M2 rejects; M4 upgrades this to PULL-then-accept. Ballot ACCEPT is
+            # exempt (recovery must complete; NOTES item 20).
+            for dep in op.deps:
+                if tx.get_op(A.codec.as_bytes(dep)) is None:
+                    return Rejected(RejectReason.UNKNOWN_DEP)
+            # contiguity-checked store for blind writes (PROTOCOL §1.1 `unknown_prev`
+            # / §2.1; NOTES item 16) — only a ballot ACCEPT may store an envelope
+            # contiguity-free (re-proposal, on_accept below).
+            res = tx.append(op)
+            if res.status == AppendStatus.GAP:
+                return Rejected(RejectReason.UNKNOWN_PREV)
+            if res.status in (AppendStatus.FORK, AppendStatus.INVALID):
+                return Rejected(RejectReason.BAD_STRUCTURE)  # fork evidence stored by append
+            # blind write: always receipted at the BLIND ballot (DESIGN §8).
+            self._advance_hw(tx, op)
+            receipt = self._issue_receipt(tx, op.op_hash, BLIND)
+        return receipt
 
     # ------------------------------------------------------------------ #
     # PREPARE — classic Paxos phase 1 (DESIGN §8 recovery)               #
     # ------------------------------------------------------------------ #
     def on_prepare(self, tag: bytes, ballot: Ballot) -> PrepareResult:
-        s = self.store.get_slot(tag)
-        # void rule (NOTES 27, DESIGN §8): a slot whose accepted op is below the
-        # checkpoint horizon is dead — a reborn creation tag must not make PREPARE
-        # report an ancient decided op that §1.3 would re-propose but that can never
-        # re-commit (its hlc is below the floor), a livelock until every node GCs.
-        # Discard the accept; the promise reports a fresh slot and the new op wins.
-        accepted_hlc: HLC | None = None
-        if s.accepted_op is not None:
-            acc = self.store.get_op(s.accepted_op)
-            if acc is None or acc.hlc < self.horizon:
-                s.accepted_ballot = None
-                s.accepted_op = None
-            else:
-                accepted_hlc = acc.hlc  # reported so the client can apply its own guard
-        if ballot > s.promised:
+        with self.store.write_txn() as tx:
+            s = tx.get_slot(tag)
+            # void rule (NOTES 27, DESIGN §8): a slot whose accepted op is below the
+            # checkpoint horizon is dead — a reborn creation tag must not make PREPARE
+            # report an ancient decided op that §1.3 would re-propose but can never
+            # re-commit (its hlc is below the floor), a livelock until every node GCs.
+            # Discard the accept; the promise reports a fresh slot and the new op wins.
+            accepted_hlc: HLC | None = None
+            if s.accepted_op is not None:
+                acc = tx.get_op(s.accepted_op)
+                if acc is None or acc.hlc < tx.get_horizon():
+                    s.accepted_ballot = None
+                    s.accepted_op = None
+                else:
+                    accepted_hlc = acc.hlc  # reported so the client applies its own guard
+            if ballot <= s.promised:
+                return Nack(s.promised)  # no write; the txn commits empty
             s.promised = ballot
-            self.store._write_slot(tag, s)
-            self.store.commit()  # fsync before signing the promise
-            return A.Promise.issue(
-                self.sk, self.pub, tag, ballot, s.accepted_ballot, s.accepted_op, accepted_hlc
-            )
-        return Nack(s.promised)
+            tx.write_slot(tag, s)
+            accepted_ballot, accepted_op = s.accepted_ballot, s.accepted_op
+        # promised ballot is now durable; sign the promise (re-derivable, not stored)
+        return A.Promise.issue(
+            self.sk, self.pub, tag, ballot, accepted_ballot, accepted_op, accepted_hlc
+        )
 
     def advance_horizon(self, hlc: HLC) -> None:
-        """Raise the checkpoint horizon on observing a quorum-committed checkpoint
-        (DESIGN §12): ops below it are GC'd and slot state accepting a below-horizon
-        op is void on prepare (the void rule above). Monotone."""
-        if hlc > self.horizon:
-            self.horizon = hlc
+        """Raise the DURABLE checkpoint horizon on observing a quorum-committed
+        checkpoint (DESIGN §12): ops below it are GC'd and slot state accepting a
+        below-horizon op is void on prepare (the void rule above). Monotone, and
+        persisted so the guards (which read `tx.get_horizon()`) never lag it."""
+        with self.store.write_txn() as tx:
+            tx.advance_horizon(hlc)
 
     # ------------------------------------------------------------------ #
     # ACCEPT — classic Paxos phase 2 (DESIGN §8 recovery)               #
@@ -245,45 +269,48 @@ class Acceptor:
             return Rejected(RejectReason.BAD_STRUCTURE)
         if op.slot_tag != tag:
             return Rejected(RejectReason.BAD_STRUCTURE)
-        skew = self._skew_reason(op, now_ms)
-        if skew:
-            return Rejected(skew)
-        s = self.store.get_slot(tag)
-        if ballot < s.promised:
-            return Nack(s.promised)
-        if (
-            s.accepted_ballot == ballot
-            and s.accepted_op is not None
-            and s.accepted_op != op.op_hash
-        ):
-            # would sign two ops at one (tag, ballot) — the one thing an honest
-            # acceptor must never do (DESIGN §8).
-            return Rejected(RejectReason.EQUIVOCATION_GUARD)
-        # §12 receipt-floor-at-horizon backstop (NOTES 34/Q5 third layer): after GC
-        # forgets below-horizon slot state, a late contender must NOT win a fresh
-        # receipt for a spent slot. Logically implied by the floor (attested ≥ the
-        # sealed F), but restated as an independent, explicit guard. Strict: hlc ==
-        # horizon is still committable (== floor passes the past gate). Skipped for
-        # an idempotent re-accept of the SAME op (serve-from-store re-issue), so a
-        # RERECEIPT across a bridge is never blocked.
-        if s.accepted_op != op.op_hash and op.hlc < self.horizon:
-            return Rejected(RejectReason.BELOW_HORIZON)
-        self.store.put_op_raw(op)  # self-contained, re-proposable
-        s.promised = ballot
-        s.accepted_ballot = ballot
-        s.accepted_op = op.op_hash
-        self.store._write_slot(tag, s)
-        self._advance_hw(op)
-        self.store.commit()  # fsync before signing
-        return self._issue_receipt(op.op_hash, ballot, receipt_epoch)
+        with self.store.write_txn() as tx:
+            skew = self._skew_reason(tx, op, now_ms)
+            if skew:
+                return Rejected(skew)
+            s = tx.get_slot(tag)
+            if ballot < s.promised:
+                return Nack(s.promised)
+            if (
+                s.accepted_ballot == ballot
+                and s.accepted_op is not None
+                and s.accepted_op != op.op_hash
+            ):
+                # would sign two ops at one (tag, ballot) — the one thing an honest
+                # acceptor must never do (DESIGN §8).
+                return Rejected(RejectReason.EQUIVOCATION_GUARD)
+            # §12 receipt-floor-at-horizon backstop (NOTES 34/Q5 third layer): after
+            # GC forgets below-horizon slot state, a late contender must NOT win a
+            # fresh receipt for a spent slot. Logically implied by the floor (attested
+            # ≥ the sealed F), restated as an explicit guard. Strict: hlc == horizon is
+            # still committable (== floor passes the past gate). Skipped for an
+            # idempotent re-accept of the SAME op, so a RERECEIPT is never blocked.
+            if s.accepted_op != op.op_hash and op.hlc < tx.get_horizon():
+                return Rejected(RejectReason.BELOW_HORIZON)
+            tx.put_op_raw(op)  # self-contained, re-proposable
+            s.promised = ballot
+            s.accepted_ballot = ballot
+            s.accepted_op = op.op_hash
+            tx.write_slot(tag, s)
+            self._advance_hw(tx, op)
+            receipt = self._issue_receipt(tx, op.op_hash, ballot, receipt_epoch)
+        return receipt
 
-    def _issue_receipt(self, op_hash: bytes, ballot: Ballot, epoch: int | None = None) -> Receipt:
-        """Sign a receipt AND persist it. A node holds every receipt it issues so
-        gossip can spread it and any node can assemble the QC from a quorum
-        (PROTOCOL §2.2, §1.4). Storage is derived from the already-fsynced slot
-        state, so it never outlives its justification (RESILIENCE §0). `epoch`
-        overrides the node's current epoch — a new-roster node receipts a roster
-        op under e+1 before activating (DESIGN §13).
+    def _issue_receipt(
+        self, tx: WriteTxn, op_hash: bytes, ballot: Ballot, epoch: int | None = None
+    ) -> Receipt:
+        """Sign a receipt AND persist it inside the caller's write transaction — the
+        receipt lands atomically with the slot state that justifies it, and the
+        COMMIT (when the caller's `write_txn` exits) fsyncs before it is returned, so
+        it never outlives its justification (RESILIENCE §0). A node holds every
+        receipt it issues so gossip can spread it and any node can assemble the QC
+        from a quorum (PROTOCOL §2.2, §1.4). `epoch` overrides the node's current
+        epoch — a new-roster node receipts a roster op under e+1 (DESIGN §13).
 
         Serve-from-store (finding-17): a receipt already stored for exactly this
         (op, epoch, ballot) is returned UNCHANGED — re-issuing is idempotent and
@@ -291,16 +318,16 @@ class Acceptor:
         crime the perjury proof relies on. A cross-epoch re-issue (RERECEIPT) reuses
         the ACCEPTANCE seq (bound when the op was first accepted, any epoch); only a
         genuinely new acceptance consumes the next monotone issue_seq."""
-        ep = self.epoch if epoch is None else epoch
-        existing = self.store.get_receipt(op_hash, ep, ballot, self.pub)
+        ep = self._epoch(tx) if epoch is None else epoch
+        existing = tx.get_receipt(op_hash, ep, ballot, self.pub)
         if existing is not None:
             return existing
-        # reserve the acceptance-bound seq + justification atomically (finding 18b),
-        # THEN sign deterministically — a crash before the receipt is stored
-        # re-derives the identical receipt on restart, never a burned seq.
-        seq = self.store.reserve_receipt_seq(op_hash, ballot)
+        # reserve the acceptance-bound seq + justification (finding 18b), sign
+        # deterministically, and store — all in the caller's txn. A crash before the
+        # COMMIT rolls it all back; the retry re-derives the identical receipt.
+        seq = tx.reserve_receipt_seq(op_hash, ballot)
         r = A.Receipt.issue(self.sk, self.pub, op_hash, ep, ballot, seq)
-        self.store.put_receipt(r)
+        tx.put_receipt(r)
         return r
 
     # ------------------------------------------------------------------ #
@@ -311,12 +338,16 @@ class Acceptor:
         acceptor state `(promised, accepted_ballot, accepted_op)` is UNTOUCHED — it
         carries across epochs unchanged; the node simply issues receipts, promises,
         and watermarks under `new_epoch` from now on (DESIGN §13). Monotone, and
-        DURABLE (finding 20): the new epoch is persisted before any receipt is
-        stamped under it, so a restart resumes e+1 instead of regressing to the
-        constructor seed and wedging."""
-        if new_epoch > self.epoch:
-            self.epoch = new_epoch
-            self.store.set_epoch(new_epoch)  # single-writer materialization
+        DURABLE (finding 20): the new epoch is persisted BEFORE `self.epoch` is
+        advanced, so a rollback (or crash) can never leave the advisory cache ahead of
+        the store — every receipt/watermark reads `tx.get_epoch()`, so it is stamped
+        under e+1 only once e+1 is durable, and a restart resumes e+1 rather than
+        regressing and wedging."""
+        with self.store.write_txn() as tx:
+            if new_epoch <= self._epoch(tx):
+                return  # monotone: never regress the durable epoch
+            tx.set_epoch(new_epoch)  # single-writer materialization, durable FIRST
+        self.epoch = new_epoch  # advisory wire cache, refreshed only AFTER commit
 
     def on_recovery_fence(
         self,
@@ -354,12 +385,15 @@ class Acceptor:
         single-epoch QC for an op that was in-flight across a roster change (DESIGN
         §13). Idempotent — the slot state is untouched. `target` is a slot_tag
         (re-receipt its accepted op at its accepted ballot) or a blind op_hash."""
-        s = self.store.get_slot(target)
-        if s.accepted_op is not None and s.accepted_ballot is not None:
-            return self._issue_receipt(s.accepted_op, s.accepted_ballot)
-        if self.store.get_op(target) is not None:
-            return self._issue_receipt(target, BLIND)  # blind op held directly
-        return None
+        with self.store.write_txn() as tx:
+            s = tx.get_slot(target)
+            if s.accepted_op is not None and s.accepted_ballot is not None:
+                receipt = self._issue_receipt(tx, s.accepted_op, s.accepted_ballot)
+            elif tx.get_op(target) is not None:
+                receipt = self._issue_receipt(tx, target, BLIND)  # blind op held directly
+            else:
+                return None
+        return receipt
 
     def holds_frontier(self, sync_frontier: A.Heads) -> bool:
         """The data-possession barrier (DESIGN §13): does this node hold every
@@ -374,22 +408,23 @@ class Acceptor:
         holds the COMPLETE below-cut baseline for that author (its retained
         digest matches the checkpoint commitment); ABOVE the cut, the per-op
         check stands (contiguous head reaches the seq AND holds the exact op)."""
-        heads = self.store.heads()
-        cut = self.store.cut()
-        committed = self.store.cut_retained()
-        have_baseline: dict[bytes, A.RetainedEntry] | None = None  # computed once, lazily
-        for author, (seq, head_hash) in sync_frontier.items():
-            centry = cut.get(author)
-            if centry is not None and seq <= centry[0]:
-                if have_baseline is None:
-                    have_baseline = self.store.baseline_commitment()
-                if have_baseline.get(author) != committed.get(author):
-                    return False  # incomplete below-cut baseline for this author
-            else:
-                cur = heads.get(author)
-                if cur is None or cur[0] < seq or self.store.get_op(head_hash) is None:
-                    return False
-        return True
+        with self.store.read_txn() as tx:
+            heads = tx.heads()
+            cut = tx.cut()
+            committed = tx.cut_retained()
+            have_baseline: dict[bytes, A.RetainedEntry] | None = None  # computed once, lazily
+            for author, (seq, head_hash) in sync_frontier.items():
+                centry = cut.get(author)
+                if centry is not None and seq <= centry[0]:
+                    if have_baseline is None:
+                        have_baseline = tx.baseline_commitment()
+                    if have_baseline.get(author) != committed.get(author):
+                        return False  # incomplete below-cut baseline for this author
+                else:
+                    cur = heads.get(author)
+                    if cur is None or cur[0] < seq or tx.get_op(head_hash) is None:
+                        return False
+            return True
 
     def on_roster_accept(
         self,

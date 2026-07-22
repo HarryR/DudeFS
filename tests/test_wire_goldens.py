@@ -81,12 +81,15 @@ def _fixtures() -> dict[str, bytes]:
     qc = A.QC.assemble(recs, 3, {C.SIGNER.public(bytes([200 + i] * 32)): i for i in range(3)})
 
     st = ChainStore()
-    st.put_op_raw(op)
-    st.put_qc(qc)
-    for r in recs:
-        st.put_receipt(r)
-    summ = gossip.summary(st, 0, None, b"", frozenset())
-    delt = gossip.delta(st, gossip.summary(ChainStore(), 0, None, b"", frozenset()))
+    with st.write_txn() as tx:
+        tx.put_op_raw(op)
+        tx.put_qc(qc)
+        for r in recs:
+            tx.put_receipt(r)
+    empty = ChainStore()
+    with empty.read_txn() as etx, st.read_txn() as tx:
+        summ = gossip.summary(tx, 0, None, b"", frozenset())
+        delt = gossip.delta(tx, gossip.summary(etx, 0, None, b"", frozenset()))
 
     reqs = {
         "REQ_submit": N.SubmitReq(op),

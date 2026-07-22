@@ -42,15 +42,18 @@ class TestEquivocator(unittest.TestCase):
         # a third party (honest node 1) gossips in the equivocator's ops+receipts
         # and ASSEMBLES the proof (B6): a portable, self-verifying DOUBLE_VOTE.
         gossip.merge(sim.raw[1].acc.store, sim.raw[0].acc.store)
-        proofs = sim.raw[1].acc.store.detect_double_votes()
+        with sim.raw[1].acc.store.write_txn() as tx:
+            proofs = tx.detect_double_votes()
         self.assertEqual(len(proofs), 1)
         self.assertTrue(proofs[0].verify())
         self.assertEqual(proofs[0].signer, sim.roster[0])  # attributed to the equivocator
-        minted = sim.raw[1].acc.store.evidence()
+        with sim.raw[1].acc.store.read_txn() as tx:
+            minted = tx.evidence()
         self.assertTrue(any(k == EvidenceKind.DOUBLE_VOTE for k, _ in minted))
 
         # detection is idempotent — re-running mints nothing new
-        self.assertEqual(sim.raw[1].acc.store.detect_double_votes(), [])
+        with sim.raw[1].acc.store.write_txn() as tx:
+            self.assertEqual(tx.detect_double_votes(), [])
 
         # CONTAINMENT: a single equivocator never reached a quorum for either op
         # (B1 at the quorum level never fired), and the fold collapses the double
@@ -77,7 +80,8 @@ class TestEquivocator(unittest.TestCase):
         self.assertEqual(sim.decided_ops(tag), {a.op_hash, b.op_hash})  # two decrees, allowed
         # B6's other clauses: proof assemblable + fold still one winner
         gossip.merge(sim.raw[1].acc.store, sim.raw[0].acc.store)
-        self.assertTrue(sim.raw[1].acc.store.detect_double_votes())
+        with sim.raw[1].acc.store.write_txn() as tx:
+            self.assertTrue(tx.detect_double_votes())
         r = fold.fold([*w.all_control(), a, b], w.keyring, w.genesis)
         self.assertIn(r.state.get(b"k"), (b"A", b"B"))
 
@@ -116,12 +120,13 @@ class TestAmnesiacNode(unittest.TestCase):
 
         # a party assembles the double vote from the two lives' receipts + ops
         store = ChainStore()
-        store.put_op_raw(a)
-        store.put_op_raw(b)
         assert isinstance(ra, A.Receipt) and isinstance(rb, A.Receipt)
-        store.put_receipt(ra)
-        store.put_receipt(rb)
-        proofs = store.detect_double_votes()
+        with store.write_txn() as tx:
+            tx.put_op_raw(a)
+            tx.put_op_raw(b)
+            tx.put_receipt(ra)
+            tx.put_receipt(rb)
+            proofs = tx.detect_double_votes()
         self.assertEqual(len(proofs), 1)
         self.assertTrue(proofs[0].verify())
         self.assertEqual(proofs[0].signer, npub)  # retirement targets this identity
@@ -136,12 +141,16 @@ class TestWithholder(unittest.TestCase):
         w = World(seed=42, n_clients=1)
         op = creation_op(w, 0, b"v")
         # nodes 1,2 hold the committed op; node 0 is eclipsed (withheld from it)
-        sim.raw[1].acc.store.append(op)
-        sim.raw[2].acc.store.append(op)
-        self.assertIsNone(sim.raw[0].acc.store.get_op(op.op_hash))  # victim lacks it
+        with sim.raw[1].acc.store.write_txn() as tx:
+            tx.append(op)
+        with sim.raw[2].acc.store.write_txn() as tx:
+            tx.append(op)
+        with sim.raw[0].acc.store.read_txn() as tx:
+            self.assertIsNone(tx.get_op(op.op_hash))  # victim lacks it
         # a single honest contact (anti-entropy from node 1) heals the victim
         gossip.merge(sim.raw[0].acc.store, sim.raw[1].acc.store)
-        self.assertIsNotNone(sim.raw[0].acc.store.get_op(op.op_hash))
+        with sim.raw[0].acc.store.read_txn() as tx:
+            self.assertIsNotNone(tx.get_op(op.op_hash))
 
 
 class TestSplitView(unittest.TestCase):
@@ -159,23 +168,30 @@ class TestSplitView(unittest.TestCase):
         self.assertNotEqual(a.op_hash, b.op_hash)
 
         v1, v2 = ChainStore(), ChainStore()  # two victims, one side each
-        v1.append(a)
-        v2.append(b)
-        self.assertEqual(v1.evidence(), [])  # neither alone sees a fork
-        self.assertEqual(v2.evidence(), [])
+        with v1.write_txn() as tx:
+            tx.append(a)
+        with v2.write_txn() as tx:
+            tx.append(b)
+        with v1.read_txn() as tx:
+            self.assertEqual(tx.evidence(), [])  # neither alone sees a fork
+        with v2.read_txn() as tx:
+            self.assertEqual(tx.evidence(), [])
 
         # the victims compare (§3.5). Gossip's seq-range delta cannot ship a
         # SAME-seq sibling, so the comparison pulls the peer's head by hash — that
         # is the split-view detector: appending it reveals the fork at seq 0.
-        peer_head = v2.heads()[w.mgr_pub][1]  # b's op_hash
-        peer_op = v2.get_op(peer_head)
+        with v2.read_txn() as tx:
+            peer_head = tx.heads()[w.mgr_pub][1]  # b's op_hash
+            peer_op = tx.get_op(peer_head)
         assert peer_op is not None
-        res = v1.append(peer_op)
+        with v1.write_txn() as tx:
+            res = tx.append(peer_op)
         self.assertEqual(res.status, AppendStatus.FORK)
         assert res.evidence is not None
         self.assertEqual(res.evidence.seq, 0)  # the divergence seq
         self.assertTrue(res.evidence.verify())
-        self.assertTrue(any(k == EvidenceKind.FORK for k, _ in v1.evidence()))
+        with v1.read_txn() as tx:
+            self.assertTrue(any(k == EvidenceKind.FORK for k, _ in tx.evidence()))
 
 
 class TestFloorPerjurer(unittest.TestCase):
@@ -203,15 +219,18 @@ class TestFloorPerjurer(unittest.TestCase):
 
         # a third party assembles the proof (B6) from the watermark + receipt + op
         store = sim.raw[2].acc.store
-        store.put_op_raw(op)
         assert isinstance(rc, A.Receipt)
-        store.put_receipt(rc)
-        proofs = store.detect_floor_perjury([wm])
+        with store.write_txn() as tx:
+            tx.put_op_raw(op)
+            tx.put_receipt(rc)
+            proofs = tx.detect_floor_perjury([wm])
         self.assertEqual(len(proofs), 1)
         self.assertTrue(proofs[0].verify())
         self.assertEqual(proofs[0].signer, sim.roster[0])
-        self.assertTrue(any(k == EvidenceKind.FLOOR_PERJURY for k, _ in store.evidence()))
-        self.assertEqual(store.detect_floor_perjury([wm]), [])  # idempotent
+        with store.read_txn() as tx:
+            self.assertTrue(any(k == EvidenceKind.FLOOR_PERJURY for k, _ in tx.evidence()))
+        with store.write_txn() as tx:
+            self.assertEqual(tx.detect_floor_perjury([wm]), [])  # idempotent
 
     def test_honest_below_floor_receipt_is_not_perjury(self):
         # THE finding-17 regression: an honest node legally receipts op X while its
@@ -231,10 +250,11 @@ class TestFloorPerjurer(unittest.TestCase):
         self.assertLess(rc.issue_seq, wm.issue_seq)  # ...but receipted BEFORE attesting
 
         store = sim.raw[1].acc.store
-        store.put_op_raw(op)
-        store.put_receipt(rc)
-        self.assertEqual(store.detect_floor_perjury([wm]), [])  # NOT convicted
-        self.assertEqual(store.evidence(), [])
+        with store.write_txn() as tx:
+            tx.put_op_raw(op)
+            tx.put_receipt(rc)
+            self.assertEqual(tx.detect_floor_perjury([wm]), [])  # NOT convicted
+            self.assertEqual(tx.evidence(), [])
 
     def test_reissue_preserves_issue_seq(self):
         # serve-from-store: a resubmitted ACCEPT returns the identical receipt, and a
@@ -272,14 +292,17 @@ class TestSeqReuse(unittest.TestCase):
         ra = A.Receipt.issue(nsk, npub, a.op_hash, 0, ballot, 5)  # issue_seq 5
         rb = A.Receipt.issue(nsk, npub, b.op_hash, 0, ballot, 5)  # 5 REUSED, different op
         store = ChainStore()
-        store.put_receipt(ra)
-        store.put_receipt(rb)
-        proofs = store.detect_seq_reuse()
+        with store.write_txn() as tx:
+            tx.put_receipt(ra)
+            tx.put_receipt(rb)
+            proofs = tx.detect_seq_reuse()
         self.assertEqual(len(proofs), 1)
         self.assertTrue(proofs[0].verify())
         self.assertEqual(proofs[0].signer, npub)
-        self.assertTrue(any(k == EvidenceKind.SEQ_REUSE for k, _ in store.evidence()))
-        self.assertEqual(store.detect_seq_reuse(), [])  # idempotent
+        with store.read_txn() as tx:
+            self.assertTrue(any(k == EvidenceKind.SEQ_REUSE for k, _ in tx.evidence()))
+        with store.write_txn() as tx:
+            self.assertEqual(tx.detect_seq_reuse(), [])  # idempotent
 
     def test_backstamp_onto_watermark_seq_mints_seq_reuse(self):
         # finding 18a: a perjurer EVADES the ordered pair by stamping its below-floor
@@ -294,17 +317,20 @@ class TestSeqReuse(unittest.TestCase):
         rc = A.Receipt.issue(nsk, npub, op.op_hash, 0, A.Ballot(1, b"x"), 9)  # back-stamped to 9
         self.assertLess(op.hlc.wall_ms, wm.floor.wall_ms)  # the receipt is below the floor
         store = ChainStore()
-        store.put_op_raw(op)
-        store.put_receipt(rc)
-        # the ordered-pair perjury detector is EVADED (rc.issue_seq 9 not > wm 9)
-        self.assertEqual(store.detect_floor_perjury([wm]), [])
-        # ...but the generalized seq-reuse detector catches the collision (18a)
-        proofs = store.detect_seq_reuse([wm])
+        with store.write_txn() as tx:
+            tx.put_op_raw(op)
+            tx.put_receipt(rc)
+            # the ordered-pair perjury detector is EVADED (rc.issue_seq 9 not > wm 9)
+            self.assertEqual(tx.detect_floor_perjury([wm]), [])
+            # ...but the generalized seq-reuse detector catches the collision (18a)
+            proofs = tx.detect_seq_reuse([wm])
         self.assertEqual(len(proofs), 1)
         self.assertTrue(proofs[0].verify())
         self.assertEqual(proofs[0].signer, npub)
-        self.assertTrue(any(k == EvidenceKind.SEQ_REUSE for k, _ in store.evidence()))
-        self.assertEqual(store.detect_seq_reuse([wm]), [])  # idempotent
+        with store.read_txn() as tx:
+            self.assertTrue(any(k == EvidenceKind.SEQ_REUSE for k, _ in tx.evidence()))
+        with store.write_txn() as tx:
+            self.assertEqual(tx.detect_seq_reuse([wm]), [])  # idempotent
 
     def test_legitimate_cross_epoch_reissue_is_not_reuse(self):
         # the same op at one issue_seq across two epochs (a RERECEIPT) is NOT reuse.
@@ -316,9 +342,10 @@ class TestSeqReuse(unittest.TestCase):
         r_e0 = A.Receipt.issue(nsk, npub, a.op_hash, 0, ballot, 7)
         r_e1 = A.Receipt.issue(nsk, npub, a.op_hash, 1, ballot, 7)  # same op, e+1, same seq
         store = ChainStore()
-        store.put_receipt(r_e0)
-        store.put_receipt(r_e1)
-        self.assertEqual(store.detect_seq_reuse(), [])  # same op -> legitimate
+        with store.write_txn() as tx:
+            tx.put_receipt(r_e0)
+            tx.put_receipt(r_e1)
+            self.assertEqual(tx.detect_seq_reuse(), [])  # same op -> legitimate
 
 
 if __name__ == "__main__":

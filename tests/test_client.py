@@ -329,8 +329,9 @@ class TestEndpointConsumption(unittest.TestCase):
         roster = [C.SIGNER.public(s) for s in sks]
         eps = self._endpoints(w, roster)
         nd = NodeDaemon(sks[0], roster[0], roster=roster, manager_pub=w.mgr_pub, delta_ms=10**9)
-        for op in [*w.control_ops, *eps]:
-            nd.store.put_op_raw(op)
+        with nd.store.write_txn() as tx:
+            for op in [*w.control_ops, *eps]:
+                tx.put_op_raw(op)
         nd.refresh_peers()
         # peers are (identity, address) pairs now (L_msg needs `to`); check the addresses
         self.assertEqual(

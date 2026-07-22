@@ -319,14 +319,16 @@ class Sim:
         sim-side of checkpoint adoption (NOTES 40 infra). GC is a SEPARATE step
         (`gc`), so mixed-laziness (nodes GC'ing at different times) is testable."""
         for i in range(self.n) if nodes is None else nodes:
-            self.raw[i].acc.store.adopt_checkpoint(cut, retained, list(dead))
+            with self.raw[i].acc.store.write_txn() as tx:
+                tx.adopt_checkpoint(cut, retained, list(dead))
         self._cut, self._dead = cut, frozenset(dead)
 
     def gc(self, dead, nodes=None) -> None:
         """Run the checkpoint's GC delta on `nodes` (all by default). Lazy + local:
         nodes may call this at wildly different times (the mixed-laziness persona)."""
         for i in range(self.n) if nodes is None else nodes:
-            self.raw[i].acc.store.gc_checkpoint(list(dead))
+            with self.raw[i].acc.store.write_txn() as tx:
+                tx.gc_checkpoint(list(dead))
 
     def start_gossip(self, period_ms: int) -> None:
         """Schedule periodic anti-entropy for the duration of the run."""
@@ -344,12 +346,12 @@ class Sim:
         DOUBLE_VOTE from an equivocator's spread receipts)."""
 
         def triple(nd) -> tuple:
-            st = nd.acc.store
-            return (
-                frozenset(o.op_hash for o in st.all_ops()),
-                frozenset((r.op_hash, r.signer) for r in st.all_receipts()),
-                frozenset(q.op_hash for q in st.all_qcs()),
-            )
+            with nd.acc.store.read_txn() as tx:
+                return (
+                    frozenset(o.op_hash for o in tx.all_ops()),
+                    frozenset((r.op_hash, r.signer) for r in tx.all_receipts()),
+                    frozenset(q.op_hash for q in tx.all_qcs()),
+                )
 
         views = [triple(nd) for nd in self.raw]
         return all(v == views[0] for v in views)
@@ -359,7 +361,11 @@ class Sim:
         never violate, so this stays empty across chaos runs; the persona builds
         (WP3) that equivocate are what exercise the minting side of B6. FORK
         (two signed ops at one author/seq) is the one kind wired today."""
-        return [ev for nd in self.raw for ev in nd.acc.store.evidence()]
+        out: list = []
+        for nd in self.raw:
+            with nd.acc.store.read_txn() as tx:
+                out.extend(tx.evidence())
+        return out
 
     # ---- read helpers for tests ------------------------------------------- #
     def decided_ops(self, slot_tag: bytes) -> set[bytes]:

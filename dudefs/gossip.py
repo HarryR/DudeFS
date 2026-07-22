@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from . import artifacts as A
 from . import codec
 from .artifacts import HLC, QC, Heads, Op, Receipt
-from .store import ChainStore, baseline_digest
+from .store import ChainStore, ReadTxn, WriteTxn, baseline_digest
 from .store import covered as _covered  # the canonical cut boundary (store L2)
 
 # --------------------------------------------------------------------------- #
@@ -54,20 +54,21 @@ class Summary:
 
 
 def summary(
-    store: ChainStore,
+    tx: ReadTxn,
     epoch: int = 0,
     cut: Heads | None = None,
     checkpoint: bytes = b"",
     dead: frozenset[bytes] = frozenset(),
 ) -> Summary:
     # the advertised baseline commits to the RETAINED projection (covered ∖ dead),
-    # so a lazy-GC node and a GC'd node advertise the SAME digest (WP1.3).
-    baseline = baseline_digest(store.all_ops(), cut, dead) if cut else {}
+    # so a lazy-GC node and a GC'd node advertise the SAME digest (WP1.3). Runs in the
+    # caller's read snapshot so heads/receipts/qcs/cut all reflect one instant.
+    baseline = baseline_digest(tx.all_ops(), cut, dead) if cut else {}
     return Summary(
-        heads={author: seq for author, (seq, _hh) in store.heads().items()},
-        receipts=frozenset((r.op_hash, r.signer) for r in store.all_receipts()),
-        qcs=frozenset(qc.op_hash for qc in store.all_qcs()),
-        floor=store.get_attested(),
+        heads={author: seq for author, (seq, _hh) in tx.heads().items()},
+        receipts=frozenset((r.op_hash, r.signer) for r in tx.all_receipts()),
+        qcs=frozenset(qc.op_hash for qc in tx.all_qcs()),
+        floor=tx.get_attested(),
         epoch=epoch,
         checkpoint=checkpoint,
         retained=baseline,
@@ -86,36 +87,44 @@ class Delta:
     qcs: tuple[QC, ...]  # QCs the peer lacks
 
 
-def delta(store: ChainStore, peer: Summary) -> Delta:
-    """What `store` holds that `peer` (per its Summary) lacks. Ops honor
-    contiguity: only the run from the peer's head up to ours, per author."""
+def delta(tx: ReadTxn, peer: Summary) -> Delta:
+    """What the store (via read snapshot `tx`) holds that `peer` (per its Summary)
+    lacks. Ops honor contiguity: only the run from the peer's head up to ours, per
+    author."""
     ops: list[Op] = []
-    for author, (my_head, _hh) in store.heads().items():
+    for author, (my_head, _hh) in tx.heads().items():
         peer_head = peer.heads.get(author, -1)
         for seq in range(peer_head + 1, my_head + 1):
-            ops.extend(store.get(author, seq))  # fork siblings included — peer mints evidence
+            ops.extend(tx.get(author, seq))  # fork siblings included — peer mints evidence
     ops.sort(key=lambda o: (o.author, o.seq))  # apply prev-before-successor
-    receipts = tuple(r for r in store.all_receipts() if (r.op_hash, r.signer) not in peer.receipts)
-    qcs = tuple(qc for qc in store.all_qcs() if qc.op_hash not in peer.qcs)
+    receipts = tuple(r for r in tx.all_receipts() if (r.op_hash, r.signer) not in peer.receipts)
+    qcs = tuple(qc for qc in tx.all_qcs() if qc.op_hash not in peer.qcs)
     return Delta(tuple(ops), receipts, qcs)
 
 
-def apply_delta(store: ChainStore, d: Delta) -> None:
-    """Merge a received Delta. Ops go through `append` (contiguity gate + fork
-    evidence); a gap/fork op is simply not stored and the next round retries."""
+def apply_delta(tx: WriteTxn, d: Delta) -> None:
+    """Merge a received Delta in ONE write transaction. Ops go through `append`
+    (contiguity gate + fork evidence); a gap/fork op is simply not stored and the
+    next round retries."""
     for op in sorted(d.ops, key=lambda o: (o.author, o.seq)):
-        store.append(op)
+        tx.append(op)
     for r in d.receipts:
-        store.put_receipt(r)
+        tx.put_receipt(r)
     for qc in d.qcs:
-        store.put_qc(qc)
+        tx.put_qc(qc)
 
 
 def merge(dst: ChainStore, src: ChainStore, dst_epoch: int = 0) -> None:
     """One-directional pull: apply everything `src` holds that `dst` lacks. A
     full epidemic round is `merge` both ways; convergence needs only that every
-    pair eventually merges (PROTOCOL §2)."""
-    apply_delta(dst, delta(src, summary(dst, dst_epoch)))
+    pair eventually merges (PROTOCOL §2). Each store access is its own transaction —
+    the peer read is not held across the local write."""
+    with dst.read_txn() as dtx:
+        summ = summary(dtx, dst_epoch)
+    with src.read_txn() as stx:
+        d = delta(stx, summ)
+    with dst.write_txn() as dtx:
+        apply_delta(dtx, d)
 
 
 def pull_op(dst: ChainStore, src: ChainStore, op_hash: bytes) -> bool:
@@ -123,10 +132,12 @@ def pull_op(dst: ChainStore, src: ChainStore, op_hash: bytes) -> bool:
     used for dep resolution — §2.1). Stored contiguity-free: a dep may be
     referenced ahead of its own chain, and the envelope is self-validating.
     Returns whether the op was found at the peer."""
-    op = src.get_op(op_hash)
+    with src.read_txn() as stx:
+        op = stx.get_op(op_hash)
     if op is None:
         return False
-    dst.put_op_raw(op)
+    with dst.write_txn() as dtx:
+        dtx.put_op_raw(op)
     return True
 
 
@@ -152,24 +163,28 @@ def pull_baseline(
     Excluding `dead` is load-bearing (WP1.3): without it a GC'd node and a lazy-GC
     peer disagree every round and re-pull each other's superseded envelopes forever
     (the oscillation bug). Only winners cross the wire, and only on a real diff."""
-    dst_digest = baseline_digest(dst.all_ops(), cut, dead)
-    src_digest = baseline_digest(src.all_ops(), cut, dead)
+    with dst.read_txn() as dtx:
+        dst_digest = baseline_digest(dtx.all_ops(), cut, dead)
+    with src.read_txn() as stx:
+        src_all = stx.all_ops()
+    src_digest = baseline_digest(src_all, cut, dead)
     src_below: dict[bytes, list[Op]] = {}
-    for o in src.all_ops():
+    for o in src_all:
         if _covered(o, cut) and o.op_hash not in dead:
             src_below.setdefault(o.author, []).append(o)
     pulled = 0
-    for author, ops in src_below.items():
-        if dst_digest.get(author) != src_digest.get(author):
-            for o in ops:
-                if dst.get_op(o.op_hash) is None:
-                    dst.put_op_raw(o)  # author-signed envelope; checkpoint certifies commitment
-                    pulled += 1
+    with dst.write_txn() as dtx:
+        for author, ops in src_below.items():
+            if dst_digest.get(author) != src_digest.get(author):
+                for o in ops:
+                    if dtx.get_op(o.op_hash) is None:
+                        dtx.put_op_raw(o)  # author-signed envelope; checkpoint certifies it
+                        pulled += 1
     return pulled
 
 
 def verify_baseline(
-    store: ChainStore,
+    tx: ReadTxn,
     cut: Heads,
     committed: Mapping[bytes, tuple[int, bytes]],
     dead: frozenset[bytes] = frozenset(),
@@ -181,7 +196,7 @@ def verify_baseline(
     so a node that has adopted the checkpoint but not yet GC'd its `dead` ops still
     verifies complete. A tampered or genuinely partial baseline fails here,
     localized to the author; the checkpoint signature is verified separately."""
-    have = baseline_digest(store.all_ops(), cut, dead)
+    have = baseline_digest(tx.all_ops(), cut, dead)
     return {a for a in set(have) | set(committed) if have.get(a) != committed.get(a)}
 
 

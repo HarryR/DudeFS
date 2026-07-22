@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+from .. import store
 from ..acceptor import Acceptor, AcceptResult, Nack, Rejected, RejectReason
 from ..artifacts import Ballot, Op
 
@@ -29,22 +30,23 @@ class EquivocatingAcceptor(Acceptor):
             return Rejected(RejectReason.BAD_STRUCTURE)
         if op.slot_tag != tag:
             return Rejected(RejectReason.BAD_STRUCTURE)
-        skew = self._skew_reason(op, now_ms)
-        if skew:
-            return Rejected(skew)
-        s = self.store.get_slot(tag)
-        if ballot < s.promised:
-            return Nack(s.promised)
-        # THE misbehavior: no equivocation guard — it re-signs at the same ballot
-        # for a different op, overwriting its accepted slot state.
-        self.store.put_op_raw(op)
-        s.promised = ballot
-        s.accepted_ballot = ballot
-        s.accepted_op = op.op_hash
-        self.store._write_slot(tag, s)
-        self._advance_hw(op)
-        self.store.commit()  # fsync before signing
-        return self._issue_receipt(op.op_hash, ballot, receipt_epoch)
+        with self.store.write_txn() as tx:
+            skew = self._skew_reason(tx, op, now_ms)
+            if skew:
+                return Rejected(skew)
+            s = tx.get_slot(tag)
+            if ballot < s.promised:
+                return Nack(s.promised)
+            # THE misbehavior: no equivocation guard — it re-signs at the same ballot
+            # for a different op, overwriting its accepted slot state.
+            tx.put_op_raw(op)
+            s.promised = ballot
+            s.accepted_ballot = ballot
+            s.accepted_op = op.op_hash
+            tx.write_slot(tag, s)
+            self._advance_hw(tx, op)
+            receipt = self._issue_receipt(tx, op.op_hash, ballot, receipt_epoch)
+        return receipt
 
 
 class FloorPerjurer(Acceptor):
@@ -55,7 +57,7 @@ class FloorPerjurer(Acceptor):
     never finalizes below its own floor, so honest finality still converges — only
     the perjurer is incriminated."""
 
-    def _skew_reason(self, op: Op, now_ms: int) -> RejectReason | None:
+    def _skew_reason(self, tx: store.ReadTxn, op: Op, now_ms: int) -> RejectReason | None:
         # only the future gate; the past gate (op.hlc < floor) is what it perjures.
         if op.hlc.wall_ms > now_ms + self.delta_ms:
             return RejectReason.FUTURE_HLC

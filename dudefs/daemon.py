@@ -23,7 +23,7 @@ from .gossip import Delta
 from .handlers import control as ctl
 from .link import Link
 from .node import LocalNode, dispatch
-from .store import ChainStore, covered
+from .store import ChainStore, ReadTxn, StoreBusy, StoreClosed, StoreError, covered
 
 LOCAL_TRANSPORT = transports.UNIX  # the POC carrier; ENDPOINT addrs are (transport, uri, opts)
 
@@ -71,8 +71,9 @@ class NodeDaemon:
         self._sealed = False  # inbound profile; serve_forever(sealed=True) unseals first
         self.store = ChainStore(store_path)
         self.manager_pub = manager_pub
-        for op in control_ops or []:  # seed the authorization view (certs/roster)
-            self.store.put_op_raw(op)
+        with self.store.write_txn() as tx:
+            for op in control_ops or []:  # seed the authorization view (certs/roster)
+                tx.put_op_raw(op)
         # the request gate's authz view (NOTES 58): a ControlState rebuilt from the
         # control ops we hold, refreshed each maintenance tick as certs gossip in.
         self._authz = ControlState(manager_pub, epoch)
@@ -89,7 +90,6 @@ class NodeDaemon:
         self.node = LocalNode(self.acc, self._clock)
         self.roster = roster or [pub]
         self.quorum = quorum_size(len(self.roster))
-        self._lock = threading.Lock()  # serializes store access across conn threads
         self._rebuild_authz()
 
     def _rebuild_authz(self) -> None:
@@ -97,7 +97,9 @@ class NodeDaemon:
         (best-effort — fail-closed until a cert propagates, NOTES 59). Reference swap
         is atomic; serving threads read the latest without a lock."""
         r = ControlReducer(self.manager_pub, self.acc.epoch)
-        for op in self.store.all_ops():
+        with self.store.read_txn() as tx:
+            ops = tx.all_ops()
+        for op in ops:
             if op.is_control:
                 r.observe(op)
         self._authz = r.control
@@ -112,41 +114,43 @@ class NodeDaemon:
         never leaks our pubkey to a party that didn't already have it. A vanished store
         (this node being killed mid-request) yields silence — the handler owns its own
         store error so the transport stays a dumb pipe."""
-        with self._lock:
-            try:
-                # sealed endpoint: unseal FIRST (a party that can't seal to us never
-                # yields an envelope -> silence, the seal IS the screen); else plain.
-                reply_key: bytes | None = None
-                if self._sealed:
-                    opened = lmsg.unseal_request(self.sk, data)
-                    if opened is None:
-                        return None  # not sealed to me / malformed -> reveal nothing
-                    env0, reply_key = opened
-                    outcome: lmsg.Inbound = lmsg.gate_envelope(
-                        env0,
-                        self_pub=self.pub,
-                        now=self._clock(),
-                        delta=self.acc.delta_ms,
-                        authorized=self._peer_authorized,
-                    )
-                else:
-                    outcome = lmsg.classify_inbound(
-                        data,
-                        self_pub=self.pub,
-                        now=self._clock(),
-                        delta=self.acc.delta_ms,
-                        authorized=self._peer_authorized,
-                    )
-                match outcome:
-                    case lmsg.Gated(env):
-                        return self._reply(env, self._dispatch(env.body), reply_key)
-                    case lmsg.Refused(env, reason):
-                        refusal = Rejected(_REFUSAL_REASON[reason])  # the signed 'no' says WHY
-                        return self._reply(env, wire.encode_response(refusal), reply_key)
-                    case lmsg.Dropped(_reason):
-                        return None  # unproven identity / malformed -> reveal nothing
-            except sqlite3.Error:
-                return None  # store closed under us (node killed) -> carrier silence
+        # No daemon-wide lock: the store serializes its own access (reader/writer
+        # connections + WAL, R5), so serving threads run concurrently and a request
+        # never blocks behind the maintenance tick.
+        try:
+            # sealed endpoint: unseal FIRST (a party that can't seal to us never
+            # yields an envelope -> silence, the seal IS the screen); else plain.
+            reply_key: bytes | None = None
+            if self._sealed:
+                opened = lmsg.unseal_request(self.sk, data)
+                if opened is None:
+                    return None  # not sealed to me / malformed -> reveal nothing
+                env0, reply_key = opened
+                outcome: lmsg.Inbound = lmsg.gate_envelope(
+                    env0,
+                    self_pub=self.pub,
+                    now=self._clock(),
+                    delta=self.acc.delta_ms,
+                    authorized=self._peer_authorized,
+                )
+            else:
+                outcome = lmsg.classify_inbound(
+                    data,
+                    self_pub=self.pub,
+                    now=self._clock(),
+                    delta=self.acc.delta_ms,
+                    authorized=self._peer_authorized,
+                )
+            match outcome:
+                case lmsg.Gated(env):
+                    return self._reply(env, self._dispatch(env.body), reply_key)
+                case lmsg.Refused(env, reason):
+                    refusal = Rejected(_REFUSAL_REASON[reason])  # the signed 'no' says WHY
+                    return self._reply(env, wire.encode_response(refusal), reply_key)
+                case lmsg.Dropped(_reason):
+                    return None  # unproven identity / malformed -> reveal nothing
+        except (sqlite3.Error, StoreError):
+            return None  # store closed/busy under us (node killed or contended) -> silence
 
     def _reply(self, env: lmsg.Envelope, body: bytes, reply_key: bytes | None) -> bytes:
         """A signed reply back to the requester (mirrors the request's verb); sealed to
@@ -172,26 +176,30 @@ class NodeDaemon:
         first = codec.as_seq(codec.decode(data))[0]
         if codec.as_bytes(first) == b"gossip":
             summ = gossip.decode_summary(codec.as_bytes(codec.as_seq(codec.decode(data))[1]))
-            d = gossip.delta(self.store, summ)
-            d = Delta((*d.ops, *self._baseline_ops_for(summ)), d.receipts, d.qcs)
+            with self.store.read_txn() as tx:  # the delta + baseline are ONE snapshot
+                d = gossip.delta(tx, summ)
+                d = Delta((*d.ops, *self._baseline_ops_for(tx, summ)), d.receipts, d.qcs)
             return gossip.encode_delta(d)
         return wire.encode_response(dispatch(self.node, wire.decode_request(data)))
 
     # ---- the epidemic gossip loop (WP1.2) ---------------------------------- #
     def summary(self) -> gossip.Summary:
-        cut = self.store.cut()
-        return gossip.summary(
-            self.store,
-            self.acc.epoch,
-            cut or None,
-            self.store.get_meta("checkpoint") or b"",
-            self.store.cut_dead(),
-        )
+        with self.store.read_txn() as tx:
+            cut = tx.cut()
+            return gossip.summary(
+                tx,
+                self.acc.epoch,
+                cut or None,
+                tx.get_meta("checkpoint") or b"",
+                tx.cut_dead(),
+            )
 
     def address_book(self) -> dict[bytes, list[transports.Endpoint]]:
         """Node reachability derived from the ENDPOINT control ops I hold (PROTOCOL
         §7 / NOTES 58) — the control plane IS the peer registry."""
-        return endpoints_of(self.store.all_ops(), self.manager_pub, self.acc.epoch)
+        with self.store.read_txn() as tx:
+            ops = tx.all_ops()
+        return endpoints_of(ops, self.manager_pub, self.acc.epoch)
 
     def refresh_peers(self) -> None:
         """Rebuild the anti-entropy peer list from the address book (every roster peer
@@ -212,26 +220,31 @@ class NodeDaemon:
         Cut-aware — the peer's reply folds in the sparse below-cut baseline for any
         author whose retained digest differs."""
         link = Link(self.sk, self.pub, peer.pub, peer.endpoint)
+        # the SUMMARY is read in its own snapshot; the peer dial happens with NO store
+        # transaction held; the reply is applied in one write transaction.
         match link.request(
             b"gossip", _gossip_request(self.summary()), epoch=self.acc.epoch, ts=self._clock()
         ):
             case lmsg.Reply(env):
-                gossip.apply_delta(self.store, gossip.decode_delta(env.body))
+                d = gossip.decode_delta(env.body)
+                with self.store.write_txn() as tx:
+                    gossip.apply_delta(tx, d)
             case _fault:  # NoReply / MalformedReply / WrongPeer — a missed round
                 pass
 
-    def _baseline_ops_for(self, peer: gossip.Summary) -> list[Op]:
+    def _baseline_ops_for(self, tx: ReadTxn, peer: gossip.Summary) -> list[Op]:
         """The below-cut RETAINED winners I hold for any author whose retained digest
         differs from the peer's — the sparse baseline half of a cut-aware round
-        (checkpoint-certified envelopes, no receipts/QCs below the cut)."""
-        cut = self.store.cut()
+        (checkpoint-certified envelopes, no receipts/QCs below the cut). Reads within
+        the caller's snapshot `tx`."""
+        cut = tx.cut()
         if not cut:
             return []
-        dead = self.store.cut_dead()
-        mine = self.store.baseline_commitment()
+        dead = tx.cut_dead()
+        mine = tx.baseline_commitment()
         return [
             o
-            for o in self.store.all_ops()
+            for o in tx.all_ops()
             if covered(o, cut)
             and o.op_hash not in dead
             and mine.get(o.author) != peer.retained.get(o.author)
@@ -244,44 +257,51 @@ class NodeDaemon:
         and lazily GC. Skipped until I hold the full below-cut baseline (verify_
         baseline non-empty means gaps — defer, a later gossip round fills them)."""
         reducer = ControlReducer(self.manager_pub, self.acc.epoch)
-        for op in sorted(self.store.all_ops(), key=lambda o: (o.hlc.as_tuple(), o.op_hash)):
-            if op.is_control:
-                reducer.observe(op)  # authorization state up to here
-        best: tuple[Op, ctl.Checkpoint] | None = None
-        for op in self.store.all_ops():
-            body = ctl.decode(op) if op.is_control else None
-            if not isinstance(body, ctl.Checkpoint):
-                continue
-            if self.store.get_qc(op.op_hash) is None:  # not quorum-committed
-                continue
-            if not reducer.control.can_author_control(op.author, ctl.ControlKind.CHECKPOINT):
-                continue  # unauthorized minter — never adopt
-            if best is None or op.hlc > best[0].hlc:
-                best = (op, body)
-        if best is None:
-            return
-        op, ckpt = best
-        if self.store.get_meta("checkpoint") == op.op_hash:
-            return  # already adopted this one
-        # only adopt once my below-cut baseline satisfies the signed retained digests
-        # — projected over the CHECKPOINT's dead (not the store's still-empty one).
-        if gossip.verify_baseline(self.store, ckpt.cut, ckpt.retained, frozenset(ckpt.dead)):
-            return  # missing baseline — defer to a later round
-        # persist cut + retained + dead + horizon in ONE atomic COMMIT (finding 19):
-        # the horizon must survive crash-restart alongside the cut, else the void
-        # rule + backstop go inert on the reborn op after a restart.
-        self.store.adopt_checkpoint(ckpt.cut, ckpt.retained, ckpt.dead, ckpt.horizon)
-        self.acc.advance_horizon(ckpt.horizon)
-        self.store.gc_checkpoint(ckpt.dead)
-        self.store.set_meta("checkpoint", op.op_hash)
+        # scan + pick + baseline-check in ONE read snapshot
+        with self.store.read_txn() as tx:
+            all_ops = tx.all_ops()
+            for op in sorted(all_ops, key=lambda o: (o.hlc.as_tuple(), o.op_hash)):
+                if op.is_control:
+                    reducer.observe(op)  # authorization state up to here
+            best: tuple[Op, ctl.Checkpoint] | None = None
+            for op in all_ops:
+                body = ctl.decode(op) if op.is_control else None
+                if not isinstance(body, ctl.Checkpoint):
+                    continue
+                if tx.get_qc(op.op_hash) is None:  # not quorum-committed
+                    continue
+                if not reducer.control.can_author_control(op.author, ctl.ControlKind.CHECKPOINT):
+                    continue  # unauthorized minter — never adopt
+                if best is None or op.hlc > best[0].hlc:
+                    best = (op, body)
+            if best is None:
+                return
+            op, ckpt = best
+            if tx.get_meta("checkpoint") == op.op_hash:
+                return  # already adopted this one
+            # only adopt once my below-cut baseline satisfies the signed retained
+            # digests — projected over the CHECKPOINT's dead (not the store's empty one).
+            if gossip.verify_baseline(tx, ckpt.cut, ckpt.retained, frozenset(ckpt.dead)):
+                return  # missing baseline — defer to a later round
+        # adopt + GC + pin the active checkpoint in ONE write transaction (finding 19):
+        # cut/retained/dead/horizon must survive crash-restart together, and the GC of
+        # `dead` must not be observable without the cut that vouches for it.
+        with self.store.write_txn() as tx:
+            tx.adopt_checkpoint(ckpt.cut, ckpt.retained, ckpt.dead, ckpt.horizon)
+            tx.gc_checkpoint(ckpt.dead)
+            tx.set_meta("checkpoint", op.op_hash)
+        # adopt_checkpoint persisted the horizon (finding 19); the guards read it
+        # transactionally, so there is no in-memory horizon to advance here.
 
     # ---- recovery-fence observation (WP1.4) -------------------------------- #
     def observe_fences(self) -> None:
         """Recognize a root-signed recovery pair among gossiped control ops (a ROSTER
         op carrying a `recovery` field naming a checkpoint) and invoke the kernel's
         on_recovery_fence — WP4.7's test-driven calls become daemon behavior."""
-        ckpts = {o.op_hash: o for o in self.store.all_ops() if o.is_control}
-        for op in self.store.all_ops():
+        with self.store.read_txn() as tx:
+            all_ops = tx.all_ops()
+        ckpts = {o.op_hash: o for o in all_ops if o.is_control}
+        for op in all_ops:
             body = ctl.decode(op) if op.is_control else None
             if not isinstance(body, ctl.Roster):
                 continue
@@ -302,14 +322,16 @@ class NodeDaemon:
         (chained within this pass as `activate_epoch` moves me forward). Distinct from
         observe_fences — that is the ROOT-signed recovery substitute when the quorum
         is dead and there is no new-roster QC to be had."""
-        qcs = {(qc.op_hash, qc.config_epoch): qc for qc in self.store.all_qcs()}
+        with self.store.read_txn() as tx:
+            qcs = {(qc.op_hash, qc.config_epoch): qc for qc in tx.all_qcs()}
+            all_ops = tx.all_ops()
         # roster-change ops grouped by the epoch they advance FROM. A slot may be
         # CONTENDED (B4: a crash-retry re-authors the same roster slot), so an epoch
         # can hold several candidate ops of which the old roster decided at most one;
         # keep them all and pick the joint-certified one below (never let an undecided
         # contender starve the activation).
         by_from: dict[int, list[tuple[Op, list[bytes]]]] = {}
-        for op in self.store.all_ops():
+        for op in all_ops:
             body = ctl.decode(op) if op.is_control else None
             if not isinstance(body, ctl.Roster):
                 continue
@@ -337,21 +359,24 @@ class NodeDaemon:
         any proof. Honest nodes mint nothing; a gossiped-in equivocator/perjurer is
         caught here and the proof spreads with the next round. Returns the count."""
         wms = observed_watermarks or []
-        n = 0
-        n += len(self.store.detect_double_votes())
-        n += len(self.store.detect_seq_reuse(wms))
-        n += len(self.store.detect_floor_perjury(wms))
+        with self.store.write_txn() as tx:  # detectors read + persist any proof
+            n = (
+                len(tx.detect_double_votes())
+                + len(tx.detect_seq_reuse(wms))
+                + len(tx.detect_floor_perjury(wms))
+            )
         return n
 
     def status(self) -> dict:
-        return {
-            "epoch": self.acc.epoch,
-            "floor": self.store.get_attested().as_tuple(),
-            "ops": len(self.store.all_ops()),
-            "checkpoint": self.store.get_meta("checkpoint") or b"",
-            "evidence": len(self.store.evidence()),
-            "issuance_gapless": self.store.issuance_gapless(),
-        }
+        with self.store.read_txn() as tx:
+            return {
+                "epoch": self.acc.epoch,
+                "floor": tx.get_attested().as_tuple(),
+                "ops": len(tx.all_ops()),
+                "checkpoint": tx.get_meta("checkpoint") or b"",
+                "evidence": len(tx.evidence()),
+                "issuance_gapless": tx.issuance_gapless(),
+            }
 
     # ---- the maintenance driver (gossip + adopt + observe + audit) --------- #
     def sync_once(self, observed_watermarks: list[Watermark] | None = None) -> None:
@@ -373,7 +398,12 @@ class NodeDaemon:
         """The epidemic cycle on a timer until `stop` — correctness rests on the
         periodic sweep alone (PROTOCOL §2.2)."""
         while not stop.wait(period_s):
-            self.sync_once()
+            try:
+                self.sync_once()
+            except StoreClosed:
+                return  # store closed under us (shutting down) -> end the loop quietly
+            except StoreBusy:
+                continue  # another process contended the store this tick -> retry next
 
     # ---- the listening carrier (the transport owns the I/O; §7 seam) ------- #
     def serve_forever(

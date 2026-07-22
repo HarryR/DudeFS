@@ -191,8 +191,14 @@ class TestDemoRunbook(unittest.TestCase):
             demo.gossip_all()
             n2 = demo.nodes[2]
             assert n2 is not None
-            self.assertTrue(poll_until(lambda: n2.store.get_op(during) is not None, timeout=3))
-            self.assertIsNotNone(n2.store.get_qc(during))  # + the commit proof
+
+            def _has_during() -> bool:
+                with n2.store.read_txn() as tx:
+                    return tx.get_op(during) is not None
+
+            self.assertTrue(poll_until(_has_during, timeout=3))
+            with n2.store.read_txn() as tx:
+                self.assertIsNotNone(tx.get_qc(during))  # + the commit proof
             demo.close()
 
     def test_disk_wipe_identity_retirement_via_replace(self):
@@ -217,7 +223,8 @@ class TestDemoRunbook(unittest.TestCase):
             nodes = {}
             for pub, sk in [*keys, (fresh, fresh_sk)]:
                 acc = Acceptor(sk, pub, ChainStore(), 0, 10**9)
-                acc.store.append(base)
+                with acc.store.write_txn() as tx:
+                    tx.append(base)
                 nodes[pub] = LocalNode(acc, lambda: 100)
             change = m.node_replace(old, fresh, lambda pub, req: dispatch(nodes[pub], req))
 

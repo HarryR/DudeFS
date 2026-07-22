@@ -19,9 +19,10 @@ BIG_DELTA = 1_000_000  # skew never bites in these tests
 
 def _state(store):
     """A store's replicated content, for equality/union checks."""
-    ops = frozenset(o.op_hash for o in store.all_ops())
-    receipts = frozenset((r.op_hash, r.signer) for r in store.all_receipts())
-    qcs = frozenset(q.op_hash for q in store.all_qcs())
+    with store.read_txn() as tx:
+        ops = frozenset(o.op_hash for o in tx.all_ops())
+        receipts = frozenset((r.op_hash, r.signer) for r in tx.all_receipts())
+        qcs = frozenset(q.op_hash for q in tx.all_qcs())
     return ops, receipts, qcs
 
 
@@ -76,8 +77,9 @@ def _seed_prefixes(store, ops, rng):
     for chain in by_author.values():
         chain.sort(key=lambda o: o.seq)
         keep = rng.randint(0, len(chain))
-        for op in chain[:keep]:
-            store.append(op)
+        with store.write_txn() as tx:
+            for op in chain[:keep]:
+                tx.append(op)
 
 
 class TestConvergence(unittest.TestCase):
@@ -87,8 +89,9 @@ class TestConvergence(unittest.TestCase):
             _, ops = _seed_world(seed)
             n = rng.randint(3, 6)
             stores = [ChainStore() for _ in range(n)]
-            for op in ops:  # store 0 holds the full set, so the union covers every op
-                stores[0].append(op)
+            with stores[0].write_txn() as tx:
+                for op in ops:  # store 0 holds the full set, union covers every op
+                    tx.append(op)
             for s in stores[1:]:  # the rest get random contiguous prefixes
                 _seed_prefixes(s, ops, rng)
             # scatter some receipts + a QC so all three artifact kinds converge
@@ -97,8 +100,10 @@ class TestConvergence(unittest.TestCase):
             th = ops[0].op_hash
             recs = [A.Receipt.issue(nkeys[i], npubs[i], th, 0, A.BLIND, 1) for i in range(3)]
             for i, r in enumerate(recs):
-                stores[i % n].put_receipt(r)
-            stores[0].put_qc(A.QC.assemble(recs, 3, {p: i for i, p in enumerate(npubs)}))
+                with stores[i % n].write_txn() as tx:
+                    tx.put_receipt(r)
+            with stores[0].write_txn() as tx:
+                tx.put_qc(A.QC.assemble(recs, 3, {p: i for i, p in enumerate(npubs)}))
 
             union = _union(stores)
             _converge(stores, _connected_mesh(n, rng))
@@ -110,10 +115,12 @@ class TestConvergence(unittest.TestCase):
     def test_merge_is_idempotent_and_order_independent(self):
         _, ops = _seed_world(99)
         a, b = ChainStore(), ChainStore()
-        for op in ops[:5]:
-            a.append(op)
-        for op in ops:  # b holds the full set
-            b.append(op)
+        with a.write_txn() as tx:
+            for op in ops[:5]:
+                tx.append(op)
+        with b.write_txn() as tx:
+            for op in ops:  # b holds the full set
+                tx.append(op)
         gossip.merge(a, b)
         once = _state(a)
         gossip.merge(a, b)  # merging again changes nothing
@@ -143,16 +150,19 @@ class TestSinglePush(unittest.TestCase):
         # gossip receipts back so node 0 holds a quorum, then it assembles the QC
         for peer in (1, 2):
             gossip.merge(nodes[0].store, nodes[peer].store)
-        recs = nodes[0].store.receipts_for(op.op_hash)
+        with nodes[0].store.read_txn() as tx:
+            recs = tx.receipts_for(op.op_hash)
         self.assertGreaterEqual(len(recs), 2)
         qc = A.QC.assemble(recs, 3, idx)
         self.assertTrue(qc.verify(roster))
-        nodes[0].store.put_qc(qc)
+        with nodes[0].store.write_txn() as tx:
+            tx.put_qc(qc)
 
         # the QC now spreads to every node by gossip
         for peer in (1, 2):
             gossip.merge(nodes[peer].store, nodes[0].store)
-            self.assertIsNotNone(nodes[peer].store.get_qc(op.op_hash))
+            with nodes[peer].store.read_txn() as tx:
+                self.assertIsNotNone(tx.get_qc(op.op_hash))
 
 
 class TestDepResolution(unittest.TestCase):
@@ -166,7 +176,8 @@ class TestDepResolution(unittest.TestCase):
 
         w = World(seed=3, n_clients=2)
         base = w.blind(0, [], [[A.Mutation.SET, b"b", b"1"]])  # the dep — lives on the peer only
-        peer.put_op_raw(base)
+        with peer.write_txn() as tx:
+            tx.put_op_raw(base)
         c = w.clients[1]
         dependent = A.Op.build_data(
             author_sk=c.sk,

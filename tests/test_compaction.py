@@ -548,15 +548,18 @@ class TestNodeGC(unittest.TestCase):
         cr = compactor.compact_genesis(below, w.keyring, w.genesis, cut)
 
         store = ChainStore()
-        for op in below:
-            store.append(op)
+        with store.write_txn() as tx:
+            for op in below:
+                tx.append(op)
         self.assertIn(first.op_hash, cr.dead)
         self.assertIn(winner.op_hash, {o.op_hash for o in cr.retained})
 
-        store.gc_checkpoint(cr.dead)
-        self.assertIsNone(store.get_op(first.op_hash))  # superseded op GC'd
-        self.assertIsNotNone(store.get_op(winner.op_hash))  # retained winner kept
-        self.assertIsNotNone(store.get_op(control[0].op_hash))  # control liveness kept
+        with store.write_txn() as tx:
+            tx.gc_checkpoint(cr.dead)
+        with store.read_txn() as tx:
+            self.assertIsNone(tx.get_op(first.op_hash))  # superseded op GC'd
+            self.assertIsNotNone(tx.get_op(winner.op_hash))  # retained winner kept
+            self.assertIsNotNone(tx.get_op(control[0].op_hash))  # control liveness kept
 
 
 class TestCutAwareStore(unittest.TestCase):
@@ -585,24 +588,28 @@ class TestCutAwareStore(unittest.TestCase):
         cut = {pub: (1, ops[1].op_hash)}  # seqs 0,1 below the cut; 2,3 dense tail
 
         store = ChainStore()
-        for o in ops:
-            self.assertTrue(store.append(o))
-        store.adopt_checkpoint(cut, {})
-        store.gc_checkpoint([ops[0].op_hash, ops[1].op_hash])  # drop below-cut ops
+        with store.write_txn() as tx:
+            for o in ops:
+                self.assertTrue(tx.append(o))
+            tx.adopt_checkpoint(cut, {})
+            tx.gc_checkpoint([ops[0].op_hash, ops[1].op_hash])  # drop below-cut ops
 
         # ACCEPT: the tail is anchored at the pin and still reported in full —
         # seq-0 is gone but the author does NOT vanish (finding 1).
-        self.assertEqual(store.heads()[pub], (3, ops[3].op_hash))
+        with store.read_txn() as tx:
+            self.assertEqual(tx.heads()[pub], (3, ops[3].op_hash))
 
         # boundary: an author whose whole chain is below the cut (fully GC'd,
         # idle) reports its PIN, not nothing.
         idle = w.clients[0].pub  # reuse: build a store with only below-cut ops
         s2 = ChainStore()
-        for o in ops[:2]:
-            s2.append(o)
-        s2.adopt_checkpoint(cut, {})
-        s2.gc_checkpoint([ops[0].op_hash, ops[1].op_hash])
-        self.assertEqual(s2.heads()[idle], (1, ops[1].op_hash))  # the pin itself
+        with s2.write_txn() as tx:
+            for o in ops[:2]:
+                tx.append(o)
+            tx.adopt_checkpoint(cut, {})
+            tx.gc_checkpoint([ops[0].op_hash, ops[1].op_hash])
+        with s2.read_txn() as tx:
+            self.assertEqual(tx.heads()[idle], (1, ops[1].op_hash))  # the pin itself
 
     def test_finding2_append_cut_exemption_is_bounded(self):
         w = World(seed=21, n_clients=1)
@@ -613,14 +620,16 @@ class TestCutAwareStore(unittest.TestCase):
         # ACCEPT (exemption): a tail op at cut_seq+1 whose predecessor sits at the
         # cut (legitimately GC'd, absent) is contiguous-by-fiat, not a gap.
         s = ChainStore()
-        s.adopt_checkpoint(cut, {})
-        self.assertEqual(s.append(ops[2]).status, AppendStatus.OK)  # pred seq1 <= cut
+        with s.write_txn() as tx:
+            tx.adopt_checkpoint(cut, {})
+            self.assertEqual(tx.append(ops[2]).status, AppendStatus.OK)  # pred seq1 <= cut
 
         # REJECT (genuine gap): one seq further, at cut_seq+2, whose predecessor is
         # neither present nor below the cut, still defers.
         s2 = ChainStore()
-        s2.adopt_checkpoint(cut, {})
-        self.assertEqual(s2.append(ops[3]).status, AppendStatus.GAP)  # pred seq2 missing
+        with s2.write_txn() as tx:
+            tx.adopt_checkpoint(cut, {})
+            self.assertEqual(tx.append(ops[3]).status, AppendStatus.GAP)  # pred seq2 missing
 
     def test_finding11_possession_below_cut_is_baseline_completeness(self):
         # An author's below-cut envelope is GC'd; a possession barrier whose entry
@@ -644,11 +653,13 @@ class TestCutAwareStore(unittest.TestCase):
         self.assertIn(first.op_hash, cr.dead)
 
         store = ChainStore()
-        for o in below:
-            store.append(o)
-        store.adopt_checkpoint(cut, committed)
-        store.gc_checkpoint(cr.dead)
-        self.assertIsNone(store.get_op(first.op_hash))  # the named envelope is gone
+        with store.write_txn() as tx:
+            for o in below:
+                tx.append(o)
+            tx.adopt_checkpoint(cut, committed)
+            tx.gc_checkpoint(cr.dead)
+        with store.read_txn() as tx:
+            self.assertIsNone(tx.get_op(first.op_hash))  # the named envelope is gone
 
         sk = bytes([170] * 32)
         acc = Acceptor(sk, crypto.SIGNER.public(sk), store, config_epoch=0, delta_ms=BIG_DELTA)
@@ -660,10 +671,11 @@ class TestCutAwareStore(unittest.TestCase):
         # REJECT (pair): a node MISSING the retained winner has an incomplete
         # baseline -> its digest diverges for that author -> possession fails.
         gap = ChainStore()
-        for o in cr.retained:
-            if o.op_hash != winner.op_hash:
-                gap.put_op_raw(o)
-        gap.adopt_checkpoint(cut, committed)
+        with gap.write_txn() as tx:
+            for o in cr.retained:
+                if o.op_hash != winner.op_hash:
+                    tx.put_op_raw(o)
+            tx.adopt_checkpoint(cut, committed)
         gacc = Acceptor(sk, crypto.SIGNER.public(sk), gap, config_epoch=0, delta_ms=BIG_DELTA)
         self.assertFalse(gacc.holds_frontier(sf))
 
@@ -677,11 +689,13 @@ class TestCutAwareStore(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "store.db")
             s = ChainStore(path)
-            s.adopt_checkpoint(cut, committed)
+            with s.write_txn() as tx:
+                tx.adopt_checkpoint(cut, committed)
             s.close()
             s2 = ChainStore(path)
-            self.assertEqual(s2.cut(), cut)
-            self.assertEqual(s2.cut_retained(), committed)
+            with s2.read_txn() as tx:
+                self.assertEqual(tx.cut(), cut)
+                self.assertEqual(tx.cut_retained(), committed)
             s2.close()
 
 
@@ -788,22 +802,27 @@ class TestBaselineSync(unittest.TestCase):
 
         # SUMMARY carries the per-author baseline digest + the active checkpoint
         src = ChainStore()
-        for op in cr.retained:
-            src.put_op_raw(op)
-        s = gossip.summary(src, cut=cut, checkpoint=b"ckpt")
+        with src.write_txn() as tx:
+            for op in cr.retained:
+                tx.put_op_raw(op)
+        with src.read_txn() as tx:
+            s = gossip.summary(tx, cut=cut, checkpoint=b"ckpt")
         self.assertEqual(s.retained, committed)
         self.assertEqual(s.checkpoint, b"ckpt")
 
         # a lagging node is missing client 1's baseline -> digest mismatch localizes
         dst = ChainStore()
-        for op in cr.retained:
-            if op.author != w.clients[1].pub:
-                dst.put_op_raw(op)
-        self.assertEqual(gossip.verify_baseline(dst, cut, committed), {w.clients[1].pub})
+        with dst.write_txn() as tx:
+            for op in cr.retained:
+                if op.author != w.clients[1].pub:
+                    tx.put_op_raw(op)
+        with dst.read_txn() as tx:
+            self.assertEqual(gossip.verify_baseline(tx, cut, committed), {w.clients[1].pub})
 
         # pull the missing author's sparse baseline, then it verifies complete
         self.assertGreater(gossip.pull_baseline(dst, src, cut), 0)
-        self.assertEqual(gossip.verify_baseline(dst, cut, committed), set())
+        with dst.read_txn() as tx:
+            self.assertEqual(gossip.verify_baseline(tx, cut, committed), set())
 
 
 class TestBaselineProjection(unittest.TestCase):
@@ -838,43 +857,53 @@ class TestBaselineProjection(unittest.TestCase):
         # a LAZY node: adopted the checkpoint, holds the winner AND the not-yet-GC'd
         # dead `first`.
         lazy = ChainStore()
-        for o in below:
-            lazy.append(o)
-        lazy.adopt_checkpoint(cut, committed, cr.dead)
-        self.assertIsNotNone(lazy.get_op(first.op_hash))  # dead op still physically held
+        with lazy.write_txn() as tx:
+            for o in below:
+                tx.append(o)
+            tx.adopt_checkpoint(cut, committed, cr.dead)
+        with lazy.read_txn() as tx:
+            self.assertIsNotNone(tx.get_op(first.op_hash))  # dead op still physically held
 
         # ACCEPT: over the retained projection it is complete...
-        self.assertEqual(gossip.verify_baseline(lazy, cut, committed, dead), set())
+        with lazy.read_txn() as tx:
+            self.assertEqual(gossip.verify_baseline(tx, cut, committed, dead), set())
         # ...and the store's own possession digest agrees (holds_frontier path).
-        self.assertEqual(lazy.baseline_commitment(), committed)
+        with lazy.read_txn() as tx:
+            self.assertEqual(tx.baseline_commitment(), committed)
         # load-bearing: the OLD all-covered digest (no dead mask) FALSE-rejects it.
-        self.assertNotEqual(gossip.verify_baseline(lazy, cut, committed), set())
+        with lazy.read_txn() as tx:
+            self.assertNotEqual(gossip.verify_baseline(tx, cut, committed), set())
 
     def test_gc_and_lazy_peers_converge_no_oscillation(self):
         w, below, cut, cr, committed, first, _winner = self._overwrite_world(31)
         dead = frozenset(cr.dead)
 
         lazy = ChainStore()  # holds winner + dead first
-        for o in below:
-            lazy.append(o)
-        lazy.adopt_checkpoint(cut, committed, cr.dead)
+        with lazy.write_txn() as tx:
+            for o in below:
+                tx.append(o)
+            tx.adopt_checkpoint(cut, committed, cr.dead)
 
         gc = ChainStore()  # adopted + physically GC'd: winner only
-        for o in below:
-            gc.append(o)
-        gc.adopt_checkpoint(cut, committed, cr.dead)
-        gc.gc_checkpoint(cr.dead)
-        self.assertIsNone(gc.get_op(first.op_hash))
+        with gc.write_txn() as tx:
+            for o in below:
+                tx.append(o)
+            tx.adopt_checkpoint(cut, committed, cr.dead)
+            tx.gc_checkpoint(cr.dead)
+        with gc.read_txn() as tx:
+            self.assertIsNone(tx.get_op(first.op_hash))
 
         # ACCEPT/converge: neither direction re-pulls the dead envelope.
         self.assertEqual(gossip.pull_baseline(gc, lazy, cut, dead), 0)
         self.assertEqual(gossip.pull_baseline(lazy, gc, cut, dead), 0)
-        self.assertIsNone(gc.get_op(first.op_hash))  # gc did NOT re-acquire the dead op
+        with gc.read_txn() as tx:
+            self.assertIsNone(tx.get_op(first.op_hash))  # gc did NOT re-acquire the dead op
 
         # load-bearing: WITHOUT the dead mask the GC'd node re-pulls `first` from
         # the lazy peer — the oscillation the projection fix removes.
         self.assertGreater(gossip.pull_baseline(gc, lazy, cut), 0)
-        self.assertIsNotNone(gc.get_op(first.op_hash))  # re-acquired (the bug)
+        with gc.read_txn() as tx:
+            self.assertIsNotNone(tx.get_op(first.op_hash))  # re-acquired (the bug)
 
 
 class TestReceiptFloorBackstop(unittest.TestCase):
@@ -1034,13 +1063,16 @@ class TestHorizonPersistence(unittest.TestCase):
             path = os.path.join(d, "store.db")
             # adopt a checkpoint sealing F=200, then simulate a crash (close+reopen)
             s = ChainStore(path)
-            s.adopt_checkpoint(cut, {}, [], A.HLC(200, 0))
-            self.assertEqual(s.get_horizon(), A.HLC(200, 0))
+            with s.write_txn() as tx:
+                tx.adopt_checkpoint(cut, {}, [], A.HLC(200, 0))
+            with s.read_txn() as tx:
+                self.assertEqual(tx.get_horizon(), A.HLC(200, 0))
             s.close()
 
             s2 = ChainStore(path)
             acc = Acceptor(nsk, crypto.SIGNER.public(nsk), s2, 0, BIG_DELTA)
-            self.assertEqual(acc.horizon, A.HLC(200, 0))  # restored, not reset to 0
+            with s2.read_txn() as tx:
+                self.assertEqual(tx.get_horizon(), A.HLC(200, 0))  # restored, not reset to 0
 
             # backstop: a fresh op strictly below the restored horizon is refused
             below = self._op(w, b"k1", A.HLC(100, 0))
@@ -1063,7 +1095,8 @@ class TestHorizonPersistence(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "store.db")
             s = ChainStore(path)
-            self.assertEqual(s.get_horizon(), A.HLC(0, 0))
+            with s.read_txn() as tx:
+                self.assertEqual(tx.get_horizon(), A.HLC(0, 0))
             acc = Acceptor(nsk, crypto.SIGNER.public(nsk), s, 0, BIG_DELTA)
             op = self._op(w, b"k", A.HLC(100, 0))
             assert op.slot_tag is not None

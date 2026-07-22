@@ -133,14 +133,16 @@ class TestPartitions(unittest.TestCase):
 
         self.assertIsInstance(r_maj.outcome, Q.Committed)  # quorum {1,2} decides
         self.assertNotIsInstance(r_min.outcome, Q.Committed)  # only 1 node -> parks
-        self.assertIsNone(sim.raw[0].acc.store.get_op(maj.op_hash))  # node 0 hasn't seen it
+        with sim.raw[0].acc.store.read_txn() as tx:
+            self.assertIsNone(tx.get_op(maj.op_hash))  # node 0 hasn't seen it
 
         # heal + anti-entropy: node 0 catches up, every node reaches the union
         net.down.clear()
         for _ in range(4):
             sim.gossip_round()
         self.assertTrue(sim.converged())
-        self.assertIsNotNone(sim.raw[0].acc.store.get_op(maj.op_hash))
+        with sim.raw[0].acc.store.read_txn() as tx:
+            self.assertIsNotNone(tx.get_op(maj.op_hash))
 
     def test_one_way_link_blocks_gossip_in_the_cut_direction_only(self):
         net = NetworkLinks(default=Link(base_ms=2, jitter_ms=1))
@@ -148,18 +150,22 @@ class TestPartitions(unittest.TestCase):
         w = World(seed=6, n_clients=1)
         # node 0 alone holds `solo`; cut 0→{1,2} one-way (1→0, 2→0 stay up)
         solo = create(w, 0, b"solo", b"1")
-        sim.raw[0].acc.store.append(solo)
+        with sim.raw[0].acc.store.write_txn() as tx:
+            tx.append(solo)
         net.cut(0, 1, both=False)
         net.cut(0, 2, both=False)
         sim.gossip_round()
         # the cut direction blocks it; nodes 1,2 never learn `solo`
-        self.assertIsNone(sim.raw[1].acc.store.get_op(solo.op_hash))
-        self.assertIsNone(sim.raw[2].acc.store.get_op(solo.op_hash))
+        with sim.raw[1].acc.store.read_txn() as tx:
+            self.assertIsNone(tx.get_op(solo.op_hash))
+        with sim.raw[2].acc.store.read_txn() as tx:
+            self.assertIsNone(tx.get_op(solo.op_hash))
         # heal -> it propagates
         net.heal(0, 1, both=False)
         net.heal(0, 2, both=False)
         sim.gossip_round()
-        self.assertIsNotNone(sim.raw[1].acc.store.get_op(solo.op_hash))
+        with sim.raw[1].acc.store.read_txn() as tx:
+            self.assertIsNotNone(tx.get_op(solo.op_hash))
         self.assertTrue(sim.converged())
 
     def test_flapping_partition_commit_lands_in_a_healed_window(self):
@@ -260,8 +266,9 @@ class TestA1AndB6(unittest.TestCase):
         op2 = w.blind(0, [], [[A.Mutation.SET, b"k", b"B"]])  # seq 0 AGAIN (a fork)
         self.assertNotEqual(op1.op_hash, op2.op_hash)
         store = sim.raw[0].acc.store
-        self.assertTrue(store.append(op1))
-        res = store.append(op2)
+        with store.write_txn() as tx:
+            self.assertTrue(tx.append(op1))
+            res = tx.append(op2)
         self.assertEqual(res.status, AppendStatus.FORK)
         assert res.evidence is not None
         self.assertTrue(res.evidence.verify())  # self-verifying portable proof

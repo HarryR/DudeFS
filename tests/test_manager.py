@@ -47,7 +47,8 @@ def _roster_cluster(node_keys, base, holders):
     for pub, sk in node_keys:
         acc = Acceptor(sk, pub, ChainStore(), 0, BIG)
         if pub in holders:
-            acc.store.append(base)
+            with acc.store.write_txn() as tx:
+                tx.append(base)
         nodes[pub] = LocalNode(acc, lambda: NOW)
 
     def rpc(pub, req):
@@ -377,8 +378,9 @@ class TestManagerFumbling(unittest.TestCase):
             )  # same payload at the same head
             self.assertEqual(first.op_hash, retry.op_hash)  # identical -> idempotent
             st = ChainStore()
-            self.assertEqual(st.append(first).status, AppendStatus.OK)
-            self.assertEqual(st.append(retry).status, AppendStatus.DUP)  # no double-apply
+            with st.write_txn() as tx:
+                self.assertEqual(tx.append(first).status, AppendStatus.OK)
+                self.assertEqual(tx.append(retry).status, AppendStatus.DUP)  # no double-apply
 
     def test_amnesia_reused_seq_forks_the_control_chain(self):
         # chain-head uncertainty is radioactive (MANAGER §3): a manager that forgets
@@ -398,8 +400,9 @@ class TestManagerFumbling(unittest.TestCase):
             self.assertNotEqual(a.op_hash, b.op_hash)
             self.assertEqual((a.author, a.seq), (b.author, b.seq))  # collide on the chain slot
             st = ChainStore()
-            st.append(a)
-            res = st.append(b)
+            with st.write_txn() as tx:
+                tx.append(a)
+                res = tx.append(b)
             self.assertEqual(res.status, AppendStatus.FORK)
             self.assertIsNotNone(res.evidence)  # portable FORK proof
 

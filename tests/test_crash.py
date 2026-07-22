@@ -49,8 +49,9 @@ class TestCrashRestart(unittest.TestCase):
             acc.store.close()  # CRASH (durable state persisted by the COMMIT)
 
             acc2 = _acc(path)  # RESTART on the same durable store
-            self.assertEqual(acc2.store.get_slot(op.slot_tag).accepted_op, op.op_hash)
-            self.assertIsNotNone(acc2.store.get_op(op.op_hash))
+            with acc2.store.read_txn() as tx:
+                self.assertEqual(tx.get_slot(op.slot_tag).accepted_op, op.op_hash)
+                self.assertIsNotNone(tx.get_op(op.op_hash))
             r2 = acc2.on_accept(op.slot_tag, b, op, NOW)  # retransmit re-accept
             assert isinstance(r2, A.Receipt)
             self.assertEqual((r1.ballot, r1.sig), (r2.ballot, r2.sig))  # idempotent
@@ -83,7 +84,8 @@ class TestCrashRestart(unittest.TestCase):
             acc.store.close()  # CRASH
 
             acc2 = _acc(path, delta=50)  # RESTART
-            self.assertEqual(acc2.store.get_attested(), wm1.floor)  # attested durable
+            with acc2.store.read_txn() as tx:
+                self.assertEqual(tx.get_attested(), wm1.floor)  # attested durable
             wm2 = acc2.issue_watermark(500)  # earlier clock
             self.assertGreaterEqual(wm2.floor, wm1.floor)  # never regressed
 
@@ -99,15 +101,18 @@ class TestCrashRestart(unittest.TestCase):
             assert op.slot_tag is not None
             b = A.Ballot(1, b"x")
             store = ChainStore(path)
-            seq = store.reserve_receipt_seq(op.op_hash, b)  # committed
+            with store.write_txn() as tx:
+                seq = tx.reserve_receipt_seq(op.op_hash, b)  # committed
             before = A.Receipt.issue(SK, C.SIGNER.public(SK), op.op_hash, 0, b, seq)
             store.close()  # CRASH before the receipt is stored
 
             store2 = ChainStore(path)  # RESTART
-            self.assertEqual(store2.reserve_receipt_seq(op.op_hash, b), seq)  # same seq, no burn
+            with store2.write_txn() as tx:
+                self.assertEqual(tx.reserve_receipt_seq(op.op_hash, b), seq)  # same seq
             after = A.Receipt.issue(SK, C.SIGNER.public(SK), op.op_hash, 0, b, seq)
             self.assertEqual(before.sig, after.sig)  # deterministic re-derive
-            self.assertTrue(store2.issuance_gapless())  # no gap opened
+            with store2.read_txn() as tx:
+                self.assertTrue(tx.issuance_gapless())  # no gap opened
 
     def test_mid_gc_crash_rolls_back_committed_gc_is_durable(self):
         # gc_checkpoint drops the dead set in ONE COMMIT. A crash BEFORE that commit
@@ -117,19 +122,26 @@ class TestCrashRestart(unittest.TestCase):
             store = ChainStore(path)
             w = World(seed=3, n_clients=1)
             op = _op(w)
-            store.append(op)
-            store.commit()
+            with store.write_txn() as tx:
+                tx.append(op)
 
-            # crash mid-GC: DELETE without COMMIT, then close -> sqlite rolls back
-            store.db.execute("DELETE FROM ops WHERE op_hash=?", (op.op_hash,))
+            # crash mid-GC: DELETE inside an OPEN transaction, then close without a
+            # COMMIT -> sqlite rolls back the uncommitted write (the atomicity a
+            # write_txn gives gc_checkpoint). Poke the writer connection directly to
+            # stage the partial state a crash would leave.
+            store._writer.execute("BEGIN")
+            store._writer.execute("DELETE FROM ops WHERE op_hash=?", (op.op_hash,))
             store.close()
             store2 = ChainStore(path)
-            self.assertIsNotNone(store2.get_op(op.op_hash))  # partial GC rolled back
+            with store2.read_txn() as tx:
+                self.assertIsNotNone(tx.get_op(op.op_hash))  # partial GC rolled back
 
-            store2.gc_checkpoint([op.op_hash])  # a full, committed GC
+            with store2.write_txn() as tx:
+                tx.gc_checkpoint([op.op_hash])  # a full, committed GC
             store2.close()
             store3 = ChainStore(path)
-            self.assertIsNone(store3.get_op(op.op_hash))  # durable
+            with store3.read_txn() as tx:
+                self.assertIsNone(tx.get_op(op.op_hash))  # durable
 
 
 if __name__ == "__main__":

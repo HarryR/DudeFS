@@ -5,19 +5,33 @@
 # One sqlite database per storage node = one durability domain (DESIGN §8): the
 # node's acceptor state, its floor, and (in a real deployment) its signing key
 # all live or die together. **Sign-after-fsync = sign after COMMIT**
-# (RESILIENCE §0): the store's mutating methods COMMIT before the acceptor
-# (L3) signs anything, so no receipt/promise/watermark ever outlives the state
-# that justified it. sqlite runs in WAL + `synchronous=FULL`, so COMMIT fsyncs.
+# (RESILIENCE §0): an acceptor op runs inside `write_txn()` — read slot, decide,
+# write slot, and (for a replicated receipt) sign + `put_receipt` — all in ONE
+# transaction; the COMMIT fsyncs before the signed artifact ESCAPES (is returned),
+# so no receipt/promise/watermark ever outlives the state that justified it, and
+# the receipt lands atomically with its slot state (no 3-commit window). Promises
+# and watermarks are re-derived from the durable slot/floor + issuance ledger, so
+# they are signed after the commit block, never stored (HANDOFF-R5).
+#
+# Concurrency (HANDOFF-R5): a reader connection and a writer connection, each
+# behind its own lock — WAL gives the reader a committed snapshot while the writer
+# holds a transaction; a Python lock alone can't (another process may commit
+# between our statements), so correctness rests on the SQL transactions, not the
+# lock. Writes: `write_txn()` (BEGIN IMMEDIATE). Compound reads: `read_txn()`
+# (BEGIN snapshot). Point reads: autocommit on the reader.
 
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Mapping
+import threading
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from enum import StrEnum
 
 from . import artifacts as A
 from . import codec
 from .artifacts import BLIND, HLC, QC, Ballot, Heads, Op, Receipt
+from .errors import DudeFSError
 
 
 def covered(op: Op, cut: Heads) -> bool:
@@ -320,104 +334,26 @@ CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v BLOB);
 """
 
 
-class ChainStore:
-    """Durable store. Knows nothing of slots-as-predicates or payloads: a
-    `slot_tag` is opaque bytes, a data payload is opaque ciphertext (zero-
-    knowledge is structural — the node build has no keyring)."""
+class ReadTxn:
+    """Read operations bound to one connection inside an open transaction — a read
+    snapshot, or (via WriteTxn) the writer's transaction. Explicit: the caller opens
+    the txn and passes this; no ambient state (HANDOFF-R5)."""
 
-    def __init__(self, path: str = ":memory:"):
-        # check_same_thread=False: the daemon serves connections on per-request
-        # threads (M7); all store access is serialized by the daemon's lock, so the
-        # single connection is safe to share across them.
-        self.db = sqlite3.connect(path, check_same_thread=False)
-        self.db.execute("PRAGMA journal_mode=WAL")
-        self.db.execute("PRAGMA synchronous=FULL")  # COMMIT fsyncs (sign-after-fsync)
-        self.db.executescript(_SCHEMA)
-        if self.db.execute("SELECT 1 FROM floor WHERE id=0").fetchone() is None:
-            self.db.execute("INSERT INTO floor VALUES (0,0,0,0,0)")
-            self.db.commit()
-
-    def close(self) -> None:
-        self.db.close()
-
-    # ---- meta ------------------------------------------------------------- #
-    def set_meta(self, key: str, value: bytes) -> None:
-        self.db.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", (key, value))
-        self.db.commit()
+    def __init__(self, conn: sqlite3.Connection):
+        self._c = conn
 
     def get_meta(self, key: str) -> bytes | None:
-        row = self.db.execute("SELECT v FROM meta WHERE k=?", (key,)).fetchone()
+        row = self._c.execute("SELECT v FROM meta WHERE k=?", (key,)).fetchone()
         return row[0] if row else None
 
     # ---- ops: append with contiguity + fork detection (PROTOCOL §2.1) ----- #
-    def append(self, op: Op) -> AppendResult:
-        if not (op.verify_structure() and op.verify_sig(op.author)):
-            return AppendResult(AppendStatus.INVALID)  # caller drops (not stored)
-        existing = self.db.execute(
-            "SELECT op_hash, raw FROM ops WHERE author=? AND seq=?", (op.author, op.seq)
-        ).fetchall()
-        for oh, raw in existing:
-            if oh == op.op_hash:
-                return AppendResult(AppendStatus.DUP)  # idempotent
-            # different hash at same (author, seq) -> fork
-            ev = ForkEvidence(op.author, op.seq, raw, op.raw)
-            self._store_evidence(EvidenceKind.FORK, [ev.author, ev.seq, ev.raw_a, ev.raw_b])
-            return AppendResult(AppendStatus.FORK, ev)
-        # contiguity: need seq-1 (or seq 0). Gaps are deferred (PROTOCOL §2.1).
-        if op.seq > 0:
-            has_prev = self.db.execute(
-                "SELECT 1 FROM ops WHERE author=? AND seq=?", (op.author, op.seq - 1)
-            ).fetchone()
-            if has_prev is None:
-                # cut exemption (WP1.2 / finding 2, PROTOCOL §2.1): an op whose
-                # predecessor is at-or-below the cut (seq-1 <= cut_seq, i.e.
-                # seq <= cut_seq+1) is contiguous-by-fiat — that predecessor was
-                # legitimately GC'd and the checkpoint's retained commitment
-                # certifies the below-cut prefix. Only a genuine tail gap defers.
-                entry = self.cut().get(op.author)
-                cut_seq = entry[0] if entry else -1
-                if op.seq > cut_seq + 1:
-                    return AppendResult(AppendStatus.GAP)
-        self.db.execute(
-            "INSERT INTO ops VALUES (?,?,?,?,?,?,?)",
-            (
-                op.op_hash,
-                op.author,
-                op.seq,
-                1 if op.is_control else 0,
-                op.hlc.wall_ms,
-                op.hlc.counter,
-                op.raw,
-            ),
-        )
-        self.db.commit()
-        return AppendResult(AppendStatus.OK)
-
-    def put_op_raw(self, op: Op) -> None:
-        """Store an op referenced by a ballot ACCEPT even if it opens no
-        contiguous chain locally (the envelope is self-contained and
-        re-proposable — DESIGN §8). Bypasses the contiguity gate."""
-        if self.get_op(op.op_hash) is not None:
-            return
-        self.db.execute(
-            "INSERT OR IGNORE INTO ops VALUES (?,?,?,?,?,?,?)",
-            (
-                op.op_hash,
-                op.author,
-                op.seq,
-                1 if op.is_control else 0,
-                op.hlc.wall_ms,
-                op.hlc.counter,
-                op.raw,
-            ),
-        )
 
     def get_op(self, op_hash: bytes) -> Op | None:
-        row = self.db.execute("SELECT raw FROM ops WHERE op_hash=?", (op_hash,)).fetchone()
+        row = self._c.execute("SELECT raw FROM ops WHERE op_hash=?", (op_hash,)).fetchone()
         return A.Op.from_bytes(row[0]) if row else None
 
     def get(self, author: bytes, seq: int) -> list[Op]:
-        row = self.db.execute(
+        row = self._c.execute(
             "SELECT raw FROM ops WHERE author=? AND seq=?", (author, seq)
         ).fetchall()
         return [A.Op.from_bytes(r[0]) for r in row]
@@ -439,7 +375,7 @@ class ChainStore:
         # seed each cut author with its pinned head: that IS its frontier below
         # the cut, and the boundary the tail extends from.
         out: Heads = dict(cut)
-        for author, seq, oh in self.db.execute(
+        for author, seq, oh in self._c.execute(
             "SELECT author, seq, op_hash FROM ops ORDER BY author, seq"
         ):
             cur = out.get(author)
@@ -453,22 +389,9 @@ class ChainStore:
         return out
 
     def all_ops(self) -> list[Op]:
-        return [A.Op.from_bytes(r[0]) for r in self.db.execute("SELECT raw FROM ops")]
+        return [A.Op.from_bytes(r[0]) for r in self._c.execute("SELECT raw FROM ops")]
 
     # ---- receipts & QCs --------------------------------------------------- #
-    def put_receipt(self, r: Receipt) -> None:
-        self.db.execute(
-            "INSERT OR IGNORE INTO receipts VALUES (?,?,?,?,?,?)",
-            (
-                r.op_hash,
-                r.config_epoch,
-                codec.encode(r.ballot.encode()),
-                r.signer,
-                r.sig,
-                r.issue_seq,
-            ),
-        )
-        self.db.commit()
 
     def _row_to_receipt(self, oh, ep, ballot, signer, sig, seq) -> Receipt:
         return A.Receipt(oh, ep, Ballot.decode(codec.decode(ballot)), int(seq), signer, sig)
@@ -476,12 +399,12 @@ class ChainStore:
     def receipts_for(self, op_hash: bytes) -> list[Receipt]:
         return [
             self._row_to_receipt(*row)
-            for row in self.db.execute("SELECT * FROM receipts WHERE op_hash=?", (op_hash,))
+            for row in self._c.execute("SELECT * FROM receipts WHERE op_hash=?", (op_hash,))
         ]
 
     def all_receipts(self) -> list[Receipt]:
         """Every receipt held, for gossip coverage/diff (M4)."""
-        return [self._row_to_receipt(*row) for row in self.db.execute("SELECT * FROM receipts")]
+        return [self._row_to_receipt(*row) for row in self._c.execute("SELECT * FROM receipts")]
 
     def get_receipt(
         self, op_hash: bytes, epoch: int, ballot: Ballot, signer: bytes
@@ -489,46 +412,11 @@ class ChainStore:
         """The exact stored receipt for one (op, epoch, ballot, signer), or None —
         the serve-from-store lookup (finding-17): an idempotent re-issue returns THIS
         instead of re-signing with a fresh issue_seq."""
-        row = self.db.execute(
+        row = self._c.execute(
             "SELECT * FROM receipts WHERE op_hash=? AND epoch=? AND ballot=? AND signer=?",
             (op_hash, epoch, codec.encode(ballot.encode()), signer),
         ).fetchone()
         return self._row_to_receipt(*row) if row else None
-
-    def reserve_issue_seq(self, kind: bytes, ident: bytes) -> int:
-        """Reserve this signer's issuance-chain position for one artifact and record
-        its justification `ident` in ONE COMMIT (finding 18b: gap-free issuance).
-
-        `ident` is the deterministic justification the artifact re-derives from — a
-        receipt's `(op_hash, ballot)` (epoch-independent, so a cross-epoch RERECEIPT
-        reuses the SAME seq), a watermark's `(floor, epoch)`. If `ident` is already
-        reserved, its seq is returned (idempotent — the deterministic re-sign yields
-        the identical artifact after a crash); otherwise the next seq is MAX+1 and
-        the reservation is written atomically. Because the counter IS the ledger, a
-        crash between reserving and signing burns nothing: the seq stays occupied by
-        its justification, re-derivable, so an honest chain has no gaps and every
-        back-stamp collides with a genuine occupant (which detect_seq_reuse proves)."""
-        row = self.db.execute(
-            "SELECT seq FROM issuance WHERE kind=? AND ident=?", (kind, ident)
-        ).fetchone()
-        if row is not None:
-            return int(row[0])
-        mx = self.db.execute("SELECT MAX(seq) FROM issuance").fetchone()[0]
-        seq = (mx or 0) + 1
-        self.db.execute("INSERT INTO issuance VALUES (?,?,?)", (seq, kind, ident))
-        self.db.commit()
-        return seq
-
-    def reserve_receipt_seq(self, op_hash: bytes, ballot: Ballot) -> int:
-        """The acceptance-bound issue_seq for a receipt on (op_hash, ballot) — the
-        same across epochs (RERECEIPT), a fresh seq for a new acceptance."""
-        return self.reserve_issue_seq(b"r", codec.encode([op_hash, ballot.encode()]))
-
-    def reserve_watermark_seq(self, floor: HLC, epoch: int) -> int:
-        """The issue_seq for a watermark attesting `floor` at `epoch`."""
-        return self.reserve_issue_seq(
-            b"w", codec.encode([floor.wall_ms, floor.counter, int(epoch)])
-        )
 
     def issuance_chain(self) -> list[tuple[int, bytes, bytes]]:
         """The signer's issuance ledger `(seq, kind, ident)` in order — the audit
@@ -536,7 +424,7 @@ class ChainStore:
         construction post-18b."""
         return [
             (int(s), k, i)
-            for s, k, i in self.db.execute("SELECT seq, kind, ident FROM issuance ORDER BY seq")
+            for s, k, i in self._c.execute("SELECT seq, kind, ident FROM issuance ORDER BY seq")
         ]
 
     def issuance_gapless(self) -> bool:
@@ -545,20 +433,6 @@ class ChainStore:
         the single-transaction reserve flow."""
         seqs = [s for s, _, _ in self.issuance_chain()]
         return seqs == list(range(1, len(seqs) + 1))
-
-    def put_qc(self, qc: QC) -> None:
-        self.db.execute(
-            "INSERT OR REPLACE INTO qcs VALUES (?,?,?,?,?,?)",
-            (
-                qc.op_hash,
-                qc.config_epoch,
-                codec.encode(qc.ballot.encode()),
-                qc.signer_bitmap,
-                codec.encode(qc.sigs),
-                codec.encode(list(qc.issue_seqs)),
-            ),
-        )
-        self.db.commit()
 
     def _row_to_qc(self, oh, ep, ballot, bitmap, sigs, seqs) -> QC:
         return A.QC(
@@ -572,7 +446,7 @@ class ChainStore:
 
     def get_qc(self, op_hash: bytes) -> QC | None:
         # deterministic pick when one op holds QCs under several epochs/ballots
-        row = self.db.execute(
+        row = self._c.execute(
             "SELECT * FROM qcs WHERE op_hash=? ORDER BY epoch DESC, ballot DESC LIMIT 1",
             (op_hash,),
         ).fetchone()
@@ -580,42 +454,9 @@ class ChainStore:
 
     def all_qcs(self) -> list[QC]:
         """Every QC held, for gossip coverage/diff (M4)."""
-        return [self._row_to_qc(*row) for row in self.db.execute("SELECT * FROM qcs")]
+        return [self._row_to_qc(*row) for row in self._c.execute("SELECT * FROM qcs")]
 
     # ---- checkpoint cut (the log-compaction boundary; DESIGN §12) ---------- #
-    def adopt_checkpoint(
-        self,
-        cut: Heads,
-        retained: Mapping[bytes, tuple[int, bytes]],
-        dead: list[bytes] = [],  # noqa: B006 (read-only default; never mutated)
-        horizon: HLC | None = None,
-    ) -> None:
-        """Persist the active compaction cut, its `retained` commitment, the `dead`
-        set, and the checkpoint `horizon` F on observing a quorum-committed
-        checkpoint (WP1.2/1.3). DURABLE — the cut re-parametrizes heads()/append()/
-        possession below it, `dead` is the RETAINED-projection mask (covered ∖ dead)
-        the possession and completeness checks run against while GC is still lazy,
-        and the horizon is §8's void / receipt-floor-backstop guard value; all must
-        survive crash-restart like the floor (`set_meta` COMMIT-fsyncs). Physical GC
-        of `dead` is a separate step (gc_checkpoint); adoption must precede it so the
-        gates never see dropped ops without the cut. Atomic (finding 16 / finding
-        19): the writes are ONE transaction/COMMIT, so a crash can never leave the
-        cut adopted without its retained/dead/horizon companions — otherwise the
-        void rule + backstop would go inert against a below-horizon reborn op after
-        a restart (nothing re-runs adoption)."""
-        self.db.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", ("cut", _encode_pairs(cut)))
-        self.db.execute(
-            "INSERT OR REPLACE INTO meta VALUES (?,?)", ("cut_retained", _encode_pairs(retained))
-        )
-        self.db.execute(
-            "INSERT OR REPLACE INTO meta VALUES (?,?)", ("cut_dead", codec.encode(list(dead)))
-        )
-        if horizon is not None:
-            self.db.execute(
-                "INSERT OR REPLACE INTO meta VALUES (?,?)",
-                ("horizon", codec.encode(list(horizon.encode()))),
-            )
-        self.db.commit()  # one atomic COMMIT for all writes
 
     def cut(self) -> Heads:
         """The active compaction cut, or {} when uncompacted (pre-M6 behavior)."""
@@ -653,12 +494,6 @@ class ChainStore:
         raw = self.get_meta("epoch")
         return codec.as_int(codec.decode(raw)) if raw else None
 
-    def set_epoch(self, epoch: int) -> None:
-        """Persist the config epoch (single-writer: `Acceptor.activate_epoch` is its
-        sole mutator — the finding-20 materialization). COMMIT-fsyncs before any
-        receipt is signed under the new epoch."""
-        self.set_meta("epoch", codec.encode(int(epoch)))
-
     def baseline_commitment(self) -> dict[bytes, A.RetainedEntry]:
         """This node's ACTUAL commitment over the RETAINED below-cut projection
         (covered ∖ dead) — compared per author against cut_retained() to prove
@@ -667,22 +502,8 @@ class ChainStore:
         the superseded ops."""
         return baseline_digest(self.all_ops(), self.cut(), self.cut_dead())
 
-    def gc_checkpoint(self, dead: list[bytes]) -> None:
-        """Log-compaction GC (DESIGN §12 rev 6): on observing a quorum-committed
-        checkpoint, drop the ops named in its `dead` delta and every receipt/QC for
-        them — the checkpoint's retained commitment vouches for below-cut commitment
-        (NOTES 29d), so provenance survives in the retained envelopes. Retained
-        winners, control-plane liveness, and pinned heads stay. Lazy, local,
-        uncoordinated: each node runs it independently."""
-        for oh in dead:
-            self.db.execute("DELETE FROM ops WHERE op_hash=?", (oh,))
-            self.db.execute("DELETE FROM receipts WHERE op_hash=?", (oh,))
-            self.db.execute("DELETE FROM qcs WHERE op_hash=?", (oh,))
-        self.db.commit()
-
-    # ---- slot acceptor state (DESIGN §8) ---------------------------------- #
     def get_slot(self, tag: bytes) -> SlotState:
-        row = self.db.execute(
+        row = self._c.execute(
             "SELECT promised, accepted_ballot, accepted_op FROM slot_state WHERE tag=?", (tag,)
         ).fetchone()
         if row is None:
@@ -691,41 +512,13 @@ class ChainStore:
         ab = Ballot.decode(codec.decode(row[1])) if row[1] is not None else None
         return SlotState(promised, ab, row[2])
 
-    def _write_slot(self, tag: bytes, s: SlotState) -> None:
-        self.db.execute(
-            "INSERT OR REPLACE INTO slot_state VALUES (?,?,?,?)",
-            (
-                tag,
-                codec.encode(s.promised.encode()),
-                codec.encode(s.accepted_ballot.encode()) if s.accepted_ballot else None,
-                s.accepted_op,
-            ),
-        )
-
-    # ---- floor / high-water (DESIGN §9) ----------------------------------- #
     def get_hw(self) -> HLC:
-        r = self.db.execute("SELECT hw_wall, hw_ctr FROM floor WHERE id=0").fetchone()
+        r = self._c.execute("SELECT hw_wall, hw_ctr FROM floor WHERE id=0").fetchone()
         return HLC(r[0], r[1])
 
     def get_attested(self) -> HLC:
-        r = self.db.execute("SELECT att_wall, att_ctr FROM floor WHERE id=0").fetchone()
+        r = self._c.execute("SELECT att_wall, att_ctr FROM floor WHERE id=0").fetchone()
         return HLC(r[0], r[1])
-
-    def _write_hw(self, hw: HLC) -> None:
-        self.db.execute("UPDATE floor SET hw_wall=?, hw_ctr=? WHERE id=0", (hw.wall_ms, hw.counter))
-
-    def _write_attested(self, att: HLC) -> None:
-        self.db.execute(
-            "UPDATE floor SET att_wall=?, att_ctr=? WHERE id=0", (att.wall_ms, att.counter)
-        )
-
-    # ---- evidence --------------------------------------------------------- #
-    def _store_evidence(self, kind: EvidenceKind, payload: list) -> None:
-        self.db.execute(
-            "INSERT INTO evidence (kind, data) VALUES (?,?)",
-            (kind.value, codec.encode(payload)),
-        )
-        self.db.commit()
 
     def evidence(
         self,
@@ -749,7 +542,7 @@ class ChainStore:
                 | LostCommitEvidence,
             ]
         ] = []
-        for kind, data in self.db.execute("SELECT kind, data FROM evidence"):
+        for kind, data in self._c.execute("SELECT kind, data FROM evidence"):
             k = EvidenceKind(kind)
             p = codec.as_seq(codec.decode(data))
             if k == EvidenceKind.FORK:
@@ -817,6 +610,225 @@ class ChainStore:
                     )
                 )
         return out
+
+
+class WriteTxn(ReadTxn):
+    """Read + write operations on the writer connection inside a BEGIN IMMEDIATE
+    transaction. Inherits reads from ReadTxn so an acceptor RMW reads and writes one
+    transaction; the COMMIT (sign-after-fsync) fires when write_txn() exits."""
+
+    def set_meta(self, key: str, value: bytes) -> None:
+        self._c.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", (key, value))
+
+    def append(self, op: Op) -> AppendResult:
+        if not (op.verify_structure() and op.verify_sig(op.author)):
+            return AppendResult(AppendStatus.INVALID)  # caller drops (not stored)
+        existing = self._c.execute(
+            "SELECT op_hash, raw FROM ops WHERE author=? AND seq=?", (op.author, op.seq)
+        ).fetchall()
+        for oh, raw in existing:
+            if oh == op.op_hash:
+                return AppendResult(AppendStatus.DUP)  # idempotent
+            # different hash at same (author, seq) -> fork
+            ev = ForkEvidence(op.author, op.seq, raw, op.raw)
+            self._store_evidence(EvidenceKind.FORK, [ev.author, ev.seq, ev.raw_a, ev.raw_b])
+            return AppendResult(AppendStatus.FORK, ev)
+        # contiguity: need seq-1 (or seq 0). Gaps are deferred (PROTOCOL §2.1).
+        if op.seq > 0:
+            has_prev = self._c.execute(
+                "SELECT 1 FROM ops WHERE author=? AND seq=?", (op.author, op.seq - 1)
+            ).fetchone()
+            if has_prev is None:
+                # cut exemption (WP1.2 / finding 2, PROTOCOL §2.1): an op whose
+                # predecessor is at-or-below the cut (seq-1 <= cut_seq, i.e.
+                # seq <= cut_seq+1) is contiguous-by-fiat — that predecessor was
+                # legitimately GC'd and the checkpoint's retained commitment
+                # certifies the below-cut prefix. Only a genuine tail gap defers.
+                entry = self.cut().get(op.author)
+                cut_seq = entry[0] if entry else -1
+                if op.seq > cut_seq + 1:
+                    return AppendResult(AppendStatus.GAP)
+        self._c.execute(
+            "INSERT INTO ops VALUES (?,?,?,?,?,?,?)",
+            (
+                op.op_hash,
+                op.author,
+                op.seq,
+                1 if op.is_control else 0,
+                op.hlc.wall_ms,
+                op.hlc.counter,
+                op.raw,
+            ),
+        )
+        return AppendResult(AppendStatus.OK)
+
+    def put_op_raw(self, op: Op) -> None:
+        """Store an op referenced by a ballot ACCEPT even if it opens no
+        contiguous chain locally (the envelope is self-contained and
+        re-proposable — DESIGN §8). Bypasses the contiguity gate."""
+        if self.get_op(op.op_hash) is not None:
+            return
+        self._c.execute(
+            "INSERT OR IGNORE INTO ops VALUES (?,?,?,?,?,?,?)",
+            (
+                op.op_hash,
+                op.author,
+                op.seq,
+                1 if op.is_control else 0,
+                op.hlc.wall_ms,
+                op.hlc.counter,
+                op.raw,
+            ),
+        )
+
+    def put_receipt(self, r: Receipt) -> None:
+        self._c.execute(
+            "INSERT OR IGNORE INTO receipts VALUES (?,?,?,?,?,?)",
+            (
+                r.op_hash,
+                r.config_epoch,
+                codec.encode(r.ballot.encode()),
+                r.signer,
+                r.sig,
+                r.issue_seq,
+            ),
+        )
+
+    def reserve_issue_seq(self, kind: bytes, ident: bytes) -> int:
+        """Reserve this signer's issuance-chain position for one artifact and record
+        its justification `ident` in ONE COMMIT (finding 18b: gap-free issuance).
+
+        `ident` is the deterministic justification the artifact re-derives from — a
+        receipt's `(op_hash, ballot)` (epoch-independent, so a cross-epoch RERECEIPT
+        reuses the SAME seq), a watermark's `(floor, epoch)`. If `ident` is already
+        reserved, its seq is returned (idempotent — the deterministic re-sign yields
+        the identical artifact after a crash); otherwise the next seq is MAX+1 and
+        the reservation is written atomically. Because the counter IS the ledger, a
+        crash between reserving and signing burns nothing: the seq stays occupied by
+        its justification, re-derivable, so an honest chain has no gaps and every
+        back-stamp collides with a genuine occupant (which detect_seq_reuse proves)."""
+        row = self._c.execute(
+            "SELECT seq FROM issuance WHERE kind=? AND ident=?", (kind, ident)
+        ).fetchone()
+        if row is not None:
+            return int(row[0])
+        mx = self._c.execute("SELECT MAX(seq) FROM issuance").fetchone()[0]
+        seq = (mx or 0) + 1
+        self._c.execute("INSERT INTO issuance VALUES (?,?,?)", (seq, kind, ident))
+        return seq
+
+    def reserve_receipt_seq(self, op_hash: bytes, ballot: Ballot) -> int:
+        """The acceptance-bound issue_seq for a receipt on (op_hash, ballot) — the
+        same across epochs (RERECEIPT), a fresh seq for a new acceptance."""
+        return self.reserve_issue_seq(b"r", codec.encode([op_hash, ballot.encode()]))
+
+    def reserve_watermark_seq(self, floor: HLC, epoch: int) -> int:
+        """The issue_seq for a watermark attesting `floor` at `epoch`."""
+        return self.reserve_issue_seq(
+            b"w", codec.encode([floor.wall_ms, floor.counter, int(epoch)])
+        )
+
+    def put_qc(self, qc: QC) -> None:
+        self._c.execute(
+            "INSERT OR REPLACE INTO qcs VALUES (?,?,?,?,?,?)",
+            (
+                qc.op_hash,
+                qc.config_epoch,
+                codec.encode(qc.ballot.encode()),
+                qc.signer_bitmap,
+                codec.encode(qc.sigs),
+                codec.encode(list(qc.issue_seqs)),
+            ),
+        )
+
+    def adopt_checkpoint(
+        self,
+        cut: Heads,
+        retained: Mapping[bytes, tuple[int, bytes]],
+        dead: list[bytes] = [],  # noqa: B006 (read-only default; never mutated)
+        horizon: HLC | None = None,
+    ) -> None:
+        """Persist the active compaction cut, its `retained` commitment, the `dead`
+        set, and the checkpoint `horizon` F on observing a quorum-committed
+        checkpoint (WP1.2/1.3). DURABLE — the cut re-parametrizes heads()/append()/
+        possession below it, `dead` is the RETAINED-projection mask (covered ∖ dead)
+        the possession and completeness checks run against while GC is still lazy,
+        and the horizon is §8's void / receipt-floor-backstop guard value; all must
+        survive crash-restart like the floor (`set_meta` COMMIT-fsyncs). Physical GC
+        of `dead` is a separate step (gc_checkpoint); adoption must precede it so the
+        gates never see dropped ops without the cut. Atomic (finding 16 / finding
+        19): the writes are ONE transaction/COMMIT, so a crash can never leave the
+        cut adopted without its retained/dead/horizon companions — otherwise the
+        void rule + backstop would go inert against a below-horizon reborn op after
+        a restart (nothing re-runs adoption)."""
+        self._c.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", ("cut", _encode_pairs(cut)))
+        self._c.execute(
+            "INSERT OR REPLACE INTO meta VALUES (?,?)", ("cut_retained", _encode_pairs(retained))
+        )
+        self._c.execute(
+            "INSERT OR REPLACE INTO meta VALUES (?,?)", ("cut_dead", codec.encode(list(dead)))
+        )
+        if horizon is not None:
+            self.advance_horizon(horizon)
+
+    def advance_horizon(self, horizon: HLC) -> None:
+        """Raise the durable checkpoint horizon F monotonically (finding 19 / DESIGN
+        §12). This is the SINGLE authoritative source: the §8 void rule and the §12
+        receipt-floor backstop read it via `get_horizon()` under their own write
+        transaction, so it can never be a stale in-memory cache that lags a committed
+        adoption. A lower `horizon` is ignored (monotone), so a late/stale checkpoint
+        can never regress F."""
+        if horizon > self.get_horizon():
+            self.set_meta("horizon", codec.encode(list(horizon.encode())))
+
+    def set_epoch(self, epoch: int) -> None:
+        """Persist the config epoch (single-writer: `Acceptor.activate_epoch` is its
+        sole mutator — the finding-20 materialization). COMMIT-fsyncs before any
+        receipt is signed under the new epoch."""
+        self.set_meta("epoch", codec.encode(int(epoch)))
+
+    def gc_checkpoint(self, dead: list[bytes]) -> None:
+        """Log-compaction GC (DESIGN §12 rev 6): on observing a quorum-committed
+        checkpoint, drop the ops named in its `dead` delta and every receipt/QC for
+        them — the checkpoint's retained commitment vouches for below-cut commitment
+        (NOTES 29d), so provenance survives in the retained envelopes. Retained
+        winners, control-plane liveness, and pinned heads stay. Lazy, local,
+        uncoordinated: each node runs it independently."""
+        for oh in dead:
+            self._c.execute("DELETE FROM ops WHERE op_hash=?", (oh,))
+            self._c.execute("DELETE FROM receipts WHERE op_hash=?", (oh,))
+            self._c.execute("DELETE FROM qcs WHERE op_hash=?", (oh,))
+
+    # ---- slot acceptor state (DESIGN §8) ---------------------------------- #
+
+    def write_slot(self, tag: bytes, s: SlotState) -> None:
+        self._c.execute(
+            "INSERT OR REPLACE INTO slot_state VALUES (?,?,?,?)",
+            (
+                tag,
+                codec.encode(s.promised.encode()),
+                codec.encode(s.accepted_ballot.encode()) if s.accepted_ballot else None,
+                s.accepted_op,
+            ),
+        )
+
+    # ---- floor / high-water (DESIGN §9) ----------------------------------- #
+
+    def write_hw(self, hw: HLC) -> None:
+        self._c.execute("UPDATE floor SET hw_wall=?, hw_ctr=? WHERE id=0", (hw.wall_ms, hw.counter))
+
+    def write_attested(self, att: HLC) -> None:
+        self._c.execute(
+            "UPDATE floor SET att_wall=?, att_ctr=? WHERE id=0", (att.wall_ms, att.counter)
+        )
+
+    # ---- evidence --------------------------------------------------------- #
+
+    def _store_evidence(self, kind: EvidenceKind, payload: list) -> None:
+        self._c.execute(
+            "INSERT INTO evidence (kind, data) VALUES (?,?)",
+            (kind.value, codec.encode(payload)),
+        )
 
     def detect_seq_reuse(
         self, watermarks: list[A.Watermark] | None = None
@@ -955,8 +967,189 @@ class ChainStore:
         return found
 
     # ---- transactional commit boundary (sign-after-fsync) ----------------- #
-    def commit(self) -> None:
-        self.db.commit()
+
+
+class StoreError(DudeFSError):
+    """Base for every error raised by the store module (errors.py hierarchy)."""
+
+
+class StoreClosed(StoreError):
+    """A transaction was opened on a closed ChainStore. Distinct type so a background
+    worker can swallow the shutdown race (a drive finishing as the daemon closes)
+    while any other error still propagates."""
+
+
+class StoreBusy(StoreError):
+    """A transaction could not take the write lock within busy_timeout — another OS
+    PROCESS holds the database's write lock on the same file (the store assumes it may
+    be shared; DESIGN §8). Typed into the store hierarchy (not leaked as a bare
+    sqlite3.OperationalError) so callers handle contention domain-side; the original
+    sqlite error is chained as `__cause__`. Transient: the caller may retry, or (in the
+    quorum path) fall silent and let the write land on another node."""
+
+
+# sqlite_errorname values that mean "someone else holds the lock" (transient
+# contention) as opposed to a durability failure (SQLITE_FULL/IOERR — surfaced loudly).
+_BUSY_ERRORNAMES = frozenset({"SQLITE_BUSY", "SQLITE_BUSY_SNAPSHOT", "SQLITE_LOCKED"})
+
+
+def _raise_if_busy(e: sqlite3.OperationalError) -> None:
+    """Translate a lock-contention OperationalError into StoreBusy (chaining the
+    sqlite cause). Returns for any other OperationalError so the caller re-raises it."""
+    if getattr(e, "sqlite_errorname", None) in _BUSY_ERRORNAMES:
+        raise StoreBusy(str(e)) from e
+
+
+class ChainStore:
+    """Durable store (DESIGN §8). A reader connection + a writer connection; every
+    access goes through an explicit transaction: `with store.read_txn() as tx` or
+    `with store.write_txn() as tx`. Knows nothing of slots-as-predicates or payloads:
+    a slot_tag is opaque bytes, a data payload is opaque ciphertext."""
+
+    def __init__(self, path: str = ":memory:", *, busy_timeout_ms: int = 5000):
+        # A file path opens a reader connection + a writer connection (HANDOFF-R5):
+        # WAL gives the reader a committed snapshot while the writer holds a
+        # transaction. ":memory:" has no WAL (and shared-cache uses table locks that
+        # deadlock reader-vs-writer), so it uses ONE connection + ONE lock — serialized,
+        # fine for unit tests; the real two-connection WAL concurrency is the file path,
+        # exercised by the concurrency + durable-restart tests. `busy_timeout_ms` is how
+        # long a contended write waits for another PROCESS before StoreBusy (default 5s).
+        self._local = threading.local()  # per-thread open-txn guard (forbids same-store nesting)
+        self._closed = False
+        if path == ":memory:":
+            self._writer = self._connect(":memory:", wal=False, busy_timeout_ms=busy_timeout_ms)
+            self._reader = self._writer
+            self._wlock = self._rlock = threading.RLock()  # one reentrant lock, one conn
+        else:
+            self._writer = self._connect(path, wal=True, busy_timeout_ms=busy_timeout_ms)
+            self._reader = self._connect(path, wal=True, busy_timeout_ms=busy_timeout_ms)
+            self._wlock = threading.Lock()  # serialize writer thread(s)
+            self._rlock = threading.RLock()  # serialize reader threads; reentrant for nesting
+        self._writer.executescript(_SCHEMA)
+        if self._writer.execute("SELECT 1 FROM floor WHERE id=0").fetchone() is None:
+            self._writer.execute("INSERT INTO floor VALUES (0,0,0,0,0)")
+        self._writer.commit()
+
+    @staticmethod
+    def _connect(dsn: str, wal: bool, busy_timeout_ms: int = 5000) -> sqlite3.Connection:
+        c = sqlite3.connect(dsn, check_same_thread=False, isolation_level=None)
+        if wal:
+            # journal_mode SILENTLY falls back (no error) when the filesystem can't do
+            # WAL — network mounts, some tmpfs/container setups. The whole two-connection
+            # reader/writer design depends on WAL giving the reader a committed snapshot
+            # while the writer holds a transaction, so a fallback must fail loudly, not
+            # degrade into writer-blocks-reader lock contention.
+            mode = c.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+            if str(mode).lower() != "wal":
+                raise StoreError(
+                    f"WAL journal mode unavailable (got {mode!r}) for {dsn!r}; the "
+                    "reader/writer store requires WAL — is it on a network or tmpfs mount?"
+                )
+        c.execute("PRAGMA synchronous=FULL")  # COMMIT fsyncs (sign-after-fsync)
+        c.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")  # cross-process contention
+        return c
+
+    def _begin_txn(self, kind: str) -> None:
+        """Forbid nesting a transaction inside another on the SAME store and thread
+        (R5). Same-store nesting is a footgun: write-in-write deadlocks (a plain lock)
+        or errors ("transaction within a transaction"); read-in-read errors likewise;
+        and read-inside-write would silently read the last *committed* snapshot on the
+        reader connection, NOT the write transaction's own uncommitted rows. The rule
+        is one transaction per store per thread — thread the `tx` through helpers
+        instead of reopening. (Different stores on one thread are fine — e.g. the sim's
+        two-store `merge`.) Raises BEFORE any lock is taken, so it never deadlocks."""
+        if self._closed:
+            raise StoreClosed("ChainStore is closed")
+        held = getattr(self._local, "txn", None)
+        if held is not None:
+            raise RuntimeError(
+                f"nested {kind}_txn while a {held}_txn is already open on this thread — "
+                "pass the existing `tx` down instead of reopening (R5: one txn/store/thread)"
+            )
+        self._local.txn = kind
+
+    def _end_txn(self) -> None:
+        self._local.txn = None
+
+    @contextmanager
+    def write_txn(self) -> Iterator[WriteTxn]:
+        """One atomic write transaction (BEGIN IMMEDIATE -> COMMIT) on the writer
+        connection; the COMMIT fsyncs, so a signed artifact is returned only AFTER
+        the block exits (sign-after-fsync)."""
+        self._begin_txn("write")  # raises on nesting (and if closed) before any lock
+        try:
+            with self._wlock:
+                if self._closed:  # close() won the lock race — refuse cleanly
+                    raise StoreClosed("ChainStore is closed")
+                try:
+                    self._writer.execute("BEGIN IMMEDIATE")
+                except sqlite3.OperationalError as e:
+                    _raise_if_busy(e)  # another process holds the write lock -> StoreBusy
+                    raise
+                try:
+                    yield WriteTxn(self._writer)
+                    self._writer.execute("COMMIT")
+                except BaseException:
+                    # SQLite AUTO-ABORTS the transaction on SQLITE_FULL / SQLITE_IOERR-
+                    # class failures (exactly the durability failures at the sign-after-
+                    # fsync boundary). A blind ROLLBACK then raises "cannot rollback - no
+                    # transaction is active", REPLACING the real disk/IO cause. Roll back
+                    # only if the txn is still open, and never let a rollback failure bury
+                    # the original exception.
+                    if self._writer.in_transaction:
+                        try:
+                            self._writer.execute("ROLLBACK")
+                        except sqlite3.Error:
+                            pass
+                    raise
+        finally:
+            self._end_txn()  # always clears, even if the lock/BEGIN itself raised
+
+    @contextmanager
+    def read_txn(self) -> Iterator[ReadTxn]:
+        """A consistent read snapshot (BEGIN -> COMMIT) on the reader connection: a
+        writer committing mid-read (ours or another process) cannot tear it."""
+        self._begin_txn("read")
+        try:
+            with self._rlock:
+                if self._closed:  # close() won the lock race — refuse cleanly
+                    raise StoreClosed("ChainStore is closed")
+                try:
+                    self._reader.execute("BEGIN")
+                except sqlite3.OperationalError as e:
+                    _raise_if_busy(e)  # rare under WAL, but stay in the store hierarchy
+                    raise
+                try:
+                    yield ReadTxn(self._reader)
+                finally:
+                    # End the read snapshot without masking a body exception: a COMMIT
+                    # hiccup on a read-only txn (nothing to persist) must not override the
+                    # error the caller is already raising. Guard on in_transaction so a
+                    # prior auto-abort doesn't trip "no transaction is active".
+                    if self._reader.in_transaction:
+                        try:
+                            self._reader.execute("COMMIT")
+                        except sqlite3.Error:
+                            pass
+        finally:
+            self._end_txn()  # always clears, even if the lock/BEGIN itself raised
+
+    def close(self) -> None:
+        """Quiesce, then close both connections. Taking both locks waits for any
+        in-flight txn to finish before we close the connection under it (the conns are
+        check_same_thread=False, so a close mid-execute on another thread is undefined
+        behavior); marking `_closed` under the locks makes any straggler txn raise a
+        clean RuntimeError at entry instead of a bare ProgrammingError. Idempotent.
+        No deadlock: a txn only ever holds ONE of the two locks, never both."""
+        with self._wlock, self._rlock:
+            if self._closed:
+                return
+            self._closed = True
+            self._writer.close()
+            if self._reader is not self._writer:  # ":memory:" shares one connection
+                self._reader.close()
+
+    # ---- meta ------------------------------------------------------------- #
 
 
 class SlotState:
