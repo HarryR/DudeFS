@@ -438,14 +438,16 @@ class Manager:
     # ---- recovery (interlocked) ----------------------------------------- #
     def probe_roster(
         self,
-        probe: Callable[[bytes, transports.Endpoint | None], HLC | None],
+        probe: Callable[[bytes, transports.Endpoint], HLC | None],
         dwell: float,
         sleep: Callable[[float], None],
     ) -> RecoverReport:
         """Dwell-probe every roster endpoint via the injected `probe(pub, endpoint) ->
         floor | None` (I/O is the caller's — the CLI passes a real enveloped FRONTIER
-        probe over the node's Endpoint; tests pass a synthetic map). Returns the
-        reachability report."""
+        probe over the node's Endpoint; tests pass a synthetic map). A roster node with no
+        known endpoint is unreachable *by definition* — it never gets a probe call and
+        falls straight into `presumed_dead`, so the callback is only ever handed a real
+        Endpoint. Returns the reachability report."""
         import time
 
         answered: dict[int, HLC] = {}
@@ -455,7 +457,10 @@ class Manager:
             for i, pub in enumerate(self.state.roster):
                 if i in answered:
                     continue
-                floor = probe(pub, self.state.node_addrs.get(pub.hex()))
+                ep = self.state.node_addrs.get(pub.hex())
+                if ep is None:
+                    continue  # no address -> unreachable; leave unanswered (presumed dead)
+                floor = probe(pub, ep)
                 if floor is not None:
                     answered[i] = floor
             if time.monotonic() >= deadline or len(answered) == n:

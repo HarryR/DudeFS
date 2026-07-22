@@ -95,7 +95,7 @@ def _floor_probe(st: ManagerState):
     """A `probe(pub, endpoint) -> floor | None` bound to the manager identity, for
     probe_roster's dwell loop (the manager signs each FRONTIER read)."""
 
-    def probe(pub: bytes, ep: transports.Endpoint | None) -> HLC | None:
+    def probe(pub: bytes, ep: transports.Endpoint) -> HLC | None:
         fb = _probe(st, pub, ep)
         return fb.floor if fb is not None else None
 
