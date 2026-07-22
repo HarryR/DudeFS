@@ -247,6 +247,55 @@ class TestAttemptsSidecar(unittest.TestCase):
         self.assertEqual(compactor.open_attempts(b"", dk), {})  # no sidecar -> {}
 
 
+class TestStateRootAudit(unittest.TestCase):
+    """WP-B: a bootstrapping node RECOMPUTES state_root from its reconstructed barrier
+    and rejects any checkpoint whose claimed root disagrees — a tampered root, an
+    omitted live winner, or a wrong attempt (a bad sidecar). The §12 trust surface: a
+    lying compactor is caught by any node that recomputes."""
+
+    def _compacted(self, w):
+        below = list(w.control_ops)
+        below.append(
+            w.blind(0, [], [[A.Mutation.SET, b"k1", b"v1"], [A.Mutation.SET, b"k2", b"w1"]])
+        )
+        below.append(w.blind(0, [], [[A.Mutation.SET, b"k1", b"v2"]]))  # supersedes v1
+        return compactor.compact_genesis(below, w.keyring, w.genesis, cut_of(w))
+
+    def _barrier(self, w, cr, attempts=None):
+        data_retained = [o for o in cr.retained if not o.is_control]
+        return compactor.barrier_state(
+            data_retained, cr.attempts if attempts is None else attempts, w.keyring
+        )
+
+    def test_correct_barrier_verifies(self):
+        w = World(seed=40, n_clients=1)
+        cr = self._compacted(w)
+        compactor.verify_state_root(cr.state_root, self._barrier(w, cr))  # no raise
+
+    def test_tampered_root_is_rejected(self):
+        w = World(seed=41, n_clients=1)
+        cr = self._compacted(w)
+        with self.assertRaises(compactor.CompactError):
+            compactor.verify_state_root(bytes(32), self._barrier(w, cr))  # forged root
+
+    def test_omitted_live_winner_is_rejected(self):
+        # a checkpoint claiming the honest root but whose retained set drops a live
+        # winner -> the reconstructed barrier is missing that key -> caught.
+        w = World(seed=42, n_clients=1)
+        cr = self._compacted(w)
+        winners = [o for o in cr.retained if not o.is_control]
+        short = compactor.barrier_state(winners[1:], cr.attempts, w.keyring)  # drop one
+        with self.assertRaises(compactor.CompactError):
+            compactor.verify_state_root(cr.state_root, short)
+
+    def test_wrong_attempt_is_rejected(self):
+        # the sidecar is part of the audited state -> a wrong attempt fails the root.
+        w = World(seed=43, n_clients=1)
+        cr = self._compacted(w)
+        with self.assertRaises(compactor.CompactError):
+            compactor.verify_state_root(cr.state_root, self._barrier(w, cr, attempts={b"k1": 7}))
+
+
 class TestA4RejectedOps(unittest.TestCase):
     """D3 finding 13: a committed-but-REJECTED op's mutations never applied, so the
     mask meta must NOT be a mutations-only fold of the whole band — it takes the

@@ -689,16 +689,15 @@ def make_barrier(result: FoldResult) -> BarrierState:
     return out
 
 
-def state_root(result: FoldResult) -> bytes:
-    """Binary BLAKE2 Merkle root over sorted live (key, value, version, attempt)
-    — makes compaction auditable (DESIGN §12). Domain-separated: leaves are
-    h(0x00 ‖ enc), interior nodes h(0x01 ‖ l ‖ r), an odd node promotes
-    unchanged — one state, one root (NOTES item 19)."""
-    leaves = [
-        crypto.h(b"\x00" + A.codec.encode([k, m.value, m.version, m.attempt]))
-        for k, m in sorted(result.meta.items())
-        if m.present
-    ]
+def _state_leaf(key: bytes, value: object, version: bytes, attempt: int) -> bytes:
+    """One live-key leaf of the state-root Merkle tree — domain-separated (0x00)."""
+    return crypto.h(b"\x00" + A.codec.encode([key, value, version, attempt]))
+
+
+def _merkle_root(leaves: list[bytes]) -> bytes:
+    """Binary BLAKE2 Merkle root: interior nodes h(0x01 ‖ l ‖ r), an odd node promotes
+    unchanged (no duplicate-leaf ambiguity), an empty tree is h(b"") — one state, one
+    root (NOTES item 19). Leaves must already be in canonical (sorted-key) order."""
     if not leaves:
         return crypto.h(b"")
     while len(leaves) > 1:
@@ -707,9 +706,33 @@ def state_root(result: FoldResult) -> bytes:
             if i + 1 < len(leaves):
                 nxt.append(crypto.h(b"\x01" + leaves[i] + leaves[i + 1]))
             else:
-                nxt.append(leaves[i])  # odd node promotes — no duplicate-leaf ambiguity
+                nxt.append(leaves[i])  # odd node promotes
         leaves = nxt
     return leaves[0]
+
+
+def state_root(result: FoldResult) -> bytes:
+    """The audit anchor over the live state at a barrier (DESIGN §12): a Merkle root
+    over sorted live (key, value, version, attempt). Makes compaction auditable —
+    `state_root_of_barrier` recomputes the SAME root from a reconstructed barrier, so a
+    bootstrapping node can verify a checkpoint (WP-B)."""
+    return _merkle_root(
+        [
+            _state_leaf(k, m.value, m.version, m.attempt)
+            for k, m in sorted(result.meta.items())
+            if m.present
+        ]
+    )
+
+
+def state_root_of_barrier(barrier: BarrierState) -> bytes:
+    """The state root recomputed from a reconstructed barrier — the bootstrap/audit
+    inverse of `state_root`. By A4 (retained bootstrap ≡ full fold) it equals the
+    `state_root` a full-history client derived, so a mismatch against a checkpoint's
+    claimed root is a forged/corrupt checkpoint (WP-B). Same leaf + Merkle scheme."""
+    return _merkle_root(
+        [_state_leaf(k, e["value"], e["version"], e["attempt"]) for k, e in sorted(barrier.items())]
+    )
 
 
 # --------------------------------------------------------------------------- #

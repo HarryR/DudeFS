@@ -57,6 +57,22 @@ def open_attempts(sealed: bytes, data_key: bytes) -> dict[bytes, int]:
     return {codec.as_bytes(k): codec.as_int(v) for k, v in codec.as_dict(codec.decode(pt)).items()}
 
 
+def verify_state_root(claimed: bytes, barrier: fold.BarrierState) -> None:
+    """Audit a checkpoint at intake (WP-B / DESIGN §12): the state_root recomputed from
+    the barrier a bootstrapping node RECONSTRUCTED from the retained set + sidecar MUST
+    equal the checkpoint's claimed `state_root`. A mismatch means a forged or corrupt
+    checkpoint — a tampered root, an omitted live winner, or a kept-superseded op that
+    perturbs the reconstructed state — so raise loudly (a portable audit failure) and
+    never adopt it. The trust surface §12 rests on: a lying compactor is caught by any
+    node that recomputes."""
+    got = fold.state_root_of_barrier(barrier)
+    if got != claimed:
+        raise CompactError(
+            f"checkpoint state_root mismatch: claimed {claimed.hex()[:16]}… "
+            f"but the reconstructed barrier hashes to {got.hex()[:16]}…"
+        )
+
+
 @dataclass(frozen=True)
 class CompactResult:
     """What a checkpoint carries (DESIGN §12): the pinned cut + audit root, the
