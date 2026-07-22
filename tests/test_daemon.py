@@ -377,20 +377,35 @@ class TestDaemonFence(unittest.TestCase):
 
 
 class TestDaemonEvidence(unittest.TestCase):
-    def test_evidence_duty_cycle_mints_a_gossiped_in_double_vote(self):
+    def test_evidence_duty_cycle_mints_a_real_equivocators_double_vote(self):
+        # PRODUCTION PATH (not a hand-planted receipt): the node IS an equivocator via
+        # the acceptor_cls seam, so two accepts at one (tag, ballot) for different ops
+        # flow the real on_accept -> put_receipt path and it SIGNS two conflicting
+        # receipts; evidence_cycle then mints DOUBLE_VOTE from them. The whole
+        # adversary-produces-then-detector-catches chain runs production code.
+        from dudefs.sim.personas import EquivocatingAcceptor
+
         w = World(seed=5, n_clients=2)
-        roster = [C.SIGNER.public(bytes([200] * 32))]
-        d = _daemon(w, 0, roster)
-        a, b = creation_op(w, 0, b"A"), creation_op(w, 1, b"B")  # same slot
-        nsk = bytes([250] * 32)
+        nsk = bytes([200] * 32)
         npub = C.SIGNER.public(nsk)
+        d = NodeDaemon(
+            nsk,
+            npub,
+            roster=[npub],
+            manager_pub=w.mgr_pub,
+            control_ops=w.control_ops,
+            clock=lambda: 100,
+            delta_ms=BIG,
+            acceptor_cls=EquivocatingAcceptor,
+        )
+        a, b = creation_op(w, 0, b"A"), creation_op(w, 1, b"B")  # same slot, two ops
+        assert a.slot_tag is not None and a.slot_tag == b.slot_tag
         ballot = A.Ballot(1, b"x")
-        with d.store.write_txn() as tx:
-            tx.put_op_raw(a)
-            tx.put_op_raw(b)
-            tx.put_receipt(A.Receipt.issue(nsk, npub, a.op_hash, 0, ballot, 1))
-            tx.put_receipt(A.Receipt.issue(nsk, npub, b.op_hash, 0, ballot, 2))
-        self.assertEqual(d.evidence_cycle(), 1)  # DOUBLE_VOTE minted
+        self.assertIsInstance(d.acc.on_accept(a.slot_tag, ballot, a, 100), A.Receipt)
+        self.assertIsInstance(
+            d.acc.on_accept(a.slot_tag, ballot, b, 100), A.Receipt
+        )  # equivocates: re-signs the same ballot for a different op
+        self.assertEqual(d.evidence_cycle(), 1)  # DOUBLE_VOTE minted from its own receipts
         self.assertGreaterEqual(d.status()["evidence"], 1)
         self.assertEqual(d.evidence_cycle(), 0)  # idempotent
 

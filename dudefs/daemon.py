@@ -65,6 +65,7 @@ class NodeDaemon:
         clock: Callable[[], int] | None = None,
         epoch: int = 0,
         delta_ms: int = tunables.SIM_DELTA_MS,
+        acceptor_cls: type[Acceptor] = Acceptor,
     ):
         self.peers: list[Peer] = peers or []  # anti-entropy peers (identity + Endpoint)
         self.sk = sk  # the node's identity key — signs L_msg envelopes (PROTOCOL §7.5)
@@ -77,7 +78,11 @@ class NodeDaemon:
         # the request gate's authz view (NOTES 58): a ControlState rebuilt from the
         # control ops we hold, refreshed each maintenance tick as certs gossip in.
         self._authz = ControlState(manager_pub, epoch)
-        self.acc = Acceptor(
+        # `acceptor_cls` is the seam for an adversarial persona (EquivocatingAcceptor,
+        # FloorPerjurer): its misbehavior then flows the PRODUCTION accept -> gossip ->
+        # evidence path, so the adversary-mints-proof test runs real code, not a
+        # hand-planted receipt. Defaults to the honest Acceptor.
+        self.acc = acceptor_cls(
             sk,
             pub,
             self.store,
