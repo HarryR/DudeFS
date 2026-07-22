@@ -1,0 +1,32 @@
+name: CI
+
+# Runs the exact developer gate: the Makefile is fully self-contained (it bootstraps
+# a project-local uv, which fetches Python 3.12 and installs ruff/ty/pynacl/coverage
+# into ./.venv), so CI needs no system Python or apt deps — just `make`.
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain (project-local uv + venv + Python 3.12)
+        run: make install
+
+      - name: Lint, format-check, typecheck, tests
+        run: make check
+
+      - name: Coverage (ratchet, --fail-under=90)
+        run: make coverage
