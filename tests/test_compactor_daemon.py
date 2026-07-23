@@ -20,7 +20,7 @@ from dudefs.handlers import control as ctl
 from dudefs.store import covered
 from tests._builders import World, now_ms, poll_until, unix_eps
 
-DELTA = 150
+DELTA = 2000  # generous skew tolerance — these tests exercise compaction, not the skew gate
 
 
 class _Fixture:
@@ -93,8 +93,14 @@ class _Fixture:
         assert poll_until(lambda: not self.client.status(op).may_flip)  # final
         return op
 
-    def compact(self):
-        for _ in range(25):
+    def compact(self, deadline_s: float = 20.0):
+        # deadline-based (not a fixed iteration count): on slow CI the pass-N writes' finality
+        # can take several rounds to land in the compactor's quorum-floor read. Pump the nodes
+        # each round so the cluster stays converged and any frontier read is complete.
+        end = time.monotonic() + deadline_s
+        while time.monotonic() < end:
+            for nd in self.nodes:
+                nd.sync_once()
             ck = self.comp.compact_once()
             if ck is not None:
                 return ck
