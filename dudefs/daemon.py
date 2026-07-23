@@ -88,7 +88,13 @@ class NodeDaemon:
             self.store,
             config_epoch=epoch,
             delta_ms=delta_ms,
-            authz=lambda a: self._authz.is_authorized(a, ctl.Cap.WRITE),
+            # SUBMIT's author IS the requester: a certed writer's blind write OR a
+            # compactor's blind checkpoint (R6 WP-G). Fold-positional authz still has the
+            # final say on the op's KIND (a COMPACT author can only carry a checkpoint).
+            authz=lambda a: (
+                self._authz.is_authorized(a, ctl.Cap.WRITE)
+                or self._authz.is_authorized(a, ctl.Cap.COMPACT)
+            ),
         )
         self.pub = pub
         self._clock = clock or (lambda: 0)
@@ -167,15 +173,18 @@ class NodeDaemon:
 
     def _peer_authorized(self, frm: bytes) -> bool:
         """The peer gate's policy: a current roster node (gossip / ballots), a certed
-        client (writes), a certed STORE node (a LEARNER catching up read-only before it
-        is promoted into the quorum — issue #2), or the root manager (control-plane drive).
-        Requester-based — a revoked client / never-member is none of these and is refused.
-        A learner's receipts never count (a QC verifies against the roster, which excludes
-        it), so admitting it grants read-only catch-up, not a vote."""
+        client (writes), a certed STORE node (a LEARNER catching up read-only before it is
+        promoted into the quorum — issue #2), a certed COMPACT node (a compactor syncing the
+        log + blind-committing checkpoints — R6 WP-G), or the root manager (control-plane
+        drive). Requester-based — a revoked client / never-member is none of these and is
+        refused. Neither a learner's nor a compactor's receipts ever count toward a QC (it
+        verifies against the roster, which excludes them), so admission grants participation
+        in the wire, not a vote; a compactor's checkpoint still needs a real node quorum."""
         return (
             frm in self.roster
             or self._authz.is_authorized(frm, ctl.Cap.WRITE)
             or self._authz.is_authorized(frm, ctl.Cap.STORE)
+            or self._authz.is_authorized(frm, ctl.Cap.COMPACT)
             or frm == self.manager_pub
         )
 
