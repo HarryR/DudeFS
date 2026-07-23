@@ -350,11 +350,35 @@ class TestManagerOps(unittest.TestCase):
             m = Manager.init(d)
             npub = C.SIGNER.public(bytes([5] * 32))
             m.node_add(npub, addr="sealed+http://host:8080/dude")
-            ep = m.state.node_addrs[npub.hex()]
+            (ep,) = m.state.node_addrs[npub.hex()]  # single-homed -> one entry
             self.assertEqual(
                 (ep.transport, ep.uri, ep.sealed), (b"http", "http://host:8080/dude", True)
             )
-            self.assertEqual(ManagerState.load(d).node_addrs[npub.hex()], ep)  # durable summary
+            self.assertEqual(ManagerState.load(d).node_addrs[npub.hex()], [ep])  # durable summary
+
+    def test_endpoint_add_remove_list_round_trips_multi_home(self):
+        # a node is multi-homed (PROTOCOL §7.1): add/remove read-modify-write the address
+        # LIST (no longer collapsed to one), dial keeps taking the first, and it's durable.
+        with tempfile.TemporaryDirectory() as d:
+            m = Manager.init(d)
+            npub = C.SIGNER.public(bytes([6] * 32))
+            m.node_add(npub, addr="/run/n1.sock")
+            m.endpoint_add(npub, "/run/n1-alt.sock")  # multi-home
+            uris = [e.uri for e in m.endpoint_list(npub)]
+            self.assertEqual(uris, ["/run/n1.sock", "/run/n1-alt.sock"])
+            first = m.state.dial(npub.hex())
+            assert first is not None
+            self.assertEqual(first.uri, "/run/n1.sock")  # dial = first
+            m.endpoint_add(npub, "/run/n1-alt.sock")  # re-add is a no-op replay, not a dup
+            self.assertEqual(len(m.endpoint_list(npub)), 2)
+            m.endpoint_remove(npub, "/run/n1.sock")  # drop the primary
+            self.assertEqual([e.uri for e in m.endpoint_list(npub)], ["/run/n1-alt.sock"])
+            promoted = m.state.dial(npub.hex())
+            assert promoted is not None
+            self.assertEqual(promoted.uri, "/run/n1-alt.sock")  # failover promotes
+            m.endpoint_remove(npub)  # empty addr -> whole-record removal
+            self.assertEqual(m.endpoint_list(npub), [])
+            self.assertIsNone(ManagerState.load(d).dial(npub.hex()))  # durable removal
 
     def test_probe_roster_with_injected_prober(self):
         # probe I/O is injected -> the dwell/report logic is tested without sockets
@@ -364,7 +388,7 @@ class TestManagerOps(unittest.TestCase):
             m = Manager.init(d)  # roster = [node0], no endpoint
             # a synthetic prober answers node0's Endpoint with a floor — no sockets
             ep0 = transports.Endpoint(transports.UNIX, "/n0.sock")
-            m.state.node_addrs[m.state.roster[0].hex()] = ep0
+            m.state.node_addrs[m.state.roster[0].hex()] = [ep0]
             answers = {ep0: A.HLC(9, 0)}
             rep = m.probe_roster(lambda _pub, e: answers.get(e), dwell=0.0, sleep=lambda _s: None)
             self.assertEqual(rep.reachable, [0])

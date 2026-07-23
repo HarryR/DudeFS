@@ -51,6 +51,12 @@ class Endpoint:
         opts) — the record IS the decomposition, so this is a view, not a re-parse."""
         return Endpoint(transport, uri.decode(), opts.get(b"lmsg") == b"sealed")
 
+    def to_record(self) -> tuple[bytes, bytes, dict[bytes, bytes]]:
+        """The inverse of `from_record`: the (transport, uri, opts) addr as an ENDPOINT
+        record stores it. Faithful because `opts` carries only the L_msg profile today, so
+        a read-modify-write of a node's address list (endpoint add/remove) round-trips."""
+        return (self.transport, self.uri.encode(), {b"lmsg": b"sealed"} if self.sealed else {})
+
 
 class Server(Protocol):
     """A listening carrier. `serve` blocks until `close` (from another thread) tears

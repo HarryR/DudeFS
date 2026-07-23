@@ -122,13 +122,22 @@ class ManagerState:
         self.epoch = cs.epoch
         self.keyepoch = cs.active_keyepoch
         self.certs = certs
-        # node_addrs: the first advertised dial Endpoint per node (matches the daemon/
-        # client "take the first" preference), keyed by pubkey hex.
-        self.node_addrs = {pub.hex(): eps[0] for pub, eps in cs.endpoints.items() if eps}
+        # node_addrs: the FULL advertised dial-Endpoint list per node (multi-homed, PROTOCOL
+        # §7.1), keyed by pubkey hex. Dialers take the first (`dial()`); the list is retained
+        # so a failover address is never silently dropped and `endpoint list` can render it.
+        self.node_addrs: dict[str, list[transports.Endpoint]] = {
+            pub.hex(): list(eps) for pub, eps in cs.endpoints.items() if eps
+        }
         if head is not None:
             self.mseq, self.mprev, self.mhlc = head.seq + 1, head.op_hash, head.hlc.wall_ms
         else:
             self.mseq, self.mprev, self.mhlc = 0, A.GENESIS_PREV, 0
+
+    def dial(self, pub_hex: str) -> transports.Endpoint | None:
+        """The primary dial Endpoint for a node — the first of its multi-homed list
+        (no failover yet). None when the node advertises no address."""
+        eps = self.node_addrs.get(pub_hex)
+        return eps[0] if eps else None
 
     def build_control(self, payload: bytes, slot_tag: bytes | None = None) -> Op:
         """Build one root-signed control op from the current chain head WITHOUT
@@ -354,8 +363,32 @@ class Manager:
         self, subject: bytes, addrs: list[tuple[bytes, bytes, dict[bytes, bytes]]]
     ) -> Op:
         """Author a root-signed ENDPOINT record for `subject` (PROTOCOL §7 / NOTES
-        58): latest-wins per subject; empty `addrs` removes the node. Root-only."""
+        58): latest-wins per subject; empty `addrs` removes the node. Root-only. The
+        deliberate replace-all clobber — `endpoint_add`/`_remove` edit the list instead."""
         return self.state.author_control(ctl.endpoint_body(subject, addrs))
+
+    def _addr_records(self, subject: bytes) -> list[tuple[bytes, bytes, dict[bytes, bytes]]]:
+        """The node's current advertised addrs as ENDPOINT records — the settable form of
+        the derived dial-Endpoint list (a faithful round-trip; opts is just the L_msg flag)."""
+        return [ep.to_record() for ep in self.state.node_addrs.get(subject.hex(), [])]
+
+    def endpoint_list(self, subject: bytes) -> list[transports.Endpoint]:
+        """A node's current dial addresses (multi-homed)."""
+        return list(self.state.node_addrs.get(subject.hex(), []))
+
+    def endpoint_add(self, subject: bytes, addr: str) -> Op:
+        """Append one dial address to the node's record (read-modify-write); a re-add of an
+        address it already advertises is a no-op replay, not a duplicate."""
+        rec = transports.parse_endpoint(addr)
+        cur = self._addr_records(subject)
+        return self.set_endpoint(subject, cur if rec in cur else [*cur, rec])
+
+    def endpoint_remove(self, subject: bytes, addr: str = "") -> Op:
+        """Drop one dial address from the node's record; an empty `addr` (or removing the
+        last one) removes the whole record — retiring the node's reachability."""
+        cur = self._addr_records(subject)
+        remaining = [r for r in cur if r != transports.parse_endpoint(addr)] if addr else []
+        return self.set_endpoint(subject, remaining)
 
     def node_promote(self, pub: bytes, rpc: NodeRPC) -> RosterChange:
         """Promote a learner to voting. Refuses an even voting roster client-side
@@ -471,7 +504,7 @@ class Manager:
             for i, pub in enumerate(self.state.roster):
                 if i in answered:
                     continue
-                ep = self.state.node_addrs.get(pub.hex())
+                ep = self.state.dial(pub.hex())
                 if ep is None:
                     continue  # no address -> unreachable; leave unanswered (presumed dead)
                 floor = probe(pub, ep)

@@ -107,7 +107,7 @@ def _node_rpc(st: ManagerState):
     roster-change drive (findings 23/24) talks to nodes by pubkey, enveloped as root."""
 
     def rpc(node_pub: bytes, req: Request) -> Response | None:
-        return _mgr_send(st, node_pub, st.node_addrs.get(node_pub.hex()), req)
+        return _mgr_send(st, node_pub, st.dial(node_pub.hex()), req)
 
     return rpc
 
@@ -213,7 +213,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     frontier = A.HLC(0, 0)
     reachable = 0
     for i, pub in enumerate(st.roster):
-        fb = _probe(st, pub, st.node_addrs.get(pub.hex()))
+        fb = _probe(st, pub, st.dial(pub.hex()))
         if fb is None:
             print(f"  node{i} {pub.hex()[:16]}…  UNREACHABLE")
             continue
