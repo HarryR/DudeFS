@@ -474,11 +474,14 @@ class TestBootstrapConsumer(unittest.TestCase):
     unsealed sidecar and reads BYTE-IDENTICALLY to a full-history client (A4) — the real
     client._fold path, verifying state_acc at intake (WP-B)."""
 
+    _NSK = bytes([200] * 32)
+    _NPUB = C.SIGNER.public(_NSK)
+
     def _client(self, w):
         c = ClientDaemon(
             w.clients[0].sk,
             w.clients[0].pub,
-            roster=[C.SIGNER.public(bytes([1] * 32))],
+            roster=[self._NPUB],  # the trust anchor the QCs below verify against (issue #3)
             roster_addrs=unix_eps(["/nonexistent.sock"]),  # reads fold locally, no RPC
             manager_pub=w.mgr_pub,
             masters={0: MASTER},
@@ -488,13 +491,12 @@ class TestBootstrapConsumer(unittest.TestCase):
         c.keyring, c.genesis = w.keyring, w.genesis  # align with the World's op keys
         return c
 
-    @staticmethod
-    def _qc(op):
-        # a minimal 1-node QC — the fold only checks a QC is PRESENT (committed)
-        nsk = bytes([200] * 32)
-        npub = C.SIGNER.public(nsk)
-        r = A.Receipt.issue(nsk, npub, op.op_hash, 0, A.BLIND, 1)
-        return A.QC.assemble([r], 1, {npub: 0})
+    @classmethod
+    def _qc(cls, op):
+        # a minimal but REAL 1-node QC: node _NPUB (the client's epoch-0 roster) signs, so
+        # qc.verify([_NPUB]) passes — the client now checks validity, not presence (issue #3).
+        r = A.Receipt.issue(cls._NSK, cls._NPUB, op.op_hash, 0, A.BLIND, 1)
+        return A.QC.assemble([r], 1, {cls._NPUB: 0})
 
     def test_gc_d_client_bootstraps_from_checkpoint_equals_full_history(self):
         w = World(seed=70, n_clients=1)
@@ -552,6 +554,97 @@ class TestBootstrapConsumer(unittest.TestCase):
             self.assertEqual(boot.state, full.state)  # A4: sparse bootstrap == full history
         finally:
             c.close()
+
+    def test_qc_not_signed_by_the_epoch_roster_is_rejected(self):
+        # issue #3: presence is not proof. A QC bearing a REAL signature — but by a key
+        # that is not in the epoch roster the client trusts — must not commit the op.
+        w = World(seed=21, n_clients=1)
+        op = w.blind(0, [], [[A.Mutation.SET, b"k", b"v"]])
+        foreign = bytes([77] * 32)
+        fpub = C.SIGNER.public(foreign)
+        r = A.Receipt.issue(foreign, fpub, op.op_hash, 0, A.BLIND, 1)
+        forged = A.QC.assemble([r], 1, {fpub: 0})  # genuine sig, wrong (non-roster) signer
+        c = self._client(w)
+        try:
+            with c.store.write_txn() as tx:
+                for cop in w.control_ops:
+                    tx.put_op_raw(cop)
+                tx.put_op_raw(op)
+                tx.put_qc(forged)
+            with c.store.read_txn() as tx:
+                self.assertNotIn(b"k", c._fold(tx).state)  # forged QC -> not committed
+            # the SAME op with a roster-signed QC (replaces the forged one) IS committed
+            with c.store.write_txn() as tx:
+                tx.put_qc(self._qc(op))
+            with c.store.read_txn() as tx:
+                self.assertEqual(c._fold(tx).state.get(b"k"), b"v")
+        finally:
+            c.close()
+
+    def test_missing_retained_winner_fails_the_state_acc_vouch(self):
+        # issue #3: the checkpoint state_acc is the below-cut vouch. A client handed an
+        # incomplete (or tampered) baseline reconstructs a barrier that does not match and
+        # fails LOUD — it never silently serves a wrong read.
+        w = World(seed=22, n_clients=1)
+        below = list(w.control_ops)  # the authz chain — else the client's data ops fold INVALID
+        mk = [[A.Mutation.SET, b"a", b"1"]]
+        below.append(w.cas(0, b"a", VERSION_ABSENT, 0, [[A.Guard.ABSENT, b"a"]], mk))
+        v, a = F.fold(below, w.keyring, w.genesis).lineage(b"a")
+        below.append(  # supersedes a=1 -> a=1 dead (GC'd)
+            w.cas(0, b"a", v, a, [[A.Guard.VERSION_EQ, b"a", v]], [[A.Mutation.SET, b"a", b"2"]])
+        )
+        absent_b, set_b = [[A.Guard.ABSENT, b"b"]], [[A.Mutation.SET, b"b", b"9"]]
+        below.append(w.cas(0, b"b", VERSION_ABSENT, 0, absent_b, set_b))
+        cut = cut_of(w)
+        cr = compactor.compact_genesis(below, w.keyring, w.genesis, cut)
+        sealed = compactor.seal_attempts(cr.attempts, w.keyring[0]["data_key"])
+        ckpt = w.checkpoint(cut=cut, state_acc=cr.state_acc, dead=cr.dead, attempts=sealed)
+        retained_data = [o for o in cr.retained if not o.is_control]
+        self.assertTrue(cr.dead)  # there really is a GC'd op, so the sparse path engages
+        c = self._client(w)
+        try:
+            with c.store.write_txn() as tx:
+                for cop in w.control_ops:
+                    tx.put_op_raw(cop)
+                for op in retained_data[:-1]:  # DROP one retained winner
+                    tx.put_op_raw(op)
+                tx.put_op_raw(ckpt)
+                tx.put_qc(self._qc(ckpt))
+            with c.store.read_txn() as tx:
+                with self.assertRaises(compactor.CompactError):
+                    c._fold(tx)
+        finally:
+            c.close()
+
+
+class TestBaselinePull(unittest.TestCase):
+    """issue #3 / finding #9: a client pulls the sparse below-cut RETAINED baseline over
+    the wire by reusing the node's gossip exchange (no new verb). `_pull_chain`'s per-author
+    walk stops at a GC'd hole below the cut; this set-based digest-diff pull crosses it."""
+
+    def test_pull_baseline_fetches_below_cut_retained_over_the_wire(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            w = World(seed=71, n_clients=1)
+            cluster = _Cluster(tmp, w, n=1)
+            try:
+                below = list(w.control_ops)
+                mk = [[A.Mutation.SET, b"k", b"v"]]
+                below.append(w.cas(0, b"k", VERSION_ABSENT, 0, [[A.Guard.ABSENT, b"k"]], mk))
+                winner = next(o for o in below if not o.is_control)
+                # drive node 0 into a checkpointed state: it holds the baseline + a cut.
+                with cluster.nodes[0].store.write_txn() as tx:
+                    for o in below:
+                        tx.put_op_raw(o)
+                    tx.adopt_checkpoint(cut_of(w), A.retained_commitment(below), [], A.HLC(0, 0))
+                c = cluster.client(w)
+                try:
+                    c._pull_baseline()  # reuse the gossip exchange as an authorized requester
+                    with c.store.read_txn() as tx:
+                        self.assertIsNotNone(tx.get_op(winner.op_hash))  # pulled over the wire
+                finally:
+                    c.close()
+            finally:
+                cluster.close()
 
 
 if __name__ == "__main__":

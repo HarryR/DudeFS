@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from typing import TypedDict
 
 from . import artifacts as A
-from . import compactor, fold, lmsg, transports, tunables, wire
+from . import codec, compactor, fold, gossip, lmsg, transports, tunables, wire
 from .artifacts import BLIND, HLC, QC, Op, Receipt, Txn, compute_slot_tag
 from .handlers import control as ctl
 from .handlers import data as data_handler
@@ -214,6 +214,8 @@ class ClientDaemon:
         store_path: str = ":memory:",
         epoch: int = 0,
         keyepoch: int = 0,
+        genesis_roster: list[bytes] | None = None,
+        genesis_epoch: int = 0,
     ):
         self.sk = sk
         self.pub = pub
@@ -223,6 +225,13 @@ class ClientDaemon:
         self.roster_addrs = roster_addrs
         self.store = ChainStore(store_path)
         self.genesis: fold.Genesis = {"manager_pub": manager_pub}
+        # roster-per-epoch trust anchor (issue #3): the founding voting set + its epoch, the
+        # single point a newcomer folds forward from to verify every committed op's QC.
+        # Defaults to the provisioned current (epoch, roster) — exact for a cluster that has
+        # not rotated; multi-epoch newcomers pass the genesis anchor. Converges to an on-chain
+        # manager-signed founding roster (issue #2).
+        self._anchor_roster = list(genesis_roster) if genesis_roster is not None else list(roster)
+        self._anchor_epoch = genesis_epoch if genesis_roster is not None else epoch
         self.cfg = QuorumConfig(roster=roster, epoch=epoch, client_fp=pub)
         self._lock = threading.Lock()  # guards store + chain head + frontier
         self._exhausted: set[bytes] = set()  # ops whose drive gave up -> `unknown`
@@ -280,6 +289,20 @@ class ClientDaemon:
             case lmsg.Reply(env):
                 return wire.decode_response(env.body)
             case _fault:  # NoReply / MalformedReply / WrongPeer — the why is here to log later
+                return None
+
+    def _gossip(self, node: int, req_body: bytes) -> gossip.Delta | None:
+        """Run the node-to-node gossip exchange as an authorized requester: send a
+        SUMMARY, return the DELTA the node owes me (issue #3). The node's reply is a
+        signed, addressed L_msg — a reply that isn't from the addressed node is no reply."""
+        if self._closing.is_set():
+            return None
+        ep, to_pub = self.roster_addrs[node], self.cfg.roster[node]
+        link = Link(self.sk, self.pub, to_pub, ep)
+        match link.request(b"gossip", req_body, epoch=self.cfg.epoch, ts=int(time.time() * 1000)):
+            case lmsg.Reply(env):
+                return gossip.decode_delta(env.body)
+            case _fault:
                 return None
 
     def _push_qc(self, qc: QC) -> None:
@@ -421,6 +444,7 @@ class ClientDaemon:
                     heads[author] = (seq, hh)
         for _, head_hash in heads.values():
             self._pull_chain(head_hash)
+        self._pull_baseline()  # sparse below-cut retained winners (issue #3 / finding #9)
         # the highest hlc a quorum attests final = the q-th highest floor (DESIGN §9)
         floors = sorted((fb.floor for fb in bundles), key=lambda h: h.as_tuple(), reverse=True)
         qfloor = floors[self.cfg.quorum - 1]
@@ -473,6 +497,32 @@ class ClientDaemon:
                 return  # we already held this op — the rest of the chain is present
             h = op.prev
 
+    def _pull_baseline(self) -> None:
+        """Pull the sparse below-cut RETAINED baseline a committed checkpoint vouches for
+        (issue #3 / finding #9). `_pull_chain`'s per-author walk stops at a GC'd hole below
+        the cut, so the retained winners never arrive that way. The node serves the baseline
+        to any authorized gossip requester (a certed client qualifies), so advertise my
+        summary and intake `d.baseline` contiguity-free via put_op_raw — no new wire verb.
+        One responsive peer holds the full retained set; an incomplete pull fails loud at
+        verify_state_acc (barrier reconstruction) and a later refresh retries."""
+        with self.store.read_txn() as tx:
+            summ = gossip.summary(
+                tx,
+                self.cfg.epoch,
+                tx.cut() or None,
+                tx.get_meta("checkpoint") or b"",
+                tx.cut_dead(),
+            )
+        body = codec.encode([b"gossip", gossip.encode_summary(summ)])
+        for node in self.cfg.fanout_order:
+            d = self._gossip(node, body)
+            if d is None or not d.baseline:
+                continue
+            with self.store.write_txn() as tx:
+                for op in d.baseline:
+                    tx.put_op_raw(op)  # author-signed envelope; the checkpoint certifies it
+            return
+
     def _one_of(self, req: Request) -> Response | None:
         """Try each reachable node in fanout order; return the first real response."""
         for node in self.cfg.fanout_order:
@@ -494,15 +544,44 @@ class ClientDaemon:
     # than opening its own: a compound view (get/list/inspect/status) folds and fences
     # over ONE consistent snapshot, so a background _pull_chain/_store_qc committing
     # mid-read can never make `final ⊄ provisional` or pair a value with a later fence.
-    def _committed_ops(self, tx: ReadTxn, *, final_only: bool = False) -> list[Op]:
-        """The committed set the daemon holds: all control ops (the authorization
-        chain) + every data op that carries a QC. `final_only` keeps only data ops
-        at/under the finality frontier (the frozen view)."""
+    def _rosters(self, control_ops: list[Op]) -> dict[int, list[bytes]]:
+        """roster-per-epoch reconstructed from the held control chain, anchored at the
+        provisioned founding roster (issue #3). Only authorized, signature-valid ROSTER
+        ops count, so a rogue compactor — which cannot author a roster op — can never
+        rewrite the roster history a committed op's QC is verified against."""
+        g: fold.Genesis = {
+            "manager_pub": self.manager_pub,
+            "epoch": self._anchor_epoch,
+            "roster": self._anchor_roster,
+        }
+        return fold.rosters_by_epoch(control_ops, g)
+
+    @staticmethod
+    def _qc_ok(qc: QC | None, rosters: dict[int, list[bytes]]) -> bool:
+        """Committed proof = a majority of the QC's OWN epoch roster actually signed it
+        (issue #3). Presence is not proof: a forged, short, or wrong-roster QC — the exact
+        thing a malicious node could feed a bootstrapping client — fails verification here."""
+        if qc is None:
+            return False
+        roster = rosters.get(qc.config_epoch)
+        return roster is not None and qc.verify(roster)
+
+    def _committed_ops(
+        self,
+        tx: ReadTxn,
+        all_ops: list[Op],
+        rosters: dict[int, list[bytes]],
+        *,
+        final_only: bool = False,
+    ) -> list[Op]:
+        """The committed set the daemon holds: all control ops (the authorization chain)
+        + every data op whose QC VERIFIES against its epoch roster (issue #3 — not mere
+        presence). `final_only` keeps only data ops at/under the finality frontier."""
         out: list[Op] = []
-        for o in tx.all_ops():
+        for o in all_ops:
             if o.is_control:
                 out.append(o)
-            elif tx.get_qc(o.op_hash) is not None:
+            elif self._qc_ok(tx.get_qc(o.op_hash), rosters):
                 if final_only and o.hlc > self._final_frontier:
                     continue
                 out.append(o)
@@ -516,19 +595,21 @@ class ClientDaemon:
         return body if isinstance(body, ctl.Checkpoint) else None
 
     def _bootstrap_barrier(
-        self, tx: ReadTxn, ops: list[Op]
+        self, tx: ReadTxn, all_ops: list[Op], rosters: dict[int, list[bytes]]
     ) -> tuple[fold.BarrierState, A.Heads] | None:
-        """The reconstructed barrier for the latest QC-committed checkpoint whose below-
-        cut band I no longer fully hold (WP-C). Returns None — a full-history fold —
-        when no compaction has happened OR I still hold the whole covered band (that
-        fold is already checkpoint-aware and correct). When the band IS sparse (GC'd),
-        fold the RETAINED winners I hold + the unsealed attempts sidecar into the
+        """The reconstructed barrier for the latest checkpoint whose QC VERIFIES and whose
+        below-cut band I no longer fully hold (WP-C / issue #3). Returns None — a full-
+        history fold — when no compaction has happened OR I still hold the whole covered
+        band (that fold is already checkpoint-aware and correct). When the band IS sparse
+        (GC'd), fold the RETAINED winners I hold + the unsealed attempts sidecar into the
         barrier and VERIFY the checkpoint state_acc against it (WP-A/B), so a GC'd or
         freshly-bootstrapped client reads byte-identically to full history (A4)."""
         latest: tuple[Op, ctl.Checkpoint] | None = None
-        for o in ops:
+        for o in all_ops:
             ck = self._checkpoint(o)
-            if ck is not None and ck.cut and tx.get_qc(o.op_hash) is not None:
+            # the checkpoint's OWN QC must verify against its epoch roster — a compactor
+            # cannot self-certify a cut; a node quorum committed it (issue #3).
+            if ck is not None and ck.cut and self._qc_ok(tx.get_qc(o.op_hash), rosters):
                 if latest is None or o.hlc > latest[0].hlc:
                     latest = (o, ck)
         if latest is None:
@@ -536,18 +617,27 @@ class ClientDaemon:
         ck = latest[1]
         if all(tx.get_op(h) is not None for h in ck.dead):
             return None  # I still hold the full covered band -> a full fold is correct
-        # sparse: the below-cut data ops I hold ARE the retained winners (dead is GC'd).
-        retained = [o for o in ops if not o.is_control and covered(o, ck.cut)]
+        # sparse: the below-cut winners are the retained ops I hold (covered ∖ dead). They
+        # carry NO per-op QC (dropped below the cut); author-sig is verified in the barrier
+        # fold and the checkpoint state_acc is the vouch — so this is sourced from the held
+        # ops directly, NOT the QC-gated committed set (else a fresh client reconstructs an
+        # empty retained set and verify_state_acc fails).
+        dead = set(ck.dead)
+        retained = [
+            o for o in all_ops if not o.is_control and covered(o, ck.cut) and o.op_hash not in dead
+        ]
         dk = self.keyring[ck.keyepoch]["data_key"]
         barrier = compactor.barrier_state(
             retained, compactor.open_attempts(ck.attempts, dk), self.keyring
         )
-        compactor.verify_state_acc(ck.state_acc, barrier)  # loud on a forged checkpoint
+        compactor.verify_state_acc(ck.state_acc, barrier)  # loud on a forged/partial checkpoint
         return barrier, ck.cut
 
     def _fold(self, tx: ReadTxn, *, final_only: bool = False) -> fold.FoldResult:
-        ops = self._committed_ops(tx, final_only=final_only)
-        boot = self._bootstrap_barrier(tx, ops)
+        all_ops = tx.all_ops()  # ONE scan, threaded into every helper (issue #3 follow-up)
+        rosters = self._rosters([o for o in all_ops if o.is_control])
+        ops = self._committed_ops(tx, all_ops, rosters, final_only=final_only)
+        boot = self._bootstrap_barrier(tx, all_ops, rosters)
         if boot is None:
             return fold.fold(ops, self.keyring, self.genesis)  # full history (unchanged)
         barrier, cut = boot

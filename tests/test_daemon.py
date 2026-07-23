@@ -774,5 +774,82 @@ class TestJointCertActivation(unittest.TestCase):
             self.assertEqual(nd.roster, old)
 
 
+class TestLearnerOnboarding(unittest.TestCase):
+    """issue #2: the FULL node-addition flow with SYNCED ops on an inproc cluster. A
+    STORE-certed learner is admitted by the peer gate, catches up read-only over real
+    gossip, and only THEN — genuinely POSSESSING the sync frontier it earned by syncing,
+    not one pre-arranged in its store — is promoted via the §13 joint certificate."""
+
+    def test_learner_syncs_through_the_gate_then_is_promoted(self):
+        with tempfile.TemporaryDirectory() as d:
+            m = Manager.init(d)
+            sks = [bytes([200 + i] * 32) for i in range(3)]
+            pubs = [C.SIGNER.public(s) for s in sks]
+            # founding node n0 (the on-chain founding roster is issue #2); seed it so every
+            # manager refold falls back to n0 rather than init's auto-minted placeholder.
+            m.state._set_meta(roster_seed=[pubs[0].hex()])
+            m.state.roster = [pubs[0]]
+            # the manager certs the two learners with SYNCED Cap.STORE ops (PoP-checked).
+            certs = [m.cert_issue("node", pubs[i], C.prove_possession(sks[i])) for i in (1, 2)]
+
+            w = World(seed=77, n_clients=1)
+            base = w.blind(0, [], [[A.Mutation.SET, b"k", b"v"]])  # committed data, held by n0
+            daemons = [
+                NodeDaemon(
+                    sks[i],
+                    pubs[i],
+                    roster=[pubs[0]],
+                    manager_pub=m.state.manager_pub,
+                    control_ops=certs,  # the synced STORE certs -> the gate admits the learners
+                    clock=lambda: 100,
+                    delta_ms=BIG,
+                )
+                for i in range(3)
+            ]
+            with daemons[0].store.write_txn() as tx:
+                tx.append(base)  # only n0 holds the frontier; the learners start EMPTY
+            for i, nd in enumerate(daemons):
+                transports.inproc.register(pubs[i].hex(), nd.serve)
+            for i, nd in enumerate(daemons):
+                nd.peers = [
+                    Peer(pubs[j], transports.Endpoint(transports.INPROC, pubs[j].hex()))
+                    for j in range(3)
+                    if j != i
+                ]
+
+            def rpc(pub, req):
+                return dispatch(daemons[pubs.index(pub)].node, req)
+
+            try:
+                for i in (1, 2):  # precondition: a learner really is empty before it syncs
+                    with daemons[i].store.read_txn() as tx:
+                        self.assertIsNone(tx.get_op(base.op_hash))
+                # 1) learners CATCH UP through the gate. Load-bearing: without Cap.STORE
+                #    admission, n0 refuses their gossip and they stay empty (and step 2 fails).
+                for _ in range(3):
+                    for nd in daemons:
+                        nd.sync_once()
+                for i in (1, 2):
+                    with daemons[i].store.read_txn() as tx:
+                        self.assertIsNotNone(tx.get_op(base.op_hash), f"learner {i} synced")
+                # 2) promote 1 -> 3 via the REAL joint cert; possession is now EARNED, not faked.
+                change = m.change_roster(pubs, rpc)
+                self.assertTrue(change.new_qc.verify(pubs))  # possession-gated on the synced nodes
+                self.assertEqual(change.old_qc.config_epoch, 0)
+                self.assertEqual(change.new_qc.config_epoch, 1)
+                # 3) the nodes hold the roster op (via AcceptReq); feed the joint cert -> activate.
+                for nd in daemons:
+                    with nd.store.write_txn() as tx:
+                        tx.put_qc(change.old_qc)
+                        tx.put_qc(change.new_qc)
+                    nd.observe_roster_activations()
+                    self.assertEqual(nd.acc.epoch, 1)
+                    self.assertEqual(nd.roster, pubs)
+            finally:
+                for i, nd in enumerate(daemons):
+                    transports.inproc.unregister(pubs[i].hex())
+                    nd.close()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -21,6 +21,19 @@ Two sides act on the system, and the CLI mirrors that split:
   It mints its **own** identity there (NOTES 58: keys generate where they live) and runs
   itself. It never holds the root key.
 
+Every join is an **interactive handshake** — two hand-offs the operator carries between the
+joiner and the manager, so no key ever leaves the box that generated it:
+
+1. **forward** — `<subject> init` prints the joiner's `pub + proof-of-possession`; the
+   operator hands them to the manager.
+2. **back** — the manager authorizes it with a **synced control op** (not local bookkeeping —
+   the existing nodes must *hear* about the newcomer or the peer gate refuses it) and emits a
+   `bootstrap.json`; the operator drops that into the joiner's `--dir`.
+
+The joiner then `serve`s: it connects to any node and syncs the rest itself, re-verifying
+everything against `manager_pub`. Of that blob, **only `manager_pub` is trusted** — the
+epoch and peer addresses are hints, re-checked on sync (§7).
+
 The **subject noun is shared**; the context says which side acts — `mgr node add`
 (manager authority *over* a node) vs. `node serve` (the node running *itself*):
 
@@ -98,8 +111,10 @@ removed). Seat the founding node separately with `node genesis`.
 **`node genesis`** · *PROPOSED* — Seat the **founding** voting node at cluster genesis,
 fusing `authorize` + `add` in one unilateral step (no prior quorum exists to run the
 joint-cert ladder against). Verifies proof-of-possession, issues the `Cap.STORE` cert, and
-seats the node as the sole voting member with its dial endpoint(s). Used exactly once,
-right after `m init`.
+seats the node as the sole voting member by authoring the **founding `Roster` op on-chain** —
+so `manager_pub` is the single root of trust and the roster is *derived and verified* from the
+log by every newcomer, never a seeded list to be trusted. Carries its dial endpoint(s). Used
+exactly once, right after `m init`.
 > `m node genesis <pub> <pop> unix:/run/n0.sock [tor:abc…onion]`
 
 **`status`** · EXISTS — Probe the roster over the p2p wire; print roster size, each node's
@@ -274,9 +289,14 @@ checkpoint op, then gossip that checkpoint back to the roster. Answers no reques
   non-standard deployments; unset, they derive from `--dir`.
 - **Worker socket:** `--sock` / `$DUDE_SOCK` (or derived from the client `--dir`).
 - **Bootstrap seed:** `bootstrap.json` inside a daemon's `--dir` —
-  `{manager_pub, epoch, roster: [{pub, addr}]}`, emitted by `m init` / `m node add`, so a
-  daemon starts gated and finds peers before gossip catches it up. Authz still arrives by
-  gossip; this is only the seed.
+  `{manager_pub, epoch, peers: [addr]}`, emitted by `m init` / `m node add` and pasted into
+  the joiner's dir (the "back" half of the enrollment handshake, §2). **Only `manager_pub` is
+  trusted** — it is the single anchor from which the joiner derives and verifies roster-per-
+  epoch, every QC, and the checkpoint off the on-chain log. `epoch` and `peers` are *hints*:
+  the epoch tells it roughly where to start, `peers` are dial addresses to reach the mesh.
+  A stale or wrong hint costs a failed connection, never a wrong state — so the seed carries
+  peer *addresses*, not roster *identity* (which is trust-derived, not seeded). Authz and the
+  roster still arrive by gossip; this is only the seed.
 - **Encryption keys never travel in clear.** A client daemon obtains the per-epoch group
   key by finding *its own* sealed wrap in the gossiped log and opening it with its private
   key (`unwrap_group_key`); the manager publishes a fresh wrap-set on every `rotate`. So

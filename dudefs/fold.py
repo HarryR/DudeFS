@@ -59,12 +59,16 @@ class Cert(TypedDict):
 
 
 class Genesis(TypedDict):
-    """Genesis config: the manager root pubkey + optional starting epochs."""
+    """Genesis config: the manager root pubkey + optional starting epochs. `roster`
+    is the founding (epoch-`epoch`) voting set — the trust anchor a newcomer folds
+    forward from to reconstruct roster-per-epoch (issue #3). Absent until the founding
+    roster becomes an on-chain manager-signed op (issue #2)."""
 
     manager_pub: bytes
     epoch: NotRequired[int]
     keyepoch: NotRequired[int]
     pver: NotRequired[int]
+    roster: NotRequired[list[bytes]]
 
 
 # Client-held key material and the checkpoint barrier state (DESIGN §3, §12).
@@ -164,10 +168,23 @@ class ControlState:
     everything is idempotent, ARCHITECTURE L5); the full profile walks it in
     total order so revocation is fold-positional (DESIGN §15)."""
 
-    def __init__(self, manager_pub: bytes, epoch: int = 0, keyepoch: int = 0, pver: int = 0):
+    def __init__(
+        self,
+        manager_pub: bytes,
+        epoch: int = 0,
+        keyepoch: int = 0,
+        pver: int = 0,
+        genesis_roster: list[bytes] | None = None,
+    ):
         self.manager_pub = manager_pub
         self.epoch = epoch
-        self.roster: list[bytes] | None = None
+        self.roster: list[bytes] | None = list(genesis_roster) if genesis_roster else None
+        # roster-per-epoch, forward-accumulated as authorized ROSTER ops fold (issue #3):
+        # the trust map a client verifies each committed op's QC against. Seeded with the
+        # founding roster at the genesis epoch when the anchor is known.
+        self.rosters: dict[int, list[bytes]] = (
+            {epoch: list(genesis_roster)} if genesis_roster else {}
+        )
         self.active_keyepoch = keyepoch
         self.pver = pver  # ACTIVE fold-semantics version (gates op.pver)
         self.pending_pver = pver  # activates at the next checkpoint barrier (§16)
@@ -226,6 +243,7 @@ class ControlState:
             case control_handler.Roster() as r:
                 self.epoch = r.from_epoch + 1
                 self.roster = list(r.roster)
+                self.rosters[r.from_epoch + 1] = list(r.roster)  # roster-per-epoch (issue #3)
             case control_handler.PverActivate() as p:
                 self.pending_pver = max(self.pending_pver, p.pver)
             case control_handler.EndpointRecord() as e:
@@ -404,11 +422,23 @@ def _authorized_cuts(ops_sorted: list[Op], invalid: set[bytes], genesis: Genesis
     crosses an op that cut does not cover), and the root-only recovery marking
     (`is_recovery`). Stage-order-vs-total-order divergence under a NON-FINAL
     (dishonest) cut is contained, not solved — deterministic for all clients."""
+    return _reduce_control(ops_sorted, invalid, genesis)[1]
+
+
+def _reduce_control(
+    ops_sorted: list[Op], invalid: set[bytes], genesis: Genesis
+) -> tuple[ControlState, list[Heads]]:
+    """The shared control-only reduction: replay control ops in total order against a
+    fresh ControlState, authorization fold-positional, yielding the final state (certs,
+    keyepoch, pver, roster-per-epoch) and the authorized checkpoint cuts. Data-
+    independent (issue #3): both cut-placement and QC-verification roster reconstruction
+    read the same replay, so they agree op-for-op with the main walk's CONTROL verdicts."""
     control = ControlState(
         genesis["manager_pub"],
         genesis.get("epoch", 0),
         genesis.get("keyepoch", 0),
         genesis.get("pver", 0),
+        genesis.get("roster"),
     )
     cuts: list[Heads] = []
     pending_barrier: Heads | None = None  # a recorded cut whose pver activation is due
@@ -431,7 +461,18 @@ def _authorized_cuts(ops_sorted: list[Op], invalid: set[bytes], genesis: Genesis
             cuts.append(body.cut)
             pending_barrier = body.cut  # its barrier activates pending downstream
         control.apply_control(op, body)
-    return cuts
+    return control, cuts
+
+
+def rosters_by_epoch(ops: list[Op], genesis: Genesis) -> dict[int, list[bytes]]:
+    """Reconstruct `epoch -> voting roster` from the held control chain (issue #3):
+    the trust map a client verifies each committed op's QC against. Only AUTHORIZED,
+    signature-valid ROSTER ops count (a compactor-forged roster op is excluded — it has
+    no `MANAGE_ROSTER` cap), so a rogue compactor cannot rewrite roster history. Anchored
+    on the genesis roster in `genesis`; forward-accumulated in total order."""
+    ops_sorted = sorted(ops, key=_total_order_key)
+    invalid = _prevalidate(ops_sorted)
+    return _reduce_control(ops_sorted, invalid, genesis)[0].rosters
 
 
 def fold(
@@ -456,6 +497,7 @@ def fold(
         genesis.get("epoch", 0),
         genesis.get("keyepoch", 0),
         genesis.get("pver", 0),
+        genesis.get("roster"),
     )
     verdicts: dict[bytes, Verdict] = {}
 

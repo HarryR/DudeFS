@@ -5,6 +5,7 @@ import random
 import unittest
 
 from dudefs import artifacts as A
+from dudefs import crypto as C
 from dudefs import fold
 from dudefs.handlers import control as ctl
 from tests._builders import World
@@ -519,6 +520,44 @@ class TestControlReducer(unittest.TestCase):
         for op in cops:
             red2.observe(op)
         self.assertEqual(red.control.certs.keys(), red2.control.certs.keys())
+
+
+class TestRostersByEpoch(unittest.TestCase):
+    """issue #3: roster-per-epoch is the trust map a client verifies committed QCs
+    against. It must fold ONLY authorized, signed ROSTER ops — a rogue compactor cannot
+    author a roster op, so it can never rewrite roster history."""
+
+    def test_folds_authorized_changes_and_excludes_a_compactor_forged_one(self):
+        w = World(seed=31, n_clients=0)
+        node = [C.SIGNER.public(bytes([i] * 32)) for i in (1, 2, 3)]
+        genesis: fold.Genesis = {"manager_pub": w.mgr_pub, "epoch": 0, "roster": node}
+
+        # manager (root) rotates the roster 0 -> 1: authorized.
+        newd = C.SIGNER.public(bytes([4] * 32))
+        new_roster = [node[0], node[1], newd]
+        r_op = w._mgr_op(ctl.roster_body(0, new_roster, {}))
+
+        # a compactor holds only Cap.COMPACT; its roster op (1 -> 2) folds INVALID.
+        csk = bytes([9] * 32)
+        cpub = C.SIGNER.public(csk)
+        w.control_ops.append(w._mgr_op(ctl.cert_issue_body(cpub, [ctl.Cap.COMPACT], 0)))
+        forged = A.Op.build(
+            author_sk=csk,
+            author_pub=cpub,
+            cls_=A.OpClass.CONTROL,
+            seq=0,
+            prev=A.GENESIS_PREV,
+            hlc=w.tick(),
+            deps=[],
+            authz=b"cert",
+            keyepoch=0,
+            payload=ctl.roster_body(1, [cpub, node[0], node[1]], {}),
+        )
+
+        rosters = fold.rosters_by_epoch([*w.control_ops, r_op, forged], genesis)
+        self.assertEqual(rosters[0], node)  # the anchored founding roster
+        self.assertEqual(rosters[1], new_roster)  # the manager-authorized change
+        self.assertNotIn(2, rosters)  # the compactor-forged change was excluded
 
 
 if __name__ == "__main__":

@@ -167,11 +167,15 @@ class NodeDaemon:
 
     def _peer_authorized(self, frm: bytes) -> bool:
         """The peer gate's policy: a current roster node (gossip / ballots), a certed
-        client (writes), or the root manager (control-plane drive). Requester-based —
-        a revoked client / never-member is none of these and is refused."""
+        client (writes), a certed STORE node (a LEARNER catching up read-only before it
+        is promoted into the quorum — issue #2), or the root manager (control-plane drive).
+        Requester-based — a revoked client / never-member is none of these and is refused.
+        A learner's receipts never count (a QC verifies against the roster, which excludes
+        it), so admitting it grants read-only catch-up, not a vote."""
         return (
             frm in self.roster
             or self._authz.is_authorized(frm, ctl.Cap.WRITE)
+            or self._authz.is_authorized(frm, ctl.Cap.STORE)
             or frm == self.manager_pub
         )
 
