@@ -62,15 +62,30 @@ class _Fixture:
             control_ops=w.control_ops,
             epoch=0,
         )
-        self.comp = CompactorDaemon(
-            comp_sk,
+        # the compactor runs on a PERSISTENT store so `restart_compactor` reopens it — the
+        # restart path (in-memory prev lost, reconstructed from disk) is the critical one.
+        self._comp_sk = comp_sk
+        self._addrs = addrs
+        self._comp_store = os.path.join(tmp, "compactor.sqlite")
+        self.comp = self._new_compactor()
+
+    def _new_compactor(self) -> CompactorDaemon:
+        return CompactorDaemon(
+            self._comp_sk,
             self.comp_pub,
             roster=self.roster,
-            roster_addrs=addrs,
-            manager_pub=w.mgr_pub,
-            control_ops=w.control_ops,
+            roster_addrs=self._addrs,
+            manager_pub=self.w.mgr_pub,
+            control_ops=self.w.control_ops,
+            store_path=self._comp_store,
             epoch=0,
         )
+
+    def restart_compactor(self) -> None:
+        """Simulate a compactor restart: tear the daemon down and rebuild it on the SAME
+        durable store — the new instance must reconstruct its incremental prev from disk."""
+        self.comp.close()
+        self.comp = self._new_compactor()
 
     def write(self, slot, guards, muts):
         op = self.client.submit(slot, guards, muts)
@@ -94,6 +109,26 @@ class _Fixture:
                 return tx.get_meta("checkpoint") == ck
 
         return poll_until(done)
+
+    def comp_cut(self) -> dict:
+        with self.comp.store.read_txn() as tx:
+            return dict(tx.cut())
+
+    def full_state_acc(self, cut) -> bytes:
+        """A from-scratch compact at `cut` over the CLIENT's un-GC'd full history — the
+        independent A4 oracle the incremental checkpoint must match."""
+        with self.client.store.read_txn() as tx:
+            ops = [o for o in tx.all_ops() if o.is_control or tx.get_qc(o.op_hash) is not None]
+        below = [o for o in ops if covered(o, cut)]
+        return compactor.compact_genesis(below, self.w.keyring, self.w.genesis, cut).state_acc
+
+    def ckpt_state_acc(self, ck) -> bytes:
+        with self.comp.store.read_txn() as tx:
+            op = tx.get_op(ck)
+        assert op is not None
+        body = ctl.decode(op)
+        assert isinstance(body, ctl.Checkpoint)
+        return body.state_acc
 
     def close(self):
         self.comp.close()
@@ -141,8 +176,11 @@ class TestCompactorDriver(unittest.TestCase):
                 ck1 = fx.compact()
                 self.assertIsNotNone(ck1)
                 self.assertTrue(fx.adopt(ck1))
-                self.assertIsNotNone(fx.comp._prev_cr)  # state carried forward
-                cut1 = dict(fx.comp._prev_cut)
+                with fx.comp.store.read_txn() as tx:
+                    cut1 = dict(
+                        tx.cut()
+                    )  # the compactor adopted its own checkpoint (state persisted)
+                self.assertTrue(cut1)
 
                 # PASS 2 (incremental): supersede k1 (a1 dead) + create k2 in the new band
                 v1 = fx.client.get(b"k1")["version"]  # the a1 op's hash — dead once superseded
@@ -160,22 +198,25 @@ class TestCompactorDriver(unittest.TestCase):
                 self.assertIsNotNone(ck2)
                 assert ck2 is not None  # narrow for the type checker
                 self.assertNotEqual(ck1, ck2)
-                cut2 = dict(fx.comp._prev_cut)
+                with fx.comp.store.read_txn() as tx:
+                    cut2 = dict(tx.cut())
                 self.assertTrue(
                     any(cut2[a][0] > cut1.get(a, (-1, b""))[0] for a in cut2)
                 )  # the cut advanced
 
                 # the INCREMENTAL checkpoint's state_acc must equal a from-scratch compact at
-                # the same cut (A4) — proof the band-only fold is exact, not lossy.
-                with fx.comp.store.read_txn() as tx:
-                    committed = [
+                # the same cut (A4) — proof the band-only fold is exact, not lossy. Baseline
+                # is the CLIENT's UN-GC'd full history (the compactor already GC'd its dead).
+                with fx.client.store.read_txn() as tx:
+                    full_ops = [
                         o for o in tx.all_ops() if o.is_control or tx.get_qc(o.op_hash) is not None
                     ]
+                with fx.comp.store.read_txn() as tx:
                     ck2_op = tx.get_op(ck2)
                 assert ck2_op is not None
                 ck2_body = ctl.decode(ck2_op)
                 full = compactor.compact_genesis(
-                    [o for o in committed if covered(o, cut2)],
+                    [o for o in full_ops if covered(o, cut2)],
                     fx.w.keyring,
                     fx.w.genesis,
                     cut2,
@@ -187,6 +228,100 @@ class TestCompactorDriver(unittest.TestCase):
                 self.assertTrue(fx.adopt(ck2))
                 with fx.nodes[0].store.read_txn() as tx:
                     self.assertIsNone(tx.get_op(v1))  # the superseded a1 op was GC'd
+            finally:
+                fx.close()
+
+
+class TestCompactorRestart(unittest.TestCase):
+    """The DESTRUCTIVE state machine: a compactor's incremental `prev` lives only in its
+    durable store, so every restart transition (in-memory state lost -> reconstructed from
+    disk -> next pass GCs against it) must preserve A4. A wrong reconstruction silently GCs
+    live data, which coverage alone never catches — so each ordering asserts incremental ==
+    full recompute across the restart."""
+
+    def _create(self, fx, key, val):
+        return fx.write(
+            (key, VERSION_ABSENT, 0), [[A.Guard.ABSENT, key]], [[A.Mutation.SET, key, val]]
+        )
+
+    def test_restart_resumes_incremental_not_genesis(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = _Fixture(tmp, seed=43)
+            try:
+                self._create(fx, b"k1", b"a1")
+                ck1 = fx.compact()
+                self.assertIsNotNone(ck1)
+                self.assertTrue(fx.adopt(ck1))
+                cut1 = fx.comp_cut()
+
+                fx.restart_compactor()  # <-- in-memory prev lost; must come back from disk
+                self.assertEqual(fx.comp_cut(), cut1)  # the adopted cut survived the restart
+
+                # new work after the restart -> an incremental pass off the reconstructed prev
+                v1 = fx.client.get(b"k1")["version"]
+                fx.write(
+                    (b"k1", v1, 0),
+                    [[A.Guard.VERSION_EQ, b"k1", v1]],
+                    [[A.Mutation.SET, b"k1", b"a2"]],
+                )
+                self._create(fx, b"k2", b"b1")
+                ck2 = fx.compact()
+                self.assertIsNotNone(ck2)
+                self.assertNotEqual(ck1, ck2)
+                cut2 = fx.comp_cut()
+                self.assertTrue(any(cut2[a][0] > cut1.get(a, (-1, b""))[0] for a in cut2))
+                # A4 across the restart: the post-restart incremental == a full recompute
+                self.assertEqual(fx.ckpt_state_acc(ck2), fx.full_state_acc(cut2))
+                self.assertTrue(fx.adopt(ck2))
+                with fx.nodes[0].store.read_txn() as tx:
+                    self.assertIsNone(tx.get_op(v1))  # the superseded a1 was GC'd
+            finally:
+                fx.close()
+
+    def test_restart_with_no_new_work_is_a_noop(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = _Fixture(tmp, seed=44)
+            try:
+                self._create(fx, b"k", b"v")
+                ck1 = fx.compact()
+                self.assertIsNotNone(ck1)
+                fx.restart_compactor()
+                # nothing new is final since the cut on disk -> the pass must SKIP, not
+                # author an empty checkpoint (else a scheduled `run` churns junk every tick).
+                self.assertIsNone(fx.comp.compact_once())
+            finally:
+                fx.close()
+
+    def test_restart_before_first_checkpoint_does_genesis(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = _Fixture(tmp, seed=45)
+            try:
+                self._create(fx, b"k", b"v")  # committed, but NOT yet compacted
+                fx.restart_compactor()  # store has no cut -> prev is genuinely empty
+                self.assertEqual(fx.comp_cut(), {})
+                ck = fx.compact()  # first checkpoint is authored AFTER the restart
+                self.assertIsNotNone(ck)
+                self.assertEqual(fx.ckpt_state_acc(ck), fx.full_state_acc(fx.comp_cut()))
+                self.assertTrue(fx.adopt(ck))
+            finally:
+                fx.close()
+
+    def test_interleaved_restarts_chain_incremental_checkpoints(self):
+        # write -> compact -> RESTART, repeated: a chain of incremental checkpoints, each of
+        # which must still equal a full recompute at its cut (no drift accumulates).
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = _Fixture(tmp, seed=46)
+            try:
+                last = None
+                for i in range(3):
+                    self._create(fx, f"key{i}".encode(), f"val{i}".encode())
+                    ck = fx.compact()
+                    self.assertIsNotNone(ck, f"pass {i}")
+                    self.assertNotEqual(ck, last)
+                    self.assertEqual(fx.ckpt_state_acc(ck), fx.full_state_acc(fx.comp_cut()))
+                    self.assertTrue(fx.adopt(ck))
+                    last = ck
+                    fx.restart_compactor()  # restart between every pass
             finally:
                 fx.close()
 

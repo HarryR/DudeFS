@@ -17,49 +17,20 @@ from __future__ import annotations
 import threading
 
 from . import artifacts as A
-from . import compactor, transports
+from . import compactor
 from .artifacts import HLC, Op
 from .client import ClientDaemon
 from .handlers import control as ctl
+from .store import ReadTxn, covered
 
 
 class CompactorDaemon(ClientDaemon):
     """A ClientDaemon that also authors checkpoints. Constructed identically (it is
     provisioned the same way — its Cap.COMPACT cert + back-wrapped keys arrive in the
     control chain); `compact_once` / `run` are the compaction surface. It carries the last
-    checkpoint's (retained set + attempts + cut) forward so each pass is INCREMENTAL — cost
-    ∝ the churn since the last cut, never ∝ history (DESIGN §12 rev 6)."""
-
-    def __init__(
-        self,
-        sk: bytes,
-        pub: bytes,
-        *,
-        roster: list[bytes],
-        roster_addrs: list[transports.Endpoint],
-        manager_pub: bytes,
-        control_ops: list[Op] | None = None,
-        store_path: str = ":memory:",
-        epoch: int = 0,
-        keyepoch: int = 0,
-        genesis_roster: list[bytes] | None = None,
-        genesis_epoch: int = 0,
-    ):
-        super().__init__(
-            sk,
-            pub,
-            roster=roster,
-            roster_addrs=roster_addrs,
-            manager_pub=manager_pub,
-            control_ops=control_ops,
-            store_path=store_path,
-            epoch=epoch,
-            keyepoch=keyepoch,
-            genesis_roster=genesis_roster,
-            genesis_epoch=genesis_epoch,
-        )
-        self._prev_cr: compactor.CompactResult | None = None  # last checkpoint's state
-        self._prev_cut: A.Heads = {}  # its cut (distinct from ClientDaemon._prev = chain head)
+    checkpoint's state forward — reconstructed from its OWN adopted store each pass — so each
+    pass is INCREMENTAL and a RESTART resumes incremental rather than re-folding history
+    (cost ∝ churn since the last cut, never ∝ history; DESIGN §12 rev 6)."""
 
     @staticmethod
     def _advances(cut: A.Heads, prev_cut: A.Heads) -> bool:
@@ -114,11 +85,32 @@ class CompactorDaemon(ClientDaemon):
             self._prev = op.op_hash
         return op
 
+    def _prev_state(self, tx: ReadTxn) -> tuple[A.Heads, list[Op], dict[bytes, int]]:
+        """Reconstruct the previous checkpoint's (cut, retained ops, attempts) from the
+        compactor's OWN adopted store — the SINGLE source of truth, so a cold restart resumes
+        incremental instead of re-folding history. After adopt+GC the ops still held below the
+        cut ARE the retained set (winners + masks + control; dead physically gone). Empty when
+        no checkpoint is adopted yet (the genesis pass)."""
+        prev_cut = tx.cut()
+        if not prev_cut:
+            return {}, [], {}
+        retained = [o for o in tx.all_ops() if covered(o, prev_cut)]
+        attempts: dict[bytes, int] = {}
+        h = tx.get_meta("checkpoint")
+        op = tx.get_op(h) if h else None
+        body = ctl.decode(op) if op is not None else None
+        if isinstance(body, ctl.Checkpoint):
+            attempts = compactor.open_attempts(
+                body.attempts, self.keyring[body.keyepoch]["data_key"]
+            )
+        return prev_cut, retained, attempts
+
     def compact_once(self) -> bytes | None:
         """One INCREMENTAL compaction pass. Returns the committed checkpoint's op_hash, or
         None when there is nothing new+final to seal (no quorum floor / no advance since the
         last cut) or the quorum didn't commit. The band `(prev_cut, cut]` is the only work:
-        cost ∝ churn since the last checkpoint, never ∝ history."""
+        cost ∝ churn since the last checkpoint, never ∝ history — and `prev_*` is read from the
+        durable store, so a restart mid-sequence resumes exactly where it left off."""
         self.sync()  # pull the committed log + set the finalized floor F
         with self._lock:
             f = self._final_frontier
@@ -128,27 +120,26 @@ class CompactorDaemon(ClientDaemon):
             committed = [
                 o for o in tx.all_ops() if o.is_control or tx.get_qc(o.op_hash) is not None
             ]
+            prev_cut, prev_retained, prev_attempts = self._prev_state(tx)
         cut = self._cut_at(committed, f)
-        if not cut or not self._advances(cut, self._prev_cut):
+        if not cut or not self._advances(cut, prev_cut):
             return None  # no new sealed work since the last checkpoint
         # incremental: fold the previous retained set + only the newly-committed band. The
         # first pass is the degenerate prev = ∅ (compact filters the tail to `(prev_cut, cut]`).
-        prev = self._prev_cr
         cr = compactor.compact(
-            prev.retained if prev else [],
-            prev.attempts if prev else {},
-            self._prev_cut,
-            committed,
-            self.keyring,
-            self.genesis,
-            cut,
+            prev_retained, prev_attempts, prev_cut, committed, self.keyring, self.genesis, cut
         )
         ckpt = self._author_checkpoint(cr, cut, f)
         qc = self._commit_blind(ckpt)  # SUBMIT to the roster; assemble a QC of blind receipts
         if qc is None:
             return None  # couldn't reach a quorum this pass — retry next
         self._store_qc(qc)  # persist + gossip the commit proof; nodes then adopt
-        self._prev_cr, self._prev_cut = cr, cut  # carry forward for the next incremental pass
+        # adopt into the compactor's OWN store — GC `dead`, persist cut/horizon — so the store
+        # below the cut becomes exactly the retained set and a restart resumes incremental.
+        with self.store.write_txn() as tx:
+            tx.adopt_checkpoint(cut, A.retained_commitment(cr.retained), cr.dead, f)
+            tx.gc_checkpoint(cr.dead)
+            tx.set_meta("checkpoint", ckpt.op_hash)
         return ckpt.op_hash
 
     def run(self, interval_s: float, stop: threading.Event | None = None) -> None:
