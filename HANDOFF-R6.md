@@ -12,9 +12,18 @@
 >
 > **This is a work order, not documentation.** The design is *complete and ruled* — this
 > milestone builds the implementation up to it; it does not reopen the design. Genuine design
-> questions become NOTES items (see §7), never workarounds. The CLI work (originally R5, now
-> parked as **HANDOFF-RX**) follows this milestone — the CLI is a thin shell over already-correct
-> machinery.
+> questions become NOTES items (see §7), never workarounds. The CLI work (originally R5, now the
+> active **[HANDOFF-R7.md](HANDOFF-R7.md)**) follows this milestone — the CLI is a thin shell over
+> already-correct machinery.
+>
+> **STATUS (2026-07-23).** The correctness/bootstrap/finality core is LANDED and green:
+> WP-0, WP-I, WP-A, WP-B, WP-C, WP-D, WP-E (node baseline intake + client baseline pull / #9),
+> WP-F(b) (checkpoint-QC verify) — and the full **client verify-pass** (issue #3): QC-per-epoch
+> against a compactor-unforgeable roster-per-epoch, below-cut author-sig + `state_acc` vouch
+> (this closes #11 and the client half of #5/#9). **Remaining:** WP-F(a) cut-dominance guard (#4),
+> WP-F(c) concurrent-compactor resolution (#6, open decision §7.1), **WP-G the compactor driver**
+> (nothing authors real checkpoints in production yet), WP-H recovery variant (#12), WP-J manager
+> control-plane compaction.
 
 ## 1. Why this is a milestone
 
@@ -195,7 +204,7 @@ it fixes the data race (#3) and makes the store safe for the multi-threaded work
 3. **WP-G** — the compactor driver + daemon. (+ T-E, T-chaos)
 4. **WP-H** — recovery variant. (+ T-G)
 5. **WP-J** — manager control-plane compaction. (+ T-H)
-6. **Then** HANDOFF-RX (the CLI) wraps `compactor run/once` + serve verbs for a real cluster.
+6. **Then** HANDOFF-R7 (the CLI) wraps `compactor run/once` + serve verbs for a real cluster.
 
 ## 7. Open decisions (need a ruling before the relevant WP)
 

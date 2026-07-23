@@ -1,8 +1,16 @@
-# HANDOFF-RX — CLI realisation: namespaces, daemons, worker shortcuts
+# HANDOFF-R7 — CLI realisation: namespaces, daemons, worker shortcuts
 
-> **Parked / interim** (renamed from R5). This CLI milestone follows the compaction milestone
-> ([HANDOFF-R6.md](HANDOFF-R6.md)); it is a thin operator shell over already-correct machinery.
-> "RX" marks it as deferred and likely to split into segmented handoffs as the work proceeds.
+> **Active milestone** (was parked as RX; before that R5). Runs alongside the tail of the
+> compaction milestone ([HANDOFF-R6.md](HANDOFF-R6.md)): Phases 1–4 below are a thin operator
+> shell over already-correct machinery and do **not** depend on the compactor driver, so they
+> proceed now; only the `compactor run/once` + `m log compact` verbs gate on R6's WP-G.
+>
+> **Already landed ahead of this order** (via issues #2/#3, this session): the client group-key
+> path — `ClientDaemon` now DERIVES its keyring from the `WRAP_SET` ops in its held log
+> (`fold.keyring_from_wraps`, finding 21), and `client`/`compactor authorize` back-wrap the full
+> live keyepoch set (issue #2 gap 3) — so **Phase 3's key-fetch bullet + its wrap-at-onboarding
+> prerequisite are DONE**. The peer gate also admits `Cap.STORE` (learner catch-up). What remains
+> is the CLI *shell*: namespaces, `init`/`genesis` minting, the `serve` launchers, and readers.
 
 > **From:** planner (Opus) · **To:** verification / implementer ·
 > **Date:** 2026-07-22 · **Baseline:** `530ad9a` (296 tests green) —
@@ -109,13 +117,12 @@ existing manager/init tests updated to the manager-only genesis shape.
 - **`client serve --dir`:** load `<dir>/client.key`; `ChainStore`; construct `ClientDaemon`;
   wrap in `WorkerServer` on `<dir>/worker.sock` (**unlink stale socket first** — workerapi.py:378
   doesn't). The refresh loop already self-starts.
-- **Client group key via wrap-unwrap (CLI.md §7, finding 21):** change `ClientDaemon` to derive
-  its keyring by finding its own WRAP_SET in the held control ops and calling
-  `control.unwrap_group_key(body, sk)` — instead of taking a plaintext `masters` dict
-  (client.py:212). **Prerequisite:** the manager must *author* a wrap-set at membership time, not
-  only on `rotate` — wire a wrap-set into `m init` (genesis epoch-0 wrap to the founding node)
-  and into `client authorize`/`node genesis` (re-wrap to include the new member). Today only
-  `rotate()` authors wraps (manager.py:299), so a freshly-authorized member has none.
+- **Client group key via wrap-unwrap (CLI.md §7, finding 21): DONE (issue #2 gap 3).**
+  `ClientDaemon` no longer takes a `masters` dict — it derives its keyring from the `WRAP_SET`
+  ops in its held log (`fold.keyring_from_wraps` → `unwrap_group_key`), re-derived after each
+  sync. `client`/`compactor authorize` back-wrap the **full live keyepoch set** to the newcomer
+  (`manager.cert_issue`); nodes are ZK and get none. Only `m init`'s epoch-0 genesis wrap to the
+  founding member remains to wire (currently the founding roster is hand-seeded).
 - **`bootstrap.json`:** emit from `m init`/`m node add` (non-secret projection of `state.json`);
   read in the serve shells. Never carries masters (secret).
 
@@ -166,9 +173,9 @@ green — as the operator shell over the finished mechanism.
 
 1. **Ordering** — the CLI daemon verbs come **after** the compaction milestone (HANDOFF-R6.md).
    Within the CLI work, foundation-first (namespaces → genesis/identity → serve verbs → readers).
-2. **Wrap-set at onboarding (Phase 3)** — to make client key-fetch (B) work, the manager must
-   author a wrap-set at `init`/`authorize`, not only `rotate`. Confirm that's in-scope for
-   Phase 3 (it's required for `client serve` to obtain a key without a manual `rotate`).
+2. **Wrap-set at onboarding (Phase 3) — RESOLVED / DONE (issue #2 gap 3).** `client`/`compactor
+   authorize` back-wrap the full live keyepoch set; the client derives its keyring from the log.
+   Only `m init`'s genesis wrap to the founding member is left to wire (with `node genesis`).
 
 ## Scope note
 Four CLI phases, each a self-contained `make check`-green commit (style/behavior never mixed;
