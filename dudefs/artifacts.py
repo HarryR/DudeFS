@@ -162,6 +162,15 @@ def roster_slot_tag(epoch: int) -> bytes:
     return crypto.h(b"roster" + codec.encode(int(epoch)))
 
 
+def checkpoint_slot_tag(seq: int) -> bytes:
+    """The public slot checkpoint `seq` contends on (WP-F(c)): `h("checkpoint" ‖ seq)`.
+    Like `roster_slot_tag`, keyed by a MONOTONE SEQUENCE — never by the cut/content — so
+    any two compactors racing to be checkpoint `seq` land on the SAME slot and the quorum
+    decrees exactly one, whatever cut it chose in the finality window. Serializes the
+    checkpoint chain through the ordinary ballot machinery; no PRF secrecy (all public)."""
+    return crypto.h(b"checkpoint" + codec.encode(int(seq)))
+
+
 def quorum_size(n: int) -> int:
     """Majority = floor(n/2)+1 = ceil((n+1)/2) (DESIGN §13).
     n=1->1, 3->2, 5->3, 7->4."""

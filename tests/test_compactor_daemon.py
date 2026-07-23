@@ -32,6 +32,13 @@ class _Fixture:
         self.comp_pub = C.SIGNER.public(comp_sk)
         w.control_ops.append(w._mgr_op(ctl.cert_issue_body(self.comp_pub, [ctl.Cap.COMPACT], 0)))
         w.control_ops.append(w._mgr_op(ctl.sealed_wrap_set_body(0, w.masters[0], [self.comp_pub])))
+        # a SECOND, distinct Cap.COMPACT identity — a genuine concurrent/failover compactor
+        # (its own key + chain, so no equivocation) for the divergence-impossibility tests.
+        comp2_sk = bytes([151] * 32)
+        self.comp2_pub = C.SIGNER.public(comp2_sk)
+        w.control_ops.append(w._mgr_op(ctl.cert_issue_body(self.comp2_pub, [ctl.Cap.COMPACT], 0)))
+        w.control_ops.append(w._mgr_op(ctl.sealed_wrap_set_body(0, w.masters[0], [self.comp2_pub])))
+        self._comp2_sk = comp2_sk
         node_sks = [bytes([200 + i] * 32) for i in range(3)]
         self.roster = [C.SIGNER.public(s) for s in node_sks]
         self.paths = [os.path.join(tmp, f"n{i}.sock") for i in range(3)]
@@ -66,6 +73,7 @@ class _Fixture:
         # restart path (in-memory prev lost, reconstructed from disk) is the critical one.
         self._comp_sk = comp_sk
         self._addrs = addrs
+        self._tmp = tmp
         self._comp_store = os.path.join(tmp, "compactor.sqlite")
         self.comp = self._new_compactor()
 
@@ -93,7 +101,23 @@ class _Fixture:
         assert poll_until(lambda: not self.client.status(op).may_flip)  # final
         return op
 
+    def make_comp2(self) -> CompactorDaemon:
+        """A second, distinct-identity compactor on its own durable store (concurrent/failover)."""
+        return CompactorDaemon(
+            self._comp2_sk,
+            self.comp2_pub,
+            roster=self.roster,
+            roster_addrs=self._addrs,
+            manager_pub=self.w.mgr_pub,
+            control_ops=self.w.control_ops,
+            store_path=os.path.join(self._tmp, "compactor2.sqlite"),
+            epoch=0,
+        )
+
     def compact(self, deadline_s: float = 20.0):
+        return self.compact_with(self.comp, deadline_s)
+
+    def compact_with(self, comp, deadline_s: float = 20.0):
         # deadline-based (not a fixed iteration count): on slow CI the pass-N writes' finality
         # can take several rounds to land in the compactor's quorum-floor read. Pump the nodes
         # each round so the cluster stays converged and any frontier read is complete.
@@ -101,7 +125,7 @@ class _Fixture:
         while time.monotonic() < end:
             for nd in self.nodes:
                 nd.sync_once()
-            ck = self.comp.compact_once()
+            ck = comp.compact_once()
             if ck is not None:
                 return ck
             time.sleep(0.2)
@@ -135,6 +159,17 @@ class _Fixture:
         body = ctl.decode(op)
         assert isinstance(body, ctl.Checkpoint)
         return body.state_acc
+
+    def ckpt_seq(self, ck) -> int:
+        """The (sequence, slot binding) of a checkpoint, read from a NODE so it survives a
+        compactor store swap. Asserts the seq binds its slot — the invariant adoption trusts."""
+        with self.nodes[0].store.read_txn() as tx:
+            op = tx.get_op(ck)
+        assert op is not None
+        body = ctl.decode(op)
+        assert isinstance(body, ctl.Checkpoint)
+        assert op.slot_tag == A.checkpoint_slot_tag(body.seq)  # seq is slot-bound
+        return body.seq
 
     def close(self):
         self.comp.close()
@@ -329,6 +364,67 @@ class TestCompactorRestart(unittest.TestCase):
                     last = ck
                     fx.restart_compactor()  # restart between every pass
             finally:
+                fx.close()
+
+
+class TestCheckpointSequencing(unittest.TestCase):
+    """WP-F(c): checkpoints are SLOTTED by a monotone sequence so divergence is impossible by
+    construction — the quorum decrees at most one per seq. Covers the sequence advancing across
+    passes and a FAILOVER successor contending the next uncontended seq (never wedging on a
+    decided one)."""
+
+    def test_checkpoints_carry_a_monotone_bound_sequence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = _Fixture(tmp, seed=48)
+            try:
+                seqs = []
+                for i in range(3):  # three passes, each with new final work -> a new link
+                    key = f"k{i}".encode()
+                    fx.write(
+                        (key, VERSION_ABSENT, 0),
+                        [[A.Guard.ABSENT, key]],
+                        [[A.Mutation.SET, key, b"v"]],
+                    )
+                    ck = fx.compact()
+                    self.assertIsNotNone(ck, f"pass {i}")
+                    self.assertTrue(fx.adopt(ck))
+                    seqs.append(fx.ckpt_seq(ck))  # ckpt_seq also asserts the slot binding
+                self.assertEqual(seqs, [0, 1, 2])  # strictly monotone, gapless
+            finally:
+                fx.close()
+
+    def test_second_compactor_contends_the_next_seq_never_a_decided_one(self):
+        # A SECOND, distinct compactor that never adopted the first's checkpoint must NOT
+        # re-author the seq the quorum already committed — that op would only ever LOSE the
+        # decided slot, wedging it forever. Reading committed checkpoints from the synced log,
+        # it contends the next uncontended seq and makes progress. This is the failover/
+        # concurrent case that proves one-checkpoint-per-seq holds across compactors.
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = _Fixture(tmp, seed=49)
+            comp2 = fx.make_comp2()
+            try:
+                fx.write(
+                    (b"k0", VERSION_ABSENT, 0),
+                    [[A.Guard.ABSENT, b"k0"]],
+                    [[A.Mutation.SET, b"k0", b"v"]],
+                )
+                ck0 = fx.compact()  # compactor A commits seq 0
+                self.assertIsNotNone(ck0)
+                self.assertEqual(fx.ckpt_seq(ck0), 0)
+                self.assertTrue(fx.adopt(ck0))
+
+                fx.write(
+                    (b"k1", VERSION_ABSENT, 0),
+                    [[A.Guard.ABSENT, b"k1"]],
+                    [[A.Mutation.SET, b"k1", b"v"]],
+                )  # new final work so there is a dominating cut to seal at seq 1
+                ck1 = fx.compact_with(comp2)  # compactor B, never adopted seq 0
+                self.assertIsNotNone(ck1)
+                self.assertNotEqual(ck0, ck1)
+                self.assertEqual(fx.ckpt_seq(ck1), 1)  # contended seq 1, not re-tried seq 0
+                self.assertTrue(fx.adopt(ck1))
+            finally:
+                comp2.close()
                 fx.close()
 
 

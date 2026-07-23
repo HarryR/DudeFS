@@ -467,10 +467,13 @@ class TestDaemonAdoption(unittest.TestCase):
 
 
 class TestAdoptionValidityGate(unittest.TestCase):
-    """WP-F(a) / #4: adoption refuses a checkpoint that would REGRESS the cut or horizon —
-    both are irreversible (destructive GC, monotone void-rule horizon), so a non-dominating
-    checkpoint is impossible-by-definition. Two INDEPENDENT keys (no supersession -> the first
-    checkpoint GCs nothing), so the losing checkpoint's baseline still verifies and it is the
+    """WP-F(a) / #4: within the checkpoint chain, adoption refuses a NEXT-seq checkpoint that
+    would REGRESS the cut or horizon — both are irreversible (destructive GC, monotone void-
+    rule horizon), so a non-dominating link is impossible-by-definition. The sequence-slot
+    (WP-F(c)) already forbids two checkpoints at the SAME seq; this dominance gate is the
+    safety net against a chained link (seq+1) whose cut/horizon walks back — e.g. an adversary
+    who won slot seq+1 with a regressing cut. Two INDEPENDENT keys (no supersession -> the
+    first checkpoint GCs nothing), so the refused link's baseline still verifies and it is the
     DOMINANCE gate — not a missing-baseline defer — that refuses it."""
 
     def _setup(self, seed):
@@ -506,7 +509,10 @@ class TestAdoptionValidityGate(unittest.TestCase):
                 tx.append(o)
         return w, d, roster, full, cut_big, cut_small, covered, fold
 
-    def _adopt(self, d, w, roster, full, cut, horizon, covered):
+    def _present(self, d, w, roster, full, cut, horizon, covered, seq, slot_seq=None):
+        """Author a committed checkpoint at `seq` and land it (op + verified QC) in d's store
+        WITHOUT triggering adoption — the caller drives adopt_committed_checkpoints itself so
+        it can control the ORDER seqs arrive in (sequential-catch-up tests)."""
         from dudefs import compactor
 
         below = [o for o in full if covered(o, cut)]
@@ -517,6 +523,8 @@ class TestAdoptionValidityGate(unittest.TestCase):
             dead=cr.dead,
             retained=A.retained_commitment(cr.retained),
             horizon=horizon,
+            seq=seq,
+            slot_seq=slot_seq,
         )
         sks = [bytes([200 + i] * 32) for i in range(3)]
         recs = [
@@ -526,19 +534,23 @@ class TestAdoptionValidityGate(unittest.TestCase):
         with d.store.write_txn() as tx:
             tx.append(ckpt)
             tx.put_qc(A.QC.assemble(recs, 3, {p: i for i, p in enumerate(roster)}))
+        return ckpt
+
+    def _adopt(self, d, w, roster, full, cut, horizon, covered, seq):
+        ckpt = self._present(d, w, roster, full, cut, horizon, covered, seq)
         d.adopt_committed_checkpoints()
         return ckpt
 
     def test_regressing_cut_is_refused(self):
         w, d, roster, full, cut_big, cut_small, covered, _ = self._setup(50)
         try:
-            big = self._adopt(d, w, roster, full, cut_big, A.HLC(500, 0), covered)
+            big = self._adopt(d, w, roster, full, cut_big, A.HLC(500, 0), covered, seq=0)
             with d.store.read_txn() as tx:
                 self.assertEqual(tx.get_meta("checkpoint"), big.op_hash)  # adopted
-            # a checkpoint at the SMALLER cut (client seq 0 < 1), authored later so its hlc is
-            # HIGHER — adoption would otherwise prefer it. Its baseline verifies (nothing GC'd),
-            # so only the dominance gate can refuse it.
-            small = self._adopt(d, w, roster, full, cut_small, A.HLC(500, 0), covered)
+            # the NEXT link (seq 1) sits on the SMALLER cut (client seq 0 < 1) — it won its
+            # slot but its cut regresses. Its baseline verifies (nothing GC'd), so only the
+            # dominance gate can refuse it (not the sequence gate — seq 1 IS next).
+            small = self._adopt(d, w, roster, full, cut_small, A.HLC(500, 0), covered, seq=1)
             with d.store.read_txn() as tx:
                 self.assertEqual(tx.get_meta("checkpoint"), big.op_hash)  # STILL big
                 self.assertEqual(dict(tx.cut()), cut_big)  # the cut did not regress
@@ -550,13 +562,13 @@ class TestAdoptionValidityGate(unittest.TestCase):
     def test_regressing_horizon_is_refused(self):
         w, d, roster, full, cut_big, _cut_small, covered, _ = self._setup(51)
         try:
-            hi = self._adopt(d, w, roster, full, cut_big, A.HLC(1000, 0), covered)
+            hi = self._adopt(d, w, roster, full, cut_big, A.HLC(1000, 0), covered, seq=0)
             with d.store.read_txn() as tx:
                 self.assertEqual(tx.get_meta("checkpoint"), hi.op_hash)
                 self.assertEqual(tx.get_horizon(), A.HLC(1000, 0))
-            # SAME cut (so it dominates) but a LOWER horizon, higher hlc -> refused: the
-            # void-rule horizon is monotone and must never walk back.
-            self._adopt(d, w, roster, full, cut_big, A.HLC(500, 0), covered)
+            # the NEXT link (seq 1) at the SAME cut (so it dominates) but a LOWER horizon ->
+            # refused: the void-rule horizon is monotone and must never walk back.
+            self._adopt(d, w, roster, full, cut_big, A.HLC(500, 0), covered, seq=1)
             with d.store.read_txn() as tx:
                 self.assertEqual(tx.get_meta("checkpoint"), hi.op_hash)  # unchanged
                 self.assertEqual(tx.get_horizon(), A.HLC(1000, 0))  # horizon did not regress
@@ -567,16 +579,52 @@ class TestAdoptionValidityGate(unittest.TestCase):
         w, d, roster, full, cut_big, cut_small, covered, _ = self._setup(52)
         try:
             self._adopt(
-                d, w, roster, full, cut_small, A.HLC(500, 0), covered
-            )  # adopt the small cut
+                d, w, roster, full, cut_small, A.HLC(500, 0), covered, seq=0
+            )  # adopt the small cut (seq 0)
             big = self._adopt(
-                d, w, roster, full, cut_big, A.HLC(500, 0), covered
-            )  # dominates -> adopt
+                d, w, roster, full, cut_big, A.HLC(500, 0), covered, seq=1
+            )  # seq 1 dominates -> adopt
             with d.store.read_txn() as tx:
                 self.assertEqual(
                     tx.get_meta("checkpoint"), big.op_hash
                 )  # advanced to the bigger cut
                 self.assertEqual(dict(tx.cut()), cut_big)
+        finally:
+            d.close()
+
+    def test_missing_middle_seq_blocks_then_catches_up(self):
+        # finding #10 / WP-F(c): checkpoints CHAIN (each seq's `dead` is the incremental band
+        # since the last), so a node must never skip a seq. A seq-1 checkpoint that arrives
+        # BEFORE seq 0 must STALL (the sequence gate refuses it); once seq 0 lands the node
+        # catches up 0 THEN 1 in a single pass (the adoption while-loop).
+        w, d, roster, full, cut_big, cut_small, covered, _ = self._setup(53)
+        try:
+            ck1 = self._present(d, w, roster, full, cut_big, A.HLC(500, 0), covered, seq=1)
+            d.adopt_committed_checkpoints()
+            with d.store.read_txn() as tx:
+                self.assertIsNone(tx.get_meta("checkpoint"))  # seq 1 alone -> stalled
+            self._present(d, w, roster, full, cut_small, A.HLC(500, 0), covered, seq=0)
+            d.adopt_committed_checkpoints()
+            with d.store.read_txn() as tx:
+                self.assertEqual(tx.get_meta("checkpoint"), ck1.op_hash)  # chained 0 -> 1
+                self.assertEqual(dict(tx.cut()), cut_big)  # caught all the way up, not stuck
+        finally:
+            d.close()
+
+    def test_seq_slot_binding_is_enforced(self):
+        # a checkpoint that CLAIMS seq 0 but was committed on a DIFFERENT slot (slot_seq=5) is
+        # refused — the declared seq must bind the slot it actually won, else an adversary who
+        # won some slot could relabel it to jump the chain. The correctly-bound seq 0 adopts.
+        w, d, roster, full, _cut_big, cut_small, covered, _ = self._setup(54)
+        try:
+            self._present(d, w, roster, full, cut_small, A.HLC(500, 0), covered, seq=0, slot_seq=5)
+            d.adopt_committed_checkpoints()
+            with d.store.read_txn() as tx:
+                self.assertIsNone(tx.get_meta("checkpoint"))  # seq/slot mismatch -> refused
+            ck0 = self._present(d, w, roster, full, cut_small, A.HLC(500, 0), covered, seq=0)
+            d.adopt_committed_checkpoints()
+            with d.store.read_txn() as tx:
+                self.assertEqual(tx.get_meta("checkpoint"), ck0.op_hash)  # bound seq 0 adopts
         finally:
             d.close()
 

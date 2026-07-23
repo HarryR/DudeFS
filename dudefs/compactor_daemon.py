@@ -1,16 +1,18 @@
 # The compactor DRIVER (R6 WP-G / DESIGN §12). A compactor is a key-holding node-adjacent
 # party — a gossip-synced replica that authors real checkpoints. It reuses the ClientDaemon
-# machinery it shares (quorum sync, keyring-from-wraps, blind-commit of a slotless op, its
-# own authored chain) and adds the compaction pass on top:
+# machinery it shares (quorum sync, keyring-from-wraps, its own authored chain) and adds the
+# compaction pass on top:
 #
 #   sync the committed log -> pick a FINAL cut (F = the quorum-attested floor) -> compact()
-#   -> author a Cap.COMPACT checkpoint op on its own chain -> blind-commit it to a node
-#   quorum -> gossip op + QC; the nodes adopt via adopt_committed_checkpoints (horizon
-#   advances, `dead` GC'd).
+#   -> author a Cap.COMPACT checkpoint op on its own chain at the next SEQUENCE -> commit it
+#   to a node quorum on the checkpoint slot -> gossip op + QC; the nodes adopt in sequence via
+#   adopt_committed_checkpoints (horizon advances, `dead` GC'd).
 #
-# A checkpoint carries no slot, so it commits on the same slotless path a blind PUT uses.
-# Cap.COMPACT authorizes ONLY the checkpoint kind, so a rogue compactor can propose junk a
-# quorum won't commit and censor — never alter the control hierarchy (issues #2/#3).
+# A checkpoint is SLOTTED by a monotone sequence (`checkpoint_slot_tag(seq)`, WP-F(c)): the
+# quorum decrees at most ONE checkpoint per seq, so concurrent compactors cannot commit
+# diverging cuts — divergence is impossible by construction, not a one-honest-compactor
+# assumption. Cap.COMPACT authorizes ONLY the checkpoint kind, so a rogue compactor can
+# propose junk a quorum won't adopt and censor — never alter the control hierarchy (#2/#3).
 
 from __future__ import annotations
 
@@ -19,8 +21,10 @@ import threading
 from . import artifacts as A
 from . import compactor
 from .artifacts import HLC, Op
-from .client import ClientDaemon
+from .client import ClientDaemon, _drive
+from .daemon import _cut_dominates
 from .handlers import control as ctl
+from .quorum import Commit, Committed
 from .store import ReadTxn, covered
 
 
@@ -52,10 +56,42 @@ class CompactorDaemon(ClientDaemon):
                     cut[o.author] = (o.seq, o.op_hash)
         return cut
 
-    def _author_checkpoint(self, cr: compactor.CompactResult, cut: A.Heads, horizon: HLC) -> Op:
+    def _committed_frontier(self, tx: ReadTxn) -> tuple[int, A.Heads]:
+        """The checkpoint-chain head the QUORUM has decided: (next seq to contend, the latest
+        committed checkpoint's cut). Reading committed checkpoints from the synced log — not
+        just my own adopted meta — means a compactor that LOST a slot or is a concurrent/
+        failover peer contends the next UNCONTENDED seq instead of wedging forever on one a
+        rival already decided, and extends the decided CUT rather than a stale local one. Only
+        slot-BOUND checkpoints count (slot_tag == the seq's tag), exactly as adoption enforces,
+        so a mismatched seq claim can neither force a skip nor move the frontier."""
+        best_seq = -1
+        best_cut: A.Heads = {}
+        h = tx.get_meta("checkpoint")
+        own = tx.get_op(h) if h else None
+        own_body = ctl.decode(own) if own is not None else None
+        if isinstance(own_body, ctl.Checkpoint):  # my adopted head (its QC may be GC'd)
+            best_seq, best_cut = own_body.seq, own_body.cut
+        for op in tx.all_ops():
+            if not op.is_control:
+                continue
+            body = ctl.decode(op)
+            if not isinstance(body, ctl.Checkpoint):
+                continue
+            if tx.get_qc(op.op_hash) is None:  # only a COMMITTED checkpoint decides a seq
+                continue
+            if op.slot_tag != A.checkpoint_slot_tag(body.seq):  # seq must bind its slot
+                continue
+            if body.seq > best_seq:
+                best_seq, best_cut = body.seq, body.cut
+        return best_seq + 1, best_cut
+
+    def _author_checkpoint(
+        self, cr: compactor.CompactResult, cut: A.Heads, horizon: HLC, seq: int
+    ) -> Op:
         """Author the Cap.COMPACT checkpoint op on the compactor's OWN chain (its cert
-        authorizes the CHECKPOINT kind). The `attempts` sidecar is sealed under the group
-        key; everything else is the plaintext structural manifest ZK nodes read."""
+        authorizes the CHECKPOINT kind), carrying `seq` and sitting on the PUBLIC slot
+        `checkpoint_slot_tag(seq)` so the quorum serializes it (WP-F(c)). The `attempts`
+        sidecar is sealed under the group key; everything else is the plaintext manifest."""
         dk = self.keyring[self.keyepoch]["data_key"]
         body = ctl.checkpoint_body(
             cut,
@@ -65,6 +101,7 @@ class CompactorDaemon(ClientDaemon):
             compactor.seal_attempts(cr.attempts, dk),
             self.keyepoch,
             horizon,
+            seq,
         )
         with self._lock:
             op = A.Op.build(
@@ -78,6 +115,7 @@ class CompactorDaemon(ClientDaemon):
                 authz=b"cert",
                 keyepoch=self.keyepoch,
                 payload=body,
+                slot_tag=A.checkpoint_slot_tag(seq),
             )
             with self.store.write_txn() as tx:
                 tx.put_op_raw(op)
@@ -121,19 +159,30 @@ class CompactorDaemon(ClientDaemon):
                 o for o in tx.all_ops() if o.is_control or tx.get_qc(o.op_hash) is not None
             ]
             prev_cut, prev_retained, prev_attempts = self._prev_state(tx)
+            seq, committed_cut = self._committed_frontier(tx)
         cut = self._cut_at(committed, f)
         if not cut or not self._advances(cut, prev_cut):
             return None  # no new sealed work since the last checkpoint
+        # never author a link that REGRESSES the decided chain head: if my finality F lags the
+        # latest committed checkpoint's cut, my cut would not dominate it and the nodes would
+        # reject it (WP-F(a) gate) — decided-but-unadoptable = a WEDGE. Skip and retry once my
+        # floor catches up, so a lagging concurrent compactor waits rather than wedges.
+        if not _cut_dominates(cut, committed_cut):
+            return None
         # incremental: fold the previous retained set + only the newly-committed band. The
         # first pass is the degenerate prev = ∅ (compact filters the tail to `(prev_cut, cut]`).
         cr = compactor.compact(
             prev_retained, prev_attempts, prev_cut, committed, self.keyring, self.genesis, cut
         )
-        ckpt = self._author_checkpoint(cr, cut, f)
-        qc = self._commit_blind(ckpt)  # SUBMIT to the roster; assemble a QC of blind receipts
-        if qc is None:
-            return None  # couldn't reach a quorum this pass — retry next
-        self._store_qc(qc)  # persist + gossip the commit proof; nodes then adopt
+        ckpt = self._author_checkpoint(cr, cut, f, seq)
+        # SLOTTED commit (WP-F(c)): PREPARE/ACCEPT on checkpoint_slot_tag(seq) — the quorum
+        # decrees at most ONE checkpoint per seq, so concurrent compactors cannot diverge. A
+        # rival that won the slot -> LostSlot; the next pass retries at the tip. Divergence is
+        # impossible by construction, no longer a one-honest-compactor assumption.
+        outcome = _drive(Commit(self.cfg, ckpt), self._rpc, stop=self._closing)
+        if not isinstance(outcome, Committed):
+            return None  # lost the slot / unreachable — retry next pass
+        self._store_qc(outcome.qc)  # persist + gossip the commit proof; nodes then adopt
         # adopt into the compactor's OWN store — GC `dead`, persist cut/horizon — so the store
         # below the cut becomes exactly the retained set and a restart resumes incremental.
         with self.store.write_txn() as tx:

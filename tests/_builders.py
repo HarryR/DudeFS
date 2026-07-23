@@ -148,7 +148,7 @@ class World:
         return A.HLC(self._hlc, 0)
 
     # ---- manager (control) ops ------------------------------------------- #
-    def _mgr_op(self, payload: bytes, keyepoch: int = 0) -> A.Op:
+    def _mgr_op(self, payload: bytes, keyepoch: int = 0, slot_tag: bytes | None = None) -> A.Op:
         op = A.Op.build(
             author_sk=self.mgr_sk,
             author_pub=self.mgr_pub,
@@ -160,6 +160,7 @@ class World:
             authz=b"root",
             keyepoch=keyepoch,
             payload=payload,
+            slot_tag=slot_tag,
         )
         self._mseq += 1
         self._mprev = op.op_hash
@@ -184,7 +185,11 @@ class World:
         attempts: bytes = b"",
         keyepoch: int = 0,
         horizon: A.HLC | None = None,
+        seq: int = 0,
+        slot_seq: int | None = None,
     ) -> A.Op:
+        # slot_seq defaults to seq (the correct binding); a test may set it apart to forge a
+        # seq/slot MISMATCH — an op that claims one sequence but contends another's slot.
         op = self._mgr_op(
             ctl.checkpoint_body(
                 cut or {},
@@ -194,7 +199,9 @@ class World:
                 attempts,
                 keyepoch,
                 horizon or A.HLC(0, 0),
-            )
+                seq,
+            ),
+            slot_tag=A.checkpoint_slot_tag(seq if slot_seq is None else slot_seq),
         )
         self.control_ops.append(op)
         return op

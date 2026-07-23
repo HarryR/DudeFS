@@ -22,10 +22,14 @@
 > sync → final cut → author Cap.COMPACT checkpoint → commit → nodes adopt), now **INCREMENTAL**
 > (band-only, == full recompute A4) with **durable restart-persistence** (adopts its own
 > checkpoint: GC + persist cut/horizon; reconstructs prev from the store; state-machine tested
-> across restart orderings). **WP-G uses the BLIND commit path — safe only under one honest
-> compactor; WP-F(c) replaces it with sequence-slotting.** **Remaining:** **WP-F** — checkpoints
-> as quorum-consensus ops: (a) adoption validity gate [DONE — cut+horizon dominance], (c) sequence-slotting
-> [RULED §7.1]; WP-H recovery variant (#12); WP-J manager control-plane compaction.
+> across restart orderings). **WP-F COMPLETE — checkpoints are now quorum-consensus ops:**
+> (a) adoption **validity gate** [cut+horizon dominance] and (c) **sequence-slotting** [DONE]:
+> each checkpoint carries a monotone `seq`, is committed on the slotted `Commit` path at
+> `checkpoint_slot_tag(seq)` (the blind path is gone), the declared seq **binds** its slot at
+> adoption, and nodes adopt **strictly in sequence** (chained catch-up, fixes finding #10). The
+> quorum decrees at most ONE checkpoint per seq ⇒ **divergence is impossible by construction**;
+> a lagging concurrent compactor **skips rather than wedges** (won't author a cut that fails the
+> dominance gate). **Remaining:** WP-H recovery variant (#12); WP-J manager control-plane compaction.
 
 ## 1. Why this is a milestone
 
@@ -145,7 +149,7 @@ the **daemon path** before the driver that would exercise them in anger. WP-0 an
 **Concurrency control** — compaction-logic only (Findings 4,5,6). *The connection/lock/transaction
 model and the data race (#3) are fixed in **HANDOFF-R5** (storage foundation), which this milestone
 sits on; the guards below run inside R5's per-connection write transactions.*
-- **WP-F — Checkpoints are quorum-consensus operations (Findings 4,5,6). RULED (see §7.1).**
+- **WP-F — Checkpoints are quorum-consensus operations (Findings 4,5,6). DONE (a)+(b)+(c).**
   A checkpoint is a link in a chain: checkpoint `k+1` advances *from* `k` (its cut dominates,
   its retained set carries `k`'s forward). Treat it exactly like a CAS / a roster change —
   the quorum decrees **one per sequence number**, and only a *valid* advance is adopted. This
@@ -184,25 +188,31 @@ sits on; the guards below run inside R5's per-connection write transactions.*
   - **(b) Verify the checkpoint QC — DONE** (WP-F(b), landed): `qc.config_epoch == epoch and
     qc.verify(roster)` at adoption (daemon.py) + the client verify-pass (issue #3).
 
-  **Staged (fewest footguns, trending valid-by-construction):**
-  1. **Now — the adoption validity gate (a).** Pure ADD in `adopt_committed_checkpoints`: reject
-     a checkpoint whose cut doesn't dominate the adopted cut. No wire change, no new verb, no
-     commit-path change. Kills the *regression* footgun (the un-GC/rollback case) and is correct
-     under the current one-honest-compactor assumption. Cheap, safe, immediately better.
-  2. **Then — sequence-slotting (c).** `seq` field (wire golden drift) + `checkpoint_slot_tag`
-     + switch `compact_once` to slotted `Commit` + chain-aware adoption. Removes the
-     one-compactor assumption; makes divergence impossible by construction.
+  **Staged (fewest footguns, trending valid-by-construction) — BOTH LANDED:**
+  1. **Adoption validity gate (a) — LANDED.** `adopt_committed_checkpoints` rejects a checkpoint
+     whose cut doesn't per-author dominate the adopted cut, or whose horizon regresses.
+  2. **Sequence-slotting (c) — LANDED.** `seq` field in the checkpoint body + `checkpoint_slot_tag`;
+     `compact_once` targets the quorum-committed frontier `seq+1` and drives the slotted `Commit`
+     (blind path gone); adoption is **strictly sequential** (`seq == adopted+1`, chained catch-up
+     — fixes finding #10) and **binds** the declared seq to its slot (`slot_tag ==
+     checkpoint_slot_tag(seq)`, no seq-jump). Anti-wedge: a compactor won't author a link whose
+     cut fails the dominance gate — a lagging concurrent compactor **skips and retries**, never
+     wedges the chain with a decided-but-unadoptable checkpoint. Divergence impossible by
+     construction. Tests: `test_daemon.TestAdoptionValidityGate` (dominance, sequential catch-up,
+     seq/slot binding), `test_compactor_daemon.TestCheckpointSequencing` (monotone bound seq,
+     second-compactor contends next seq). **RESIDUAL:** a TRULY concurrent multi-compactor
+     deployment is serialized safely but the loser wastes a pass; the model is single-compactor
+     (or manager-run, WP-J) — file an issue if concurrent compaction becomes a real deployment.
 
-  Files: `dudefs/daemon.py`, `dudefs/store.py`, `dudefs/handlers/control.py` (seq field + tag),
-  `dudefs/compactor_daemon.py` (target `seq+1`, slotted commit).
+  Files (landed): `dudefs/daemon.py`, `dudefs/handlers/control.py` (seq field), `dudefs/artifacts.py`
+  (`checkpoint_slot_tag`), `dudefs/compactor_daemon.py` (`_committed_frontier`, slotted commit).
 
 **The driver**
-- **WP-G — Compactor identity + author + commit + daemon. DONE (blind path).** Cap.COMPACT-signed
+- **WP-G — Compactor identity + author + commit + daemon. DONE.** Cap.COMPACT-signed
   checkpoint on the compactor's own chain; cut selector (F = quorum floor, `cut ≤ F` — W retired,
   ACCUMULATOR §2/DESIGN §12); `compactor run` (continuous) / `once`; keys via wrap-unwrap;
-  INCREMENTAL + durable restart-persistence. **NOTE:** commit is `_commit_blind` (slotless) — the
-  one-honest-compactor shortcut; **WP-F(c) replaces it with the sequence-slotted `Commit`.** Files:
-  `dudefs/compactor_daemon.py`.
+  INCREMENTAL + durable restart-persistence. Commit is now the **sequence-slotted `Commit`**
+  (WP-F(c) landed; the blind shortcut is gone). Files: `dudefs/compactor_daemon.py`.
 
 **Recovery variant** (Finding 12)
 - **WP-H — Recovery checkpoint carries a real manifest and is adopted.** Author the recovery

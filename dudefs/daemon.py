@@ -17,7 +17,7 @@ from dataclasses import dataclass
 
 from . import codec, gossip, lmsg, transports, tunables, wire
 from .acceptor import Acceptor, Rejected, RejectReason
-from .artifacts import Op, Watermark, quorum_size
+from .artifacts import Op, Watermark, checkpoint_slot_tag, quorum_size
 from .fold import ControlReducer, ControlState, endpoints_of
 from .gossip import Delta
 from .handlers import control as ctl
@@ -282,74 +282,96 @@ class NodeDaemon:
 
     # ---- checkpoint adoption pipeline (WP1.3) ------------------------------ #
     def adopt_committed_checkpoints(self) -> None:
-        """On holding a quorum-committed, AUTHORIZED checkpoint whose retained
-        digests my baseline satisfies: adopt the cut, advance the horizon to its F,
-        and lazily GC. Skipped until I hold the full below-cut baseline (verify_
-        baseline non-empty means gaps — defer, a later gossip round fills them)."""
-        reducer = ControlReducer(self.manager_pub, self.acc.epoch)
-        # scan + pick + baseline-check in ONE read snapshot
-        with self.store.read_txn() as tx:
-            all_ops = tx.all_ops()
-            cur_cut = tx.cut()  # the checkpoint I've already adopted (empty before the first)
-            cur_horizon = tx.get_horizon()
-            for op in sorted(all_ops, key=lambda o: (o.hlc.as_tuple(), o.op_hash)):
-                if op.is_control:
-                    reducer.observe(op)  # authorization state up to here
-            best: tuple[Op, ctl.Checkpoint] | None = None
-            for op in all_ops:
-                body = ctl.decode(op) if op.is_control else None
-                if not isinstance(body, ctl.Checkpoint):
-                    continue
-                qc = tx.get_qc(op.op_hash)
-                if qc is None:  # not quorum-committed
-                    continue
-                # VERIFY the QC, don't just note its presence (WP-F(b), finding #5):
-                # put_qc stores whatever is gossiped in, so a forged / sub-quorum /
-                # wrong-epoch QC would otherwise drive a GC on a lie. Mirror the roster
-                # path — a MAJORITY of THIS epoch's roster must have signed it.
-                if qc.config_epoch != self.acc.epoch or not qc.verify(self.roster):
-                    continue
-                if not reducer.control.can_author_control(op.author, ctl.ControlKind.CHECKPOINT):
-                    continue  # unauthorized minter — never adopt
-                # WP-D — horizon covers the cut (finding #8): the horizon is F, the
-                # finality frontier the cut was sealed at, so EVERY op the checkpoint
-                # compacts (≤ cut) must sit at/below it. A cut reaching above its horizon
-                # would seal a not-yet-final op — GC + bootstrap would then diverge from a
-                # full fold. Structural (hlc is cleartext), so a ZK node enforces it. No
-                # cut-lag margin: the horizon is exactly F, not F − W (W is vestigial —
-                # the audit is deterministic recomputation, not a timed race).
-                if any(covered(o, body.cut) and o.hlc > body.horizon for o in all_ops):
-                    continue
-                # WP-F(a) / #4 — never adopt a checkpoint that would REGRESS what I hold: GC
-                # past a cut and the monotone horizon are both irreversible, so a cut that
-                # does not per-author dominate my adopted cut, or a lower horizon, is impossible
-                # by definition — refuse it (a later valid checkpoint supersedes). Divergence
-                # on INCOMPARABLE cuts (concurrent compactors) is the sequence-slot's job
-                # (WP-F(c)); this closes the regression case.
-                if body.horizon.as_tuple() < cur_horizon.as_tuple() or not _cut_dominates(
-                    body.cut, cur_cut
-                ):
-                    continue
-                if best is None or op.hlc > best[0].hlc:
-                    best = (op, body)
-            if best is None:
-                return
-            op, ckpt = best
-            if tx.get_meta("checkpoint") == op.op_hash:
-                return  # already adopted this one
-            # only adopt once my below-cut baseline satisfies the signed retained
-            # digests — projected over the CHECKPOINT's dead (not the store's empty one).
-            if gossip.verify_baseline(tx, ckpt.cut, ckpt.retained, frozenset(ckpt.dead)):
-                return  # missing baseline — defer to a later round
-        # adopt + GC + pin the active checkpoint in ONE write transaction (finding 19):
-        # cut/retained/dead/horizon must survive crash-restart together, and the GC of
-        # `dead` must not be observable without the cut that vouches for it.
-        with self.store.write_txn() as tx:
-            tx.adopt_checkpoint(ckpt.cut, ckpt.retained, ckpt.dead, ckpt.horizon)
-            tx.gc_checkpoint(ckpt.dead)
-            tx.set_meta("checkpoint", op.op_hash)
-        # adopt_checkpoint persisted the horizon (finding 19); the guards read it
-        # transactionally, so there is no in-memory horizon to advance here.
+        """Adopt quorum-committed, AUTHORIZED checkpoints STRICTLY IN SEQUENCE (WP-F(c)):
+        each pass adopts the checkpoint at seq = adopted+1 — advancing the cut, raising the
+        horizon to its F, lazily GC-ing `dead`. Checkpoints CHAIN: seq N's `dead` is the
+        incremental band since N-1, so a node must never skip a seq (finding #10) — the
+        sequence-slot decrees exactly one checkpoint per seq, and I walk them one at a time.
+        A lagging node catches up seq-by-seq: the while-loop chains within this pass, and any
+        remaining gap fills over later gossip rounds. Deferred while my below-cut baseline has
+        gaps (verify_baseline non-empty — a later round supplies the missing digests)."""
+        while True:
+            reducer = ControlReducer(self.manager_pub, self.acc.epoch)
+            # scan + pick + baseline-check for the NEXT seq in ONE read snapshot
+            with self.store.read_txn() as tx:
+                all_ops = tx.all_ops()
+                cur_cut = tx.cut()  # the checkpoint I've adopted (empty before the first)
+                cur_horizon = tx.get_horizon()
+                adopted = tx.get_meta("checkpoint")
+                next_seq = 0
+                if adopted is not None:  # chain from the seq I last adopted
+                    cur = tx.get_op(adopted)
+                    cur_body = ctl.decode(cur) if cur is not None else None
+                    next_seq = cur_body.seq + 1 if isinstance(cur_body, ctl.Checkpoint) else 0
+                for op in sorted(all_ops, key=lambda o: (o.hlc.as_tuple(), o.op_hash)):
+                    if op.is_control:
+                        reducer.observe(op)  # authorization state up to here
+                picked: tuple[Op, ctl.Checkpoint] | None = None
+                for op in all_ops:
+                    body = ctl.decode(op) if op.is_control else None
+                    if not isinstance(body, ctl.Checkpoint):
+                        continue
+                    # SEQUENCE gate — adopt strictly the next link in the chain. Skipping a
+                    # seq would apply an incremental `dead` band whose predecessor I never
+                    # adopted (finding #10); the slot guarantees at most one per seq.
+                    if body.seq != next_seq:
+                        continue
+                    # BIND the declared seq to the slot the op actually won: without this an
+                    # adversary could win slot-0 yet claim seq=5 in the body, jumping the chain.
+                    # The slot decrees one-per-seq only if body.seq == the contended slot.
+                    if op.slot_tag != checkpoint_slot_tag(body.seq):
+                        continue
+                    qc = tx.get_qc(op.op_hash)
+                    if qc is None:  # not quorum-committed
+                        continue
+                    # VERIFY the QC, don't just note its presence (WP-F(b), finding #5):
+                    # put_qc stores whatever is gossiped in, so a forged / sub-quorum /
+                    # wrong-epoch QC would otherwise drive a GC on a lie. Mirror the roster
+                    # path — a MAJORITY of THIS epoch's roster must have signed it.
+                    if qc.config_epoch != self.acc.epoch or not qc.verify(self.roster):
+                        continue
+                    if not reducer.control.can_author_control(
+                        op.author, ctl.ControlKind.CHECKPOINT
+                    ):
+                        continue  # unauthorized minter — never adopt
+                    # WP-D — horizon covers the cut (finding #8): the horizon is F, the
+                    # finality frontier the cut was sealed at, so EVERY op the checkpoint
+                    # compacts (≤ cut) must sit at/below it. A cut reaching above its horizon
+                    # would seal a not-yet-final op — GC + bootstrap would then diverge from a
+                    # full fold. Structural (hlc is cleartext), so a ZK node enforces it. No
+                    # cut-lag margin: the horizon is exactly F, not F − W (W is vestigial —
+                    # the audit is deterministic recomputation, not a timed race).
+                    if any(covered(o, body.cut) and o.hlc > body.horizon for o in all_ops):
+                        continue
+                    # WP-F(a) / #4 — never adopt a checkpoint that would REGRESS what I hold: GC
+                    # past a cut and the monotone horizon are both irreversible, so a cut that
+                    # does not per-author dominate my adopted cut, or a lower horizon, is
+                    # impossible by definition — refuse it. Combined with the sequence gate this
+                    # makes divergence impossible by construction: one checkpoint per seq, each
+                    # dominating the last (WP-F(c)).
+                    if body.horizon.as_tuple() < cur_horizon.as_tuple() or not _cut_dominates(
+                        body.cut, cur_cut
+                    ):
+                        continue
+                    picked = (op, body)
+                    break  # the slot admits at most one committed checkpoint per seq
+                if picked is None:
+                    return  # next seq not yet committed/valid — nothing more to adopt
+                op, ckpt = picked
+                # only adopt once my below-cut baseline satisfies the signed retained
+                # digests — projected over the CHECKPOINT's dead (not the store's empty one).
+                if gossip.verify_baseline(tx, ckpt.cut, ckpt.retained, frozenset(ckpt.dead)):
+                    return  # missing baseline — defer to a later round
+            # adopt + GC + pin the active checkpoint in ONE write transaction (finding 19):
+            # cut/retained/dead/horizon must survive crash-restart together, and the GC of
+            # `dead` must not be observable without the cut that vouches for it.
+            with self.store.write_txn() as tx:
+                tx.adopt_checkpoint(ckpt.cut, ckpt.retained, ckpt.dead, ckpt.horizon)
+                tx.gc_checkpoint(ckpt.dead)
+                tx.set_meta("checkpoint", op.op_hash)
+            # loop: the following seq may already be committed (lagging-node catch-up).
+            # adopt_checkpoint persisted the horizon (finding 19); the guards read it
+            # transactionally, so there is no in-memory horizon to advance here.
 
     # ---- recovery-fence observation (WP1.4) -------------------------------- #
     def observe_fences(self) -> None:

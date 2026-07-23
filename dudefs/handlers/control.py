@@ -101,6 +101,7 @@ class Checkpoint:
     attempts: bytes
     keyepoch: int
     horizon: HLC  # the finality frontier F the cut was sealed at (§9)
+    seq: int = 0  # monotone checkpoint sequence; the public slot it contends (WP-F(c))
 
 
 @dataclass(frozen=True)
@@ -200,6 +201,7 @@ def _v_checkpoint(b: dict[bytes, codec.Bencodable]) -> Checkpoint:
         attempts=codec.as_bytes(codec.field(b, b"attempts")),
         keyepoch=_uint(codec.field(b, b"keyepoch")),
         horizon=HLC.decode(codec.field(b, b"horizon")),
+        seq=_uint(codec.field(b, b"seq")),
     )
 
 
@@ -345,11 +347,14 @@ def checkpoint_body(
     attempts: bytes,
     keyepoch: int,
     horizon: HLC,
+    seq: int = 0,
 ) -> bytes:
     """A rev-6 checkpoint (DESIGN §12): the pinned `cut`, the `state_acc` audit
     anchor, the incremental `dead` delta, the per-author `retained` commitment,
-    the encrypted `attempts` sidecar, and the `horizon` finality frontier F the
-    cut was sealed at (the void / below-horizon guard value, §8). No snapshot."""
+    the encrypted `attempts` sidecar, the `horizon` finality frontier F the cut was
+    sealed at (the void / below-horizon guard value, §8), and the monotone `seq` —
+    the checkpoint's position in the chain and the public slot it contends (WP-F(c),
+    like a roster epoch). No snapshot."""
     cut_enc = {a: [s, h] for a, (s, h) in cut.items()}
     retained_enc = {a: [c, d] for a, (c, d) in retained.items()}
     return codec.encode(
@@ -362,6 +367,7 @@ def checkpoint_body(
             b"attempts": attempts,
             b"keyepoch": int(keyepoch),
             b"horizon": list(horizon.encode()),
+            b"seq": int(seq),
         }
     )
 
