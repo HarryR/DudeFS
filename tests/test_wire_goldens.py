@@ -24,7 +24,7 @@ GOLDENS = {
     "QC": "29f2738a962d7bda31a8e12d92a237804cdfe5303c7ba914319255b8e6d07d02",
     "RECEIPT": "a74599e60223187f6833ca9422c0d96823f1d0dc49df4027cd1615beeea096d7",
     "SUMMARY": "ed27f5324949d1f73f6c3bbfee154d654648c811a285c54ad83b697ecad65945",
-    "DELTA": "258ba2cbea5d6943f7bb2e4b3d27b9ac33e2a8411d7a7e9ba231c8c89405c9aa",
+    "DELTA": "e391aa380aa11c694fe9c658199ae9bd24768d6fdc6cca49a6f1e14f90f5f345",
     "REQ_submit": "639ba1db1b9f407759a00094e81c23f74c0c0d6c4153550acc25da677ee53455",
     "REQ_prepare": "bfd627b7ba7860af3e590bd810755e68355902237291e66084de7d520d7edd50",
     "REQ_accept": "3edcf9c0a3473b321af41c665d197f298c92f09b304c581dd876878d43ce6722",
@@ -90,6 +90,7 @@ def _fixtures() -> dict[str, bytes]:
     with empty.read_txn() as etx, st.read_txn() as tx:
         summ = gossip.summary(tx, 0, None, b"", frozenset())
         delt = gossip.delta(tx, gossip.summary(etx, 0, None, b"", frozenset()))
+        delt = gossip.Delta(delt.ops, delt.receipts, delt.qcs, baseline=(op,))  # pin baseline field
 
     reqs = {
         "REQ_submit": N.SubmitReq(op),

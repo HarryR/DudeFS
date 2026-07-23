@@ -82,9 +82,10 @@ def summary(
 
 @dataclass(frozen=True)
 class Delta:
-    ops: tuple[Op, ...]  # contiguous per-author runs the peer lacks
+    ops: tuple[Op, ...]  # contiguous per-author runs the peer lacks (append, contiguity-gated)
     receipts: tuple[Receipt, ...]  # receipts the peer's coverage lacks
     qcs: tuple[QC, ...]  # QCs the peer lacks
+    baseline: tuple[Op, ...] = ()  # sparse below-cut RETAINED ops — intake CONTIGUITY-FREE
 
 
 def delta(tx: ReadTxn, peer: Summary) -> Delta:
@@ -103,9 +104,16 @@ def delta(tx: ReadTxn, peer: Summary) -> Delta:
 
 
 def apply_delta(tx: WriteTxn, d: Delta) -> None:
-    """Merge a received Delta in ONE write transaction. Ops go through `append`
-    (contiguity gate + fork evidence); a gap/fork op is simply not stored and the
-    next round retries."""
+    """Merge a received Delta in ONE write transaction. `baseline` ops (sparse
+    below-cut retained winners, whose predecessors are legitimately GC'd) intake
+    CONTIGUITY-FREE via `put_op_raw` — and FIRST, so the tail's `append` can find its
+    predecessors and a fresh node's adoption sees a complete baseline (WP-E / Finding 1:
+    breaks the bootstrap-vs-cut deadlock; the checkpoint's `retained` commitment vouches
+    for them, and completeness is re-checked at adopt). Tail `ops` go through `append`
+    (contiguity gate + fork evidence); a gap/fork op is simply not stored and the next
+    round retries."""
+    for op in d.baseline:
+        tx.put_op_raw(op)  # author-signed envelope; no contiguity gate below the cut
     for op in sorted(d.ops, key=lambda o: (o.author, o.seq)):
         tx.append(op)
     for r in d.receipts:
@@ -245,6 +253,7 @@ def encode_delta(d: Delta) -> bytes:
             [o.raw for o in d.ops],
             [r.encode() for r in d.receipts],
             [qc.encode() for qc in d.qcs],
+            [o.raw for o in d.baseline],
         ]
     )
 
@@ -254,4 +263,5 @@ def decode_delta(data: bytes) -> Delta:
     ops = tuple(A.Op.from_bytes(codec.as_bytes(x)) for x in codec.as_seq(p[0]))
     receipts = tuple(A.Receipt.decode(codec.as_bytes(x)) for x in codec.as_seq(p[1]))
     qcs = tuple(A.QC.decode(codec.as_bytes(x)) for x in codec.as_seq(p[2]))
-    return Delta(ops, receipts, qcs)
+    baseline = tuple(A.Op.from_bytes(codec.as_bytes(x)) for x in codec.as_seq(p[3]))
+    return Delta(ops, receipts, qcs, baseline)

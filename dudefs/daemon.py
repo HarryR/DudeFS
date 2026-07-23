@@ -183,7 +183,10 @@ class NodeDaemon:
             summ = gossip.decode_summary(codec.as_bytes(codec.as_seq(codec.decode(data))[1]))
             with self.store.read_txn() as tx:  # the delta + baseline are ONE snapshot
                 d = gossip.delta(tx, summ)
-                d = Delta((*d.ops, *self._baseline_ops_for(tx, summ)), d.receipts, d.qcs)
+                # the sparse below-cut baseline rides its OWN field — the peer intakes it
+                # contiguity-free (WP-E), not through the tail's `append` gate.
+                base = tuple(self._baseline_ops_for(tx, summ))
+                d = Delta(d.ops, d.receipts, d.qcs, baseline=base)
             return gossip.encode_delta(d)
         return wire.encode_response(dispatch(self.node, wire.decode_request(data)))
 

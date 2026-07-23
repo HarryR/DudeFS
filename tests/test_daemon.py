@@ -466,6 +466,75 @@ class TestDaemonAdoption(unittest.TestCase):
             self.assertIsNotNone(tx.get_op(first.op_hash))  # dead NOT GC'd
 
 
+class TestFreshBootstrap(unittest.TestCase):
+    def test_fresh_member_bootstraps_the_sparse_baseline_over_gossip(self):
+        # WP-E / Finding 1 (T-C): a node that adopted a checkpoint holds only the sparse
+        # retained winners below the cut (their predecessors GC'd). A FRESH roster member
+        # (disk-wiped) must re-acquire them over PRODUCTION gossip and re-adopt. The
+        # contiguity gate blocked this — a winner whose predecessor is GC'd GAPs on
+        # append, the bootstrap-vs-cut deadlock. The baseline now intakes contiguity-free
+        # (it rides its own Delta field, put_op_raw). Reproduces Finding 1 (fails pre-fix).
+        from dudefs import compactor, fold
+
+        w = World(seed=22, n_clients=1)
+        roster = [C.SIGNER.public(bytes([200 + i] * 32)) for i in range(3)]
+        d = _daemon(w, 0, roster)  # node 0 — drive it into a compacted state
+        below = list(w.control_ops)
+        first = w.cas(
+            0, b"k", A.VERSION_ABSENT, 0, [[A.Guard.ABSENT, b"k"]], [[A.Mutation.SET, b"k", b"v1"]]
+        )
+        below.append(first)
+        v, at = fold.fold(below, w.keyring, w.genesis).lineage(b"k")
+        winner = w.cas(
+            0, b"k", v, at, [[A.Guard.VERSION_EQ, b"k", v]], [[A.Mutation.SET, b"k", b"v2"]]
+        )
+        below.append(winner)
+        cut = {c.pub: (c.seq - 1, c.prev) for c in w.clients if c.seq > 0}
+        cut[w.mgr_pub] = (w._mseq - 1, w._mprev)
+        cr = compactor.compact_genesis(below, w.keyring, w.genesis, cut)
+        ckpt = w.checkpoint(
+            cut=cut,
+            state_acc=cr.state_acc,
+            dead=cr.dead,
+            retained=A.retained_commitment(cr.retained),
+            horizon=A.HLC(500, 0),
+        )
+        with d.store.write_txn() as tx:
+            for o in [*below, ckpt]:
+                tx.append(o)
+        sks = [bytes([200 + i] * 32) for i in range(3)]
+        recs = [
+            A.Receipt.issue(sks[i], roster[i], ckpt.op_hash, 0, A.Ballot(1, b"c"), 1)
+            for i in range(3)
+        ]
+        with d.store.write_txn() as tx:
+            tx.put_qc(A.QC.assemble(recs, 3, {p: i for i, p in enumerate(roster)}))
+        d.adopt_committed_checkpoints()
+        with d.store.read_txn() as tx:
+            self.assertEqual(tx.get_meta("checkpoint"), ckpt.op_hash)  # d compacted
+            self.assertIsNone(tx.get_op(first.op_hash))  # d GC'd the dead predecessor
+            self.assertIsNotNone(tx.get_op(winner.op_hash))  # d holds only the retained winner
+
+        f = _daemon(w, 1, roster)  # a FRESH roster member (empty :memory: store)
+        transports.inproc.register(roster[0].hex(), d.serve)
+        transports.inproc.register(roster[1].hex(), f.serve)
+        d.peers = [Peer(roster[1], transports.Endpoint(transports.INPROC, roster[1].hex()))]
+        f.peers = [Peer(roster[0], transports.Endpoint(transports.INPROC, roster[0].hex()))]
+        try:
+            for _ in range(3):  # sweep: round 1 pulls the baseline + adopts
+                f.sync_once()
+            with f.store.read_txn() as tx:
+                self.assertIsNotNone(tx.get_op(winner.op_hash))  # acquired the sparse baseline
+                self.assertIsNotNone(tx.get_op(ckpt.op_hash))  # + the checkpoint op
+                self.assertEqual(tx.get_meta("checkpoint"), ckpt.op_hash)  # and re-adopted it
+                self.assertIsNone(tx.get_op(first.op_hash))  # never the GC'd dead op
+        finally:
+            transports.inproc.unregister(roster[0].hex())
+            transports.inproc.unregister(roster[1].hex())
+            d.close()
+            f.close()
+
+
 class TestDaemonFence(unittest.TestCase):
     def test_observes_root_recovery_pair_and_activates(self):
         from dudefs.handlers import control as ctl
