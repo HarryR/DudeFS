@@ -174,7 +174,8 @@ the node's record (read-modify-write); repeat to multi-home.
 > `m node endpoint list <pub>`
 
 **`client authorize`** · EXISTS *(was `cert issue client`)* — Issue a `Cap.WRITE` cert for
-a client (writer).
+a client (writer) **and back-wrap the full live keyepoch set** to it — its fold spans every
+epoch, so without every live key it cannot decrypt the dataset (§7).
 > `m client authorize <pub> <pop>`
 
 **`client revoke`** · EXISTS *(was `cert revoke`)* — Revoke a client's cert (blacklist) by
@@ -185,7 +186,8 @@ pubkey; stages a rotate by default.
 > `m client list`
 
 **`compactor authorize`** · EXISTS *(was `cert issue compactor`)* — Issue a `Cap.COMPACT`
-cert for a compactor.
+cert for a compactor **and back-wrap the full live keyepoch set** to it — the compactor
+decrypts to compute supersession/dead, so like a client it needs every live key (§7).
 > `m compactor authorize <pub> <pop>`
 
 **`compactor revoke`** · EXISTS *(was `cert revoke`)* — Revoke a compactor's cert by pubkey.
@@ -297,16 +299,24 @@ checkpoint op, then gossip that checkpoint back to the roster. Answers no reques
   A stale or wrong hint costs a failed connection, never a wrong state — so the seed carries
   peer *addresses*, not roster *identity* (which is trust-derived, not seeded). Authz and the
   roster still arrive by gossip; this is only the seed.
-- **Encryption keys never travel in clear.** A client daemon obtains the per-epoch group
-  key by finding *its own* sealed wrap in the gossiped log and opening it with its private
-  key (`unwrap_group_key`); the manager publishes a fresh wrap-set on every `rotate`. So
-  `client init`/`serve` need only the client keyfile + the log — no key is hand-delivered.
+- **Encryption keys never travel in clear.** Data is per-epoch ciphertext and a member's
+  fold spans *every* keyepoch (rotating re-encrypts nothing — nodes are zero-knowledge), so
+  a member needs **all live keyepoch keys** or its fold silently drops/mis-reads ops above the
+  cut and fails loud below it. Each `K_epoch` arrives sealed *to the member's pubkey* in a
+  `WRAP_SET` op; the member opens *its own* wrap (`unwrap_group_key`) from the gossiped log.
+  Two producers: **`rotate`** seals the *new* epoch's key to every current member (existing
+  members accumulate wraps epoch-by-epoch), and **`client`/`compactor authorize`** back-wraps
+  the *full live set* to the newcomer in one shot — it never accumulated the old ones. Nodes
+  are zero-knowledge and get no wrap. So `client init`/`serve` need only the client keyfile +
+  the log — no key is hand-delivered.
 
 ## 8. Open questions (iterate here)
 
 **Resolved:** generic `cert` retired — three cert kinds = three principals, full cover. ·
 Compactor is a standalone node with its own gossip-synced replica. · Client group key via
-the finding-21 wrap-set unwrap, never a clear-text hand-off. · Two-step node onboarding,
+the finding-21 wrap-set unwrap, never a clear-text hand-off — and since a member's fold
+spans every keyepoch, `authorize` back-wraps the **full live keyepoch set** to a newcomer
+(`rotate` only adds the new epoch's key incrementally). · Two-step node onboarding,
 `authorize` then `add`, with endpoint(s) passed **inline to `add`**. · Top-level
 `get/set/cas/del` shortcuts kept, aliasing `client …`.
 
