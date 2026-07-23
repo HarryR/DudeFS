@@ -6,10 +6,16 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import os
 
+from .. import crypto as C
+from ..client import ClientDaemon
 from ..manager import mint_identity
+from ..workerapi import WorkerServer
 from . import _util as U
 from ._args import dir_arg, sock_arg
+from .bootstrap import Bootstrap
 
 
 def cmd_init(args: argparse.Namespace) -> int:
@@ -21,6 +27,36 @@ def cmd_init(args: argparse.Namespace) -> int:
         pop,
         f"authorize it:  dude mgr client authorize {pub.hex()} {pop.hex()}",
     )
+    return U.OK
+
+
+def cmd_serve(args: argparse.Namespace) -> int:
+    with open(os.path.join(args.dir, "client.key"), "rb") as f:
+        sk = f.read()
+    pub = C.SIGNER.public(sk)
+    b = Bootstrap.read(args.dir)
+    cd = ClientDaemon(
+        sk,
+        pub,
+        roster=b.roster,
+        roster_addrs=b.dial_addrs(),
+        manager_pub=b.manager_pub,
+        control_ops=b.control_ops,
+        store_path=os.path.join(args.dir, "store.sqlite"),
+        epoch=b.epoch,
+    )
+    sock = args.sock or os.path.join(args.dir, "worker.sock")
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(sock)  # clear a stale socket from a previous run
+    ws = WorkerServer(cd)
+    print(f"client {pub.hex()[:16]}… worker socket {sock} (epoch {b.epoch})")
+    try:
+        ws.serve_forever(sock)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        ws.close()
+        cd.close()
     return U.OK
 
 
@@ -118,5 +154,8 @@ def register(sub: argparse._SubParsersAction) -> None:
     dir_arg(csub.add_parser("init", help="mint this client's identity keyfile")).set_defaults(
         fn=cmd_init
     )
+    srv = dir_arg(csub.add_parser("serve", help="run the client daemon + worker socket"))
+    srv.add_argument("--sock", default=None, help="worker socket (default <dir>/worker.sock)")
+    srv.set_defaults(fn=cmd_serve)
     _worker_leaves(csub, top=False)
     _worker_leaves(sub, top=True)  # top-level get/set/cas/del shortcuts

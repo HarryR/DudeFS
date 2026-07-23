@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 
@@ -14,7 +15,15 @@ from .. import transports
 from ..artifacts import quorum_size
 from ..manager import Manager, ManagerError, ManagerState, RecoverDecision, recover_decision
 from . import _util as U
+from . import bootstrap
 from ._args import dir_arg, pop, pubkey
+
+
+def cmd_bootstrap(args: argparse.Namespace) -> int:
+    """Emit the non-secret cold-start projection; redirect it into each daemon's --dir:
+    `dude mgr bootstrap --dir ./mgr > ./n1/bootstrap.json`."""
+    print(json.dumps(bootstrap.emit(ManagerState.load(args.dir)), indent=2))
+    return U.OK
 
 
 # --------------------------------------------------------------------------- #
@@ -275,6 +284,9 @@ def register(sub: argparse._SubParsersAction) -> None:
     dir_arg(
         msub.add_parser("rotate", help="new group key + wrap-set + keyepoch bump")
     ).set_defaults(fn=cmd_rotate)
+    dir_arg(
+        msub.add_parser("bootstrap", help="emit bootstrap.json (non-secret cold-start)")
+    ).set_defaults(fn=cmd_bootstrap)
 
     # mgr node …
     node = msub.add_parser("node", help="roster membership + reachability")
