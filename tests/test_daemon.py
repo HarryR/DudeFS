@@ -418,6 +418,53 @@ class TestDaemonAdoption(unittest.TestCase):
             self.assertIsNotNone(tx.get_op(first.op_hash))  # dead NOT GC'd
             self.assertIsNotNone(tx.get_op(winner.op_hash))  # winner retained
 
+    def test_checkpoint_with_horizon_below_the_cut_is_not_adopted(self):
+        # WP-D / finding #8: the horizon (= F) must COVER the cut. A checkpoint whose
+        # horizon sits below an op it compacts (≤ cut) seals a not-yet-final region and
+        # is refused — even with a valid QC + authorized minter. No cut-lag W: the
+        # horizon is exactly F, and coverage is a structural (cleartext-hlc) check.
+        from dudefs import compactor, fold
+
+        w = World(seed=9, n_clients=1)
+        roster = [C.SIGNER.public(bytes([200 + i] * 32)) for i in range(3)]
+        d = _daemon(w, 0, roster)
+        below = list(w.control_ops)
+        first = w.cas(
+            0, b"k", A.VERSION_ABSENT, 0, [[A.Guard.ABSENT, b"k"]], [[A.Mutation.SET, b"k", b"v1"]]
+        )
+        below.append(first)
+        v, at = fold.fold(below, w.keyring, w.genesis).lineage(b"k")
+        winner = w.cas(
+            0, b"k", v, at, [[A.Guard.VERSION_EQ, b"k", v]], [[A.Mutation.SET, b"k", b"v2"]]
+        )
+        below.append(winner)
+        cut = {c.pub: (c.seq - 1, c.prev) for c in w.clients if c.seq > 0}
+        cut[w.mgr_pub] = (w._mseq - 1, w._mprev)
+        cr = compactor.compact_genesis(below, w.keyring, w.genesis, cut)
+        # horizon ONE BELOW the highest compacted op -> does not cover the cut
+        ckpt = w.checkpoint(
+            cut=cut,
+            state_acc=cr.state_acc,
+            dead=cr.dead,
+            retained=A.retained_commitment(cr.retained),
+            horizon=A.HLC(winner.hlc.wall_ms - 1, 0),
+        )
+        with d.store.write_txn() as tx:
+            for o in [*below, ckpt]:
+                tx.append(o)
+        sks = [bytes([200 + i] * 32) for i in range(3)]
+        recs = [
+            A.Receipt.issue(sks[i], roster[i], ckpt.op_hash, 0, A.Ballot(1, b"c"), 1)
+            for i in range(3)
+        ]
+        with d.store.write_txn() as tx:
+            tx.put_qc(A.QC.assemble(recs, 3, {p: i for i, p in enumerate(roster)}))
+
+        d.adopt_committed_checkpoints()
+        with d.store.read_txn() as tx:
+            self.assertIsNone(tx.get_meta("checkpoint"))  # refused (horizon < cut)
+            self.assertIsNotNone(tx.get_op(first.op_hash))  # dead NOT GC'd
+
 
 class TestDaemonFence(unittest.TestCase):
     def test_observes_root_recovery_pair_and_activates(self):

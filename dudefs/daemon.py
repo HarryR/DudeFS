@@ -284,6 +284,15 @@ class NodeDaemon:
                     continue
                 if not reducer.control.can_author_control(op.author, ctl.ControlKind.CHECKPOINT):
                     continue  # unauthorized minter — never adopt
+                # WP-D — horizon covers the cut (finding #8): the horizon is F, the
+                # finality frontier the cut was sealed at, so EVERY op the checkpoint
+                # compacts (≤ cut) must sit at/below it. A cut reaching above its horizon
+                # would seal a not-yet-final op — GC + bootstrap would then diverge from a
+                # full fold. Structural (hlc is cleartext), so a ZK node enforces it. No
+                # cut-lag margin: the horizon is exactly F, not F − W (W is vestigial —
+                # the audit is deterministic recomputation, not a timed race).
+                if any(covered(o, body.cut) and o.hlc > body.horizon for o in all_ops):
+                    continue
                 if best is None or op.hlc > best[0].hlc:
                     best = (op, body)
             if best is None:
