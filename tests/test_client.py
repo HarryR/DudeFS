@@ -472,7 +472,7 @@ class TestBootstrapConsumer(unittest.TestCase):
     """WP-C: a client whose below-cut band is GC'd (holds only the retained winners +
     the checkpoint + the tail, NOT the dead ops) reconstructs the barrier from the
     unsealed sidecar and reads BYTE-IDENTICALLY to a full-history client (A4) — the real
-    client._fold path, verifying state_root at intake (WP-B)."""
+    client._fold path, verifying state_acc at intake (WP-B)."""
 
     def _client(self, w):
         c = ClientDaemon(
@@ -528,7 +528,7 @@ class TestBootstrapConsumer(unittest.TestCase):
         cut = cut_of(w)
         cr = compactor.compact_genesis(below, w.keyring, w.genesis, cut)
         sealed = compactor.seal_attempts(cr.attempts, w.keyring[0]["data_key"])
-        ckpt = w.checkpoint(cut=cut, state_root=cr.state_root, dead=cr.dead, attempts=sealed)
+        ckpt = w.checkpoint(cut=cut, state_acc=cr.state_acc, dead=cr.dead, attempts=sealed)
         v2, a2 = F.fold(below, w.keyring, w.genesis).lineage(b"k1")
         tail = w.cas(
             0, b"k1", v2, a2, [[A.Guard.VERSION_EQ, b"k1", v2]], [[A.Mutation.SET, b"k1", b"v3"]]

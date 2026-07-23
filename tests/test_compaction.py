@@ -76,7 +76,7 @@ class TestA4RetainedBootstrap(unittest.TestCase):
         ]
 
         cr = compactor.compact_genesis(below, w.keyring, w.genesis, cut)
-        ckpt = w.checkpoint(cut=cut, state_root=cr.state_root, dead=cr.dead)
+        ckpt = w.checkpoint(cut=cut, state_acc=cr.state_acc, dead=cr.dead)
         full = fold.fold(below + [ckpt] + tail, w.keyring, w.genesis)
         boot = _boot(w, cr, control, tail, cut)
 
@@ -101,7 +101,7 @@ class TestA4RetainedBootstrap(unittest.TestCase):
         below.append(z)
         cut = cut_of(w)
         cr = compactor.compact_genesis(below, w.keyring, w.genesis, cut)
-        ckpt = w.checkpoint(cut=cut, state_root=cr.state_root, dead=cr.dead)
+        ckpt = w.checkpoint(cut=cut, state_acc=cr.state_acc, dead=cr.dead)
         full = fold.fold(below + [ckpt], w.keyring, w.genesis)
         boot = _boot(w, cr, control, [], cut)
         self.assertEqual(boot.state, full.state)  # C not resurrected
@@ -124,7 +124,7 @@ class TestA4RetainedBootstrap(unittest.TestCase):
         cut = cut_of(w)
 
         cr = compactor.compact_genesis(below, w.keyring, w.genesis, cut)
-        ckpt = w.checkpoint(cut=cut, state_root=cr.state_root, dead=cr.dead)
+        ckpt = w.checkpoint(cut=cut, state_acc=cr.state_acc, dead=cr.dead)
         full = fold.fold(below + [ckpt], w.keyring, w.genesis)
         self.assertEqual(full.state, {b"A": b"1"})  # B is gone
 
@@ -173,7 +173,7 @@ class TestA4RetainedBootstrap(unittest.TestCase):
 
         cr = compactor.compact_genesis(below, w.keyring, w.genesis, cut)
         self.assertEqual(cr.attempts, {b"k": 1})  # the sidecar carries it
-        ckpt = w.checkpoint(cut=cut, state_root=cr.state_root, dead=cr.dead)
+        ckpt = w.checkpoint(cut=cut, state_acc=cr.state_acc, dead=cr.dead)
         full = fold.fold(below + [ckpt] + tail, w.keyring, w.genesis)
         boot = _boot(w, cr, control, tail, cut)
         self.assertEqual(full.state, boot.state)
@@ -217,7 +217,7 @@ class TestAttemptsSidecar(unittest.TestCase):
         dk = w.keyring[0]["data_key"]
         # AUTHOR: seal the sidecar INTO a real checkpoint op's attempts field
         sealed = compactor.seal_attempts(cr.attempts, dk)
-        ckpt_op = w.checkpoint(cut=cut, state_root=cr.state_root, dead=cr.dead, attempts=sealed)
+        ckpt_op = w.checkpoint(cut=cut, state_acc=cr.state_acc, dead=cr.dead, attempts=sealed)
         # BOOTSTRAP: decode the op off the wire, unseal ITS field, rebuild the barrier
         ckpt = ctl.decode(ckpt_op)
         assert isinstance(ckpt, ctl.Checkpoint)
@@ -248,7 +248,7 @@ class TestAttemptsSidecar(unittest.TestCase):
 
 
 class TestStateRootAudit(unittest.TestCase):
-    """WP-B: a bootstrapping node RECOMPUTES state_root from its reconstructed barrier
+    """WP-B: a bootstrapping node RECOMPUTES state_acc from its reconstructed barrier
     and rejects any checkpoint whose claimed root disagrees — a tampered root, an
     omitted live winner, or a wrong attempt (a bad sidecar). The §12 trust surface: a
     lying compactor is caught by any node that recomputes."""
@@ -270,13 +270,13 @@ class TestStateRootAudit(unittest.TestCase):
     def test_correct_barrier_verifies(self):
         w = World(seed=40, n_clients=1)
         cr = self._compacted(w)
-        compactor.verify_state_root(cr.state_root, self._barrier(w, cr))  # no raise
+        compactor.verify_state_acc(cr.state_acc, self._barrier(w, cr))  # no raise
 
     def test_tampered_root_is_rejected(self):
         w = World(seed=41, n_clients=1)
         cr = self._compacted(w)
         with self.assertRaises(compactor.CompactError):
-            compactor.verify_state_root(bytes(32), self._barrier(w, cr))  # forged root
+            compactor.verify_state_acc(bytes(32), self._barrier(w, cr))  # forged root
 
     def test_omitted_live_winner_is_rejected(self):
         # a checkpoint claiming the honest root but whose retained set drops a live
@@ -286,14 +286,14 @@ class TestStateRootAudit(unittest.TestCase):
         winners = [o for o in cr.retained if not o.is_control]
         short = compactor.barrier_state(winners[1:], cr.attempts, w.keyring)  # drop one
         with self.assertRaises(compactor.CompactError):
-            compactor.verify_state_root(cr.state_root, short)
+            compactor.verify_state_acc(cr.state_acc, short)
 
     def test_wrong_attempt_is_rejected(self):
         # the sidecar is part of the audited state -> a wrong attempt fails the root.
         w = World(seed=43, n_clients=1)
         cr = self._compacted(w)
         with self.assertRaises(compactor.CompactError):
-            compactor.verify_state_root(cr.state_root, self._barrier(w, cr, attempts={b"k1": 7}))
+            compactor.verify_state_acc(cr.state_acc, self._barrier(w, cr, attempts={b"k1": 7}))
 
 
 class TestA4RejectedOps(unittest.TestCase):
@@ -483,7 +483,7 @@ class TestA4PropertyFuzz(unittest.TestCase):
             full = fold.fold(full_ops, w.keyring, w.genesis)
             self.assertEqual(boot.state, full.state, f"seed {seed}: state diverged")
             self.assertEqual(
-                fold.state_root(boot), fold.state_root(full), f"seed {seed}: root diverged"
+                fold.state_acc(boot), fold.state_acc(full), f"seed {seed}: root diverged"
             )
 
     def test_two_checkpoint_A4_holds(self):
@@ -515,7 +515,7 @@ class TestA4PropertyFuzz(unittest.TestCase):
             full = fold.fold(full_ops, w.keyring, w.genesis)
             self.assertEqual(boot.state, full.state, f"seed {seed}: state diverged")
             self.assertEqual(
-                fold.state_root(boot), fold.state_root(full), f"seed {seed}: root diverged"
+                fold.state_acc(boot), fold.state_acc(full), f"seed {seed}: root diverged"
             )
 
 
@@ -833,7 +833,7 @@ class TestCheckpointArtifact(unittest.TestCase):
         retained = A.retained_commitment(cr.retained)
         ckpt = w.checkpoint(
             cut=cut,
-            state_root=cr.state_root,
+            state_acc=cr.state_acc,
             dead=cr.dead,
             retained=retained,
             attempts=b"ct",
@@ -842,7 +842,7 @@ class TestCheckpointArtifact(unittest.TestCase):
         body = ctl.decode(ckpt)
         assert isinstance(body, ctl.Checkpoint)
         self.assertEqual(body.cut, cut)
-        self.assertEqual(body.state_root, cr.state_root)
+        self.assertEqual(body.state_acc, cr.state_acc)
         self.assertEqual(body.dead, cr.dead)
         self.assertEqual(body.retained, retained)
         self.assertEqual(body.attempts, b"ct")

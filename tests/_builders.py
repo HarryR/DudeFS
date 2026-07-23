@@ -175,7 +175,7 @@ class World:
     def checkpoint(
         self,
         cut: A.Heads | None = None,
-        state_root: bytes = b"",
+        state_acc: bytes = b"",
         dead: list[bytes] | None = None,
         retained: Mapping[bytes, tuple[int, bytes]] | None = None,
         attempts: bytes = b"",
@@ -185,7 +185,7 @@ class World:
         op = self._mgr_op(
             ctl.checkpoint_body(
                 cut or {},
-                state_root,
+                state_acc,
                 dead or [],
                 retained or {},
                 attempts,

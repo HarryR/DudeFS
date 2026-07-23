@@ -689,50 +689,34 @@ def make_barrier(result: FoldResult) -> BarrierState:
     return out
 
 
-def _state_leaf(key: bytes, value: object, version: bytes, attempt: int) -> bytes:
-    """One live-key leaf of the state-root Merkle tree — domain-separated (0x00)."""
-    return crypto.h(b"\x00" + A.codec.encode([key, value, version, attempt]))
+def _acc_element(key: bytes, value: object, version: bytes, attempt: int) -> bytes:
+    """φ of one live-key element — its ECMH curve point (ACCUMULATOR §3.1). The encoding
+    `[key, value, version, attempt]` is the canonical, injective serialization."""
+    return crypto.acc_element(A.codec.encode([key, value, version, attempt]))
 
 
-def _merkle_root(leaves: list[bytes]) -> bytes:
-    """Binary BLAKE2 Merkle root: interior nodes h(0x01 ‖ l ‖ r), an odd node promotes
-    unchanged (no duplicate-leaf ambiguity), an empty tree is h(b"") — one state, one
-    root (NOTES item 19). Leaves must already be in canonical (sorted-key) order."""
-    if not leaves:
-        return crypto.h(b"")
-    while len(leaves) > 1:
-        nxt: list[bytes] = []
-        for i in range(0, len(leaves), 2):
-            if i + 1 < len(leaves):
-                nxt.append(crypto.h(b"\x01" + leaves[i] + leaves[i + 1]))
-            else:
-                nxt.append(leaves[i])  # odd node promotes
-        leaves = nxt
-    return leaves[0]
+def state_acc(result: FoldResult) -> bytes:
+    """The audit anchor over the live state at a barrier (DESIGN §12 / ACCUMULATOR): the
+    ECMH accumulator `Σ φ(key, value, version, attempt)` over live keys — a 32-byte curve
+    point, order-independent (no sort), incrementally verifiable. `state_acc_of_barrier`
+    recomputes the SAME value from a reconstructed barrier, so a key-holder can audit a
+    checkpoint (WP-B); mis-selection is caught in O(Δ) via the transition check."""
+    a = crypto.ACC_IDENTITY
+    for k, m in result.meta.items():
+        if m.present and m.value is not None:
+            a = crypto.acc_add(a, _acc_element(k, m.value, m.version, m.attempt))
+    return a
 
 
-def state_root(result: FoldResult) -> bytes:
-    """The audit anchor over the live state at a barrier (DESIGN §12): a Merkle root
-    over sorted live (key, value, version, attempt). Makes compaction auditable —
-    `state_root_of_barrier` recomputes the SAME root from a reconstructed barrier, so a
-    bootstrapping node can verify a checkpoint (WP-B)."""
-    return _merkle_root(
-        [
-            _state_leaf(k, m.value, m.version, m.attempt)
-            for k, m in sorted(result.meta.items())
-            if m.present
-        ]
-    )
-
-
-def state_root_of_barrier(barrier: BarrierState) -> bytes:
-    """The state root recomputed from a reconstructed barrier — the bootstrap/audit
-    inverse of `state_root`. By A4 (retained bootstrap ≡ full fold) it equals the
-    `state_root` a full-history client derived, so a mismatch against a checkpoint's
-    claimed root is a forged/corrupt checkpoint (WP-B). Same leaf + Merkle scheme."""
-    return _merkle_root(
-        [_state_leaf(k, e["value"], e["version"], e["attempt"]) for k, e in sorted(barrier.items())]
-    )
+def state_acc_of_barrier(barrier: BarrierState) -> bytes:
+    """The state accumulator recomputed from a reconstructed barrier — the bootstrap/audit
+    inverse of `state_acc`. By A4 (retained bootstrap ≡ full fold) it equals the `state_acc`
+    a full-history fold derives, so a mismatch against a checkpoint's claimed value is a
+    forged/corrupt checkpoint (WP-B)."""
+    a = crypto.ACC_IDENTITY
+    for k, e in barrier.items():
+        a = crypto.acc_add(a, _acc_element(k, e["value"], e["version"], e["attempt"]))
+    return a
 
 
 # --------------------------------------------------------------------------- #

@@ -523,7 +523,7 @@ class ClientDaemon:
         when no compaction has happened OR I still hold the whole covered band (that
         fold is already checkpoint-aware and correct). When the band IS sparse (GC'd),
         fold the RETAINED winners I hold + the unsealed attempts sidecar into the
-        barrier and VERIFY the checkpoint's state_root against it (WP-A/B), so a GC'd or
+        barrier and VERIFY the checkpoint state_acc against it (WP-A/B), so a GC'd or
         freshly-bootstrapped client reads byte-identically to full history (A4)."""
         latest: tuple[Op, ctl.Checkpoint] | None = None
         for o in ops:
@@ -542,7 +542,7 @@ class ClientDaemon:
         barrier = compactor.barrier_state(
             retained, compactor.open_attempts(ck.attempts, dk), self.keyring
         )
-        compactor.verify_state_root(ck.state_root, barrier)  # loud on a forged checkpoint
+        compactor.verify_state_acc(ck.state_acc, barrier)  # loud on a forged checkpoint
         return barrier, ck.cut
 
     def _fold(self, tx: ReadTxn, *, final_only: bool = False) -> fold.FoldResult:

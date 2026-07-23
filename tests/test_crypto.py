@@ -182,5 +182,44 @@ class TestMultiSigList(unittest.TestCase):
         self.assertFalse(C.MULTISIG.verify(bitmap, sigs, msg, bad))
 
 
+class TestStateAccumulator(unittest.TestCase):
+    """ECMH over the ed25519 prime-order subgroup (ACCUMULATOR §6.1): a commutative,
+    incremental multiset digest. `from_uniform` clears the cofactor, so the sum is
+    MuHash-on-a-curve — a 32-byte, order-independent, invertible state clock."""
+
+    def _acc(self, elems):
+        a = C.ACC_IDENTITY
+        for e in elems:
+            a = C.acc_add(a, C.acc_element(e))
+        return a
+
+    def test_digest_is_a_valid_32byte_prime_order_point(self):
+        import nacl.bindings as sodium
+
+        p = C.acc_element(b"x")
+        self.assertEqual(len(p), C.ACC_SIZE)
+        self.assertEqual(C.ACC_SIZE, 32)
+        # is_valid_point => canonical, on the main (prime-order) subgroup, not small-order
+        self.assertTrue(sodium.crypto_core_ed25519_is_valid_point(p))
+
+    def test_identity_is_neutral_and_empty_set(self):
+        p = C.acc_element(b"x")
+        self.assertEqual(C.acc_add(p, C.ACC_IDENTITY), p)
+        self.assertEqual(C.acc_add(C.ACC_IDENTITY, p), p)
+        self.assertEqual(C.acc_sub(p, p), C.ACC_IDENTITY)  # {x} ∖ {x} = ∅
+
+    def test_order_independent_and_incremental_remove(self):
+        abc = self._acc([b"a", b"b", b"c"])
+        self.assertEqual(abc, self._acc([b"c", b"a", b"b"]))  # commutative
+        self.assertEqual(C.acc_sub(abc, C.acc_element(b"b")), self._acc([b"a", b"c"]))  # remove
+        # an update (b: v1 -> v2) is remove-old ⊕ add-new
+        updated = C.acc_add(C.acc_sub(abc, C.acc_element(b"b")), C.acc_element(b"b2"))
+        self.assertEqual(updated, self._acc([b"a", b"c", b"b2"]))
+
+    def test_distinct_elements_distinct_digests(self):
+        self.assertNotEqual(C.acc_element(b"a"), C.acc_element(b"b"))
+        self.assertNotEqual(self._acc([b"a"]), self._acc([b"a", b"b"]))
+
+
 if __name__ == "__main__":
     unittest.main()

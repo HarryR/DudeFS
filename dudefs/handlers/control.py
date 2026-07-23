@@ -95,7 +95,7 @@ class WrapSet:
 class Checkpoint:
     KIND: ClassVar[ControlKind] = ControlKind.CHECKPOINT
     cut: Heads
-    state_root: bytes
+    state_acc: bytes
     dead: list[bytes]
     retained: dict[bytes, RetainedEntry]  # author -> (count, digest)
     attempts: bytes
@@ -194,7 +194,7 @@ def _v_checkpoint(b: dict[bytes, codec.Bencodable]) -> Checkpoint:
     # GC delta; `retained` commits the FULL retained set ≤ cut; `attempts` the sidecar.
     return Checkpoint(
         cut=_heads(codec.field(b, b"cut")),
-        state_root=codec.as_bytes(codec.field(b, b"state_root")),
+        state_acc=codec.as_bytes(codec.field(b, b"state_acc")),
         dead=[codec.as_bytes(h) for h in codec.as_seq(codec.field(b, b"dead"))],
         retained=_retained(codec.field(b, b"retained")),
         attempts=codec.as_bytes(codec.field(b, b"attempts")),
@@ -339,14 +339,14 @@ def unwrap_group_key(body: WrapSet, member_sk: bytes) -> bytes | None:
 
 def checkpoint_body(
     cut: Heads,
-    state_root: bytes,
+    state_acc: bytes,
     dead: list[bytes],
     retained: Mapping[bytes, tuple[int, bytes]],
     attempts: bytes,
     keyepoch: int,
     horizon: HLC,
 ) -> bytes:
-    """A rev-6 checkpoint (DESIGN §12): the pinned `cut`, the `state_root` audit
+    """A rev-6 checkpoint (DESIGN §12): the pinned `cut`, the `state_acc` audit
     anchor, the incremental `dead` delta, the per-author `retained` commitment,
     the encrypted `attempts` sidecar, and the `horizon` finality frontier F the
     cut was sealed at (the void / below-horizon guard value, §8). No snapshot."""
@@ -356,7 +356,7 @@ def checkpoint_body(
         {
             BK_KIND: ControlKind.CHECKPOINT,
             b"cut": cut_enc,
-            b"state_root": state_root,
+            b"state_acc": state_acc,
             b"dead": list(dead),
             b"retained": retained_enc,
             b"attempts": attempts,

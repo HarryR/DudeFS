@@ -22,6 +22,7 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Iterable
 
+import nacl.bindings
 import nacl.exceptions
 import nacl.public
 import nacl.secret
@@ -72,6 +73,42 @@ DIGEST_SIZE = 32
 def h(data: bytes) -> bytes:
     """Content-address hash. `op_hash = h(bytes-as-received)` (IMPLEMENTATION §2)."""
     return hashlib.blake2b(data, digest_size=DIGEST_SIZE).digest()
+
+
+# --------------------------------------------------------------------------- #
+# State accumulator — ECMH over the ed25519 prime-order subgroup (ACCUMULATOR) #
+# --------------------------------------------------------------------------- #
+# A commutative, incremental digest of a SET of elements (the live-key state).
+# `acc_element` maps a canonical element encoding to a curve point via libsodium's
+# Elligator2 map WITH the cofactor cleared (`from_uniform` lands on the prime-order
+# subgroup), so the sum is MuHash-on-a-curve: collision-resistant under discrete log,
+# a fixed 32-byte digest independent of set size, add/sub the group op + inverse.
+# XHASH was rejected (silent key-drop via GF(2) subset-cancellation); Ristretto255 is
+# not exposed by PyNaCl, but ed25519+from_uniform gives the same prime-order + canonical
+# encoding we need (ACCUMULATOR §6).
+
+ACC_SIZE = nacl.bindings.crypto_core_ed25519_BYTES  # 32 — the digest / point width
+PERSON_ACC = b"dude.acc:v1"  # element-hash domain separation (frozen: goldens depend on it)
+# The neutral element (identity point (0,1)) = the digest of the EMPTY set.
+ACC_IDENTITY = b"\x01" + b"\x00" * (ACC_SIZE - 1)
+
+
+def acc_element(enc: bytes) -> bytes:
+    """φ(e): map a canonical element encoding to its prime-order curve point — a
+    domain-separated 32-byte hash through Elligator2 + cofactor clear. `enc` MUST be a
+    canonical, injective serialization of the element (ACCUMULATOR §3.1)."""
+    return nacl.bindings.crypto_core_ed25519_from_uniform(h(PERSON_ACC + enc))
+
+
+def acc_add(a: bytes, b: bytes) -> bytes:
+    """Add element/point `b` into accumulator `a` (the group op ⊕)."""
+    return nacl.bindings.crypto_core_ed25519_add(a, b)
+
+
+def acc_sub(a: bytes, b: bytes) -> bytes:
+    """Remove element/point `b` from accumulator `a` (the inverse ⊖) — self-consistent
+    with `acc_add`, so an update is `acc_sub(acc_add(A, new), old)`."""
+    return nacl.bindings.crypto_core_ed25519_sub(a, b)
 
 
 # --------------------------------------------------------------------------- #

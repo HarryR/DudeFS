@@ -345,7 +345,7 @@ class TestDaemonAdoption(unittest.TestCase):
         committed = A.retained_commitment(cr.retained)
         ckpt = w.checkpoint(
             cut=cut,
-            state_root=cr.state_root,
+            state_acc=cr.state_acc,
             dead=cr.dead,
             retained=committed,
             horizon=A.HLC(500, 0),
@@ -393,7 +393,7 @@ class TestDaemonAdoption(unittest.TestCase):
         cr = compactor.compact_genesis(below, w.keyring, w.genesis, cut)
         ckpt = w.checkpoint(
             cut=cut,
-            state_root=cr.state_root,
+            state_acc=cr.state_acc,
             dead=cr.dead,
             retained=A.retained_commitment(cr.retained),
             horizon=A.HLC(500, 0),

@@ -252,8 +252,8 @@ class TestA1AndB6(unittest.TestCase):
         for s in range(6):
             shuffled = base[:]
             random.Random(s).shuffle(shuffled)
-            roots.add(fold.state_root(fold.fold(shuffled, w.keyring, w.genesis)))
-        self.assertEqual(len(roots), 1)  # A1: one state_root across every order
+            roots.add(fold.state_acc(fold.fold(shuffled, w.keyring, w.genesis)))
+        self.assertEqual(len(roots), 1)  # A1: one state_acc across every order
         self.assertEqual(sim.evidence(), [])  # B6: honest chaos run mints no proof
 
     def test_B6_a_fork_mints_portable_evidence(self):

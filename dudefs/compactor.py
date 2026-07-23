@@ -9,8 +9,11 @@
 # `barrier_state` (mutations-only LWW + the attempts sidecar), and A4 holds:
 # retained-bootstrap ≡ full-history fold.
 #
-# Zero-knowledge forces the oracle upward: a node cannot see supersession, so only
-# the compactor (which decrypts) can compute the dead set. Cost ∝ churn.
+# Zero-knowledge keeps the STORAGE nodes blind: a node holds ciphertext + opaque
+# slot-tags and cannot see supersession, so the dead set is computed by a KEY-HOLDER.
+# The compactor is that key-holder by role (a client-side `compact`-cap identity); its
+# key-holding peers can re-derive and VERIFY its output via the state accumulator
+# (ACCUMULATOR §2/§5). Cost ∝ churn.
 
 from __future__ import annotations
 
@@ -57,19 +60,19 @@ def open_attempts(sealed: bytes, data_key: bytes) -> dict[bytes, int]:
     return {codec.as_bytes(k): codec.as_int(v) for k, v in codec.as_dict(codec.decode(pt)).items()}
 
 
-def verify_state_root(claimed: bytes, barrier: fold.BarrierState) -> None:
-    """Audit a checkpoint at intake (WP-B / DESIGN §12): the state_root recomputed from
-    the barrier a bootstrapping node RECONSTRUCTED from the retained set + sidecar MUST
-    equal the checkpoint's claimed `state_root`. A mismatch means a forged or corrupt
-    checkpoint — a tampered root, an omitted live winner, or a kept-superseded op that
-    perturbs the reconstructed state — so raise loudly (a portable audit failure) and
-    never adopt it. The trust surface §12 rests on: a lying compactor is caught by any
-    node that recomputes."""
-    got = fold.state_root_of_barrier(barrier)
+def verify_state_acc(claimed: bytes, barrier: fold.BarrierState) -> None:
+    """Audit a checkpoint at intake (WP-B / ACCUMULATOR §5.1): the ECMH `state_acc`
+    recomputed from the barrier a key-holder RECONSTRUCTED (retained winners + sidecar)
+    MUST equal the checkpoint's claimed `state_acc`. A mismatch means a forged or corrupt
+    checkpoint — a tampered value, an omitted live winner, or a wrong attempt — so raise
+    loudly (a portable audit failure) and never adopt it. The §12 trust surface: a lying
+    compactor is caught by any key-holder that recomputes (and, with the prior clock +
+    tail, by the O(Δ) transition check)."""
+    got = fold.state_acc_of_barrier(barrier)
     if got != claimed:
         raise CompactError(
-            f"checkpoint state_root mismatch: claimed {claimed.hex()[:16]}… "
-            f"but the reconstructed barrier hashes to {got.hex()[:16]}…"
+            f"checkpoint state_acc mismatch: claimed {claimed.hex()[:16]}… "
+            f"but the reconstructed barrier accumulates to {got.hex()[:16]}…"
         )
 
 
@@ -80,7 +83,7 @@ class CompactResult:
     sidecar (cleartext here; the checkpoint body encrypts it)."""
 
     cut: Heads
-    state_root: bytes
+    state_acc: bytes
     dead: list[bytes]  # newly-dead op hashes ≤ cut (the GC delta)
     retained: list[Op]  # retained ops: winners + resurrection masks + control liveness
     attempts: dict[bytes, int]  # live keys with a nonzero attempt at the cut
@@ -204,7 +207,7 @@ def compact(
     keep = winners | masks | control_live
     retained = [universe[h] for h in keep if h in universe]
     dead = [h for h in universe if h not in keep]  # (prev_retained ∪ tail) ∖ retained
-    return CompactResult(cut, fold.state_root(r), dead, retained, attempts)
+    return CompactResult(cut, fold.state_acc(r), dead, retained, attempts)
 
 
 def compact_genesis(
