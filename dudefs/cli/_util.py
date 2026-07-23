@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import os
 import socket
 import time
 
@@ -14,6 +15,7 @@ from ..artifacts import HLC
 from ..link import Link
 from ..manager import ManagerState
 from ..node import FrontierReq, Request, Response
+from ..store import ChainStore
 
 # ---- exit codes -------------------------------------------------------------- #
 OK = 0
@@ -102,6 +104,25 @@ def print_cert_inventory(st: ManagerState) -> None:
     for c in st.certs:
         flag = " REVOKED" if c["revoked"] else ""
         print(f"  {c['subject'][:16]}…  caps={','.join(c['caps'])}  epoch={c['epoch']}{flag}")
+
+
+def store_stats(d: str, store_name: str = "store.sqlite") -> dict:
+    """A daemon's LOCAL view straight from its durable store (no network): ops held, the
+    attested floor, and whether a compaction cut / checkpoint is present."""
+    path = os.path.join(d, store_name)
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"no store at {path} (has this daemon run?)")
+    st = ChainStore(path)
+    try:
+        with st.read_txn() as tx:
+            return {
+                "ops": len(tx.all_ops()),
+                "floor": tx.get_attested(),
+                "cut": bool(tx.cut()),
+                "checkpoint": bool(tx.get_meta("checkpoint")),
+            }
+    finally:
+        st.close()
 
 
 def print_minted(role: str, pub: bytes, keyfile: str, pop: bytes, *next_steps: str) -> None:

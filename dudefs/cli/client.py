@@ -93,6 +93,12 @@ def cmd_del(args: argparse.Namespace) -> int:
     return U.OK
 
 
+def cmd_status_local(args: argparse.Namespace) -> int:
+    s = U.store_stats(args.dir)
+    print(f"client  ops held: {s['ops']}   cut: {'set' if s['cut'] else 'none'}")
+    return U.OK
+
+
 def cmd_wheres(args: argparse.Namespace) -> int:
     """Human `where is my thing`: joins args with `/` and renders INSPECT for people
     (present/value, tier + finality, fencing token, pending ops with intent)."""
@@ -157,5 +163,8 @@ def register(sub: argparse._SubParsersAction) -> None:
     srv = dir_arg(csub.add_parser("serve", help="run the client daemon + worker socket"))
     srv.add_argument("--sock", default=None, help="worker socket (default <dir>/worker.sock)")
     srv.set_defaults(fn=cmd_serve)
+    dir_arg(csub.add_parser("status", help="local view from the durable store")).set_defaults(
+        fn=cmd_status_local
+    )
     _worker_leaves(csub, top=False)
     _worker_leaves(sub, top=True)  # top-level get/set/cas/del shortcuts

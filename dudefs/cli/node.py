@@ -62,6 +62,17 @@ def cmd_serve(args: argparse.Namespace) -> int:
     return U.OK
 
 
+def cmd_status(args: argparse.Namespace) -> int:
+    b = Bootstrap.read(args.dir)
+    s = U.store_stats(args.dir)
+    print(f"node  epoch {b.epoch}  roster {len(b.roster)} voting")
+    print(f"  attested floor: {s['floor'].as_tuple()}   ops held: {s['ops']}")
+    print(
+        f"  cut: {'set' if s['cut'] else 'none'}   checkpoint: {'yes' if s['checkpoint'] else 'no'}"
+    )
+    return U.OK
+
+
 def register(sub: argparse._SubParsersAction) -> None:
     node = sub.add_parser("node", help="run a storage node")
     nsub = node.add_subparsers(dest="node_verb", required=True)
@@ -71,3 +82,6 @@ def register(sub: argparse._SubParsersAction) -> None:
     srv = dir_arg(nsub.add_parser("serve", help="run the storage-node daemon"))
     srv.add_argument("--listen", required=True, help="this node's own listen address")
     srv.set_defaults(fn=cmd_serve)
+    dir_arg(nsub.add_parser("status", help="local view from the durable store")).set_defaults(
+        fn=cmd_status
+    )
