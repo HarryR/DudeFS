@@ -104,5 +104,14 @@ def print_cert_inventory(st: ManagerState) -> None:
         print(f"  {c['subject'][:16]}…  caps={','.join(c['caps'])}  epoch={c['epoch']}{flag}")
 
 
+def print_minted(role: str, pub: bytes, keyfile: str, pop: bytes, *next_steps: str) -> None:
+    """The shared `<role> init` report: the freshly-minted identity + how to authorize it."""
+    print(f"minted {role} identity -> {keyfile}")
+    print(f"  pub: {pub.hex()}")
+    print(f"  pop: {pop.hex()}")
+    for step in next_steps:
+        print(f"  {step}")
+
+
 # Back-compat alias: test_demo imports `_floor_probe` from dudefs.cli.
 _floor_probe = floor_probe

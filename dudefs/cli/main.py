@@ -8,7 +8,7 @@ import argparse
 import sys
 
 from ..manager import ManagerError
-from . import client, mgr
+from . import client, compactor, mgr, node
 from ._util import ERR
 
 
@@ -16,7 +16,9 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="dude", description="DudeFS control + client CLI")
     sub = p.add_subparsers(dest="cmd", required=True)
     mgr.register(sub)
+    node.register(sub)
     client.register(sub)
+    compactor.register(sub)
     return p
 
 

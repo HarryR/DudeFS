@@ -31,6 +31,15 @@ def _run(argv):
     return code, out.getvalue(), err.getvalue()
 
 
+def _genesis(d, seed=99, *addrs):
+    """Seat a founding node through the CLI (init is manager-only)."""
+    sk = bytes([seed] * 32)
+    return _run(
+        ["mgr", "node", "genesis", C.SIGNER.public(sk).hex(), C.prove_possession(sk).hex(), *addrs]
+        + ["--dir", d]
+    )
+
+
 class TestManagerCommands(unittest.TestCase):
     def test_init_refuses_over_existing_state(self):
         with tempfile.TemporaryDirectory() as d:
@@ -116,7 +125,8 @@ class TestManagerCommands(unittest.TestCase):
 
     def test_node_promote_refuses_even_roster(self):
         with tempfile.TemporaryDirectory() as d:
-            _run(["mgr", "init", "--dir", d])  # genesis roster = 1 node (odd)
+            _run(["mgr", "init", "--dir", d])
+            _genesis(d)  # founding node -> roster = 1 (odd)
             npub = C.SIGNER.public(bytes([5] * 32))
             _run(["mgr", "node", "add", npub.hex(), "--dir", d])
             # promoting to 2 voting members is even -> client-side refusal
@@ -192,7 +202,8 @@ class TestRecoverInterlock(unittest.TestCase):
         # --fence PERFORMS the recovery — authors the checkpoint + recovery-marked
         # roster op, no placeholder narration (NOTES 55 closure item).
         with tempfile.TemporaryDirectory() as d:
-            _run(["mgr", "init", "--dir", d])  # roster = 1 node, NO endpoint -> unreachable
+            _run(["mgr", "init", "--dir", d])
+            _genesis(d)  # roster = 1 node, NO endpoint -> unreachable
             code, out, _ = _run(
                 ["mgr", "recover", "--dir", d, "--dwell", "0.2", "--i-understand-data-loss"]
             )

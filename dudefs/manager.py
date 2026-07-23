@@ -33,6 +33,19 @@ class ManagerError(Exception):
     strings; the CLI maps it to an exit code."""
 
 
+def mint_identity(d: str, role: str = "node") -> tuple[bytes, str, bytes]:
+    """Mint a principal's identity keyfile in its OWN dir (`<role>.key`, 0600) and return
+    (pub, keyfile, proof-of-possession). Keys generate where they live (NOTES 58): the sk
+    never leaves this dir — only `pub` + `pop` travel to `mgr <role> authorize`. This is the
+    `<role> init` primitive; the manager never sees the key."""
+    os.makedirs(d, exist_ok=True)
+    key = os.urandom(32)
+    keyfile = os.path.join(d, f"{role}.key")
+    with open(os.open(keyfile, os.O_WRONLY | os.O_CREAT, 0o600), "wb") as f:
+        f.write(key)
+    return C.SIGNER.public(key), keyfile, C.prove_possession(key)
+
+
 # --------------------------------------------------------------------------- #
 # Manager state — the on-disk durable set (MANAGER §1)                         #
 # --------------------------------------------------------------------------- #
@@ -257,19 +270,14 @@ class Manager:
         self.state = state
 
     @classmethod
-    def init(cls, d: str, node_addr: str = "") -> Manager:
-        """Mint the root key, genesis identity, an n=1 node, and the epoch-0 group
-        master (DESIGN §14). Refuses over existing state (the genesis-only interlock)."""
+    def init(cls, d: str) -> Manager:
+        """Manager genesis (CLI.md §3): mint the root key + the epoch-0 group master. The
+        founding node is seated by `node_genesis` (keys generate where they live). Refuses
+        over existing state (the genesis-only interlock)."""
         os.makedirs(d, exist_ok=True)
         if ManagerState.exists(d):
             raise ManagerError(f"state already exists at {d} (init is genesis-only)")
         root_key = os.urandom(32)
-        node_key = os.urandom(32)
-        node_pub = C.SIGNER.public(node_key)
-        with open(
-            os.open(os.path.join(d, "node0.key"), os.O_WRONLY | os.O_CREAT, 0o600), "wb"
-        ) as f:
-            f.write(node_key)
         db_p, key_p = ManagerState._paths(d)
         with open(os.open(key_p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb") as f:
             f.write(root_key)
@@ -277,12 +285,22 @@ class Manager:
         with store.write_txn() as tx:  # seed the non-derivable genesis state (one txn)
             tx.set_meta("masters", json.dumps({"0": os.urandom(32).hex()}).encode())  # finding 21
             tx.set_meta("learners", json.dumps([]).encode())
-            tx.set_meta("roster_seed", json.dumps([node_pub.hex()]).encode())  # genesis roster
-        m = cls(ManagerState(d, store, root_key, C.SIGNER.public(root_key)))
-        seed_rec = transports.parse_endpoint(node_addr) if node_addr else None  # decompose ONCE
-        if seed_rec is not None:  # genesis seed endpoint — the mesh's bootstrap record
-            m.set_endpoint(node_pub, [seed_rec])
-        return m
+            tx.set_meta("roster_seed", json.dumps([]).encode())
+        return cls(ManagerState(d, store, root_key, C.SIGNER.public(root_key)))
+
+    def node_genesis(self, pub: bytes, pop: bytes, addrs: list[str]) -> Op:
+        """Seat the founding voting node at cluster genesis (CLI.md §3), unilaterally — no
+        prior quorum exists to run the §13 joint-cert ladder against. PoP-checked Cap.STORE
+        cert (synced) + its dial endpoint(s) + seat as the sole voting member via the roster
+        seed. Genesis-only: refuses once a node is seated (thereafter it's the
+        authorize -> add -> promote ladder)."""
+        if self.state.roster:
+            raise ManagerError("founding node already seated (use authorize -> add -> promote)")
+        cert = self.cert_issue("node", pub, pop)  # verifies PoP; ZK node -> no wrap
+        if addrs:
+            self.set_endpoint(pub, [transports.parse_endpoint(a) for a in addrs])
+        self.state._set_meta(roster_seed=[pub.hex()])
+        return cert
 
     @classmethod
     def load(cls, d: str) -> Manager:
@@ -337,18 +355,6 @@ class Manager:
         return [wrap_op, rot_op]
 
     # ---- membership ----------------------------------------------------- #
-    def node_spawn(self) -> tuple[bytes, str, bytes]:
-        """Mint a node identity, returning (pubkey, keyfile path, proof-of-possession).
-        Keys generate where they live (NOTES 58) — the key stays in the node's keyfile;
-        only the pubkey + pop travel to the manager for `cert issue`. (In the POC the
-        CLI stands in for the node; the sk never reaches the manager.)"""
-        key = os.urandom(32)
-        pub = C.SIGNER.public(key)
-        keyfile = os.path.join(self.state.dir, f"node-{pub.hex()[:8]}.key")
-        with open(os.open(keyfile, os.O_WRONLY | os.O_CREAT, 0o600), "wb") as f:
-            f.write(key)
-        return pub, keyfile, C.prove_possession(key)
-
     def node_add(self, pub: bytes, addr: str = "") -> None:
         if pub in self.state.roster or pub in self.state.learners:
             raise ManagerError("already a member/learner")

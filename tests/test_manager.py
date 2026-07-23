@@ -68,6 +68,14 @@ def _report(n, reachable, salvage=ZERO):
     )
 
 
+def _founding(m, seed=99, addr="/n0.sock"):
+    """Seat a founding voting node (init is manager-only, so tests seat their own)."""
+    sk = bytes([seed] * 32)
+    pub = C.SIGNER.public(sk)
+    m.node_genesis(pub, C.prove_possession(sk), [addr] if addr else [])
+    return pub
+
+
 class TestRecoverDecisionPure(unittest.TestCase):
     # The load-bearing interlock as a pure function — the whole matrix, no sockets.
     def test_quorum_answering_always_refuses(self):
@@ -117,14 +125,17 @@ class TestManagerOps(unittest.TestCase):
                 m.cert_issue("client", sub, forged)
             self.assertNotIn(sub.hex(), [c["subject"] for c in m.state.certs])
 
-    def test_node_spawn_emits_a_verifiable_pop_for_the_held_key(self):
+    def test_mint_identity_emits_a_verifiable_pop_for_the_held_key(self):
+        from dudefs.manager import mint_identity
+
         with tempfile.TemporaryDirectory() as d:
-            m = Manager.init(d)
-            pub, keyfile, pop = m.node_spawn()
+            pub, keyfile, pop = mint_identity(d, "node")  # keys generate where they live
+            self.assertTrue(keyfile.endswith("node.key"))
             self.assertTrue(C.verify_possession(pub, pop))  # the pop matches the pubkey
             with open(keyfile, "rb") as f:
                 self.assertEqual(C.SIGNER.public(f.read()), pub)  # and the local key is the sk
             # the pop the node hands over actually certifies it
+            m = Manager.init(d)
             op = m.cert_issue("node", pub, pop)
             self.assertIsNotNone(ctl.decode(op))
 
@@ -156,6 +167,7 @@ class TestManagerOps(unittest.TestCase):
     def test_revoke_stages_rotate_bumps_keyepoch_and_wraps_all_members(self):
         with tempfile.TemporaryDirectory() as d:
             m = Manager.init(d)
+            _founding(m)
             sub = C.SIGNER.public(bytes([9] * 32))
             m.cert_issue("client", sub, C.prove_possession(bytes([9] * 32)))
             self.assertEqual(m.state.keyepoch, 0)
@@ -180,7 +192,8 @@ class TestManagerOps(unittest.TestCase):
 
     def test_promote_refuses_even_roster(self):
         with tempfile.TemporaryDirectory() as d:
-            m = Manager.init(d)  # roster = 1 (odd)
+            m = Manager.init(d)
+            _founding(m)  # roster = 1 (odd)
             npub = C.SIGNER.public(bytes([5] * 32))
             m.node_add(npub)
             with self.assertRaises(ManagerError):
@@ -190,6 +203,7 @@ class TestManagerOps(unittest.TestCase):
     def test_node_add_rejects_duplicate(self):
         with tempfile.TemporaryDirectory() as d:
             m = Manager.init(d)
+            _founding(m)
             npub = C.SIGNER.public(bytes([5] * 32))
             m.node_add(npub)
             with self.assertRaises(ManagerError):
@@ -213,15 +227,18 @@ class TestManagerOps(unittest.TestCase):
             self.assertEqual(body.subject, npub)
             self.assertEqual(body.addrs, [(b"unix", b"/run/node5.sock", {})])
 
-    def test_init_seeds_the_genesis_endpoint(self):
+    def test_node_genesis_seats_the_founding_node(self):
         from dudefs import fold, transports
 
         with tempfile.TemporaryDirectory() as d:
-            m = Manager.init(d, node_addr="/run/node0.sock")
+            m = Manager.init(d)
+            self.assertEqual(m.state.roster, [])  # manager-only genesis
+            pub = _founding(m, addr="/run/node0.sock")
+            self.assertEqual(m.state.roster, [pub])  # sole voting member
             book = fold.endpoints_of(self._control_log(d), m.state.manager_pub)
-            self.assertEqual(
-                book[m.state.roster[0]], [transports.Endpoint(b"unix", "/run/node0.sock", False)]
-            )
+            self.assertEqual(book[pub], [transports.Endpoint(b"unix", "/run/node0.sock", False)])
+            with self.assertRaises(ManagerError):  # genesis-only
+                _founding(m, seed=98)
 
     def test_cert_issue_rejects_unknown_kind(self):
         with tempfile.TemporaryDirectory() as d:
@@ -333,6 +350,7 @@ class TestManagerOps(unittest.TestCase):
     def test_fence_authoring_produces_the_recovery_pair(self):
         with tempfile.TemporaryDirectory() as d:
             m = Manager.init(d)
+            _founding(m)
             rep = _report(1, [], salvage=A.HLC(500, 0))  # nobody answers
             ckpt, rop = m.author_recovery_fence(rep)
             cbody = ctl.decode(ckpt)
@@ -385,7 +403,8 @@ class TestManagerOps(unittest.TestCase):
         from dudefs import transports
 
         with tempfile.TemporaryDirectory() as d:
-            m = Manager.init(d)  # roster = [node0], no endpoint
+            m = Manager.init(d)
+            _founding(m, addr="")  # roster = 1, endpoint set below
             # a synthetic prober answers node0's Endpoint with a floor — no sockets
             ep0 = transports.Endpoint(transports.UNIX, "/n0.sock")
             m.state.node_addrs[m.state.roster[0].hex()] = [ep0]

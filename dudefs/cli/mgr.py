@@ -22,13 +22,25 @@ from ._args import dir_arg, pop, pubkey
 # --------------------------------------------------------------------------- #
 def cmd_init(args: argparse.Namespace) -> int:
     try:
-        m = Manager.init(args.dir, node_addr=args.node_addr)
+        m = Manager.init(args.dir)
     except ManagerError as e:
         print(f"refusing: {e}", file=sys.stderr)
         return U.REFUSE_EXISTING
-    print(f"initialized dudefs at {args.dir}")
+    print(f"initialized dudefs manager at {args.dir}")
     print(f"  manager (root): {m.state.manager_pub.hex()}")
-    print(f"  node0:          {m.state.roster[0].hex()}")
+    print("  seat the founding node:  dude mgr node genesis <pub> <pop> <addr>")
+    return U.OK
+
+
+def cmd_node_genesis(args: argparse.Namespace) -> int:
+    m = Manager.load(args.dir)
+    try:
+        cert = m.node_genesis(bytes.fromhex(args.pubkey), bytes.fromhex(args.pop), args.addr)
+    except ManagerError as e:
+        print(f"refusing: {e}", file=sys.stderr)
+        return U.ERR
+    print(f"seated founding node {args.pubkey} (sole voting member, epoch {m.state.epoch})")
+    print(f"  STORE cert: {cert.op_hash.hex()}   endpoints: {', '.join(args.addr) or '(none)'}")
     return U.OK
 
 
@@ -134,16 +146,6 @@ def cmd_revoke(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------- #
 # mgr node — roster membership + reachability                                 #
 # --------------------------------------------------------------------------- #
-def cmd_node_spawn(args: argparse.Namespace) -> int:
-    # transitional (moves to self-side `node init` in Phase 2, keys-generate-where-they-live)
-    m = Manager.load(args.dir)
-    pub, keyfile, pp = m.node_spawn()
-    print(f"spawned node identity {pub.hex()} (key: {keyfile})")
-    print(f"  authorize it:  dude mgr node authorize {pub.hex()} {pp.hex()}")
-    print(f"  add it:        dude mgr node add {pub.hex()} <addr>")
-    return U.OK
-
-
 def cmd_node_add(args: argparse.Namespace) -> int:
     m = Manager.load(args.dir)
     pub = bytes.fromhex(args.pubkey)
@@ -260,9 +262,9 @@ def register(sub: argparse._SubParsersAction) -> None:
     mgr = sub.add_parser("mgr", aliases=["m", "manager"], help="control plane (manager authority)")
     msub = mgr.add_subparsers(dest="mgr_cmd", required=True)
 
-    init = dir_arg(msub.add_parser("init", help="mint root key + genesis"))
-    init.add_argument("--node-addr", default="", help="endpoint for the genesis node")
-    init.set_defaults(fn=cmd_init)
+    dir_arg(msub.add_parser("init", help="manager genesis (root key + group master)")).set_defaults(
+        fn=cmd_init
+    )
     dir_arg(msub.add_parser("status", help="roster/floors/finality health")).set_defaults(
         fn=cmd_status
     )
@@ -277,7 +279,11 @@ def register(sub: argparse._SubParsersAction) -> None:
     # mgr node …
     node = msub.add_parser("node", help="roster membership + reachability")
     nsub = node.add_subparsers(dest="node_cmd", required=True)
-    dir_arg(nsub.add_parser("spawn", help="mint a node identity")).set_defaults(fn=cmd_node_spawn)
+    ngen = dir_arg(nsub.add_parser("genesis", help="seat the founding node (unilateral)"))
+    pubkey(ngen)
+    pop(ngen)
+    ngen.add_argument("addr", nargs="*", help="dial address(es)")
+    ngen.set_defaults(fn=cmd_node_genesis)
     _authorize_leaf(nsub, "node")
     nadd = dir_arg(nsub.add_parser("add", help="add a learner with its endpoint"))
     pubkey(nadd)

@@ -7,8 +7,21 @@ from __future__ import annotations
 
 import argparse
 
+from ..manager import mint_identity
 from . import _util as U
-from ._args import sock_arg
+from ._args import dir_arg, sock_arg
+
+
+def cmd_init(args: argparse.Namespace) -> int:
+    pub, keyfile, pop = mint_identity(args.dir, "client")
+    U.print_minted(
+        "client",
+        pub,
+        keyfile,
+        pop,
+        f"authorize it:  dude mgr client authorize {pub.hex()} {pop.hex()}",
+    )
+    return U.OK
 
 
 def cmd_set(args: argparse.Namespace) -> int:
@@ -100,6 +113,10 @@ def _worker_leaves(sub, *, top: bool) -> None:
 
 
 def register(sub: argparse._SubParsersAction) -> None:
-    client = sub.add_parser("client", help="client worker verbs (dial a running `client serve`)")
-    _worker_leaves(client.add_subparsers(dest="client_verb", required=True), top=False)
+    client = sub.add_parser("client", help="run a client / worker verbs")
+    csub = client.add_subparsers(dest="client_verb", required=True)
+    dir_arg(csub.add_parser("init", help="mint this client's identity keyfile")).set_defaults(
+        fn=cmd_init
+    )
+    _worker_leaves(csub, top=False)
     _worker_leaves(sub, top=True)  # top-level get/set/cas/del shortcuts
