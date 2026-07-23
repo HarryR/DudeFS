@@ -48,6 +48,15 @@ def _gossip_request(summ: gossip.Summary) -> bytes:
     return codec.encode([b"gossip", gossip.encode_summary(summ)])
 
 
+def _cut_dominates(
+    new: dict[bytes, tuple[int, bytes]], cur: dict[bytes, tuple[int, bytes]]
+) -> bool:
+    """Does `new` per-author advance-or-hold every author of `cur`? (A checkpoint's cut may
+    add authors / higher seqs, but must never take one BACKWARDS — GC past a cut is
+    irreversible, WP-F(a)/#4.) Vacuously true against the empty (pre-first-checkpoint) cut."""
+    return all((e := new.get(a)) is not None and e[0] >= seq for a, (seq, _h) in cur.items())
+
+
 class NodeDaemon:
     """One storage node: an Acceptor + store, served over a socket, kept converged
     by anti-entropy, and self-auditing for evidence."""
@@ -281,6 +290,8 @@ class NodeDaemon:
         # scan + pick + baseline-check in ONE read snapshot
         with self.store.read_txn() as tx:
             all_ops = tx.all_ops()
+            cur_cut = tx.cut()  # the checkpoint I've already adopted (empty before the first)
+            cur_horizon = tx.get_horizon()
             for op in sorted(all_ops, key=lambda o: (o.hlc.as_tuple(), o.op_hash)):
                 if op.is_control:
                     reducer.observe(op)  # authorization state up to here
@@ -308,6 +319,16 @@ class NodeDaemon:
                 # cut-lag margin: the horizon is exactly F, not F − W (W is vestigial —
                 # the audit is deterministic recomputation, not a timed race).
                 if any(covered(o, body.cut) and o.hlc > body.horizon for o in all_ops):
+                    continue
+                # WP-F(a) / #4 — never adopt a checkpoint that would REGRESS what I hold: GC
+                # past a cut and the monotone horizon are both irreversible, so a cut that
+                # does not per-author dominate my adopted cut, or a lower horizon, is impossible
+                # by definition — refuse it (a later valid checkpoint supersedes). Divergence
+                # on INCOMPARABLE cuts (concurrent compactors) is the sequence-slot's job
+                # (WP-F(c)); this closes the regression case.
+                if body.horizon.as_tuple() < cur_horizon.as_tuple() or not _cut_dominates(
+                    body.cut, cur_cut
+                ):
                     continue
                 if best is None or op.hlc > best[0].hlc:
                     best = (op, body)

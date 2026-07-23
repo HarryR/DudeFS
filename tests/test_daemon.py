@@ -466,6 +466,121 @@ class TestDaemonAdoption(unittest.TestCase):
             self.assertIsNotNone(tx.get_op(first.op_hash))  # dead NOT GC'd
 
 
+class TestAdoptionValidityGate(unittest.TestCase):
+    """WP-F(a) / #4: adoption refuses a checkpoint that would REGRESS the cut or horizon —
+    both are irreversible (destructive GC, monotone void-rule horizon), so a non-dominating
+    checkpoint is impossible-by-definition. Two INDEPENDENT keys (no supersession -> the first
+    checkpoint GCs nothing), so the losing checkpoint's baseline still verifies and it is the
+    DOMINANCE gate — not a missing-baseline defer — that refuses it."""
+
+    def _setup(self, seed):
+        from dudefs import fold
+        from dudefs.store import covered
+
+        w = World(seed=seed, n_clients=1)
+        roster = [C.SIGNER.public(bytes([200 + i] * 32)) for i in range(3)]
+        d = _daemon(w, 0, roster)
+        full = list(w.control_ops)
+        k1 = w.cas(
+            0,
+            b"k1",
+            A.VERSION_ABSENT,
+            0,
+            [[A.Guard.ABSENT, b"k1"]],
+            [[A.Mutation.SET, b"k1", b"a"]],
+        )
+        k2 = w.cas(
+            0,
+            b"k2",
+            A.VERSION_ABSENT,
+            0,
+            [[A.Guard.ABSENT, b"k2"]],
+            [[A.Mutation.SET, b"k2", b"b"]],
+        )
+        full += [k1, k2]
+        mgr_head = (w._mseq - 1, w._mprev)  # manager frontier BEFORE any checkpoint op
+        cut_big = {w.clients[0].pub: (1, k2.op_hash), w.mgr_pub: mgr_head}  # covers k1 + k2
+        cut_small = {w.clients[0].pub: (0, k1.op_hash), w.mgr_pub: mgr_head}  # covers k1 only
+        with d.store.write_txn() as tx:
+            for o in full:
+                tx.append(o)
+        return w, d, roster, full, cut_big, cut_small, covered, fold
+
+    def _adopt(self, d, w, roster, full, cut, horizon, covered):
+        from dudefs import compactor
+
+        below = [o for o in full if covered(o, cut)]
+        cr = compactor.compact_genesis(below, w.keyring, w.genesis, cut)
+        ckpt = w.checkpoint(
+            cut=cut,
+            state_acc=cr.state_acc,
+            dead=cr.dead,
+            retained=A.retained_commitment(cr.retained),
+            horizon=horizon,
+        )
+        sks = [bytes([200 + i] * 32) for i in range(3)]
+        recs = [
+            A.Receipt.issue(sks[i], roster[i], ckpt.op_hash, 0, A.Ballot(1, b"c"), 1)
+            for i in range(3)
+        ]
+        with d.store.write_txn() as tx:
+            tx.append(ckpt)
+            tx.put_qc(A.QC.assemble(recs, 3, {p: i for i, p in enumerate(roster)}))
+        d.adopt_committed_checkpoints()
+        return ckpt
+
+    def test_regressing_cut_is_refused(self):
+        w, d, roster, full, cut_big, cut_small, covered, _ = self._setup(50)
+        try:
+            big = self._adopt(d, w, roster, full, cut_big, A.HLC(500, 0), covered)
+            with d.store.read_txn() as tx:
+                self.assertEqual(tx.get_meta("checkpoint"), big.op_hash)  # adopted
+            # a checkpoint at the SMALLER cut (client seq 0 < 1), authored later so its hlc is
+            # HIGHER — adoption would otherwise prefer it. Its baseline verifies (nothing GC'd),
+            # so only the dominance gate can refuse it.
+            small = self._adopt(d, w, roster, full, cut_small, A.HLC(500, 0), covered)
+            with d.store.read_txn() as tx:
+                self.assertEqual(tx.get_meta("checkpoint"), big.op_hash)  # STILL big
+                self.assertEqual(dict(tx.cut()), cut_big)  # the cut did not regress
+                self.assertNotEqual(dict(tx.cut()), cut_small)
+                del small
+        finally:
+            d.close()
+
+    def test_regressing_horizon_is_refused(self):
+        w, d, roster, full, cut_big, _cut_small, covered, _ = self._setup(51)
+        try:
+            hi = self._adopt(d, w, roster, full, cut_big, A.HLC(1000, 0), covered)
+            with d.store.read_txn() as tx:
+                self.assertEqual(tx.get_meta("checkpoint"), hi.op_hash)
+                self.assertEqual(tx.get_horizon(), A.HLC(1000, 0))
+            # SAME cut (so it dominates) but a LOWER horizon, higher hlc -> refused: the
+            # void-rule horizon is monotone and must never walk back.
+            self._adopt(d, w, roster, full, cut_big, A.HLC(500, 0), covered)
+            with d.store.read_txn() as tx:
+                self.assertEqual(tx.get_meta("checkpoint"), hi.op_hash)  # unchanged
+                self.assertEqual(tx.get_horizon(), A.HLC(1000, 0))  # horizon did not regress
+        finally:
+            d.close()
+
+    def test_dominating_checkpoint_is_adopted(self):
+        w, d, roster, full, cut_big, cut_small, covered, _ = self._setup(52)
+        try:
+            self._adopt(
+                d, w, roster, full, cut_small, A.HLC(500, 0), covered
+            )  # adopt the small cut
+            big = self._adopt(
+                d, w, roster, full, cut_big, A.HLC(500, 0), covered
+            )  # dominates -> adopt
+            with d.store.read_txn() as tx:
+                self.assertEqual(
+                    tx.get_meta("checkpoint"), big.op_hash
+                )  # advanced to the bigger cut
+                self.assertEqual(dict(tx.cut()), cut_big)
+        finally:
+            d.close()
+
+
 class TestFreshBootstrap(unittest.TestCase):
     def test_fresh_member_bootstraps_the_sparse_baseline_over_gossip(self):
         # WP-E / Finding 1 (T-C): a node that adopted a checkpoint holds only the sparse

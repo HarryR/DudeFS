@@ -24,7 +24,7 @@
 > checkpoint: GC + persist cut/horizon; reconstructs prev from the store; state-machine tested
 > across restart orderings). **WP-G uses the BLIND commit path — safe only under one honest
 > compactor; WP-F(c) replaces it with sequence-slotting.** **Remaining:** **WP-F** — checkpoints
-> as quorum-consensus ops: (a) adoption validity gate [do first, cheap], (c) sequence-slotting
+> as quorum-consensus ops: (a) adoption validity gate [DONE — cut+horizon dominance], (c) sequence-slotting
 > [RULED §7.1]; WP-H recovery variant (#12); WP-J manager control-plane compaction.
 
 ## 1. Why this is a milestone
