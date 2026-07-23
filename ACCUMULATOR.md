@@ -1,10 +1,11 @@
 # ACCUMULATOR — the state accumulator (state clock)
 
-> **Status: normative draft (for review).** Supersedes the binary Merkle `state_root`
-> (DESIGN §12, `fold.state_root`) as the checkpoint audit anchor and the state-coherence
-> primitive. Corrects the "zero-knowledge forces the oracle upward" premise in the
-> `compactor.py` header (§2). Consumers: DESIGN §12, HANDOFF-R6 (WP-B is rewritten
-> against this), FORMAL.md (soundness obligation).
+> **Status: normative (ratified).** Supersedes the binary Merkle `state_root` (DESIGN §12)
+> as the checkpoint audit anchor and the state-coherence primitive; construction ruled ECMH
+> over ed25519 (§6.1) and landed in code (`crypto`/`fold`/`compactor`/`control`). Also
+> retires the cut-lag window `W` (§2/§7). Refines the "zero-knowledge forces the oracle
+> upward" premise in the `compactor.py` header (§2). Referenced by DESIGN §12; FORMAL.md
+> carries the soundness obligation (§8).
 
 ## 0. Summary
 
@@ -63,18 +64,33 @@ actually matters.
     header: the ZK-node premise stands; "only the compactor decrypts" becomes "all
     key-holders decrypt; the compactor is merely the one that runs compaction, and its
     peers verify it.")*
-- **So the audit is a key-holder's continuous, incremental duty — not a race.** A client
-  that maintained the previous cut's clock `A_prev` and folds the committed inter-cut tail
-  computes `A_prev ⊕ Δ(tail)` and checks it against the compactor's claimed `A_cut` (§5.1).
-  This catches a **mis-selecting** compactor — a dropped live winner, a resurrected
-  tombstone, a stale value — using only the **clock + the tail**, never full history, and
-  with **no window `W`**: the tail is in hand before any GC, and the client's clock advances
-  continuously. `W` reverts to its one real meaning, a *client-staleness* knob, unentangled
-  from the audit.
+- **What makes GC safe is structural, not a race — and clients never ratify.** Storage
+  nodes enforce the checkpoint's *partition* without decrypting: every committed op ≤ cut
+  is classified `dead` or `retained`, and `(below-cut ∖ dead)` must hash to the checkpoint's
+  `retained` commitment — this is `verify_baseline`, already wired into adoption. A node
+  holding an op the compactor tried to silently drop recomputes a mismatching digest and
+  refuses the checkpoint, so **no committed op can be silently omitted**. GC then proceeds
+  on the compactor's authority (a `compact`-cap identity) + its committed QC + this
+  partition check. **Clients are never waited on** — ephemeral, offline, provisioned by the
+  day and dropped (or persistent for months), they cannot ratify anything in-band; a
+  checkpoint is a *fast-sync artifact*, and what a client signs is its own lineage.
+- **The residual trust is the dead-set *classification*** — whether an op marked `dead` was
+  *actually* superseded, which a ZK node cannot check. It is caught **opportunistically**,
+  against **client-durable evidence**: an author holds its ops and their QCs indefinitely
+  (the lineage it signs), so "op `O` was committed" is provable weeks later, long after
+  every node GC'd its copy. So catching a mis-classification **never races GC** — the
+  evidence does not expire with GC. A bad checkpoint is a *trusted-compactor compromise*
+  (same class as manager compromise): detected into portable evidence, ejected, recovered
+  via the fence path — never prevented, never timed. **There is no `W`** (the cut is exactly
+  ≤ F, not F − W; §7).
+- The **accumulator is the mechanism** of that opportunistic audit: a key-holder with
+  continuity across the cut recomputes `A_cut =? A_prev ⊕ Δ(tail)` (or, cold-bootstrapping,
+  the internal-consistency check `A(barrier) =? A_cut`) in O(Δ) and shouts on mismatch
+  (§5.1) — cheap enough that any key-holder does it as a matter of course.
 
-This splits the accumulator into **two views** (§5): a ZK **structural** clock the storage
-nodes maintain (op/slot coherence, no keys), and the **semantic** state clock the
-key-holders maintain (the checkpoint's cleartext audit anchor, replacing `state_root`).
+This gives the accumulator **two views** (§5): a ZK **structural** clock the storage nodes
+maintain (op/slot coherence, no keys), and the **semantic** state clock the key-holders
+maintain (the checkpoint's cleartext audit anchor, replacing `state_root`).
 
 ## 3. The state accumulator
 
@@ -138,20 +154,24 @@ The checkpoint carries `A_cut` (the semantic clock at the cut) in place of `stat
 A **key-holding client** audits it — a storage node cannot and does not. Two checks, by
 capability:
 
-- **Continuous key-holder — mis-selection audit (the strong one).** A client holding the
-  prior cut's clock `A_prev` and the committed inter-cut tail verifies the *transition*:
-  `A_cut =? A_prev ⊕ Δ(tail)`, `Δ(tail)` folded from ops it already holds. A dropped
-  winner / resurrected tombstone / stale value perturbs `Δ` and fails the check. **O(Δ),
-  no full history, no window.** This is what keeps a trusted-but-fallible compactor honest.
+- **Continuous key-holder — mis-selection audit.** A client holding the prior cut's clock
+  `A_prev` and the committed inter-cut tail verifies the *transition*:
+  `A_cut =? A_prev ⊕ Δ(tail)`, `Δ(tail)` folded from ops it already holds. A wrongly-dropped
+  winner / resurrected tombstone / stale value perturbs `Δ` and fails the check. **O(Δ), no
+  full history, no window** — the evidence (the ops in `Δ`) is client-durable, so this catch
+  can happen any time, not before a deadline. This is what makes the dead-set classification
+  auditable (§2); silent *omission* is separately foreclosed by the storage nodes'
+  `verify_baseline` partition check.
 - **Cold-bootstrapping client — internal-consistency check.** With no `A_prev`, a client
   computes `A(barrier)` from the retained winners + unsealed sidecar (WP-A) and checks
   `== A_cut`: the claimed state matches the shipped retained set (catches tampering /
   corruption; the sidecar is part of the element, so a wrong attempt fails here too). It
-  cannot *independently* catch mis-selection — it has nothing prior to compare against, so
-  it trusts the checkpoint it boots from, a trust backed by the continuous auditors above.
+  cannot *independently* catch mis-classification — it has nothing prior to compare against,
+  so it trusts the checkpoint it boots from (weak subjectivity — the accepted price of
+  fast-sync), a trust backed by the continuity-holding auditors above.
 
-Mismatch ⇒ reject loudly. No privileged full-history holder, no O(n) snapshot — the audit
-is a cheap key-holder duty, and mis-selection is caught in O(Δ) by anyone with continuity.
+Mismatch ⇒ reject loudly. No privileged full-history holder, no O(n) snapshot, no window —
+a cheap key-holder duty, done as a matter of course by anyone with continuity.
 
 ### 5.2 Consensus strengthening — two coherence checks, by view
 
@@ -240,20 +260,22 @@ claimed bytes), which is the only thing Ristretto's decode-side bijection would 
 check confirmed order-independence and incremental removal (`A_{a,b,c} − φ(b) == A_{a,c}`);
 32-byte digest. `crypto_core_ristretto255_*` is **absent** — hence the ed25519-direct route.
 
-## 7. Integration (what changes)
+## 7. Integration (landed)
 
-- `fold.state_root` (Merkle) and `state_root_of_barrier` → `fold.state_acc(barrier)` /
-  the incremental clock update; `_merkle_root` retired.
-- `Checkpoint.state_root: bytes` → `Checkpoint.state_acc` (the accumulator value; width per
-  construction). A wire-format change ⇒ the checkpoint golden vectors move (behavior commit).
-- `compactor.verify_state_root` → `verify_state_acc`, the equality/transition check of §5.1.
-- The compactor maintains the semantic `A` on its warm incremental fold and stamps `A_cut`
-  per checkpoint (O(Δ)). Key-holding clients maintain `A` and run the §5.1 transition audit;
-  storage nodes maintain the *structural* clock (§5.2) for ZK anti-entropy. `A` may ride the
-  gossip summary.
-- The `compactor.py` header is *refined*, not retired (§2): the ZK-storage-node premise
-  stands; "only the compactor decrypts" → "all key-holders decrypt; the compactor runs
-  compaction and its key-holding peers verify it."
+- `fold.state_root`/`_merkle_root`/`state_root_of_barrier` → `fold.state_acc(barrier)` +
+  the incremental clock update (`crypto.acc_element`/`acc_add`/`acc_sub`/`ACC_IDENTITY`).
+- `Checkpoint.state_root: bytes` → `Checkpoint.state_acc` (a 32-byte ECMH point). Wire-format
+  change — the checkpoint golden vectors moved (behavior commit).
+- `compactor.verify_state_root` → `verify_state_acc`, the §5.1 check. The `compactor.py`
+  header refined per §2 (ZK-storage-node premise stands; the compactor is one key-holder,
+  its peers verify).
+- **`W` deleted; the horizon is exactly F.** `adopt_committed_checkpoints` refuses any
+  checkpoint whose `horizon` does not cover its `cut` (every op ≤ cut sits at/below the
+  horizon = F) — a structural, cleartext-hlc check, alongside the QC-verify and the
+  `verify_baseline` partition. There is no `cut ≤ F − W`, no cut-lag tunable.
+- **Not yet built (rides WP-G — the compactor driver):** the compactor maintaining the warm
+  `A` and stamping `A_cut` incrementally; the storage nodes' *structural* clock (§5.2) for ZK
+  anti-entropy; `A` on the gossip summary; the cut ≤ quorum-attested-F check at mint.
 
 ## 8. Soundness obligation (for FORMAL.md)
 

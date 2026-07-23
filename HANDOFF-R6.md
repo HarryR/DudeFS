@@ -59,7 +59,7 @@ already-adopted party** (store.py:377-380,438-453); adopt-before-GC ordering (da
 below-cut QCs — more conservative than DESIGN.md:343.)
 
 **Known stubs / unwired (first pass):** encrypted `attempts` sidecar is `b""` everywhere, seal/unseal
-unbuilt (NOTES 29a MANDATORY → A4 break); `state_root` computed+carried but **never verified**;
+unbuilt (NOTES 29a MANDATORY → A4 break); `state_acc` computed+carried but **never verified**;
 client fold (client.py:492) has no barrier so bootstrap-from-checkpoint is unwired; no production
 cut/W selector; no compactor identity/chain; `quorum.Commit` slotted-only so no blind-commit driver.
 
@@ -79,7 +79,7 @@ cut/W selector; no compactor identity/chain; `quorum.Commit` slotted-only so no 
 | 10 | **Dead deltas not applied in chain order** — adoption leaps to max-`hlc`; skipped intermediate deltas' ops pollute `baseline_digest` → `verify_baseline` mismatch → **adoption wedges**. | IMPL-DIFF | daemon.py:250-275; gossip.py:184 | a node that skipped a checkpoint can't adopt the next |
 | 11 | **Per-retained-op provenance unverified at intake** — baseline winners via `put_op_raw` stored on digest-match only, no author-sig/cert-chain check. | DOC-UNBUILT | gossip.py:166 | §12:347 "verify every retained op" assumed, not done |
 | 12 | **Recovery variant unwired + empty** — recovery fence does epoch-switch only (no cut/horizon/GC adoption); recovery checkpoint authored with empty cut/retained (no salvage manifest); `detect_lost_commits` never run by a node. | DOC-UNBUILT | daemon.py:279-291; manager.py:487; daemon.py:341-343 | post-recovery: no horizon protection, no manifest, no disclosure |
-| 13 | **Compactor completeness precondition unasserted** — no check the compactor holds the full below-cut set before sealing; only backstop is the unbuilt `state_root` verify. | DOC-UNBUILT | compactor.py:63-157 | a lagged compactor seals a wrong `dead`/winner, caught by nothing |
+| 13 | **Compactor completeness precondition unasserted** — no check the compactor holds the full below-cut set before sealing; only backstop is the unbuilt `state_acc` verify. | DOC-UNBUILT | compactor.py:63-157 | a lagged compactor seals a wrong `dead`/winner, caught by nothing |
 
 **Two are live bugs today, independent of the compactor:** #3 (data race — fires on any maintenance
 tick overlapping a request, in the shipped M7 daemon; **fixed in HANDOFF-R5**, the storage
@@ -108,7 +108,7 @@ the **daemon path** before the driver that would exercise them in anger. WP-0 an
 - **WP-A — Attempts sidecar seal/unseal.** Codec between `cr.attempts` (cleartext) and the
   checkpoint's encrypted `attempts` field; wire seal into authoring, unseal into bootstrap barrier
   assembly; retire the `b""` stub. Files: `dudefs/handlers/control.py`, `dudefs/compactor.py`.
-- **WP-B — `state_root` derive-and-verify.** Recompute at intake (bootstrap + the compactor/manager
+- **WP-B — `state_acc` derive-and-verify.** Recompute at intake (bootstrap + the compactor/manager
   auditors) and compare; loud, portable audit failure on mismatch. Files: `dudefs/fold.py`, consumer.
 - **WP-C — Client/node bootstrap consumer.** Route the client fold through the checkpoint barrier
   (`barrier_state` + unsealed sidecar) instead of the unconditional full-history fold (client.py:492).
@@ -143,7 +143,7 @@ sits on; the guards below run inside R5's per-connection write transactions.*
 
 **The driver**
 - **WP-G — Compactor identity + author + commit + daemon.** Cap.COMPACT-signed checkpoint on the
-  compactor's own chain; cut/W selector (F = quorum floor, `cut ≤ F − W`, W a δ-family constant);
+  compactor's own chain; cut selector (F = quorum floor, `cut ≤ F` — W retired, ACCUMULATOR §2/DESIGN §12);
   blind-commit of the slotless checkpoint (extract from `client._commit_blind`); `compactor run`
   (continuous) / `once`. Own gossip-synced replica; keys via wrap-unwrap. Files: new
   `dudefs/compactor_daemon.py`.
@@ -162,7 +162,7 @@ sits on; the guards below run inside R5's per-connection write transactions.*
 
 All lifecycle tests run against `NodeDaemon` (post WP-I), not the sim.
 - **T-A sidecar roundtrip** (WP-A) — seal→carry(checkpoint op)→unseal; nonzero-`attempt` key survives.
-- **T-B state_root audit** (WP-B) — tampered `state_root`/omitted-live/kept-superseded → loud reject.
+- **T-B state_acc audit** (WP-B) — tampered `state_acc`/omitted-live/kept-superseded → loud reject.
 - **T-C bootstrap consumer** (WP-C/E) — a fresh **daemon** node + client bootstrap a **GC'd** cluster
   and read byte-identically to a full-history client; A4 across a nonzero-`attempt` key; resurrection
   mask holds; reborn-tag CAS folds `stale`. **This is the "starts after compaction, replays to the
@@ -171,7 +171,7 @@ All lifecycle tests run against `NodeDaemon` (post WP-I), not the sim.
   is refused; the client no-accept guard fires on a below-horizon promise (reproduces Finding 7).
 - **T-E checkpoint lifecycle** (WP-G) — compactor authors a real **sealed** checkpoint → blind-commit
   to a quorum → gossip → nodes adopt (horizon advances, `dead` GC'd), carrying a nonempty sidecar and
-  verifiable `state_root`.
+  verifiable `state_acc` (ECMH accumulator, ACCUMULATOR.md).
 - **T-F concurrency** (WP-F) — cut cannot
   regress (#4); an unverified/forged QC is rejected (#5); two compactors converge deterministically
   or the non-elected is ignored (#6); dead-delta skip resyncs rather than wedges (#10).

@@ -152,7 +152,7 @@ cluster.
 The compactor daemon (`compactor run`/`once`) and manager-log compaction were an earlier
 "Phase 5" here. Exploration showed compaction is **half-implemented** — a sound fold kernel
 but an absent driver, two *mandatory* correctness properties stubbed (the encrypted `attempts`
-sidecar and `state_root` derive-and-verify), and the client bootstrap consumer unwired — with
+sidecar and `state_acc` derive-and-verify), and the client bootstrap consumer unwired — with
 its own substantial testing arc (notably: a client that starts *after* compaction and must
 replay to the same state as every other node). It is therefore a **separate milestone with
 its own work-order: see [HANDOFF-R6.md](HANDOFF-R6.md).** It **precedes** this CLI milestone

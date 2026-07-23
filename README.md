@@ -65,7 +65,7 @@ dudefs/
   handlers/
     data.py        # L6 data/txn handler (client-only): AEAD open + guard evaluation
     control.py     # L6 control handlers: roster / cert / rotate / wrap-set / checkpoint / pver bodies
-  fold.py          # L5 full profile (clients) + ControlReducer (nodes) + state_root + keyring_from_masters
+  fold.py          # L5 full profile (clients) + ControlReducer (nodes) + state_acc + keyring_from_masters
   store.py         # L2 sqlite ChainStore: contiguity, evidence, receipts, QCs, slots, durable floor/horizon/epoch
   acceptor.py      # L3 per-slot Acceptor (SUBMIT/PREPARE/ACCEPT) + skew gates + watermarks + void rule
   node.py          # NodeAPI Protocol (the §1 verbs) + typed requests + LocalNode adapter

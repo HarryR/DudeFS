@@ -26,7 +26,7 @@
 | Author + receipt signatures | **Ed25519, permanently for v1** — BLS12-381 DECLINED (below) |
 | Payload AEAD (`xcs1`) | **XChaCha20-Poly1305-IETF with SIV-style derived nonce** (misuse-resistant in practice; below) |
 | Wrap-sets (`sbx1`) | **libsodium sealed box** (X25519-XSalsa20-Poly1305, anonymous), recipient key **derived from the member's Ed25519 identity** (`crypto_sign_ed25519_pk_to_curve25519`) — one identity keypair per member, nothing new to distribute or rotate separately |
-| PRF / hashing / KDF | **keyed BLAKE2b** everywhere, domain-separated via `person` (`dude.tag`, `dude.nonce`, merkle domains) — unchanged from POC |
+| PRF / hashing / KDF | **keyed BLAKE2b** everywhere, domain-separated via `person` (`dude.tag`, `dude.nonce`, `dude.acc` — the accumulator's hash-to-curve input) — unchanged from POC |
 | Backend | **PyNaCl (libsodium; PyCA-maintained)** — the single `uv`-managed crypto dependency on top of stdlib. **No vendored oracle, no no-native lane** (NOTES 46 de-hedge): libsodium does not need our differential testing — RFC 8032 and self-generated `xcs1` golden vectors are the conformance surface; `vendor/ed25519.py` is deleted with the swap |
 
 The internal names (`xcs1`, `sbx1`) label the constructions in code and docs;
@@ -171,7 +171,7 @@ daemon consumer lands on real crypto and the demo runs encrypted:
 3. Payload golden vectors bump once (ciphertexts change op hashes). KATs: RFC
    8032 via PyNaCl, self-generated `xcs1` vectors, sealed-box roundtrip +
    wrong-recipient failure. The A4/fuzz suites now exercise real ciphertext.
-4. Slot tags, state roots, hashing: unchanged (keyed/plain BLAKE2b, stdlib).
+4. Slot tags, hashing: unchanged (keyed/plain BLAKE2b, stdlib). The **state accumulator** is ECMH over the ed25519 prime-order subgroup (`crypto_core_ed25519_from_uniform`/`add`/`sub`, PyNaCl) — not a BLAKE2b Merkle root (ACCUMULATOR.md).
    A future scheme change is a lane-2 `pver` fence + rotation, per the
    one-scheme rule above.
 

@@ -2020,3 +2020,36 @@ and A4 as formally stated. Resolutions decided with the design owner; DESIGN
       the one case that must survive, surviving. Post-L_msg the
       slotted path is "ungated" only with respect to artifact authors,
       which is correct permanently, not a compromise.
+
+61. **RULED 2026-07-23 — state accumulator (ECMH) supersedes the Merkle
+    `state_root`, and the cut-lag window `W` is DELETED (ACCUMULATOR.md
+    normative; supersedes NOTES 10/19 and the item-(g) cut-lag ruling +
+    477-480/606/809).**
+    - **`state_root` → `state_acc`.** The audit anchor is no longer a binary
+      BLAKE2b Merkle root (NOTES 10/19) — it is an **ECMH multiset hash** over
+      the ed25519 prime-order subgroup: `A = Σ from_uniform(H("dude.acc"‖enc))`,
+      `add`/`sub` the group op + inverse (PyNaCl `crypto_core_ed25519_*`; ristretto
+      not exposed, `from_uniform` clears the cofactor). 32-byte, order-independent
+      (no sort), incrementally maintained (a *state clock*): O(Δ) to author, ~O(1)
+      to verify. The Merkle tree forced an O(n) snapshot recompute — the very thing
+      that had pushed the audit into a "recompute-before-GC" race. XHASH rejected
+      (silent key-drop via GF(2) subset-cancellation), AdHash rejected (digest grows
+      with set size), RSA rejected (heavy/awkward removal). Refs: Bellare-Micciancio
+      EUROCRYPT'97, Clarke et al. ASIACRYPT'03, ECMH 2016.
+    - **`W` deleted — not renamed, not tunable.** The old model (cut ≤ F − W; resident
+      full-history clients audit within `W` before GC) rested on two falsehoods: there
+      is no "full history" (the compacted state IS the history, A4), and the compactor
+      is just another *key-holding client* whose checkpoint is exactly recomputable by
+      any peer. So the audit is deterministic recomputation, not a timed race. Silent
+      *omission* is foreclosed **structurally at the ZK storage nodes** — `retained =
+      covered ∖ dead` checked against the signed `retained` commitment (`verify_baseline`,
+      already wired) — no decryption needed. The residual dead-set *classification* trust
+      is caught **opportunistically** by any continuity-holding key-holder recomputing
+      `state_acc`, against **client-durable lineage** (an author holds its ops + QCs
+      indefinitely, so a committed op is provable long after GC — detection never races
+      GC). A bad checkpoint is a trusted-compactor compromise: detect → eject → recover,
+      never prevented. Clients are ephemeral/offline and never ratify; a checkpoint is a
+      fast-sync artifact. The cut is pinned at `F` itself; `adopt` enforces horizon-covers-
+      cut structurally (finding #8). Consequence: the **compaction trilemma collapses to a
+      two-way dial** (disk floor × bandwidth via cadence) — the audit-window axis is gone
+      (DESIGN §12 dials/trilemma updated).
