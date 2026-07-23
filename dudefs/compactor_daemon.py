@@ -17,17 +17,56 @@ from __future__ import annotations
 import threading
 
 from . import artifacts as A
-from . import compactor
+from . import compactor, transports
 from .artifacts import HLC, Op
 from .client import ClientDaemon
 from .handlers import control as ctl
-from .store import covered
 
 
 class CompactorDaemon(ClientDaemon):
     """A ClientDaemon that also authors checkpoints. Constructed identically (it is
     provisioned the same way — its Cap.COMPACT cert + back-wrapped keys arrive in the
-    control chain); `compact_once` / `run` are the compaction surface."""
+    control chain); `compact_once` / `run` are the compaction surface. It carries the last
+    checkpoint's (retained set + attempts + cut) forward so each pass is INCREMENTAL — cost
+    ∝ the churn since the last cut, never ∝ history (DESIGN §12 rev 6)."""
+
+    def __init__(
+        self,
+        sk: bytes,
+        pub: bytes,
+        *,
+        roster: list[bytes],
+        roster_addrs: list[transports.Endpoint],
+        manager_pub: bytes,
+        control_ops: list[Op] | None = None,
+        store_path: str = ":memory:",
+        epoch: int = 0,
+        keyepoch: int = 0,
+        genesis_roster: list[bytes] | None = None,
+        genesis_epoch: int = 0,
+    ):
+        super().__init__(
+            sk,
+            pub,
+            roster=roster,
+            roster_addrs=roster_addrs,
+            manager_pub=manager_pub,
+            control_ops=control_ops,
+            store_path=store_path,
+            epoch=epoch,
+            keyepoch=keyepoch,
+            genesis_roster=genesis_roster,
+            genesis_epoch=genesis_epoch,
+        )
+        self._prev_cr: compactor.CompactResult | None = None  # last checkpoint's state
+        self._prev_cut: A.Heads = {}  # its cut (distinct from ClientDaemon._prev = chain head)
+
+    @staticmethod
+    def _advances(cut: A.Heads, prev_cut: A.Heads) -> bool:
+        """Does `cut` move at least one author's frontier past `prev_cut`? (Finality is
+        monotone, so no author ever regresses — so this is exactly 'is there new sealed
+        work'.) No advance => nothing to compact this pass."""
+        return any(seq > prev_cut.get(a, (-1, b""))[0] for a, (seq, _h) in cut.items())
 
     def _cut_at(self, ops: list[Op], f: HLC) -> A.Heads:
         """The per-author frontier at the finalized floor `f`: the highest-seq op each
@@ -76,9 +115,11 @@ class CompactorDaemon(ClientDaemon):
         return op
 
     def compact_once(self) -> bytes | None:
-        """One compaction pass. Returns the committed checkpoint's op_hash, or None when
-        there is nothing final to seal (no quorum floor yet) or the quorum didn't commit."""
-        self.sync()  # pull the full committed log + set the finalized floor F
+        """One INCREMENTAL compaction pass. Returns the committed checkpoint's op_hash, or
+        None when there is nothing new+final to seal (no quorum floor / no advance since the
+        last cut) or the quorum didn't commit. The band `(prev_cut, cut]` is the only work:
+        cost ∝ churn since the last checkpoint, never ∝ history."""
+        self.sync()  # pull the committed log + set the finalized floor F
         with self._lock:
             f = self._final_frontier
         if f == HLC(0, 0):
@@ -88,17 +129,26 @@ class CompactorDaemon(ClientDaemon):
                 o for o in tx.all_ops() if o.is_control or tx.get_qc(o.op_hash) is not None
             ]
         cut = self._cut_at(committed, f)
-        if not cut:
-            return None
-        below = [o for o in committed if covered(o, cut)]
-        # genesis-first: the whole committed set below the cut. (Incremental compaction
-        # from a prior checkpoint is the next step — DESIGN §12 rev 6.)
-        cr = compactor.compact_genesis(below, self.keyring, self.genesis, cut)
+        if not cut or not self._advances(cut, self._prev_cut):
+            return None  # no new sealed work since the last checkpoint
+        # incremental: fold the previous retained set + only the newly-committed band. The
+        # first pass is the degenerate prev = ∅ (compact filters the tail to `(prev_cut, cut]`).
+        prev = self._prev_cr
+        cr = compactor.compact(
+            prev.retained if prev else [],
+            prev.attempts if prev else {},
+            self._prev_cut,
+            committed,
+            self.keyring,
+            self.genesis,
+            cut,
+        )
         ckpt = self._author_checkpoint(cr, cut, f)
         qc = self._commit_blind(ckpt)  # SUBMIT to the roster; assemble a QC of blind receipts
         if qc is None:
             return None  # couldn't reach a quorum this pass — retry next
         self._store_qc(qc)  # persist + gossip the commit proof; nodes then adopt
+        self._prev_cr, self._prev_cut = cr, cut  # carry forward for the next incremental pass
         return ckpt.op_hash
 
     def run(self, interval_s: float, stop: threading.Event | None = None) -> None:
