@@ -35,26 +35,25 @@ class TestManagerCommands(unittest.TestCase):
     def test_init_refuses_over_existing_state(self):
         with tempfile.TemporaryDirectory() as d:
             dd = os.path.join(d, "st")
-            code, out, _ = _run(["init", "--dir", dd])
+            code, out, _ = _run(["mgr", "init", "--dir", dd])
             self.assertEqual(code, 0)
             self.assertIn("initialized dudefs", out)
             self.assertTrue(ManagerState.exists(dd))
             # second init is refused (genesis-only interlock)
-            code2, _, err2 = _run(["init", "--dir", dd])
+            code2, _, err2 = _run(["mgr", "init", "--dir", dd])
             self.assertEqual(code2, 2)
             self.assertIn("refusing", err2)
 
     def test_cert_issue_authors_a_valid_write_cert(self):
         with tempfile.TemporaryDirectory() as d:
-            _run(["init", "--dir", d])
+            _run(["mgr", "init", "--dir", d])
             client_pub = C.SIGNER.public(bytes([9] * 32))
             code, out, _ = _run(
                 [
-                    "cert",
-                    "issue",
+                    "mgr",
                     "client",
+                    "authorize",
                     client_pub.hex(),
-                    "--pop",
                     C.prove_possession(bytes([9] * 32)).hex(),
                     "--dir",
                     d,
@@ -73,22 +72,21 @@ class TestManagerCommands(unittest.TestCase):
 
     def test_revoke_stages_rotate_and_bumps_keyepoch(self):
         with tempfile.TemporaryDirectory() as d:
-            _run(["init", "--dir", d])
+            _run(["mgr", "init", "--dir", d])
             sub = C.SIGNER.public(bytes([9] * 32))
             _run(
                 [
-                    "cert",
-                    "issue",
+                    "mgr",
                     "client",
+                    "authorize",
                     sub.hex(),
-                    "--pop",
                     C.prove_possession(bytes([9] * 32)).hex(),
                     "--dir",
                     d,
                 ]
             )
             self.assertEqual(ManagerState.load(d).keyepoch, 0)
-            code, out, _ = _run(["cert", "revoke", sub.hex(), "--dir", d])
+            code, out, _ = _run(["mgr", "client", "revoke", sub.hex(), "--dir", d])
             self.assertEqual(code, 0)
             self.assertIn("staged rotate -> keyepoch 1", out)
             st = ManagerState.load(d)
@@ -98,35 +96,56 @@ class TestManagerCommands(unittest.TestCase):
 
     def test_no_rotate_flag_skips_rotation_loudly(self):
         with tempfile.TemporaryDirectory() as d:
-            _run(["init", "--dir", d])
+            _run(["mgr", "init", "--dir", d])
             sub = C.SIGNER.public(bytes([9] * 32))
             _run(
                 [
-                    "cert",
-                    "issue",
+                    "mgr",
                     "client",
+                    "authorize",
                     sub.hex(),
-                    "--pop",
                     C.prove_possession(bytes([9] * 32)).hex(),
                     "--dir",
                     d,
                 ]
             )
-            code, out, _ = _run(["cert", "revoke", sub.hex(), "--no-rotate", "--dir", d])
+            code, out, _ = _run(["mgr", "client", "revoke", sub.hex(), "--no-rotate", "--dir", d])
             self.assertEqual(code, 0)
             self.assertIn("WARNING", out)
             self.assertEqual(ManagerState.load(d).keyepoch, 0)  # NOT rotated
 
     def test_node_promote_refuses_even_roster(self):
         with tempfile.TemporaryDirectory() as d:
-            _run(["init", "--dir", d])  # genesis roster = 1 node (odd)
+            _run(["mgr", "init", "--dir", d])  # genesis roster = 1 node (odd)
             npub = C.SIGNER.public(bytes([5] * 32))
-            _run(["node", "add", npub.hex(), "--dir", d])
+            _run(["mgr", "node", "add", npub.hex(), "--dir", d])
             # promoting to 2 voting members is even -> client-side refusal
-            code, _, err = _run(["node", "promote", npub.hex(), "--dir", d])
+            code, _, err = _run(["mgr", "node", "promote", npub.hex(), "--dir", d])
             self.assertEqual(code, 1)
             self.assertIn("EVEN", err)
             self.assertEqual(len(ManagerState.load(d).roster), 1)  # unchanged
+
+    def test_new_mgr_verbs_wire_end_to_end(self):
+        # the readers + endpoint RMW verbs the split just wired, exercised through argparse.
+        with tempfile.TemporaryDirectory() as d:
+            _run(["mgr", "init", "--dir", d])
+            npub = C.SIGNER.public(bytes([5] * 32)).hex()
+            self.assertEqual(_run(["mgr", "node", "add", npub, "/run/n.sock", "--dir", d])[0], 0)
+            self.assertEqual(
+                _run(["mgr", "node", "endpoint", "add", npub, "/run/n-alt.sock", "--dir", d])[0], 0
+            )
+            _, out, _ = _run(["mgr", "node", "endpoint", "list", npub, "--dir", d])
+            self.assertIn("/run/n.sock", out)
+            self.assertIn("/run/n-alt.sock", out)  # multi-homed via the CLI
+            _, out, _ = _run(["mgr", "node", "list", "--dir", d])
+            self.assertIn(npub[:16], out)  # the learner is listed
+            # compactor authorize + client authorize/list through the subject namespaces
+            for kind, seed in (("compactor", 6), ("client", 7)):
+                sub = C.SIGNER.public(bytes([seed] * 32)).hex()
+                pop = C.prove_possession(bytes([seed] * 32)).hex()
+                self.assertEqual(_run(["mgr", kind, "authorize", sub, pop, "--dir", d])[0], 0)
+            _, out, _ = _run(["mgr", "client", "list", "--dir", d])
+            self.assertIn(C.SIGNER.public(bytes([7] * 32)).hex()[:16], out)
 
 
 class TestRecoverInterlock(unittest.TestCase):
@@ -134,7 +153,7 @@ class TestRecoverInterlock(unittest.TestCase):
         # THE load-bearing interlock (MANAGER §3 / RESILIENCE §2.3): a reachable
         # quorum must hard-refuse recovery — the cluster is not dead.
         with tempfile.TemporaryDirectory() as d:
-            _run(["init", "--dir", d])
+            _run(["mgr", "init", "--dir", d])
             st = ManagerState.load(d)
             # stand up a real 3-node roster on sockets and point the state at them
             sks = [bytes([200 + i] * 32) for i in range(3)]
@@ -159,7 +178,7 @@ class TestRecoverInterlock(unittest.TestCase):
                 st.author_control(ctl.endpoint_body(roster[i], rec))
             st._set_meta(roster_seed=[p.hex() for p in roster])  # seat the genesis roster
 
-            code, out, err = _run(["recover", "--dir", d, "--dwell", "0.3"])
+            code, out, err = _run(["mgr", "recover", "--dir", d, "--dwell", "0.3"])
             self.assertEqual(code, 3)  # REFUSE_RECOVER
             self.assertIn("REFUSING recovery", err)
             self.assertIn("reachable: 3/3", out)
@@ -173,9 +192,9 @@ class TestRecoverInterlock(unittest.TestCase):
         # --fence PERFORMS the recovery — authors the checkpoint + recovery-marked
         # roster op, no placeholder narration (NOTES 55 closure item).
         with tempfile.TemporaryDirectory() as d:
-            _run(["init", "--dir", d])  # roster = 1 node, NO endpoint -> unreachable
+            _run(["mgr", "init", "--dir", d])  # roster = 1 node, NO endpoint -> unreachable
             code, out, _ = _run(
-                ["recover", "--dir", d, "--dwell", "0.2", "--i-understand-data-loss"]
+                ["mgr", "recover", "--dir", d, "--dwell", "0.2", "--i-understand-data-loss"]
             )
             self.assertEqual(code, 0)
             self.assertIn("recovery fence AUTHORED", out)
@@ -241,7 +260,7 @@ class TestClientPassthrough(unittest.TestCase):
             self.assertTrue(poll_until(committed))
 
             # `dude wheres my car` joins with '/' and renders INSPECT for a human
-            code, out, _ = _run(["wheres", "my", "car", "--sock", wsock])
+            code, out, _ = _run(["client", "wheres", "my", "car", "--sock", wsock])
             self.assertEqual(code, 0)
             self.assertIn("where is my/car:", out)
             self.assertIn("parked", out)
