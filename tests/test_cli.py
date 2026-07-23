@@ -20,7 +20,6 @@ from dudefs.handlers import control as ctl
 from dudefs.workerapi import WorkerServer
 from tests._builders import World, now_ms, poll_until, unix_eps
 
-MASTER = bytes(range(32))
 DELTA = 150
 
 
@@ -65,10 +64,12 @@ class TestManagerCommands(unittest.TestCase):
             # the control log (now the manager ChainStore) holds a decodable CERT_ISSUE
             st = ManagerState.load(d)
             with st.store.read_txn() as tx:
-                last = max(tx.all_ops(), key=lambda o: o.seq)
-            body = ctl.decode(last)
-            assert isinstance(body, ctl.CertIssue)
-            self.assertEqual(body.subject, client_pub)
+                bodies = [ctl.decode(o) for o in tx.all_ops()]
+            cert = next(b for b in bodies if isinstance(b, ctl.CertIssue))
+            self.assertEqual(cert.subject, client_pub)
+            # a client authorize ALSO back-wraps the group key to it (issue #2 gap 3)
+            wraps = [b for b in bodies if isinstance(b, ctl.WrapSet)]
+            self.assertTrue(any(client_pub in w.wraps for w in wraps))
 
     def test_revoke_stages_rotate_and_bumps_keyepoch(self):
         with tempfile.TemporaryDirectory() as d:
@@ -214,7 +215,6 @@ class TestClientPassthrough(unittest.TestCase):
             roster=roster,
             roster_addrs=unix_eps(paths),
             manager_pub=w.mgr_pub,
-            masters={0: MASTER},
             control_ops=w.control_ops,
             epoch=0,
         )

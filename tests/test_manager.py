@@ -128,6 +128,25 @@ class TestManagerOps(unittest.TestCase):
             op = m.cert_issue("node", pub, pop)
             self.assertIsNotNone(ctl.decode(op))
 
+    def test_node_authorize_wraps_nothing_client_authorize_wraps_the_full_live_set(self):
+        # issue #2 gap 3: nodes are zero-knowledge (no wrap); a key-holder is back-wrapped
+        # EVERY live keyepoch at authorize, so its fold (which spans all epochs) can decrypt.
+        with tempfile.TemporaryDirectory() as d:
+            m = Manager.init(d)
+            m.rotate()  # masters {0, 1}
+            npub = C.SIGNER.public(bytes([7] * 32))
+            m.cert_issue("node", npub, C.prove_possession(bytes([7] * 32)))
+            with m.state.store.read_txn() as tx:
+                wraps = [b for o in tx.all_ops() if isinstance(b := ctl.decode(o), ctl.WrapSet)]
+            self.assertFalse(any(npub in w.wraps for w in wraps))  # ZK node: no wrap
+
+            cpub = C.SIGNER.public(bytes([8] * 32))
+            m.cert_issue("client", cpub, C.prove_possession(bytes([8] * 32)))
+            with m.state.store.read_txn() as tx:
+                wraps = [b for o in tx.all_ops() if isinstance(b := ctl.decode(o), ctl.WrapSet)]
+            got = {w.keyepoch for w in wraps if cpub in w.wraps}
+            self.assertEqual(got, {0, 1})  # the client gets EVERY live keyepoch
+
     def test_revoke_stages_rotate_bumps_keyepoch_and_wraps_all_members(self):
         with tempfile.TemporaryDirectory() as d:
             m = Manager.init(d)

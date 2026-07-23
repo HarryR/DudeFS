@@ -24,7 +24,6 @@ from tests._builders import World, cut_of, now_ms, poll_until, unix_eps
 
 DELTA = 150  # ms — small enough that finality sweeps ~DELTA after a write, big
 # enough that same-machine client/node clock jitter never trips the skew gate.
-MASTER = bytes(range(32))  # the epoch-0 group master (finding 21 derives from it)
 
 
 class _Cluster:
@@ -58,7 +57,6 @@ class _Cluster:
             roster=self.roster,
             roster_addrs=unix_eps(self.paths),
             manager_pub=w.mgr_pub,
-            masters={0: MASTER},
             control_ops=w.control_ops,
             epoch=0,
         )
@@ -222,7 +220,6 @@ class TestWorkerAPIProtocol(unittest.TestCase):
             roster=[C.SIGNER.public(bytes([1] * 32))],
             roster_addrs=unix_eps(["/nonexistent.sock"]),
             manager_pub=w.mgr_pub,
-            masters={0: MASTER},
             control_ops=w.control_ops,
             epoch=0,
         )
@@ -363,7 +360,6 @@ class TestEndpointConsumption(unittest.TestCase):
             roster=roster,
             roster_addrs=unix_eps(["seed", "seed", "seed"]),
             manager_pub=w.mgr_pub,
-            masters={0: MASTER},
             control_ops=[*w.control_ops, *eps],
             epoch=0,
         )
@@ -396,7 +392,6 @@ class TestEndpointConsumption(unittest.TestCase):
             roster=roster,
             roster_addrs=unix_eps(["s0", "s1", "s2"]),
             manager_pub=w.mgr_pub,
-            masters={0: MASTER},
             control_ops=[*w.control_ops, *eps],
             epoch=0,
         )
@@ -484,7 +479,6 @@ class TestBootstrapConsumer(unittest.TestCase):
             roster=[self._NPUB],  # the trust anchor the QCs below verify against (issue #3)
             roster_addrs=unix_eps(["/nonexistent.sock"]),  # reads fold locally, no RPC
             manager_pub=w.mgr_pub,
-            masters={0: MASTER},
             control_ops=w.control_ops,
             epoch=0,
         )
@@ -615,6 +609,46 @@ class TestBootstrapConsumer(unittest.TestCase):
                     c._fold(tx)
         finally:
             c.close()
+
+
+class TestKeyringFromWraps(unittest.TestCase):
+    """issue #2 gap 3 + finding 21: a client authorized AFTER a rotate still receives EVERY
+    live keyepoch key (back-wrapped at authorize) and DERIVES its keyring from the log — so
+    it can read data written under an epoch that predates its own membership. No master ever
+    crosses the wire; the keyring is reconstructed from the `WRAP_SET` ops it holds."""
+
+    def test_authorize_after_rotate_back_wraps_the_full_live_set(self):
+        from dudefs.manager import Manager, ManagerState
+
+        with tempfile.TemporaryDirectory() as d:
+            m = Manager.init(d)
+            m.rotate()  # masters now {0, 1}; a newcomer must receive BOTH
+            self.assertEqual(set(m.state.masters), {0, 1})
+            want = F.keyring_from_masters(m.state.masters)
+
+            rsk = bytes([55] * 32)
+            rpub = C.SIGNER.public(rsk)
+            m.cert_issue("client", rpub, C.prove_possession(rsk))  # authorized AFTER the rotate
+            with ManagerState.load(d).store.read_txn() as tx:
+                control = sorted(tx.all_ops(), key=lambda o: o.seq)
+
+            reader = ClientDaemon(
+                rsk,
+                rpub,
+                roster=[m.state.manager_pub],
+                roster_addrs=unix_eps(["/nonexistent.sock"]),
+                manager_pub=m.state.manager_pub,
+                control_ops=control,
+                epoch=0,
+            )
+            try:
+                # derived purely from its back-wraps: BOTH live keyepochs, incl. the epoch-0
+                # one that predates its membership, and byte-identical to the real keyring.
+                self.assertEqual(set(reader.keyring), {0, 1})
+                self.assertEqual(reader.keyring[0], want[0])
+                self.assertEqual(reader.keyring[1], want[1])
+            finally:
+                reader.close()
 
 
 class TestBaselinePull(unittest.TestCase):

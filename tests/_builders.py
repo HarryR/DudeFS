@@ -124,20 +124,23 @@ class World:
         self.rng = random.Random(seed)
         self.mgr_sk, self.mgr_pub = _seed_keypair(self.rng)
         self.genesis: fold.Genesis = {"manager_pub": self.mgr_pub}
-        self.keyring: fold.Keyring = {}
-        for e in epochs:
-            self.keyring[e] = {
-                "data_key": bytes(self.rng.getrandbits(8) for _ in range(32)),
-                "slot_secret": bytes(self.rng.getrandbits(8) for _ in range(32)),
-            }
+        # a per-epoch master; the working keyring DERIVES from it (finding 21), and the same
+        # master is back-wrapped to each client below so a ClientDaemon reconstructs the very
+        # same keyring from the log — no hand-delivered keys.
+        self.masters: dict[int, bytes] = {
+            e: bytes(self.rng.getrandbits(8) for _ in range(32)) for e in epochs
+        }
+        self.keyring: fold.Keyring = fold.keyring_from_masters(self.masters)
         self.clients: list[Client] = [Client(*_seed_keypair(self.rng)) for _ in range(n_clients)]
-        # manager control chain: a cert per client
+        # manager control chain: a cert per client + its full-live-set wraps (issue #2 gap 3)
         self._mseq = 0
         self._mprev = A.GENESIS_PREV
         self._hlc = 1
         self.control_ops: list[A.Op] = []
         for c in self.clients:
             self.control_ops.append(self._mgr_op(ctl.cert_issue_body(c.pub, [ctl.Cap.WRITE], 0)))
+            for e, m in sorted(self.masters.items()):
+                self.control_ops.append(self._mgr_op(ctl.sealed_wrap_set_body(e, m, [c.pub])))
 
     # ---- clocks ---------------------------------------------------------- #
     def tick(self) -> A.HLC:

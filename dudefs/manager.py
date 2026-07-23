@@ -281,18 +281,28 @@ class Manager:
 
     # ---- identity ------------------------------------------------------- #
     _CAP_FOR = {"client": [ctl.Cap.WRITE], "node": [ctl.Cap.STORE], "compactor": [ctl.Cap.COMPACT]}
+    _KEY_HOLDERS = {"client", "compactor"}  # decrypt the dataset; nodes are zero-knowledge
 
     def cert_issue(self, kind: str, subject: bytes, pop: bytes) -> Op:
         """Certify `subject`'s capability — after verifying its PROOF-OF-POSSESSION
         (NOTES 58): the manager signs pubkeys only and never certifies an unheld
-        key, so an invalid/missing pop is refused before any op is authored."""
+        key, so an invalid/missing pop is refused before any op is authored. For a
+        key-holder (client / compactor) it ALSO back-wraps the FULL live keyepoch set to
+        `subject` (issue #2 gap 3): a member's fold spans every keyepoch, so without every
+        live key it can't decrypt the dataset. Existing members accumulated these wraps
+        incrementally via `rotate`; a newcomer holds none, so authorize seals them all in
+        one shot. Nodes are zero-knowledge and get no wrap."""
         if kind not in self._CAP_FOR:
             raise ManagerError(f"unknown cert kind {kind!r}")
         if not C.verify_possession(subject, pop):
             raise ManagerError("proof-of-possession failed: subject does not hold the key")
         caps = self._CAP_FOR[kind]
         # the CERT_ISSUE op IS the record; the certs view re-derives from the log.
-        return self.state.author_control(ctl.cert_issue_body(subject, caps, self.state.epoch))
+        op = self.state.author_control(ctl.cert_issue_body(subject, caps, self.state.epoch))
+        if kind in self._KEY_HOLDERS:
+            for ke, master in sorted(self.state.masters.items()):
+                self.state.author_control(ctl.sealed_wrap_set_body(ke, master, [subject]))
+        return op
 
     def cert_revoke(self, subject: bytes, *, rotate: bool = True) -> list[Op]:
         """Revoke a cert; STAGE a rotation by default (revocation without rotation is

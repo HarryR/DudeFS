@@ -25,7 +25,6 @@ from dudefs.store import ChainStore
 from tests._builders import World, now_ms, poll_until, unix_eps, unix_peer
 
 DELTA = 150
-MASTER = bytes(range(32))
 
 
 def _k(s: str) -> bytes:
@@ -74,7 +73,6 @@ class Demo:
             roster=self.roster,
             roster_addrs=unix_eps(self.paths),
             manager_pub=w.mgr_pub,
-            masters={0: MASTER},
             control_ops=w.control_ops,
             epoch=0,
         )

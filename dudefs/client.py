@@ -197,9 +197,10 @@ def _drive(
 
 class ClientDaemon:
     """One client identity's daemon: authors ops, drives quorums, folds the held
-    committed set into the CLIENT.md ladder. `masters` are per-keyepoch 32-byte
-    master secrets (finding 21) — the working keyring DERIVES from them here, the
-    client never receives the working keys over the wire."""
+    committed set into the CLIENT.md ladder. It holds NO master over the wire (finding
+    21): its working keyring is DERIVED from the `WRAP_SET` ops in its own held log —
+    `unwrap_group_key` recovers each `K_epoch` sealed to it, `keyring_from_masters`
+    derives the working keys — re-derived as more wraps arrive by gossip (e.g. a rotate)."""
 
     def __init__(
         self,
@@ -209,7 +210,6 @@ class ClientDaemon:
         roster: list[bytes],
         roster_addrs: list[transports.Endpoint],
         manager_pub: bytes,
-        masters: dict[int, bytes],
         control_ops: list[Op] | None = None,
         store_path: str = ":memory:",
         epoch: int = 0,
@@ -221,7 +221,7 @@ class ClientDaemon:
         self.pub = pub
         self.manager_pub = manager_pub
         self.keyepoch = keyepoch
-        self.keyring = fold.keyring_from_masters(masters)  # finding 21: derive, never distribute
+        self.keyring: fold.Keyring = {}  # derived from held wraps once the log is seeded (below)
         self.roster_addrs = roster_addrs
         self.store = ChainStore(store_path)
         self.genesis: fold.Genesis = {"manager_pub": manager_pub}
@@ -241,14 +241,24 @@ class ClientDaemon:
         self._hlc_wall = 0
         self._hlc_ctr = 0
         with self.store.write_txn() as tx:
-            for op in control_ops or []:  # the authorization chain (certs/genesis)
+            for op in control_ops or []:  # the authorization chain (certs + wrap-sets)
                 tx.put_op_raw(op)
+        self._rederive_keyring()  # unwrap my group keys from the seeded log (finding 21)
         self._seq, self._prev = self._chain_head()
         # read-side freshness (finding 22): a background quorum-read pull keeps
         # `local`/`INSPECT` current with OTHER clients' committed writes; `final`
         # reads sync on demand (below). Correctness never depends on the cadence.
         self._refresh_thread = threading.Thread(target=self._refresh_loop, daemon=True)
         self._refresh_thread.start()
+
+    def _rederive_keyring(self) -> None:
+        """Rebuild the working keyring from the WRAP_SET ops I currently hold (finding 21):
+        every key-epoch whose wrap seals to me. Called at construction and after a sync pulls
+        new control ops, so a rotate's fresh wrap (or my own authorize back-wrap) takes effect
+        without any key crossing the wire."""
+        with self.store.read_txn() as tx:
+            ops = tx.all_ops()
+        self.keyring = fold.keyring_from_wraps(ops, self.sk)
 
     # ---- chain head + clock ------------------------------------------------ #
     def _chain_head(self) -> tuple[int, bytes]:
@@ -445,6 +455,7 @@ class ClientDaemon:
         for _, head_hash in heads.values():
             self._pull_chain(head_hash)
         self._pull_baseline()  # sparse below-cut retained winners (issue #3 / finding #9)
+        self._rederive_keyring()  # pick up any wraps that arrived (rotate / my back-wrap)
         # the highest hlc a quorum attests final = the q-th highest floor (DESIGN §9)
         floors = sorted((fb.floor for fb in bundles), key=lambda h: h.as_tuple(), reverse=True)
         qfloor = floors[self.cfg.quorum - 1]

@@ -93,6 +93,25 @@ def keyring_from_masters(masters: dict[int, bytes]) -> Keyring:
     }
 
 
+def keyring_from_wraps(ops: list[Op], member_sk: bytes) -> Keyring:
+    """The member-side consumer of the wrap-sets in the held log (finding 21 / issue #2):
+    for every `WRAP_SET` op that seals a key to me, unwrap my `K_epoch` and derive that
+    epoch's working keys. NEVER take a master over the wire — the keyring is reconstructed
+    from what the log distributes, so a newcomer back-wrapped the full live set at authorize
+    (and an existing member's accumulated wraps) both just work. A keyepoch with no wrap for
+    me is simply absent — ops at it fold STALE, exactly as an undecryptable epoch should."""
+    masters: dict[int, bytes] = {}
+    for op in ops:
+        if not op.is_control:
+            continue
+        body = control_handler.decode(op)
+        if isinstance(body, control_handler.WrapSet):
+            k = control_handler.unwrap_group_key(body, member_sk)
+            if k is not None:
+                masters[body.keyepoch] = k  # same master across dup wraps -> idempotent
+    return keyring_from_masters(masters)
+
+
 class Verdict(StrEnum):
     """Per-op fold outcome (DESIGN §6). Frozen at finality (§9)."""
 

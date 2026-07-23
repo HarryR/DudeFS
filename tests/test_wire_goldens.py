@@ -152,7 +152,6 @@ class TestJsonRpcContract(unittest.TestCase):
             roster=[C.SIGNER.public(bytes([1] * 32))],
             roster_addrs=unix_eps(["/nonexistent.sock"]),
             manager_pub=w.mgr_pub,
-            masters={0: bytes(range(32))},
             control_ops=w.control_ops,
             epoch=0,
         )
