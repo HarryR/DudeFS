@@ -18,12 +18,12 @@ import socket
 import sys
 import time
 
-from . import artifacts as A
-from . import lmsg, transports, wire
-from .artifacts import HLC, quorum_size
-from .link import Link
-from .manager import Manager, ManagerError, ManagerState, RecoverDecision, recover_decision
-from .node import FrontierReq, Request, Response
+from .. import artifacts as A
+from .. import lmsg, transports, wire
+from ..artifacts import HLC, quorum_size
+from ..link import Link
+from ..manager import Manager, ManagerError, ManagerState, RecoverDecision, recover_decision
+from ..node import FrontierReq, Request, Response
 
 # ---- exit codes -------------------------------------------------------------- #
 OK = 0

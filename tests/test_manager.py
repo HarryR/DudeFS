@@ -140,12 +140,18 @@ class TestManagerOps(unittest.TestCase):
                 wraps = [b for o in tx.all_ops() if isinstance(b := ctl.decode(o), ctl.WrapSet)]
             self.assertFalse(any(npub in w.wraps for w in wraps))  # ZK node: no wrap
 
-            cpub = C.SIGNER.public(bytes([8] * 32))
-            m.cert_issue("client", cpub, C.prove_possession(bytes([8] * 32)))
-            with m.state.store.read_txn() as tx:
-                wraps = [b for o in tx.all_ops() if isinstance(b := ctl.decode(o), ctl.WrapSet)]
-            got = {w.keyepoch for w in wraps if cpub in w.wraps}
-            self.assertEqual(got, {0, 1})  # the client gets EVERY live keyepoch
+            # both key-holder kinds (client AND compactor — the compactor decrypts to compute
+            # supersession) are back-wrapped every live keyepoch.
+            for kind, seed in (("client", 8), ("compactor", 6)):
+                sub = C.SIGNER.public(bytes([seed] * 32))
+                cert = m.cert_issue(kind, sub, C.prove_possession(bytes([seed] * 32)))
+                caps = ctl.decode(cert)
+                assert isinstance(caps, ctl.CertIssue)
+                self.assertEqual(caps.caps, m._CAP_FOR[kind])  # the right capability
+                with m.state.store.read_txn() as tx:
+                    wraps = [b for o in tx.all_ops() if isinstance(b := ctl.decode(o), ctl.WrapSet)]
+                got = {w.keyepoch for w in wraps if sub in w.wraps}
+                self.assertEqual(got, {0, 1}, kind)  # EVERY live keyepoch
 
     def test_revoke_stages_rotate_bumps_keyepoch_and_wraps_all_members(self):
         with tempfile.TemporaryDirectory() as d:
