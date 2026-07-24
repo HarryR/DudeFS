@@ -15,7 +15,7 @@ import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from . import codec, gossip, lmsg, transports, tunables, wire
+from . import gossip, lmsg, transports, tunables, wire
 from .acceptor import Acceptor, Rejected, RejectReason
 from .artifacts import Op, Watermark, checkpoint_slot_tag, covered, quorum_size
 from .fold import ControlReducer, ControlState, endpoints_of
@@ -49,10 +49,6 @@ class Peer:
 
     pub: bytes
     endpoint: transports.Endpoint
-
-
-def _gossip_request(summ: gossip.Summary) -> bytes:
-    return codec.encode([b"gossip", summ.encode()])
 
 
 def _cut_dominates(
@@ -207,9 +203,8 @@ class NodeDaemon:
     def _dispatch(self, data: bytes) -> bytes:
         """Dispatch a gated inner payload: a gossip exchange (return the DELTA I owe)
         or a node RPC verb (dispatch to the acceptor). Idempotent, local-only."""
-        first = codec.as_seq(codec.decode(data))[0]
-        if codec.as_bytes(first) == b"gossip":
-            summ = gossip.Summary.decode(codec.as_bytes(codec.as_seq(codec.decode(data))[1]))
+        summ = gossip.Summary.from_request(data)
+        if summ is not None:
             return self._gossip_reply(summ).encode()
         return wire.encode_response(dispatch(self.node, wire.decode_request(data)))
 
@@ -276,7 +271,7 @@ class NodeDaemon:
         composes summary()/`_gossip_reply`/`apply_gossip` directly for step control."""
         link = Link(self.sk, self.pub, peer.pub, peer.endpoint)
         match link.request(
-            b"gossip", _gossip_request(self.summary()), epoch=self.acc.epoch, ts=self._clock()
+            b"gossip", self.summary().request(), epoch=self.acc.epoch, ts=self._clock()
         ):
             case lmsg.Reply(env):
                 self.apply_gossip(gossip.Delta.decode(env.body))

@@ -109,6 +109,18 @@ class Summary:
             retained,
         )
 
+    def request(self) -> bytes:
+        """This Summary as a gossip-exchange REQUEST payload — tagged `b"gossip"` so a peer's
+        dispatch routes it to the anti-entropy responder rather than a node RPC verb."""
+        return codec.encode([b"gossip", self.encode()])
+
+    @classmethod
+    def from_request(cls, data: bytes) -> Summary | None:
+        """Parse a dispatch payload as a gossip request, or None if it is NOT one (a node RPC
+        verb instead) — the discriminator the responder routes on."""
+        p = codec.as_seq(codec.decode(data))
+        return cls.decode(codec.as_bytes(p[1])) if codec.as_bytes(p[0]) == b"gossip" else None
+
 
 # --------------------------------------------------------------------------- #
 # Delta — exactly the diff a Summary exposes (PROTOCOL §2.2)                   #

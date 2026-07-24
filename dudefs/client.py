@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from typing import TypedDict
 
 from . import artifacts as A
-from . import codec, compactor, fold, gossip, lmsg, transports, tunables, wire
+from . import compactor, fold, gossip, lmsg, transports, tunables, wire
 from .artifacts import BLIND, HLC, QC, Op, Receipt, Txn, compute_slot_tag, covered
 from .handlers import control as ctl
 from .handlers import data as data_handler
@@ -524,7 +524,7 @@ class ClientDaemon:
                 tx.get_meta("checkpoint") or b"",
                 tx.cut_dead(),
             )
-        body = codec.encode([b"gossip", summ.encode()])
+        body = summ.request()
         for node in self.cfg.fanout_order:
             d = self._gossip(node, body)
             if d is None or not d.baseline:
