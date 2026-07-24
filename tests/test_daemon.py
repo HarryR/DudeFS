@@ -71,6 +71,38 @@ class TestInprocCluster(unittest.TestCase):
                 d.close()
 
 
+class TestSansIoGossipDriver(unittest.TestCase):
+    """The anti-entropy seams — summary() / _gossip_reply() / apply_gossip() — are pure
+    store ops with the network I/O lifted out, so a TEST drives real NodeDaemons with
+    exact step control: `step A (plan) -> transit to B (respond) -> transit reply to A
+    (apply)`, choosing the order itself. No mock transport, no sim harness — the real
+    daemon logic, deterministically clocked by the test. This is the pattern the ported
+    partition/skew/adversary suites run on."""
+
+    def test_controlled_gossip_steps_converge_two_real_daemons(self):
+        w = World(seed=30, n_clients=2)
+        roster = [C.SIGNER.public(bytes([200 + i] * 32)) for i in range(2)]
+        a, b = _daemon(w, 0, roster), _daemon(w, 1, roster)
+        try:
+            x = w.blind(0, [], [[A.Mutation.SET, b"x", b"1"]])
+            y = w.blind(1, [], [[A.Mutation.SET, b"y", b"1"]])
+            with a.store.write_txn() as tx:
+                tx.append(x)  # x lives only at A
+            with b.store.write_txn() as tx:
+                tx.append(y)  # y lives only at B
+            # EXACT sequencing, zero transport. A pulls from B, then B pulls from A —
+            # each round is plan (summary) -> transit (peer responds) -> apply.
+            a.apply_gossip(b._gossip_reply(a.summary()))  # A learns y
+            b.apply_gossip(a._gossip_reply(b.summary()))  # B learns x
+            for d in (a, b):  # converged to the union, via controlled steps on real logic
+                with d.store.read_txn() as tx:
+                    self.assertIsNotNone(tx.get_op(x.op_hash))
+                    self.assertIsNotNone(tx.get_op(y.op_hash))
+        finally:
+            a.close()
+            b.close()
+
+
 class TestDaemonGossip(unittest.TestCase):
     # Gossip end-to-end over real carriers is covered by TestDaemonPeerSockets (unix)
     # and TestMixedTransportCluster (unix↔http); gossip_round now dials via a Link.

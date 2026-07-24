@@ -211,14 +211,31 @@ class NodeDaemon:
         first = codec.as_seq(codec.decode(data))[0]
         if codec.as_bytes(first) == b"gossip":
             summ = gossip.decode_summary(codec.as_bytes(codec.as_seq(codec.decode(data))[1]))
-            with self.store.read_txn() as tx:  # the delta + baseline are ONE snapshot
-                d = gossip.delta(tx, summ)
-                # the sparse below-cut baseline rides its OWN field — the peer intakes it
-                # contiguity-free (WP-E), not through the tail's `append` gate.
-                base = tuple(self._baseline_ops_for(tx, summ))
-                d = Delta(d.ops, d.receipts, d.qcs, baseline=base)
-            return gossip.encode_delta(d)
+            return gossip.encode_delta(self._gossip_reply(summ))
         return wire.encode_response(dispatch(self.node, wire.decode_request(data)))
+
+    # ---- anti-entropy, sans-io: three pure seams a driver composes -------- #
+    # A round is plan -> exchange -> apply. `summary()` plans (below), `_gossip_reply`
+    # is the RESPONDER, `apply_gossip` is the APPLY — all pure store ops, no network.
+    # Production wires them through the peer's carrier in `gossip_round`; a deterministic
+    # test driver composes them DIRECTLY against real daemons (A.summary() ->
+    # B._gossip_reply() -> A.apply_gossip()), controlling delivery order itself — the
+    # I/O is the driver's, never the logic's, so no mock transport is needed.
+
+    def _gossip_reply(self, summ: gossip.Summary) -> gossip.Delta:
+        """The DELTA I owe a peer whose SUMMARY is `summ`: the ops/receipts/QCs it lacks
+        plus the sparse below-cut baseline for any author whose retained digest differs
+        (WP-E — it rides its OWN field, intaken contiguity-free, not the tail's append
+        gate). A pure function of my store + the peer's summary."""
+        with self.store.read_txn() as tx:  # the delta + baseline are ONE snapshot
+            d = gossip.delta(tx, summ)
+            base = tuple(self._baseline_ops_for(tx, summ))
+            return Delta(d.ops, d.receipts, d.qcs, baseline=base)
+
+    def apply_gossip(self, delta: gossip.Delta) -> None:
+        """Intake a peer's DELTA into my store (one write transaction) — the APPLY seam."""
+        with self.store.write_txn() as tx:
+            gossip.apply_delta(tx, delta)
 
     # ---- the epidemic gossip loop (WP1.2) ---------------------------------- #
     def summary(self) -> gossip.Summary:
@@ -253,20 +270,17 @@ class NodeDaemon:
             self.peers = peers
 
     def gossip_round(self, peer: Peer) -> None:
-        """One anti-entropy round against `peer`: advertise my SUMMARY (digest first)
-        over a Link (L_msg envelope + the peer's carrier), apply the DELTA it owes me.
-        Cut-aware — the peer's reply folds in the sparse below-cut baseline for any
-        author whose retained digest differs."""
+        """One anti-entropy round against `peer` OVER THE WIRE: dial my SUMMARY through
+        the peer's carrier, apply the DELTA it owes. This is the production DRIVER of the
+        three seams above — the SUMMARY is read in its own snapshot, the dial holds no
+        transaction, the reply is applied in one write. A test driver skips this and
+        composes summary()/`_gossip_reply`/`apply_gossip` directly for step control."""
         link = Link(self.sk, self.pub, peer.pub, peer.endpoint)
-        # the SUMMARY is read in its own snapshot; the peer dial happens with NO store
-        # transaction held; the reply is applied in one write transaction.
         match link.request(
             b"gossip", _gossip_request(self.summary()), epoch=self.acc.epoch, ts=self._clock()
         ):
             case lmsg.Reply(env):
-                d = gossip.decode_delta(env.body)
-                with self.store.write_txn() as tx:
-                    gossip.apply_delta(tx, d)
+                self.apply_gossip(gossip.decode_delta(env.body))
             case _fault:  # NoReply / MalformedReply / WrongPeer — a missed round
                 pass
 
