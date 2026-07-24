@@ -11,10 +11,10 @@ from dudefs import fold, gossip
 from dudefs.acceptor import Acceptor
 from dudefs.handlers import control as ctl
 from dudefs.sim.harness import Sim
-from dudefs.sim.personas import EquivocatingAcceptor, FloorPerjurer
 from dudefs.store import AppendStatus, ChainStore, EvidenceKind
 from tests._builders import World
 from tests._cluster import creation_op
+from tests._personas import EquivocatingAcceptor, FloorPerjurer
 
 NOW = 100
 BIG = 1_000_000

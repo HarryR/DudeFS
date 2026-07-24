@@ -15,11 +15,11 @@ from dudefs import quorum as Q
 from dudefs.acceptor import Acceptor, Rejected
 from dudefs.handlers import control as ctl
 from dudefs.sim.harness import Sim
-from dudefs.sim.personas import EquivocatingAcceptor
 from dudefs.store import AppendStatus, ChainStore, EvidenceKind
 from dudefs.transports.memory import Link, NetworkLinks
 from tests._builders import World, create
 from tests._cluster import creation_op
+from tests._personas import EquivocatingAcceptor
 
 NOW = 100
 NSK = bytes([220] * 32)

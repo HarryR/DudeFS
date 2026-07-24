@@ -1,17 +1,18 @@
-# DudeFS — adversarial sim-node personas (IMPLEMENTATION §6.4 / RESILIENCE §3).
+# Adversarial Acceptor personas — test doubles (IMPLEMENTATION §6.4 / RESILIENCE §3).
 #
-# First-class Acceptor subclasses that MISBEHAVE in one specific way each, wired
-# into the Sim as ordinary nodes (Sim(personas={i: Cls})). Every persona asserts
-# BOTH containment (honest nodes' state is unaffected) AND evidence (the violation
-# mints a portable proof — B6 becomes an assertion, not a claim). The TEE
-# deployment profile (NOTES 35) makes these node-side personas the priority
-# threat, outranking client-side ones.
+# First-class Acceptor subclasses that MISBEHAVE in one specific way each. Every persona
+# asserts BOTH containment (honest nodes' state is unaffected) AND evidence (the violation
+# mints a portable proof — B6 becomes an assertion, not a claim). The TEE deployment profile
+# (NOTES 35) makes these node-side personas the priority threat, outranking client-side ones.
+#
+# These subclass the REAL Acceptor (not a sim double), so they drive the production evidence
+# path directly (test_daemon's detector tests wire them into a live NodeDaemon).
 
 from __future__ import annotations
 
-from .. import store
-from ..acceptor import Acceptor, AcceptResult, Nack, Rejected, RejectReason
-from ..artifacts import Ballot, Op
+from dudefs import store
+from dudefs.acceptor import Acceptor, AcceptResult, Nack, Rejected, RejectReason
+from dudefs.artifacts import Ballot, Op
 
 
 class EquivocatingAcceptor(Acceptor):

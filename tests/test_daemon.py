@@ -809,7 +809,7 @@ class TestDaemonEvidence(unittest.TestCase):
         # flow the real on_accept -> put_receipt path and it SIGNS two conflicting
         # receipts; evidence_cycle then mints DOUBLE_VOTE from them. The whole
         # adversary-produces-then-detector-catches chain runs production code.
-        from dudefs.sim.personas import EquivocatingAcceptor
+        from tests._personas import EquivocatingAcceptor
 
         w = World(seed=5, n_clients=2)
         nsk = bytes([200] * 32)
@@ -841,7 +841,7 @@ class TestDaemonEvidence(unittest.TestCase):
         # BENEATH F through the real on_accept (its dropped past-gate lets it); the
         # watermark + that below-floor receipt are the FLOOR_PERJURY proof evidence_cycle
         # mints — the perjurer PRODUCES it on production code, not a hand-planted receipt.
-        from dudefs.sim.personas import FloorPerjurer
+        from tests._personas import FloorPerjurer
 
         w = World(seed=1, n_clients=1)
         nsk = bytes([200] * 32)
