@@ -592,22 +592,34 @@ class TestAdoptionValidityGate(unittest.TestCase):
         finally:
             d.close()
 
-    def test_missing_middle_seq_blocks_then_catches_up(self):
-        # finding #10 / WP-F(c): checkpoints CHAIN (each seq's `dead` is the incremental band
-        # since the last), so a node must never skip a seq. A seq-1 checkpoint that arrives
-        # BEFORE seq 0 must STALL (the sequence gate refuses it); once seq 0 lands the node
-        # catches up 0 THEN 1 in a single pass (the adoption while-loop).
-        w, d, roster, full, cut_big, cut_small, covered, _ = self._setup(53)
+    def test_bootstrap_adopts_a_seq_distant_checkpoint_directly(self):
+        # WARM/COLD far-behind: a node that never adopted seqs 0..1 (GC'd while it was away)
+        # adopts a seq-2 checkpoint DIRECTLY because it holds the full retained baseline. This
+        # is the mode that unblocks onboarding once compaction GCs the intermediate links —
+        # finding #10 stays covered: the jump only happens against a fully-verified baseline.
+        w, d, roster, full, cut_big, _cs, covered, _ = self._setup(53)
         try:
-            ck1 = self._present(d, w, roster, full, cut_big, A.HLC(500, 0), covered, seq=1)
+            ck2 = self._present(d, w, roster, full, cut_big, A.HLC(500, 0), covered, seq=2)
             d.adopt_committed_checkpoints()
             with d.store.read_txn() as tx:
-                self.assertIsNone(tx.get_meta("checkpoint"))  # seq 1 alone -> stalled
-            self._present(d, w, roster, full, cut_small, A.HLC(500, 0), covered, seq=0)
+                self.assertEqual(tx.get_meta("checkpoint"), ck2.op_hash)  # jumped straight to 2
+                self.assertEqual(dict(tx.cut()), cut_big)
+        finally:
+            d.close()
+
+    def test_defers_a_checkpoint_whose_baseline_is_incomplete(self):
+        # the jump is gated on holding the FULL retained set: drop one below-cut winner and the
+        # per-author digest no longer matches, so adoption defers (never GCs against a baseline
+        # it can't reconstruct) until a later gossip round refills it.
+        w, d, roster, full, cut_big, _cs, covered, _ = self._setup(56)
+        try:
+            k2 = full[-1]  # the second client op — drop it so my baseline has a gap
+            with d.store.write_txn() as tx:
+                tx.gc_checkpoint([k2.op_hash])
+            self._present(d, w, roster, full, cut_big, A.HLC(500, 0), covered, seq=0)
             d.adopt_committed_checkpoints()
             with d.store.read_txn() as tx:
-                self.assertEqual(tx.get_meta("checkpoint"), ck1.op_hash)  # chained 0 -> 1
-                self.assertEqual(dict(tx.cut()), cut_big)  # caught all the way up, not stuck
+                self.assertIsNone(tx.get_meta("checkpoint"))  # incomplete baseline -> defer
         finally:
             d.close()
 

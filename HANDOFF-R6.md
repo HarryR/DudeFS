@@ -222,7 +222,37 @@ sits on; the guards below run inside R5's per-connection write transactions.*
 
 **Manager control-plane compaction**
 - **WP-J — post-WP-0**, the manager's control plane checkpoints/compacts via the **same** path as
-  any node (no bespoke `control.log` prune).
+  any node (no bespoke `control.log` prune). Cut policy differs: control ops are effective-on-author
+  (not quorum-final), so "dead" = SUPERSEDED (revoked cert, roster below the latest joint-cert,
+  wrap-set below the current keyepoch), not below-a-finality-floor. Retained control set must be a
+  SELF-SUFFICIENT live-state snapshot (current roster + activating joint-cert, live certs, current
+  wrap-sets, keyepoch, active fences) so a cold backup reconstructs current control state from
+  retained-only.
+
+**PREREQUISITE for WP-H + WP-J — the resurrecting far-behind path (RULED, Harry).** Strict sequential
+adoption (WP-F(c)) assumes every checkpoint from `adopted+1` forward is present. That holds only
+because nothing GCs old checkpoint ops yet; **WP-J is what starts GC-ing them**, which strands any
+backup whose next-needed seq is gone. So adoption needs TWO modes:
+- **Hot (incremental):** `seq == adopted+1` — apply the incremental `dead` band. (Current code.)
+- **Warm/Cold (bootstrap):** direct-adopt-latest — adopt a seq-DISTANT checkpoint whose `retained`
+  baseline FULLY verifies, bypassing the sequence gate (the retained commitment is a COMPLETE
+  baseline, not a delta), then **reconcile-GC** below the new cut (drop ops not in `retained`).
+
+Ruled properties: **warm, not cold** — keep the store; delta-fill only the CHURN via gossip
+(`retained_commitment` is already the anti-entropy diff key — `verify_baseline` returns the per-author
+mismatch set to `pull_baseline`); "keep vs discard" is per-op `in retained?`, never a wipe; cost
+bounded by churn, never dataset size or seq-distance (cold = the degenerate case that held nothing).
+**Dominance gate STAYS on the warm path** — forward-only; a backup ahead of the quorum frontier is
+"deeply sus" and refused; the root-signed recovery fence is the SOLE deliberate rewind (its own
+`observe_fences` path). Invariant: **absolute finality behind the frontier, `may_flip` flux only
+ahead of it** (CLIENT.md §2.1). Same shape for a resurrected backup MANAGER: delta-fill missing
+control ops + adopt the current control checkpoint, after author-amnesia (quorum-read chain head,
+wait δ) re-anchors its single-author chain — backups are COLD STANDBY (concurrent root authoring
+would equivocate the root chain, the same failure as a compactor fresh-store restart).
+
+Testing note: prefer **deterministic seam injection** (fail between named inter-transaction seams:
+authored-op → drove-Commit → stored-QC → adopted-own) over `kill -9` — WAL + `synchronous=FULL` makes
+every crash land on a consistent store, so kill-9 samples no distinct failure state.
 
 ## 5. Testing arc (the gate) — on the daemon path
 

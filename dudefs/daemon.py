@@ -282,17 +282,27 @@ class NodeDaemon:
 
     # ---- checkpoint adoption pipeline (WP1.3) ------------------------------ #
     def adopt_committed_checkpoints(self) -> None:
-        """Adopt quorum-committed, AUTHORIZED checkpoints STRICTLY IN SEQUENCE (WP-F(c)):
-        each pass adopts the checkpoint at seq = adopted+1 — advancing the cut, raising the
-        horizon to its F, lazily GC-ing `dead`. Checkpoints CHAIN: seq N's `dead` is the
-        incremental band since N-1, so a node must never skip a seq (finding #10) — the
-        sequence-slot decrees exactly one checkpoint per seq, and I walk them one at a time.
-        A lagging node catches up seq-by-seq: the while-loop chains within this pass, and any
-        remaining gap fills over later gossip rounds. Deferred while my below-cut baseline has
-        gaps (verify_baseline non-empty — a later round supplies the missing digests)."""
+        """Adopt quorum-committed, AUTHORIZED checkpoints — advancing the cut, raising the
+        horizon to F, lazily GC-ing `dead`. TWO modes (the resurrecting-far-behind ruling):
+
+        - HOT / incremental — the next link `seq == adopted+1`: apply its incremental `dead`
+          band. Checkpoints CHAIN (seq N's `dead` is the band since N-1), so a near-current
+          node walks them one at a time; the while-loop chains a lagging node forward here.
+        - WARM/COLD / bootstrap — a seq-DISTANT link whose signed `retained` baseline I hold
+          in FULL (verify_baseline clean): adopt it DIRECTLY, jumping the sequence. Safe
+          because the retained commitment is a COMPLETE baseline, not a delta — a verified
+          hold means my below-cut set already IS the retained set, so the predecessor-relative
+          `dead` band GC is a no-op. This is what lets a wiped / new / long-offline node catch
+          up once compaction has GC'd the intermediate checkpoints; finding #10 stays covered
+          — a jump only ever happens against a fully-verified baseline, never an out-of-order
+          `dead` band.
+
+        Forward-only in both modes (per-author cut dominance + monotone horizon); a node ahead
+        of the quorum frontier is refused, and the root-signed recovery fence is the sole
+        deliberate rewind (observe_fences). Deferred while no candidate's baseline verifies."""
         while True:
             reducer = ControlReducer(self.manager_pub, self.acc.epoch)
-            # scan + pick + baseline-check for the NEXT seq in ONE read snapshot
+            # collect every VALID forward candidate in ONE read snapshot, then select the mode
             with self.store.read_txn() as tx:
                 all_ops = tx.all_ops()
                 cur_cut = tx.cut()  # the checkpoint I've adopted (empty before the first)
@@ -306,16 +316,13 @@ class NodeDaemon:
                 for op in sorted(all_ops, key=lambda o: (o.hlc.as_tuple(), o.op_hash)):
                     if op.is_control:
                         reducer.observe(op)  # authorization state up to here
-                picked: tuple[Op, ctl.Checkpoint] | None = None
+                candidates: dict[int, tuple[Op, ctl.Checkpoint]] = {}
                 for op in all_ops:
                     body = ctl.decode(op) if op.is_control else None
                     if not isinstance(body, ctl.Checkpoint):
                         continue
-                    # SEQUENCE gate — adopt strictly the next link in the chain. Skipping a
-                    # seq would apply an incremental `dead` band whose predecessor I never
-                    # adopted (finding #10); the slot guarantees at most one per seq.
-                    if body.seq != next_seq:
-                        continue
+                    if body.seq < next_seq:
+                        continue  # already adopted / superseded — only ever look forward
                     # BIND the declared seq to the slot the op actually won: without this an
                     # adversary could win slot-0 yet claim seq=5 in the body, jumping the chain.
                     # The slot decrees one-per-seq only if body.seq == the contended slot.
@@ -346,22 +353,16 @@ class NodeDaemon:
                     # WP-F(a) / #4 — never adopt a checkpoint that would REGRESS what I hold: GC
                     # past a cut and the monotone horizon are both irreversible, so a cut that
                     # does not per-author dominate my adopted cut, or a lower horizon, is
-                    # impossible by definition — refuse it. Combined with the sequence gate this
-                    # makes divergence impossible by construction: one checkpoint per seq, each
-                    # dominating the last (WP-F(c)).
+                    # impossible by definition — refuse it. Forward-only, both modes.
                     if body.horizon.as_tuple() < cur_horizon.as_tuple() or not _cut_dominates(
                         body.cut, cur_cut
                     ):
                         continue
-                    picked = (op, body)
-                    break  # the slot admits at most one committed checkpoint per seq
+                    candidates.setdefault(body.seq, (op, body))  # the slot => one per seq
+                picked = self._select_checkpoint(tx, candidates, next_seq)
                 if picked is None:
-                    return  # next seq not yet committed/valid — nothing more to adopt
+                    return  # next link not here yet and no reachable baseline verifies — defer
                 op, ckpt = picked
-                # only adopt once my below-cut baseline satisfies the signed retained
-                # digests — projected over the CHECKPOINT's dead (not the store's empty one).
-                if gossip.verify_baseline(tx, ckpt.cut, ckpt.retained, frozenset(ckpt.dead)):
-                    return  # missing baseline — defer to a later round
             # adopt + GC + pin the active checkpoint in ONE write transaction (finding 19):
             # cut/retained/dead/horizon must survive crash-restart together, and the GC of
             # `dead` must not be observable without the cut that vouches for it.
@@ -372,6 +373,31 @@ class NodeDaemon:
             # loop: the following seq may already be committed (lagging-node catch-up).
             # adopt_checkpoint persisted the horizon (finding 19); the guards read it
             # transactionally, so there is no in-memory horizon to advance here.
+
+    def _select_checkpoint(
+        self,
+        tx: ReadTxn,
+        candidates: dict[int, tuple[Op, ctl.Checkpoint]],
+        next_seq: int,
+    ) -> tuple[Op, ctl.Checkpoint] | None:
+        """Choose which committed checkpoint to adopt from the valid forward candidates: the
+        HOT next link if I hold its baseline (incremental, applying its `dead` band); else the
+        HIGHEST seq whose signed `retained` baseline I hold in FULL — a bootstrap JUMP over
+        links GC'd while I was away. None = defer: the next link isn't here and no reachable
+        baseline verifies. The verify gate is what keeps the jump safe — I only ever leap to a
+        checkpoint I demonstrably already satisfy, so the skipped `dead` bands never matter."""
+
+        def holds_baseline(c: tuple[Op, ctl.Checkpoint]) -> bool:
+            body = c[1]  # verify_baseline: empty mismatch set == I hold the full retained set
+            return not gossip.verify_baseline(tx, body.cut, body.retained, frozenset(body.dead))
+
+        hot = candidates.get(next_seq)
+        if hot is not None and holds_baseline(hot):
+            return hot
+        for seq in sorted(candidates, reverse=True):  # jump as far as a held baseline allows
+            if seq != next_seq and holds_baseline(candidates[seq]):
+                return candidates[seq]
+        return None
 
     # ---- recovery-fence observation (WP1.4) -------------------------------- #
     def observe_fences(self) -> None:
