@@ -88,7 +88,7 @@ class _Driver:
 def _preaccept(nodes, op, ballot):
     """Seed a node state by ACCEPTing `op` at `ballot` (rev 5: slotted envelopes
     reach a node only via ballot ACCEPT, never SUBMIT — item 21)."""
-    assert op.slot_tag is not None
+    assert isinstance(op, A.Slotted)
     for nd in nodes:
         r = nd.acc.on_accept(op.slot_tag, ballot, op, NOW)
         assert isinstance(r, A.Receipt)
@@ -107,7 +107,7 @@ class TestTwoPhase(unittest.TestCase):
         self.assertIsInstance(outcome, Q.Committed)
         assert isinstance(outcome, Q.Committed)
         self.assertEqual(outcome.qc.op_hash, op.op_hash)
-        assert op.slot_tag is not None
+        assert isinstance(op, A.Slotted)
         prio = A.slot_priority(op.slot_tag, cfg.client_fp)  # per-slot tiebreak (24d)
         self.assertEqual(outcome.qc.ballot, A.Ballot(1, prio))  # round 1, not 0
         self.assertTrue(outcome.qc.verify(roster))
@@ -121,6 +121,7 @@ class TestContention(unittest.TestCase):
         w = World(seed=2, n_clients=2)
         rival = create(w, 0, b"k", b"A")
         mine = create(w, 1, b"k", b"B")
+        assert isinstance(rival, A.Slotted) and isinstance(mine, A.Slotted)
         self.assertEqual(rival.slot_tag, mine.slot_tag)  # same lineage -> same tag
         _preaccept(nodes, rival, A.Ballot(1, b"\x01"))  # rival decided at (1,·) everywhere
 

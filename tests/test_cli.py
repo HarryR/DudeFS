@@ -11,12 +11,12 @@ import threading
 import time
 import unittest
 
+from dudefs import artifacts as A
 from dudefs import crypto as C
 from dudefs import transports
 from dudefs.cli import ManagerState, main
 from dudefs.client import ClientDaemon
 from dudefs.daemon import NodeDaemon
-from dudefs.handlers import control as ctl
 from dudefs.workerapi import WorkerServer
 from tests._builders import World, now_ms, poll_until, unix_eps
 
@@ -72,11 +72,11 @@ class TestManagerCommands(unittest.TestCase):
             # the control log (now the manager ChainStore) holds a decodable CERT_ISSUE
             st = ManagerState.load(d)
             with st.store.read_txn() as tx:
-                bodies = [ctl.decode(o) for o in tx.all_ops()]
-            cert = next(b for b in bodies if isinstance(b, ctl.CertIssue))
+                bodies = list(tx.all_ops())
+            cert = next(b for b in bodies if isinstance(b, A.CertIssueOp))
             self.assertEqual(cert.subject, client_pub)
             # a client authorize ALSO back-wraps the group key to it (issue #2 gap 3)
-            wraps = [b for b in bodies if isinstance(b, ctl.WrapSet)]
+            wraps = [b for b in bodies if isinstance(b, A.WrapSetOp)]
             self.assertTrue(any(client_pub in w.wraps for w in wraps))
 
     def test_revoke_stages_rotate_and_bumps_keyepoch(self):
@@ -185,7 +185,7 @@ class TestRecoverInterlock(unittest.TestCase):
                 nodes.append(nd)
                 # publish a durable ENDPOINT op so the reloaded CLI manager can dial it
                 rec = [(transports.UNIX, path.encode(), {})]
-                st.author_control(ctl.endpoint_body(roster[i], rec))
+                st.author_control(A.EndpointOp.build(**st._head(), subject=roster[i], addrs=rec))
             st._set_meta(roster_seed=[p.hex() for p in roster])  # seat the genesis roster
 
             code, out, err = _run(["mgr", "recover", "--dir", d, "--dwell", "0.3"])
@@ -213,9 +213,8 @@ class TestRecoverInterlock(unittest.TestCase):
             st = ManagerState.load(d)
             with st.store.read_txn() as tx:
                 last = max(tx.all_ops(), key=lambda o: o.seq)
-            body = ctl.decode(last)
-            assert isinstance(body, ctl.Roster)
-            self.assertIsNotNone(body.recovery)  # names the recovery checkpoint
+            assert isinstance(last, A.RosterOp)
+            self.assertIsNotNone(last.recovery)  # names the recovery checkpoint
             self.assertEqual(ManagerState.load(d).epoch, 1)  # epoch advanced
 
 

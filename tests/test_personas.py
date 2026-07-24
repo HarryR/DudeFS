@@ -4,12 +4,12 @@
 # becomes an assertion). TEE profile (NOTES 35): node personas are the priority.
 
 import unittest
+from functools import partial
 
 from dudefs import artifacts as A
 from dudefs import crypto as C
 from dudefs import fold
 from dudefs.acceptor import Acceptor
-from dudefs.handlers import control as ctl
 from dudefs.store import AppendStatus, ChainStore, EvidenceKind
 from tests._builders import World
 from tests._cluster import creation_op
@@ -30,7 +30,7 @@ class TestEquivocator(unittest.TestCase):
         w = World(seed=1, n_clients=2)
         a = creation_op(w, 0, b"A")  # key k
         b = creation_op(w, 1, b"B")  # key k -> SAME slot as a
-        assert a.slot_tag is not None
+        assert isinstance(a, A.Slotted) and isinstance(b, A.Slotted)
         self.assertEqual(a.slot_tag, b.slot_tag)
         tag, ballot = a.slot_tag, A.Ballot(1, b"x")
 
@@ -71,7 +71,7 @@ class TestEquivocator(unittest.TestCase):
         sim = Sim(seed=3, n=3, personas={0: EquivocatingAcceptor})
         w = World(seed=3, n_clients=2)
         a, b = creation_op(w, 0, b"A"), creation_op(w, 1, b"B")  # same slot
-        assert a.slot_tag is not None
+        assert isinstance(a, A.Slotted)
         tag, ballot = a.slot_tag, A.Ballot(1, b"x")
         # node 0 (persona) signs BOTH; node 1 signs a, node 2 signs b -> QCs {0,1},{0,2}
         sim.nodes[0].accept(tag, ballot, a)
@@ -92,7 +92,7 @@ class TestEquivocator(unittest.TestCase):
         sim = Sim(seed=2, n=3, personas={1: EquivocatingAcceptor})
         w = World(seed=2, n_clients=2)
         a, b = creation_op(w, 0, b"A"), creation_op(w, 1, b"B")
-        assert a.slot_tag is not None
+        assert isinstance(a, A.Slotted)
         ballot = A.Ballot(1, b"y")
         sim.nodes[1].accept(a.slot_tag, ballot, a)
         sim.nodes[1].accept(a.slot_tag, ballot, b)  # would raise if B1 tripped
@@ -107,7 +107,7 @@ class TestAmnesiacNode(unittest.TestCase):
     def test_amnesia_double_votes_and_is_retirable(self):
         w = World(seed=40, n_clients=2)
         a, b = creation_op(w, 0, b"A"), creation_op(w, 1, b"B")  # same slot
-        assert a.slot_tag is not None
+        assert isinstance(a, A.Slotted)
         tag, ballot = a.slot_tag, A.Ballot(1, b"x")
         nsk = bytes([240] * 32)
         npub = C.SIGNER.public(nsk)
@@ -163,9 +163,13 @@ class TestSplitView(unittest.TestCase):
         w = World(seed=30, n_clients=0)
         pubx = C.SIGNER.public(bytes([1] * 32))
         puby = C.SIGNER.public(bytes([2] * 32))
-        a = w._mgr_op(ctl.roster_body(0, [pubx], {}))  # chain A, manager seq 0
+        a = w._mgr_op(
+            partial(A.RosterOp.build, from_epoch=0, roster=[pubx], sync_frontier={})
+        )  # chain A, manager seq 0
         w._mseq, w._mprev = 0, A.GENESIS_PREV  # the root rewinds -> a divergent view
-        b = w._mgr_op(ctl.roster_body(0, [puby], {}))  # chain B, manager seq 0 (a fork)
+        b = w._mgr_op(
+            partial(A.RosterOp.build, from_epoch=0, roster=[puby], sync_frontier={})
+        )  # chain B, manager seq 0 (a fork)
         self.assertNotEqual(a.op_hash, b.op_hash)
 
         v1, v2 = ChainStore(), ChainStore()  # two victims, one side each
@@ -204,7 +208,7 @@ class TestFloorPerjurer(unittest.TestCase):
         sim = Sim(seed=1, n=3, delta=10, personas={0: FloorPerjurer})
         w = World(seed=1, n_clients=1)
         op = creation_op(w, 0, b"v")  # small hlc
-        assert op.slot_tag is not None
+        assert isinstance(op, A.Slotted)
         perjurer = sim.raw[0].acc
 
         wm = perjurer.issue_watermark(1000)  # attests floor ~990
@@ -242,7 +246,7 @@ class TestFloorPerjurer(unittest.TestCase):
         sim = Sim(seed=2, n=3, delta=10_000)  # all honest
         w = World(seed=2, n_clients=1)
         op = creation_op(w, 0, b"v")
-        assert op.slot_tag is not None
+        assert isinstance(op, A.Slotted)
         honest = sim.raw[0].acc
         rc = honest.on_accept(op.slot_tag, A.Ballot(1, b"x"), op, 100)  # floor(100) < 0 -> legal
         assert isinstance(rc, A.Receipt)
@@ -264,7 +268,7 @@ class TestFloorPerjurer(unittest.TestCase):
         sim = Sim(seed=3, n=3, delta=10_000)
         w = World(seed=3, n_clients=1)
         op = creation_op(w, 0, b"v")
-        assert op.slot_tag is not None
+        assert isinstance(op, A.Slotted)
         acc = sim.raw[0].acc
         r1 = acc.on_accept(op.slot_tag, A.Ballot(1, b"x"), op, 100)
         r2 = acc.on_accept(op.slot_tag, A.Ballot(1, b"x"), op, 100)  # resubmission

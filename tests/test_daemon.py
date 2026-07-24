@@ -111,7 +111,7 @@ class TestDaemonGossip(unittest.TestCase):
         roster = [C.SIGNER.public(bytes([200] * 32))]
         d = _daemon(w, 0, roster)
         op = creation_op(w, 0, b"v")
-        assert op.slot_tag is not None
+        assert isinstance(op, A.Slotted)
         resp = call_node(d, w.clients[0].sk, N.AcceptReq(op.slot_tag, A.Ballot(1, b"x"), op))
         self.assertIsInstance(resp, A.Receipt)
 
@@ -128,7 +128,7 @@ class TestPeerGate(unittest.TestCase):
         d = _daemon(w, 0, roster)
         stranger = bytes([222] * 32)  # neither a roster node, a certed client, nor root
         op = creation_op(w, 0, b"v")
-        assert op.slot_tag is not None
+        assert isinstance(op, A.Slotted)
         resp = call_node(d, stranger, N.AcceptReq(op.slot_tag, A.Ballot(1, b"x"), op))
         assert isinstance(resp, Rejected)
         self.assertIs(resp.reason, RejectReason.NOT_A_MEMBER)  # says WHY, not BAD_AUTHZ
@@ -141,7 +141,7 @@ class TestPeerGate(unittest.TestCase):
         roster = [C.SIGNER.public(bytes([200] * 32))]
         d = _daemon(w, 0, roster)  # clock = 100, delta = BIG
         op = creation_op(w, 0, b"v")
-        assert op.slot_tag is not None
+        assert isinstance(op, A.Slotted)
         # a member's request, but stamped far outside δ -> stale, not unauthorized
         resp = call_node(
             d, w.clients[0].sk, N.AcceptReq(op.slot_tag, A.Ballot(1, b"x"), op), ts=100 + BIG + 1
@@ -215,7 +215,7 @@ class TestSealedMode(unittest.TestCase):
         d = _daemon(w, 0, [C.SIGNER.public(bytes([200] * 32))])
         uri = self._serve_sealed(d)
         op = creation_op(w, 0, b"v")
-        assert op.slot_tag is not None
+        assert isinstance(op, A.Slotted)
         link = Link(
             w.clients[0].sk,
             w.clients[0].pub,
@@ -241,7 +241,7 @@ class TestSealedMode(unittest.TestCase):
         d = _daemon(w, 0, [C.SIGNER.public(bytes([200] * 32))])
         uri = self._serve_sealed(d)
         op = creation_op(w, 0, b"v")
-        assert op.slot_tag is not None
+        assert isinstance(op, A.Slotted)
         plain = Link(  # a PLAIN link to the sealed endpoint (mismatched profile)
             w.clients[0].sk, w.clients[0].pub, d.pub, transports.Endpoint(transports.HTTP, uri)
         )
@@ -275,7 +275,7 @@ class TestHttpCarrier(unittest.TestCase):
         ).start()
         self.assertTrue(ready.wait(2))
         op = creation_op(w, 0, b"v")
-        assert op.slot_tag is not None
+        assert isinstance(op, A.Slotted)
         out = enveloped(
             w.clients[0].sk, d.pub, N.AcceptReq(op.slot_tag, A.Ballot(1, b"x"), op), ts=d._clock()
         )
@@ -309,7 +309,7 @@ class TestHttpCarrier(unittest.TestCase):
         # reflection to a wrong `to` -> Dropped -> 404 -> b"". Use the wrong-to probe:
         stranger = bytes([222] * 32)
         op = creation_op(w, 0, b"v")
-        assert op.slot_tag is not None
+        assert isinstance(op, A.Slotted)
         wrong_to = enveloped(
             stranger,
             C.SIGNER.public(bytes([1] * 32)),
@@ -797,30 +797,33 @@ class TestFreshBootstrap(unittest.TestCase):
 
 class TestDaemonFence(unittest.TestCase):
     def test_observes_root_recovery_pair_and_activates(self):
-        from dudefs.handlers import control as ctl
 
         w = World(seed=4, n_clients=0)
         roster = [C.SIGNER.public(bytes([200] * 32))]
         d = _daemon(w, 0, roster)
-        rckpt = A.Op.build(
+        rckpt = A.CheckpointOp.build(
             author_sk=w.mgr_sk,
             author_pub=w.mgr_pub,
-            cls_=A.OpClass.CONTROL,
             seq=0,
             prev=A.GENESIS_PREV,
             hlc=A.HLC(500, 0),
+            baseline=A.Baseline({}, {}),
+            state_acc=b"r",
+            attempts=b"",
             keyepoch=0,
-            payload=ctl.checkpoint_body(A.Baseline({}, {}), b"r", b"", 0, A.HLC(0, 0)),
+            horizon=A.HLC(0, 0),
+            checkpoint_seq=0,
         )
-        rop = A.Op.build(
+        rop = A.RosterOp.build(
             author_sk=w.mgr_sk,
             author_pub=w.mgr_pub,
-            cls_=A.OpClass.CONTROL,
             seq=1,
             prev=rckpt.op_hash,
             hlc=A.HLC(501, 0),
-            keyepoch=0,
-            payload=ctl.roster_body(0, roster, {}, recovery=rckpt.op_hash),
+            from_epoch=0,
+            roster=roster,
+            sync_frontier={},
+            recovery=rckpt.op_hash,
         )
         with d.store.write_txn() as tx:
             tx.append(rckpt)
@@ -853,7 +856,7 @@ class TestDaemonEvidence(unittest.TestCase):
             acceptor_cls=EquivocatingAcceptor,
         )
         a, b = creation_op(w, 0, b"A"), creation_op(w, 1, b"B")  # same slot, two ops
-        assert a.slot_tag is not None and a.slot_tag == b.slot_tag
+        assert isinstance(a, A.Slotted) and isinstance(b, A.Slotted) and a.slot_tag == b.slot_tag
         ballot = A.Ballot(1, b"x")
         self.assertIsInstance(d.acc.on_accept(a.slot_tag, ballot, a, 100), A.Receipt)
         self.assertIsInstance(
@@ -885,7 +888,7 @@ class TestDaemonEvidence(unittest.TestCase):
             acceptor_cls=FloorPerjurer,
         )
         op = creation_op(w, 0, b"v")  # small hlc, beneath the sworn floor
-        assert op.slot_tag is not None
+        assert isinstance(op, A.Slotted)
         wm = d.acc.issue_watermark(1000)  # attests floor ~990
         self.assertGreater(wm.floor.wall_ms, op.hlc.wall_ms)  # op is beneath the floor
         rc = d.acc.on_accept(op.slot_tag, A.Ballot(1, b"x"), op, 1000)
@@ -907,7 +910,7 @@ class TestDaemonSocket(unittest.TestCase):
             t.start()
             self.assertTrue(ready.wait(2))
             op = creation_op(w, 0, b"v")
-            assert op.slot_tag is not None
+            assert isinstance(op, A.Slotted)
             cli = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             cli.connect(path)
             out = enveloped(
@@ -985,15 +988,18 @@ class TestJointCertActivation(unittest.TestCase):
         # B4: a crash-retry re-authors the SAME roster slot, so the store can hold an
         # undecided contender (no QC) beside the joint-certified op. Activation must
         # pick the certified one, never let the contender starve it.
-        from dudefs.handlers import control as ctl
 
         with tempfile.TemporaryDirectory() as d:
             m = Manager.init(d)
             rc, old, old_sks, new = self._joint_cert(m)
             other = C.SIGNER.public(bytes([211] * 32))
             contender = m.state.author_control(
-                ctl.roster_body(0, [old[0], old[1], other], {}),
-                slot_tag=A.roster_slot_tag(0),
+                A.RosterOp.build(
+                    **m.state._head(),
+                    from_epoch=0,
+                    roster=[old[0], old[1], other],
+                    sync_frontier={},
+                )
             )
             nd = self._fresh_daemon(m, old, old_sks)
             with nd.store.write_txn() as tx:

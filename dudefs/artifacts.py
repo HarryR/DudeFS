@@ -14,11 +14,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from dataclasses import dataclass
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass, field
 from enum import Enum
 from functools import total_ordering
-from typing import NamedTuple, Self
+from typing import Any, ClassVar, NamedTuple, Self
 
 from . import codec, crypto
 from .codec import Bencodable
@@ -330,184 +330,235 @@ def compute_slot_tag(slot_secret: bytes, key: bytes, version: bytes, attempt: in
 # --------------------------------------------------------------------------- #
 
 
-class Op:
-    """A self-authenticating operation. Construct via `build()`; ingest a peer's
-    bytes via `from_bytes()` (which rejects non-canonical encodings through the
-    codec)."""
+class _OpFields:
+    """Cooperative-decode root. `_kwargs` chains via `super()` UP the op hierarchy
+    — Op adds the envelope-common fields, `Slotted` adds `slot_tag`, `DataOp` adds
+    keyepoch/payload — and bottoms out here. So decode lives ON the types (no free
+    functions), each level owns exactly its own fields, and a leaf is built with
+    `leaf(**leaf._kwargs(env, raw))` (HANDOFF-R8: the wrapping pattern)."""
 
-    __slots__ = ("raw", "fields", "op_hash")
+    __slots__ = ()
 
-    def __init__(self, raw: bytes, fields: dict[Field, Bencodable]):
-        self.raw = raw
-        self.fields = fields
-        self.op_hash = crypto.h(raw)
+    @classmethod
+    def _kwargs(cls, env: dict[bytes, Bencodable], raw: bytes) -> dict[str, Any]:
+        return {"raw": raw}
 
-    # ---- accessors (typed views over the canonical dict) ------------------ #
-    # Each extracts a concrete type from the decoded envelope or raises
-    # CodecError; verify_structure() is the up-front gate, these are the lens.
-    @property
-    def cls(self) -> bytes:
-        return codec.as_bytes(self.fields[Field.CLASS])
 
-    @property
-    def author(self) -> bytes:
-        return codec.as_bytes(self.fields[Field.AUTHOR])
+class Slotted(_OpFields):
+    """Mixin adding a NON-optional `slot_tag` to the ops decided by single-decree
+    agreement (CAS, roster, checkpoint) — mixed in ONLY there, so a non-slotted op
+    has no `slot_tag` at all (ask `isinstance(op, Slotted)`; never probe a field for
+    None). `quorum.Commit` takes a `Slotted`, so `slot_tag` is `bytes` by the type.
+    Public slots bind the tag to the op's own fields (`expected_slot_tag`); CAS binds
+    via a PRF over a node-invisible secret, checked in the fold by attribution."""
 
-    @property
-    def seq(self) -> int:
-        return codec.as_int(self.fields[Field.SEQ])
+    __slots__ = ()
+    slot_tag: bytes  # a dataclass field on each concrete slotted leaf
 
-    @property
-    def prev(self) -> bytes:
-        return codec.as_bytes(self.fields[Field.PREV])
+    @classmethod
+    def _kwargs(cls, env: dict[bytes, Bencodable], raw: bytes) -> dict[str, Any]:
+        return {
+            **super()._kwargs(env, raw),
+            "slot_tag": codec.as_bytes(_require(env, Field.SLOT_TAG)),
+        }
 
-    @property
-    def hlc(self) -> HLC:
-        return HLC.decode(self.fields[Field.HLC])
+    def expected_slot_tag(self) -> bytes | None:
+        """The public slot binding, or None when it is secret (CAS)."""
+        return None
 
-    @property
-    def keyepoch(self) -> int:
-        return codec.as_int(self.fields[Field.KEYEPOCH])
+    def slot_binding_ok(self) -> bool:
+        exp = self.expected_slot_tag()
+        return exp is None or self.slot_tag == exp
 
-    @property
-    def pver(self) -> int:
-        return codec.as_int(self.fields[Field.PVER])
 
-    @property
-    def slot_tag(self) -> bytes | None:
-        v = self.fields.get(Field.SLOT_TAG)  # None => blind write
-        return None if v is None else codec.as_bytes(v)
+@dataclass(frozen=True, slots=True, kw_only=True)
+class Op(_OpFields):
+    """A self-authenticating operation, decoded ONCE into a concrete leaf. Identity
+    is the received bytes (`raw`); `op_hash = h(raw)`. Ingest via `from_bytes`
+    (dispatches on `class`); author via each leaf's own typed `build` — there is NO
+    generic field-bag builder. The signature covers every envelope field but `sig`;
+    the data AAD is envelope-minus-payload-minus-sig (DESIGN §5)."""
 
-    @property
-    def payload(self) -> bytes:
-        return codec.as_bytes(self.fields[Field.PAYLOAD])
+    author: bytes
+    seq: int
+    prev: bytes
+    hlc: HLC
+    pver: int
+    sig: bytes
+    raw: bytes
+    op_hash: bytes = field(init=False, compare=False, repr=False)
 
-    @property
-    def sig(self) -> bytes:
-        return codec.as_bytes(self.fields[Field.SIG])
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "op_hash", crypto.h(self.raw))
 
     @property
     def is_control(self) -> bool:
-        # .get(): an envelope missing CLASS (struct-invalid, folds `invalid`)
-        # classifies as data — total, never a KeyError (NOTES item 17).
-        return self.fields.get(Field.CLASS) == OpClass.CONTROL
+        return False  # ControlOp overrides -> True (polymorphism, no forward ref)
 
-    # ---- the three canonical byte views ----------------------------------- #
-    # These only feed codec.encode (which accepts `object`), so they take the
-    # broad Mapping — accepting both the stored fields and a freshly-built dict.
+    # ---- decode: each level owns its fields, chained via super() ----------- #
+    @classmethod
+    def _kwargs(cls, env: dict[bytes, Bencodable], raw: bytes) -> dict[str, Any]:
+        return {
+            **super(Op, cls)._kwargs(env, raw),  # explicit super — slots recreates the class
+            "author": codec.as_bytes(_require(env, Field.AUTHOR)),
+            "seq": codec.as_int(_require(env, Field.SEQ)),
+            "prev": codec.as_bytes(_require(env, Field.PREV)),
+            "hlc": HLC.decode(_require(env, Field.HLC)),
+            "pver": codec.as_int(_require(env, Field.PVER)),
+            "sig": codec.as_bytes(_require(env, Field.SIG)),
+        }
+
     @staticmethod
-    def _fields_wo(fields: Mapping[Field, object], *drop: Field) -> dict[Field, object]:
-        return {k: v for k, v in fields.items() if k not in drop}
+    def _envelope(raw: bytes) -> dict[bytes, Bencodable]:
+        """Canonical envelope bytes -> {Field: value}, rejecting unknown keys with
+        the typed UnknownField (validation, not a cast)."""
+        out: dict[bytes, Bencodable] = {}
+        for k, v in codec.as_dict(codec.decode(raw)).items():
+            try:
+                out[Field(k)] = v
+            except ValueError:
+                raise UnknownField(k) from None
+        return out
 
     @classmethod
-    def _signing_bytes(cls, fields: Mapping[Field, object]) -> bytes:
-        # everything except the signature (DESIGN §5)
-        return codec.encode(cls._fields_wo(fields, Field.SIG))
+    def from_bytes(cls, raw: bytes) -> Op:
+        """Decode ONCE and return the concrete leaf (data op / control leaf /
+        InvalidOp). Rejects non-canonical bytes and unknown envelope fields."""
+        env = Op._envelope(raw)
+        if env.get(Field.CLASS) == OpClass.CONTROL:
+            return ControlOp._from_envelope(env, raw)
+        return DataOp._from_envelope(env, raw)
 
-    @classmethod
-    def _aad_bytes(cls, fields: Mapping[Field, object]) -> bytes:
-        # envelope-minus-payload-minus-sig (DESIGN §5 AAD binding)
-        return codec.encode(cls._fields_wo(fields, Field.SIG, Field.PAYLOAD))
-
-    def aad_hash(self) -> bytes:
-        return crypto.h(self._aad_bytes(self.fields))
-
-    # ---- verification ----------------------------------------------------- #
-    def verify_sig(self, author_pubkey: bytes) -> bool:
-        return crypto.SIGNER.verify(author_pubkey, self._signing_bytes(self.fields), self.sig)
-
+    # ---- verification ------------------------------------------------------ #
     def verify_structure(self) -> bool:
-        """Local, key-independent structural checks (shape + canonicity).
-        Canonicity is already guaranteed by from_bytes()'s decode; here we
-        check field presence/typing. The codec extractors raise CodecError (a
-        ValueError) on a mistyped field, caught below as a False verdict."""
-        f = self.fields
-        try:
-            if codec.as_bytes(f[Field.CLASS]) not in (OpClass.DATA, OpClass.CONTROL):
-                return False
-            codec.as_bytes(f[Field.AUTHOR])
-            if codec.as_int(f[Field.SEQ]) < 0:
-                return False
-            prev = codec.as_bytes(f[Field.PREV])
-            if len(prev) != 32:
-                return False
-            HLC.decode(f[Field.HLC])
-            if codec.as_int(f[Field.KEYEPOCH]) < 0:
-                return False
-            if codec.as_int(f[Field.PVER]) < 0:
-                return False
-            if Field.SLOT_TAG in f:
-                codec.as_bytes(f[Field.SLOT_TAG])
-            codec.as_bytes(f[Field.PAYLOAD])
-            codec.as_bytes(f[Field.SIG])
-            if codec.as_int(f[Field.SEQ]) == 0 and prev != GENESIS_PREV:
-                return False
-        except (KeyError, DudeFSError):
+        """Value-level structural checks over the typed fields (shape/canonicity are
+        enforced by `from_bytes` — a mistyped field can't become an Op). Leaves
+        extend it (DataOp: keyepoch >= 0)."""
+        if self.seq < 0 or self.pver < 0:
+            return False
+        if len(self.prev) != 32:
+            return False
+        if self.seq == 0 and self.prev != GENESIS_PREV:
             return False
         return True
 
-    # ---- data payload open (client-only; needs the group key) ------------- #
+    def verify_sig(self, author_pubkey: bytes) -> bool:
+        """Verify the signature over the RECEIVED bytes minus `sig` (identity is the
+        received bytes; a control payload need not be canonical bencode internally,
+        so we verify over what actually arrived — DESIGN §5)."""
+        try:
+            env = Op._envelope(self.raw)
+        except ArtifactError:
+            return False
+        env.pop(Field.SIG, None)
+        return crypto.SIGNER.verify(author_pubkey, codec.encode(env), self.sig)
+
+    # ---- authoring core: each leaf `build` signs, then constructs itself --- #
+    @staticmethod
+    def _sign(author_sk: bytes, fields: dict[Field, Bencodable]) -> tuple[bytes, bytes]:
+        """Sign `fields` (no SIG yet); return (raw, sig). A leaf's `build` assembles
+        its own wire `fields`, signs here, then constructs itself DIRECTLY from its
+        typed params + this raw/sig — no encode-then-decode round-trip."""
+        sig = crypto.SIGNER.sign(author_sk, codec.encode(fields))
+        return codec.encode({**fields, Field.SIG: sig}), sig
+
+
+# ---- data leaves ----------------------------------------------------------- #
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class DataOp(Op):
+    """An opaque, encrypted data op (DESIGN §5). `payload` is AEAD ciphertext
+    (`nonce ‖ ct ‖ tag`); only a key-holding client can `open_payload` it.
+    `keyepoch` (envelope-level, DATA-ONLY) selects the group key."""
+
+    keyepoch: int
+    payload: bytes
+
+    @classmethod
+    def _kwargs(cls, env: dict[bytes, Bencodable], raw: bytes) -> dict[str, Any]:
+        return {
+            **super(DataOp, cls)._kwargs(env, raw),
+            "keyepoch": codec.as_int(_require(env, Field.KEYEPOCH)),
+            "payload": codec.as_bytes(_require(env, Field.PAYLOAD)),
+        }
+
+    @classmethod
+    def _from_envelope(cls, env: dict[bytes, Bencodable], raw: bytes) -> DataOp:
+        """A data op is a CasOp if it carries a slot_tag, else a BlindPutOp."""
+        leaf = CasOp if Field.SLOT_TAG in env else BlindPutOp
+        return leaf(**leaf._kwargs(env, raw))
+
+    def _aad_fields(self) -> dict[Field, Bencodable]:
+        f: dict[Field, Bencodable] = {
+            Field.CLASS: OpClass.DATA,
+            Field.AUTHOR: self.author,
+            Field.SEQ: self.seq,
+            Field.PREV: self.prev,
+            Field.HLC: self.hlc.encode(),
+            Field.PVER: self.pver,
+            Field.KEYEPOCH: self.keyepoch,
+        }
+        if isinstance(self, Slotted):
+            f[Field.SLOT_TAG] = self.slot_tag
+        return f
+
+    def aad_hash(self) -> bytes:
+        # envelope-minus-payload-minus-sig, rebuilt from typed fields (payload
+        # excluded -> no inner-canonicity concern; no re-decode).
+        return crypto.h(codec.encode(self._aad_fields()))
+
     def open_payload(self, data_key: bytes) -> bytes | None:
-        """Decrypt a data op's payload -> plaintext Txn bytes, or None on
-        authentication failure (⊥). Control ops carry plaintext payloads and
-        must not be opened this way. AD = envelope-minus-payload, recomputed from
-        the envelope; the SIV nonce travels inside the sealed blob (CRYPTO.md §2)."""
+        """Decrypt -> plaintext Txn bytes, or None on authentication failure (⊥)."""
         return crypto.AEAD.open(data_key, self.aad_hash(), self.payload)
 
-    # ---- construction ----------------------------------------------------- #
-    @classmethod
-    def from_bytes(cls, raw: bytes) -> Self:
-        # Re-key the decoded envelope through Field(), which *rejects* an unknown
-        # key — validation, not a cast. (This is stricter than DESIGN §16's
-        # lane-3 unknown-field pass-through; relax when evolution lands, M8.)
-        decoded = codec.as_dict(codec.decode(raw))
-        fields: dict[Field, Bencodable] = {}
-        for k, v in decoded.items():
-            try:
-                field = Field(k)
-            except ValueError:
-                raise UnknownField(k) from None  # typed leaf carrying the key
-            fields[field] = v
-        return cls(raw, fields)
+    def verify_structure(self) -> bool:
+        return super(DataOp, self).verify_structure() and self.keyepoch >= 0
 
-    @classmethod
-    def build(
-        cls,
+    @staticmethod
+    def _seal_and_sign(
         *,
         author_sk: bytes,
         author_pub: bytes,
-        cls_: bytes,
         seq: int,
         prev: bytes,
         hlc: HLC,
+        pver: int,
         keyepoch: int,
-        payload: bytes,
-        slot_tag: bytes | None = None,
-        pver: int = 0,
-    ) -> Self:
-        """Build & sign an op with an already-materialized payload (control
-        ops, or data ops whose payload was sealed via `seal_data_payload`)."""
-        # tuple(deps) + the tuple-valued HLC.encode() are covariantly Bencodable,
-        # so this annotates directly — no cast (see codec.Bencodable).
-        fields: dict[Field, Bencodable] = {
-            Field.CLASS: cls_,
+        slot_tag: bytes | None,
+        data_key: bytes,
+        txn_bytes: bytes,
+    ) -> tuple[bytes, bytes, bytes]:
+        """Seal `txn_bytes` (AAD = envelope-minus-payload, computed before the payload
+        exists — DESIGN §5) and sign; return (payload, raw, sig) so the data leaf
+        constructs itself directly. Shared by both data builds."""
+        f: dict[Field, Bencodable] = {
+            Field.CLASS: OpClass.DATA,
             Field.AUTHOR: author_pub,
             Field.SEQ: int(seq),
             Field.PREV: prev,
             Field.HLC: hlc.encode(),
-            Field.KEYEPOCH: int(keyepoch),
             Field.PVER: int(pver),
-            Field.PAYLOAD: payload,
+            Field.KEYEPOCH: int(keyepoch),
         }
         if slot_tag is not None:
-            fields[Field.SLOT_TAG] = slot_tag
-        sig = crypto.SIGNER.sign(author_sk, cls._signing_bytes(fields))
-        fields[Field.SIG] = sig
-        raw = codec.encode(fields)
-        return cls(raw, fields)
+            f[Field.SLOT_TAG] = slot_tag
+        payload = crypto.AEAD.seal(data_key, crypto.h(codec.encode(f)), txn_bytes)
+        f[Field.PAYLOAD] = payload
+        raw, sig = Op._sign(author_sk, f)
+        return payload, raw, sig
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class CasOp(DataOp, Slotted):
+    """A slotted data op — CAS contended on `slot_tag` (guaranteed non-None) via the
+    ballot machinery. The tag is `compute_slot_tag(secret, ...)` over a secret the
+    node cannot see, so its binding is verified in the fold by attribution (§7)."""
+
+    slot_tag: bytes
 
     @classmethod
-    def build_data(
+    def build(
         cls,
         *,
         author_sk: bytes,
@@ -518,37 +569,702 @@ class Op:
         keyepoch: int,
         data_key: bytes,
         txn_bytes: bytes,
-        slot_tag: bytes | None = None,
+        slot_tag: bytes,
         pver: int = 0,
     ) -> Self:
-        """Build a data op: seal `txn_bytes` under the group key with
-        AAD = envelope-minus-payload, then sign. The AAD is computed from the
-        envelope fields *before* the payload exists (DESIGN §5)."""
-        base = {  # only fed to codec.encode (accepts object) for the AAD hash
-            Field.CLASS: OpClass.DATA,
+        payload, raw, sig = DataOp._seal_and_sign(
+            author_sk=author_sk,
+            author_pub=author_pub,
+            seq=seq,
+            prev=prev,
+            hlc=hlc,
+            pver=pver,
+            keyepoch=keyepoch,
+            slot_tag=slot_tag,
+            data_key=data_key,
+            txn_bytes=txn_bytes,
+        )
+        return cls(
+            author=author_pub,
+            seq=int(seq),
+            prev=prev,
+            hlc=hlc,
+            pver=int(pver),
+            sig=sig,
+            raw=raw,
+            keyepoch=int(keyepoch),
+            payload=payload,
+            slot_tag=slot_tag,
+        )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class BlindPutOp(DataOp):
+    """A blind data write — no slot, always receipted at the BLIND ballot (§8)."""
+
+    @classmethod
+    def build(
+        cls,
+        *,
+        author_sk: bytes,
+        author_pub: bytes,
+        seq: int,
+        prev: bytes,
+        hlc: HLC,
+        keyepoch: int,
+        data_key: bytes,
+        txn_bytes: bytes,
+        pver: int = 0,
+    ) -> Self:
+        payload, raw, sig = DataOp._seal_and_sign(
+            author_sk=author_sk,
+            author_pub=author_pub,
+            seq=seq,
+            prev=prev,
+            hlc=hlc,
+            pver=pver,
+            keyepoch=keyepoch,
+            slot_tag=None,
+            data_key=data_key,
+            txn_bytes=txn_bytes,
+        )
+        return cls(
+            author=author_pub,
+            seq=int(seq),
+            prev=prev,
+            hlc=hlc,
+            pver=int(pver),
+            sig=sig,
+            raw=raw,
+            keyepoch=int(keyepoch),
+            payload=payload,
+        )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ControlOp(Op):
+    """A plaintext, node-folded control op (DESIGN §5 carve-out). Abstract base for
+    the concrete control leaves (defined with the control section below, alongside
+    the kind vocabulary they dispatch through). `from_bytes` never yields a bare
+    ControlOp — a well-formed body -> its leaf, a malformed/unknown one -> InvalidOp."""
+
+    KIND: ClassVar[ControlKind]  # each concrete leaf assigns its kind (InvalidOp has none)
+
+    @property
+    def is_control(self) -> bool:
+        return True  # overrides Op.is_control; InvalidOp (a ControlOp) inherits this
+
+    @classmethod
+    def _from_envelope(cls, env: dict[bytes, Bencodable], raw: bytes) -> Op:
+        """Decode the plaintext body ONCE, dispatch to the kind's leaf `_from_body`,
+        or InvalidOp on any failure (totality — never raises on wire input, NOTES 17)."""
+        invalid = InvalidOp(**InvalidOp._kwargs(env, raw))
+        try:
+            body = codec.decode(codec.as_bytes(_require(env, Field.PAYLOAD)))
+        except (codec.CodecError, ArtifactError):
+            return invalid
+        if not isinstance(body, dict) or BK_KIND not in body:
+            return invalid
+        try:
+            kind = ControlKind(body[BK_KIND])
+        except ValueError:
+            return invalid  # unknown kind — fail-closed (lane-3 gates new kinds)
+        leaf = _CONTROL_LEAVES.get(kind)
+        if leaf is None:
+            return invalid
+        try:
+            return leaf._from_body(env, raw, body)
+        except (codec.CodecError, ArtifactError, KeyError, TypeError):
+            return invalid
+
+    @classmethod
+    def _from_body(
+        cls, env: dict[bytes, Bencodable], raw: bytes, body: dict[bytes, Bencodable]
+    ) -> Op:
+        """Construct this leaf from the envelope + already-decoded body. Each concrete
+        leaf overrides; the base is unreachable (dispatch only hits a known leaf)."""
+        raise NotImplementedError
+
+    @staticmethod
+    def _control_raw(
+        author_sk: bytes,
+        *,
+        author_pub: bytes,
+        seq: int,
+        prev: bytes,
+        hlc: HLC,
+        pver: int,
+        body: bytes,
+        slot_tag: bytes | None = None,
+    ) -> tuple[bytes, bytes]:
+        """Assemble + sign a CONTROL envelope (no keyepoch — control carries it in the
+        body); return (raw, sig). Each leaf's `build` encodes its body, calls this, then
+        constructs itself directly."""
+        f: dict[Field, Bencodable] = {
+            Field.CLASS: OpClass.CONTROL,
             Field.AUTHOR: author_pub,
             Field.SEQ: int(seq),
             Field.PREV: prev,
             Field.HLC: hlc.encode(),
-            Field.KEYEPOCH: int(keyepoch),
             Field.PVER: int(pver),
+            Field.PAYLOAD: body,
         }
         if slot_tag is not None:
-            base[Field.SLOT_TAG] = slot_tag
-        aad = crypto.h(codec.encode(base))  # envelope-minus-payload-minus-sig
-        payload = crypto.AEAD.seal(data_key, aad, txn_bytes)  # nonce ‖ ct ‖ tag
-        return cls.build(
-            author_sk=author_sk,
+            f[Field.SLOT_TAG] = slot_tag
+        return Op._sign(author_sk, f)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class InvalidOp(ControlOp):
+    """A well-formed envelope whose (control) body is unparseable or an unknown
+    kind. An explicit variant so the fold treats it `invalid` BY TYPE (totality,
+    NOTES 17), not a None sentinel."""
+
+
+# --------------------------------------------------------------------------- #
+# Control ops — the plaintext, node-folded leaves (DESIGN §5 carve-out, §12/13) #
+# --------------------------------------------------------------------------- #
+#
+# The control-plane leaves live in the FORMAT LAYER (HANDOFF-R8 §3a): each is a
+# concrete `ControlOp` subclass carrying its decoded body fields, so `from_bytes`
+# dispatches natively (no registry). Node-folded semantics (roster/cert
+# application) stay in the state machines (fold.ControlState) — this is structure
+# and bytes only. `decode()` maps any malformed/unknown body to InvalidOp so the
+# fold stays total (NOTES 17).
+
+BK_KIND = b"kind"  # body discriminator (a field key, not a value vocabulary)
+
+
+class ControlKind(BytesEnum):
+    """The kind of a control-op body (DESIGN §12, §13, §15, §16). An unknown kind
+    -> InvalidOp (fail-closed; new kinds are lane-3 gated, DESIGN §16)."""
+
+    CERT_ISSUE = b"cert_issue"
+    CERT_REVOKE = b"cert_revoke"
+    ROSTER = b"roster"
+    ROTATE = b"rotate"
+    WRAP_SET = b"wrap_set"
+    CHECKPOINT = b"checkpoint"
+    PVER_ACTIVATE = b"pver_activate"
+    ENDPOINT = b"endpoint"
+
+
+class Cap(BytesEnum):
+    """Capability certs grant (DESIGN §15)."""
+
+    WRITE = b"write"
+    STORE = b"store"
+    COMPACT = b"compact"
+    MANAGE_ROSTER = b"manage-roster"
+    ISSUE_REVOKE = b"issue-revoke"
+
+
+# small generic body-value parsers (codec-level, shared by the leaves' `_from_body`)
+def _uint(v: Bencodable) -> int:
+    n = codec.as_int(v)
+    if n < 0:
+        raise codec.CodecError("expected a non-negative integer")
+    return n
+
+
+def _heads(v: Bencodable) -> Heads:
+    out: Heads = {}
+    for author, entry in codec.as_dict(v).items():
+        pair = codec.as_seq(entry, 2)
+        out[author] = (_uint(pair[0]), codec.as_bytes(pair[1]))
+    return out
+
+
+def _retained(v: Bencodable) -> dict[bytes, RetainedEntry]:
+    """Per-author retained-set commitment {author: (size, digest)} (DESIGN §12 rev 6,
+    NOTES 29c). Plaintext — op-hashes are public metadata."""
+    out: dict[bytes, RetainedEntry] = {}
+    for author, entry in codec.as_dict(v).items():
+        pair = codec.as_seq(entry, 2)
+        out[author] = RetainedEntry(_uint(pair[0]), codec.as_bytes(pair[1]))
+    return out
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class CertIssueOp(ControlOp):
+    KIND: ClassVar[ControlKind] = ControlKind.CERT_ISSUE
+    subject: bytes
+    caps: list[bytes]
+    epoch: int
+
+    @classmethod
+    def _from_body(
+        cls, env: dict[bytes, Bencodable], raw: bytes, body: dict[bytes, Bencodable]
+    ) -> Self:
+        return cls(
+            **cls._kwargs(env, raw),
+            subject=codec.as_bytes(codec.field(body, b"subject")),
+            caps=[codec.as_bytes(c) for c in codec.as_seq(codec.field(body, b"caps"))],
+            epoch=_uint(codec.field(body, b"epoch")),
+        )
+
+    @classmethod
+    def build(
+        cls,
+        *,
+        author_sk: bytes,
+        author_pub: bytes,
+        seq: int,
+        prev: bytes,
+        hlc: HLC,
+        subject: bytes,
+        caps: Iterable[bytes],
+        epoch: int,
+        pver: int = 0,
+    ) -> Self:
+        body = codec.encode(
+            {
+                BK_KIND: cls.KIND,
+                b"subject": subject,
+                b"caps": [bytes(c) for c in caps],
+                b"epoch": int(epoch),
+            }
+        )
+        raw, sig = ControlOp._control_raw(
+            author_sk, author_pub=author_pub, seq=seq, prev=prev, hlc=hlc, pver=pver, body=body
+        )
+        return cls(
+            author=author_pub,
+            seq=int(seq),
+            prev=prev,
+            hlc=hlc,
+            pver=int(pver),
+            sig=sig,
+            raw=raw,
+            subject=subject,
+            caps=[bytes(c) for c in caps],
+            epoch=int(epoch),
+        )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class CertRevokeOp(ControlOp):
+    KIND: ClassVar[ControlKind] = ControlKind.CERT_REVOKE
+    subject: bytes
+
+    @classmethod
+    def _from_body(
+        cls, env: dict[bytes, Bencodable], raw: bytes, body: dict[bytes, Bencodable]
+    ) -> Self:
+        return cls(**cls._kwargs(env, raw), subject=codec.as_bytes(codec.field(body, b"subject")))
+
+    @classmethod
+    def build(
+        cls,
+        *,
+        author_sk: bytes,
+        author_pub: bytes,
+        seq: int,
+        prev: bytes,
+        hlc: HLC,
+        subject: bytes,
+        pver: int = 0,
+    ) -> Self:
+        body = codec.encode({BK_KIND: cls.KIND, b"subject": subject})
+        raw, sig = ControlOp._control_raw(
+            author_sk, author_pub=author_pub, seq=seq, prev=prev, hlc=hlc, pver=pver, body=body
+        )
+        return cls(
+            author=author_pub,
+            seq=int(seq),
+            prev=prev,
+            hlc=hlc,
+            pver=int(pver),
+            sig=sig,
+            raw=raw,
+            subject=subject,
+        )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class RosterOp(ControlOp, Slotted):
+    KIND: ClassVar[ControlKind] = ControlKind.ROSTER
+    from_epoch: int
+    roster: list[bytes]
+    sync_frontier: Heads
+    recovery: bytes | None  # NOTES 36a: an op_hash = the fiat recovery pairing; None = normal
+    slot_tag: bytes  # (Slotted) contended on roster_slot_tag(from_epoch) (DESIGN §13, B4)
+
+    def expected_slot_tag(self) -> bytes:
+        return roster_slot_tag(self.from_epoch)
+
+    @classmethod
+    def _from_body(
+        cls, env: dict[bytes, Bencodable], raw: bytes, body: dict[bytes, Bencodable]
+    ) -> Self:
+        roster = [codec.as_bytes(p) for p in codec.as_seq(codec.field(body, b"roster"))]
+        # DESIGN §13: roster size is always odd — even voting counts enlarge quorums
+        # without adding tolerance, so they are malformed.
+        if len(roster) == 0 or len(roster) % 2 == 0:
+            raise codec.CodecError("roster must have an odd, non-zero voting-member count")
+        rec = body.get(b"recovery")  # present => the fiat recovery trigger (root-only)
+        return cls(
+            **cls._kwargs(env, raw),
+            from_epoch=_uint(codec.field(body, b"from_epoch")),
+            roster=roster,
+            sync_frontier=_heads(codec.field(body, b"sync_frontier")),
+            recovery=codec.as_bytes(rec) if rec is not None else None,
+        )
+
+    @classmethod
+    def build(
+        cls,
+        *,
+        author_sk: bytes,
+        author_pub: bytes,
+        seq: int,
+        prev: bytes,
+        hlc: HLC,
+        from_epoch: int,
+        roster: list[bytes],
+        sync_frontier: Heads,
+        recovery: bytes | None = None,
+        pver: int = 0,
+    ) -> Self:
+        d: dict[bytes, Any] = {
+            BK_KIND: cls.KIND,
+            b"from_epoch": int(from_epoch),
+            b"roster": [bytes(p) for p in roster],
+            b"sync_frontier": {a: [s, h] for a, (s, h) in sync_frontier.items()},
+        }
+        if recovery is not None:  # the fiat recovery pairing; omit for a normal roster
+            d[b"recovery"] = recovery
+        slot = roster_slot_tag(from_epoch)
+        raw, sig = ControlOp._control_raw(
+            author_sk,
             author_pub=author_pub,
-            cls_=OpClass.DATA,
             seq=seq,
             prev=prev,
             hlc=hlc,
-            keyepoch=keyepoch,
-            payload=payload,
-            slot_tag=slot_tag,
             pver=pver,
+            body=codec.encode(d),
+            slot_tag=slot,
         )
+        return cls(
+            author=author_pub,
+            seq=int(seq),
+            prev=prev,
+            hlc=hlc,
+            pver=int(pver),
+            sig=sig,
+            raw=raw,
+            from_epoch=int(from_epoch),
+            roster=[bytes(p) for p in roster],
+            sync_frontier=sync_frontier,
+            recovery=recovery,
+            slot_tag=slot,
+        )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class RotateOp(ControlOp):
+    KIND: ClassVar[ControlKind] = ControlKind.ROTATE
+    keyepoch: int
+
+    @classmethod
+    def _from_body(
+        cls, env: dict[bytes, Bencodable], raw: bytes, body: dict[bytes, Bencodable]
+    ) -> Self:
+        return cls(**cls._kwargs(env, raw), keyepoch=_uint(codec.field(body, b"keyepoch")))
+
+    @classmethod
+    def build(
+        cls,
+        *,
+        author_sk: bytes,
+        author_pub: bytes,
+        seq: int,
+        prev: bytes,
+        hlc: HLC,
+        keyepoch: int,
+        pver: int = 0,
+    ) -> Self:
+        body = codec.encode({BK_KIND: cls.KIND, b"keyepoch": int(keyepoch)})
+        raw, sig = ControlOp._control_raw(
+            author_sk, author_pub=author_pub, seq=seq, prev=prev, hlc=hlc, pver=pver, body=body
+        )
+        return cls(
+            author=author_pub,
+            seq=int(seq),
+            prev=prev,
+            hlc=hlc,
+            pver=int(pver),
+            sig=sig,
+            raw=raw,
+            keyepoch=int(keyepoch),
+        )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class WrapSetOp(ControlOp):
+    KIND: ClassVar[ControlKind] = ControlKind.WRAP_SET
+    keyepoch: int
+    wraps: dict[bytes, bytes]  # member_pub -> sealed group key
+
+    @classmethod
+    def _from_body(
+        cls, env: dict[bytes, Bencodable], raw: bytes, body: dict[bytes, Bencodable]
+    ) -> Self:
+        return cls(
+            **cls._kwargs(env, raw),
+            keyepoch=_uint(codec.field(body, b"keyepoch")),
+            wraps={
+                k: codec.as_bytes(v) for k, v in codec.as_dict(codec.field(body, b"wraps")).items()
+            },
+        )
+
+    @classmethod
+    def build(
+        cls,
+        *,
+        author_sk: bytes,
+        author_pub: bytes,
+        seq: int,
+        prev: bytes,
+        hlc: HLC,
+        keyepoch: int,
+        group_key: bytes,
+        members: list[bytes],
+        pver: int = 0,
+    ) -> Self:
+        """Distribute `group_key` (K_epoch) to each member: an `sbx1` sealed box per
+        member pubkey (DESIGN §3 / §15). Only that member's secret key opens its wrap;
+        the control op's signature authenticates the distribution."""
+        wraps = {m: crypto.seal_to(m, group_key) for m in members}
+        body = codec.encode({BK_KIND: cls.KIND, b"keyepoch": int(keyepoch), b"wraps": wraps})
+        raw, sig = ControlOp._control_raw(
+            author_sk, author_pub=author_pub, seq=seq, prev=prev, hlc=hlc, pver=pver, body=body
+        )
+        return cls(
+            author=author_pub,
+            seq=int(seq),
+            prev=prev,
+            hlc=hlc,
+            pver=int(pver),
+            sig=sig,
+            raw=raw,
+            keyepoch=int(keyepoch),
+            wraps=wraps,
+        )
+
+    def unwrap(self, member_sk: bytes) -> bytes | None:
+        """Member-side: recover K_epoch, or None if this member has no wrap in the set
+        (or it fails to open)."""
+        sealed = self.wraps.get(crypto.SIGNER.public(member_sk))
+        return None if sealed is None else crypto.open_sealed(member_sk, sealed)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class CheckpointOp(ControlOp, Slotted):
+    KIND: ClassVar[ControlKind] = ControlKind.CHECKPOINT
+    baseline: Baseline  # the below-cut manifest: cut + retained commitment + dead band
+    state_acc: bytes
+    attempts: bytes
+    keyepoch: int
+    horizon: HLC  # the finality frontier F the cut was sealed at (§9)
+    # the monotone checkpoint sequence (the public slot it contends, WP-F(c)) — NOT
+    # the envelope `seq` (this op's own chain position); distinct now they're fused.
+    checkpoint_seq: int
+    slot_tag: bytes  # (Slotted) contended on checkpoint_slot_tag(checkpoint_seq)
+
+    def expected_slot_tag(self) -> bytes:
+        return checkpoint_slot_tag(self.checkpoint_seq)
+
+    @classmethod
+    def _from_body(
+        cls, env: dict[bytes, Bencodable], raw: bytes, body: dict[bytes, Bencodable]
+    ) -> Self:
+        # rev 6 (DESIGN §12): log-compaction — `dead` is the incremental GC delta,
+        # `retained` commits the FULL retained set ≤ cut, `attempts` the sealed sidecar.
+        return cls(
+            **cls._kwargs(env, raw),
+            baseline=Baseline(
+                cut=_heads(codec.field(body, b"cut")),
+                retained=_retained(codec.field(body, b"retained")),
+                dead=frozenset(codec.as_bytes(h) for h in codec.as_seq(codec.field(body, b"dead"))),
+            ),
+            state_acc=codec.as_bytes(codec.field(body, b"state_acc")),
+            attempts=codec.as_bytes(codec.field(body, b"attempts")),
+            keyepoch=_uint(codec.field(body, b"keyepoch")),
+            horizon=HLC.decode(codec.field(body, b"horizon")),
+            checkpoint_seq=_uint(codec.field(body, b"seq")),
+        )
+
+    @classmethod
+    def build(
+        cls,
+        *,
+        author_sk: bytes,
+        author_pub: bytes,
+        seq: int,
+        prev: bytes,
+        hlc: HLC,
+        baseline: Baseline,
+        state_acc: bytes,
+        attempts: bytes,
+        keyepoch: int,
+        horizon: HLC,
+        checkpoint_seq: int,
+        pver: int = 0,
+    ) -> Self:
+        # `dead` is encoded SORTED — a set, so the wire is deterministic regardless of GC order.
+        body = codec.encode(
+            {
+                BK_KIND: cls.KIND,
+                b"cut": {a: [s, h] for a, (s, h) in baseline.cut.items()},
+                b"state_acc": state_acc,
+                b"dead": sorted(baseline.dead),
+                b"retained": {a: [c, d] for a, (c, d) in baseline.retained.items()},
+                b"attempts": attempts,
+                b"keyepoch": int(keyepoch),
+                b"horizon": list(horizon.encode()),
+                b"seq": int(checkpoint_seq),
+            }
+        )
+        slot = checkpoint_slot_tag(checkpoint_seq)
+        raw, sig = ControlOp._control_raw(
+            author_sk,
+            author_pub=author_pub,
+            seq=seq,
+            prev=prev,
+            hlc=hlc,
+            pver=pver,
+            body=body,
+            slot_tag=slot,
+        )
+        return cls(
+            author=author_pub,
+            seq=int(seq),
+            prev=prev,
+            hlc=hlc,
+            pver=int(pver),
+            sig=sig,
+            raw=raw,
+            baseline=baseline,
+            state_acc=state_acc,
+            attempts=attempts,
+            keyepoch=int(keyepoch),
+            horizon=horizon,
+            checkpoint_seq=int(checkpoint_seq),
+            slot_tag=slot,
+        )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class PverActivateOp(ControlOp):
+    KIND: ClassVar[ControlKind] = ControlKind.PVER_ACTIVATE
+    activate_pver: int  # the target protocol version — NOT the envelope `pver`
+
+    @classmethod
+    def _from_body(
+        cls, env: dict[bytes, Bencodable], raw: bytes, body: dict[bytes, Bencodable]
+    ) -> Self:
+        return cls(**cls._kwargs(env, raw), activate_pver=_uint(codec.field(body, b"pver")))
+
+    @classmethod
+    def build(
+        cls,
+        *,
+        author_sk: bytes,
+        author_pub: bytes,
+        seq: int,
+        prev: bytes,
+        hlc: HLC,
+        activate_pver: int,
+        pver: int = 0,
+    ) -> Self:
+        body = codec.encode({BK_KIND: cls.KIND, b"pver": int(activate_pver)})
+        raw, sig = ControlOp._control_raw(
+            author_sk, author_pub=author_pub, seq=seq, prev=prev, hlc=hlc, pver=pver, body=body
+        )
+        return cls(
+            author=author_pub,
+            seq=int(seq),
+            prev=prev,
+            hlc=hlc,
+            pver=int(pver),
+            sig=sig,
+            raw=raw,
+            activate_pver=int(activate_pver),
+        )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class EndpointOp(ControlOp):
+    KIND: ClassVar[ControlKind] = ControlKind.ENDPOINT
+    subject: bytes
+    addrs: list[tuple[bytes, bytes, dict[bytes, bytes]]]  # (transport, uri, opts); empty = removal
+
+    @classmethod
+    def _from_body(
+        cls, env: dict[bytes, Bencodable], raw: bytes, body: dict[bytes, Bencodable]
+    ) -> Self:
+        # Node reachability (PROTOCOL §7.1, NOTES 58): pubkey -> access methods.
+        addrs: list[tuple[bytes, bytes, dict[bytes, bytes]]] = []
+        for entry in codec.as_seq(codec.field(body, b"addrs")):
+            e = codec.as_seq(entry, 3)
+            opts = {k: codec.as_bytes(v) for k, v in codec.as_dict(e[2]).items()}
+            addrs.append((codec.as_bytes(e[0]), codec.as_bytes(e[1]), opts))
+        return cls(
+            **cls._kwargs(env, raw),
+            subject=codec.as_bytes(codec.field(body, b"subject")),
+            addrs=addrs,
+        )
+
+    @classmethod
+    def build(
+        cls,
+        *,
+        author_sk: bytes,
+        author_pub: bytes,
+        seq: int,
+        prev: bytes,
+        hlc: HLC,
+        subject: bytes,
+        addrs: list[tuple[bytes, bytes, dict[bytes, bytes]]],
+        pver: int = 0,
+    ) -> Self:
+        """Latest-wins per subject; an EMPTY `addrs` removes the node."""
+        body = codec.encode(
+            {
+                BK_KIND: cls.KIND,
+                b"subject": subject,
+                b"addrs": [[t, u, dict(o)] for (t, u, o) in addrs],
+            }
+        )
+        raw, sig = ControlOp._control_raw(
+            author_sk, author_pub=author_pub, seq=seq, prev=prev, hlc=hlc, pver=pver, body=body
+        )
+        return cls(
+            author=author_pub,
+            seq=int(seq),
+            prev=prev,
+            hlc=hlc,
+            pver=int(pver),
+            sig=sig,
+            raw=raw,
+            subject=subject,
+            addrs=list(addrs),
+        )
+
+
+# kind -> leaf, the only dispatch `ControlOp._from_envelope` needs (each leaf owns
+# its own decode/encode). A malformed body or a kind absent here -> InvalidOp.
+_CONTROL_LEAVES: dict[ControlKind, type[ControlOp]] = {
+    ControlKind.CERT_ISSUE: CertIssueOp,
+    ControlKind.CERT_REVOKE: CertRevokeOp,
+    ControlKind.ROSTER: RosterOp,
+    ControlKind.ROTATE: RotateOp,
+    ControlKind.WRAP_SET: WrapSetOp,
+    ControlKind.CHECKPOINT: CheckpointOp,
+    ControlKind.PVER_ACTIVATE: PverActivateOp,
+    ControlKind.ENDPOINT: EndpointOp,
+}
 
 
 # --------------------------------------------------------------------------- #

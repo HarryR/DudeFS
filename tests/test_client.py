@@ -10,6 +10,7 @@ import tempfile
 import threading
 import time
 import unittest
+from functools import partial
 
 from dudefs import artifacts as A
 from dudefs import compactor
@@ -18,7 +19,6 @@ from dudefs import fold as F
 from dudefs.artifacts import VERSION_ABSENT
 from dudefs.client import ClientDaemon, KeyEntry
 from dudefs.daemon import NodeDaemon
-from dudefs.handlers import control as ctl
 from dudefs.workerapi import WorkerServer
 from tests._builders import World, cut_of, now_ms, poll_until, unix_eps
 
@@ -329,7 +329,13 @@ class TestEndpointConsumption(unittest.TestCase):
 
     def _endpoints(self, w, roster):
         return [
-            w._mgr_op(ctl.endpoint_body(roster[i], [(b"unix", f"/n{i}.sock".encode(), {})]))
+            w._mgr_op(
+                partial(
+                    A.EndpointOp.build,
+                    subject=roster[i],
+                    addrs=[(b"unix", f"/n{i}.sock".encode(), {})],
+                )
+            )
             for i in range(len(roster))
         ]
 
@@ -376,15 +382,20 @@ class TestEndpointConsumption(unittest.TestCase):
         roster = [C.SIGNER.public(bytes([200 + i] * 32)) for i in range(3)]
         eps = [
             w._mgr_op(
-                ctl.endpoint_body(
-                    roster[0],
-                    [
+                partial(
+                    A.EndpointOp.build,
+                    subject=roster[0],
+                    addrs=[
                         (b"http", b"http://x/dude", {b"lmsg": b"sealed"}),
                         (b"unix", b"/n0.sock", {}),
                     ],
                 )
             ),
-            w._mgr_op(ctl.endpoint_body(roster[1], [(b"http", b"http://y/dude", {})])),
+            w._mgr_op(
+                partial(
+                    A.EndpointOp.build, subject=roster[1], addrs=[(b"http", b"http://y/dude", {})]
+                )
+            ),
         ]
         c = ClientDaemon(
             w.clients[0].sk,

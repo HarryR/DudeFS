@@ -23,7 +23,6 @@ from . import compactor
 from .artifacts import HLC, Op, covered
 from .client import ClientDaemon, _drive
 from .daemon import _cut_dominates
-from .handlers import control as ctl
 from .quorum import Commit, Committed
 from .store import ReadTxn
 
@@ -68,21 +67,17 @@ class CompactorDaemon(ClientDaemon):
         best_cut: A.Heads = {}
         h = tx.get_meta("checkpoint")
         own = tx.get_op(h) if h else None
-        own_body = ctl.decode(own) if own is not None else None
-        if isinstance(own_body, ctl.Checkpoint):  # my adopted head (its QC may be GC'd)
-            best_seq, best_cut = own_body.seq, own_body.baseline.cut
+        if isinstance(own, A.CheckpointOp):  # my adopted head (its QC may be GC'd)
+            best_seq, best_cut = own.checkpoint_seq, own.baseline.cut
         for op in tx.all_ops():
-            if not op.is_control:
-                continue
-            body = ctl.decode(op)
-            if not isinstance(body, ctl.Checkpoint):
+            if not isinstance(op, A.CheckpointOp):
                 continue
             if tx.get_qc(op.op_hash) is None:  # only a COMMITTED checkpoint decides a seq
                 continue
-            if op.slot_tag != A.checkpoint_slot_tag(body.seq):  # seq must bind its slot
+            if op.slot_tag != A.checkpoint_slot_tag(op.checkpoint_seq):  # seq must bind its slot
                 continue
-            if body.seq > best_seq:
-                best_seq, best_cut = body.seq, body.baseline.cut
+            if op.checkpoint_seq > best_seq:
+                best_seq, best_cut = op.checkpoint_seq, op.baseline.cut
         return best_seq + 1, best_cut
 
     def _author_checkpoint(
@@ -93,25 +88,19 @@ class CompactorDaemon(ClientDaemon):
         `checkpoint_slot_tag(seq)` so the quorum serializes it (WP-F(c)). The `attempts`
         sidecar is sealed under the group key; everything else is the plaintext manifest."""
         dk = self.keyring[self.keyepoch]["data_key"]
-        body = ctl.checkpoint_body(
-            A.Baseline(cut, A.retained_commitment(cr.retained), frozenset(cr.dead)),
-            cr.state_acc,
-            compactor.seal_attempts(cr.attempts, dk),
-            self.keyepoch,
-            horizon,
-            seq,
-        )
         with self._lock:
-            op = A.Op.build(
+            op = A.CheckpointOp.build(
                 author_sk=self.sk,
                 author_pub=self.pub,
-                cls_=A.OpClass.CONTROL,
                 seq=self._seq,
                 prev=self._prev,
                 hlc=self._next_hlc(),
+                baseline=A.Baseline(cut, A.retained_commitment(cr.retained), frozenset(cr.dead)),
+                state_acc=cr.state_acc,
+                attempts=compactor.seal_attempts(cr.attempts, dk),
                 keyepoch=self.keyepoch,
-                payload=body,
-                slot_tag=A.checkpoint_slot_tag(seq),
+                horizon=horizon,
+                checkpoint_seq=seq,
             )
             with self.store.write_txn() as tx:
                 tx.put_op_raw(op)
@@ -132,11 +121,8 @@ class CompactorDaemon(ClientDaemon):
         attempts: dict[bytes, int] = {}
         h = tx.get_meta("checkpoint")
         op = tx.get_op(h) if h else None
-        body = ctl.decode(op) if op is not None else None
-        if isinstance(body, ctl.Checkpoint):
-            attempts = compactor.open_attempts(
-                body.attempts, self.keyring[body.keyepoch]["data_key"]
-            )
+        if isinstance(op, A.CheckpointOp):
+            attempts = compactor.open_attempts(op.attempts, self.keyring[op.keyepoch]["data_key"])
         return prev_cut, retained, attempts
 
     def compact_once(self) -> bytes | None:

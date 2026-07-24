@@ -182,7 +182,8 @@ class DoubleVoteEvidence:
         except Exception:
             return False
         return (
-            a.slot_tag is not None
+            isinstance(a, A.Slotted)
+            and isinstance(b, A.Slotted)
             and a.slot_tag == b.slot_tag  # same slot
             and a.op_hash != b.op_hash  # different ops
             and self.rcpt_a.op_hash == a.op_hash
@@ -941,9 +942,13 @@ class WriteTxn(ReadTxn):
                 for j in range(i + 1, len(rcpts)):
                     a, b = rcpts[i], rcpts[j]
                     oa, ob = ops.get(a.op_hash), ops.get(b.op_hash)
-                    if oa is None or ob is None or oa.slot_tag is None:
+                    if oa is None or ob is None or not isinstance(oa, A.Slotted):
                         continue
-                    if oa.op_hash != ob.op_hash and oa.slot_tag == ob.slot_tag:
+                    if (
+                        oa.op_hash != ob.op_hash
+                        and isinstance(ob, A.Slotted)
+                        and oa.slot_tag == ob.slot_tag
+                    ):
                         if (signer, a.op_hash, b.op_hash) in seen or (
                             signer,
                             b.op_hash,

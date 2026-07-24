@@ -5,17 +5,26 @@
 import os
 import tempfile
 import unittest
+from functools import partial
 
 from dudefs import artifacts as A
 from dudefs import crypto as C
 from dudefs import fold, transports
 from dudefs.acceptor import Acceptor, Rejected, RejectReason
-from dudefs.handlers import control as ctl
 from dudefs.store import ChainStore
 from tests._builders import World
 from tests._gossip import merge
 
-CP = ctl.checkpoint_body(A.Baseline({}, {}), b"", b"", 0, A.HLC(0, 0))  # authz-only; no cut placed
+# authz-only; no cut placed. A leaf `build` partial fed the envelope by `_ctl`.
+CP = partial(
+    A.CheckpointOp.build,
+    baseline=A.Baseline({}, {}),
+    state_acc=b"",
+    attempts=b"",
+    keyepoch=0,
+    horizon=A.HLC(0, 0),
+    checkpoint_seq=0,
+)
 NOW = 100
 BIG_DELTA = 1_000_000  # skew never bites in these unit tests
 
@@ -30,16 +39,15 @@ def _acc_cluster(n, epoch=0):
 
 def _roster_op(msk, mpub, new_roster, sync_frontier, epoch=0):
     """A roster op: a slotted CONTROL op on the public slot H('roster' ‖ epoch)."""
-    return A.Op.build(
+    return A.RosterOp.build(
         author_sk=msk,
         author_pub=mpub,
-        cls_=A.OpClass.CONTROL,
         seq=0,
         prev=A.GENESIS_PREV,
         hlc=A.HLC(NOW, 0),
-        keyepoch=0,
-        payload=ctl.roster_body(epoch, new_roster, sync_frontier),
-        slot_tag=A.roster_slot_tag(epoch),
+        from_epoch=epoch,
+        roster=new_roster,
+        sync_frontier=sync_frontier,
     )
 
 
@@ -48,17 +56,10 @@ def _key(b):
     return sk, C.SIGNER.public(sk)
 
 
-def _ctl(sk, pub, seq, prev, hlc_ms, payload):
-    return A.Op.build(
-        author_sk=sk,
-        author_pub=pub,
-        cls_=A.OpClass.CONTROL,
-        seq=seq,
-        prev=prev,
-        hlc=A.HLC(hlc_ms, 0),
-        keyepoch=0,
-        payload=payload,
-    )
+def _ctl(sk, pub, seq, prev, hlc_ms, build):
+    """`build` is a leaf `build` partial pre-bound with its typed body kwargs; this
+    supplies the envelope (author/seq/prev/hlc)."""
+    return build(author_sk=sk, author_pub=pub, seq=seq, prev=prev, hlc=A.HLC(hlc_ms, 0))
 
 
 class TestCapabilityAuthz(unittest.TestCase):
@@ -78,10 +79,15 @@ class TestCapabilityAuthz(unittest.TestCase):
             0,
             A.GENESIS_PREV,
             1,
-            ctl.cert_issue_body(dpub, [ctl.Cap.COMPACT], 0),
+            partial(A.CertIssueOp.build, subject=dpub, caps=[A.Cap.COMPACT], epoch=0),
         )
         cert_c = _ctl(
-            self.msk, self.mpub, 1, cert_d.op_hash, 2, ctl.cert_issue_body(cpub, [ctl.Cap.WRITE], 0)
+            self.msk,
+            self.mpub,
+            1,
+            cert_d.op_hash,
+            2,
+            partial(A.CertIssueOp.build, subject=cpub, caps=[A.Cap.WRITE], epoch=0),
         )
         cp_delegate = _ctl(dsk, dpub, 0, A.GENESIS_PREV, 100, CP)  # has compact -> ok
         cp_client = _ctl(csk, cpub, 0, A.GENESIS_PREV, 101, CP)  # write only -> not ok
@@ -91,7 +97,12 @@ class TestCapabilityAuthz(unittest.TestCase):
 
     def test_root_authors_any_kind_without_a_cert(self):
         roster = _ctl(
-            self.msk, self.mpub, 0, A.GENESIS_PREV, 1, ctl.roster_body(0, [self.mpub], {})
+            self.msk,
+            self.mpub,
+            0,
+            A.GENESIS_PREV,
+            1,
+            partial(A.RosterOp.build, from_epoch=0, roster=[self.mpub], sync_frontier={}),
         )
         r = self._fold([roster])
         self.assertEqual(r.verdicts[roster.op_hash], fold.Verdict.CONTROL)
@@ -105,7 +116,7 @@ class TestCapabilityAuthz(unittest.TestCase):
             0,
             A.GENESIS_PREV,
             1,
-            ctl.cert_issue_body(dpub, [ctl.Cap.MANAGE_ROSTER], 0),
+            partial(A.CertIssueOp.build, subject=dpub, caps=[A.Cap.MANAGE_ROSTER], epoch=0),
         )
         cp = _ctl(dsk, dpub, 0, A.GENESIS_PREV, 100, CP)
         r = self._fold([cert, cp])
@@ -119,9 +130,11 @@ class TestCapabilityAuthz(unittest.TestCase):
             0,
             A.GENESIS_PREV,
             1,
-            ctl.cert_issue_body(dpub, [ctl.Cap.COMPACT], 0),
+            partial(A.CertIssueOp.build, subject=dpub, caps=[A.Cap.COMPACT], epoch=0),
         )
-        revoke = _ctl(self.msk, self.mpub, 1, cert.op_hash, 100, ctl.cert_revoke_body(dpub))
+        revoke = _ctl(
+            self.msk, self.mpub, 1, cert.op_hash, 100, partial(A.CertRevokeOp.build, subject=dpub)
+        )
         cp_before = _ctl(dsk, dpub, 0, A.GENESIS_PREV, 50, CP)  # before the revoke in fold order
         cp_after = _ctl(dsk, dpub, 1, cp_before.op_hash, 150, CP)  # after -> invalid
         r = self._fold([cert, revoke, cp_before, cp_after])
@@ -140,7 +153,7 @@ class TestEpochBridge(unittest.TestCase):
         op = w.cas(
             0, b"k", A.VERSION_ABSENT, 0, [[A.Guard.ABSENT, b"k"]], [[A.Mutation.SET, b"k", b"v"]]
         )
-        assert op.slot_tag is not None
+        assert isinstance(op, A.Slotted)
         tag, b = op.slot_tag, A.Ballot(1, b"x")
         for nd in nodes:
             self.assertIsInstance(nd.on_accept(tag, b, op, NOW), A.Receipt)
@@ -185,7 +198,15 @@ class TestRecoveryFence(unittest.TestCase):
             5,
             A.GENESIS_PREV,
             200,
-            ctl.checkpoint_body(A.Baseline({}, {}), b"root", b"", 0, A.HLC(0, 0)),
+            partial(
+                A.CheckpointOp.build,
+                baseline=A.Baseline({}, {}),
+                state_acc=b"root",
+                attempts=b"",
+                keyepoch=0,
+                horizon=A.HLC(0, 0),
+                checkpoint_seq=0,
+            ),
         )
         rop = _ctl(
             self.msk,
@@ -193,7 +214,13 @@ class TestRecoveryFence(unittest.TestCase):
             6,
             rckpt.op_hash,
             201,
-            ctl.roster_body(from_epoch, roster, {}, recovery=rckpt.op_hash),
+            partial(
+                A.RosterOp.build,
+                from_epoch=from_epoch,
+                roster=roster,
+                sync_frontier={},
+                recovery=rckpt.op_hash,
+            ),
         )
         return rckpt, rop
 
@@ -209,7 +236,7 @@ class TestRecoveryFence(unittest.TestCase):
         op = self.w.cas(
             0, b"k", A.VERSION_ABSENT, 0, [[A.Guard.ABSENT, b"k"]], [[A.Mutation.SET, b"k", b"v"]]
         )
-        assert op.slot_tag is not None
+        assert isinstance(op, A.Slotted)
         r = n.on_accept(op.slot_tag, A.Ballot(1, b"x"), op, NOW)
         assert isinstance(r, A.Receipt)
         self.assertEqual(r.config_epoch, 1)
@@ -222,7 +249,7 @@ class TestRecoveryFence(unittest.TestCase):
             0,
             A.GENESIS_PREV,
             1,
-            ctl.cert_issue_body(dpub, [ctl.Cap.MANAGE_ROSTER], 0),
+            partial(A.CertIssueOp.build, subject=dpub, caps=[A.Cap.MANAGE_ROSTER], epoch=0),
         )
         rckpt = _ctl(
             self.msk,
@@ -230,7 +257,15 @@ class TestRecoveryFence(unittest.TestCase):
             1,
             cert.op_hash,
             2,
-            ctl.checkpoint_body(A.Baseline({}, {}), b"", b"", 0, A.HLC(0, 0)),
+            partial(
+                A.CheckpointOp.build,
+                baseline=A.Baseline({}, {}),
+                state_acc=b"",
+                attempts=b"",
+                keyepoch=0,
+                horizon=A.HLC(0, 0),
+                checkpoint_seq=0,
+            ),
         )
         # a manage-roster delegate authors a recovery-marked roster -> root-only -> invalid
         rop = _ctl(
@@ -239,14 +274,27 @@ class TestRecoveryFence(unittest.TestCase):
             0,
             A.GENESIS_PREV,
             3,
-            ctl.roster_body(0, [dpub], {}, recovery=rckpt.op_hash),
+            partial(
+                A.RosterOp.build,
+                from_epoch=0,
+                roster=[dpub],
+                sync_frontier={},
+                recovery=rckpt.op_hash,
+            ),
         )
         r = self._fold([cert, rckpt, rop])
         self.assertEqual(r.verdicts[rop.op_hash], fold.Verdict.INVALID)
 
         # load-bearing: the SAME delegate's NON-recovery roster IS authorized —
         # it is the recovery marking, not the delegate, that forces root.
-        rop_ok = _ctl(dsk, dpub, 0, A.GENESIS_PREV, 3, ctl.roster_body(0, [dpub], {}))
+        rop_ok = _ctl(
+            dsk,
+            dpub,
+            0,
+            A.GENESIS_PREV,
+            3,
+            partial(A.RosterOp.build, from_epoch=0, roster=[dpub], sync_frontier={}),
+        )
         r2 = self._fold([cert, rop_ok])
         self.assertEqual(r2.verdicts[rop_ok.op_hash], fold.Verdict.CONTROL)
 
@@ -280,9 +328,16 @@ class TestRecoveryFence(unittest.TestCase):
             0,
             A.GENESIS_PREV,
             1,
-            ctl.cert_issue_body(dpub, [ctl.Cap.MANAGE_ROSTER], 0),
+            partial(A.CertIssueOp.build, subject=dpub, caps=[A.Cap.MANAGE_ROSTER], epoch=0),
         )
-        rop_normal = _ctl(dsk, dpub, 0, A.GENESIS_PREV, 2, ctl.roster_body(0, [dpub], {}))
+        rop_normal = _ctl(
+            dsk,
+            dpub,
+            0,
+            A.GENESIS_PREV,
+            2,
+            partial(A.RosterOp.build, from_epoch=0, roster=[dpub], sync_frontier={}),
+        )
         r = self._fold([cert, rop_normal])
         self.assertEqual(r.verdicts[rop_normal.op_hash], fold.Verdict.CONTROL)  # normal path
 
@@ -292,7 +347,15 @@ class TestRecoveryFence(unittest.TestCase):
             1,
             cert.op_hash,
             3,
-            ctl.checkpoint_body(A.Baseline({}, {}), b"", b"", 0, A.HLC(0, 0)),
+            partial(
+                A.CheckpointOp.build,
+                baseline=A.Baseline({}, {}),
+                state_acc=b"",
+                attempts=b"",
+                keyepoch=0,
+                horizon=A.HLC(0, 0),
+                checkpoint_seq=0,
+            ),
         )
         n = _acc_cluster(1)[0][0]
         # the fence requires the explicit pairing: a wrong recovery hash won't fire
@@ -418,25 +481,23 @@ class TestWrapSet(unittest.TestCase):
         sks = [bytes([50 + i] * 32) for i in range(3)]
         members = [C.SIGNER.public(s) for s in sks]
         k_epoch = bytes(range(32))
-        body = ctl.decode(
-            A.Op.build(
-                author_sk=bytes([1] * 32),
-                author_pub=C.SIGNER.public(bytes([1] * 32)),
-                cls_=A.OpClass.CONTROL,
-                seq=0,
-                prev=A.GENESIS_PREV,
-                hlc=A.HLC(NOW, 0),
-                keyepoch=1,
-                payload=ctl.sealed_wrap_set_body(1, k_epoch, members),
-            )
+        op = A.WrapSetOp.build(
+            author_sk=bytes([1] * 32),
+            author_pub=C.SIGNER.public(bytes([1] * 32)),
+            seq=0,
+            prev=A.GENESIS_PREV,
+            hlc=A.HLC(NOW, 0),
+            keyepoch=1,
+            group_key=k_epoch,
+            members=members,
         )
-        assert isinstance(body, ctl.WrapSet)
-        self.assertEqual(body.keyepoch, 1)
+        assert isinstance(op, A.WrapSetOp)
+        self.assertEqual(op.keyepoch, 1)
         # each member recovers K_epoch; a non-member gets nothing
         for sk in sks:
-            self.assertEqual(ctl.unwrap_group_key(body, sk), k_epoch)
+            self.assertEqual(op.unwrap(sk), k_epoch)
         outsider = bytes([200] * 32)
-        self.assertIsNone(ctl.unwrap_group_key(body, outsider))
+        self.assertIsNone(op.unwrap(outsider))
 
     def test_unwrap_then_derive_installs_the_working_keyring(self):
         # the finding-21 loop: ONE master is wrapped/unwrapped, then BOTH working
@@ -445,20 +506,18 @@ class TestWrapSet(unittest.TestCase):
         sk = bytes([60] * 32)
         member = C.SIGNER.public(sk)
         k_epoch = bytes([0xC3] * 32)
-        body = ctl.decode(
-            A.Op.build(
-                author_sk=bytes([1] * 32),
-                author_pub=C.SIGNER.public(bytes([1] * 32)),
-                cls_=A.OpClass.CONTROL,
-                seq=0,
-                prev=A.GENESIS_PREV,
-                hlc=A.HLC(NOW, 0),
-                keyepoch=2,
-                payload=ctl.sealed_wrap_set_body(2, k_epoch, [member]),
-            )
+        op = A.WrapSetOp.build(
+            author_sk=bytes([1] * 32),
+            author_pub=C.SIGNER.public(bytes([1] * 32)),
+            seq=0,
+            prev=A.GENESIS_PREV,
+            hlc=A.HLC(NOW, 0),
+            keyepoch=2,
+            group_key=k_epoch,
+            members=[member],
         )
-        assert isinstance(body, ctl.WrapSet)
-        recovered = ctl.unwrap_group_key(body, sk)
+        assert isinstance(op, A.WrapSetOp)
+        recovered = op.unwrap(sk)
         assert recovered is not None
         self.assertEqual(recovered, k_epoch)
         ring = fold.keyring_from_masters({2: recovered})
@@ -476,8 +535,10 @@ class TestEndpointRecords(unittest.TestCase):
     def test_folds_latest_wins_and_removal(self):
         w = World(seed=30, n_clients=0)
         node = C.SIGNER.public(bytes([70] * 32))
-        e1 = w._mgr_op(ctl.endpoint_body(node, self.ADDRS1))
-        e2 = w._mgr_op(ctl.endpoint_body(node, self.ADDRS2))  # supersedes e1
+        e1 = w._mgr_op(partial(A.EndpointOp.build, subject=node, addrs=self.ADDRS1))
+        e2 = w._mgr_op(
+            partial(A.EndpointOp.build, subject=node, addrs=self.ADDRS2)
+        )  # supersedes e1
         res = fold.fold([*w.control_ops, e1, e2], w.keyring, w.genesis)
         # decoded to dial Endpoints; latest wins, and the L_msg profile survives
         self.assertEqual(
@@ -485,7 +546,7 @@ class TestEndpointRecords(unittest.TestCase):
         )
         self.assertFalse(res.control.endpoints[node][0].sealed)  # plain profile survived
 
-        e3 = w._mgr_op(ctl.endpoint_body(node, []))  # empty addrs = removal
+        e3 = w._mgr_op(partial(A.EndpointOp.build, subject=node, addrs=[]))  # empty addrs = removal
         res2 = fold.fold([*w.control_ops, e1, e2, e3], w.keyring, w.genesis)
         self.assertNotIn(node, res2.control.endpoints)
 
@@ -496,7 +557,12 @@ class TestEndpointRecords(unittest.TestCase):
         delegate = w.clients[0]
         node = C.SIGNER.public(bytes([71] * 32))
         ep = _ctl(
-            delegate.sk, delegate.pub, 0, A.GENESIS_PREV, 100, ctl.endpoint_body(node, self.ADDRS1)
+            delegate.sk,
+            delegate.pub,
+            0,
+            A.GENESIS_PREV,
+            100,
+            partial(A.EndpointOp.build, subject=node, addrs=self.ADDRS1),
         )
         res = fold.fold([*w.control_ops, ep], w.keyring, w.genesis)
         self.assertNotIn(node, res.control.endpoints)  # unauthorized -> ignored

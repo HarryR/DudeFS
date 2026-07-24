@@ -8,6 +8,7 @@ import tempfile
 import threading
 import time
 import unittest
+from functools import partial
 
 from dudefs import artifacts as A
 from dudefs import compactor
@@ -16,7 +17,6 @@ from dudefs.artifacts import VERSION_ABSENT, covered
 from dudefs.client import ClientDaemon
 from dudefs.compactor_daemon import CompactorDaemon
 from dudefs.daemon import NodeDaemon, Peer
-from dudefs.handlers import control as ctl
 from tests._builders import World, now_ms, poll_until, unix_eps
 
 DELTA = 2000  # generous skew tolerance — these tests exercise compaction, not the skew gate
@@ -29,14 +29,34 @@ class _Fixture:
         self.w = w = World(seed=seed, n_clients=1)
         comp_sk = bytes([150] * 32)
         self.comp_pub = C.SIGNER.public(comp_sk)
-        w.control_ops.append(w._mgr_op(ctl.cert_issue_body(self.comp_pub, [ctl.Cap.COMPACT], 0)))
-        w.control_ops.append(w._mgr_op(ctl.sealed_wrap_set_body(0, w.masters[0], [self.comp_pub])))
+        w.control_ops.append(
+            w._mgr_op(
+                partial(A.CertIssueOp.build, subject=self.comp_pub, caps=[A.Cap.COMPACT], epoch=0)
+            )
+        )
+        w.control_ops.append(
+            w._mgr_op(
+                partial(
+                    A.WrapSetOp.build, keyepoch=0, group_key=w.masters[0], members=[self.comp_pub]
+                )
+            )
+        )
         # a SECOND, distinct Cap.COMPACT identity — a genuine concurrent/failover compactor
         # (its own key + chain, so no equivocation) for the divergence-impossibility tests.
         comp2_sk = bytes([151] * 32)
         self.comp2_pub = C.SIGNER.public(comp2_sk)
-        w.control_ops.append(w._mgr_op(ctl.cert_issue_body(self.comp2_pub, [ctl.Cap.COMPACT], 0)))
-        w.control_ops.append(w._mgr_op(ctl.sealed_wrap_set_body(0, w.masters[0], [self.comp2_pub])))
+        w.control_ops.append(
+            w._mgr_op(
+                partial(A.CertIssueOp.build, subject=self.comp2_pub, caps=[A.Cap.COMPACT], epoch=0)
+            )
+        )
+        w.control_ops.append(
+            w._mgr_op(
+                partial(
+                    A.WrapSetOp.build, keyepoch=0, group_key=w.masters[0], members=[self.comp2_pub]
+                )
+            )
+        )
         self._comp2_sk = comp2_sk
         node_sks = [bytes([200 + i] * 32) for i in range(3)]
         self.roster = [C.SIGNER.public(s) for s in node_sks]
@@ -155,9 +175,8 @@ class _Fixture:
         with self.comp.store.read_txn() as tx:
             op = tx.get_op(ck)
         assert op is not None
-        body = ctl.decode(op)
-        assert isinstance(body, ctl.Checkpoint)
-        return body.state_acc
+        assert isinstance(op, A.CheckpointOp)
+        return op.state_acc
 
     def ckpt_seq(self, ck) -> int:
         """The (sequence, slot binding) of a checkpoint, read from a NODE so it survives a
@@ -165,10 +184,9 @@ class _Fixture:
         with self.nodes[0].store.read_txn() as tx:
             op = tx.get_op(ck)
         assert op is not None
-        body = ctl.decode(op)
-        assert isinstance(body, ctl.Checkpoint)
-        assert op.slot_tag == A.checkpoint_slot_tag(body.seq)  # seq is slot-bound
-        return body.seq
+        assert isinstance(op, A.CheckpointOp)
+        assert op.slot_tag == A.checkpoint_slot_tag(op.checkpoint_seq)  # seq is slot-bound
+        return op.checkpoint_seq
 
     def close(self):
         self.comp.close()
@@ -254,15 +272,14 @@ class TestCompactorDriver(unittest.TestCase):
                 with fx.comp.store.read_txn() as tx:
                     ck2_op = tx.get_op(ck2)
                 assert ck2_op is not None
-                ck2_body = ctl.decode(ck2_op)
                 full = compactor.compact_genesis(
                     [o for o in full_ops if covered(o, cut2)],
                     fx.w.keyring,
                     fx.w.genesis,
                     cut2,
                 )
-                assert isinstance(ck2_body, ctl.Checkpoint)
-                self.assertEqual(ck2_body.state_acc, full.state_acc)  # incremental == full
+                assert isinstance(ck2_op, A.CheckpointOp)
+                self.assertEqual(ck2_op.state_acc, full.state_acc)  # incremental == full
 
                 # nodes adopt the incremental checkpoint; the newly-dead op is GC'd
                 self.assertTrue(fx.adopt(ck2))

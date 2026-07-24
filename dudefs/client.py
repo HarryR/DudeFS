@@ -24,7 +24,6 @@ from typing import TypedDict
 from . import artifacts as A
 from . import compactor, fold, gossip, lmsg, transports, tunables, wire
 from .artifacts import BLIND, HLC, QC, Op, Receipt, Txn, compute_slot_tag, covered
-from .handlers import control as ctl
 from .handlers import data as data_handler
 from .link import Link
 from .node import FetchOpReq, FrontierReq, GetQCReq, PutQCReq, Request, Response, SubmitReq
@@ -333,17 +332,30 @@ class ClientDaemon:
             slot_tag = compute_slot_tag(ring["slot_secret"], path, version, attempt)
         txn = Txn(slot=slot, guards=guards, mutations=mutations)
         with self._lock:
-            op = A.Op.build_data(
-                author_sk=self.sk,
-                author_pub=self.pub,
-                seq=self._seq,
-                prev=self._prev,
-                hlc=self._next_hlc(),
-                keyepoch=self.keyepoch,
-                data_key=ring["data_key"],
-                txn_bytes=txn.encode(),
-                slot_tag=slot_tag,
-            )
+            hlc = self._next_hlc()
+            if slot_tag is not None:
+                op: Op = A.CasOp.build(
+                    author_sk=self.sk,
+                    author_pub=self.pub,
+                    seq=self._seq,
+                    prev=self._prev,
+                    hlc=hlc,
+                    keyepoch=self.keyepoch,
+                    data_key=ring["data_key"],
+                    txn_bytes=txn.encode(),
+                    slot_tag=slot_tag,
+                )
+            else:
+                op = A.BlindPutOp.build(
+                    author_sk=self.sk,
+                    author_pub=self.pub,
+                    seq=self._seq,
+                    prev=self._prev,
+                    hlc=hlc,
+                    keyepoch=self.keyepoch,
+                    data_key=ring["data_key"],
+                    txn_bytes=txn.encode(),
+                )
             with self.store.write_txn() as tx:
                 tx.put_op_raw(op)  # hold our own op so the ladder can see in-flight
             # advance the chain head ONLY after the op is durable: a rolled-back
@@ -376,7 +388,7 @@ class ClientDaemon:
                 raise  # a genuine closed-store bug; only the shutdown race is benign
 
     def _drive_to_final_inner(self, op: Op) -> None:
-        if op.slot_tag is not None:
+        if isinstance(op, A.Slotted):
             outcome = _drive(Commit(self.cfg, op), self._rpc, stop=self._closing)
             if isinstance(outcome, Committed):
                 self._store_qc(outcome.qc)
@@ -597,11 +609,8 @@ class ClientDaemon:
         return out
 
     @staticmethod
-    def _checkpoint(op: Op) -> ctl.Checkpoint | None:
-        if not op.is_control:
-            return None
-        body = ctl.decode(op)
-        return body if isinstance(body, ctl.Checkpoint) else None
+    def _checkpoint(op: Op) -> A.CheckpointOp | None:
+        return op if isinstance(op, A.CheckpointOp) else None
 
     def _bootstrap_barrier(
         self, tx: ReadTxn, all_ops: list[Op], rosters: dict[int, list[bytes]]
@@ -613,7 +622,7 @@ class ClientDaemon:
         (GC'd), fold the RETAINED winners I hold + the unsealed attempts sidecar into the
         barrier and VERIFY the checkpoint state_acc against it (WP-A/B), so a GC'd or
         freshly-bootstrapped client reads byte-identically to full history (A4)."""
-        latest: tuple[Op, ctl.Checkpoint] | None = None
+        latest: tuple[Op, A.CheckpointOp] | None = None
         for o in all_ops:
             ck = self._checkpoint(o)
             # the checkpoint's OWN QC must verify against its epoch roster — a compactor
@@ -660,8 +669,9 @@ class ClientDaemon:
     def _slot_winner(self, tx: ReadTxn, slot_tag: bytes) -> bytes | None:
         """The op_hash committed (QC'd) for a slot tag, if any."""
         for o in tx.all_ops():
-            if o.slot_tag == slot_tag and tx.get_qc(o.op_hash) is not None:
-                return o.op_hash
+            if isinstance(o, A.Slotted) and o.slot_tag == slot_tag:
+                if tx.get_qc(o.op_hash) is not None:
+                    return o.op_hash
         return None
 
     def status(self, op_hash: bytes) -> Ladder:
@@ -681,7 +691,7 @@ class ClientDaemon:
             lost_to = self._lost.get(op_hash)
             if lost_to is not None:
                 return Ladder(phase="lost", winner=lost_to)
-            if op is not None and op.slot_tag is not None:
+            if op is not None and isinstance(op, A.Slotted):
                 winner = self._slot_winner(tx, op.slot_tag)
                 if winner is not None and winner != op_hash:
                     return Ladder(phase="lost", winner=winner)
@@ -806,7 +816,7 @@ class ClientDaemon:
         committed = tx.get_qc(op.op_hash) is not None
         if committed:
             return "committed"
-        if op.slot_tag is not None:
+        if isinstance(op, A.Slotted):
             w = self._slot_winner(tx, op.slot_tag)
             if w is not None and w != op.op_hash:
                 return "lost"

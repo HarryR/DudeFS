@@ -42,7 +42,7 @@ class TestCrashRestart(unittest.TestCase):
             acc = _acc(path)
             w = World(seed=1, n_clients=1)
             op = _op(w)
-            assert op.slot_tag is not None
+            assert isinstance(op, A.Slotted)
             b = A.Ballot(1, b"x")
             r1 = acc.on_accept(op.slot_tag, b, op, NOW)
             assert isinstance(r1, A.Receipt)
@@ -98,7 +98,7 @@ class TestCrashRestart(unittest.TestCase):
             path = os.path.join(d, "s.db")
             w = World(seed=6, n_clients=1)
             op = _op(w)
-            assert op.slot_tag is not None
+            assert isinstance(op, A.Slotted)
             b = A.Ballot(1, b"x")
             store = ChainStore(path)
             with store.write_txn() as tx:

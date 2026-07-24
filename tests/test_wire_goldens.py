@@ -55,7 +55,7 @@ def _fixtures() -> dict[str, bytes]:
         (b"k", A.VERSION_ABSENT, 0), [[A.Guard.ABSENT, b"k"]], [[A.Mutation.SET, b"k", b"v"]]
     )
     tag = A.compute_slot_tag(bytes([9] * 32), b"k", A.VERSION_ABSENT, 0)
-    op = A.Op.build_data(
+    op = A.CasOp.build(
         author_sk=sk,
         author_pub=pub,
         seq=0,

@@ -24,6 +24,7 @@ from __future__ import annotations
 import random
 from dataclasses import dataclass, field
 
+from dudefs import artifacts as A
 from dudefs import tunables
 from dudefs.acceptor import Acceptor, AcceptResult, PrepareResult, SubmitResult
 from dudefs.artifacts import (
@@ -87,7 +88,7 @@ class LoggingNode:
     def submit(self, op: Op) -> SubmitResult:
         r = self.inner.submit(op)
         self.sim._trace(self.idx, "submit", r)
-        if isinstance(r, Receipt) and op.slot_tag is not None:
+        if isinstance(r, Receipt) and isinstance(op, A.Slotted):
             self.sim._on_receipt(op.slot_tag, r.ballot, op.op_hash, self.idx)
         return r
 
@@ -99,7 +100,7 @@ class LoggingNode:
     def accept(self, tag: bytes, ballot: Ballot, op: Op) -> AcceptResult:
         r = self.inner.accept(tag, ballot, op)
         self.sim._trace(self.idx, "accept", r)
-        if isinstance(r, Receipt) and op.slot_tag is not None:
+        if isinstance(r, Receipt) and isinstance(op, A.Slotted):
             self.sim._on_receipt(op.slot_tag, r.ballot, op.op_hash, self.idx)
         return r
 
@@ -108,7 +109,7 @@ class LoggingNode:
     ) -> AcceptResult:
         r = self.inner.roster_accept(tag, ballot, op, sync_frontier, new_epoch)
         self.sim._trace(self.idx, "roster_accept", r)
-        if isinstance(r, Receipt) and op.slot_tag is not None:
+        if isinstance(r, Receipt) and isinstance(op, A.Slotted):
             self.sim._on_receipt(op.slot_tag, r.ballot, op.op_hash, self.idx)
         return r
 

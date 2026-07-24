@@ -30,7 +30,6 @@ from . import artifacts as A
 from . import crypto, transports, tunables
 from .artifacts import GENESIS_PREV, VERSION_ABSENT, Heads, Op, Txn
 from .errors import DudeFSError
-from .handlers import control as control_handler
 from .handlers import data as data_handler
 from .handlers.data import Opaque
 
@@ -102,13 +101,10 @@ def keyring_from_wraps(ops: list[Op], member_sk: bytes) -> Keyring:
     me is simply absent — ops at it fold STALE, exactly as an undecryptable epoch should."""
     masters: dict[int, bytes] = {}
     for op in ops:
-        if not op.is_control:
-            continue
-        body = control_handler.decode(op)
-        if isinstance(body, control_handler.WrapSet):
-            k = control_handler.unwrap_group_key(body, member_sk)
+        if isinstance(op, A.WrapSetOp):
+            k = op.unwrap(member_sk)
             if k is not None:
-                masters[body.keyepoch] = k  # same master across dup wraps -> idempotent
+                masters[op.keyepoch] = k  # same master across dup wraps -> idempotent
     return keyring_from_masters(masters)
 
 
@@ -165,20 +161,20 @@ class StateView:
 # The delegable capability each control kind needs (DESIGN §15). Root authors
 # any kind; kinds absent here are root-only (pver/endpoint). Revocation drives
 # key rotation, so rotate/wrap-set ride the issue-revoke capability.
-_CAP_FOR_KIND: dict[control_handler.ControlKind, control_handler.Cap] = {
-    control_handler.ControlKind.CHECKPOINT: control_handler.Cap.COMPACT,
-    control_handler.ControlKind.ROSTER: control_handler.Cap.MANAGE_ROSTER,
-    control_handler.ControlKind.CERT_ISSUE: control_handler.Cap.ISSUE_REVOKE,
-    control_handler.ControlKind.CERT_REVOKE: control_handler.Cap.ISSUE_REVOKE,
-    control_handler.ControlKind.ROTATE: control_handler.Cap.ISSUE_REVOKE,
-    control_handler.ControlKind.WRAP_SET: control_handler.Cap.ISSUE_REVOKE,
+_CAP_FOR_KIND: dict[A.ControlKind, A.Cap] = {
+    A.ControlKind.CHECKPOINT: A.Cap.COMPACT,
+    A.ControlKind.ROSTER: A.Cap.MANAGE_ROSTER,
+    A.ControlKind.CERT_ISSUE: A.Cap.ISSUE_REVOKE,
+    A.ControlKind.CERT_REVOKE: A.Cap.ISSUE_REVOKE,
+    A.ControlKind.ROTATE: A.Cap.ISSUE_REVOKE,
+    A.ControlKind.WRAP_SET: A.Cap.ISSUE_REVOKE,
 }
 
 
-def _is_recovery_roster(body: control_handler.ControlBody) -> bool:
+def _is_recovery_roster(body: A.ControlOp) -> bool:
     """A ROSTER op carrying a `recovery` field is the fiat recovery trigger
     (NOTES 36a / WP1.7) — root-only, never delegable."""
-    return isinstance(body, control_handler.Roster) and body.recovery is not None
+    return isinstance(body, A.RosterOp) and body.recovery is not None
 
 
 class ControlState:
@@ -219,7 +215,7 @@ class ControlState:
         return bool(c and not c["revoked"] and cap in c["caps"])
 
     def can_author_control(
-        self, author: bytes, kind: control_handler.ControlKind, is_recovery: bool = False
+        self, author: bytes, kind: A.ControlKind, is_recovery: bool = False
     ) -> bool:
         """Control-op authorization (DESIGN §15; upgrades NOTES item 9's M1
         root-only shortcut). The root may author any kind; a delegate needs the
@@ -245,27 +241,27 @@ class ControlState:
         checkpoint barrier (DESIGN §16)."""
         self.pver = max(self.pver, self.pending_pver)
 
-    def apply_control(self, op: Op, body: control_handler.ControlBody) -> None:
-        # `body` is the typed, schema-validated control body — match on its kind.
+    def apply_control(self, op: Op) -> None:
+        # `op` IS the typed, schema-validated control leaf — match on its type.
         # WrapSet / Checkpoint have no ControlState effect here (the `_` arm).
-        match body:
-            case control_handler.CertIssue() as c:
+        match op:
+            case A.CertIssueOp() as c:
                 self.certs[c.subject] = {"caps": set(c.caps), "revoked": False}
-            case control_handler.CertRevoke() as c:
+            case A.CertRevokeOp() as c:
                 existing = self.certs.get(c.subject)
                 if existing:
                     existing["revoked"] = True
                 else:
                     self.certs[c.subject] = {"caps": set(), "revoked": True}
-            case control_handler.Rotate() as r:
+            case A.RotateOp() as r:
                 self.active_keyepoch = r.keyepoch
-            case control_handler.Roster() as r:
+            case A.RosterOp() as r:
                 self.epoch = r.from_epoch + 1
                 self.roster = list(r.roster)
                 self.rosters[r.from_epoch + 1] = list(r.roster)  # roster-per-epoch (issue #3)
-            case control_handler.PverActivate() as p:
-                self.pending_pver = max(self.pending_pver, p.pver)
-            case control_handler.EndpointRecord() as e:
+            case A.PverActivateOp() as p:
+                self.pending_pver = max(self.pending_pver, p.activate_pver)
+            case A.EndpointOp() as e:
                 if e.addrs:  # latest-wins; empty addrs = removal (NOTES 58)
                     # decompose the record's (transport, uri, opts) into dial structs here
                     self.endpoints[e.subject] = [
@@ -467,19 +463,18 @@ def _reduce_control(
         if pending_barrier is not None and not _covered(op, pending_barrier):
             control.activate_pending_pver()
             pending_barrier = None
-        if op.op_hash in invalid or not op.is_control:
+        if op.op_hash in invalid or not isinstance(op, A.ControlOp):
             continue
         if op.pver > control.pver:
             continue  # lane-2 fence: INVALID in the main walk -> no state, no barrier
-        body = control_handler.decode(op)
-        if body is None or not control.can_author_control(
-            op.author, body.KIND, _is_recovery_roster(body)
+        if isinstance(op, A.InvalidOp) or not control.can_author_control(
+            op.author, op.KIND, _is_recovery_roster(op)
         ):
             continue  # unauthorized -> folds `invalid` in the main walk; no barrier
-        if isinstance(body, control_handler.Checkpoint):
-            cuts.append(body.baseline.cut)
-            pending_barrier = body.baseline.cut  # its barrier activates pending downstream
-        control.apply_control(op, body)
+        if isinstance(op, A.CheckpointOp):
+            cuts.append(op.baseline.cut)
+            pending_barrier = op.baseline.cut  # its barrier activates pending downstream
+        control.apply_control(op)
     return control, cuts
 
 
@@ -581,20 +576,19 @@ def fold(
                 _consume_invalid_slot(op, keyring, universe, state)
                 continue
 
-            if op.is_control:
-                body = control_handler.decode(op)
-                if body is None or not control.can_author_control(
-                    op.author, body.KIND, _is_recovery_roster(body)
+            if isinstance(op, A.ControlOp):
+                if isinstance(op, A.InvalidOp) or not control.can_author_control(
+                    op.author, op.KIND, _is_recovery_roster(op)
                 ):
                     verdicts[op.op_hash] = Verdict.INVALID
                     _consume_invalid_slot(op, keyring, universe, state)
                     continue
-                control.apply_control(op, body)
+                control.apply_control(op)
                 verdicts[op.op_hash] = Verdict.CONTROL
                 continue
 
             # data op --------------------------------------------------------- #
-            if not control.is_authorized(op.author, control_handler.Cap.WRITE):
+            if not control.is_authorized(op.author, A.Cap.WRITE):
                 verdicts[op.op_hash] = Verdict.INVALID
                 _consume_invalid_slot(op, keyring, universe, state)
                 continue
@@ -602,7 +596,7 @@ def fold(
             d = decoded[op.op_hash]  # every non-control op was decoded in pass 1
             view = StateView(state)
 
-            if op.slot_tag is None:
+            if not isinstance(op, A.CasOp):
                 # blind write (LWW). Undecryptable blind write cannot apply.
                 if isinstance(d, Opaque):
                     verdicts[op.op_hash] = Verdict.REJECTED
@@ -687,17 +681,12 @@ def _consume_invalid_slot(
     fold-positional invalidity is invisible; leaving the tag expected while its
     slot is decided would be a permanent wedge. Unattributable (garbage tag,
     unreadable envelope, unknown epoch) → no state change, like `stale`."""
-    try:
-        tag = op.slot_tag
-        keyepoch = op.keyepoch
-    except (KeyError, DudeFSError):
-        return
-    if tag is None:
-        return
-    ring = keyring.get(keyepoch)
+    if not isinstance(op, A.CasOp):
+        return  # only a slotted data op names a data slot (garbage/control/blind → no-op)
+    ring = keyring.get(op.keyepoch)
     if ring is None:
         return
-    k = _attribute(tag, ring["slot_secret"], universe, state)
+    k = _attribute(op.slot_tag, ring["slot_secret"], universe, state)
     if k is not None:
         _bump_attempt(state, k)
 
@@ -797,20 +786,19 @@ class ControlReducer:
     def observe(self, op: Op) -> bool:
         """Idempotently fold one control op. Returns True if applied. Data ops
         are ignored (bytes to store, never interpreted)."""
-        if not op.is_control:
+        if not isinstance(op, A.ControlOp):
             return False
         if not _struct_and_sig_ok(op):
             return False
-        body = control_handler.decode(op)
-        if body is None:
+        if isinstance(op, A.InvalidOp):
             return False
         # best-effort capability filter (DESIGN §15): the node profile is
         # order-independent, so revocation isn't fold-positional here — the full
         # fold is authoritative. Enough to recognize a delegate's control op.
-        if not self.control.can_author_control(op.author, body.KIND, _is_recovery_roster(body)):
+        if not self.control.can_author_control(op.author, op.KIND, _is_recovery_roster(op)):
             return False
-        self.control.apply_control(op, body)
-        if isinstance(body, control_handler.Checkpoint):
+        self.control.apply_control(op)
+        if isinstance(op, A.CheckpointOp):
             # observing a committed checkpoint IS the node's barrier (§16);
             # nodes never fold data, so a high pver never halts them.
             self.control.activate_pending_pver()

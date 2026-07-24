@@ -17,7 +17,6 @@ from . import artifacts as A
 from . import crypto as C
 from . import fold, transports
 from .artifacts import HLC, QC, FrontierBundle, Heads, Op, Receipt, quorum_size
-from .handlers import control as ctl
 from .node import AcceptReq, FrontierReq, PutQCReq, Request, Response, RosterAcceptReq
 from .store import ChainStore, ReadTxn
 
@@ -105,22 +104,21 @@ class ManagerState:
             # the manager is the sole author, so its ops fold in hlc (= authoring) order.
             ops = sorted(tx.all_ops(), key=lambda o: (o.hlc.as_tuple(), o.op_hash))
             for op in ops:
-                body = ctl.decode(op) if op.is_control else None
-                if body is None:
+                if not op.is_control or isinstance(op, A.InvalidOp):
                     continue
-                cs.apply_control(op, body)
-                if isinstance(body, ctl.CertIssue):
+                cs.apply_control(op)
+                if isinstance(op, A.CertIssueOp):
                     certs.append(
                         {
-                            "subject": body.subject.hex(),
-                            "caps": [c.decode() for c in body.caps],
-                            "epoch": body.epoch,
+                            "subject": op.subject.hex(),
+                            "caps": [c.decode() for c in op.caps],
+                            "epoch": op.epoch,
                             "revoked": False,
                         }
                     )
-                elif isinstance(body, ctl.CertRevoke):
+                elif isinstance(op, A.CertRevokeOp):
                     for c in certs:
-                        if c["subject"] == body.subject.hex():
+                        if c["subject"] == op.subject.hex():
                             c["revoked"] = True
             roster_seed = self._meta(tx, "roster_seed", [])
             self.masters = {
@@ -152,25 +150,18 @@ class ManagerState:
         eps = self.node_addrs.get(pub_hex)
         return eps[0] if eps else None
 
-    def build_control(self, payload: bytes, slot_tag: bytes | None = None) -> Op:
-        """Build one root-signed control op from the current chain head WITHOUT
-        persisting it. A roster change builds its op to send to nodes for ratification,
-        but persists to the manager's own log only once the joint cert succeeds — an
-        unratified change must not flip the derived view. `slot_tag` puts the op on a
-        public slot (the roster slot, B4) so the old roster's single-decree machinery
-        serializes crash-retries (a retry rebuilds the identical op — head is unchanged
-        until persist)."""
-        return A.Op.build(
-            author_sk=self.root_key,
-            author_pub=self.manager_pub,
-            cls_=A.OpClass.CONTROL,
-            seq=self.mseq,
-            prev=self.mprev,
-            hlc=A.HLC(self.mhlc + 1, 0),
-            keyepoch=self.keyepoch,
-            payload=payload,
-            slot_tag=slot_tag,
-        )
+    def _head(self) -> dict:
+        """The current chain-head envelope kwargs every leaf `build` needs (author, seq,
+        prev, hlc). Splatted into `A.<Leaf>.build(**self._head(), ...)` — the format layer
+        signs + constructs the op, so an unratified roster change is just a built-but-unpersisted
+        op (a crash-retry rebuilds the identical op; the head is unchanged until persist)."""
+        return {
+            "author_sk": self.root_key,
+            "author_pub": self.manager_pub,
+            "seq": self.mseq,
+            "prev": self.mprev,
+            "hlc": A.HLC(self.mhlc + 1, 0),
+        }
 
     def persist(self, op: Op, *, meta: dict[str, object] | None = None) -> None:
         """Commit an op to the log — plus any `meta` (secret/intent that must land
@@ -183,16 +174,10 @@ class ManagerState:
                 tx.set_meta(k, json.dumps(v).encode())
         self._refold()
 
-    def author_control(
-        self,
-        payload: bytes,
-        slot_tag: bytes | None = None,
-        *,
-        meta: dict[str, object] | None = None,
-    ) -> Op:
-        """Build + persist one root-signed control op (the common case: the op is
-        effective the moment it is authored — certs, endpoints, rotate, fiat recovery)."""
-        op = self.build_control(payload, slot_tag)
+    def author_control(self, op: Op, *, meta: dict[str, object] | None = None) -> Op:
+        """Persist an already-built root-signed control op (the common case: the op is
+        effective the moment it is authored — certs, endpoints, rotate, fiat recovery).
+        The caller builds the typed leaf via `A.<Leaf>.build(**self._head(), ...)`."""
         self.persist(op, meta=meta)
         return op
 
@@ -305,7 +290,7 @@ class Manager:
         return cls(ManagerState.load(d))
 
     # ---- identity ------------------------------------------------------- #
-    _CAP_FOR = {"client": [ctl.Cap.WRITE], "node": [ctl.Cap.STORE], "compactor": [ctl.Cap.COMPACT]}
+    _CAP_FOR = {"client": [A.Cap.WRITE], "node": [A.Cap.STORE], "compactor": [A.Cap.COMPACT]}
     _KEY_HOLDERS = {"client", "compactor"}  # decrypt the dataset; nodes are zero-knowledge
 
     def cert_issue(self, kind: str, subject: bytes, pop: bytes) -> Op:
@@ -323,16 +308,26 @@ class Manager:
             raise ManagerError("proof-of-possession failed: subject does not hold the key")
         caps = self._CAP_FOR[kind]
         # the CERT_ISSUE op IS the record; the certs view re-derives from the log.
-        op = self.state.author_control(ctl.cert_issue_body(subject, caps, self.state.epoch))
+        op = self.state.author_control(
+            A.CertIssueOp.build(
+                **self.state._head(), subject=subject, caps=caps, epoch=self.state.epoch
+            )
+        )
         if kind in self._KEY_HOLDERS:
             for ke, master in sorted(self.state.masters.items()):
-                self.state.author_control(ctl.sealed_wrap_set_body(ke, master, [subject]))
+                self.state.author_control(
+                    A.WrapSetOp.build(
+                        **self.state._head(), keyepoch=ke, group_key=master, members=[subject]
+                    )
+                )
         return op
 
     def cert_revoke(self, subject: bytes, *, rotate: bool = True) -> list[Op]:
         """Revoke a cert; STAGE a rotation by default (revocation without rotation is
         a foot-gun — the revoked key still opens the current group key, MANAGER §2)."""
-        ops = [self.state.author_control(ctl.cert_revoke_body(subject))]
+        ops = [
+            self.state.author_control(A.CertRevokeOp.build(**self.state._head(), subject=subject))
+        ]
         if rotate:
             ops += self.rotate()
         return ops
@@ -347,9 +342,14 @@ class Manager:
         # the new master (secret) lands ATOMICALLY with its wrap-set op — a crash never
         # leaves a wrap-set whose master the manager forgot (or vice versa).
         wrap_op = self.state.author_control(
-            ctl.sealed_wrap_set_body(new_ke, master, members), meta={"masters": masters}
+            A.WrapSetOp.build(
+                **self.state._head(), keyepoch=new_ke, group_key=master, members=members
+            ),
+            meta={"masters": masters},
         )
-        rot_op = self.state.author_control(ctl.rotate_body(new_ke))  # keyepoch derives from it
+        rot_op = self.state.author_control(
+            A.RotateOp.build(**self.state._head(), keyepoch=new_ke)  # keyepoch derives from it
+        )
         return [wrap_op, rot_op]
 
     # ---- membership ----------------------------------------------------- #
@@ -369,7 +369,9 @@ class Manager:
         """Author a root-signed ENDPOINT record for `subject` (PROTOCOL §7 / NOTES
         58): latest-wins per subject; empty `addrs` removes the node. Root-only. The
         deliberate replace-all clobber — `endpoint_add`/`_remove` edit the list instead."""
-        return self.state.author_control(ctl.endpoint_body(subject, addrs))
+        return self.state.author_control(
+            A.EndpointOp.build(**self.state._head(), subject=subject, addrs=addrs)
+        )
 
     def _addr_records(self, subject: bytes) -> list[tuple[bytes, bytes, dict[bytes, bytes]]]:
         """The node's current advertised addrs as ENDPOINT records — the settable form of
@@ -456,7 +458,9 @@ class Manager:
         tag = A.roster_slot_tag(epoch)
         # BUILD the op for ratification; persist to the manager log only once BOTH QCs
         # assemble — an unratified change must not flip the derived roster/epoch view.
-        op = self.state.build_control(ctl.roster_body(epoch, new_roster, sf), slot_tag=tag)
+        op = A.RosterOp.build(
+            **self.state._head(), from_epoch=epoch, roster=new_roster, sync_frontier=sf
+        )
         ballot = A.Ballot(1, A.slot_priority(tag, self.state.manager_pub))
 
         old_qc = self._gather(
@@ -535,10 +539,24 @@ class Manager:
         §2.2). Callers MUST pass the recover_decision() interlock first."""
         survivors = [self.state.roster[i] for i in report.reachable] or self.state.roster
         ckpt = self.state.author_control(
-            ctl.checkpoint_body(A.Baseline({}, {}), b"", b"", self.state.keyepoch, report.salvage)
+            A.CheckpointOp.build(
+                **self.state._head(),
+                baseline=A.Baseline({}, {}),
+                state_acc=b"",
+                attempts=b"",
+                keyepoch=self.state.keyepoch,
+                horizon=report.salvage,
+                checkpoint_seq=0,
+            )
         )
         rop = self.state.author_control(
-            ctl.roster_body(self.state.epoch, survivors, {}, recovery=ckpt.op_hash)
+            A.RosterOp.build(
+                **self.state._head(),
+                from_epoch=self.state.epoch,
+                roster=survivors,
+                sync_frontier={},
+                recovery=ckpt.op_hash,
+            )
         )
         # epoch + roster derive from the recovery ROSTER op — no hand-set.
         return [ckpt, rop]

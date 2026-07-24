@@ -180,7 +180,7 @@ class Acceptor:
     def on_submit(self, op: Op, now_ms: int) -> SubmitResult:
         # rev 5 (NOTES item 21): the ballot-0 fast path is gone — a slotted op is
         # proposed via PREPARE/ACCEPT, never SUBMIT. SUBMIT serves blind writes.
-        if op.slot_tag is not None:
+        if isinstance(op, A.Slotted):
             return Rejected(RejectReason.NEEDS_BALLOT)
         if not (op.verify_structure() and op.verify_sig(op.author)):
             return Rejected(RejectReason.BAD_STRUCTURE)
@@ -259,7 +259,7 @@ class Acceptor:
     ) -> AcceptResult:
         if not (op.verify_structure() and op.verify_sig(op.author)):
             return Rejected(RejectReason.BAD_STRUCTURE)
-        if op.slot_tag != tag:
+        if not isinstance(op, A.Slotted) or op.slot_tag != tag:
             return Rejected(RejectReason.BAD_STRUCTURE)
         with self.store.write_txn() as tx:
             skew = self._skew_reason(tx, op, now_ms)

@@ -46,7 +46,7 @@ class TestRequestCodec(unittest.TestCase):
     def test_all_requests_roundtrip(self):
         w = World(seed=1, n_clients=1)
         op = _slotted(w)
-        assert op.slot_tag is not None
+        assert isinstance(op, A.Slotted)
         b = A.Ballot(1, b"x")
         reqs = [
             N.SubmitReq(op),
@@ -78,7 +78,7 @@ class TestResponseCodec(unittest.TestCase):
         nd = N.LocalNode(Acceptor(sk, C.SIGNER.public(sk), ChainStore(), 0, 1_000_000), lambda: 100)
         op = _slotted(w)
         blind = w.blind(0, [], [[A.Mutation.SET, b"j", b"w"]])
-        assert op.slot_tag is not None
+        assert isinstance(op, A.Slotted)
 
         responses = [
             N.dispatch(nd, N.SubmitReq(blind)),  # Receipt
@@ -102,7 +102,7 @@ class TestResponseCodec(unittest.TestCase):
             seen.add(type(resp).__name__)
         # every response kind was actually exercised
         expected = {"Receipt", "Rejected", "Promise", "Nack"}
-        expected |= {"FrontierBundle", "Watermark", "Op", "NoneType"}
+        expected |= {"FrontierBundle", "Watermark", "CasOp", "NoneType"}
         self.assertEqual(seen, expected)
 
 

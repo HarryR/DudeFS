@@ -36,7 +36,7 @@ class TestHappyPath(unittest.TestCase):
         sim = Sim(seed=1, n=3)
         w = World(seed=1, n_clients=1)
         op = creation_op(w, 0, b"v")
-        assert op.slot_tag is not None
+        assert isinstance(op, A.Slotted)
         r = sim.commit(op)
         sim.run()
         self.assertIsInstance(r.outcome, Q.Committed)
@@ -54,7 +54,7 @@ class TestContention(unittest.TestCase):
         w = World(seed=5, n_clients=2)
         a = creation_op(w, 0, b"A")
         b = creation_op(w, 1, b"B")
-        assert a.slot_tag is not None
+        assert isinstance(a, A.Slotted) and isinstance(b, A.Slotted)
         self.assertEqual(a.slot_tag, b.slot_tag)  # true contention on one slot
         ra, rb = sim.commit(a), sim.commit(b)
         sim.run()
@@ -85,7 +85,7 @@ class TestContention(unittest.TestCase):
                 a, b = creation_op(w, 0, b"A"), creation_op(w, 1, b"B")
                 ra, rb = sim.commit(a), sim.commit(b)
                 sim.run()
-                assert a.slot_tag is not None
+                assert isinstance(a, A.Slotted)
                 self.assertTrue(ra.done and rb.done, f"seed={seed} n={n}: a dueler wedged")
                 self.assertLessEqual(len(sim.decided_ops(a.slot_tag)), 1, f"seed={seed} n={n}")
 
@@ -99,8 +99,9 @@ class TestSplitVoteRegression(unittest.TestCase):
         sim = Sim(seed=11, n=5, faults=CHAOS)
         w = World(seed=11, n_clients=3)
         ops = [creation_op(w, i, bytes([65 + i])) for i in range(3)]
-        slot = ops[0].slot_tag
-        assert slot is not None
+        first = ops[0]
+        assert isinstance(first, A.Slotted)
+        slot = first.slot_tag
         runners = [sim.commit(op) for op in ops]
         sim.run()
         self.assertTrue(all(r.done for r in runners), "recovery wedged — B1 liveness")
@@ -219,7 +220,7 @@ class TestTimeSkew(unittest.TestCase):
         sim = Sim(seed=4, n=3, delta=10, skew={2: 300})
         w = World(seed=4, n_clients=1)
         op = create(w, 0, b"k", b"1")
-        assert op.slot_tag is not None
+        assert isinstance(op, A.Slotted)
         b = A.Ballot(1, b"x")
         self.assertIsInstance(sim.nodes[0].accept(op.slot_tag, b, op), A.Receipt)  # in sync
         self.assertNotIsInstance(sim.nodes[2].accept(op.slot_tag, b, op), A.Receipt)  # ahead
@@ -245,7 +246,7 @@ class TestA1AndB6(unittest.TestCase):
         sim.commit(a)
         sim.commit(b)
         sim.run()
-        assert a.slot_tag is not None
+        assert isinstance(a, A.Slotted)
         decided = [op for h in sim.decided_ops(a.slot_tag) if (op := sim.get_op(h)) is not None]
         base = [*w.all_control(), *decided]
         roots = set()
@@ -282,7 +283,7 @@ class TestFinalityAndVerdict(unittest.TestCase):
         sim = Sim(seed=2, n=3, delta=5)
         w = World(seed=2, n_clients=1)
         op = creation_op(w, 0, b"v")
-        assert op.slot_tag is not None
+        assert isinstance(op, A.Slotted)
         rc = sim.commit(op)
         sim.run()
         self.assertIsInstance(rc.outcome, Q.Committed)

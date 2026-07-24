@@ -10,11 +10,11 @@ import random
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from functools import partial
 
 from dudefs import artifacts as A
+from dudefs import codec, fold
 from dudefs import crypto as C
-from dudefs import fold
-from dudefs.handlers import control as ctl
 
 # --------------------------------------------------------------------------- #
 # Shared test helpers (NOTES 57 item 4) — consolidated so the refactor touches  #
@@ -139,9 +139,17 @@ class World:
         self._hlc = 1
         self.control_ops: list[A.Op] = []
         for c in self.clients:
-            self.control_ops.append(self._mgr_op(ctl.cert_issue_body(c.pub, [ctl.Cap.WRITE], 0)))
+            self.control_ops.append(
+                self._mgr_op(
+                    partial(A.CertIssueOp.build, subject=c.pub, caps=[A.Cap.WRITE], epoch=0)
+                )
+            )
             for e, m in sorted(self.masters.items()):
-                self.control_ops.append(self._mgr_op(ctl.sealed_wrap_set_body(e, m, [c.pub])))
+                self.control_ops.append(
+                    self._mgr_op(
+                        partial(A.WrapSetOp.build, keyepoch=e, group_key=m, members=[c.pub])
+                    )
+                )
 
     # ---- clocks ---------------------------------------------------------- #
     def tick(self) -> A.HLC:
@@ -149,29 +157,61 @@ class World:
         return A.HLC(self._hlc, 0)
 
     # ---- manager (control) ops ------------------------------------------- #
-    def _mgr_op(self, payload: bytes, keyepoch: int = 0, slot_tag: bytes | None = None) -> A.Op:
-        op = A.Op.build(
+    def _mgr_op(self, build: Callable[..., A.Op]) -> A.Op:
+        """Author the next manager control op. `build` is a leaf `build` classmethod
+        pre-bound with its typed body kwargs (via functools.partial); this supplies the
+        envelope position (seq/prev/hlc) and advances the manager chain head. The built
+        op is re-ingested via `from_bytes` so its LEAF identity comes from its bytes (a
+        malformed body — e.g. an even roster — resolves to InvalidOp, mirroring the wire)."""
+        built = build(
             author_sk=self.mgr_sk,
             author_pub=self.mgr_pub,
-            cls_=A.OpClass.CONTROL,
             seq=self._mseq,
             prev=self._mprev,
             hlc=self.tick(),
-            keyepoch=keyepoch,
-            payload=payload,
-            slot_tag=slot_tag,
         )
+        op = A.Op.from_bytes(built.raw)
         self._mseq += 1
         self._mprev = op.op_hash
         return op
 
+    def _mgr_raw(self, body: bytes) -> A.Op:
+        """Author a manager control op carrying an ARBITRARY raw `body` — for malformed or
+        unknown-kind bodies that must fold `invalid`. Signed as a CONTROL envelope and
+        re-ingested via `from_bytes` (yielding the InvalidOp leaf its bytes decode to)."""
+        f: dict[A.Field, A.Bencodable] = {
+            A.Field.CLASS: A.OpClass.CONTROL,
+            A.Field.AUTHOR: self.mgr_pub,
+            A.Field.SEQ: int(self._mseq),
+            A.Field.PREV: self._mprev,
+            A.Field.HLC: self.tick().encode(),
+            A.Field.PVER: 0,
+            A.Field.PAYLOAD: body,
+        }
+        f[A.Field.SIG] = C.SIGNER.sign(self.mgr_sk, codec.encode(f))
+        op = A.Op.from_bytes(codec.encode(f))
+        self._mseq += 1
+        self._mprev = op.op_hash
+        return op
+
+    def _reslot(self, op: A.Op, slot_tag: bytes) -> A.Op:
+        """Re-sign `op` with a DIFFERENT envelope slot_tag — used only to forge a
+        seq/slot MISMATCH (a validly-signed checkpoint that contends a slot its declared
+        seq does not bind). Public builds bind the slot to the seq, so the forgery must
+        go through the raw envelope."""
+        env = codec.as_dict(codec.decode(op.raw))
+        env.pop(A.Field.SIG, None)
+        env[A.Field.SLOT_TAG] = slot_tag
+        env[A.Field.SIG] = C.SIGNER.sign(self.mgr_sk, codec.encode(env))
+        return A.Op.from_bytes(codec.encode(env))
+
     def rotate(self, keyepoch: int) -> A.Op:
-        op = self._mgr_op(ctl.rotate_body(keyepoch))
+        op = self._mgr_op(partial(A.RotateOp.build, keyepoch=keyepoch))
         self.control_ops.append(op)
         return op
 
     def revoke(self, client_index: int) -> A.Op:
-        op = self._mgr_op(ctl.cert_revoke_body(self.clients[client_index].pub))
+        op = self._mgr_op(partial(A.CertRevokeOp.build, subject=self.clients[client_index].pub))
         self.control_ops.append(op)
         return op
 
@@ -189,17 +229,30 @@ class World:
     ) -> A.Op:
         # slot_seq defaults to seq (the correct binding); a test may set it apart to forge a
         # seq/slot MISMATCH — an op that claims one sequence but contends another's slot.
-        op = self._mgr_op(
-            ctl.checkpoint_body(
-                A.Baseline(cut or {}, retained or {}, frozenset(dead or [])),
-                state_acc,
-                attempts,
-                keyepoch,
-                horizon or A.HLC(0, 0),
-                seq,
-            ),
-            slot_tag=A.checkpoint_slot_tag(seq if slot_seq is None else slot_seq),
-        )
+        baseline = A.Baseline(cut or {}, retained or {}, frozenset(dead or []))
+        cseq = seq  # the checkpoint (body) sequence — distinct from the envelope seq below
+
+        def _build(
+            *, author_sk: bytes, author_pub: bytes, seq: int, prev: bytes, hlc: A.HLC
+        ) -> A.Op:
+            op = A.CheckpointOp.build(
+                author_sk=author_sk,
+                author_pub=author_pub,
+                seq=seq,
+                prev=prev,
+                hlc=hlc,
+                baseline=baseline,
+                state_acc=state_acc,
+                attempts=attempts,
+                keyepoch=keyepoch,
+                horizon=horizon or A.HLC(0, 0),
+                checkpoint_seq=cseq,
+            )
+            if slot_seq is not None and slot_seq != cseq:
+                op = self._reslot(op, A.checkpoint_slot_tag(slot_seq))
+            return op
+
+        op = self._mgr_op(_build)
         self.control_ops.append(op)
         return op
 
@@ -214,17 +267,33 @@ class World:
         hlc: A.HLC | None = None,
     ) -> A.Op:
         c = self.clients[ci]
-        op = A.Op.build_data(
-            author_sk=c.sk,
-            author_pub=c.pub,
-            seq=c.seq,
-            prev=c.prev,
-            hlc=hlc or self.tick(),
-            keyepoch=keyepoch,
-            data_key=self.keyring[keyepoch]["data_key"],
-            txn_bytes=txn.encode(),
-            slot_tag=slot_tag,
-        )
+        hlc = hlc or self.tick()
+        data_key = self.keyring[keyepoch]["data_key"]
+        txn_bytes = txn.encode()
+        op: A.Op
+        if slot_tag is None:
+            op = A.BlindPutOp.build(
+                author_sk=c.sk,
+                author_pub=c.pub,
+                seq=c.seq,
+                prev=c.prev,
+                hlc=hlc,
+                keyepoch=keyepoch,
+                data_key=data_key,
+                txn_bytes=txn_bytes,
+            )
+        else:
+            op = A.CasOp.build(
+                author_sk=c.sk,
+                author_pub=c.pub,
+                seq=c.seq,
+                prev=c.prev,
+                hlc=hlc,
+                keyepoch=keyepoch,
+                data_key=data_key,
+                txn_bytes=txn_bytes,
+                slot_tag=slot_tag,
+            )
         c.seq += 1
         c.prev = op.op_hash
         return op
@@ -255,10 +324,9 @@ class World:
         undecryptable op that participates only by tag-equality (DESIGN §6)."""
         c = self.clients[ci]
         garbage = bytes(self.rng.getrandbits(8) for _ in range(48))  # tag||ct that won't auth
-        op = A.Op.build(
-            author_sk=c.sk,
-            author_pub=c.pub,
-            cls_=A.OpClass.DATA,
+        op = self._forged_data(
+            c.sk,
+            c.pub,
             seq=c.seq,
             prev=c.prev,
             hlc=self.tick(),
@@ -269,6 +337,37 @@ class World:
         c.seq += 1
         c.prev = op.op_hash
         return op
+
+    @staticmethod
+    def _forged_data(
+        sk: bytes,
+        pub: bytes,
+        *,
+        seq: int,
+        prev: bytes,
+        hlc: A.HLC,
+        keyepoch: int,
+        payload: bytes,
+        slot_tag: bytes | None,
+        pver: int = 0,
+    ) -> A.Op:
+        """A hand-signed DATA op carrying an ARBITRARY (here: garbage) payload. The public
+        data builds seal real txn bytes, so an un-openable payload must go through the raw
+        envelope (DESIGN §6 — participates only by tag-equality)."""
+        f: dict[A.Field, A.Bencodable] = {
+            A.Field.CLASS: A.OpClass.DATA,
+            A.Field.AUTHOR: pub,
+            A.Field.SEQ: int(seq),
+            A.Field.PREV: prev,
+            A.Field.HLC: hlc.encode(),
+            A.Field.PVER: int(pver),
+            A.Field.KEYEPOCH: int(keyepoch),
+            A.Field.PAYLOAD: payload,
+        }
+        if slot_tag is not None:
+            f[A.Field.SLOT_TAG] = slot_tag
+        f[A.Field.SIG] = C.SIGNER.sign(sk, codec.encode(f))
+        return A.Op.from_bytes(codec.encode(f))
 
     def all_control(self) -> list[A.Op]:
         return list(self.control_ops)

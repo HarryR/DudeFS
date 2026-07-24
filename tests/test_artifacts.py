@@ -26,7 +26,7 @@ class TestOp(unittest.TestCase):
             mutations=[[A.Mutation.SET, b"k", b"v"]],
         )
         tag = A.compute_slot_tag(self.secret, b"k", A.VERSION_ABSENT, 0)
-        return A.Op.build_data(
+        return A.CasOp.build(
             author_sk=self.sk,
             author_pub=self.pub,
             seq=0,
@@ -138,7 +138,7 @@ class TestGoldenVectors(unittest.TestCase):
             mutations=[[A.Mutation.SET, b"k", b"v"]],
         )
         tag = A.compute_slot_tag(secret, b"k", A.VERSION_ABSENT, 0)
-        op = A.Op.build_data(
+        op = A.CasOp.build(
             author_sk=sk,
             author_pub=pub,
             seq=0,

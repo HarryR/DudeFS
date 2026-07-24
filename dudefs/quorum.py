@@ -21,7 +21,18 @@ from typing import TypeGuard
 
 from . import tunables
 from .acceptor import Nack
-from .artifacts import HLC, QC, Ballot, Op, Promise, Receipt, Watermark, quorum_size, slot_priority
+from .artifacts import (
+    HLC,
+    QC,
+    Ballot,
+    Op,
+    Promise,
+    Receipt,
+    Slotted,
+    Watermark,
+    quorum_size,
+    slot_priority,
+)
 from .node import AcceptReq, FetchOpReq, PrepareReq, Request, Response, WatermarkReq
 
 # --------------------------------------------------------------------------- #
@@ -226,7 +237,7 @@ class Commit:
     Failed. Two round trips is the accepted price of ultra-durability."""
 
     def __init__(self, cfg: QuorumConfig, op: Op):
-        assert op.slot_tag is not None, "Commit is for slotted ops (blind writes race no slot)"
+        assert isinstance(op, Slotted), "Commit is for slotted ops (blind writes race no slot)"
         self.cfg = cfg
         self.op = op
         self.tag: bytes = op.slot_tag
@@ -392,6 +403,7 @@ class Commit:
     def _on_fetch_reply(self, result: Response, now: int) -> list[Command]:
         if (
             isinstance(result, Op)
+            and isinstance(result, Slotted)
             and result.op_hash == self.fetch_hash
             and result.slot_tag == self.tag
             and result.verify_sig(result.author)

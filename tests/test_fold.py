@@ -3,11 +3,11 @@
 
 import random
 import unittest
+from functools import partial
 
 from dudefs import artifacts as A
 from dudefs import crypto as C
 from dudefs import fold
-from dudefs.handlers import control as ctl
 from tests._builders import World
 
 # --------------------------------------------------------------------------- #
@@ -157,7 +157,7 @@ class TestA2NoWedge(unittest.TestCase):
             w, ops = make_soup(seed)
             r = fold.fold(ops, w.keyring, w.genesis)
             existing_tags = {
-                op.slot_tag for op in ops if not op.is_control and op.slot_tag is not None
+                op.slot_tag for op in ops if not op.is_control and isinstance(op, A.Slotted)
             }
             for ring in w.keyring.values():
                 for key in keys:
@@ -176,7 +176,7 @@ class TestA2NoWedge(unittest.TestCase):
             w, ops = make_soup(seed)
             r = fold.fold(ops, w.keyring, w.genesis)
             for op in ops:
-                if op.is_control or op.slot_tag is None:
+                if op.is_control or not isinstance(op, A.Slotted):
                     continue
                 self.assertIn(
                     r.verdicts[op.op_hash],
@@ -480,7 +480,7 @@ class TestAuthzAndVersioning(unittest.TestCase):
         ops = list(w.all_control())
         c = w.clients[0]
         txn = A.Txn(None, [], [[A.Mutation.SET, b"k", b"v"]])
-        op = A.Op.build_data(
+        op = A.BlindPutOp.build(
             author_sk=c.sk,
             author_pub=c.pub,
             seq=0,
@@ -507,7 +507,7 @@ class TestControlReducer(unittest.TestCase):
         red = fold.ControlReducer(w.mgr_pub)
         for op in w.all_control():
             self.assertTrue(red.observe(op))
-        self.assertTrue(red.control.is_authorized(w.clients[0].pub, ctl.Cap.WRITE))
+        self.assertTrue(red.control.is_authorized(w.clients[0].pub, A.Cap.WRITE))
         # a data op is ignored by the node profile
         d = w.blind(0, [], [[A.Mutation.SET, b"k", b"v"]])
         self.assertFalse(red.observe(d))
@@ -533,21 +533,25 @@ class TestRostersByEpoch(unittest.TestCase):
         # manager (root) rotates the roster 0 -> 1: authorized.
         newd = C.SIGNER.public(bytes([4] * 32))
         new_roster = [node[0], node[1], newd]
-        r_op = w._mgr_op(ctl.roster_body(0, new_roster, {}))
+        r_op = w._mgr_op(
+            partial(A.RosterOp.build, from_epoch=0, roster=new_roster, sync_frontier={})
+        )
 
         # a compactor holds only Cap.COMPACT; its roster op (1 -> 2) folds INVALID.
         csk = bytes([9] * 32)
         cpub = C.SIGNER.public(csk)
-        w.control_ops.append(w._mgr_op(ctl.cert_issue_body(cpub, [ctl.Cap.COMPACT], 0)))
-        forged = A.Op.build(
+        w.control_ops.append(
+            w._mgr_op(partial(A.CertIssueOp.build, subject=cpub, caps=[A.Cap.COMPACT], epoch=0))
+        )
+        forged = A.RosterOp.build(
             author_sk=csk,
             author_pub=cpub,
-            cls_=A.OpClass.CONTROL,
             seq=0,
             prev=A.GENESIS_PREV,
             hlc=w.tick(),
-            keyepoch=0,
-            payload=ctl.roster_body(1, [cpub, node[0], node[1]], {}),
+            from_epoch=1,
+            roster=[cpub, node[0], node[1]],
+            sync_frontier={},
         )
 
         rosters = fold.rosters_by_epoch([*w.control_ops, r_op, forged], genesis)

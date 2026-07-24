@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+from dudefs import artifacts as A
 from dudefs import store
 from dudefs.acceptor import Acceptor, AcceptResult, Nack, Rejected, RejectReason
 from dudefs.artifacts import Ballot, Op
@@ -29,7 +30,7 @@ class EquivocatingAcceptor(Acceptor):
     ) -> AcceptResult:
         if not (op.verify_structure() and op.verify_sig(op.author)):
             return Rejected(RejectReason.BAD_STRUCTURE)
-        if op.slot_tag != tag:
+        if not isinstance(op, A.Slotted) or op.slot_tag != tag:
             return Rejected(RejectReason.BAD_STRUCTURE)
         with self.store.write_txn() as tx:
             skew = self._skew_reason(tx, op, now_ms)

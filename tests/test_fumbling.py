@@ -8,12 +8,12 @@ import os
 import random
 import tempfile
 import unittest
+from functools import partial
 
 from dudefs import artifacts as A
 from dudefs import crypto as C
 from dudefs import quorum as Q
 from dudefs.acceptor import Acceptor, Rejected
-from dudefs.handlers import control as ctl
 from dudefs.store import AppendStatus, ChainStore, EvidenceKind
 from dudefs.transports.memory import Link, NetworkLinks
 from tests._builders import World, create
@@ -30,41 +30,44 @@ def _node(path, delta=10_000):
 
 
 def _roster(msk, mpub, roster, seq, prev, epoch=0, hlc=100):
-    return A.Op.build(
+    return A.RosterOp.build(
         author_sk=msk,
         author_pub=mpub,
-        cls_=A.OpClass.CONTROL,
         seq=seq,
         prev=prev,
         hlc=A.HLC(hlc, 0),
-        keyepoch=0,
-        payload=ctl.roster_body(epoch, roster, {}),
-        slot_tag=A.roster_slot_tag(epoch),
+        from_epoch=epoch,
+        roster=roster,
+        sync_frontier={},
     )
 
 
 def _recovery_pair(msk, mpub, roster, from_epoch=0):
     """A root-signed recovery pair: a recovery checkpoint + a ROSTER op naming it
     via `recovery` (substitutes for the joint certificate, WP1.7 / NOTES 36a)."""
-    ckpt = A.Op.build(
+    ckpt = A.CheckpointOp.build(
         author_sk=msk,
         author_pub=mpub,
-        cls_=A.OpClass.CONTROL,
         seq=0,
         prev=A.GENESIS_PREV,
         hlc=A.HLC(500, 0),
+        baseline=A.Baseline({}, {}),
+        state_acc=b"recover",
+        attempts=b"",
         keyepoch=0,
-        payload=ctl.checkpoint_body(A.Baseline({}, {}), b"recover", b"", 0, A.HLC(0, 0)),
+        horizon=A.HLC(0, 0),
+        checkpoint_seq=0,
     )
-    rop = A.Op.build(
+    rop = A.RosterOp.build(
         author_sk=msk,
         author_pub=mpub,
-        cls_=A.OpClass.CONTROL,
         seq=1,
         prev=ckpt.op_hash,
         hlc=A.HLC(501, 0),
-        keyepoch=0,
-        payload=ctl.roster_body(from_epoch, roster, {}, recovery=ckpt.op_hash),
+        from_epoch=from_epoch,
+        roster=roster,
+        sync_frontier={},
+        recovery=ckpt.op_hash,
     )
     return ckpt, rop
 
@@ -108,7 +111,7 @@ class TestMistakenRecovery(unittest.TestCase):
 
         # old-epoch receipting stops: a fresh accept on a majority node stamps e+1.
         op2 = create(w, 0, b"k2", b"x")
-        assert op2.slot_tag is not None
+        assert isinstance(op2, A.Slotted)
         rc = sim.raw[1].acc.on_accept(op2.slot_tag, A.Ballot(1, b"z"), op2, NOW)
         assert isinstance(rc, A.Receipt)
         self.assertEqual(rc.config_epoch, 1)
@@ -171,7 +174,7 @@ class TestFumblingManager(unittest.TestCase):
         # is idempotent: one accepted slot op, one (identical) receipt, one activation.
         w = World(seed=1, n_clients=0)
         rop = _roster(w.mgr_sk, w.mgr_pub, [C.SIGNER.public(NSK)], seq=0, prev=A.GENESIS_PREV)
-        assert rop.slot_tag is not None
+        assert isinstance(rop, A.Slotted)
         b = A.Ballot(1, b"m")
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "s.db")
@@ -193,7 +196,7 @@ class TestFumblingManager(unittest.TestCase):
         pubX, pubY = C.SIGNER.public(bytes([1] * 32)), C.SIGNER.public(bytes([2] * 32))
         a_op = _roster(w.mgr_sk, w.mgr_pub, [pubX], seq=0, prev=A.GENESIS_PREV)
         b_op = _roster(w.mgr_sk, w.mgr_pub, [pubY], seq=1, prev=a_op.op_hash)  # a new plan
-        assert a_op.slot_tag is not None
+        assert isinstance(a_op, A.Slotted)
         tag, b = a_op.slot_tag, A.Ballot(1, b"m")
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "s.db")
@@ -213,7 +216,7 @@ class TestFumblingManager(unittest.TestCase):
         sim = Sim(seed=3, n=3)
         w = World(seed=3, n_clients=0)
         rop = _roster(w.mgr_sk, w.mgr_pub, [sim.roster[0]], seq=0, prev=A.GENESIS_PREV)
-        assert rop.slot_tag is not None
+        assert isinstance(rop, A.Slotted)
         r = sim.raw[0].acc.on_roster_accept(rop.slot_tag, A.Ballot(1, b"m"), rop, {}, 1, NOW)
         self.assertIsInstance(r, A.Receipt)  # a possession receipt under e+1...
         # ...but NO node advanced its epoch — the abandoned flow half-activated nothing
@@ -227,8 +230,12 @@ class TestAmnesiacManager(unittest.TestCase):
     def test_reused_seq_forks_fresh_seq_does_not(self):
         w = World(seed=41, n_clients=0)
         px, py, pz = (C.SIGNER.public(bytes([k] * 32)) for k in (1, 2, 3))
-        o0 = w._mgr_op(ctl.roster_body(0, [px], {}))  # seq 0
-        o1 = w._mgr_op(ctl.roster_body(1, [py], {}))  # seq 1 — the amnesia PROCEDURE
+        o0 = w._mgr_op(
+            partial(A.RosterOp.build, from_epoch=0, roster=[px], sync_frontier={})
+        )  # seq 0
+        o1 = w._mgr_op(
+            partial(A.RosterOp.build, from_epoch=1, roster=[py], sync_frontier={})
+        )  # seq 1 — the amnesia PROCEDURE
         store = ChainStore()
         with store.write_txn() as tx:
             self.assertTrue(tx.append(o0))
@@ -236,7 +243,9 @@ class TestAmnesiacManager(unittest.TestCase):
             self.assertEqual(tx.evidence(), [])  # fresh-seq continuation: no fork
 
         w._mseq, w._mprev = 0, A.GENESIS_PREV  # WITHOUT the procedure: forget + rewind
-        o0b = w._mgr_op(ctl.roster_body(0, [pz], {}))  # seq 0 again, different -> FORK
+        o0b = w._mgr_op(
+            partial(A.RosterOp.build, from_epoch=0, roster=[pz], sync_frontier={})
+        )  # seq 0 again, different -> FORK
         with store.write_txn() as tx:
             res = tx.append(o0b)
         self.assertEqual(res.status, AppendStatus.FORK)

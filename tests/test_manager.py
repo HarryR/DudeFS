@@ -11,7 +11,6 @@ from dudefs import artifacts as A
 from dudefs import crypto as C
 from dudefs.acceptor import Acceptor, Rejected, RejectReason
 from dudefs.artifacts import quorum_size
-from dudefs.handlers import control as ctl
 from dudefs.manager import (
     HLC,
     Manager,
@@ -109,10 +108,9 @@ class TestManagerOps(unittest.TestCase):
             m = Manager.init(d)
             sub = C.SIGNER.public(bytes([9] * 32))
             op = m.cert_issue("client", sub, C.prove_possession(bytes([9] * 32)))
-            body = ctl.decode(op)
-            assert isinstance(body, ctl.CertIssue)
-            self.assertEqual(body.subject, sub)
-            self.assertEqual(body.caps, [ctl.Cap.WRITE])
+            assert isinstance(op, A.CertIssueOp)
+            self.assertEqual(op.subject, sub)
+            self.assertEqual(op.caps, [A.Cap.WRITE])
 
     def test_cert_issue_refuses_a_bad_proof_of_possession(self):
         # the manager never certifies an unheld key (NOTES 58): a pop signed by a
@@ -137,7 +135,7 @@ class TestManagerOps(unittest.TestCase):
             # the pop the node hands over actually certifies it
             m = Manager.init(d)
             op = m.cert_issue("node", pub, pop)
-            self.assertIsNotNone(ctl.decode(op))
+            self.assertIsInstance(op, A.CertIssueOp)
 
     def test_node_authorize_wraps_nothing_client_authorize_wraps_the_full_live_set(self):
         # issue #2 gap 3: nodes are zero-knowledge (no wrap); a key-holder is back-wrapped
@@ -148,7 +146,7 @@ class TestManagerOps(unittest.TestCase):
             npub = C.SIGNER.public(bytes([7] * 32))
             m.cert_issue("node", npub, C.prove_possession(bytes([7] * 32)))
             with m.state.store.read_txn() as tx:
-                wraps = [b for o in tx.all_ops() if isinstance(b := ctl.decode(o), ctl.WrapSet)]
+                wraps = [o for o in tx.all_ops() if isinstance(o, A.WrapSetOp)]
             self.assertFalse(any(npub in w.wraps for w in wraps))  # ZK node: no wrap
 
             # both key-holder kinds (client AND compactor — the compactor decrypts to compute
@@ -156,11 +154,10 @@ class TestManagerOps(unittest.TestCase):
             for kind, seed in (("client", 8), ("compactor", 6)):
                 sub = C.SIGNER.public(bytes([seed] * 32))
                 cert = m.cert_issue(kind, sub, C.prove_possession(bytes([seed] * 32)))
-                caps = ctl.decode(cert)
-                assert isinstance(caps, ctl.CertIssue)
-                self.assertEqual(caps.caps, m._CAP_FOR[kind])  # the right capability
+                assert isinstance(cert, A.CertIssueOp)
+                self.assertEqual(cert.caps, m._CAP_FOR[kind])  # the right capability
                 with m.state.store.read_txn() as tx:
-                    wraps = [b for o in tx.all_ops() if isinstance(b := ctl.decode(o), ctl.WrapSet)]
+                    wraps = [o for o in tx.all_ops() if isinstance(o, A.WrapSetOp)]
                 got = {w.keyepoch for w in wraps if sub in w.wraps}
                 self.assertEqual(got, {0, 1}, kind)  # EVERY live keyepoch
 
@@ -176,8 +173,8 @@ class TestManagerOps(unittest.TestCase):
             self.assertEqual(m.state.keyepoch, 1)
             self.assertIn(1, m.state.masters)
             # the revoked subject is NOT wrapped into the new epoch; the roster is
-            wrap_body = ctl.decode(ops[1])
-            assert isinstance(wrap_body, ctl.WrapSet)
+            wrap_body = ops[1]
+            assert isinstance(wrap_body, A.WrapSetOp)
             self.assertIn(m.state.roster[0], wrap_body.wraps)
             self.assertNotIn(sub, wrap_body.wraps)  # revoked -> excluded
 
@@ -222,8 +219,8 @@ class TestManagerOps(unittest.TestCase):
             m = Manager.init(d)
             npub = C.SIGNER.public(bytes([5] * 32))
             m.node_add(npub, addr="/run/node5.sock")
-            body = ctl.decode(self._control_log(d)[-1])
-            assert isinstance(body, ctl.EndpointRecord)
+            body = self._control_log(d)[-1]
+            assert isinstance(body, A.EndpointOp)
             self.assertEqual(body.subject, npub)
             self.assertEqual(body.addrs, [(b"unix", b"/run/node5.sock", {})])
 
@@ -272,14 +269,15 @@ class TestManagerOps(unittest.TestCase):
             _, rpc = _roster_cluster(keys, base, holders=set(pubs))  # all caught up
             change = m.change_roster(pubs, rpc)
 
+            assert isinstance(change.op, A.Slotted)
             self.assertEqual(change.op.slot_tag, A.roster_slot_tag(0))  # F24: on the slot
             self.assertEqual(change.old_qc.config_epoch, 0)
             self.assertEqual(change.new_qc.config_epoch, 1)
             self.assertTrue(change.new_qc.verify(pubs))  # possession-gated new QC
             self.assertEqual(m.state.roster, pubs)
             self.assertEqual(m.state.epoch, 1)
-            body = ctl.decode(change.op)
-            assert isinstance(body, ctl.Roster)
+            body = change.op
+            assert isinstance(body, A.RosterOp)
             self.assertTrue(body.sync_frontier)  # F23: the barrier has real teeth
 
     def test_change_roster_refused_when_new_node_lacks_possession(self):
@@ -313,16 +311,15 @@ class TestManagerOps(unittest.TestCase):
 
             tag = A.roster_slot_tag(0)
             ballot = A.Ballot(1, A.slot_priority(tag, m.state.manager_pub))
-            rival = A.Op.build(
+            rival = A.RosterOp.build(
                 author_sk=bytes([99] * 32),
                 author_pub=C.SIGNER.public(bytes([99] * 32)),
-                cls_=A.OpClass.CONTROL,
                 seq=0,
                 prev=A.GENESIS_PREV,
                 hlc=A.HLC(2, 0),
-                keyepoch=0,
-                payload=ctl.roster_body(0, [pubs[0]], {}),
-                slot_tag=tag,
+                from_epoch=0,
+                roster=[pubs[0]],
+                sync_frontier={},
             )
             self.assertNotEqual(rival.op_hash, change.op.op_hash)
             r = nodes[pubs[0]].accept(tag, ballot, rival)  # same slot, same ballot
@@ -341,6 +338,7 @@ class TestManagerOps(unittest.TestCase):
             self.assertEqual(len(m.state.roster), 3)  # count preserved (stays odd)
             self.assertIn(fresh, m.state.roster)
             self.assertNotIn(n2, m.state.roster)
+            assert isinstance(change.op, A.Slotted)
             self.assertEqual(change.op.slot_tag, A.roster_slot_tag(0))
             with self.assertRaises(ManagerError):
                 m.node_replace(C.SIGNER.public(bytes([200] * 32)), fresh, NOP_RPC)  # old absent
@@ -351,12 +349,10 @@ class TestManagerOps(unittest.TestCase):
             _founding(m)
             rep = _report(1, [], salvage=A.HLC(500, 0))  # nobody answers
             ckpt, rop = m.author_recovery_fence(rep)
-            cbody = ctl.decode(ckpt)
-            rbody = ctl.decode(rop)
-            assert isinstance(cbody, ctl.Checkpoint)
-            assert isinstance(rbody, ctl.Roster)
-            self.assertEqual(cbody.horizon, A.HLC(500, 0))  # salvage frontier = fiat horizon
-            self.assertEqual(rbody.recovery, ckpt.op_hash)  # the pairing
+            assert isinstance(ckpt, A.CheckpointOp)
+            assert isinstance(rop, A.RosterOp)
+            self.assertEqual(ckpt.horizon, A.HLC(500, 0))  # salvage frontier = fiat horizon
+            self.assertEqual(rop.recovery, ckpt.op_hash)  # the pairing
             self.assertEqual(m.state.epoch, 1)
 
     def test_node_addr_summary_decomposes_and_survives_json_round_trip(self):
@@ -491,20 +487,20 @@ class TestManagerFumbling(unittest.TestCase):
             ballot = A.Ballot(1, A.slot_priority(tag, m.state.manager_pub))
             # a competing press: a different roster op on the same slot/ballot is
             # refused by the node that already decided the first (equivocation guard)
-            rival = A.Op.build(
+            rival = A.RosterOp.build(
                 author_sk=bytes([99] * 32),
                 author_pub=C.SIGNER.public(bytes([99] * 32)),
-                cls_=A.OpClass.CONTROL,
                 seq=0,
                 prev=A.GENESIS_PREV,
                 hlc=A.HLC(2, 0),
-                keyepoch=0,
-                payload=ctl.roster_body(0, [pubs[0]], {}),
-                slot_tag=tag,
+                from_epoch=0,
+                roster=[pubs[0]],
+                sync_frontier={},
             )
             r = nodes[pubs[0]].accept(tag, ballot, rival)
             assert isinstance(r, Rejected)
             self.assertEqual(r.reason, RejectReason.EQUIVOCATION_GUARD)
+            assert isinstance(change.op, A.Slotted)
             self.assertEqual(change.op.slot_tag, tag)
 
 

@@ -3,13 +3,13 @@
 
 import random
 import unittest
+from functools import partial
 
 from dudefs import artifacts as A
 from dudefs import crypto as C
 from dudefs import fold
 from dudefs.acceptor import Acceptor, Rejected, RejectReason
 from dudefs.artifacts import HLC, Ballot
-from dudefs.handlers import control as ctl
 from dudefs.store import ChainStore
 from tests._builders import World
 
@@ -63,7 +63,7 @@ class TestControlBodyValidation(unittest.TestCase):
         ops = list(w.all_control())
         from dudefs import codec
 
-        bad = w._mgr_op(codec.encode({b"kind": ctl.ControlKind.CERT_ISSUE}))  # no subject/caps
+        bad = w._mgr_raw(codec.encode({b"kind": A.ControlKind.CERT_ISSUE}))  # no subject/caps
         ops.append(bad)
         r = fold.fold(ops, w.keyring, w.genesis)  # must not raise
         self.assertEqual(r.verdicts[bad.op_hash], fold.Verdict.INVALID)
@@ -73,7 +73,7 @@ class TestControlBodyValidation(unittest.TestCase):
         ops = list(w.all_control())
         from dudefs import codec
 
-        bad = w._mgr_op(codec.encode({b"kind": b"launch_missiles"}))
+        bad = w._mgr_raw(codec.encode({b"kind": b"launch_missiles"}))
         ops.append(bad)
         r = fold.fold(ops, w.keyring, w.genesis)
         self.assertEqual(r.verdicts[bad.op_hash], fold.Verdict.INVALID)
@@ -83,7 +83,7 @@ class TestControlBodyValidation(unittest.TestCase):
         w = World(seed=10, n_clients=1)
         ops = list(w.all_control())
         pubs = [C.SIGNER.public(bytes([40 + i] * 32)) for i in range(4)]
-        bad = w._mgr_op(ctl.roster_body(0, pubs, {}))
+        bad = w._mgr_op(partial(A.RosterOp.build, from_epoch=0, roster=pubs, sync_frontier={}))
         ops.append(bad)
         r = fold.fold(ops, w.keyring, w.genesis)
         self.assertEqual(r.verdicts[bad.op_hash], fold.Verdict.INVALID)
@@ -163,6 +163,7 @@ class TestA2UniversalLineageAdvance(unittest.TestCase):
         # expected again (A2), the next CAS gets a fresh slot.
         self.assertEqual(r2.lineage(KEY), (v, a + 1))
         fresh = A.compute_slot_tag(w.keyring[0]["slot_secret"], KEY, v, a + 1)
+        assert isinstance(bad, A.Slotted)
         self.assertNotEqual(fresh, bad.slot_tag)
 
     def test_shuffle_invariance_with_revocation(self):
@@ -198,15 +199,13 @@ class TestLane2Fence(unittest.TestCase):
     def test_pver_fence_gates_control_ops(self):
         w = World(seed=14, n_clients=1)
         ops = list(w.all_control())
-        op = A.Op.build(
+        op = A.RotateOp.build(
             author_sk=w.mgr_sk,
             author_pub=w.mgr_pub,
-            cls_=A.OpClass.CONTROL,
             seq=w._mseq,
             prev=w._mprev,
             hlc=w.tick(),
-            keyepoch=0,
-            payload=ctl.rotate_body(1),
+            keyepoch=1,
             pver=99,
         )
         ops.append(op)
@@ -217,7 +216,7 @@ class TestLane2Fence(unittest.TestCase):
     def test_activation_is_pending_until_barrier(self):
         w = World(seed=15, n_clients=1)
         ops = list(w.all_control())
-        pv = w._mgr_op(ctl.pver_body(1))
+        pv = w._mgr_op(partial(A.PverActivateOp.build, activate_pver=1))
         ops.append(pv)
         r = fold.fold(ops, w.keyring, w.genesis)  # no checkpoint -> no barrier
         self.assertEqual(r.verdicts[pv.op_hash], fold.Verdict.CONTROL)
@@ -227,7 +226,7 @@ class TestLane2Fence(unittest.TestCase):
     def test_unsupported_activation_halts_at_barrier(self):
         w = World(seed=16, n_clients=1)
         ops = list(w.all_control())
-        pv = w._mgr_op(ctl.pver_body(fold.SUPPORTED_PVER + 1))
+        pv = w._mgr_op(partial(A.PverActivateOp.build, activate_pver=fold.SUPPORTED_PVER + 1))
         ops.append(pv)
         cut = {w.mgr_pub: (w._mseq - 1, w._mprev)}
         ckpt = w.checkpoint(cut=cut, keyepoch=0)
@@ -319,15 +318,15 @@ class TestFoldTotalityOverGarbage(unittest.TestCase):
         victim = w.clients[0]
         o0 = w.blind(0, [], [[A.Mutation.SET, b"k", b"1"]])
         ops.append(o0)
-        forged = A.Op.build(
-            author_sk=w.clients[1].sk,  # signed with the WRONG key on purpose
-            author_pub=victim.pub,
-            cls_=A.OpClass.DATA,
+        forged = w._forged_data(
+            w.clients[1].sk,  # signed with the WRONG key on purpose
+            victim.pub,
             seq=1,
             prev=o0.op_hash,
             hlc=A.HLC(10**12, 0),  # a poison-attempt hlc
             keyepoch=0,
             payload=b"x" * 48,
+            slot_tag=None,
         )
         ops.append(forged)
         o1 = w.blind(0, [], [[A.Mutation.SET, b"k", b"2"]])

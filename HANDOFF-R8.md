@@ -118,6 +118,25 @@ Notes:
   carry ciphertext *fields*: `WrapSetOp.wraps`, `CheckpointOp.attempts`. Typing those as a `Sealed`
   `bytes` newtype ("opened with key K") is a nice-to-have, not required.
 
+### Module layering (SETTLED) — the format layer vs the state machines
+
+The hierarchy lives in **one self-contained log-format layer**: `artifacts.py` owns the entire `Op`
+discriminated union (base + data leaves + control leaves + `InvalidOp`), all structure/bytes and
+encode/decode, and **nothing else** — no state machine. The control-body **structures** (the leaf
+dataclasses, their per-kind decode/encode, the `*_body` builders) **move into `artifacts.py`** from
+`handlers/control.py`. Consequence: `from_bytes` dispatches to every leaf **natively — there is NO
+decoder registry / injection**. (The registry was only ever needed while control structures lived a
+layer *above* the format, creating an `artifacts`→`handlers.control` cycle; co-locating them in the
+format layer dissolves both.)
+
+The **state machines** — `fold` (CRDT), `acceptor` (single-decree), `quorum` (consensus driver),
+`compactor` — and the control **semantics** (roster/cert application, policy effects) sit ABOVE the
+format layer and consume typed leaves. They never re-decode bytes. `handlers/control.py`'s
+decode+build role relocates into the format layer; its application role already lives in
+`fold.ControlState` — so the module is **deleted outright** (consumers migrated to `A.<Leaf>` /
+`isinstance` in the same wave; no transitional shim). Splitting `artifacts.py` into an
+`artifacts/` package is optional later organization, not required for the untangling.
+
 ## 4. Rejected alternatives — DO NOT REOPEN
 
 Both were floated during design and explicitly rejected; recorded here so the question stays shut.

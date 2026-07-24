@@ -17,10 +17,19 @@ from dataclasses import dataclass
 
 from . import gossip, lmsg, transports, tunables, wire
 from .acceptor import Acceptor, Rejected, RejectReason
-from .artifacts import Op, Watermark, checkpoint_slot_tag, covered, quorum_size
+from .artifacts import (
+    Cap,
+    CheckpointOp,
+    ControlKind,
+    Op,
+    RosterOp,
+    Watermark,
+    checkpoint_slot_tag,
+    covered,
+    quorum_size,
+)
 from .fold import ControlReducer, ControlState, endpoints_of
 from .gossip import Delta
-from .handlers import control as ctl
 from .link import Link
 from .node import LocalNode, dispatch
 from .store import (
@@ -104,8 +113,7 @@ class NodeDaemon:
             # compactor's blind checkpoint (R6 WP-G). Fold-positional authz still has the
             # final say on the op's KIND (a COMPACT author can only carry a checkpoint).
             authz=lambda a: (
-                self._authz.is_authorized(a, ctl.Cap.WRITE)
-                or self._authz.is_authorized(a, ctl.Cap.COMPACT)
+                self._authz.is_authorized(a, Cap.WRITE) or self._authz.is_authorized(a, Cap.COMPACT)
             ),
         )
         self.pub = pub
@@ -194,9 +202,9 @@ class NodeDaemon:
         in the wire, not a vote; a compactor's checkpoint still needs a real node quorum."""
         return (
             frm in self.roster
-            or self._authz.is_authorized(frm, ctl.Cap.WRITE)
-            or self._authz.is_authorized(frm, ctl.Cap.STORE)
-            or self._authz.is_authorized(frm, ctl.Cap.COMPACT)
+            or self._authz.is_authorized(frm, Cap.WRITE)
+            or self._authz.is_authorized(frm, Cap.STORE)
+            or self._authz.is_authorized(frm, Cap.COMPACT)
             or frm == self.manager_pub
         )
 
@@ -328,22 +336,20 @@ class NodeDaemon:
                 next_seq = 0
                 if adopted is not None:  # chain from the seq I last adopted
                     cur = tx.get_op(adopted)
-                    cur_body = ctl.decode(cur) if cur is not None else None
-                    next_seq = cur_body.seq + 1 if isinstance(cur_body, ctl.Checkpoint) else 0
+                    next_seq = cur.checkpoint_seq + 1 if isinstance(cur, CheckpointOp) else 0
                 for op in sorted(all_ops, key=lambda o: (o.hlc.as_tuple(), o.op_hash)):
                     if op.is_control:
                         reducer.observe(op)  # authorization state up to here
-                candidates: dict[int, tuple[Op, ctl.Checkpoint]] = {}
+                candidates: dict[int, tuple[Op, CheckpointOp]] = {}
                 for op in all_ops:
-                    body = ctl.decode(op) if op.is_control else None
-                    if not isinstance(body, ctl.Checkpoint):
+                    if not isinstance(op, CheckpointOp):
                         continue
-                    if body.seq < next_seq:
+                    if op.checkpoint_seq < next_seq:
                         continue  # already adopted / superseded — only ever look forward
                     # BIND the declared seq to the slot the op actually won: without this an
                     # adversary could win slot-0 yet claim seq=5 in the body, jumping the chain.
-                    # The slot decrees one-per-seq only if body.seq == the contended slot.
-                    if op.slot_tag != checkpoint_slot_tag(body.seq):
+                    # The slot decrees one-per-seq only if checkpoint_seq == the contended slot.
+                    if op.slot_tag != checkpoint_slot_tag(op.checkpoint_seq):
                         continue
                     qc = tx.get_qc(op.op_hash)
                     if qc is None:  # not quorum-committed
@@ -354,9 +360,7 @@ class NodeDaemon:
                     # path — a MAJORITY of THIS epoch's roster must have signed it.
                     if qc.config_epoch != self.acc.epoch or not qc.verify(self.roster):
                         continue
-                    if not reducer.control.can_author_control(
-                        op.author, ctl.ControlKind.CHECKPOINT
-                    ):
+                    if not reducer.control.can_author_control(op.author, ControlKind.CHECKPOINT):
                         continue  # unauthorized minter — never adopt
                     # WP-D — horizon covers the cut (finding #8): the horizon is F, the
                     # finality frontier the cut was sealed at, so EVERY op the checkpoint
@@ -365,17 +369,17 @@ class NodeDaemon:
                     # full fold. Structural (hlc is cleartext), so a ZK node enforces it. No
                     # cut-lag margin: the horizon is exactly F, not F − W (W is vestigial —
                     # the audit is deterministic recomputation, not a timed race).
-                    if any(covered(o, body.baseline.cut) and o.hlc > body.horizon for o in all_ops):
+                    if any(covered(o, op.baseline.cut) and o.hlc > op.horizon for o in all_ops):
                         continue
                     # WP-F(a) / #4 — never adopt a checkpoint that would REGRESS what I hold: GC
                     # past a cut and the monotone horizon are both irreversible, so a cut that
                     # does not per-author dominate my adopted cut, or a lower horizon, is
                     # impossible by definition — refuse it. Forward-only, both modes.
-                    if body.horizon.as_tuple() < cur_horizon.as_tuple() or not _cut_dominates(
-                        body.baseline.cut, cur_cut
+                    if op.horizon.as_tuple() < cur_horizon.as_tuple() or not _cut_dominates(
+                        op.baseline.cut, cur_cut
                     ):
                         continue
-                    candidates.setdefault(body.seq, (op, body))  # the slot => one per seq
+                    candidates.setdefault(op.checkpoint_seq, (op, op))  # the slot => one per seq
                 picked = self._select_checkpoint(tx, candidates, next_seq)
                 if picked is None:
                     # can't fast-path. If I'm over-full — holding MORE below-cut ops than a
@@ -401,7 +405,7 @@ class NodeDaemon:
                 tx.gc_checkpoint(stale)
 
     def _overfull_below_cut(
-        self, tx: ReadTxn, candidates: dict[int, tuple[Op, ctl.Checkpoint]]
+        self, tx: ReadTxn, candidates: dict[int, tuple[Op, CheckpointOp]]
     ) -> list[bytes]:
         """The below-cut ops to DROP when the fast path is impossible. For the furthest
         committed checkpoint I can't verify, any author where I hold MORE retained-projection
@@ -423,9 +427,9 @@ class NodeDaemon:
     def _select_checkpoint(
         self,
         tx: ReadTxn,
-        candidates: dict[int, tuple[Op, ctl.Checkpoint]],
+        candidates: dict[int, tuple[Op, CheckpointOp]],
         next_seq: int,
-    ) -> tuple[Op, ctl.Checkpoint] | None:
+    ) -> tuple[Op, CheckpointOp] | None:
         """Choose which committed checkpoint to adopt from the valid forward candidates: the
         HOT next link if I hold its baseline (incremental, applying its `dead` band); else the
         HIGHEST seq whose signed `retained` baseline I hold in FULL — a bootstrap JUMP over
@@ -433,7 +437,7 @@ class NodeDaemon:
         baseline verifies. The verify gate is what keeps the jump safe — I only ever leap to a
         checkpoint I demonstrably already satisfy, so the skipped `dead` bands never matter."""
 
-        def holds_baseline(c: tuple[Op, ctl.Checkpoint]) -> bool:
+        def holds_baseline(c: tuple[Op, CheckpointOp]) -> bool:
             # no mismatched authors == I hold the full below-cut baseline the checkpoint pins
             return not c[1].baseline.mismatched(tx.all_ops())
 
@@ -454,13 +458,12 @@ class NodeDaemon:
             all_ops = tx.all_ops()
         ckpts = {o.op_hash: o for o in all_ops if o.is_control}
         for op in all_ops:
-            body = ctl.decode(op) if op.is_control else None
-            if not isinstance(body, ctl.Roster):
+            if not isinstance(op, RosterOp):
                 continue
-            rec = body.recovery
+            rec = op.recovery
             if rec is None or rec not in ckpts:
                 continue
-            self.acc.on_recovery_fence(op, ckpts[rec], body.from_epoch + 1, rec, self.manager_pub)
+            self.acc.on_recovery_fence(op, ckpts[rec], op.from_epoch + 1, rec, self.manager_pub)
 
     # ---- joint-certificate activation (findings 23/24 follow-up) ----------- #
     def observe_roster_activations(self) -> None:
@@ -484,12 +487,11 @@ class NodeDaemon:
         # contender starve the activation).
         by_from: dict[int, list[tuple[Op, list[bytes]]]] = {}
         for op in all_ops:
-            body = ctl.decode(op) if op.is_control else None
-            if not isinstance(body, ctl.Roster):
+            if not isinstance(op, RosterOp):
                 continue
-            if body.recovery is not None:
+            if op.recovery is not None:
                 continue  # the recovery path is observe_fences, not the joint cert
-            by_from.setdefault(body.from_epoch, []).append((op, body.roster))
+            by_from.setdefault(op.from_epoch, []).append((op, op.roster))
         while cands := by_from.get(self.acc.epoch):
             e = self.acc.epoch
             for op, new_roster in cands:

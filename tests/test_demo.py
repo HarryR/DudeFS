@@ -18,7 +18,6 @@ from dudefs.acceptor import Acceptor
 from dudefs.artifacts import VERSION_ABSENT
 from dudefs.client import ClientDaemon
 from dudefs.daemon import NodeDaemon
-from dudefs.handlers import control as ctl
 from dudefs.manager import Manager
 from dudefs.node import LocalNode, dispatch
 from dudefs.store import ChainStore
@@ -230,6 +229,7 @@ class TestDemoRunbook(unittest.TestCase):
             self.assertNotIn(old, m.state.roster)
             self.assertEqual(len(m.state.roster), 3)  # odd, unchanged
             self.assertTrue(change.new_qc.verify(m.state.roster))  # possession-gated
+            assert isinstance(change.op, A.Slotted)
             self.assertEqual(change.op.slot_tag, A.roster_slot_tag(0))
 
     def test_recovery_drill_authors_fence_when_quorum_is_dead(self):
@@ -265,9 +265,8 @@ class TestDemoRunbook(unittest.TestCase):
                 self.assertLess(len(report.reachable), report.quorum)  # quorum is dead
                 self.assertIs(recover_decision(report, data_loss_ack=True), RecoverDecision.PROCEED)
                 ckpt, rop = m.author_recovery_fence(report)
-                rbody = ctl.decode(rop)
-                assert isinstance(rbody, ctl.Roster)
-                self.assertEqual(rbody.recovery, ckpt.op_hash)  # the recovery pairing
+                assert isinstance(rop, A.RosterOp)
+                self.assertEqual(rop.recovery, ckpt.op_hash)  # the recovery pairing
             demo.close()
 
 

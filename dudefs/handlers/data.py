@@ -70,6 +70,8 @@ def decode(op: Op, keyring: Keyring) -> Txn | Opaque:
     {keyepoch: {"data_key":.., "slot_secret":..}} (DESIGN §3). Total over
     arbitrary envelopes: a missing/mistyped keyepoch or payload field is
     Opaque, never a raised KeyError (NOTES item 17)."""
+    if not isinstance(op, A.DataOp):
+        return Opaque(OpaqueReason.MALFORMED_TXN)  # a control/invalid op carries no data payload
     try:
         ring = keyring.get(op.keyepoch)
         if ring is None:

@@ -108,9 +108,9 @@ class TestWALConcurrency(unittest.TestCase):
             guards = [[A.Guard.ABSENT, KEY]]
             op_a = w.cas(0, KEY, A.VERSION_ABSENT, 0, guards, [[A.Mutation.SET, KEY, b"A"]])
             op_b = w.cas(1, KEY, A.VERSION_ABSENT, 0, guards, [[A.Mutation.SET, KEY, b"B"]])
+            assert isinstance(op_a, A.Slotted) and isinstance(op_b, A.Slotted)
             self.assertEqual(op_a.slot_tag, op_b.slot_tag)  # same slot, two contenders
             tag = op_a.slot_tag
-            assert tag is not None
             ballot = A.Ballot(1, b"x")
             results: dict[str, object] = {}
 

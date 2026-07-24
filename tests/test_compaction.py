@@ -7,11 +7,11 @@ import os
 import random
 import tempfile
 import unittest
+from functools import partial
 
 from dudefs import artifacts as A
 from dudefs import compactor, crypto, fold, gossip
 from dudefs.acceptor import Acceptor, Rejected, RejectReason
-from dudefs.handlers import control as ctl
 from dudefs.store import AppendStatus, ChainStore
 from tests._builders import World, cut_of
 from tests._gossip import pull_baseline
@@ -220,9 +220,8 @@ class TestAttemptsSidecar(unittest.TestCase):
         sealed = compactor.seal_attempts(cr.attempts, dk)
         ckpt_op = w.checkpoint(cut=cut, state_acc=cr.state_acc, dead=cr.dead, attempts=sealed)
         # BOOTSTRAP: decode the op off the wire, unseal ITS field, rebuild the barrier
-        ckpt = ctl.decode(ckpt_op)
-        assert isinstance(ckpt, ctl.Checkpoint)
-        attempts = compactor.open_attempts(ckpt.attempts, dk)
+        assert isinstance(ckpt_op, A.CheckpointOp)
+        attempts = compactor.open_attempts(ckpt_op.attempts, dk)
         data_retained = [o for o in cr.retained if not o.is_control]
         barrier = compactor.barrier_state(data_retained, attempts, w.keyring)
         self.assertEqual(barrier[b"k"]["attempt"], 1)  # survived the wire (A4)
@@ -528,15 +527,18 @@ class TestDelegateCheckpointBarrier(unittest.TestCase):
     author places no barrier (the reborn tag collides and stays dead)."""
 
     def _ckpt(self, sk, pub, cut, hlc_ms, pver=0):
-        return A.Op.build(
+        return A.CheckpointOp.build(
             author_sk=sk,
             author_pub=pub,
-            cls_=A.OpClass.CONTROL,
             seq=0,
             prev=A.GENESIS_PREV,
             hlc=A.HLC(hlc_ms, 0),
+            baseline=A.Baseline(cut, {}),
+            state_acc=b"",
+            attempts=b"",
             keyepoch=0,
-            payload=ctl.checkpoint_body(A.Baseline(cut, {}), b"", b"", 0, A.HLC(0, 0)),
+            horizon=A.HLC(0, 0),
+            checkpoint_seq=0,
             pver=pver,
         )
 
@@ -592,8 +594,10 @@ class TestDelegateCheckpointBarrier(unittest.TestCase):
         w = World(seed=44, n_clients=1)
         dsk, dpub = bytes([90] * 32), crypto.SIGNER.public(bytes([90] * 32))
         wsk, wpub = bytes([91] * 32), crypto.SIGNER.public(bytes([91] * 32))
-        cert_d = w._mgr_op(ctl.cert_issue_body(dpub, [ctl.Cap.COMPACT], 0))
-        cert_w = w._mgr_op(ctl.cert_issue_body(wpub, [ctl.Cap.WRITE], 0))
+        cert_d = w._mgr_op(
+            partial(A.CertIssueOp.build, subject=dpub, caps=[A.Cap.COMPACT], epoch=0)
+        )
+        cert_w = w._mgr_op(partial(A.CertIssueOp.build, subject=wpub, caps=[A.Cap.WRITE], epoch=0))
 
         # k created then deleted below the cut: its creation slot T is consumed and
         # k is dead — the sealed key that must leave the attributable universe.
@@ -608,6 +612,7 @@ class TestDelegateCheckpointBarrier(unittest.TestCase):
 
         # a reborn creation of k above the cut: byte-identical tag to c1's.
         tag = A.compute_slot_tag(w.keyring[0]["slot_secret"], b"k", A.VERSION_ABSENT, 0)
+        assert isinstance(c1, A.Slotted)
         self.assertEqual(tag, c1.slot_tag)  # the reborn collision the barrier resolves
         c2 = w.data_op(
             0,
@@ -838,8 +843,8 @@ class TestCheckpointArtifact(unittest.TestCase):
             attempts=b"ct",
             horizon=A.HLC(200, 3),
         )
-        body = ctl.decode(ckpt)
-        assert isinstance(body, ctl.Checkpoint)
+        assert isinstance(ckpt, A.CheckpointOp)
+        body = ckpt
         self.assertEqual(body.baseline.cut, cut)
         self.assertEqual(body.state_acc, cr.state_acc)
         self.assertEqual(body.baseline.dead, frozenset(cr.dead))
@@ -1050,14 +1055,14 @@ class TestReceiptFloorBackstop(unittest.TestCase):
         b = A.Ballot(1, b"a")
         # REJECT: a fresh op strictly below the horizon (skew gate passes — floor<0)
         below = self._op(w, b"k1", A.HLC(100, 0))
-        assert below.slot_tag is not None
+        assert isinstance(below, A.Slotted)
         r = acc.on_accept(below.slot_tag, b, below, 100)
         self.assertIsInstance(r, Rejected)
         assert isinstance(r, Rejected)
         self.assertEqual(r.reason, RejectReason.BELOW_HORIZON)
         # ACCEPT (boundary): hlc == horizon is still committable (== floor passes)
         at = self._op(w, b"k2", A.HLC(200, 0))
-        assert at.slot_tag is not None
+        assert isinstance(at, A.Slotted)
         self.assertIsInstance(acc.on_accept(at.slot_tag, b, at, 100), A.Receipt)
 
     def test_idempotent_reaccept_below_horizon_is_still_served(self):
@@ -1067,7 +1072,7 @@ class TestReceiptFloorBackstop(unittest.TestCase):
         w = World(seed=51, n_clients=1)
         b = A.Ballot(1, b"a")
         op = self._op(w, b"k", A.HLC(100, 0))
-        assert op.slot_tag is not None
+        assert isinstance(op, A.Slotted)
         r1 = acc.on_accept(op.slot_tag, b, op, 100)  # horizon 0 -> accepted
         assert isinstance(r1, A.Receipt)
         acc.advance_horizon(A.HLC(200, 0))  # horizon now above the op
@@ -1147,9 +1152,8 @@ class TestVoidRule(unittest.TestCase):
         node, tag, _op = self._one_accept_node(A.HLC(100, 0))
         w = World(seed=18, n_clients=1)
         ckpt = w.checkpoint(cut=cut_of(w), horizon=A.HLC(150, 0))
-        body = ctl.decode(ckpt)
-        assert isinstance(body, ctl.Checkpoint)
-        node.advance_horizon(body.horizon)  # sourced from F on the wire
+        assert isinstance(ckpt, A.CheckpointOp)
+        node.advance_horizon(ckpt.horizon)  # sourced from F on the wire
         p = node.on_prepare(tag, A.Ballot(2, b"z"))
         assert isinstance(p, A.Promise)
         self.assertIsNone(p.accepted_op_hash)  # F=150 > 100 -> voided
@@ -1191,13 +1195,13 @@ class TestHorizonPersistence(unittest.TestCase):
 
             # backstop: a fresh op strictly below the restored horizon is refused
             below = self._op(w, b"k1", A.HLC(100, 0))
-            assert below.slot_tag is not None
+            assert isinstance(below, A.Slotted)
             r = acc.on_accept(below.slot_tag, A.Ballot(1, b"a"), below, 100)
             assert isinstance(r, Rejected)
             self.assertEqual(r.reason, RejectReason.BELOW_HORIZON)
             # boundary: hlc == horizon is still committable
             at = self._op(w, b"k2", A.HLC(200, 0))
-            assert at.slot_tag is not None
+            assert isinstance(at, A.Slotted)
             self.assertIsInstance(acc.on_accept(at.slot_tag, A.Ballot(1, b"a"), at, 100), A.Receipt)
             s2.close()
 
@@ -1214,7 +1218,7 @@ class TestHorizonPersistence(unittest.TestCase):
                 self.assertEqual(tx.get_horizon(), A.HLC(0, 0))
             acc = Acceptor(nsk, crypto.SIGNER.public(nsk), s, 0, BIG_DELTA)
             op = self._op(w, b"k", A.HLC(100, 0))
-            assert op.slot_tag is not None
+            assert isinstance(op, A.Slotted)
             # no horizon adopted -> the op commits (backstop inert, correctly)
             self.assertIsInstance(acc.on_accept(op.slot_tag, A.Ballot(1, b"a"), op, 100), A.Receipt)
             s.close()
