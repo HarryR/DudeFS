@@ -23,7 +23,15 @@ from .gossip import Delta
 from .handlers import control as ctl
 from .link import Link
 from .node import LocalNode, dispatch
-from .store import ChainStore, ReadTxn, StoreBusy, StoreClosed, StoreError, covered
+from .store import (
+    ChainStore,
+    ReadTxn,
+    StoreBusy,
+    StoreClosed,
+    StoreError,
+    baseline_digest,
+    covered,
+)
 
 LOCAL_TRANSPORT = transports.UNIX  # the POC carrier; ENDPOINT addrs are (transport, uri, opts)
 
@@ -300,6 +308,7 @@ class NodeDaemon:
         Forward-only in both modes (per-author cut dominance + monotone horizon); a node ahead
         of the quorum frontier is refused, and the root-signed recovery fence is the sole
         deliberate rewind (observe_fences). Deferred while no candidate's baseline verifies."""
+        stale: list[bytes] = []
         while True:
             reducer = ControlReducer(self.manager_pub, self.acc.epoch)
             # collect every VALID forward candidate in ONE read snapshot, then select the mode
@@ -361,7 +370,13 @@ class NodeDaemon:
                     candidates.setdefault(body.seq, (op, body))  # the slot => one per seq
                 picked = self._select_checkpoint(tx, candidates, next_seq)
                 if picked is None:
-                    return  # next link not here yet and no reachable baseline verifies — defer
+                    # can't fast-path. If I'm over-full — holding MORE below-cut ops than a
+                    # committed checkpoint's signed retained count — I carry stale extras a pull
+                    # can never fix; drop that author's whole below-cut set and let gossip
+                    # refetch exactly the winners (reload beats reconcile). Else it's a plain
+                    # missing-baseline lag a later round fills: defer.
+                    stale = self._overfull_below_cut(tx, candidates)
+                    break
                 op, ckpt = picked
             # adopt + GC + pin the active checkpoint in ONE write transaction (finding 19):
             # cut/retained/dead/horizon must survive crash-restart together, and the GC of
@@ -373,6 +388,29 @@ class NodeDaemon:
             # loop: the following seq may already be committed (lagging-node catch-up).
             # adopt_checkpoint persisted the horizon (finding 19); the guards read it
             # transactionally, so there is no in-memory horizon to advance here.
+        if stale:  # over-full reload: drop the stale extras; gossip refetches the winners, then
+            with self.store.write_txn() as tx:  # a later round's bootstrap adopts (never-stuck)
+                tx.gc_checkpoint(stale)
+
+    def _overfull_below_cut(
+        self, tx: ReadTxn, candidates: dict[int, tuple[Op, ctl.Checkpoint]]
+    ) -> list[bytes]:
+        """The below-cut ops to DROP when the fast path is impossible. For the furthest
+        committed checkpoint I can't verify, any author where I hold MORE retained-projection
+        ops than its signed `retained` count is proof I carry stale superseded extras a PULL can
+        never fix (pull only adds). Reload beats reconcile (no delta/union logic): drop that
+        author's whole below-cut set and let gossip refetch exactly the retained winners — the
+        manager-signed count is the below-cut authority, so this only ever drops non-winners
+        plus winners that immediately return. [] = nothing over-full — a plain missing-baseline
+        lag that a later gossip round fills on its own (never a destructive reload for mere lag)."""
+        if not candidates:
+            return []
+        _op, body = candidates[max(candidates)]  # the furthest target I'm trying to reach
+        have = baseline_digest(tx.all_ops(), body.cut, frozenset(body.dead))
+        overfull = {a for a, e in have.items() if e.size > body.retained.get(a, (0, b""))[0]}
+        if not overfull:
+            return []
+        return [o.op_hash for o in tx.all_ops() if o.author in overfull and covered(o, body.cut)]
 
     def _select_checkpoint(
         self,

@@ -509,10 +509,24 @@ class TestAdoptionValidityGate(unittest.TestCase):
                 tx.append(o)
         return w, d, roster, full, cut_big, cut_small, covered, fold
 
-    def _present(self, d, w, roster, full, cut, horizon, covered, seq, slot_seq=None):
+    def _present(
+        self,
+        d,
+        w,
+        roster,
+        full,
+        cut,
+        horizon,
+        covered,
+        seq,
+        slot_seq=None,
+        retained=None,
+        dead=None,
+    ):
         """Author a committed checkpoint at `seq` and land it (op + verified QC) in d's store
-        WITHOUT triggering adoption — the caller drives adopt_committed_checkpoints itself so
-        it can control the ORDER seqs arrive in (sequential-catch-up tests)."""
+        WITHOUT triggering adoption — the caller drives adopt_committed_checkpoints itself so it
+        can control the ORDER seqs arrive in. `retained`/`dead` override the computed manifest
+        (to craft an over-full baseline)."""
         from dudefs import compactor
 
         below = [o for o in full if covered(o, cut)]
@@ -520,8 +534,8 @@ class TestAdoptionValidityGate(unittest.TestCase):
         ckpt = w.checkpoint(
             cut=cut,
             state_acc=cr.state_acc,
-            dead=cr.dead,
-            retained=A.retained_commitment(cr.retained),
+            dead=cr.dead if dead is None else dead,
+            retained=A.retained_commitment(cr.retained) if retained is None else retained,
             horizon=horizon,
             seq=seq,
             slot_seq=slot_seq,
@@ -604,6 +618,45 @@ class TestAdoptionValidityGate(unittest.TestCase):
             with d.store.read_txn() as tx:
                 self.assertEqual(tx.get_meta("checkpoint"), ck2.op_hash)  # jumped straight to 2
                 self.assertEqual(dict(tx.cut()), cut_big)
+        finally:
+            d.close()
+
+    def test_overfull_baseline_triggers_a_reload(self):
+        # supersession-heavy far-behind: I hold a below-cut op the signed retained set says is
+        # NOT a winner (a stale extra from a band I skipped). A PULL can't fix that (it only
+        # adds), so adoption REALIZES it's over-full, drops the author's whole below-cut set,
+        # and lets gossip refetch exactly the winners — a later round then bootstraps. Reload
+        # beats reconcile: never-stuck without any delta/union logic.
+        w, d, roster, full, cut_big, _cs, covered, _ = self._setup(57)
+        try:
+            k1, k2 = full[-2], full[-1]  # client 0 authored both below cut_big
+            # a well-formed manifest that keeps every winner EXCEPT k2 (the stale extra)
+            retained = A.retained_commitment(
+                [o for o in full if covered(o, cut_big) and o.op_hash != k2.op_hash]
+            )
+            self._present(
+                d,
+                w,
+                roster,
+                full,
+                cut_big,
+                A.HLC(500, 0),
+                covered,
+                seq=0,
+                retained=retained,
+                dead=[],
+            )
+            d.adopt_committed_checkpoints()
+            with d.store.read_txn() as tx:
+                self.assertIsNone(tx.get_meta("checkpoint"))  # over-full -> not adopted
+                self.assertIsNone(tx.get_op(k2.op_hash))  # stale extra dropped
+                self.assertIsNone(tx.get_op(k1.op_hash))  # whole author baseline reloaded
+            with d.store.write_txn() as tx:  # gossip refetches exactly the retained winner
+                tx.put_op_raw(k1)
+            d.adopt_committed_checkpoints()
+            with d.store.read_txn() as tx:
+                self.assertIsNotNone(tx.get_meta("checkpoint"))  # now bootstraps
+                self.assertIsNone(tx.get_op(k2.op_hash))  # extra stays gone
         finally:
             d.close()
 
