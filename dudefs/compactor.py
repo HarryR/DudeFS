@@ -146,9 +146,7 @@ def compact(
     # prev_cut (NOT the new cut) is what keeps these tail ops in the fold instead
     # of skipped as already-in-barrier.
     tail_new = list(
-        {
-            o.op_hash: o for o in tail if fold._covered(o, cut) and not fold._covered(o, prev_cut)
-        }.values()
+        {o.op_hash: o for o in tail if A.covered(o, cut) and not A.covered(o, prev_cut)}.values()
     )
     r = fold.fold(
         prev_control + tail_new,

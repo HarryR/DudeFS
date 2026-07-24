@@ -28,7 +28,7 @@ from typing import NotRequired, TypedDict
 
 from . import artifacts as A
 from . import crypto, transports, tunables
-from .artifacts import GENESIS_PREV, VERSION_ABSENT, Heads, Op, Txn
+from .artifacts import GENESIS_PREV, VERSION_ABSENT, Heads, Op, Txn, covered
 from .errors import DudeFSError
 from .handlers import data as data_handler
 from .handlers.data import Opaque
@@ -405,16 +405,6 @@ def _total_order_key(op: Op) -> tuple[tuple[int, int], bytes, int, bytes]:
     return (h, author, seq, op.op_hash)
 
 
-def _covered(op: Op, cut: Heads) -> bool:
-    """Is `op` at-or-below the pinned cut? Membership is per-author by seq
-    (DESIGN §12); garbage ops with unreadable author/seq are never covered."""
-    try:
-        entry = cut.get(op.author)
-        return entry is not None and op.seq <= entry[0]
-    except (KeyError, DudeFSError):
-        return False
-
-
 def _authorized_cuts(ops_sorted: list[Op], invalid: set[bytes], genesis: Genesis) -> list[Heads]:
     """The pinned cuts of every AUTHORIZED checkpoint, in total order (NOTES 37 /
     finding 12). A control-only PRE-WALK: replay control ops in total order against
@@ -460,7 +450,7 @@ def _reduce_control(
     for op in ops_sorted:  # already in _total_order_key order
         # barrier-position pver activation: crossing beyond a recorded cut moves
         # its pending pver active, mirroring the main walk's end-of-stage step.
-        if pending_barrier is not None and not _covered(op, pending_barrier):
+        if pending_barrier is not None and not covered(op, pending_barrier):
             control.activate_pending_pver()
             pending_barrier = None
         if op.op_hash in invalid or not isinstance(op, A.ControlOp):
@@ -527,7 +517,7 @@ def fold(
     # ops below the cut still fold: the snapshot carries data state only, the
     # control chain is retained in full (PROTOCOL §7.2).
     if cut_frontier:
-        ops_sorted = [o for o in ops_sorted if o.is_control or not _covered(o, cut_frontier)]
+        ops_sorted = [o for o in ops_sorted if o.is_control or not covered(o, cut_frontier)]
 
     # ---- cached decodes (every client decrypts the same set, DESIGN §6) ----- #
     decoded: dict[bytes, Txn | Opaque] = {}  # op_hash -> parsed payload
@@ -539,8 +529,8 @@ def fold(
     stages: list[list[Op]] = []
     remaining = ops_sorted
     for cut in _authorized_cuts(ops_sorted, invalid, genesis):
-        stages.append([o for o in remaining if _covered(o, cut)])
-        remaining = [o for o in remaining if not _covered(o, cut)]
+        stages.append([o for o in remaining if covered(o, cut)])
+        remaining = [o for o in remaining if not covered(o, cut)]
     stages.append(remaining)
 
     def _stage_universe(idx: int) -> set[bytes]:
