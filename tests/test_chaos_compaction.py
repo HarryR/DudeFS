@@ -7,10 +7,10 @@ from dudefs import artifacts as A
 from dudefs import compactor, fold
 from dudefs.acceptor import Acceptor
 from dudefs.crypto import SIGNER
-from dudefs.sim.harness import Sim
 from dudefs.store import ChainStore
 from dudefs.transports.memory import Link, NetworkLinks
 from tests._builders import World, cut_of
+from tests._harness import Sim
 
 NOW = 100
 

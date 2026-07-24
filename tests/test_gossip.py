@@ -8,10 +8,10 @@ import unittest
 
 from dudefs import artifacts as A
 from dudefs import crypto as C
-from dudefs import gossip
 from dudefs.acceptor import Acceptor, Rejected, RejectReason
 from dudefs.store import ChainStore
 from tests._builders import World
+from tests._gossip import merge, pull_op
 
 NOW = 10_000
 BIG_DELTA = 1_000_000  # skew never bites in these tests
@@ -50,8 +50,8 @@ def _converge(stores, edges, max_rounds=200):
     for _ in range(max_rounds):
         before = [_state(s) for s in stores]
         for a, b in edges:
-            gossip.merge(stores[a], stores[b])
-            gossip.merge(stores[b], stores[a])
+            merge(stores[a], stores[b])
+            merge(stores[b], stores[a])
         if [_state(s) for s in stores] == before:
             return
     raise AssertionError("gossip did not converge")
@@ -121,9 +121,9 @@ class TestConvergence(unittest.TestCase):
         with b.write_txn() as tx:
             for op in ops:  # b holds the full set
                 tx.append(op)
-        gossip.merge(a, b)
+        merge(a, b)
         once = _state(a)
-        gossip.merge(a, b)  # merging again changes nothing
+        merge(a, b)  # merging again changes nothing
         self.assertEqual(_state(a), once)
         self.assertEqual(_state(a), _state(b))  # a caught up to b exactly
 
@@ -145,11 +145,11 @@ class TestSinglePush(unittest.TestCase):
 
         # gossip the op to the peers, and each peer receipts it on arrival
         for peer in (1, 2):
-            gossip.merge(nodes[peer].store, nodes[0].store)
+            merge(nodes[peer].store, nodes[0].store)
             self.assertIsInstance(nodes[peer].on_submit(op, NOW), A.Receipt)
         # gossip receipts back so node 0 holds a quorum, then it assembles the QC
         for peer in (1, 2):
-            gossip.merge(nodes[0].store, nodes[peer].store)
+            merge(nodes[0].store, nodes[peer].store)
         with nodes[0].store.read_txn() as tx:
             recs = tx.receipts_for(op.op_hash)
         self.assertGreaterEqual(len(recs), 2)
@@ -160,7 +160,7 @@ class TestSinglePush(unittest.TestCase):
 
         # the QC now spreads to every node by gossip
         for peer in (1, 2):
-            gossip.merge(nodes[peer].store, nodes[0].store)
+            merge(nodes[peer].store, nodes[0].store)
             with nodes[peer].store.read_txn() as tx:
                 self.assertIsNotNone(tx.get_qc(op.op_hash))
 
@@ -198,7 +198,7 @@ class TestDepResolution(unittest.TestCase):
         assert isinstance(r, Rejected)
         self.assertEqual(r.reason, RejectReason.UNKNOWN_DEP)
         # 2. PULL the dep from the peer that holds it
-        self.assertTrue(gossip.pull_op(node.store, peer, base.op_hash))
+        self.assertTrue(pull_op(node.store, peer, base.op_hash))
         # 3. retry -> accepted
         self.assertIsInstance(node.on_submit(dependent, NOW), A.Receipt)
 

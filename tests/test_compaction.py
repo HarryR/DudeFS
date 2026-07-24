@@ -14,6 +14,7 @@ from dudefs.acceptor import Acceptor, Rejected, RejectReason
 from dudefs.handlers import control as ctl
 from dudefs.store import AppendStatus, ChainStore
 from tests._builders import World, cut_of
+from tests._gossip import pull_baseline
 
 BIG_DELTA = 1_000_000
 
@@ -934,7 +935,7 @@ class TestBaselineSync(unittest.TestCase):
             self.assertEqual(gossip.verify_baseline(tx, cut, committed), {w.clients[1].pub})
 
         # pull the missing author's sparse baseline, then it verifies complete
-        self.assertGreater(gossip.pull_baseline(dst, src, cut), 0)
+        self.assertGreater(pull_baseline(dst, src, cut), 0)
         with dst.read_txn() as tx:
             self.assertEqual(gossip.verify_baseline(tx, cut, committed), set())
 
@@ -1008,14 +1009,14 @@ class TestBaselineProjection(unittest.TestCase):
             self.assertIsNone(tx.get_op(first.op_hash))
 
         # ACCEPT/converge: neither direction re-pulls the dead envelope.
-        self.assertEqual(gossip.pull_baseline(gc, lazy, cut, dead), 0)
-        self.assertEqual(gossip.pull_baseline(lazy, gc, cut, dead), 0)
+        self.assertEqual(pull_baseline(gc, lazy, cut, dead), 0)
+        self.assertEqual(pull_baseline(lazy, gc, cut, dead), 0)
         with gc.read_txn() as tx:
             self.assertIsNone(tx.get_op(first.op_hash))  # gc did NOT re-acquire the dead op
 
         # load-bearing: WITHOUT the dead mask the GC'd node re-pulls `first` from
         # the lazy peer — the oscillation the projection fix removes.
-        self.assertGreater(gossip.pull_baseline(gc, lazy, cut), 0)
+        self.assertGreater(pull_baseline(gc, lazy, cut), 0)
         with gc.read_txn() as tx:
             self.assertIsNotNone(tx.get_op(first.op_hash))  # re-acquired (the bug)
 

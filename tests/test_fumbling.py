@@ -14,11 +14,11 @@ from dudefs import crypto as C
 from dudefs import quorum as Q
 from dudefs.acceptor import Acceptor, Rejected
 from dudefs.handlers import control as ctl
-from dudefs.sim.harness import Sim
 from dudefs.store import AppendStatus, ChainStore, EvidenceKind
 from dudefs.transports.memory import Link, NetworkLinks
 from tests._builders import World, create
 from tests._cluster import creation_op
+from tests._harness import Sim
 from tests._personas import EquivocatingAcceptor
 
 NOW = 100

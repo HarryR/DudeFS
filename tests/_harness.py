@@ -24,9 +24,9 @@ from __future__ import annotations
 import random
 from dataclasses import dataclass, field
 
-from .. import gossip, tunables
-from ..acceptor import Acceptor, AcceptResult, PrepareResult, SubmitResult
-from ..artifacts import (
+from dudefs import tunables
+from dudefs.acceptor import Acceptor, AcceptResult, PrepareResult, SubmitResult
+from dudefs.artifacts import (
     HLC,
     QC,
     Ballot,
@@ -38,11 +38,11 @@ from ..artifacts import (
     fingerprint,
     quorum_size,
 )
-from ..crypto import SIGNER
-from ..node import LocalNode
-from ..quorum import Commit, Finalize, QuorumConfig
-from ..store import ChainStore
-from ..transports.memory import (
+from dudefs.crypto import SIGNER
+from dudefs.node import LocalNode
+from dudefs.quorum import Commit, Finalize, QuorumConfig
+from dudefs.store import ChainStore
+from dudefs.transports.memory import (
     CLIENT,
     ClientRunner,
     Faults,
@@ -50,6 +50,7 @@ from ..transports.memory import (
     NetworkLinks,
     Scheduler,
 )
+from tests._gossip import merge, pull_baseline
 
 NO_FAULTS = Faults()
 
@@ -310,9 +311,9 @@ class Sim:
             for j in range(self.n):
                 if i != j and (self.net is None or (j, i) not in self.net.down):
                     dst, src = self.raw[i].acc.store, self.raw[j].acc.store
-                    gossip.merge(dst, src)
+                    merge(dst, src)
                     if self._cut:
-                        gossip.pull_baseline(dst, src, self._cut, self._dead)
+                        pull_baseline(dst, src, self._cut, self._dead)
 
     def adopt_checkpoint(self, cut, retained, dead, nodes=None) -> None:
         """Adopt a quorum-committed checkpoint on `nodes` (all by default) — the

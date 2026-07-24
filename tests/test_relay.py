@@ -11,10 +11,11 @@ import unittest
 
 from dudefs import artifacts as A
 from dudefs import crypto as C
-from dudefs import fold, gossip
+from dudefs import fold
 from dudefs.acceptor import Acceptor
 from dudefs.store import ChainStore
 from tests._builders import World
+from tests._gossip import pull_op
 
 DELTA = 5
 SUBMIT = 10_000  # the write is dated here (inside the skew window at submit time)
@@ -89,8 +90,8 @@ class TestRelayRead(unittest.TestCase):
         # 4. PULL what we lack through the relay, then fold locally -> the value.
         reader = ChainStore()
         for op in control:
-            gossip.pull_op(reader, relay.store, op.op_hash)
-        gossip.pull_op(reader, relay.store, write.op_hash)
+            pull_op(reader, relay.store, op.op_hash)
+        pull_op(reader, relay.store, write.op_hash)
         with reader.read_txn() as tx:
             reader_ops = tx.all_ops()
         r = fold.fold(reader_ops, w.keyring, w.genesis)

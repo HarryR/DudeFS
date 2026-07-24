@@ -12,11 +12,11 @@ import unittest
 from dudefs import artifacts as A
 from dudefs import fold
 from dudefs import quorum as Q
-from dudefs.sim.harness import Sim
 from dudefs.store import AppendStatus
 from dudefs.transports.memory import CLIENT, Faults, Link, NetworkLinks
 from tests._builders import World, create
 from tests._cluster import creation_op
+from tests._harness import Sim
 
 CHAOS = Faults(loss=0.25, dup=0.2, delay_lo=1, delay_hi=6)
 

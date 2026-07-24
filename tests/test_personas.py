@@ -7,13 +7,14 @@ import unittest
 
 from dudefs import artifacts as A
 from dudefs import crypto as C
-from dudefs import fold, gossip
+from dudefs import fold
 from dudefs.acceptor import Acceptor
 from dudefs.handlers import control as ctl
-from dudefs.sim.harness import Sim
 from dudefs.store import AppendStatus, ChainStore, EvidenceKind
 from tests._builders import World
 from tests._cluster import creation_op
+from tests._gossip import merge
+from tests._harness import Sim
 from tests._personas import EquivocatingAcceptor, FloorPerjurer
 
 NOW = 100
@@ -41,7 +42,7 @@ class TestEquivocator(unittest.TestCase):
 
         # a third party (honest node 1) gossips in the equivocator's ops+receipts
         # and ASSEMBLES the proof (B6): a portable, self-verifying DOUBLE_VOTE.
-        gossip.merge(sim.raw[1].acc.store, sim.raw[0].acc.store)
+        merge(sim.raw[1].acc.store, sim.raw[0].acc.store)
         with sim.raw[1].acc.store.write_txn() as tx:
             proofs = tx.detect_double_votes()
         self.assertEqual(len(proofs), 1)
@@ -79,7 +80,7 @@ class TestEquivocator(unittest.TestCase):
         sim.nodes[2].accept(tag, ballot, b)  # this call reaches the 2nd QC; relaxed B1 must pass
         self.assertEqual(sim.decided_ops(tag), {a.op_hash, b.op_hash})  # two decrees, allowed
         # B6's other clauses: proof assemblable + fold still one winner
-        gossip.merge(sim.raw[1].acc.store, sim.raw[0].acc.store)
+        merge(sim.raw[1].acc.store, sim.raw[0].acc.store)
         with sim.raw[1].acc.store.write_txn() as tx:
             self.assertTrue(tx.detect_double_votes())
         r = fold.fold([*w.all_control(), a, b], w.keyring, w.genesis)
@@ -148,7 +149,7 @@ class TestWithholder(unittest.TestCase):
         with sim.raw[0].acc.store.read_txn() as tx:
             self.assertIsNone(tx.get_op(op.op_hash))  # victim lacks it
         # a single honest contact (anti-entropy from node 1) heals the victim
-        gossip.merge(sim.raw[0].acc.store, sim.raw[1].acc.store)
+        merge(sim.raw[0].acc.store, sim.raw[1].acc.store)
         with sim.raw[0].acc.store.read_txn() as tx:
             self.assertIsNotNone(tx.get_op(op.op_hash))
 

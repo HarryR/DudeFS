@@ -8,11 +8,12 @@ import unittest
 
 from dudefs import artifacts as A
 from dudefs import crypto as C
-from dudefs import fold, gossip, transports
+from dudefs import fold, transports
 from dudefs.acceptor import Acceptor, Rejected, RejectReason
 from dudefs.handlers import control as ctl
 from dudefs.store import ChainStore
 from tests._builders import World
+from tests._gossip import merge
 
 CP = ctl.checkpoint_body({}, b"", [], {}, b"", 0, A.HLC(0, 0))  # authz-only; no cut placed
 NOW = 100
@@ -336,7 +337,7 @@ class TestPossessionBarrier(unittest.TestCase):
         with nodes[0].store.write_txn() as tx:
             tx.append(base)  # the incumbent holds the frontier
         self.assertFalse(nodes[1].holds_frontier(sf))  # fresh learner: empty
-        gossip.merge(nodes[1].store, nodes[0].store)  # anti-entropy catch-up
+        merge(nodes[1].store, nodes[0].store)  # anti-entropy catch-up
         self.assertTrue(nodes[1].holds_frontier(sf))  # now honestly caught up
 
 
