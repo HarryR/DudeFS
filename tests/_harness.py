@@ -30,6 +30,7 @@ from dudefs.artifacts import (
     HLC,
     QC,
     Ballot,
+    Baseline,
     FrontierBundle,
     Heads,
     Op,
@@ -321,7 +322,7 @@ class Sim:
         (`gc`), so mixed-laziness (nodes GC'ing at different times) is testable."""
         for i in range(self.n) if nodes is None else nodes:
             with self.raw[i].acc.store.write_txn() as tx:
-                tx.adopt_checkpoint(cut, retained, list(dead))
+                tx.adopt_checkpoint(Baseline(cut, retained, frozenset(dead)))
         self._cut, self._dead = cut, frozenset(dead)
 
     def gc(self, dead, nodes=None) -> None:

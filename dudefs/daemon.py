@@ -395,9 +395,8 @@ class NodeDaemon:
             # cut/retained/dead/horizon must survive crash-restart together, and the GC of
             # `dead` must not be observable without the cut that vouches for it.
             with self.store.write_txn() as tx:
-                dead = sorted(ckpt.baseline.dead)
-                tx.adopt_checkpoint(ckpt.baseline.cut, ckpt.baseline.retained, dead, ckpt.horizon)
-                tx.gc_checkpoint(dead)
+                tx.adopt_checkpoint(ckpt.baseline, ckpt.horizon)
+                tx.gc_checkpoint(sorted(ckpt.baseline.dead))
                 tx.set_meta("checkpoint", op.op_hash)
             # loop: the following seq may already be committed (lagging-node catch-up).
             # adopt_checkpoint persisted the horizon (finding 19); the guards read it

@@ -448,6 +448,11 @@ class ReadTxn:
 
     # ---- checkpoint cut (the log-compaction boundary; DESIGN §12) ---------- #
 
+    def baseline(self) -> A.Baseline:
+        """The adopted checkpoint's below-cut manifest — cut + retained commitment + dead —
+        as ONE object (composing the three persisted rows). Empty Baseline when uncompacted."""
+        return A.Baseline(self.cut(), self.cut_retained(), self.cut_dead())
+
     def cut(self) -> Heads:
         """The active compaction cut, or {} when uncompacted (pre-M6 behavior)."""
         raw = self.get_meta("cut")
@@ -731,32 +736,29 @@ class WriteTxn(ReadTxn):
             ),
         )
 
-    def adopt_checkpoint(
-        self,
-        cut: Heads,
-        retained: Mapping[bytes, tuple[int, bytes]],
-        dead: list[bytes] = [],  # noqa: B006 (read-only default; never mutated)
-        horizon: HLC | None = None,
-    ) -> None:
-        """Persist the active compaction cut, its `retained` commitment, the `dead`
-        set, and the checkpoint `horizon` F on observing a quorum-committed
-        checkpoint (WP1.2/1.3). DURABLE — the cut re-parametrizes heads()/append()/
-        possession below it, `dead` is the RETAINED-projection mask (covered ∖ dead)
-        the possession and completeness checks run against while GC is still lazy,
-        and the horizon is §8's void / receipt-floor-backstop guard value; all must
-        survive crash-restart like the floor (`set_meta` COMMIT-fsyncs). Physical GC
-        of `dead` is a separate step (gc_checkpoint); adoption must precede it so the
-        gates never see dropped ops without the cut. Atomic (finding 16 / finding
-        19): the writes are ONE transaction/COMMIT, so a crash can never leave the
-        cut adopted without its retained/dead/horizon companions — otherwise the
-        void rule + backstop would go inert against a below-horizon reborn op after
-        a restart (nothing re-runs adoption)."""
-        self._c.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", ("cut", _encode_pairs(cut)))
+    def adopt_checkpoint(self, baseline: A.Baseline, horizon: HLC | None = None) -> None:
+        """Persist the adopted `baseline` (cut + per-author retained commitment + dead band)
+        and the checkpoint `horizon` F on observing a quorum-committed checkpoint (WP1.2/1.3).
+        DURABLE — the cut re-parametrizes heads()/append()/possession below it, `dead` is the
+        RETAINED-projection mask (covered ∖ dead) the possession and completeness checks run
+        against while GC is still lazy, and the horizon is §8's void / receipt-floor-backstop
+        guard value; all must survive crash-restart like the floor (`set_meta` COMMIT-fsyncs).
+        Physical GC of `dead` is a separate step (gc_checkpoint); adoption must precede it so
+        the gates never see dropped ops without the cut. Atomic (finding 16 / finding 19): the
+        rows are ONE transaction/COMMIT, so a crash can never leave the cut adopted without its
+        retained/dead/horizon companions — otherwise the void rule + backstop would go inert
+        against a below-horizon reborn op after a restart (nothing re-runs adoption). The
+        Baseline is persisted as three meta rows (unchanged on-disk); the interface is typed."""
         self._c.execute(
-            "INSERT OR REPLACE INTO meta VALUES (?,?)", ("cut_retained", _encode_pairs(retained))
+            "INSERT OR REPLACE INTO meta VALUES (?,?)", ("cut", _encode_pairs(baseline.cut))
         )
         self._c.execute(
-            "INSERT OR REPLACE INTO meta VALUES (?,?)", ("cut_dead", codec.encode(list(dead)))
+            "INSERT OR REPLACE INTO meta VALUES (?,?)",
+            ("cut_retained", _encode_pairs(baseline.retained)),
+        )
+        self._c.execute(
+            "INSERT OR REPLACE INTO meta VALUES (?,?)",
+            ("cut_dead", codec.encode(sorted(baseline.dead))),
         )
         if horizon is not None:
             self.advance_horizon(horizon)

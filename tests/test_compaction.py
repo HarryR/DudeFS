@@ -706,7 +706,7 @@ class TestCutAwareStore(unittest.TestCase):
         with store.write_txn() as tx:
             for o in ops:
                 self.assertTrue(tx.append(o))
-            tx.adopt_checkpoint(cut, {})
+            tx.adopt_checkpoint(A.Baseline(cut, {}))
             tx.gc_checkpoint([ops[0].op_hash, ops[1].op_hash])  # drop below-cut ops
 
         # ACCEPT: the tail is anchored at the pin and still reported in full —
@@ -721,7 +721,7 @@ class TestCutAwareStore(unittest.TestCase):
         with s2.write_txn() as tx:
             for o in ops[:2]:
                 tx.append(o)
-            tx.adopt_checkpoint(cut, {})
+            tx.adopt_checkpoint(A.Baseline(cut, {}))
             tx.gc_checkpoint([ops[0].op_hash, ops[1].op_hash])
         with s2.read_txn() as tx:
             self.assertEqual(tx.heads()[idle], (1, ops[1].op_hash))  # the pin itself
@@ -736,14 +736,14 @@ class TestCutAwareStore(unittest.TestCase):
         # cut (legitimately GC'd, absent) is contiguous-by-fiat, not a gap.
         s = ChainStore()
         with s.write_txn() as tx:
-            tx.adopt_checkpoint(cut, {})
+            tx.adopt_checkpoint(A.Baseline(cut, {}))
             self.assertEqual(tx.append(ops[2]).status, AppendStatus.OK)  # pred seq1 <= cut
 
         # REJECT (genuine gap): one seq further, at cut_seq+2, whose predecessor is
         # neither present nor below the cut, still defers.
         s2 = ChainStore()
         with s2.write_txn() as tx:
-            tx.adopt_checkpoint(cut, {})
+            tx.adopt_checkpoint(A.Baseline(cut, {}))
             self.assertEqual(tx.append(ops[3]).status, AppendStatus.GAP)  # pred seq2 missing
 
     def test_finding11_possession_below_cut_is_baseline_completeness(self):
@@ -771,7 +771,7 @@ class TestCutAwareStore(unittest.TestCase):
         with store.write_txn() as tx:
             for o in below:
                 tx.append(o)
-            tx.adopt_checkpoint(cut, committed)
+            tx.adopt_checkpoint(A.Baseline(cut, committed))
             tx.gc_checkpoint(cr.dead)
         with store.read_txn() as tx:
             self.assertIsNone(tx.get_op(first.op_hash))  # the named envelope is gone
@@ -790,7 +790,7 @@ class TestCutAwareStore(unittest.TestCase):
             for o in cr.retained:
                 if o.op_hash != winner.op_hash:
                     tx.put_op_raw(o)
-            tx.adopt_checkpoint(cut, committed)
+            tx.adopt_checkpoint(A.Baseline(cut, committed))
         gacc = Acceptor(sk, crypto.SIGNER.public(sk), gap, config_epoch=0, delta_ms=BIG_DELTA)
         self.assertFalse(gacc.holds_frontier(sf))
 
@@ -800,12 +800,12 @@ class TestCutAwareStore(unittest.TestCase):
         w = World(seed=23, n_clients=1)
         pub = w.clients[0].pub
         cut = {pub: (2, b"\x11" * 32)}
-        committed = {pub: (1, b"\x22" * 32)}
+        committed = {pub: A.RetainedEntry(1, b"\x22" * 32)}
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "store.db")
             s = ChainStore(path)
             with s.write_txn() as tx:
-                tx.adopt_checkpoint(cut, committed)
+                tx.adopt_checkpoint(A.Baseline(cut, committed))
             s.close()
             s2 = ChainStore(path)
             with s2.read_txn() as tx:
@@ -976,7 +976,7 @@ class TestBaselineProjection(unittest.TestCase):
         with lazy.write_txn() as tx:
             for o in below:
                 tx.append(o)
-            tx.adopt_checkpoint(cut, committed, cr.dead)
+            tx.adopt_checkpoint(A.Baseline(cut, committed, frozenset(cr.dead)))
         with lazy.read_txn() as tx:
             self.assertIsNotNone(tx.get_op(first.op_hash))  # dead op still physically held
 
@@ -999,13 +999,13 @@ class TestBaselineProjection(unittest.TestCase):
         with lazy.write_txn() as tx:
             for o in below:
                 tx.append(o)
-            tx.adopt_checkpoint(cut, committed, cr.dead)
+            tx.adopt_checkpoint(A.Baseline(cut, committed, frozenset(cr.dead)))
 
         gc = ChainStore()  # adopted + physically GC'd: winner only
         with gc.write_txn() as tx:
             for o in below:
                 tx.append(o)
-            tx.adopt_checkpoint(cut, committed, cr.dead)
+            tx.adopt_checkpoint(A.Baseline(cut, committed, frozenset(cr.dead)))
             tx.gc_checkpoint(cr.dead)
         with gc.read_txn() as tx:
             self.assertIsNone(tx.get_op(first.op_hash))
@@ -1181,7 +1181,7 @@ class TestHorizonPersistence(unittest.TestCase):
             # adopt a checkpoint sealing F=200, then simulate a crash (close+reopen)
             s = ChainStore(path)
             with s.write_txn() as tx:
-                tx.adopt_checkpoint(cut, {}, [], A.HLC(200, 0))
+                tx.adopt_checkpoint(A.Baseline(cut, {}), A.HLC(200, 0))
             with s.read_txn() as tx:
                 self.assertEqual(tx.get_horizon(), A.HLC(200, 0))
             s.close()

@@ -184,7 +184,8 @@ class CompactorDaemon(ClientDaemon):
         # adopt into the compactor's OWN store — GC `dead`, persist cut/horizon — so the store
         # below the cut becomes exactly the retained set and a restart resumes incremental.
         with self.store.write_txn() as tx:
-            tx.adopt_checkpoint(cut, A.retained_commitment(cr.retained), cr.dead, f)
+            manifest = A.Baseline(cut, A.retained_commitment(cr.retained), frozenset(cr.dead))
+            tx.adopt_checkpoint(manifest, f)
             tx.gc_checkpoint(cr.dead)
             tx.set_meta("checkpoint", ckpt.op_hash)
         return ckpt.op_hash

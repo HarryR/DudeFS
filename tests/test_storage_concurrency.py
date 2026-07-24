@@ -238,7 +238,7 @@ class TestDurableRestart(unittest.TestCase):
             op = w.blind(0, [], [[A.Mutation.SET, b"k", b"v"]])
             with s.write_txn() as tx:
                 tx.append(op)
-                tx.adopt_checkpoint({op.author: (0, op.op_hash)}, {}, [], A.HLC(9, 0))
+                tx.adopt_checkpoint(A.Baseline({op.author: (0, op.op_hash)}, {}), A.HLC(9, 0))
             s.close()  # process restart
 
             s2 = ChainStore(path)

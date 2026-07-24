@@ -669,7 +669,8 @@ class TestBaselinePull(unittest.TestCase):
                 with cluster.nodes[0].store.write_txn() as tx:
                     for o in below:
                         tx.put_op_raw(o)
-                    tx.adopt_checkpoint(cut_of(w), A.retained_commitment(below), [], A.HLC(0, 0))
+                    manifest = A.Baseline(cut_of(w), A.retained_commitment(below))
+                    tx.adopt_checkpoint(manifest, A.HLC(0, 0))
                 c = cluster.client(w)
                 try:
                     c._pull_baseline()  # reuse the gossip exchange as an authorized requester

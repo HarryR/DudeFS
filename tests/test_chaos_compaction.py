@@ -87,7 +87,7 @@ class TestStaleFrontierRoster(unittest.TestCase):
         with acc.store.write_txn() as tx:
             for o in below:
                 tx.append(o)
-            tx.adopt_checkpoint(cut, committed, list(cr.dead))
+            tx.adopt_checkpoint(A.Baseline(cut, committed, frozenset(cr.dead)))
             tx.gc_checkpoint(list(cr.dead))
         with acc.store.read_txn() as tx:
             self.assertIsNone(tx.get_op(first.op_hash))  # first is GC'd
