@@ -186,7 +186,6 @@ class TestDepResolution(unittest.TestCase):
             prev=A.GENESIS_PREV,
             hlc=A.HLC(NOW, 0),
             deps=[base.op_hash],
-            authz=b"cert",
             keyepoch=0,
             data_key=w.keyring[0]["data_key"],
             txn_bytes=A.Txn(None, [], [[A.Mutation.SET, b"d", b"2"]]).encode(),

@@ -206,7 +206,6 @@ class TestLane2Fence(unittest.TestCase):
             prev=w._mprev,
             hlc=w.tick(),
             deps=[],
-            authz=b"root",
             keyepoch=0,
             payload=ctl.rotate_body(1),
             pver=99,
@@ -329,7 +328,6 @@ class TestDepsAcceptGate(unittest.TestCase):
             prev=prev,
             hlc=HLC(hlc_ms, 0),
             deps=deps,
-            authz=b"cert",
             keyepoch=0,
             data_key=w.keyring[0]["data_key"],
             txn_bytes=txn.encode(),
@@ -378,7 +376,6 @@ class TestFoldTotalityOverGarbage(unittest.TestCase):
             prev=o0.op_hash,
             hlc=A.HLC(10**12, 0),  # a poison-attempt hlc
             deps=[],
-            authz=b"cert",
             keyepoch=0,
             payload=b"x" * 48,
         )

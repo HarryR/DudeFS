@@ -100,7 +100,6 @@ class TestStaleFrontierRoster(unittest.TestCase):
             prev=A.GENESIS_PREV,
             hlc=A.HLC(NOW, 0),
             deps=[],
-            authz=b"root",
             keyepoch=0,
             payload=b"",
             slot_tag=A.roster_slot_tag(0),

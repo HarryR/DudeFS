@@ -168,7 +168,6 @@ class ManagerState:
             prev=self.mprev,
             hlc=A.HLC(self.mhlc + 1, 0),
             deps=[],
-            authz=b"root",
             keyepoch=self.keyepoch,
             payload=payload,
             slot_tag=slot_tag,

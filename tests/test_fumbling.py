@@ -38,7 +38,6 @@ def _roster(msk, mpub, roster, seq, prev, epoch=0, hlc=100):
         prev=prev,
         hlc=A.HLC(hlc, 0),
         deps=[],
-        authz=b"root",
         keyepoch=0,
         payload=ctl.roster_body(epoch, roster, {}),
         slot_tag=A.roster_slot_tag(epoch),
@@ -56,7 +55,6 @@ def _recovery_pair(msk, mpub, roster, from_epoch=0):
         prev=A.GENESIS_PREV,
         hlc=A.HLC(500, 0),
         deps=[],
-        authz=b"root",
         keyepoch=0,
         payload=ctl.checkpoint_body(A.Baseline({}, {}), b"recover", b"", 0, A.HLC(0, 0)),
     )
@@ -68,7 +66,6 @@ def _recovery_pair(msk, mpub, roster, from_epoch=0):
         prev=ckpt.op_hash,
         hlc=A.HLC(501, 0),
         deps=[],
-        authz=b"root",
         keyepoch=0,
         payload=ctl.roster_body(from_epoch, roster, {}, recovery=ckpt.op_hash),
     )

@@ -810,7 +810,6 @@ class TestDaemonFence(unittest.TestCase):
             prev=A.GENESIS_PREV,
             hlc=A.HLC(500, 0),
             deps=[],
-            authz=b"root",
             keyepoch=0,
             payload=ctl.checkpoint_body(A.Baseline({}, {}), b"r", b"", 0, A.HLC(0, 0)),
         )
@@ -822,7 +821,6 @@ class TestDaemonFence(unittest.TestCase):
             prev=rckpt.op_hash,
             hlc=A.HLC(501, 0),
             deps=[],
-            authz=b"root",
             keyepoch=0,
             payload=ctl.roster_body(0, roster, {}, recovery=rckpt.op_hash),
         )

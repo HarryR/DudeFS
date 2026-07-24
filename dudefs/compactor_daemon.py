@@ -110,7 +110,6 @@ class CompactorDaemon(ClientDaemon):
                 prev=self._prev,
                 hlc=self._next_hlc(),
                 deps=[],
-                authz=b"cert",
                 keyepoch=self.keyepoch,
                 payload=body,
                 slot_tag=A.checkpoint_slot_tag(seq),

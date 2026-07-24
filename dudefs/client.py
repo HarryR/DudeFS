@@ -340,7 +340,6 @@ class ClientDaemon:
                 prev=self._prev,
                 hlc=self._next_hlc(),
                 deps=[],
-                authz=b"cert",
                 keyepoch=self.keyepoch,
                 data_key=ring["data_key"],
                 txn_bytes=txn.encode(),

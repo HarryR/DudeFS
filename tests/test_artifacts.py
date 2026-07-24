@@ -33,7 +33,6 @@ class TestOp(unittest.TestCase):
             prev=A.GENESIS_PREV,
             hlc=A.HLC(1000, 0),
             deps=[],
-            authz=b"cert",
             keyepoch=0,
             data_key=self.data_key,
             txn_bytes=txn.encode(),
@@ -147,7 +146,6 @@ class TestGoldenVectors(unittest.TestCase):
             prev=A.GENESIS_PREV,
             hlc=A.HLC(1000, 0),
             deps=[],
-            authz=b"cert",
             keyepoch=0,
             data_key=data_key,
             txn_bytes=txn.encode(),
@@ -163,12 +161,12 @@ class TestGoldenVectors(unittest.TestCase):
 
 
 # Golden constants captured from the reference implementation (M0 freeze).
-# GOLDEN_OP_HASH bumped ONCE at the auth0→xcs1 crypto swap: the payload is now
-# real XChaCha20-Poly1305 ciphertext (was authenticated-plaintext), so the sealed
-# envelope — and its hash — changed. The slot-tag and receipt-message goldens are
-# untouched (they never involved the AEAD). Deterministic: the SIV nonce is a pure
-# function of (data_key, AD, plaintext), so this hash is stable across runs.
-GOLDEN_OP_HASH = "26143bb56b0450b396076a558e18e8b3da1b0355c49de937e5625fdfbee48d3a"
+# GOLDEN_OP_HASH bumped at (1) the auth0→xcs1 crypto swap (payload became real
+# XChaCha20-Poly1305 ciphertext) and (2) the removal of the vestigial `authz`
+# envelope field — a deliberate wire change (the field was never consumed; authority
+# is author-capability based). The slot-tag and receipt-message goldens are untouched
+# (they never involved the envelope's field set). Deterministic across runs.
+GOLDEN_OP_HASH = "1a939ece61c7e89aeed1743ec7fae479cdd1f932951ae596aec941ec5b0d55ac"
 GOLDEN_SLOT_TAG = "90f95fff86da601e863bff7a94a015ef6a55241da944541f4ee5ce26556a6c53"
 GOLDEN_RECEIPT_MSG_HASH = "14b2178154576d6005816103e16b6f4fee08c09fedcbce7323fdfb9d3e593bac"
 

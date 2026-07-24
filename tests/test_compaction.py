@@ -536,7 +536,6 @@ class TestDelegateCheckpointBarrier(unittest.TestCase):
             prev=A.GENESIS_PREV,
             hlc=A.HLC(hlc_ms, 0),
             deps=[],
-            authz=b"cert",
             keyepoch=0,
             payload=ctl.checkpoint_body(A.Baseline(cut, {}), b"", b"", 0, A.HLC(0, 0)),
             pver=pver,

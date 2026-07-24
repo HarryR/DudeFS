@@ -100,7 +100,6 @@ class Field(BytesEnum):
     codec sorts keys, so declaration order is irrelevant to the wire."""
 
     AUTHOR = b"author"
-    AUTHZ = b"authz"
     CLASS = b"class"
     DEPS = b"deps"
     HLC = b"hlc"
@@ -372,10 +371,6 @@ class Op:
         return codec.as_seq(self.fields[Field.DEPS])
 
     @property
-    def authz(self) -> bytes:
-        return codec.as_bytes(self.fields[Field.AUTHZ])
-
-    @property
     def keyepoch(self) -> int:
         return codec.as_int(self.fields[Field.KEYEPOCH])
 
@@ -444,7 +439,6 @@ class Op:
             HLC.decode(f[Field.HLC])
             for dep in codec.as_seq(f[Field.DEPS]):
                 codec.as_bytes(dep)
-            codec.as_bytes(f[Field.AUTHZ])
             if codec.as_int(f[Field.KEYEPOCH]) < 0:
                 return False
             if codec.as_int(f[Field.PVER]) < 0:
@@ -494,7 +488,6 @@ class Op:
         prev: bytes,
         hlc: HLC,
         deps: list[bytes],
-        authz: bytes,
         keyepoch: int,
         payload: bytes,
         slot_tag: bytes | None = None,
@@ -511,7 +504,6 @@ class Op:
             Field.PREV: prev,
             Field.HLC: hlc.encode(),
             Field.DEPS: tuple(deps),
-            Field.AUTHZ: authz,
             Field.KEYEPOCH: int(keyepoch),
             Field.PVER: int(pver),
             Field.PAYLOAD: payload,
@@ -533,7 +525,6 @@ class Op:
         prev: bytes,
         hlc: HLC,
         deps: list[bytes],
-        authz: bytes,
         keyepoch: int,
         data_key: bytes,
         txn_bytes: bytes,
@@ -550,7 +541,6 @@ class Op:
             Field.PREV: prev,
             Field.HLC: hlc.encode(),
             Field.DEPS: list(deps),
-            Field.AUTHZ: authz,
             Field.KEYEPOCH: int(keyepoch),
             Field.PVER: int(pver),
         }
@@ -566,7 +556,6 @@ class Op:
             prev=prev,
             hlc=hlc,
             deps=deps,
-            authz=authz,
             keyepoch=keyepoch,
             payload=payload,
             slot_tag=slot_tag,
