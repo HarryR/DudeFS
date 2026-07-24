@@ -12,12 +12,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
 from .. import codec, crypto
-from ..artifacts import HLC, BytesEnum, Heads, Op, RetainedEntry
+from ..artifacts import HLC, Baseline, BytesEnum, Heads, Op, RetainedEntry
 
 # Body discriminator (a field key, not a value vocabulary).
 BK_KIND = b"kind"
@@ -94,10 +94,8 @@ class WrapSet:
 @dataclass(frozen=True)
 class Checkpoint:
     KIND: ClassVar[ControlKind] = ControlKind.CHECKPOINT
-    cut: Heads
+    baseline: Baseline  # the below-cut manifest: cut + retained commitment + dead band
     state_acc: bytes
-    dead: list[bytes]
-    retained: dict[bytes, RetainedEntry]  # author -> (count, digest)
     attempts: bytes
     keyepoch: int
     horizon: HLC  # the finality frontier F the cut was sealed at (§9)
@@ -194,10 +192,12 @@ def _v_checkpoint(b: dict[bytes, codec.Bencodable]) -> Checkpoint:
     # rev 6 (DESIGN §12): log-compaction — no snapshot blob. `dead` is the incremental
     # GC delta; `retained` commits the FULL retained set ≤ cut; `attempts` the sidecar.
     return Checkpoint(
-        cut=_heads(codec.field(b, b"cut")),
+        baseline=Baseline(
+            cut=_heads(codec.field(b, b"cut")),
+            retained=_retained(codec.field(b, b"retained")),
+            dead=frozenset(codec.as_bytes(h) for h in codec.as_seq(codec.field(b, b"dead"))),
+        ),
         state_acc=codec.as_bytes(codec.field(b, b"state_acc")),
-        dead=[codec.as_bytes(h) for h in codec.as_seq(codec.field(b, b"dead"))],
-        retained=_retained(codec.field(b, b"retained")),
         attempts=codec.as_bytes(codec.field(b, b"attempts")),
         keyepoch=_uint(codec.field(b, b"keyepoch")),
         horizon=HLC.decode(codec.field(b, b"horizon")),
@@ -340,29 +340,27 @@ def unwrap_group_key(body: WrapSet, member_sk: bytes) -> bytes | None:
 
 
 def checkpoint_body(
-    cut: Heads,
+    baseline: Baseline,
     state_acc: bytes,
-    dead: list[bytes],
-    retained: Mapping[bytes, tuple[int, bytes]],
     attempts: bytes,
     keyepoch: int,
     horizon: HLC,
     seq: int = 0,
 ) -> bytes:
-    """A rev-6 checkpoint (DESIGN §12): the pinned `cut`, the `state_acc` audit
-    anchor, the incremental `dead` delta, the per-author `retained` commitment,
-    the encrypted `attempts` sidecar, the `horizon` finality frontier F the cut was
-    sealed at (the void / below-horizon guard value, §8), and the monotone `seq` —
-    the checkpoint's position in the chain and the public slot it contends (WP-F(c),
-    like a roster epoch). No snapshot."""
-    cut_enc = {a: [s, h] for a, (s, h) in cut.items()}
-    retained_enc = {a: [c, d] for a, (c, d) in retained.items()}
+    """A rev-6 checkpoint (DESIGN §12): the below-cut `baseline` manifest (pinned cut +
+    per-author retained commitment + the incremental dead band), the `state_acc` audit
+    anchor, the encrypted `attempts` sidecar, the `horizon` finality frontier F the cut was
+    sealed at (the void / below-horizon guard value, §8), and the monotone `seq` — the
+    checkpoint's position in the chain and the public slot it contends (WP-F(c)). `dead` is
+    encoded SORTED — it is a set, so the wire is deterministic regardless of GC order."""
+    cut_enc = {a: [s, h] for a, (s, h) in baseline.cut.items()}
+    retained_enc = {a: [c, d] for a, (c, d) in baseline.retained.items()}
     return codec.encode(
         {
             BK_KIND: ControlKind.CHECKPOINT,
             b"cut": cut_enc,
             b"state_acc": state_acc,
-            b"dead": list(dead),
+            b"dead": sorted(baseline.dead),
             b"retained": retained_enc,
             b"attempts": attempts,
             b"keyepoch": int(keyepoch),

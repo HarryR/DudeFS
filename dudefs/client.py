@@ -620,29 +620,29 @@ class ClientDaemon:
             ck = self._checkpoint(o)
             # the checkpoint's OWN QC must verify against its epoch roster — a compactor
             # cannot self-certify a cut; a node quorum committed it (issue #3).
-            if ck is not None and ck.cut and self._qc_ok(tx.get_qc(o.op_hash), rosters):
+            if ck is not None and ck.baseline.cut and self._qc_ok(tx.get_qc(o.op_hash), rosters):
                 if latest is None or o.hlc > latest[0].hlc:
                     latest = (o, ck)
         if latest is None:
             return None
         ck = latest[1]
-        if all(tx.get_op(h) is not None for h in ck.dead):
+        if all(tx.get_op(h) is not None for h in ck.baseline.dead):
             return None  # I still hold the full covered band -> a full fold is correct
         # sparse: the below-cut winners are the retained ops I hold (covered ∖ dead). They
         # carry NO per-op QC (dropped below the cut); author-sig is verified in the barrier
         # fold and the checkpoint state_acc is the vouch — so this is sourced from the held
         # ops directly, NOT the QC-gated committed set (else a fresh client reconstructs an
         # empty retained set and verify_state_acc fails).
-        dead = set(ck.dead)
+        dead, cut = set(ck.baseline.dead), ck.baseline.cut
         retained = [
-            o for o in all_ops if not o.is_control and covered(o, ck.cut) and o.op_hash not in dead
+            o for o in all_ops if not o.is_control and covered(o, cut) and o.op_hash not in dead
         ]
         dk = self.keyring[ck.keyepoch]["data_key"]
         barrier = compactor.barrier_state(
             retained, compactor.open_attempts(ck.attempts, dk), self.keyring
         )
         compactor.verify_state_acc(ck.state_acc, barrier)  # loud on a forged/partial checkpoint
-        return barrier, ck.cut
+        return barrier, ck.baseline.cut
 
     def _fold(self, tx: ReadTxn, *, final_only: bool = False) -> fold.FoldResult:
         all_ops = tx.all_ops()  # ONE scan, threaded into every helper (issue #3 follow-up)

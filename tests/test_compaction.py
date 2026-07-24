@@ -538,7 +538,7 @@ class TestDelegateCheckpointBarrier(unittest.TestCase):
             deps=[],
             authz=b"cert",
             keyepoch=0,
-            payload=ctl.checkpoint_body(cut, b"", [], {}, b"", 0, A.HLC(0, 0)),
+            payload=ctl.checkpoint_body(A.Baseline(cut, {}), b"", b"", 0, A.HLC(0, 0)),
             pver=pver,
         )
 
@@ -842,10 +842,10 @@ class TestCheckpointArtifact(unittest.TestCase):
         )
         body = ctl.decode(ckpt)
         assert isinstance(body, ctl.Checkpoint)
-        self.assertEqual(body.cut, cut)
+        self.assertEqual(body.baseline.cut, cut)
         self.assertEqual(body.state_acc, cr.state_acc)
-        self.assertEqual(body.dead, cr.dead)
-        self.assertEqual(body.retained, retained)
+        self.assertEqual(body.baseline.dead, frozenset(cr.dead))
+        self.assertEqual(body.baseline.retained, retained)
         self.assertEqual(body.attempts, b"ct")
         self.assertEqual(body.horizon, A.HLC(200, 3))  # WP1.5: F carried on the wire
 

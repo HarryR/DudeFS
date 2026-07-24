@@ -812,7 +812,7 @@ class TestDaemonFence(unittest.TestCase):
             deps=[],
             authz=b"root",
             keyepoch=0,
-            payload=ctl.checkpoint_body({}, b"r", [], {}, b"", 0, A.HLC(0, 0)),
+            payload=ctl.checkpoint_body(A.Baseline({}, {}), b"r", b"", 0, A.HLC(0, 0)),
         )
         rop = A.Op.build(
             author_sk=w.mgr_sk,

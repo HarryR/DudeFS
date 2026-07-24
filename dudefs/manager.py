@@ -537,7 +537,7 @@ class Manager:
         §2.2). Callers MUST pass the recover_decision() interlock first."""
         survivors = [self.state.roster[i] for i in report.reachable] or self.state.roster
         ckpt = self.state.author_control(
-            ctl.checkpoint_body({}, b"", [], {}, b"", self.state.keyepoch, report.salvage)
+            ctl.checkpoint_body(A.Baseline({}, {}), b"", b"", self.state.keyepoch, report.salvage)
         )
         rop = self.state.author_control(
             ctl.roster_body(self.state.epoch, survivors, {}, recovery=ckpt.op_hash)

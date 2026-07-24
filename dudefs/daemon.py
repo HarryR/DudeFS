@@ -17,7 +17,7 @@ from dataclasses import dataclass
 
 from . import codec, gossip, lmsg, transports, tunables, wire
 from .acceptor import Acceptor, Rejected, RejectReason
-from .artifacts import Baseline, Op, Watermark, checkpoint_slot_tag, covered, quorum_size
+from .artifacts import Op, Watermark, checkpoint_slot_tag, covered, quorum_size
 from .fold import ControlReducer, ControlState, endpoints_of
 from .gossip import Delta
 from .handlers import control as ctl
@@ -370,14 +370,14 @@ class NodeDaemon:
                     # full fold. Structural (hlc is cleartext), so a ZK node enforces it. No
                     # cut-lag margin: the horizon is exactly F, not F − W (W is vestigial —
                     # the audit is deterministic recomputation, not a timed race).
-                    if any(covered(o, body.cut) and o.hlc > body.horizon for o in all_ops):
+                    if any(covered(o, body.baseline.cut) and o.hlc > body.horizon for o in all_ops):
                         continue
                     # WP-F(a) / #4 — never adopt a checkpoint that would REGRESS what I hold: GC
                     # past a cut and the monotone horizon are both irreversible, so a cut that
                     # does not per-author dominate my adopted cut, or a lower horizon, is
                     # impossible by definition — refuse it. Forward-only, both modes.
                     if body.horizon.as_tuple() < cur_horizon.as_tuple() or not _cut_dominates(
-                        body.cut, cur_cut
+                        body.baseline.cut, cur_cut
                     ):
                         continue
                     candidates.setdefault(body.seq, (op, body))  # the slot => one per seq
@@ -395,8 +395,9 @@ class NodeDaemon:
             # cut/retained/dead/horizon must survive crash-restart together, and the GC of
             # `dead` must not be observable without the cut that vouches for it.
             with self.store.write_txn() as tx:
-                tx.adopt_checkpoint(ckpt.cut, ckpt.retained, ckpt.dead, ckpt.horizon)
-                tx.gc_checkpoint(ckpt.dead)
+                dead = sorted(ckpt.baseline.dead)
+                tx.adopt_checkpoint(ckpt.baseline.cut, ckpt.baseline.retained, dead, ckpt.horizon)
+                tx.gc_checkpoint(dead)
                 tx.set_meta("checkpoint", op.op_hash)
             # loop: the following seq may already be committed (lagging-node catch-up).
             # adopt_checkpoint persisted the horizon (finding 19); the guards read it
@@ -418,12 +419,12 @@ class NodeDaemon:
         lag that a later gossip round fills on its own (never a destructive reload for mere lag)."""
         if not candidates:
             return []
-        _op, body = candidates[max(candidates)]  # the furthest target I'm trying to reach
-        have = baseline_digest(tx.all_ops(), body.cut, frozenset(body.dead))
-        overfull = {a for a, e in have.items() if e.size > body.retained.get(a, (0, b""))[0]}
+        bl = candidates[max(candidates)][1].baseline  # the furthest target I'm trying to reach
+        have = baseline_digest(tx.all_ops(), bl.cut, bl.dead)
+        overfull = {a for a, e in have.items() if e.size > bl.retained.get(a, (0, b""))[0]}
         if not overfull:
             return []
-        return [o.op_hash for o in tx.all_ops() if o.author in overfull and covered(o, body.cut)]
+        return [o.op_hash for o in tx.all_ops() if o.author in overfull and covered(o, bl.cut)]
 
     def _select_checkpoint(
         self,
@@ -439,9 +440,8 @@ class NodeDaemon:
         checkpoint I demonstrably already satisfy, so the skipped `dead` bands never matter."""
 
         def holds_baseline(c: tuple[Op, ctl.Checkpoint]) -> bool:
-            body = c[1]  # no mismatched authors == I hold the full below-cut baseline
-            manifest = Baseline(body.cut, body.retained, frozenset(body.dead))
-            return not manifest.mismatched(tx.all_ops())
+            # no mismatched authors == I hold the full below-cut baseline the checkpoint pins
+            return not c[1].baseline.mismatched(tx.all_ops())
 
         hot = candidates.get(next_seq)
         if hot is not None and holds_baseline(hot):

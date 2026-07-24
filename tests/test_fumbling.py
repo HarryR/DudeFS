@@ -58,7 +58,7 @@ def _recovery_pair(msk, mpub, roster, from_epoch=0):
         deps=[],
         authz=b"root",
         keyepoch=0,
-        payload=ctl.checkpoint_body({}, b"recover", [], {}, b"", 0, A.HLC(0, 0)),
+        payload=ctl.checkpoint_body(A.Baseline({}, {}), b"recover", b"", 0, A.HLC(0, 0)),
     )
     rop = A.Op.build(
         author_sk=msk,

@@ -70,7 +70,7 @@ class CompactorDaemon(ClientDaemon):
         own = tx.get_op(h) if h else None
         own_body = ctl.decode(own) if own is not None else None
         if isinstance(own_body, ctl.Checkpoint):  # my adopted head (its QC may be GC'd)
-            best_seq, best_cut = own_body.seq, own_body.cut
+            best_seq, best_cut = own_body.seq, own_body.baseline.cut
         for op in tx.all_ops():
             if not op.is_control:
                 continue
@@ -82,7 +82,7 @@ class CompactorDaemon(ClientDaemon):
             if op.slot_tag != A.checkpoint_slot_tag(body.seq):  # seq must bind its slot
                 continue
             if body.seq > best_seq:
-                best_seq, best_cut = body.seq, body.cut
+                best_seq, best_cut = body.seq, body.baseline.cut
         return best_seq + 1, best_cut
 
     def _author_checkpoint(
@@ -94,10 +94,8 @@ class CompactorDaemon(ClientDaemon):
         sidecar is sealed under the group key; everything else is the plaintext manifest."""
         dk = self.keyring[self.keyepoch]["data_key"]
         body = ctl.checkpoint_body(
-            cut,
+            A.Baseline(cut, A.retained_commitment(cr.retained), frozenset(cr.dead)),
             cr.state_acc,
-            cr.dead,
-            A.retained_commitment(cr.retained),
             compactor.seal_attempts(cr.attempts, dk),
             self.keyepoch,
             horizon,

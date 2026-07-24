@@ -477,8 +477,8 @@ def _reduce_control(
         ):
             continue  # unauthorized -> folds `invalid` in the main walk; no barrier
         if isinstance(body, control_handler.Checkpoint):
-            cuts.append(body.cut)
-            pending_barrier = body.cut  # its barrier activates pending downstream
+            cuts.append(body.baseline.cut)
+            pending_barrier = body.baseline.cut  # its barrier activates pending downstream
         control.apply_control(op, body)
     return control, cuts
 

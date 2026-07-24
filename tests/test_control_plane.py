@@ -15,7 +15,7 @@ from dudefs.store import ChainStore
 from tests._builders import World
 from tests._gossip import merge
 
-CP = ctl.checkpoint_body({}, b"", [], {}, b"", 0, A.HLC(0, 0))  # authz-only; no cut placed
+CP = ctl.checkpoint_body(A.Baseline({}, {}), b"", b"", 0, A.HLC(0, 0))  # authz-only; no cut placed
 NOW = 100
 BIG_DELTA = 1_000_000  # skew never bites in these unit tests
 
@@ -189,7 +189,7 @@ class TestRecoveryFence(unittest.TestCase):
             5,
             A.GENESIS_PREV,
             200,
-            ctl.checkpoint_body({}, b"root", [], {}, b"", 0, A.HLC(0, 0)),
+            ctl.checkpoint_body(A.Baseline({}, {}), b"root", b"", 0, A.HLC(0, 0)),
         )
         rop = _ctl(
             self.msk,
@@ -234,7 +234,7 @@ class TestRecoveryFence(unittest.TestCase):
             1,
             cert.op_hash,
             2,
-            ctl.checkpoint_body({}, b"", [], {}, b"", 0, A.HLC(0, 0)),
+            ctl.checkpoint_body(A.Baseline({}, {}), b"", b"", 0, A.HLC(0, 0)),
         )
         # a manage-roster delegate authors a recovery-marked roster -> root-only -> invalid
         rop = _ctl(
@@ -296,7 +296,7 @@ class TestRecoveryFence(unittest.TestCase):
             1,
             cert.op_hash,
             3,
-            ctl.checkpoint_body({}, b"", [], {}, b"", 0, A.HLC(0, 0)),
+            ctl.checkpoint_body(A.Baseline({}, {}), b"", b"", 0, A.HLC(0, 0)),
         )
         n = _acc_cluster(1)[0][0]
         # the fence requires the explicit pairing: a wrong recovery hash won't fire

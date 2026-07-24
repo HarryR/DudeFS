@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import random
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from dudefs import artifacts as A
@@ -182,7 +182,7 @@ class World:
         cut: A.Heads | None = None,
         state_acc: bytes = b"",
         dead: list[bytes] | None = None,
-        retained: Mapping[bytes, tuple[int, bytes]] | None = None,
+        retained: dict[bytes, A.RetainedEntry] | None = None,
         attempts: bytes = b"",
         keyepoch: int = 0,
         horizon: A.HLC | None = None,
@@ -193,10 +193,8 @@ class World:
         # seq/slot MISMATCH — an op that claims one sequence but contends another's slot.
         op = self._mgr_op(
             ctl.checkpoint_body(
-                cut or {},
+                A.Baseline(cut or {}, retained or {}, frozenset(dead or [])),
                 state_acc,
-                dead or [],
-                retained or {},
                 attempts,
                 keyepoch,
                 horizon or A.HLC(0, 0),
