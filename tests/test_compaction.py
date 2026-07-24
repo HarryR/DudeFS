@@ -932,12 +932,13 @@ class TestBaselineSync(unittest.TestCase):
                 if op.author != w.clients[1].pub:
                     tx.put_op_raw(op)
         with dst.read_txn() as tx:
-            self.assertEqual(gossip.verify_baseline(tx, cut, committed), {w.clients[1].pub})
+            mismatched = A.Baseline(cut, committed).mismatched(tx.all_ops())
+        self.assertEqual(mismatched, {w.clients[1].pub})
 
         # pull the missing author's sparse baseline, then it verifies complete
         self.assertGreater(pull_baseline(dst, src, cut), 0)
         with dst.read_txn() as tx:
-            self.assertEqual(gossip.verify_baseline(tx, cut, committed), set())
+            self.assertEqual(A.Baseline(cut, committed).mismatched(tx.all_ops()), set())
 
 
 class TestBaselineProjection(unittest.TestCase):
@@ -981,13 +982,14 @@ class TestBaselineProjection(unittest.TestCase):
 
         # ACCEPT: over the retained projection it is complete...
         with lazy.read_txn() as tx:
-            self.assertEqual(gossip.verify_baseline(tx, cut, committed, dead), set())
+            mismatched = A.Baseline(cut, committed, frozenset(dead)).mismatched(tx.all_ops())
+        self.assertEqual(mismatched, set())
         # ...and the store's own possession digest agrees (holds_frontier path).
         with lazy.read_txn() as tx:
             self.assertEqual(tx.baseline_commitment(), committed)
         # load-bearing: the OLD all-covered digest (no dead mask) FALSE-rejects it.
         with lazy.read_txn() as tx:
-            self.assertNotEqual(gossip.verify_baseline(tx, cut, committed), set())
+            self.assertNotEqual(A.Baseline(cut, committed).mismatched(tx.all_ops()), set())
 
     def test_gc_and_lazy_peers_converge_no_oscillation(self):
         w, below, cut, cr, committed, first, _winner = self._overwrite_world(31)

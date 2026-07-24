@@ -21,7 +21,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 from . import artifacts as A
@@ -182,23 +181,6 @@ class Delta:
 # certified by the manager-signed checkpoint, not per-op quorum proofs (NOTES
 # 29d). So this path is digest-diff + pull-by-hash of author-signed envelopes,
 # not the contiguous-run DELTA the dense tail uses.
-
-
-def verify_baseline(
-    tx: ReadTxn,
-    cut: Heads,
-    committed: Mapping[bytes, tuple[int, bytes]],
-    dead: frozenset[bytes] = frozenset(),
-) -> set[bytes]:
-    """Verify a node/client holds the FULL below-cut baseline against the
-    checkpoint's signed `retained` commitment (DESIGN §12 intake, NOTES 29c/29d).
-    Returns the set of authors whose held baseline doesn't match — empty means
-    complete. Compared over the RETAINED projection (covered ∖ dead, NOTES 34 Q2)
-    so a node that has adopted the checkpoint but not yet GC'd its `dead` ops still
-    verifies complete. A tampered or genuinely partial baseline fails here,
-    localized to the author; the checkpoint signature is verified separately."""
-    have = baseline_digest(tx.all_ops(), cut, dead)
-    return {a for a in set(have) | set(committed) if have.get(a) != committed.get(a)}
 
 
 # --------------------------------------------------------------------------- #

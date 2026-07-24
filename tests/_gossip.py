@@ -8,9 +8,9 @@
 
 from __future__ import annotations
 
-from dudefs.artifacts import Heads, Op
+from dudefs.artifacts import Heads, Op, covered
 from dudefs.gossip import Delta, Summary
-from dudefs.store import ChainStore, baseline_digest, covered
+from dudefs.store import ChainStore, baseline_digest
 
 
 def merge(dst: ChainStore, src: ChainStore, dst_epoch: int = 0) -> None:

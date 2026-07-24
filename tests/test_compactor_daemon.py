@@ -12,12 +12,11 @@ import unittest
 from dudefs import artifacts as A
 from dudefs import compactor
 from dudefs import crypto as C
-from dudefs.artifacts import VERSION_ABSENT
+from dudefs.artifacts import VERSION_ABSENT, covered
 from dudefs.client import ClientDaemon
 from dudefs.compactor_daemon import CompactorDaemon
 from dudefs.daemon import NodeDaemon, Peer
 from dudefs.handlers import control as ctl
-from dudefs.store import covered
 from tests._builders import World, now_ms, poll_until, unix_eps
 
 DELTA = 2000  # generous skew tolerance — these tests exercise compaction, not the skew gate

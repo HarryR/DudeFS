@@ -17,7 +17,7 @@ from dataclasses import dataclass
 
 from . import codec, gossip, lmsg, transports, tunables, wire
 from .acceptor import Acceptor, Rejected, RejectReason
-from .artifacts import Op, Watermark, checkpoint_slot_tag, quorum_size
+from .artifacts import Baseline, Op, Watermark, checkpoint_slot_tag, covered, quorum_size
 from .fold import ControlReducer, ControlState, endpoints_of
 from .gossip import Delta
 from .handlers import control as ctl
@@ -30,7 +30,6 @@ from .store import (
     StoreClosed,
     StoreError,
     baseline_digest,
-    covered,
 )
 
 LOCAL_TRANSPORT = transports.UNIX  # the POC carrier; ENDPOINT addrs are (transport, uri, opts)
@@ -440,8 +439,9 @@ class NodeDaemon:
         checkpoint I demonstrably already satisfy, so the skipped `dead` bands never matter."""
 
         def holds_baseline(c: tuple[Op, ctl.Checkpoint]) -> bool:
-            body = c[1]  # verify_baseline: empty mismatch set == I hold the full retained set
-            return not gossip.verify_baseline(tx, body.cut, body.retained, frozenset(body.dead))
+            body = c[1]  # no mismatched authors == I hold the full below-cut baseline
+            manifest = Baseline(body.cut, body.retained, frozenset(body.dead))
+            return not manifest.mismatched(tx.all_ops())
 
         hot = candidates.get(next_seq)
         if hot is not None and holds_baseline(hot):

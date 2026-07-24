@@ -34,23 +34,13 @@ from .artifacts import BLIND, HLC, QC, Ballot, Heads, Op, Receipt
 from .errors import DudeFSError
 
 
-def covered(op: Op, cut: Heads) -> bool:
-    """At-or-below the pinned cut, per-author by seq (DESIGN §12) — the boundary
-    between the sparse baseline and the dense tail. The canonical predicate;
-    gossip (L2) imports it so store and anti-entropy agree on the boundary."""
-    entry = cut.get(op.author)
-    return entry is not None and op.seq <= entry[0]
-
-
 def baseline_digest(
     ops: list[Op], cut: Heads, dead: frozenset[bytes]
 ) -> dict[bytes, A.RetainedEntry]:
-    """The per-author commitment over the RETAINED below-cut projection —
-    `covered ∖ dead` (DESIGN §12 / NOTES 34, Q2). Excluding `dead` is what makes
-    a lazy-GC node (still holding superseded ops) agree with a GC'd node and with
-    the checkpoint's winners-only `retained`: both project to the same winners, so
-    completeness compares equal and neither re-pulls the other's dead envelopes."""
-    return A.retained_commitment([o for o in ops if covered(o, cut) and o.op_hash not in dead])
+    """The per-author retained commitment over the below-cut projection (covered ∖ dead) —
+    the `retained` field of the Baseline `ops` present at `cut`. A thin store-side alias for
+    `Baseline.of(...).retained` (DESIGN §12 / NOTES 34, Q2)."""
+    return A.Baseline.of(ops, cut, dead).retained
 
 
 def _encode_pairs(d: Mapping[bytes, tuple[int, bytes]]) -> bytes:

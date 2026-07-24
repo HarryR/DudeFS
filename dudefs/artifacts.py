@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 from enum import Enum
 from functools import total_ordering
 from typing import NamedTuple, Self
@@ -152,6 +153,43 @@ def retained_commitment(retained: list[Op]) -> dict[bytes, RetainedEntry]:
     return {
         a: RetainedEntry(len(hs), crypto.h(b"".join(sorted(hs)))) for a, hs in by_author.items()
     }
+
+
+def covered(op: Op, cut: Heads) -> bool:
+    """At-or-below the pinned cut, per-author by seq (DESIGN §12) — the boundary between the
+    sparse baseline and the dense tail. The canonical predicate; store and anti-entropy both
+    use it so they agree on the boundary."""
+    entry = cut.get(op.author)
+    return entry is not None and op.seq <= entry[0]
+
+
+@dataclass(frozen=True)
+class Baseline:
+    """The below-cut manifest a checkpoint pins (DESIGN §12 rev 6): the per-author `cut`, the
+    `retained` (size, digest) commitment over the covered∖dead projection, and the `dead` band
+    GC'd since the previous checkpoint. ONE object for the (cut, retained, dead) triple that
+    used to travel as loose args through baseline_digest / verify_baseline / adopt_checkpoint /
+    the Summary + Checkpoint wire. In-memory grouping only — the encoding is unchanged."""
+
+    cut: Heads
+    retained: dict[bytes, RetainedEntry]
+    dead: frozenset[bytes] = frozenset()
+
+    @classmethod
+    def of(cls, ops: list[Op], cut: Heads, dead: frozenset[bytes] = frozenset()) -> Baseline:
+        """The manifest a set of `ops` presents at `cut`: the retained commitment over the
+        RETAINED projection (covered ∖ dead). Excluding `dead` is load-bearing (WP1.3) — a
+        lazy-GC node and a GC'd node then present the SAME digest, so completeness compares
+        equal and neither re-pulls the other's superseded envelopes."""
+        winners = [o for o in ops if covered(o, cut) and o.op_hash not in dead]
+        return cls(cut, retained_commitment(winners), frozenset(dead))
+
+    def mismatched(self, held: list[Op]) -> set[bytes]:
+        """The authors whose `held` retained projection ≠ my committed digest (empty = the
+        holder has the FULL below-cut baseline). A tampered or partial baseline fails here,
+        localized to one author; the checkpoint signature is verified separately."""
+        have = Baseline.of(held, self.cut, self.dead).retained
+        return {a for a in set(have) | set(self.retained) if have.get(a) != self.retained.get(a)}
 
 
 def roster_slot_tag(epoch: int) -> bytes:

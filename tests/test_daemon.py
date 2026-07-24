@@ -510,7 +510,7 @@ class TestAdoptionValidityGate(unittest.TestCase):
 
     def _setup(self, seed):
         from dudefs import fold
-        from dudefs.store import covered
+        from dudefs.artifacts import covered
 
         w = World(seed=seed, n_clients=1)
         roster = [C.SIGNER.public(bytes([200 + i] * 32)) for i in range(3)]

@@ -20,12 +20,12 @@ import threading
 
 from . import artifacts as A
 from . import compactor
-from .artifacts import HLC, Op
+from .artifacts import HLC, Op, covered
 from .client import ClientDaemon, _drive
 from .daemon import _cut_dominates
 from .handlers import control as ctl
 from .quorum import Commit, Committed
-from .store import ReadTxn, covered
+from .store import ReadTxn
 
 
 class CompactorDaemon(ClientDaemon):

@@ -23,7 +23,7 @@ from typing import TypedDict
 
 from . import artifacts as A
 from . import codec, compactor, fold, gossip, lmsg, transports, tunables, wire
-from .artifacts import BLIND, HLC, QC, Op, Receipt, Txn, compute_slot_tag
+from .artifacts import BLIND, HLC, QC, Op, Receipt, Txn, compute_slot_tag, covered
 from .handlers import control as ctl
 from .handlers import data as data_handler
 from .link import Link
@@ -41,7 +41,7 @@ from .quorum import (
     Tick,
     Wake,
 )
-from .store import ChainStore, ReadTxn, StoreClosed, covered
+from .store import ChainStore, ReadTxn, StoreClosed
 
 # Timing lives in tunables.py (single-place visibility): DRIVE_DEADLINE_MS is the
 # no-quorum-reachable wall-clock backstop (the sans-io machine gives up earlier via
