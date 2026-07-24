@@ -19,15 +19,13 @@ from . import crypto, gossip, lmsg, transports, tunables, wire
 from .acceptor import Acceptor, Rejected, RejectReason
 from .artifacts import (
     Cap,
-    CheckpointOp,
-    ControlKind,
     Op,
     RosterOp,
     Watermark,
-    checkpoint_slot_tag,
     covered,
     quorum_size,
 )
+from .checkpoint import CheckpointView
 from .fold import ControlReducer, ControlState, endpoints_of
 from .gossip import Delta
 from .link import Link
@@ -38,7 +36,6 @@ from .store import (
     StoreBusy,
     StoreClosed,
     StoreError,
-    baseline_digest,
 )
 
 LOCAL_TRANSPORT = transports.UNIX  # the POC carrier; ENDPOINT addrs are (transport, uri, opts)
@@ -58,15 +55,6 @@ class Peer:
 
     pub: bytes
     endpoint: transports.Endpoint
-
-
-def _cut_dominates(
-    new: dict[bytes, tuple[int, bytes]], cur: dict[bytes, tuple[int, bytes]]
-) -> bool:
-    """Does `new` per-author advance-or-hold every author of `cur`? (A checkpoint's cut may
-    add authors / higher seqs, but must never take one BACKWARDS — GC past a cut is
-    irreversible, WP-F(a)/#4.) Vacuously true against the empty (pre-first-checkpoint) cut."""
-    return all((e := new.get(a)) is not None and e[0] >= seq for a, (seq, _h) in cur.items())
 
 
 class NodeDaemon:
@@ -326,130 +314,34 @@ class NodeDaemon:
         Forward-only in both modes (per-author cut dominance + monotone horizon); a node ahead
         of the quorum frontier is refused, and the root-signed recovery fence is the sole
         deliberate rewind (observe_fences). Deferred while no candidate's baseline verifies."""
-        stale: list[bytes] = []
-        while True:
-            reducer = ControlReducer(self.manager_pub, self.acc.epoch)
-            # collect every VALID forward candidate in ONE read snapshot, then select the mode
-            with self.store.read_txn() as tx:
-                all_ops = tx.all_ops()
-                cur_cut = tx.cut()  # the checkpoint I've adopted (empty before the first)
-                cur_horizon = tx.get_horizon()
-                adopted = tx.get_meta("checkpoint")
-                next_seq = 0
-                if adopted is not None:  # chain from the seq I last adopted
-                    cur = tx.get_op(adopted)
-                    next_seq = cur.checkpoint_seq + 1 if isinstance(cur, CheckpointOp) else 0
-                for op in sorted(all_ops, key=lambda o: (o.hlc.as_tuple(), o.op_hash)):
-                    if op.is_control:
-                        reducer.observe(op)  # authorization state up to here
-                candidates: dict[int, tuple[Op, CheckpointOp]] = {}
-                for op in all_ops:
-                    if not isinstance(op, CheckpointOp):
-                        continue
-                    if op.checkpoint_seq < next_seq:
-                        continue  # already adopted / superseded — only ever look forward
-                    # BIND the declared seq to the slot the op actually won: without this an
-                    # adversary could win slot-0 yet claim seq=5 in the body, jumping the chain.
-                    # The slot decrees one-per-seq only if checkpoint_seq == the contended slot.
-                    if op.slot_tag != checkpoint_slot_tag(op.checkpoint_seq):
-                        continue
-                    qc = tx.get_qc(op.op_hash)
-                    if qc is None:  # not quorum-committed
-                        continue
-                    # VERIFY the QC, don't just note its presence (WP-F(b), finding #5):
-                    # put_qc stores whatever is gossiped in, so a forged / sub-quorum /
-                    # wrong-epoch QC would otherwise drive a GC on a lie. Mirror the roster
-                    # path — a MAJORITY of THIS epoch's roster must have signed it.
-                    if qc.config_epoch != self.acc.epoch or not qc.verify(self.roster):
-                        continue
-                    if not reducer.control.can_author_control(op.author, ControlKind.CHECKPOINT):
-                        continue  # unauthorized minter — never adopt
-                    # WP-D — horizon covers the cut (finding #8): the horizon is F, the
-                    # finality frontier the cut was sealed at, so EVERY op the checkpoint
-                    # compacts (≤ cut) must sit at/below it. A cut reaching above its horizon
-                    # would seal a not-yet-final op — GC + bootstrap would then diverge from a
-                    # full fold. Structural (hlc is cleartext), so a ZK node enforces it. No
-                    # cut-lag margin: the horizon is exactly F, not F − W (W is vestigial —
-                    # the audit is deterministic recomputation, not a timed race).
-                    if any(covered(o, op.baseline.cut) and o.hlc > op.horizon for o in all_ops):
-                        continue
-                    # WP-F(a) / #4 — never adopt a checkpoint that would REGRESS what I hold: GC
-                    # past a cut and the monotone horizon are both irreversible, so a cut that
-                    # does not per-author dominate my adopted cut, or a lower horizon, is
-                    # impossible by definition — refuse it. Forward-only, both modes.
-                    if op.horizon.as_tuple() < cur_horizon.as_tuple() or not _cut_dominates(
-                        op.baseline.cut, cur_cut
-                    ):
-                        continue
-                    candidates.setdefault(op.checkpoint_seq, (op, op))  # the slot => one per seq
-                picked = self._select_checkpoint(tx, candidates, next_seq)
-                if picked is None:
-                    # can't fast-path. If I'm over-full — holding MORE below-cut ops than a
-                    # committed checkpoint's signed retained count — I carry stale extras a pull
-                    # can never fix; drop that author's whole below-cut set and let gossip
-                    # refetch exactly the winners (reload beats reconcile). Else it's a plain
-                    # missing-baseline lag a later round fills: defer.
-                    stale = self._overfull_below_cut(tx, candidates)
-                    break
-                op, ckpt = picked
-            # adopt + GC + pin the active checkpoint in ONE write transaction (finding 19):
-            # cut/retained/dead/horizon must survive crash-restart together, and the GC of
-            # `dead` must not be observable without the cut that vouches for it.
-            with self.store.write_txn() as tx:
-                tx.adopt_checkpoint(ckpt.baseline, ckpt.horizon)
-                tx.gc_checkpoint(sorted(ckpt.baseline.dead))
-                tx.set_meta("checkpoint", op.op_hash)
-            # loop: the following seq may already be committed (lagging-node catch-up).
-            # adopt_checkpoint persisted the horizon (finding 19); the guards read it
-            # transactionally, so there is no in-memory horizon to advance here.
-        if stale:  # over-full reload: drop the stale extras; gossip refetches the winners, then
-            with self.store.write_txn() as tx:  # a later round's bootstrap adopts (never-stuck)
-                tx.gc_checkpoint(stale)
+        while self._adopt_one():
+            pass
 
-    def _overfull_below_cut(
-        self, tx: ReadTxn, candidates: dict[int, tuple[Op, CheckpointOp]]
-    ) -> list[bytes]:
-        """The below-cut ops to DROP when the fast path is impossible. For the furthest
-        committed checkpoint I can't verify, any author where I hold MORE retained-projection
-        ops than its signed `retained` count is proof I carry stale superseded extras a PULL can
-        never fix (pull only adds). Reload beats reconcile (no delta/union logic): drop that
-        author's whole below-cut set and let gossip refetch exactly the retained winners — the
-        manager-signed count is the below-cut authority, so this only ever drops non-winners
-        plus winners that immediately return. [] = nothing over-full — a plain missing-baseline
-        lag that a later gossip round fills on its own (never a destructive reload for mere lag)."""
-        if not candidates:
-            return []
-        bl = candidates[max(candidates)][1].baseline  # the furthest target I'm trying to reach
-        have = baseline_digest(tx.all_ops(), bl.cut, bl.dead)
-        overfull = {a for a, e in have.items() if e.size > bl.retained.get(a, (0, b""))[0]}
-        if not overfull:
-            return []
-        return [o.op_hash for o in tx.all_ops() if o.author in overfull and covered(o, bl.cut)]
-
-    def _select_checkpoint(
-        self,
-        tx: ReadTxn,
-        candidates: dict[int, tuple[Op, CheckpointOp]],
-        next_seq: int,
-    ) -> tuple[Op, CheckpointOp] | None:
-        """Choose which committed checkpoint to adopt from the valid forward candidates: the
-        HOT next link if I hold its baseline (incremental, applying its `dead` band); else the
-        HIGHEST seq whose signed `retained` baseline I hold in FULL — a bootstrap JUMP over
-        links GC'd while I was away. None = defer: the next link isn't here and no reachable
-        baseline verifies. The verify gate is what keeps the jump safe — I only ever leap to a
-        checkpoint I demonstrably already satisfy, so the skipped `dead` bands never matter."""
-
-        def holds_baseline(c: tuple[Op, CheckpointOp]) -> bool:
-            # no mismatched authors == I hold the full below-cut baseline the checkpoint pins
-            return not c[1].baseline.mismatched(tx.all_ops())
-
-        hot = candidates.get(next_seq)
-        if hot is not None and holds_baseline(hot):
-            return hot
-        for seq in sorted(candidates, reverse=True):  # jump as far as a held baseline allows
-            if seq != next_seq and holds_baseline(candidates[seq]):
-                return candidates[seq]
-        return None
+    def _adopt_one(self) -> bool:
+        """Adopt ONE committed checkpoint I can — the HOT next link or a verified bootstrap JUMP
+        (`CheckpointView.select`) — in one adopt+GC+pin write txn (finding 19); or, when none is
+        adoptable, drop the over-full below-cut extras (reload-beats-reconcile) and defer. Returns
+        whether a checkpoint was adopted, so `adopt_committed_checkpoints` loops it forward. All the
+        WP-F decision logic is on the CheckpointView (checkpoint.py) — testable without a daemon."""
+        with self.store.read_txn() as tx:
+            view = CheckpointView.of(
+                tx, epoch=self.acc.epoch, roster=self.roster, manager_pub=self.manager_pub
+            )
+        picked = view.select()
+        if picked is None:
+            stale = view.overfull_drop()  # reload-beats-reconcile, or [] to defer
+            if stale:
+                with self.store.write_txn() as tx:
+                    tx.gc_checkpoint(stale)
+            return False
+        # adopt + GC + pin in ONE write txn (finding 19): cut/retained/dead/horizon survive
+        # crash-restart together, and the GC of `dead` is never observable without the cut that
+        # vouches for it.
+        with self.store.write_txn() as tx:
+            tx.adopt_checkpoint(picked.baseline, picked.horizon)
+            tx.gc_checkpoint(sorted(picked.baseline.dead))
+            tx.set_meta("checkpoint", picked.op_hash)
+        return True
 
     # ---- recovery-fence observation (WP1.4) -------------------------------- #
     def observe_fences(self) -> None:
@@ -479,35 +371,35 @@ class NodeDaemon:
         (chained within this pass as `activate_epoch` moves me forward). Distinct from
         observe_fences — that is the ROOT-signed recovery substitute when the quorum
         is dead and there is no new-roster QC to be had."""
+        while self._activate_one():
+            pass
+
+    def _activate_one(self) -> bool:
+        """Activate ONE roster change I hold the JOINT CERTIFICATE for — an old-roster QC at my
+        current epoch e AND a new-roster QC at e+1, both verified — advancing my epoch/roster by
+        one. A slot may be CONTENDED (B4: a crash-retry re-authors the same roster slot), so an
+        epoch can hold several candidates of which the old roster decided at most one; the undecided
+        ones are skipped, never starving the activation. Returns whether one activated, so the loop
+        chains a lagging node forward one epoch per call."""
+        e = self.acc.epoch
         with self.store.read_txn() as tx:
             qcs = {(qc.op_hash, qc.config_epoch): qc for qc in tx.all_qcs()}
-            all_ops = tx.all_ops()
-        # roster-change ops grouped by the epoch they advance FROM. A slot may be
-        # CONTENDED (B4: a crash-retry re-authors the same roster slot), so an epoch
-        # can hold several candidate ops of which the old roster decided at most one;
-        # keep them all and pick the joint-certified one below (never let an undecided
-        # contender starve the activation).
-        by_from: dict[int, list[tuple[Op, list[bytes]]]] = {}
-        for op in all_ops:
-            if not isinstance(op, RosterOp):
-                continue
-            if op.recovery is not None:
-                continue  # the recovery path is observe_fences, not the joint cert
-            by_from.setdefault(op.from_epoch, []).append((op, op.roster))
-        while cands := by_from.get(self.acc.epoch):
-            e = self.acc.epoch
-            for op, new_roster in cands:
-                old_qc, new_qc = qcs.get((op.op_hash, e)), qcs.get((op.op_hash, e + 1))
-                if old_qc is None or new_qc is None:
-                    continue  # incomplete joint cert for THIS candidate
-                if not old_qc.verify(self.roster) or not new_qc.verify(new_roster):
-                    continue  # a half that does not ratify -> not a valid activation
-                self.acc.activate_epoch(e + 1)  # monotone + durable (finding 20)
-                self.roster = new_roster
-                self.quorum = quorum_size(len(new_roster))
-                break  # advanced one epoch; the while re-reads at the new epoch
-            else:
-                break  # no candidate at this epoch carried a full joint cert -> done
+            cands = [
+                op
+                for op in tx.all_ops()
+                if isinstance(op, RosterOp) and op.recovery is None and op.from_epoch == e
+            ]
+        for op in cands:
+            old_qc, new_qc = qcs.get((op.op_hash, e)), qcs.get((op.op_hash, e + 1))
+            if old_qc is None or new_qc is None:
+                continue  # incomplete joint cert for THIS candidate
+            if not old_qc.verify(self.roster) or not new_qc.verify(op.roster):
+                continue  # a half that does not ratify -> not a valid activation
+            self.acc.activate_epoch(e + 1)  # monotone + durable (finding 20)
+            self.roster = op.roster
+            self.quorum = quorum_size(len(op.roster))
+            return True
+        return False
 
     # ---- evidence duty-cycle (WP1.5) --------------------------------------- #
     def evidence_cycle(self, observed_watermarks: list[Watermark] | None = None) -> int:

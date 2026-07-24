@@ -21,10 +21,92 @@ from dataclasses import dataclass
 
 from . import artifacts as A
 from . import codec, crypto, fold
-from .artifacts import VERSION_ABSENT, Heads, Op
+from .artifacts import HLC, VERSION_ABSENT, Heads, Op, covered
+from .checkpoint import cut_dominates
 from .errors import DudeFSError
 from .handlers import data as data_handler
 from .handlers.data import Opaque
+from .store import ReadTxn
+
+# --------------------------------------------------------------------------- #
+# The compaction DECISION (author-side) — pure over a read snapshot, so the "what/whether to    #
+# compact" logic unit-tests with crafted inputs, no daemon (HANDOFF-R9 §0). The checkpoint RULES #
+# (cut_dominates, adoptability) live in checkpoint.py; this is the author's planning over them.  #
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class PrevState:
+    """The compactor's OWN last-adopted baseline (cut + retained ops + attempts), read from its own
+    store — the single source of truth, so a cold restart resumes INCREMENTAL rather than re-folding
+    history. Empty before the first checkpoint (the genesis pass)."""
+
+    cut: Heads
+    retained: list[Op]
+    attempts: dict[bytes, int]
+
+    @classmethod
+    def of(cls, tx: ReadTxn, keyring: fold.Keyring) -> PrevState:
+        prev_cut = tx.cut()
+        if not prev_cut:
+            return cls({}, [], {})
+        # after adopt+GC the ops held below the cut ARE the retained set (dead gone)
+        retained = [o for o in tx.all_ops() if covered(o, prev_cut)]
+        attempts: dict[bytes, int] = {}
+        h = tx.get_meta("checkpoint")
+        op = tx.get_op(h) if h else None
+        if isinstance(op, A.CheckpointOp):
+            attempts = open_attempts(op.attempts, keyring[op.keyepoch]["data_key"])
+        return cls(prev_cut, retained, attempts)
+
+
+@dataclass(frozen=True)
+class CompactionPlan:
+    """A decided compaction pass: the new final `cut`, its chain `seq`, the `committed` band to
+    fold, the `prev` baseline, and the `horizon` F the cut is sealed at. `plan_compaction` returns
+    None when there is no new sealed work, or the cut would regress the decided chain head."""
+
+    cut: Heads
+    seq: int
+    committed: list[Op]
+    prev: PrevState
+    horizon: HLC
+
+
+def cut_at(ops: list[Op], f: HLC) -> Heads:
+    """The per-author frontier at the finalized floor `f`: the highest-seq op each author has
+    authored with `hlc <= f`. Per-author HLC monotonicity (DESIGN §4) makes this a contiguous,
+    final cut — everything it covers has `hlc <= f = horizon`."""
+    ft = f.as_tuple()
+    cut: Heads = {}
+    for o in ops:
+        if o.hlc.as_tuple() <= ft:
+            cur = cut.get(o.author)
+            if cur is None or o.seq > cur[0]:
+                cut[o.author] = (o.seq, o.op_hash)
+    return cut
+
+
+def advances(cut: Heads, prev_cut: Heads) -> bool:
+    """Does `cut` move at least one author's frontier past `prev_cut`? (Finality is monotone, so
+    no author ever regresses — so this is exactly 'is there new sealed work'.)"""
+    return any(seq > prev_cut.get(a, (-1, b""))[0] for a, (seq, _h) in cut.items())
+
+
+def plan_compaction(
+    committed: list[Op], prev: PrevState, *, horizon: HLC, next_seq: int, committed_cut: Heads
+) -> CompactionPlan | None:
+    """The PURE compaction decision. The new final cut at `horizon`, or None when there is nothing
+    new+final to seal (no advance since the last cut) OR the cut would REGRESS the decided chain
+    head — if my finality lags the latest committed checkpoint's cut, my cut would not dominate it
+    and the nodes would reject it (WP-F(a) gate). Skip and retry once my floor catches up, so a
+    lagging compactor waits rather than wedges."""
+    cut = cut_at(committed, horizon)
+    if not cut or not advances(cut, prev.cut):
+        return None  # no new sealed work since the last checkpoint
+    if not cut_dominates(cut, committed_cut):
+        return None  # would regress the decided chain head -> decided-but-unadoptable = a WEDGE
+    return CompactionPlan(cut=cut, seq=next_seq, committed=committed, prev=prev, horizon=horizon)
 
 
 class CompactError(DudeFSError):

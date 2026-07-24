@@ -20,9 +20,8 @@ import threading
 
 from . import artifacts as A
 from . import compactor
-from .artifacts import HLC, Op, covered
+from .artifacts import HLC, Op
 from .client import ClientDaemon, _drive
-from .daemon import _cut_dominates
 from .quorum import Commit, Committed
 from .store import ReadTxn
 
@@ -34,26 +33,6 @@ class CompactorDaemon(ClientDaemon):
     checkpoint's state forward — reconstructed from its OWN adopted store each pass — so each
     pass is INCREMENTAL and a RESTART resumes incremental rather than re-folding history
     (cost ∝ churn since the last cut, never ∝ history; DESIGN §12 rev 6)."""
-
-    @staticmethod
-    def _advances(cut: A.Heads, prev_cut: A.Heads) -> bool:
-        """Does `cut` move at least one author's frontier past `prev_cut`? (Finality is
-        monotone, so no author ever regresses — so this is exactly 'is there new sealed
-        work'.) No advance => nothing to compact this pass."""
-        return any(seq > prev_cut.get(a, (-1, b""))[0] for a, (seq, _h) in cut.items())
-
-    def _cut_at(self, ops: list[Op], f: HLC) -> A.Heads:
-        """The per-author frontier at the finalized floor `f`: the highest-seq op each
-        author has authored with `hlc <= f`. Per-author HLC monotonicity (DESIGN §4) makes
-        this a contiguous, final cut — everything it covers has `hlc <= f = horizon`."""
-        ft = f.as_tuple()
-        cut: dict[bytes, tuple[int, bytes]] = {}
-        for o in ops:
-            if o.hlc.as_tuple() <= ft:
-                cur = cut.get(o.author)
-                if cur is None or o.seq > cur[0]:
-                    cut[o.author] = (o.seq, o.op_hash)
-        return cut
 
     def _committed_frontier(self, tx: ReadTxn) -> tuple[int, A.Heads]:
         """The checkpoint-chain head the QUORUM has decided: (next seq to contend, the latest
@@ -107,29 +86,12 @@ class CompactorDaemon(ClientDaemon):
             self._prev = op.op_hash
         return op
 
-    def _prev_state(self, tx: ReadTxn) -> tuple[A.Heads, list[Op], dict[bytes, int]]:
-        """Reconstruct the previous checkpoint's (cut, retained ops, attempts) from the
-        compactor's OWN adopted store — the SINGLE source of truth, so a cold restart resumes
-        incremental instead of re-folding history. After adopt+GC the ops still held below the
-        cut ARE the retained set (winners + masks + control; dead physically gone). Empty when
-        no checkpoint is adopted yet (the genesis pass)."""
-        prev_cut = tx.cut()
-        if not prev_cut:
-            return {}, [], {}
-        retained = [o for o in tx.all_ops() if covered(o, prev_cut)]
-        attempts: dict[bytes, int] = {}
-        h = tx.get_meta("checkpoint")
-        op = tx.get_op(h) if h else None
-        if isinstance(op, A.CheckpointOp):
-            attempts = compactor.open_attempts(op.attempts, self.keyring[op.keyepoch]["data_key"])
-        return prev_cut, retained, attempts
-
     def compact_once(self) -> bytes | None:
-        """One INCREMENTAL compaction pass. Returns the committed checkpoint's op_hash, or
-        None when there is nothing new+final to seal (no quorum floor / no advance since the
-        last cut) or the quorum didn't commit. The band `(prev_cut, cut]` is the only work:
-        cost ∝ churn since the last checkpoint, never ∝ history — and `prev_*` is read from the
-        durable store, so a restart mid-sequence resumes exactly where it left off."""
+        """One INCREMENTAL compaction pass: sync -> decide (`compactor.plan_compaction`) -> seal ->
+        commit+adopt. Returns the committed checkpoint's op_hash, or None when there is nothing
+        new+final to seal or the quorum didn't commit. The DECISION is pure (testable without a
+        daemon); the store I/O is `_seal` / `_commit_and_adopt`. Cost ∝ churn since the last cut,
+        never ∝ history; `prev` reads from the durable store, so a restart resumes."""
         self.sync()  # pull the committed log + set the finalized floor F
         with self._lock:
             f = self._final_frontier
@@ -139,36 +101,44 @@ class CompactorDaemon(ClientDaemon):
             committed = [
                 o for o in tx.all_ops() if o.is_control or tx.get_qc(o.op_hash) is not None
             ]
-            prev_cut, prev_retained, prev_attempts = self._prev_state(tx)
-            seq, committed_cut = self._committed_frontier(tx)
-        cut = self._cut_at(committed, f)
-        if not cut or not self._advances(cut, prev_cut):
-            return None  # no new sealed work since the last checkpoint
-        # never author a link that REGRESSES the decided chain head: if my finality F lags the
-        # latest committed checkpoint's cut, my cut would not dominate it and the nodes would
-        # reject it (WP-F(a) gate) — decided-but-unadoptable = a WEDGE. Skip and retry once my
-        # floor catches up, so a lagging concurrent compactor waits rather than wedges.
-        if not _cut_dominates(cut, committed_cut):
-            return None
-        # incremental: fold the previous retained set + only the newly-committed band. The
-        # first pass is the degenerate prev = ∅ (compact filters the tail to `(prev_cut, cut]`).
-        cr = compactor.compact(
-            prev_retained, prev_attempts, prev_cut, committed, self.keyring, self.genesis, cut
+            prev = compactor.PrevState.of(tx, self.keyring)
+            next_seq, committed_cut = self._committed_frontier(tx)
+        plan = compactor.plan_compaction(
+            committed, prev, horizon=f, next_seq=next_seq, committed_cut=committed_cut
         )
-        ckpt = self._author_checkpoint(cr, cut, f, seq)
-        # SLOTTED commit (WP-F(c)): PREPARE/ACCEPT on checkpoint_slot_tag(seq) — the quorum
-        # decrees at most ONE checkpoint per seq, so concurrent compactors cannot diverge. A
-        # rival that won the slot -> LostSlot; the next pass retries at the tip. Divergence is
-        # impossible by construction, no longer a one-honest-compactor assumption.
+        if plan is None:
+            return None
+        ckpt, cr = self._seal(plan)
+        return self._commit_and_adopt(ckpt, cr, plan)
+
+    def _seal(self, plan: compactor.CompactionPlan) -> tuple[Op, compactor.CompactResult]:
+        """Fold the prev retained set + only the newly-committed band `(prev_cut, cut]` into a
+        CompactResult, and author the Cap.COMPACT checkpoint op on my own chain (WP-F(c) slot)."""
+        cr = compactor.compact(
+            plan.prev.retained,
+            plan.prev.attempts,
+            plan.prev.cut,
+            plan.committed,
+            self.keyring,
+            self.genesis,
+            plan.cut,
+        )
+        return self._author_checkpoint(cr, plan.cut, plan.horizon, plan.seq), cr
+
+    def _commit_and_adopt(
+        self, ckpt: Op, cr: compactor.CompactResult, plan: compactor.CompactionPlan
+    ) -> bytes | None:
+        """SLOTTED-commit the checkpoint to a node quorum (WP-F(c): the quorum decrees at most ONE
+        per seq, so concurrent compactors cannot diverge), then adopt into my OWN store — GC `dead`,
+        persist cut/horizon so a restart resumes incremental. None if I lost the slot
+        (retry next pass)."""
         outcome = _drive(Commit(self.cfg, ckpt), self._rpc, stop=self._closing)
         if not isinstance(outcome, Committed):
             return None  # lost the slot / unreachable — retry next pass
         self._store_qc(outcome.qc)  # persist + gossip the commit proof; nodes then adopt
-        # adopt into the compactor's OWN store — GC `dead`, persist cut/horizon — so the store
-        # below the cut becomes exactly the retained set and a restart resumes incremental.
         with self.store.write_txn() as tx:
-            manifest = A.Baseline(cut, A.retained_commitment(cr.retained), frozenset(cr.dead))
-            tx.adopt_checkpoint(manifest, f)
+            manifest = A.Baseline(plan.cut, A.retained_commitment(cr.retained), frozenset(cr.dead))
+            tx.adopt_checkpoint(manifest, plan.horizon)
             tx.gc_checkpoint(cr.dead)
             tx.set_meta("checkpoint", ckpt.op_hash)
         return ckpt.op_hash
