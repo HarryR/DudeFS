@@ -486,7 +486,6 @@ class TestAuthzAndVersioning(unittest.TestCase):
             seq=0,
             prev=A.GENESIS_PREV,
             hlc=w.tick(),
-            deps=[],
             keyepoch=0,
             data_key=w.keyring[0]["data_key"],
             txn_bytes=txn.encode(),
@@ -547,7 +546,6 @@ class TestRostersByEpoch(unittest.TestCase):
             seq=0,
             prev=A.GENESIS_PREV,
             hlc=w.tick(),
-            deps=[],
             keyepoch=0,
             payload=ctl.roster_body(1, [cpub, node[0], node[1]], {}),
         )

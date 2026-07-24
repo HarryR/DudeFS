@@ -37,7 +37,6 @@ def _roster_op(msk, mpub, new_roster, sync_frontier, epoch=0):
         seq=0,
         prev=A.GENESIS_PREV,
         hlc=A.HLC(NOW, 0),
-        deps=[],
         keyepoch=0,
         payload=ctl.roster_body(epoch, new_roster, sync_frontier),
         slot_tag=A.roster_slot_tag(epoch),
@@ -57,7 +56,6 @@ def _ctl(sk, pub, seq, prev, hlc_ms, payload):
         seq=seq,
         prev=prev,
         hlc=A.HLC(hlc_ms, 0),
-        deps=[],
         keyepoch=0,
         payload=payload,
     )
@@ -428,7 +426,6 @@ class TestWrapSet(unittest.TestCase):
                 seq=0,
                 prev=A.GENESIS_PREV,
                 hlc=A.HLC(NOW, 0),
-                deps=[],
                 keyepoch=1,
                 payload=ctl.sealed_wrap_set_body(1, k_epoch, members),
             )
@@ -456,7 +453,6 @@ class TestWrapSet(unittest.TestCase):
                 seq=0,
                 prev=A.GENESIS_PREV,
                 hlc=A.HLC(NOW, 0),
-                deps=[],
                 keyepoch=2,
                 payload=ctl.sealed_wrap_set_body(2, k_epoch, [member]),
             )

@@ -339,7 +339,6 @@ class ClientDaemon:
                 seq=self._seq,
                 prev=self._prev,
                 hlc=self._next_hlc(),
-                deps=[],
                 keyepoch=self.keyepoch,
                 data_key=ring["data_key"],
                 txn_bytes=txn.encode(),

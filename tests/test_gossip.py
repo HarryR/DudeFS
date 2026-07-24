@@ -8,10 +8,10 @@ import unittest
 
 from dudefs import artifacts as A
 from dudefs import crypto as C
-from dudefs.acceptor import Acceptor, Rejected, RejectReason
+from dudefs.acceptor import Acceptor
 from dudefs.store import ChainStore
 from tests._builders import World
-from tests._gossip import merge, pull_op
+from tests._gossip import merge
 
 NOW = 10_000
 BIG_DELTA = 1_000_000  # skew never bites in these tests
@@ -163,43 +163,6 @@ class TestSinglePush(unittest.TestCase):
             merge(nodes[peer].store, nodes[0].store)
             with nodes[peer].store.read_txn() as tx:
                 self.assertIsNotNone(tx.get_qc(op.op_hash))
-
-
-class TestDepResolution(unittest.TestCase):
-    def test_unknown_dep_is_pulled_then_accepted(self):
-        # PROTOCOL §2.1: an op whose `deps` the node lacks is not hard-rejected —
-        # the node PULLs the dep from a peer, then accepts. M4 upgrade of the M2
-        # `unknown_dep` reject.
-        nsk = bytes([201] * 32)
-        node = Acceptor(nsk, C.SIGNER.public(nsk), ChainStore(), 0, BIG_DELTA)
-        peer = ChainStore()
-
-        w = World(seed=3, n_clients=2)
-        base = w.blind(0, [], [[A.Mutation.SET, b"b", b"1"]])  # the dep — lives on the peer only
-        with peer.write_txn() as tx:
-            tx.put_op_raw(base)
-        c = w.clients[1]
-        dependent = A.Op.build_data(
-            author_sk=c.sk,
-            author_pub=c.pub,
-            seq=0,
-            prev=A.GENESIS_PREV,
-            hlc=A.HLC(NOW, 0),
-            deps=[base.op_hash],
-            keyepoch=0,
-            data_key=w.keyring[0]["data_key"],
-            txn_bytes=A.Txn(None, [], [[A.Mutation.SET, b"d", b"2"]]).encode(),
-            slot_tag=None,
-        )
-
-        # 1. node lacks the dep -> unknown_dep (defer, not a hard failure)
-        r = node.on_submit(dependent, NOW)
-        assert isinstance(r, Rejected)
-        self.assertEqual(r.reason, RejectReason.UNKNOWN_DEP)
-        # 2. PULL the dep from the peer that holds it
-        self.assertTrue(pull_op(node.store, peer, base.op_hash))
-        # 3. retry -> accepted
-        self.assertIsInstance(node.on_submit(dependent, NOW), A.Receipt)
 
 
 if __name__ == "__main__":

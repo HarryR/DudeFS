@@ -101,7 +101,6 @@ class Field(BytesEnum):
 
     AUTHOR = b"author"
     CLASS = b"class"
-    DEPS = b"deps"
     HLC = b"hlc"
     KEYEPOCH = b"keyepoch"
     PAYLOAD = b"payload"
@@ -367,10 +366,6 @@ class Op:
         return HLC.decode(self.fields[Field.HLC])
 
     @property
-    def deps(self) -> tuple[Bencodable, ...]:
-        return codec.as_seq(self.fields[Field.DEPS])
-
-    @property
     def keyepoch(self) -> int:
         return codec.as_int(self.fields[Field.KEYEPOCH])
 
@@ -437,8 +432,6 @@ class Op:
             if len(prev) != 32:
                 return False
             HLC.decode(f[Field.HLC])
-            for dep in codec.as_seq(f[Field.DEPS]):
-                codec.as_bytes(dep)
             if codec.as_int(f[Field.KEYEPOCH]) < 0:
                 return False
             if codec.as_int(f[Field.PVER]) < 0:
@@ -487,7 +480,6 @@ class Op:
         seq: int,
         prev: bytes,
         hlc: HLC,
-        deps: list[bytes],
         keyepoch: int,
         payload: bytes,
         slot_tag: bytes | None = None,
@@ -503,7 +495,6 @@ class Op:
             Field.SEQ: int(seq),
             Field.PREV: prev,
             Field.HLC: hlc.encode(),
-            Field.DEPS: tuple(deps),
             Field.KEYEPOCH: int(keyepoch),
             Field.PVER: int(pver),
             Field.PAYLOAD: payload,
@@ -524,7 +515,6 @@ class Op:
         seq: int,
         prev: bytes,
         hlc: HLC,
-        deps: list[bytes],
         keyepoch: int,
         data_key: bytes,
         txn_bytes: bytes,
@@ -540,7 +530,6 @@ class Op:
             Field.SEQ: int(seq),
             Field.PREV: prev,
             Field.HLC: hlc.encode(),
-            Field.DEPS: list(deps),
             Field.KEYEPOCH: int(keyepoch),
             Field.PVER: int(pver),
         }
@@ -555,7 +544,6 @@ class Op:
             seq=seq,
             prev=prev,
             hlc=hlc,
-            deps=deps,
             keyepoch=keyepoch,
             payload=payload,
             slot_tag=slot_tag,

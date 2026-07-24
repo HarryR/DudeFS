@@ -32,7 +32,6 @@ class TestOp(unittest.TestCase):
             seq=0,
             prev=A.GENESIS_PREV,
             hlc=A.HLC(1000, 0),
-            deps=[],
             keyepoch=0,
             data_key=self.data_key,
             txn_bytes=txn.encode(),
@@ -145,7 +144,6 @@ class TestGoldenVectors(unittest.TestCase):
             seq=0,
             prev=A.GENESIS_PREV,
             hlc=A.HLC(1000, 0),
-            deps=[],
             keyepoch=0,
             data_key=data_key,
             txn_bytes=txn.encode(),
@@ -162,11 +160,12 @@ class TestGoldenVectors(unittest.TestCase):
 
 # Golden constants captured from the reference implementation (M0 freeze).
 # GOLDEN_OP_HASH bumped at (1) the auth0→xcs1 crypto swap (payload became real
-# XChaCha20-Poly1305 ciphertext) and (2) the removal of the vestigial `authz`
-# envelope field — a deliberate wire change (the field was never consumed; authority
-# is author-capability based). The slot-tag and receipt-message goldens are untouched
-# (they never involved the envelope's field set). Deterministic across runs.
-GOLDEN_OP_HASH = "1a939ece61c7e89aeed1743ec7fae479cdd1f932951ae596aec941ec5b0d55ac"
+# XChaCha20-Poly1305 ciphertext), (2) removal of the vestigial `authz` field, and
+# (3) removal of the `deps` field (the plaintext dependency mechanism — orphaned by
+# the ZK invariant, will return transaction-integrated behind a protocol-version bump
+# if ever). All deliberate wire changes. The slot-tag and receipt-message goldens are
+# untouched (never involved the envelope's field set). Deterministic across runs.
+GOLDEN_OP_HASH = "fe765b8a3da629d45f21877c0d8b81e51746d12e67f762cde3c96855fb3c5ce0"
 GOLDEN_SLOT_TAG = "90f95fff86da601e863bff7a94a015ef6a55241da944541f4ee5ce26556a6c53"
 GOLDEN_RECEIPT_MSG_HASH = "14b2178154576d6005816103e16b6f4fee08c09fedcbce7323fdfb9d3e593bac"
 

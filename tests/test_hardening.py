@@ -205,7 +205,6 @@ class TestLane2Fence(unittest.TestCase):
             seq=w._mseq,
             prev=w._mprev,
             hlc=w.tick(),
-            deps=[],
             keyepoch=0,
             payload=ctl.rotate_body(1),
             pver=99,
@@ -310,54 +309,6 @@ class TestSubmitGates(unittest.TestCase):
             self.assertEqual(tx.heads(), {})  # but never a frontier claim
 
 
-class TestDepsAcceptGate(unittest.TestCase):
-    """NOTES item 20: deps resolve at ACCEPT time (SUBMIT gated, fold ignores).
-    A dep is a commitment-to-have-observed — evidence, never fold-validity."""
-
-    def _acceptor(self):
-        nsk = bytes([88] * 32)
-        return Acceptor(nsk, C.SIGNER.public(nsk), ChainStore(), 0, DELTA)
-
-    def _op(self, w, ci, seq, prev, deps, hlc_ms):
-        c = w.clients[ci]
-        txn = A.Txn(None, [], [[A.Mutation.SET, b"k", b"v"]])
-        return A.Op.build_data(
-            author_sk=c.sk,
-            author_pub=c.pub,
-            seq=seq,
-            prev=prev,
-            hlc=HLC(hlc_ms, 0),
-            deps=deps,
-            keyepoch=0,
-            data_key=w.keyring[0]["data_key"],
-            txn_bytes=txn.encode(),
-        )
-
-    def test_unknown_dep_rejected_known_dep_accepted(self):
-        w = World(seed=22, n_clients=2)
-        acc = self._acceptor()
-        ghost = bytes([9] * 32)  # references nothing the node holds
-        bad = self._op(w, 0, 0, A.GENESIS_PREV, [ghost], NOW)
-        r = acc.on_submit(bad, NOW)
-        assert isinstance(r, Rejected)
-        self.assertEqual(r.reason, RejectReason.UNKNOWN_DEP)
-        # once the referenced op is stored, the dep resolves
-        base = self._op(w, 1, 0, A.GENESIS_PREV, [], NOW)
-        assert isinstance(acc.on_submit(base, NOW), A.Receipt)
-        good = self._op(w, 0, 0, A.GENESIS_PREV, [base.op_hash], NOW + 1)
-        assert isinstance(acc.on_submit(good, NOW), A.Receipt)
-
-    def test_fold_ignores_deps(self):
-        # the fold never gates on deps — an op citing a ghost dep still applies
-        # (its verdict is a function of hlc order + guards, DESIGN §6).
-        w = World(seed=23, n_clients=1)
-        ops = list(w.all_control())
-        op = self._op(w, 0, 0, A.GENESIS_PREV, [bytes([9] * 32)], hlc_ms=NOW)
-        ops.append(op)
-        r = fold.fold(ops, w.keyring, w.genesis)
-        self.assertEqual(r.verdicts[op.op_hash], fold.Verdict.APPLIED)
-
-
 class TestFoldTotalityOverGarbage(unittest.TestCase):
     """NOTES item 17: sig-invalid ops cannot poison an honest author's chain,
     and the fold is total over adversarial soups."""
@@ -375,7 +326,6 @@ class TestFoldTotalityOverGarbage(unittest.TestCase):
             seq=1,
             prev=o0.op_hash,
             hlc=A.HLC(10**12, 0),  # a poison-attempt hlc
-            deps=[],
             keyepoch=0,
             payload=b"x" * 48,
         )

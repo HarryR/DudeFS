@@ -52,7 +52,6 @@ class RejectReason(Enum):
     FUTURE_HLC = auto()  # op.hlc > local_now + δ
     BELOW_FLOOR = auto()  # op.hlc < floor
     UNKNOWN_PREV = auto()  # node lacks the author's prior op
-    UNKNOWN_DEP = auto()  # node lacks a deps-referenced op (SUBMIT only — PROTOCOL §2.1)
     WRONG_EPOCH = auto()
     EQUIVOCATION_GUARD = auto()  # would double-vote a (tag, ballot); refused
     BELOW_HORIZON = auto()  # op.hlc < checkpoint horizon — §12 receipt-floor backstop
@@ -202,13 +201,6 @@ class Acceptor:
             skew = self._skew_reason(tx, op, now_ms)
             if skew:
                 return Rejected(skew)
-            # deps resolve before acceptance (DESIGN §4 / PROTOCOL §2.1): every
-            # referenced op must be present locally — committed or merely stored.
-            # M2 rejects; M4 upgrades this to PULL-then-accept. Ballot ACCEPT is
-            # exempt (recovery must complete; NOTES item 20).
-            for dep in op.deps:
-                if tx.get_op(A.codec.as_bytes(dep)) is None:
-                    return Rejected(RejectReason.UNKNOWN_DEP)
             # contiguity-checked store for blind writes (PROTOCOL §1.1 `unknown_prev`
             # / §2.1; NOTES item 16) — only a ballot ACCEPT may store an envelope
             # contiguity-free (re-proposal, on_accept below).

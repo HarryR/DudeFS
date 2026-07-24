@@ -99,7 +99,6 @@ class TestStaleFrontierRoster(unittest.TestCase):
             seq=0,
             prev=A.GENESIS_PREV,
             hlc=A.HLC(NOW, 0),
-            deps=[],
             keyepoch=0,
             payload=b"",
             slot_tag=A.roster_slot_tag(0),

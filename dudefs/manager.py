@@ -167,7 +167,6 @@ class ManagerState:
             seq=self.mseq,
             prev=self.mprev,
             hlc=A.HLC(self.mhlc + 1, 0),
-            deps=[],
             keyepoch=self.keyepoch,
             payload=payload,
             slot_tag=slot_tag,
