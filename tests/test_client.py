@@ -37,8 +37,7 @@ class _Cluster:
         self.nodes = []
         for i in range(n):
             d = NodeDaemon(
-                self.node_sks[i],
-                self.roster[i],
+                C.SoftwareKeypair.from_seed(self.node_sks[i]),
                 roster=self.roster,
                 manager_pub=w.mgr_pub,
                 control_ops=w.control_ops,  # the node holds the authz view (request gate)
@@ -52,8 +51,7 @@ class _Cluster:
 
     def client(self, w, ci=0):
         return ClientDaemon(
-            w.clients[ci].sk,
-            w.clients[ci].pub,
+            C.SoftwareKeypair.from_seed(w.clients[ci].sk),
             roster=self.roster,
             roster_addrs=unix_eps(self.paths),
             manager_pub=w.mgr_pub,
@@ -215,8 +213,7 @@ class TestWorkerAPIProtocol(unittest.TestCase):
         w = World(seed=9, n_clients=1)
         # roster present but endpoints unreachable — reads fold locally, no RPC needed
         return ClientDaemon(
-            w.clients[0].sk,
-            w.clients[0].pub,
+            C.SoftwareKeypair.from_seed(w.clients[0].sk),
             roster=[C.SIGNER.public(bytes([1] * 32))],
             roster_addrs=unix_eps(["/nonexistent.sock"]),
             manager_pub=w.mgr_pub,
@@ -282,8 +279,7 @@ class TestRequestGate(unittest.TestCase):
         control = [*w.control_ops, w.revoke(1)]
         sk = bytes([200] * 32)
         nd = NodeDaemon(
-            sk,
-            C.SIGNER.public(sk),
+            C.SoftwareKeypair.from_seed(sk),
             roster=[C.SIGNER.public(sk)],
             manager_pub=w.mgr_pub,
             control_ops=control,
@@ -308,8 +304,7 @@ class TestRequestGate(unittest.TestCase):
         w = World(seed=51, n_clients=1)
         sk = bytes([201] * 32)
         nd = NodeDaemon(
-            sk,
-            C.SIGNER.public(sk),
+            C.SoftwareKeypair.from_seed(sk),
             roster=[C.SIGNER.public(sk)],
             manager_pub=w.mgr_pub,
             control_ops=[],
@@ -344,7 +339,12 @@ class TestEndpointConsumption(unittest.TestCase):
         sks = [bytes([200 + i] * 32) for i in range(3)]
         roster = [C.SIGNER.public(s) for s in sks]
         eps = self._endpoints(w, roster)
-        nd = NodeDaemon(sks[0], roster[0], roster=roster, manager_pub=w.mgr_pub, delta_ms=10**9)
+        nd = NodeDaemon(
+            C.SoftwareKeypair.from_seed(sks[0]),
+            roster=roster,
+            manager_pub=w.mgr_pub,
+            delta_ms=10**9,
+        )
         with nd.store.write_txn() as tx:
             for op in [*w.control_ops, *eps]:
                 tx.put_op_raw(op)
@@ -361,8 +361,7 @@ class TestEndpointConsumption(unittest.TestCase):
         roster = [C.SIGNER.public(s) for s in sks]
         eps = self._endpoints(w, roster)
         c = ClientDaemon(
-            w.clients[0].sk,
-            w.clients[0].pub,
+            C.SoftwareKeypair.from_seed(w.clients[0].sk),
             roster=roster,
             roster_addrs=unix_eps(["seed", "seed", "seed"]),
             manager_pub=w.mgr_pub,
@@ -398,8 +397,7 @@ class TestEndpointConsumption(unittest.TestCase):
             ),
         ]
         c = ClientDaemon(
-            w.clients[0].sk,
-            w.clients[0].pub,
+            C.SoftwareKeypair.from_seed(w.clients[0].sk),
             roster=roster,
             roster_addrs=unix_eps(["s0", "s1", "s2"]),
             manager_pub=w.mgr_pub,
@@ -485,8 +483,7 @@ class TestBootstrapConsumer(unittest.TestCase):
 
     def _client(self, w):
         c = ClientDaemon(
-            w.clients[0].sk,
-            w.clients[0].pub,
+            C.SoftwareKeypair.from_seed(w.clients[0].sk),
             roster=[self._NPUB],  # the trust anchor the QCs below verify against (issue #3)
             roster_addrs=unix_eps(["/nonexistent.sock"]),  # reads fold locally, no RPC
             manager_pub=w.mgr_pub,
@@ -500,7 +497,7 @@ class TestBootstrapConsumer(unittest.TestCase):
     def _qc(cls, op):
         # a minimal but REAL 1-node QC: node _NPUB (the client's epoch-0 roster) signs, so
         # qc.verify([_NPUB]) passes — the client now checks validity, not presence (issue #3).
-        r = A.Receipt.issue(cls._NSK, cls._NPUB, op.op_hash, 0, A.BLIND, 1)
+        r = A.Receipt.issue(C.SoftwareKeypair.from_seed(cls._NSK), op.op_hash, 0, A.BLIND, 1)
         return A.QC.assemble([r], 1, {cls._NPUB: 0})
 
     def test_gc_d_client_bootstraps_from_checkpoint_equals_full_history(self):
@@ -567,7 +564,7 @@ class TestBootstrapConsumer(unittest.TestCase):
         op = w.blind(0, [], [[A.Mutation.SET, b"k", b"v"]])
         foreign = bytes([77] * 32)
         fpub = C.SIGNER.public(foreign)
-        r = A.Receipt.issue(foreign, fpub, op.op_hash, 0, A.BLIND, 1)
+        r = A.Receipt.issue(C.SoftwareKeypair.from_seed(foreign), op.op_hash, 0, A.BLIND, 1)
         forged = A.QC.assemble([r], 1, {fpub: 0})  # genuine sig, wrong (non-roster) signer
         c = self._client(w)
         try:
@@ -644,11 +641,10 @@ class TestKeyringFromWraps(unittest.TestCase):
                 control = sorted(tx.all_ops(), key=lambda o: o.seq)
 
             reader = ClientDaemon(
-                rsk,
-                rpub,
-                roster=[m.state.manager_pub],
+                C.SoftwareKeypair.from_seed(rsk),
+                roster=[m.state.root.public],
                 roster_addrs=unix_eps(["/nonexistent.sock"]),
-                manager_pub=m.state.manager_pub,
+                manager_pub=m.state.root.public,
                 control_ops=control,
                 epoch=0,
             )

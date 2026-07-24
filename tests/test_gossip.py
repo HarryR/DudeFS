@@ -98,7 +98,10 @@ class TestConvergence(unittest.TestCase):
             nkeys = [bytes([200 + i] * 32) for i in range(3)]
             npubs = [C.SIGNER.public(k) for k in nkeys]
             th = ops[0].op_hash
-            recs = [A.Receipt.issue(nkeys[i], npubs[i], th, 0, A.BLIND, 1) for i in range(3)]
+            recs = [
+                A.Receipt.issue(C.SoftwareKeypair.from_seed(nkeys[i]), th, 0, A.BLIND, 1)
+                for i in range(3)
+            ]
             for i, r in enumerate(recs):
                 with stores[i % n].write_txn() as tx:
                     tx.put_receipt(r)
@@ -135,8 +138,8 @@ class TestSinglePush(unittest.TestCase):
         nodes = []
         for i in range(3):
             sk = bytes([200 + i] * 32)
-            nodes.append(Acceptor(sk, C.SIGNER.public(sk), ChainStore(), 0, BIG_DELTA))
-        roster = [nd.pub for nd in nodes]
+            nodes.append(Acceptor(C.SoftwareKeypair.from_seed(sk), ChainStore(), 0, BIG_DELTA))
+        roster: list[bytes] = [nd.node.public for nd in nodes]
         idx = {p: i for i, p in enumerate(roster)}
 
         w = World(seed=7, n_clients=1)

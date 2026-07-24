@@ -379,7 +379,7 @@ class Op(_OpFields):
     generic field-bag builder. The signature covers every envelope field but `sig`;
     the data AAD is envelope-minus-payload-minus-sig (DESIGN §5)."""
 
-    author: bytes
+    author: crypto.PublicKey
     seq: int
     prev: bytes
     hlc: HLC
@@ -400,7 +400,7 @@ class Op(_OpFields):
     def _kwargs(cls, env: dict[bytes, Bencodable], raw: bytes) -> dict[str, Any]:
         return {
             **super(Op, cls)._kwargs(env, raw),  # explicit super — slots recreates the class
-            "author": codec.as_bytes(_require(env, Field.AUTHOR)),
+            "author": crypto.PublicKey(codec.as_bytes(_require(env, Field.AUTHOR))),
             "seq": codec.as_int(_require(env, Field.SEQ)),
             "prev": codec.as_bytes(_require(env, Field.PREV)),
             "hlc": HLC.decode(_require(env, Field.HLC)),
@@ -442,24 +442,25 @@ class Op(_OpFields):
             return False
         return True
 
-    def verify_sig(self, author_pubkey: bytes) -> bool:
+    def verify_sig(self, author_pubkey: crypto.PublicKey | None = None) -> bool:
         """Verify the signature over the RECEIVED bytes minus `sig` (identity is the
         received bytes; a control payload need not be canonical bencode internally,
         so we verify over what actually arrived — DESIGN §5)."""
+        pk = self.author if author_pubkey is None else author_pubkey
         try:
             env = Op._envelope(self.raw)
         except ArtifactError:
             return False
         env.pop(Field.SIG, None)
-        return crypto.SIGNER.verify(author_pubkey, codec.encode(env), self.sig)
+        return pk.verify(codec.encode(env), self.sig)
 
     # ---- authoring core: each leaf `build` signs, then constructs itself --- #
     @staticmethod
-    def _sign(author_sk: bytes, fields: dict[Field, Bencodable]) -> tuple[bytes, bytes]:
+    def _sign(author: crypto.Keypair, fields: dict[Field, Bencodable]) -> tuple[bytes, bytes]:
         """Sign `fields` (no SIG yet); return (raw, sig). A leaf's `build` assembles
         its own wire `fields`, signs here, then constructs itself DIRECTLY from its
         typed params + this raw/sig — no encode-then-decode round-trip."""
-        sig = crypto.SIGNER.sign(author_sk, codec.encode(fields))
+        sig = author.sign(codec.encode(fields))
         return codec.encode({**fields, Field.SIG: sig}), sig
 
 
@@ -518,8 +519,7 @@ class DataOp(Op):
     @staticmethod
     def _seal_and_sign(
         *,
-        author_sk: bytes,
-        author_pub: bytes,
+        author: crypto.Keypair,
         seq: int,
         prev: bytes,
         hlc: HLC,
@@ -534,7 +534,7 @@ class DataOp(Op):
         constructs itself directly. Shared by both data builds."""
         f: dict[Field, Bencodable] = {
             Field.CLASS: OpClass.DATA,
-            Field.AUTHOR: author_pub,
+            Field.AUTHOR: author.public,
             Field.SEQ: int(seq),
             Field.PREV: prev,
             Field.HLC: hlc.encode(),
@@ -545,7 +545,7 @@ class DataOp(Op):
             f[Field.SLOT_TAG] = slot_tag
         payload = crypto.AEAD.seal(data_key, crypto.h(codec.encode(f)), txn_bytes)
         f[Field.PAYLOAD] = payload
-        raw, sig = Op._sign(author_sk, f)
+        raw, sig = Op._sign(author, f)
         return payload, raw, sig
 
 
@@ -561,8 +561,7 @@ class CasOp(DataOp, Slotted):
     def build(
         cls,
         *,
-        author_sk: bytes,
-        author_pub: bytes,
+        author: crypto.Keypair,
         seq: int,
         prev: bytes,
         hlc: HLC,
@@ -573,8 +572,7 @@ class CasOp(DataOp, Slotted):
         pver: int = 0,
     ) -> Self:
         payload, raw, sig = DataOp._seal_and_sign(
-            author_sk=author_sk,
-            author_pub=author_pub,
+            author=author,
             seq=seq,
             prev=prev,
             hlc=hlc,
@@ -585,7 +583,7 @@ class CasOp(DataOp, Slotted):
             txn_bytes=txn_bytes,
         )
         return cls(
-            author=author_pub,
+            author=author.public,
             seq=int(seq),
             prev=prev,
             hlc=hlc,
@@ -606,8 +604,7 @@ class BlindPutOp(DataOp):
     def build(
         cls,
         *,
-        author_sk: bytes,
-        author_pub: bytes,
+        author: crypto.Keypair,
         seq: int,
         prev: bytes,
         hlc: HLC,
@@ -617,8 +614,7 @@ class BlindPutOp(DataOp):
         pver: int = 0,
     ) -> Self:
         payload, raw, sig = DataOp._seal_and_sign(
-            author_sk=author_sk,
-            author_pub=author_pub,
+            author=author,
             seq=seq,
             prev=prev,
             hlc=hlc,
@@ -629,7 +625,7 @@ class BlindPutOp(DataOp):
             txn_bytes=txn_bytes,
         )
         return cls(
-            author=author_pub,
+            author=author.public,
             seq=int(seq),
             prev=prev,
             hlc=hlc,
@@ -687,9 +683,8 @@ class ControlOp(Op):
 
     @staticmethod
     def _control_raw(
-        author_sk: bytes,
+        author: crypto.Keypair,
         *,
-        author_pub: bytes,
         seq: int,
         prev: bytes,
         hlc: HLC,
@@ -702,7 +697,7 @@ class ControlOp(Op):
         constructs itself directly."""
         f: dict[Field, Bencodable] = {
             Field.CLASS: OpClass.CONTROL,
-            Field.AUTHOR: author_pub,
+            Field.AUTHOR: author.public,
             Field.SEQ: int(seq),
             Field.PREV: prev,
             Field.HLC: hlc.encode(),
@@ -711,7 +706,7 @@ class ControlOp(Op):
         }
         if slot_tag is not None:
             f[Field.SLOT_TAG] = slot_tag
-        return Op._sign(author_sk, f)
+        return Op._sign(author, f)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -807,8 +802,7 @@ class CertIssueOp(ControlOp):
     def build(
         cls,
         *,
-        author_sk: bytes,
-        author_pub: bytes,
+        author: crypto.Keypair,
         seq: int,
         prev: bytes,
         hlc: HLC,
@@ -825,11 +819,9 @@ class CertIssueOp(ControlOp):
                 b"epoch": int(epoch),
             }
         )
-        raw, sig = ControlOp._control_raw(
-            author_sk, author_pub=author_pub, seq=seq, prev=prev, hlc=hlc, pver=pver, body=body
-        )
+        raw, sig = ControlOp._control_raw(author, seq=seq, prev=prev, hlc=hlc, pver=pver, body=body)
         return cls(
-            author=author_pub,
+            author=author.public,
             seq=int(seq),
             prev=prev,
             hlc=hlc,
@@ -857,8 +849,7 @@ class CertRevokeOp(ControlOp):
     def build(
         cls,
         *,
-        author_sk: bytes,
-        author_pub: bytes,
+        author: crypto.Keypair,
         seq: int,
         prev: bytes,
         hlc: HLC,
@@ -866,11 +857,9 @@ class CertRevokeOp(ControlOp):
         pver: int = 0,
     ) -> Self:
         body = codec.encode({BK_KIND: cls.KIND, b"subject": subject})
-        raw, sig = ControlOp._control_raw(
-            author_sk, author_pub=author_pub, seq=seq, prev=prev, hlc=hlc, pver=pver, body=body
-        )
+        raw, sig = ControlOp._control_raw(author, seq=seq, prev=prev, hlc=hlc, pver=pver, body=body)
         return cls(
-            author=author_pub,
+            author=author.public,
             seq=int(seq),
             prev=prev,
             hlc=hlc,
@@ -915,8 +904,7 @@ class RosterOp(ControlOp, Slotted):
     def build(
         cls,
         *,
-        author_sk: bytes,
-        author_pub: bytes,
+        author: crypto.Keypair,
         seq: int,
         prev: bytes,
         hlc: HLC,
@@ -936,8 +924,7 @@ class RosterOp(ControlOp, Slotted):
             d[b"recovery"] = recovery
         slot = roster_slot_tag(from_epoch)
         raw, sig = ControlOp._control_raw(
-            author_sk,
-            author_pub=author_pub,
+            author,
             seq=seq,
             prev=prev,
             hlc=hlc,
@@ -946,7 +933,7 @@ class RosterOp(ControlOp, Slotted):
             slot_tag=slot,
         )
         return cls(
-            author=author_pub,
+            author=author.public,
             seq=int(seq),
             prev=prev,
             hlc=hlc,
@@ -976,8 +963,7 @@ class RotateOp(ControlOp):
     def build(
         cls,
         *,
-        author_sk: bytes,
-        author_pub: bytes,
+        author: crypto.Keypair,
         seq: int,
         prev: bytes,
         hlc: HLC,
@@ -985,11 +971,9 @@ class RotateOp(ControlOp):
         pver: int = 0,
     ) -> Self:
         body = codec.encode({BK_KIND: cls.KIND, b"keyepoch": int(keyepoch)})
-        raw, sig = ControlOp._control_raw(
-            author_sk, author_pub=author_pub, seq=seq, prev=prev, hlc=hlc, pver=pver, body=body
-        )
+        raw, sig = ControlOp._control_raw(author, seq=seq, prev=prev, hlc=hlc, pver=pver, body=body)
         return cls(
-            author=author_pub,
+            author=author.public,
             seq=int(seq),
             prev=prev,
             hlc=hlc,
@@ -1022,8 +1006,7 @@ class WrapSetOp(ControlOp):
     def build(
         cls,
         *,
-        author_sk: bytes,
-        author_pub: bytes,
+        author: crypto.Keypair,
         seq: int,
         prev: bytes,
         hlc: HLC,
@@ -1037,11 +1020,9 @@ class WrapSetOp(ControlOp):
         the control op's signature authenticates the distribution."""
         wraps = {m: crypto.seal_to(m, group_key) for m in members}
         body = codec.encode({BK_KIND: cls.KIND, b"keyepoch": int(keyepoch), b"wraps": wraps})
-        raw, sig = ControlOp._control_raw(
-            author_sk, author_pub=author_pub, seq=seq, prev=prev, hlc=hlc, pver=pver, body=body
-        )
+        raw, sig = ControlOp._control_raw(author, seq=seq, prev=prev, hlc=hlc, pver=pver, body=body)
         return cls(
-            author=author_pub,
+            author=author.public,
             seq=int(seq),
             prev=prev,
             hlc=hlc,
@@ -1052,11 +1033,12 @@ class WrapSetOp(ControlOp):
             wraps=wraps,
         )
 
-    def unwrap(self, member_sk: bytes) -> bytes | None:
+    def unwrap(self, member: crypto.Keypair) -> bytes | None:
         """Member-side: recover K_epoch, or None if this member has no wrap in the set
-        (or it fails to open)."""
-        sealed = self.wraps.get(crypto.SIGNER.public(member_sk))
-        return None if sealed is None else crypto.open_sealed(member_sk, sealed)
+        (or it fails to open). The recovered master is a SYMMETRIC secret (`bytes`); only
+        the unwrap itself — opening the sealed box — is asymmetric."""
+        sealed = self.wraps.get(member.public)
+        return None if sealed is None else member.open_sealed(sealed)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -1099,8 +1081,7 @@ class CheckpointOp(ControlOp, Slotted):
     def build(
         cls,
         *,
-        author_sk: bytes,
-        author_pub: bytes,
+        author: crypto.Keypair,
         seq: int,
         prev: bytes,
         hlc: HLC,
@@ -1128,8 +1109,7 @@ class CheckpointOp(ControlOp, Slotted):
         )
         slot = checkpoint_slot_tag(checkpoint_seq)
         raw, sig = ControlOp._control_raw(
-            author_sk,
-            author_pub=author_pub,
+            author,
             seq=seq,
             prev=prev,
             hlc=hlc,
@@ -1138,7 +1118,7 @@ class CheckpointOp(ControlOp, Slotted):
             slot_tag=slot,
         )
         return cls(
-            author=author_pub,
+            author=author.public,
             seq=int(seq),
             prev=prev,
             hlc=hlc,
@@ -1170,8 +1150,7 @@ class PverActivateOp(ControlOp):
     def build(
         cls,
         *,
-        author_sk: bytes,
-        author_pub: bytes,
+        author: crypto.Keypair,
         seq: int,
         prev: bytes,
         hlc: HLC,
@@ -1179,11 +1158,9 @@ class PverActivateOp(ControlOp):
         pver: int = 0,
     ) -> Self:
         body = codec.encode({BK_KIND: cls.KIND, b"pver": int(activate_pver)})
-        raw, sig = ControlOp._control_raw(
-            author_sk, author_pub=author_pub, seq=seq, prev=prev, hlc=hlc, pver=pver, body=body
-        )
+        raw, sig = ControlOp._control_raw(author, seq=seq, prev=prev, hlc=hlc, pver=pver, body=body)
         return cls(
-            author=author_pub,
+            author=author.public,
             seq=int(seq),
             prev=prev,
             hlc=hlc,
@@ -1220,8 +1197,7 @@ class EndpointOp(ControlOp):
     def build(
         cls,
         *,
-        author_sk: bytes,
-        author_pub: bytes,
+        author: crypto.Keypair,
         seq: int,
         prev: bytes,
         hlc: HLC,
@@ -1237,11 +1213,9 @@ class EndpointOp(ControlOp):
                 b"addrs": [[t, u, dict(o)] for (t, u, o) in addrs],
             }
         )
-        raw, sig = ControlOp._control_raw(
-            author_sk, author_pub=author_pub, seq=seq, prev=prev, hlc=hlc, pver=pver, body=body
-        )
+        raw, sig = ControlOp._control_raw(author, seq=seq, prev=prev, hlc=hlc, pver=pver, body=body)
         return cls(
-            author=author_pub,
+            author=author.public,
             seq=int(seq),
             prev=prev,
             hlc=hlc,
@@ -1412,7 +1386,7 @@ class Receipt:
         config_epoch: int,
         ballot: Ballot,
         issue_seq: int,
-        signer: bytes,
+        signer: crypto.PublicKey,
         sig: bytes,
     ):
         self.op_hash = op_hash
@@ -1427,12 +1401,11 @@ class Receipt:
         return receipt_message(self.op_hash, self.config_epoch, self.ballot, self.issue_seq)
 
     def verify(self) -> bool:
-        return crypto.SIGNER.verify(self.signer, self.message, self.sig)
+        return self.signer.verify(self.message, self.sig)
 
     @staticmethod
     def issue(
-        node_sk: bytes,
-        node_pub: bytes,
+        node: crypto.Keypair,
         op_hash: bytes,
         config_epoch: int,
         ballot: Ballot,
@@ -1444,8 +1417,8 @@ class Receipt:
             config_epoch,
             ballot,
             issue_seq,
-            node_pub,
-            crypto.MULTISIG.sign_share(node_sk, msg),
+            node.public,
+            node.sign(msg),
         )
 
     def encode(self) -> bytes:
@@ -1468,7 +1441,7 @@ class Receipt:
             codec.as_int(_require(d, ReceiptField.EPOCH)),
             Ballot.decode(_require(d, ReceiptField.BALLOT)),
             codec.as_int(_require(d, ReceiptField.ISSUE_SEQ)),
-            codec.as_bytes(_require(d, ReceiptField.SIGNER)),
+            crypto.PublicKey(codec.as_bytes(_require(d, ReceiptField.SIGNER))),
             codec.as_bytes(_require(d, ReceiptField.SIG)),
         )
 
@@ -1521,7 +1494,7 @@ class Promise:
         accepted_ballot: Ballot | None,
         accepted_op_hash: bytes | None,
         accepted_hlc: HLC | None,
-        signer: bytes,
+        signer: crypto.PublicKey,
         sig: bytes,
     ):
         self.tag = tag
@@ -1539,12 +1512,11 @@ class Promise:
         )
 
     def verify(self) -> bool:
-        return crypto.SIGNER.verify(self.signer, self.message, self.sig)
+        return self.signer.verify(self.message, self.sig)
 
     @staticmethod
     def issue(
-        node_sk: bytes,
-        node_pub: bytes,
+        node: crypto.Keypair,
         tag: bytes,
         ballot: Ballot,
         accepted_ballot: Ballot | None,
@@ -1558,8 +1530,8 @@ class Promise:
             accepted_ballot,
             accepted_op_hash,
             accepted_hlc,
-            node_pub,
-            crypto.SIGNER.sign(node_sk, msg),
+            node.public,
+            node.sign(msg),
         )
 
     def encode(self) -> bytes:
@@ -1584,7 +1556,7 @@ class Promise:
             Ballot.decode(p[2]) if p[2] != b"" else None,
             b if (b := codec.as_bytes(p[3])) else None,
             None if p[4] == b"" else HLC.decode(p[4]),
-            codec.as_bytes(p[5]),
+            crypto.PublicKey(codec.as_bytes(p[5])),
             codec.as_bytes(p[6]),
         )
 
@@ -1710,7 +1682,9 @@ def watermark_message(floor: HLC, config_epoch: int, issue_seq: int) -> bytes:
 class Watermark:
     __slots__ = ("floor", "config_epoch", "issue_seq", "signer", "sig")
 
-    def __init__(self, floor: HLC, config_epoch: int, issue_seq: int, signer: bytes, sig: bytes):
+    def __init__(
+        self, floor: HLC, config_epoch: int, issue_seq: int, signer: crypto.PublicKey, sig: bytes
+    ):
         self.floor = floor
         self.config_epoch = int(config_epoch)
         self.issue_seq = int(issue_seq)
@@ -1718,18 +1692,15 @@ class Watermark:
         self.sig = sig
 
     def verify(self) -> bool:
-        return crypto.SIGNER.verify(
-            self.signer,
+        return self.signer.verify(
             watermark_message(self.floor, self.config_epoch, self.issue_seq),
             self.sig,
         )
 
     @staticmethod
-    def issue(
-        node_sk: bytes, node_pub: bytes, floor: HLC, config_epoch: int, issue_seq: int
-    ) -> Watermark:
+    def issue(node: crypto.Keypair, floor: HLC, config_epoch: int, issue_seq: int) -> Watermark:
         msg = watermark_message(floor, config_epoch, issue_seq)
-        return Watermark(floor, config_epoch, issue_seq, node_pub, crypto.SIGNER.sign(node_sk, msg))
+        return Watermark(floor, config_epoch, issue_seq, node.public, node.sign(msg))
 
     def encode(self) -> bytes:
         return codec.encode(
@@ -1743,7 +1714,7 @@ class Watermark:
             HLC.decode(p[0]),
             codec.as_int(p[1]),
             codec.as_int(p[2]),
-            codec.as_bytes(p[3]),
+            crypto.PublicKey(codec.as_bytes(p[3])),
             codec.as_bytes(p[4]),
         )
 
@@ -1772,7 +1743,7 @@ class FrontierBundle:
         checkpoint_head: bytes | None,
         config_epoch: int,
         floor: HLC,
-        signer: bytes,
+        signer: crypto.PublicKey,
         sig: bytes,
     ):
         self.heads = heads
@@ -1784,12 +1755,11 @@ class FrontierBundle:
 
     def verify(self) -> bool:
         msg = frontier_message(self.heads, self.checkpoint_head, self.config_epoch, self.floor)
-        return crypto.SIGNER.verify(self.signer, msg, self.sig)
+        return self.signer.verify(msg, self.sig)
 
     @staticmethod
     def issue(
-        node_sk: bytes,
-        node_pub: bytes,
+        node: crypto.Keypair,
         heads: Heads,
         checkpoint_head: bytes | None,
         config_epoch: int,
@@ -1797,7 +1767,7 @@ class FrontierBundle:
     ) -> FrontierBundle:
         msg = frontier_message(heads, checkpoint_head, config_epoch, floor)
         return FrontierBundle(
-            heads, checkpoint_head, config_epoch, floor, node_pub, crypto.SIGNER.sign(node_sk, msg)
+            heads, checkpoint_head, config_epoch, floor, node.public, node.sign(msg)
         )
 
     def encode(self) -> bytes:
@@ -1825,6 +1795,6 @@ class FrontierBundle:
             ch if (ch := codec.as_bytes(p[1])) else None,
             codec.as_int(p[2]),
             HLC.decode(p[3]),
-            codec.as_bytes(p[4]),
+            crypto.PublicKey(codec.as_bytes(p[4])),
             codec.as_bytes(p[5]),
         )

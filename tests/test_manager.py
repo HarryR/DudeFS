@@ -44,7 +44,7 @@ def _roster_cluster(node_keys, base, holders):
     slot, joint cert) without sockets. `holders` store `base` (possession)."""
     nodes = {}
     for pub, sk in node_keys:
-        acc = Acceptor(sk, pub, ChainStore(), 0, BIG)
+        acc = Acceptor(C.SoftwareKeypair.from_seed(sk), ChainStore(), 0, BIG)
         if pub in holders:
             with acc.store.write_txn() as tx:
                 tx.append(base)
@@ -232,7 +232,7 @@ class TestManagerOps(unittest.TestCase):
             self.assertEqual(m.state.roster, [])  # manager-only genesis
             pub = _founding(m, addr="/run/node0.sock")
             self.assertEqual(m.state.roster, [pub])  # sole voting member
-            book = fold.endpoints_of(self._control_log(d), m.state.manager_pub)
+            book = fold.endpoints_of(self._control_log(d), m.state.root.public)
             self.assertEqual(book[pub], [transports.Endpoint(b"unix", "/run/node0.sock", False)])
             with self.assertRaises(ManagerError):  # genesis-only
                 _founding(m, seed=98)
@@ -310,10 +310,9 @@ class TestManagerOps(unittest.TestCase):
             change = m.change_roster(pubs, rpc)
 
             tag = A.roster_slot_tag(0)
-            ballot = A.Ballot(1, A.slot_priority(tag, m.state.manager_pub))
+            ballot = A.Ballot(1, A.slot_priority(tag, m.state.root.public))
             rival = A.RosterOp.build(
-                author_sk=bytes([99] * 32),
-                author_pub=C.SIGNER.public(bytes([99] * 32)),
+                author=C.SoftwareKeypair.from_seed(bytes([99] * 32)),
                 seq=0,
                 prev=A.GENESIS_PREV,
                 hlc=A.HLC(2, 0),
@@ -415,7 +414,7 @@ class TestManagerOps(unittest.TestCase):
                 "client", C.SIGNER.public(bytes([9] * 32)), C.prove_possession(bytes([9] * 32))
             )
             reloaded = ManagerState.load(d)
-            self.assertEqual(reloaded.manager_pub, m.state.manager_pub)
+            self.assertEqual(reloaded.root.public, m.state.root.public)
             self.assertEqual(reloaded.mseq, m.state.mseq)
             self.assertEqual(len(reloaded.certs), 1)
 
@@ -484,12 +483,11 @@ class TestManagerFumbling(unittest.TestCase):
             change = m.change_roster(pubs, rpc)
 
             tag = A.roster_slot_tag(0)
-            ballot = A.Ballot(1, A.slot_priority(tag, m.state.manager_pub))
+            ballot = A.Ballot(1, A.slot_priority(tag, m.state.root.public))
             # a competing press: a different roster op on the same slot/ballot is
             # refused by the node that already decided the first (equivocation guard)
             rival = A.RosterOp.build(
-                author_sk=bytes([99] * 32),
-                author_pub=C.SIGNER.public(bytes([99] * 32)),
+                author=C.SoftwareKeypair.from_seed(bytes([99] * 32)),
                 seq=0,
                 prev=A.GENESIS_PREV,
                 hlc=A.HLC(2, 0),

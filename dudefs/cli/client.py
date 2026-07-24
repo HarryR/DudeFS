@@ -32,12 +32,10 @@ def cmd_init(args: argparse.Namespace) -> int:
 
 def cmd_serve(args: argparse.Namespace) -> int:
     with open(os.path.join(args.dir, "client.key"), "rb") as f:
-        sk = f.read()
-    pub = C.SIGNER.public(sk)
+        seed = f.read()
     b = Bootstrap.read(args.dir)
     cd = ClientDaemon(
-        sk,
-        pub,
+        C.SoftwareKeypair.from_seed(seed),
         roster=b.roster,
         roster_addrs=b.dial_addrs(),
         manager_pub=b.manager_pub,
@@ -49,7 +47,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
     with contextlib.suppress(FileNotFoundError):
         os.unlink(sock)  # clear a stale socket from a previous run
     ws = WorkerServer(cd)
-    print(f"client {pub.hex()[:16]}… worker socket {sock} (epoch {b.epoch})")
+    print(f"client {cd.key.public.hex()[:16]}… worker socket {sock} (epoch {b.epoch})")
     try:
         ws.serve_forever(sock)
     except KeyboardInterrupt:

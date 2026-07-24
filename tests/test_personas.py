@@ -112,9 +112,13 @@ class TestAmnesiacNode(unittest.TestCase):
         nsk = bytes([240] * 32)
         npub = C.SIGNER.public(nsk)
 
-        acc1 = Acceptor(nsk, npub, ChainStore(), config_epoch=0, delta_ms=BIG)  # life 1
+        acc1 = Acceptor(
+            C.SoftwareKeypair.from_seed(nsk), ChainStore(), config_epoch=0, delta_ms=BIG
+        )  # life 1
         ra = acc1.on_accept(tag, ballot, a, NOW)
-        acc2 = Acceptor(nsk, npub, ChainStore(), config_epoch=0, delta_ms=BIG)  # WIPED, same key
+        acc2 = Acceptor(
+            C.SoftwareKeypair.from_seed(nsk), ChainStore(), config_epoch=0, delta_ms=BIG
+        )  # WIPED, same key
         rb = acc2.on_accept(tag, ballot, b, NOW)  # forgot A -> votes B at the same ballot
         self.assertIsInstance(ra, A.Receipt)
         self.assertIsInstance(rb, A.Receipt)
@@ -294,8 +298,12 @@ class TestSeqReuse(unittest.TestCase):
         nsk = bytes([250] * 32)
         npub = C.SIGNER.public(nsk)
         ballot = A.Ballot(1, b"x")
-        ra = A.Receipt.issue(nsk, npub, a.op_hash, 0, ballot, 5)  # issue_seq 5
-        rb = A.Receipt.issue(nsk, npub, b.op_hash, 0, ballot, 5)  # 5 REUSED, different op
+        ra = A.Receipt.issue(
+            C.SoftwareKeypair.from_seed(nsk), a.op_hash, 0, ballot, 5
+        )  # issue_seq 5
+        rb = A.Receipt.issue(
+            C.SoftwareKeypair.from_seed(nsk), b.op_hash, 0, ballot, 5
+        )  # 5 REUSED, different op
         store = ChainStore()
         with store.write_txn() as tx:
             tx.put_receipt(ra)
@@ -318,8 +326,12 @@ class TestSeqReuse(unittest.TestCase):
         op = creation_op(w, 0, b"v")
         nsk = bytes([252] * 32)
         npub = C.SIGNER.public(nsk)
-        wm = A.Watermark.issue(nsk, npub, A.HLC(990, 0), 0, 9)  # floor 990 at seq 9
-        rc = A.Receipt.issue(nsk, npub, op.op_hash, 0, A.Ballot(1, b"x"), 9)  # back-stamped to 9
+        wm = A.Watermark.issue(
+            C.SoftwareKeypair.from_seed(nsk), A.HLC(990, 0), 0, 9
+        )  # floor 990 at seq 9
+        rc = A.Receipt.issue(
+            C.SoftwareKeypair.from_seed(nsk), op.op_hash, 0, A.Ballot(1, b"x"), 9
+        )  # back-stamped to 9
         self.assertLess(op.hlc.wall_ms, wm.floor.wall_ms)  # the receipt is below the floor
         store = ChainStore()
         with store.write_txn() as tx:
@@ -342,10 +354,11 @@ class TestSeqReuse(unittest.TestCase):
         w = World(seed=5, n_clients=1)
         a = creation_op(w, 0, b"A")
         nsk = bytes([251] * 32)
-        npub = C.SIGNER.public(nsk)
         ballot = A.Ballot(1, b"x")
-        r_e0 = A.Receipt.issue(nsk, npub, a.op_hash, 0, ballot, 7)
-        r_e1 = A.Receipt.issue(nsk, npub, a.op_hash, 1, ballot, 7)  # same op, e+1, same seq
+        r_e0 = A.Receipt.issue(C.SoftwareKeypair.from_seed(nsk), a.op_hash, 0, ballot, 7)
+        r_e1 = A.Receipt.issue(
+            C.SoftwareKeypair.from_seed(nsk), a.op_hash, 1, ballot, 7
+        )  # same op, e+1, same seq
         store = ChainStore()
         with store.write_txn() as tx:
             tx.put_receipt(r_e0)

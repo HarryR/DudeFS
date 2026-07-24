@@ -8,8 +8,10 @@ import unittest
 from dudefs import crypto as C
 from dudefs import lmsg
 
-A_SK, B_SK, X_SK = bytes([1] * 32), bytes([2] * 32), bytes([9] * 32)
-A, B, X = C.SIGNER.public(A_SK), C.SIGNER.public(B_SK), C.SIGNER.public(X_SK)
+A_KP = C.SoftwareKeypair.from_seed(bytes([1] * 32))
+B_KP = C.SoftwareKeypair.from_seed(bytes([2] * 32))
+X_KP = C.SoftwareKeypair.from_seed(bytes([9] * 32))
+A, B, X = A_KP.public, B_KP.public, X_KP.public
 NOW, DELTA = 1000, 150
 
 
@@ -20,13 +22,13 @@ def _member(*pubs):
 
 class TestPlainEnvelope(unittest.TestCase):
     def test_author_verifies_and_binds_every_field(self):
-        env = lmsg.author(A_SK, B, b"FRONTIER", b"payload", epoch=3, ts=NOW, nonce=b"n1")
+        env = lmsg.author(A_KP, B, b"FRONTIER", b"payload", epoch=3, ts=NOW, nonce=b"n1")
         self.assertEqual(env.frm, A)  # from is derived from the signing key
         self.assertTrue(env.verify_sig())
         self.assertEqual(lmsg.Envelope.decode(env.encode()), env)  # canon round-trip
 
     def test_tamper_any_signed_field_breaks_the_sig(self):
-        env = lmsg.author(A_SK, B, b"SUBMIT", b"payload", epoch=0, ts=NOW)
+        env = lmsg.author(A_KP, B, b"SUBMIT", b"payload", epoch=0, ts=NOW)
         import dataclasses
 
         for field, val in [
@@ -45,18 +47,18 @@ class TestPlainEnvelope(unittest.TestCase):
 
 class TestSealedEnvelope(unittest.TestCase):
     def _reply_kp(self):
-        rsk = bytes([77] * 32)
-        return rsk, C.SIGNER.public(rsk)
+        r_kp = C.SoftwareKeypair.from_seed(bytes([77] * 32))
+        return r_kp, r_kp.public
 
     def test_sign_then_seal_round_trip_hides_everything_but_the_hint(self):
-        rsk, rpub = self._reply_kp()
-        env = lmsg.author(A_SK, B, b"SUBMIT", b"top-secret", epoch=0, ts=NOW)
+        _r_kp, rpub = self._reply_kp()
+        env = lmsg.author(A_KP, B, b"SUBMIT", b"top-secret", epoch=0, ts=NOW)
         outer = lmsg.seal_request(env, B, rpub)
         # the intermediary sees neither the verb, the from, nor the body
         self.assertNotIn(b"SUBMIT", outer)
         self.assertNotIn(b"top-secret", outer)
         self.assertNotIn(A, outer)
-        opened = lmsg.unseal_request(B_SK, outer)
+        opened = lmsg.unseal_request(B_KP, outer)
         assert opened is not None
         inner, reply_key = opened
         self.assertEqual(inner, env)  # the exact signed struct, recovered
@@ -64,31 +66,31 @@ class TestSealedEnvelope(unittest.TestCase):
         self.assertEqual(reply_key, rpub)  # the reply-key rides inside the seal
 
     def test_only_the_addressee_can_unseal(self):
-        rsk, rpub = self._reply_kp()
-        env = lmsg.author(A_SK, B, b"GET", b"q", epoch=0, ts=NOW)
+        _r_kp, rpub = self._reply_kp()
+        env = lmsg.author(A_KP, B, b"GET", b"q", epoch=0, ts=NOW)
         outer = lmsg.seal_request(env, B, rpub)
-        self.assertIsNone(lmsg.unseal_request(X_SK, outer))  # wrong recipient key
-        self.assertIsNone(lmsg.unseal_request(B_SK, outer[:-1] + bytes([outer[-1] ^ 1])))  # tamper
+        self.assertIsNone(lmsg.unseal_request(X_KP, outer))  # wrong recipient key
+        self.assertIsNone(lmsg.unseal_request(B_KP, outer[:-1] + bytes([outer[-1] ^ 1])))  # tamper
 
     def test_sealed_mode_requires_a_reply_key(self):
-        env = lmsg.author(A_SK, B, b"GET", b"q", epoch=0, ts=NOW)
+        env = lmsg.author(A_KP, B, b"GET", b"q", epoch=0, ts=NOW)
         with self.assertRaises(ValueError):
-            lmsg.seal_request(env, B, b"")  # no downgrade lever
+            lmsg.seal_request(env, B, C.PublicKey(b""))  # no downgrade lever
 
     def test_sealed_reply_round_trips_to_the_ephemeral_key(self):
         rsk, rpub = self._reply_kp()
-        reply = lmsg.author(B_SK, A, b"FRONTIER", b"bundle", epoch=0, ts=NOW)
+        reply = lmsg.author(B_KP, A, b"FRONTIER", b"bundle", epoch=0, ts=NOW)
         sealed = lmsg.seal_reply(reply, rpub)
         self.assertNotIn(b"bundle", sealed)
         got = lmsg.unseal_reply(rsk, sealed)
         self.assertEqual(got, reply)
-        self.assertIsNone(lmsg.unseal_reply(X_SK, sealed))  # only the requester opens
+        self.assertIsNone(lmsg.unseal_reply(X_KP, sealed))  # only the requester opens
 
 
 class TestScreeningTag(unittest.TestCase):
     def test_hint_matches_only_the_target_identity(self):
-        rpub = C.SIGNER.public(bytes([77] * 32))
-        env = lmsg.author(A_SK, B, b"SUBMIT", b"x", epoch=0, ts=NOW)
+        rpub = C.SoftwareKeypair.from_seed(bytes([77] * 32)).public
+        env = lmsg.author(A_KP, B, b"SUBMIT", b"x", epoch=0, ts=NOW)
         outer = lmsg.seal_request(env, B, rpub)
         self.assertTrue(lmsg.matches_tag(B, outer))  # the addressee screens IN
         self.assertFalse(lmsg.matches_tag(X, outer))  # a bystander node screens OUT
@@ -99,8 +101,8 @@ class TestScreeningTag(unittest.TestCase):
         # before any ECDH — random internet traffic costs one symmetric hash.
         from dudefs import codec
 
-        rpub = C.SIGNER.public(bytes([77] * 32))
-        env = lmsg.author(A_SK, B, b"SUBMIT", b"x", epoch=0, ts=NOW)
+        rpub = C.SoftwareKeypair.from_seed(bytes([77] * 32)).public
+        env = lmsg.author(A_KP, B, b"SUBMIT", b"x", epoch=0, ts=NOW)
         outer = lmsg.seal_request(env, B, rpub)
         tag, sealed = (codec.as_bytes(p) for p in codec.as_seq(codec.decode(outer), length=2))
         self.assertEqual(tag, C.screen_tag(B, sealed))  # the addressee reproduces it
@@ -112,18 +114,18 @@ class TestScreeningTag(unittest.TestCase):
         # ECDH, not the other way round.
         from dudefs import codec
 
-        rpub = C.SIGNER.public(bytes([77] * 32))
-        env = lmsg.author(A_SK, B, b"SUBMIT", b"x", epoch=0, ts=NOW)
+        rpub = C.SoftwareKeypair.from_seed(bytes([77] * 32)).public
+        env = lmsg.author(A_KP, B, b"SUBMIT", b"x", epoch=0, ts=NOW)
         outer = lmsg.seal_request(env, B, rpub)  # correctly sealed + tagged for B
         _tag, sealed = (codec.as_bytes(p) for p in codec.as_seq(codec.decode(outer), length=2))
         forged = codec.encode([C.screen_tag(X, sealed), sealed])  # same box, wrong tag
-        self.assertIsNone(lmsg.unseal_request(B_SK, forged))  # dropped at the tag
-        self.assertIsNotNone(lmsg.unseal_request(B_SK, outer))  # right tag -> opens
+        self.assertIsNone(lmsg.unseal_request(B_KP, forged))  # dropped at the tag
+        self.assertIsNotNone(lmsg.unseal_request(B_KP, outer))  # right tag -> opens
 
 
 class TestRequestGate(unittest.TestCase):
     def _env(self, *, verb=b"SUBMIT", body=b"b", epoch=0, ts=NOW, nonce=b""):
-        return lmsg.author(A_SK, B, verb, body, epoch=epoch, ts=ts, nonce=nonce)
+        return lmsg.author(A_KP, B, verb, body, epoch=epoch, ts=ts, nonce=nonce)
 
     def test_member_at_the_door_is_admitted(self):
         env = self._env()
@@ -166,7 +168,7 @@ class TestRequestGate(unittest.TestCase):
 class TestClassifyInbound(unittest.TestCase):
     """The typed inbound outcome the transport renders (no None, no exceptions)."""
 
-    def _env(self, *, frm_sk=A_SK, to=B, verb=b"SUBMIT", body=b"b", epoch=0, ts=NOW):
+    def _env(self, *, frm_sk=A_KP, to=B, verb=b"SUBMIT", body=b"b", epoch=0, ts=NOW):
         return lmsg.author(frm_sk, to, verb, body, epoch=epoch, ts=ts)
 
     def _classify(self, env):
@@ -206,7 +208,7 @@ class TestClassifyInbound(unittest.TestCase):
 
 class TestClassifyReply(unittest.TestCase):
     def test_valid_reply_from_the_addressed_peer(self):
-        reply = lmsg.author(B_SK, A, b"SUBMIT", b"receipt", epoch=0, ts=NOW)
+        reply = lmsg.author(B_KP, A, b"SUBMIT", b"receipt", epoch=0, ts=NOW)
         out = lmsg.classify_reply(reply.encode(), expect_from=B, expect_to=A)
         self.assertIsInstance(out, lmsg.Reply)
 
@@ -217,20 +219,20 @@ class TestClassifyReply(unittest.TestCase):
             lmsg.classify_reply(b"junk", expect_from=B, expect_to=A), lmsg.MalformedReply
         )
         # a well-formed reply, but from a peer I didn't address -> not my reply
-        other = lmsg.author(X_SK, A, b"SUBMIT", b"r", epoch=0, ts=NOW)
+        other = lmsg.author(X_KP, A, b"SUBMIT", b"r", epoch=0, ts=NOW)
         out = lmsg.classify_reply(other.encode(), expect_from=B, expect_to=A)
         self.assertIsInstance(out, lmsg.WrongPeer)
         assert isinstance(out, lmsg.WrongPeer)
         self.assertEqual(out.frm, X)  # names who actually signed it
 
     def test_sealed_reply_opens_with_the_ephemeral_key_only(self):
-        rsk = bytes([77] * 32)
-        reply = lmsg.author(B_SK, A, b"V", b"body", epoch=0, ts=NOW)  # B -> A
-        sealed = lmsg.seal_reply(reply, C.SIGNER.public(rsk))
-        got = lmsg.classify_sealed_reply(sealed, reply_sk=rsk, expect_from=B, expect_to=A)
+        r_kp = C.SoftwareKeypair.from_seed(bytes([77] * 32))
+        reply = lmsg.author(B_KP, A, b"V", b"body", epoch=0, ts=NOW)  # B -> A
+        sealed = lmsg.seal_reply(reply, r_kp.public)
+        got = lmsg.classify_sealed_reply(sealed, reply=r_kp, expect_from=B, expect_to=A)
         self.assertIsInstance(got, lmsg.Reply)
         # a different reply-key cannot open it -> not our reply
-        bad = lmsg.classify_sealed_reply(sealed, reply_sk=X_SK, expect_from=B, expect_to=A)
+        bad = lmsg.classify_sealed_reply(sealed, reply=X_KP, expect_from=B, expect_to=A)
         self.assertIsInstance(bad, lmsg.MalformedReply)
 
 

@@ -11,8 +11,9 @@ from dudefs import crypto as C
 from dudefs import lmsg, transports
 from dudefs.link import Link
 
-A_SK, B_SK = bytes([1] * 32), bytes([2] * 32)
-A, B = C.SIGNER.public(A_SK), C.SIGNER.public(B_SK)
+A_KP = C.SoftwareKeypair.from_seed(bytes([1] * 32))
+B_KP = C.SoftwareKeypair.from_seed(bytes([2] * 32))
+A, B = A_KP.public, B_KP.public
 
 
 def _echo_reply(payload: bytes) -> bytes | None:
@@ -21,7 +22,7 @@ def _echo_reply(payload: bytes) -> bytes | None:
     env = lmsg.Envelope.decode(payload)
     if not env.verify_sig():
         return None
-    return lmsg.author(B_SK, env.frm, env.verb, b"pong:" + env.body, epoch=0, ts=env.ts).encode()
+    return lmsg.author(B_KP, env.frm, env.verb, b"pong:" + env.body, epoch=0, ts=env.ts).encode()
 
 
 class TestLink(unittest.TestCase):
@@ -36,7 +37,7 @@ class TestLink(unittest.TestCase):
     def test_request_round_trips_a_verified_reply(self):
         with tempfile.TemporaryDirectory() as td:
             srv, uri = self._serve(td, _echo_reply)
-            link = Link(A_SK, A, B, transports.Endpoint(transports.UNIX, uri))
+            link = Link(A_KP, B, transports.Endpoint(transports.UNIX, uri))
             out = link.request(b"PING", b"hi", epoch=0, ts=100)
             self.assertIsInstance(out, lmsg.Reply)
             assert isinstance(out, lmsg.Reply)
@@ -46,7 +47,7 @@ class TestLink(unittest.TestCase):
             time.sleep(0.05)
 
     def test_unreachable_peer_is_a_typed_no_reply(self):
-        link = Link(A_SK, A, B, transports.Endpoint(transports.UNIX, "/nonexistent.sock"))
+        link = Link(A_KP, B, transports.Endpoint(transports.UNIX, "/nonexistent.sock"))
         out = link.request(b"PING", b"hi", epoch=0, ts=100, timeout=0.3)
         self.assertIsInstance(out, lmsg.NoReply)
 
@@ -54,11 +55,13 @@ class TestLink(unittest.TestCase):
         # the server signs its reply as SOMEONE ELSE -> not the peer I addressed
         def imposter(payload: bytes) -> bytes:
             e = lmsg.Envelope.decode(payload)
-            return lmsg.author(bytes([9] * 32), e.frm, e.verb, b"x", epoch=0, ts=e.ts).encode()
+            return lmsg.author(
+                C.SoftwareKeypair.from_seed(bytes([9] * 32)), e.frm, e.verb, b"x", epoch=0, ts=e.ts
+            ).encode()
 
         with tempfile.TemporaryDirectory() as td:
             srv, uri = self._serve(td, imposter)
-            link = Link(A_SK, A, B, transports.Endpoint(transports.UNIX, uri))
+            link = Link(A_KP, B, transports.Endpoint(transports.UNIX, uri))
             self.assertIsInstance(link.request(b"P", b"h", epoch=0, ts=100), lmsg.WrongPeer)
             srv.close()
             time.sleep(0.05)

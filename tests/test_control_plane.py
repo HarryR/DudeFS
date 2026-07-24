@@ -33,15 +33,14 @@ def _acc_cluster(n, epoch=0):
     nodes = []
     for i in range(n):
         sk = bytes([180 + i] * 32)
-        nodes.append(Acceptor(sk, C.SIGNER.public(sk), ChainStore(), epoch, BIG_DELTA))
-    return nodes, [nd.pub for nd in nodes]
+        nodes.append(Acceptor(C.SoftwareKeypair.from_seed(sk), ChainStore(), epoch, BIG_DELTA))
+    return nodes, [nd.node.public for nd in nodes]
 
 
 def _roster_op(msk, mpub, new_roster, sync_frontier, epoch=0):
     """A roster op: a slotted CONTROL op on the public slot H('roster' ‖ epoch)."""
     return A.RosterOp.build(
-        author_sk=msk,
-        author_pub=mpub,
+        author=C.SoftwareKeypair.from_seed(msk),
         seq=0,
         prev=A.GENESIS_PREV,
         hlc=A.HLC(NOW, 0),
@@ -59,7 +58,7 @@ def _key(b):
 def _ctl(sk, pub, seq, prev, hlc_ms, build):
     """`build` is a leaf `build` partial pre-bound with its typed body kwargs; this
     supplies the envelope (author/seq/prev/hlc)."""
-    return build(author_sk=sk, author_pub=pub, seq=seq, prev=prev, hlc=A.HLC(hlc_ms, 0))
+    return build(author=C.SoftwareKeypair.from_seed(sk), seq=seq, prev=prev, hlc=A.HLC(hlc_ms, 0))
 
 
 class TestCapabilityAuthz(unittest.TestCase):
@@ -226,7 +225,7 @@ class TestRecoveryFence(unittest.TestCase):
 
     def test_a_valid_root_pair_activates_without_joint_qc_and_parks(self):
         nodes, _r = _acc_cluster(3)
-        rckpt, rop = self._pair([n.pub for n in nodes])
+        rckpt, rop = self._pair([n.node.public for n in nodes])
         n = nodes[0]
         self.assertEqual(n.epoch, 0)
         self.assertTrue(n.on_recovery_fence(rop, rckpt, 1, rckpt.op_hash, self.mpub))
@@ -306,7 +305,7 @@ class TestRecoveryFence(unittest.TestCase):
     def test_c_replayed_fence_is_a_monotone_noop(self):
         nodes, _r = _acc_cluster(1)
         n = nodes[0]
-        rckpt, rop = self._pair([n.pub])
+        rckpt, rop = self._pair([n.node.public])
         self.assertTrue(n.on_recovery_fence(rop, rckpt, 1, rckpt.op_hash, self.mpub))
         self.assertEqual(n.epoch, 1)
         # replay the identical fence for the now-passed epoch -> valid but no-op
@@ -375,7 +374,7 @@ class TestPossessionBarrier(unittest.TestCase):
         self.assertFalse(nodes[1].holds_frontier(sf))
 
         msk, mpub = _key(90)
-        rop = _roster_op(msk, mpub, [n.pub for n in nodes], sf)
+        rop = _roster_op(msk, mpub, [n.node.public for n in nodes], sf)
         tag, b = A.roster_slot_tag(0), A.Ballot(1, b"m")
         # node 0 possesses the data -> receipts under e+1 (possession proof)
         r0 = nodes[0].on_roster_accept(tag, b, rop, sf, 1, NOW)
@@ -408,8 +407,8 @@ class TestRosterSlot(unittest.TestCase):
         tag = A.roster_slot_tag(0)
         aSk, aPub = _key(70)
         bSk, bPub = _key(71)
-        rosterA = _roster_op(aSk, aPub, [nodes[0].pub], {})  # A: shrink to {node0}
-        rosterB = _roster_op(bSk, bPub, [nodes[1].pub], {})  # B: shrink to {node1}
+        rosterA = _roster_op(aSk, aPub, [nodes[0].node.public], {})  # A: shrink to {node0}
+        rosterB = _roster_op(bSk, bPub, [nodes[1].node.public], {})  # B: shrink to {node1}
         self.assertNotEqual(rosterA.op_hash, rosterB.op_hash)
 
         bal = A.Ballot(1, b"\x01")
@@ -451,9 +450,9 @@ class TestRosterActivation(unittest.TestCase):
         # old-roster QC (epoch 0): the old roster is just {n0}
         r_old = nodes[0].on_accept(tag, bal, rop, NOW)
         assert isinstance(r_old, A.Receipt)
-        old_qc = A.QC.assemble([r_old], 1, {nodes[0].pub: 0})
+        old_qc = A.QC.assemble([r_old], 1, {nodes[0].node.public: 0})
         self.assertEqual(old_qc.config_epoch, 0)
-        self.assertTrue(old_qc.verify([nodes[0].pub]))
+        self.assertTrue(old_qc.verify([nodes[0].node.public]))
 
         # new-roster QC (epoch 1): possession-gated receipts from {n0,n1,n2}
         new_idx = {p: i for i, p in enumerate(roster3)}
@@ -482,8 +481,7 @@ class TestWrapSet(unittest.TestCase):
         members = [C.SIGNER.public(s) for s in sks]
         k_epoch = bytes(range(32))
         op = A.WrapSetOp.build(
-            author_sk=bytes([1] * 32),
-            author_pub=C.SIGNER.public(bytes([1] * 32)),
+            author=C.SoftwareKeypair.from_seed(bytes([1] * 32)),
             seq=0,
             prev=A.GENESIS_PREV,
             hlc=A.HLC(NOW, 0),
@@ -495,9 +493,9 @@ class TestWrapSet(unittest.TestCase):
         self.assertEqual(op.keyepoch, 1)
         # each member recovers K_epoch; a non-member gets nothing
         for sk in sks:
-            self.assertEqual(op.unwrap(sk), k_epoch)
+            self.assertEqual(op.unwrap(C.SoftwareKeypair.from_seed(sk)), k_epoch)
         outsider = bytes([200] * 32)
-        self.assertIsNone(op.unwrap(outsider))
+        self.assertIsNone(op.unwrap(C.SoftwareKeypair.from_seed(outsider)))
 
     def test_unwrap_then_derive_installs_the_working_keyring(self):
         # the finding-21 loop: ONE master is wrapped/unwrapped, then BOTH working
@@ -507,8 +505,7 @@ class TestWrapSet(unittest.TestCase):
         member = C.SIGNER.public(sk)
         k_epoch = bytes([0xC3] * 32)
         op = A.WrapSetOp.build(
-            author_sk=bytes([1] * 32),
-            author_pub=C.SIGNER.public(bytes([1] * 32)),
+            author=C.SoftwareKeypair.from_seed(bytes([1] * 32)),
             seq=0,
             prev=A.GENESIS_PREV,
             hlc=A.HLC(NOW, 0),
@@ -517,7 +514,7 @@ class TestWrapSet(unittest.TestCase):
             members=[member],
         )
         assert isinstance(op, A.WrapSetOp)
-        recovered = op.unwrap(sk)
+        recovered = op.unwrap(C.SoftwareKeypair.from_seed(sk))
         assert recovered is not None
         self.assertEqual(recovered, k_epoch)
         ring = fold.keyring_from_masters({2: recovered})
@@ -576,7 +573,7 @@ class TestEpochPersistence(unittest.TestCase):
 
     def _acc(self, store, config_epoch=0):
         sk = bytes([170] * 32)
-        return Acceptor(sk, C.SIGNER.public(sk), store, config_epoch, BIG_DELTA)
+        return Acceptor(C.SoftwareKeypair.from_seed(sk), store, config_epoch, BIG_DELTA)
 
     def test_epoch_survives_restart_and_stamps_fresh_watermark(self):
         with tempfile.TemporaryDirectory() as d:

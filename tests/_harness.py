@@ -40,7 +40,7 @@ from dudefs.artifacts import (
     fingerprint,
     quorum_size,
 )
-from dudefs.crypto import SIGNER
+from dudefs.crypto import SoftwareKeypair
 from dudefs.node import LocalNode
 from dudefs.quorum import Commit, Finalize, QuorumConfig
 from dudefs.store import ChainStore
@@ -176,7 +176,7 @@ class Sim:
         self._skew = dict(skew or {})
         self._drift = dict(drift or {})
         self.raw = self._build_nodes(n, delta)
-        self.roster = [nd.acc.pub for nd in self.raw]
+        self.roster: list[bytes] = [nd.acc.node.public for nd in self.raw]
         self.nodes = [LoggingNode(nd, i, self) for i, nd in enumerate(self.raw)]
         # `net` (a NetworkLinks) enables per-link faults + partitions + gossip heal
         # (WP2.2); without it the transport is the uniform per-hop Faults, unchanged.
@@ -195,9 +195,8 @@ class Sim:
         out = []
         for i in range(n):
             sk = bytes([200 + i] * 32)
-            pub = SIGNER.public(sk)
             cls = self._personas.get(i, Acceptor)  # an adversarial subclass, or honest
-            acc = cls(sk, pub, ChainStore(), config_epoch=0, delta_ms=delta)
+            acc = cls(SoftwareKeypair.from_seed(sk), ChainStore(), config_epoch=0, delta_ms=delta)
             out.append(LocalNode(acc, self._node_clock(i)))
         return out
 

@@ -10,6 +10,7 @@ import socket
 import time
 
 from .. import artifacts as A
+from .. import crypto as C
 from .. import lmsg, transports, wire
 from ..artifacts import HLC
 from ..link import Link
@@ -56,7 +57,7 @@ def mgr_send(
     root, so the drive passes. None if the node has no known endpoint."""
     if ep is None:
         return None
-    match Link(st.root_key, st.manager_pub, to_pub, ep).request(
+    match Link(st.root, C.PublicKey(to_pub), ep).request(
         b"", wire.encode_request(req), epoch=st.epoch, ts=int(time.time() * 1000), timeout=timeout
     ):
         case lmsg.Reply(env):

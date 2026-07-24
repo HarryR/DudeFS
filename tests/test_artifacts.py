@@ -10,7 +10,7 @@ from dudefs import crypto as C
 
 def _kp(seed):
     sk = bytes([seed] * 32)
-    return sk, C.SIGNER.public(sk)
+    return sk, C.SoftwareKeypair.from_seed(sk).public
 
 
 class TestOp(unittest.TestCase):
@@ -27,8 +27,7 @@ class TestOp(unittest.TestCase):
         )
         tag = A.compute_slot_tag(self.secret, b"k", A.VERSION_ABSENT, 0)
         return A.CasOp.build(
-            author_sk=self.sk,
-            author_pub=self.pub,
+            author=C.SoftwareKeypair.from_seed(self.sk),
             seq=0,
             prev=A.GENESIS_PREV,
             hlc=A.HLC(1000, 0),
@@ -98,7 +97,10 @@ class TestQuorumArtifacts(unittest.TestCase):
 
     def test_qc_needs_majority(self):
         oph = bytes([7] * 32)
-        rs = [A.Receipt.issue(self.sks[i], self.pubs[i], oph, 0, A.BLIND, 1) for i in (0, 1, 3)]
+        rs = [
+            A.Receipt.issue(C.SoftwareKeypair.from_seed(self.sks[i]), oph, 0, A.BLIND, 1)
+            for i in (0, 1, 3)
+        ]
         for r in rs:
             self.assertTrue(r.verify())
         qc = A.QC.assemble(rs, self.n, self.index)
@@ -115,12 +117,14 @@ class TestQuorumArtifacts(unittest.TestCase):
         self.assertLess(A.Ballot(1, b"a"), A.Ballot(1, b"b"))
 
     def test_watermark_and_frontier(self):
-        wm = A.Watermark.issue(self.sks[0], self.pubs[0], A.HLC(5000, 0), 0, 1)
+        wm = A.Watermark.issue(C.SoftwareKeypair.from_seed(self.sks[0]), A.HLC(5000, 0), 0, 1)
         self.assertTrue(wm.verify())
         wm.floor = A.HLC(9999, 0)
         self.assertFalse(wm.verify())
         heads = {b"A": (3, bytes([1] * 32)), b"B": (0, bytes([2] * 32))}
-        fb = A.FrontierBundle.issue(self.sks[0], self.pubs[0], heads, None, 0, A.HLC(5000, 0))
+        fb = A.FrontierBundle.issue(
+            C.SoftwareKeypair.from_seed(self.sks[0]), heads, None, 0, A.HLC(5000, 0)
+        )
         self.assertTrue(fb.verify())
 
 
@@ -139,8 +143,7 @@ class TestGoldenVectors(unittest.TestCase):
         )
         tag = A.compute_slot_tag(secret, b"k", A.VERSION_ABSENT, 0)
         op = A.CasOp.build(
-            author_sk=sk,
-            author_pub=pub,
+            author=C.SoftwareKeypair.from_seed(sk),
             seq=0,
             prev=A.GENESIS_PREV,
             hlc=A.HLC(1000, 0),

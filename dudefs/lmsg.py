@@ -28,8 +28,8 @@ class Envelope:
     the sealed inner. `to` binds the message to one recipient INSIDE the seal — the
     anti-reflection field, without which a signed request to A is replayable to B."""
 
-    frm: bytes
-    to: bytes
+    frm: C.PublicKey
+    to: C.PublicKey
     epoch: int
     ts: int
     nonce: bytes
@@ -45,7 +45,7 @@ class Envelope:
         )
 
     def verify_sig(self) -> bool:
-        return bool(self.sig) and C.SIGNER.verify(self.frm, self._signed_bytes(), self.sig)
+        return bool(self.sig) and self.frm.verify(self._signed_bytes(), self.sig)
 
     def encode(self) -> bytes:
         return codec.encode(
@@ -56,8 +56,8 @@ class Envelope:
     def decode(raw: bytes) -> Envelope:
         f = codec.as_seq(codec.decode(raw), length=8)
         return Envelope(
-            frm=codec.as_bytes(f[0]),
-            to=codec.as_bytes(f[1]),
+            frm=C.PublicKey(codec.as_bytes(f[0])),
+            to=C.PublicKey(codec.as_bytes(f[1])),
             epoch=codec.as_int(f[2]),
             ts=codec.as_int(f[3]),
             nonce=codec.as_bytes(f[4]),
@@ -68,12 +68,19 @@ class Envelope:
 
 
 def author(
-    sk: bytes, to: bytes, verb: bytes, body: bytes, *, epoch: int, ts: int, nonce: bytes = b""
+    signer: C.Keypair,
+    to: C.PublicKey,
+    verb: bytes,
+    body: bytes,
+    *,
+    epoch: int,
+    ts: int,
+    nonce: bytes = b"",
 ) -> Envelope:
-    """Build + sign a plain envelope. `frm` is DERIVED from `sk` (never passed
+    """Build + sign a plain envelope. `frm` is DERIVED from `signer` (never passed
     separately — the signature can never outrun the identity that made it)."""
-    unsigned = Envelope(C.SIGNER.public(sk), to, int(epoch), int(ts), nonce, verb, body)
-    return dataclasses.replace(unsigned, sig=C.SIGNER.sign(sk, unsigned._signed_bytes()))
+    unsigned = Envelope(signer.public, to, int(epoch), int(ts), nonce, verb, body)
+    return dataclasses.replace(unsigned, sig=signer.sign(unsigned._signed_bytes()))
 
 
 # --------------------------------------------------------------------------- #
@@ -82,7 +89,7 @@ def author(
 # --------------------------------------------------------------------------- #
 
 
-def seal_request(env: Envelope, to_pub: bytes, reply_key: bytes) -> bytes:
+def seal_request(env: Envelope, to_pub: C.PublicKey, reply_key: C.PublicKey) -> bytes:
     """Seal a fully-signed `env` (+ a REQUIRED fresh ephemeral reply-key) to `to_pub`.
     `reply_key` is the requester's ephemeral PUBLIC key; the node seals its reply back
     to it (confidential both ways, still no session). The outer wire is ALWAYS
@@ -92,11 +99,11 @@ def seal_request(env: Envelope, to_pub: bytes, reply_key: bytes) -> bytes:
     if not reply_key:
         raise ValueError("sealed mode requires a reply-key (no downgrade lever, TRANSPORT §2)")
     inner = codec.encode([env.encode(), reply_key])
-    sealed = C.seal_to(to_pub, inner)
+    sealed = to_pub.seal(inner)
     return codec.encode([C.screen_tag(to_pub, sealed), sealed])
 
 
-def matches_tag(self_pub: bytes, outer: bytes) -> bool:
+def matches_tag(self_pub: C.PublicKey, outer: bytes) -> bool:
     """Screen a sealed `[to_hint, sealed]` WITHOUT unsealing: it is for me iff the tag
     keys under MY identity (TRANSPORT §3). One keyed hash, no ECDH — the DoS pre-filter
     before any unseal. A never-member can't forge the tag, so its noise screens out
@@ -109,17 +116,17 @@ def matches_tag(self_pub: bytes, outer: bytes) -> bool:
     return hmac.compare_digest(tag, C.screen_tag(self_pub, sealed))
 
 
-def unseal_request(sk: bytes, outer: bytes) -> tuple[Envelope, bytes] | None:
-    """Open a sealed request with `sk`; return (inner envelope, reply_key), or None if
-    the tag isn't mine / it wasn't sealed to me / is malformed. The keyed tag is
+def unseal_request(recipient: C.Keypair, outer: bytes) -> tuple[Envelope, bytes] | None:
+    """Open a sealed request with `recipient`; return (inner envelope, reply_key), or None
+    if the tag isn't mine / it wasn't sealed to me / is malformed. The keyed tag is
     checked FIRST (one hash) so the ECDH runs only on a hit — the pre-filter (§4). Does
     NOT verify the sig or gate; the caller runs `gate` next."""
-    self_pub = C.SIGNER.public(sk)
+    self_pub = recipient.public
     if not matches_tag(self_pub, outer):
         return None  # wrong tag -> not mine, dropped for one hash (no ECDH)
     try:
         parts = codec.as_seq(codec.decode(outer), length=2)
-        opened = C.open_sealed(sk, codec.as_bytes(parts[1]))
+        opened = recipient.open_sealed(codec.as_bytes(parts[1]))
         if opened is None:
             return None
         inner = codec.as_seq(codec.decode(opened), length=2)
@@ -128,23 +135,23 @@ def unseal_request(sk: bytes, outer: bytes) -> tuple[Envelope, bytes] | None:
         return None  # malformed -> a non-match, never a crash
 
 
-def seal_reply(env: Envelope, reply_key: bytes) -> bytes:
+def seal_reply(env: Envelope, reply_key: C.PublicKey) -> bytes:
     """Seal a node's signed reply back to the requester's ephemeral `reply_key`,
     symmetric with the request: `[to_hint, sealed]` so the requester can O(1)-screen
     its reply (keyed by its reply-key) before the ECDH — the reverse-direction hint."""
-    sealed = C.seal_to(reply_key, env.encode())
+    sealed = reply_key.seal(env.encode())
     return codec.encode([C.screen_tag(reply_key, sealed), sealed])
 
 
-def unseal_reply(reply_sk: bytes, outer: bytes) -> Envelope | None:
-    """Open a sealed reply with the requester's ephemeral reply secret — tag pre-filter
+def unseal_reply(reply: C.Keypair, outer: bytes) -> Envelope | None:
+    """Open a sealed reply with the requester's ephemeral reply identity — tag pre-filter
     (keyed by the reply-key pub) FIRST, then the ECDH only on a hit."""
-    reply_pub = C.SIGNER.public(reply_sk)
+    reply_pub = reply.public
     if not matches_tag(reply_pub, outer):
         return None
     try:
         parts = codec.as_seq(codec.decode(outer), length=2)
-        opened = C.open_sealed(reply_sk, codec.as_bytes(parts[1]))
+        opened = reply.open_sealed(codec.as_bytes(parts[1]))
         return Envelope.decode(opened) if opened is not None else None
     except (ValueError, IndexError, codec.CodecError):
         return None
@@ -164,7 +171,12 @@ class Gate(enum.Enum):
 
 
 def gate(
-    env: Envelope, *, self_pub: bytes, now: int, delta: int, authorized: Callable[[bytes], bool]
+    env: Envelope,
+    *,
+    self_pub: C.PublicKey,
+    now: int,
+    delta: int,
+    authorized: Callable[[bytes], bool],
 ) -> Gate:
     """The request gate over an ALREADY-unsealed envelope (TRANSPORT §5). Cheap door
     checks first, membership last. **Check ORDER is load-bearing** (`classify_inbound`
@@ -229,7 +241,12 @@ type Inbound = Gated | Refused | Dropped
 
 
 def gate_envelope(
-    env: Envelope, *, self_pub: bytes, now: int, delta: int, authorized: Callable[[bytes], bool]
+    env: Envelope,
+    *,
+    self_pub: C.PublicKey,
+    now: int,
+    delta: int,
+    authorized: Callable[[bytes], bool],
 ) -> Inbound:
     """Gate an ALREADY-decoded envelope into a typed outcome — PURE. The plain path
     (classify_inbound) decodes first; the sealed path unseals first and calls this."""
@@ -242,7 +259,12 @@ def gate_envelope(
 
 
 def classify_inbound(
-    data: bytes, *, self_pub: bytes, now: int, delta: int, authorized: Callable[[bytes], bool]
+    data: bytes,
+    *,
+    self_pub: C.PublicKey,
+    now: int,
+    delta: int,
+    authorized: Callable[[bytes], bool],
 ) -> Inbound:
     """Decode + gate one PLAIN inbound request frame — PURE, no I/O. The transport
     matches on the result and renders it (reply / silence)."""
@@ -285,7 +307,7 @@ class WrongPeer:
 type ReplyOutcome = Reply | NoReply | MalformedReply | WrongPeer
 
 
-def _check_reply(env: Envelope, expect_from: bytes, expect_to: bytes) -> ReplyOutcome:
+def _check_reply(env: Envelope, expect_from: C.PublicKey, expect_to: C.PublicKey) -> ReplyOutcome:
     """The verify half shared by plain + sealed reply classification."""
     if not env.verify_sig():
         return MalformedReply()  # unsigned / tampered -> not a verifiable reply
@@ -294,7 +316,9 @@ def _check_reply(env: Envelope, expect_from: bytes, expect_to: bytes) -> ReplyOu
     return Reply(env)
 
 
-def classify_reply(data: bytes, *, expect_from: bytes, expect_to: bytes) -> ReplyOutcome:
+def classify_reply(
+    data: bytes, *, expect_from: C.PublicKey, expect_to: C.PublicKey
+) -> ReplyOutcome:
     """Validate a PLAIN inbound REPLY frame against the peer we addressed — PURE, no
     I/O. A reply not signed by `expect_from` back to `expect_to` is not our reply."""
     if not data:
@@ -307,13 +331,13 @@ def classify_reply(data: bytes, *, expect_from: bytes, expect_to: bytes) -> Repl
 
 
 def classify_sealed_reply(
-    data: bytes, *, reply_sk: bytes, expect_from: bytes, expect_to: bytes
+    data: bytes, *, reply: C.Keypair, expect_from: C.PublicKey, expect_to: C.PublicKey
 ) -> ReplyOutcome:
-    """Validate a SEALED inbound reply: open it with the ephemeral `reply_sk` from the
-    request, then the same verify as plain. Un-openable bytes are 'not our reply'."""
+    """Validate a SEALED inbound reply: open it with the ephemeral `reply` identity from
+    the request, then the same verify as plain. Un-openable bytes are 'not our reply'."""
     if not data:
         return NoReply()
-    env = unseal_reply(reply_sk, data)
+    env = unseal_reply(reply, data)
     if env is None:
         return MalformedReply()  # couldn't open with our reply-key -> not ours
     return _check_reply(env, expect_from, expect_to)

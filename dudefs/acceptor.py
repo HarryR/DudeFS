@@ -23,7 +23,7 @@ from collections.abc import Callable
 from enum import Enum, auto
 
 from . import artifacts as A
-from . import tunables
+from . import crypto, tunables
 from .artifacts import (
     BLIND,
     HLC,
@@ -85,15 +85,13 @@ class Acceptor:
 
     def __init__(
         self,
-        node_sk: bytes,
-        node_pub: bytes,
+        node: crypto.Keypair,
         store: ChainStore,
         config_epoch: int = 0,
         delta_ms: int = tunables.DELTA_MS,
         authz: Callable[[bytes], bool] | None = None,
     ):
-        self.sk = node_sk
-        self.pub = node_pub
+        self.node = node
         self.store = store
         # the request gate (NOTES 58): `authz(author)` is the node's best-effort view
         # of whether an author may WRITE. None = ungated (the L4 sim + unit tests);
@@ -160,14 +158,14 @@ class Acceptor:
             # the same value — a concurrent activation cannot slip between them.
             ep = self._epoch(tx)
             seq = tx.reserve_watermark_seq(new_att, ep)
-        return A.Watermark.issue(self.sk, self.pub, new_att, ep, seq)
+        return A.Watermark.issue(self.node, new_att, ep, seq)
 
     def issue_frontier(self, now_ms: int) -> FrontierBundle:
         """The signed read primitive (PROTOCOL §1): per-author heads + floor +
         epoch, all signed at one instant (relay-safe, PROTOCOL §7.3)."""
         with self.store.read_txn() as tx:
             heads, fl, ep = tx.heads(), self.floor(tx, now_ms), self._epoch(tx)
-        return A.FrontierBundle.issue(self.sk, self.pub, heads, None, ep, fl)
+        return A.FrontierBundle.issue(self.node, heads, None, ep, fl)
 
     def _advance_hw(self, tx: WriteTxn, op: Op) -> None:
         hw = tx.get_hw()
@@ -182,7 +180,7 @@ class Acceptor:
         # proposed via PREPARE/ACCEPT, never SUBMIT. SUBMIT serves blind writes.
         if isinstance(op, A.Slotted):
             return Rejected(RejectReason.NEEDS_BALLOT)
-        if not (op.verify_structure() and op.verify_sig(op.author)):
+        if not (op.verify_structure() and op.verify_sig()):
             return Rejected(RejectReason.BAD_STRUCTURE)
         # the request gate (NOTES 58/60): refuse a non-authorized REQUESTER at the
         # door — best-effort, fail-closed until the cert propagates (NOTES 59), the
@@ -239,9 +237,7 @@ class Acceptor:
             tx.write_slot(tag, s)
             accepted_ballot, accepted_op = s.accepted_ballot, s.accepted_op
         # promised ballot is now durable; sign the promise (re-derivable, not stored)
-        return A.Promise.issue(
-            self.sk, self.pub, tag, ballot, accepted_ballot, accepted_op, accepted_hlc
-        )
+        return A.Promise.issue(self.node, tag, ballot, accepted_ballot, accepted_op, accepted_hlc)
 
     def advance_horizon(self, hlc: HLC) -> None:
         """Raise the DURABLE checkpoint horizon on observing a quorum-committed
@@ -257,7 +253,7 @@ class Acceptor:
     def on_accept(
         self, tag: bytes, ballot: Ballot, op: Op, now_ms: int, *, receipt_epoch: int | None = None
     ) -> AcceptResult:
-        if not (op.verify_structure() and op.verify_sig(op.author)):
+        if not (op.verify_structure() and op.verify_sig()):
             return Rejected(RejectReason.BAD_STRUCTURE)
         if not isinstance(op, A.Slotted) or op.slot_tag != tag:
             return Rejected(RejectReason.BAD_STRUCTURE)
@@ -311,14 +307,14 @@ class Acceptor:
         the ACCEPTANCE seq (bound when the op was first accepted, any epoch); only a
         genuinely new acceptance consumes the next monotone issue_seq."""
         ep = self._epoch(tx) if epoch is None else epoch
-        existing = tx.get_receipt(op_hash, ep, ballot, self.pub)
+        existing = tx.get_receipt(op_hash, ep, ballot, self.node.public)
         if existing is not None:
             return existing
         # reserve the acceptance-bound seq + justification (finding 18b), sign
         # deterministically, and store — all in the caller's txn. A crash before the
         # COMMIT rolls it all back; the retry re-derives the identical receipt.
         seq = tx.reserve_receipt_seq(op_hash, ballot)
-        r = A.Receipt.issue(self.sk, self.pub, op_hash, ep, ballot, seq)
+        r = A.Receipt.issue(self.node, op_hash, ep, ballot, seq)
         tx.put_receipt(r)
         return r
 
@@ -364,7 +360,7 @@ class Acceptor:
         no-op. Returns whether the pair is a valid fence."""
         if roster_op.author != manager_pub or recovery_ckpt.author != manager_pub:
             return False  # fiat is root-only
-        if not (roster_op.verify_sig(manager_pub) and recovery_ckpt.verify_sig(manager_pub)):
+        if not (roster_op.verify_sig() and recovery_ckpt.verify_sig()):
             return False
         if recovery_hash != recovery_ckpt.op_hash:
             return False  # the roster must name THIS checkpoint (the pairing)

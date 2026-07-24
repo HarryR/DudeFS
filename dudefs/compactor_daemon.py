@@ -90,8 +90,7 @@ class CompactorDaemon(ClientDaemon):
         dk = self.keyring[self.keyepoch]["data_key"]
         with self._lock:
             op = A.CheckpointOp.build(
-                author_sk=self.sk,
-                author_pub=self.pub,
+                author=self.key,
                 seq=self._seq,
                 prev=self._prev,
                 hlc=self._next_hlc(),

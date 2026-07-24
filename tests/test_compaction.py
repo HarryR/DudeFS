@@ -528,8 +528,7 @@ class TestDelegateCheckpointBarrier(unittest.TestCase):
 
     def _ckpt(self, sk, pub, cut, hlc_ms, pver=0):
         return A.CheckpointOp.build(
-            author_sk=sk,
-            author_pub=pub,
+            author=crypto.SoftwareKeypair.from_seed(sk),
             seq=0,
             prev=A.GENESIS_PREV,
             hlc=A.HLC(hlc_ms, 0),
@@ -780,7 +779,9 @@ class TestCutAwareStore(unittest.TestCase):
             self.assertIsNone(tx.get_op(first.op_hash))  # the named envelope is gone
 
         sk = bytes([170] * 32)
-        acc = Acceptor(sk, crypto.SIGNER.public(sk), store, config_epoch=0, delta_ms=BIG_DELTA)
+        acc = Acceptor(
+            crypto.SoftwareKeypair.from_seed(sk), store, config_epoch=0, delta_ms=BIG_DELTA
+        )
         # a frontier entry BELOW the cut naming the GC'd (dead) envelope:
         sf = {w.clients[0].pub: (0, first.op_hash)}
         # ACCEPT: baseline is complete (winner + control held) -> possession holds
@@ -794,7 +795,9 @@ class TestCutAwareStore(unittest.TestCase):
                 if o.op_hash != winner.op_hash:
                     tx.put_op_raw(o)
             tx.adopt_checkpoint(A.Baseline(cut, committed))
-        gacc = Acceptor(sk, crypto.SIGNER.public(sk), gap, config_epoch=0, delta_ms=BIG_DELTA)
+        gacc = Acceptor(
+            crypto.SoftwareKeypair.from_seed(sk), gap, config_epoch=0, delta_ms=BIG_DELTA
+        )
         self.assertFalse(gacc.holds_frontier(sf))
 
     def test_adopted_cut_survives_crash_restart(self):
@@ -1036,7 +1039,7 @@ class TestReceiptFloorBackstop(unittest.TestCase):
     def _node(self, key=190):
         nsk = bytes([key] * 32)
         return Acceptor(
-            nsk, crypto.SIGNER.public(nsk), ChainStore(), config_epoch=0, delta_ms=BIG_DELTA
+            crypto.SoftwareKeypair.from_seed(nsk), ChainStore(), config_epoch=0, delta_ms=BIG_DELTA
         )
 
     def _op(self, w, key, hlc):
@@ -1088,7 +1091,7 @@ class TestVoidRule(unittest.TestCase):
         # hlc is below the floor and can never re-commit). The acceptor voids the
         # below-horizon accept on PREPARE, so the reborn op proposes itself.
         nsk = bytes([200] * 32)
-        node = Acceptor(nsk, crypto.SIGNER.public(nsk), ChainStore(), 0, BIG_DELTA)
+        node = Acceptor(crypto.SoftwareKeypair.from_seed(nsk), ChainStore(), 0, BIG_DELTA)
         w = World(seed=7, n_clients=1)
         tag = A.compute_slot_tag(w.keyring[0]["slot_secret"], b"k", A.VERSION_ABSENT, 0)
         ancient = w.data_op(
@@ -1117,7 +1120,7 @@ class TestVoidRule(unittest.TestCase):
     def _one_accept_node(self, hlc):
         # a node holding a single decided op at `hlc`; returns (node, tag, op).
         nsk = bytes([201] * 32)
-        node = Acceptor(nsk, crypto.SIGNER.public(nsk), ChainStore(), 0, BIG_DELTA)
+        node = Acceptor(crypto.SoftwareKeypair.from_seed(nsk), ChainStore(), 0, BIG_DELTA)
         w = World(seed=17, n_clients=1)
         tag = A.compute_slot_tag(w.keyring[0]["slot_secret"], b"k", A.VERSION_ABSENT, 0)
         op = w.data_op(
@@ -1189,7 +1192,7 @@ class TestHorizonPersistence(unittest.TestCase):
             s.close()
 
             s2 = ChainStore(path)
-            acc = Acceptor(nsk, crypto.SIGNER.public(nsk), s2, 0, BIG_DELTA)
+            acc = Acceptor(crypto.SoftwareKeypair.from_seed(nsk), s2, 0, BIG_DELTA)
             with s2.read_txn() as tx:
                 self.assertEqual(tx.get_horizon(), A.HLC(200, 0))  # restored, not reset to 0
 
@@ -1216,7 +1219,7 @@ class TestHorizonPersistence(unittest.TestCase):
             s = ChainStore(path)
             with s.read_txn() as tx:
                 self.assertEqual(tx.get_horizon(), A.HLC(0, 0))
-            acc = Acceptor(nsk, crypto.SIGNER.public(nsk), s, 0, BIG_DELTA)
+            acc = Acceptor(crypto.SoftwareKeypair.from_seed(nsk), s, 0, BIG_DELTA)
             op = self._op(w, b"k", A.HLC(100, 0))
             assert isinstance(op, A.Slotted)
             # no horizon adopted -> the op commits (backstop inert, correctly)

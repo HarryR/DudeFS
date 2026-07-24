@@ -38,7 +38,7 @@ class TestSubmitRejectsSlotted(unittest.TestCase):
     def setUp(self):
         self.w = World(seed=1, n_clients=2)
         self.nsk, self.npub = _node(200)
-        self.acc = Acceptor(self.nsk, self.npub, ChainStore(), 0, DELTA)
+        self.acc = Acceptor(C.SoftwareKeypair.from_seed(self.nsk), ChainStore(), 0, DELTA)
 
     def test_slotted_submit_is_needs_ballot(self):
         op, _ = _slot_op(self.w, 0, b"a", NOW)
@@ -66,7 +66,7 @@ class TestRecoveryOrdering(unittest.TestCase):
     def setUp(self):
         self.w = World(seed=2, n_clients=2)
         self.nsk, self.npub = _node(201)
-        self.acc = Acceptor(self.nsk, self.npub, ChainStore(), 0, DELTA)
+        self.acc = Acceptor(C.SoftwareKeypair.from_seed(self.nsk), ChainStore(), 0, DELTA)
 
     def test_promise_accept_ordering_and_nack(self):
         opA, tag = _slot_op(self.w, 0, b"a", NOW)
@@ -106,7 +106,7 @@ class TestSkewAndFloor(unittest.TestCase):
     def setUp(self):
         self.w = World(seed=3, n_clients=1)
         self.nsk, self.npub = _node(202)
-        self.acc = Acceptor(self.nsk, self.npub, ChainStore(), 0, DELTA)
+        self.acc = Acceptor(C.SoftwareKeypair.from_seed(self.nsk), ChainStore(), 0, DELTA)
 
     def test_future_and_past_gates(self):
         # skew gates bind ballot ACCEPT of slotted ops (rev 5: the slotted path);
@@ -145,8 +145,8 @@ class TestSingleDecree(unittest.TestCase):
         nodes = []
         for i in range(n):
             sk, pub = _node(210 + i)
-            nodes.append(Acceptor(sk, pub, ChainStore(), 0, DELTA))
-        pubs = [nd.pub for nd in nodes]
+            nodes.append(Acceptor(C.SoftwareKeypair.from_seed(sk), ChainStore(), 0, DELTA))
+        pubs = [nd.node.public for nd in nodes]
         return nodes, pubs, {p: i for i, p in enumerate(pubs)}
 
     def test_split_vote_recovers_to_one_winner(self):

@@ -92,7 +92,7 @@ def keyring_from_masters(masters: dict[int, bytes]) -> Keyring:
     }
 
 
-def keyring_from_wraps(ops: list[Op], member_sk: bytes) -> Keyring:
+def keyring_from_wraps(ops: list[Op], member: crypto.Keypair) -> Keyring:
     """The member-side consumer of the wrap-sets in the held log (finding 21 / issue #2):
     for every `WRAP_SET` op that seals a key to me, unwrap my `K_epoch` and derive that
     epoch's working keys. NEVER take a master over the wire — the keyring is reconstructed
@@ -102,7 +102,7 @@ def keyring_from_wraps(ops: list[Op], member_sk: bytes) -> Keyring:
     masters: dict[int, bytes] = {}
     for op in ops:
         if isinstance(op, A.WrapSetOp):
-            k = op.unwrap(member_sk)
+            k = op.unwrap(member)
             if k is not None:
                 masters[op.keyepoch] = k  # same master across dup wraps -> idempotent
     return keyring_from_masters(masters)
@@ -291,7 +291,7 @@ _SIG_CACHE_MAX = tunables.SIG_CACHE_MAX
 def _struct_and_sig_ok(op: Op) -> bool:
     ok = _SIG_CACHE.get(op.op_hash)
     if ok is None:
-        ok = op.verify_structure() and op.verify_sig(op.author)
+        ok = op.verify_structure() and op.verify_sig()
         if len(_SIG_CACHE) < _SIG_CACHE_MAX:
             _SIG_CACHE[op.op_hash] = ok
     return ok

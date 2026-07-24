@@ -26,8 +26,8 @@ def _cluster(n):
     nodes = []
     for i in range(n):
         sk = bytes([200 + i] * 32)
-        nodes.append(Acceptor(sk, C.SIGNER.public(sk), ChainStore(), 0, DELTA))
-    return nodes, [nd.pub for nd in nodes]
+        nodes.append(Acceptor(C.SoftwareKeypair.from_seed(sk), ChainStore(), 0, DELTA))
+    return nodes, [nd.node.public for nd in nodes]
 
 
 def _finality_frontier(bundles, quorum):

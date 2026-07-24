@@ -172,10 +172,9 @@ class TestRecoverInterlock(unittest.TestCase):
             for i in range(3):
                 path = os.path.join(d, f"node{i}.sock")
                 nd = NodeDaemon(
-                    sks[i],
-                    roster[i],
+                    C.SoftwareKeypair.from_seed(sks[i]),
                     roster=roster,
-                    manager_pub=st.manager_pub,  # nodes trust the CLI root -> probe passes
+                    manager_pub=st.root.public,  # nodes trust the CLI root -> probe passes
                     clock=now_ms,
                     delta_ms=DELTA,
                 )
@@ -226,8 +225,7 @@ class TestClientPassthrough(unittest.TestCase):
         nodes = []
         for i in range(3):
             nd = NodeDaemon(
-                sks[i],
-                roster[i],
+                C.SoftwareKeypair.from_seed(sks[i]),
                 roster=roster,
                 manager_pub=w.mgr_pub,
                 control_ops=w.control_ops,  # the node holds the authz view (request gate)
@@ -239,8 +237,7 @@ class TestClientPassthrough(unittest.TestCase):
             self.assertTrue(ev.wait(2))
             nodes.append(nd)
         client = ClientDaemon(
-            w.clients[0].sk,
-            w.clients[0].pub,
+            C.SoftwareKeypair.from_seed(w.clients[0].sk),
             roster=roster,
             roster_addrs=unix_eps(paths),
             manager_pub=w.mgr_pub,

@@ -15,7 +15,7 @@ import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from . import gossip, lmsg, transports, tunables, wire
+from . import crypto, gossip, lmsg, transports, tunables, wire
 from .acceptor import Acceptor, Rejected, RejectReason
 from .artifacts import (
     Cap,
@@ -75,8 +75,7 @@ class NodeDaemon:
 
     def __init__(
         self,
-        sk: bytes,
-        pub: bytes,
+        key: crypto.Keypair,
         store_path: str = ":memory:",
         *,
         roster: list[bytes] | None = None,
@@ -89,7 +88,9 @@ class NodeDaemon:
         acceptor_cls: type[Acceptor] = Acceptor,
     ):
         self.peers: list[Peer] = peers or []  # anti-entropy peers (identity + Endpoint)
-        self.sk = sk  # the node's identity key — signs L_msg envelopes (PROTOCOL §7.5)
+        # the node's sole identity — signs L_msg envelopes (PROTOCOL §7.5), backs the
+        # Acceptor, and unseals sealed requests; no raw seed is held.
+        self.key = key
         self._sealed = False  # inbound profile; serve_forever(sealed=True) unseals first
         self.store = ChainStore(store_path)
         self.manager_pub = manager_pub
@@ -104,8 +105,7 @@ class NodeDaemon:
         # evidence path, so the adversary-mints-proof test runs real code, not a
         # hand-planted receipt. Defaults to the honest Acceptor.
         self.acc = acceptor_cls(
-            sk,
-            pub,
+            key,
             self.store,
             config_epoch=epoch,
             delta_ms=delta_ms,
@@ -116,10 +116,10 @@ class NodeDaemon:
                 self._authz.is_authorized(a, Cap.WRITE) or self._authz.is_authorized(a, Cap.COMPACT)
             ),
         )
-        self.pub = pub
+        self.pub = key.public
         self._clock = clock or (lambda: 0)
         self.node = LocalNode(self.acc, self._clock)
-        self.roster = roster or [pub]
+        self.roster = roster or [self.pub]
         self.quorum = quorum_size(len(self.roster))
         self._rebuild_authz()
 
@@ -153,7 +153,7 @@ class NodeDaemon:
             # yields an envelope -> silence, the seal IS the screen); else plain.
             reply_key: bytes | None = None
             if self._sealed:
-                opened = lmsg.unseal_request(self.sk, data)
+                opened = lmsg.unseal_request(self.key, data)
                 if opened is None:
                     return None  # not sealed to me / malformed -> reveal nothing
                 env0, reply_key = opened
@@ -187,9 +187,11 @@ class NodeDaemon:
         """A signed reply back to the requester (mirrors the request's verb); sealed to
         the requester's ephemeral reply-key when the inbound was sealed."""
         reply = lmsg.author(
-            self.sk, env.frm, env.verb, body, epoch=self.acc.epoch, ts=self._clock()
+            self.key, env.frm, env.verb, body, epoch=self.acc.epoch, ts=self._clock()
         )
-        return lmsg.seal_reply(reply, reply_key) if reply_key is not None else reply.encode()
+        if reply_key is None:
+            return reply.encode()
+        return lmsg.seal_reply(reply, crypto.PublicKey(reply_key))
 
     def _peer_authorized(self, frm: bytes) -> bool:
         """The peer gate's policy: a current roster node (gossip / ballots), a certed
@@ -277,7 +279,7 @@ class NodeDaemon:
         three seams above — the SUMMARY is read in its own snapshot, the dial holds no
         transaction, the reply is applied in one write. A test driver skips this and
         composes summary()/`_gossip_reply`/`apply_gossip` directly for step control."""
-        link = Link(self.sk, self.pub, peer.pub, peer.endpoint)
+        link = Link(self.key, crypto.PublicKey(peer.pub), peer.endpoint)
         match link.request(
             b"gossip", self.summary().request(), epoch=self.acc.epoch, ts=self._clock()
         ):

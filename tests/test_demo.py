@@ -51,8 +51,7 @@ class Demo:
         if os.path.exists(self.paths[i]):
             os.unlink(self.paths[i])  # clear the stale socket file so re-bind succeeds
         nd = NodeDaemon(
-            sk or self.node_sks[i],
-            C.SIGNER.public(sk) if sk else self.roster[i],
+            C.SoftwareKeypair.from_seed(sk or self.node_sks[i]),
             roster=self.roster,
             manager_pub=self.w.mgr_pub,
             peers=self._peers(i),
@@ -67,8 +66,7 @@ class Demo:
 
     def _client(self, w, ci):
         return ClientDaemon(
-            w.clients[ci].sk,
-            w.clients[ci].pub,
+            C.SoftwareKeypair.from_seed(w.clients[ci].sk),
             roster=self.roster,
             roster_addrs=unix_eps(self.paths),
             manager_pub=w.mgr_pub,
@@ -219,7 +217,7 @@ class TestDemoRunbook(unittest.TestCase):
             # fresh replacement caught up via gossip before joining)
             nodes = {}
             for pub, sk in [*keys, (fresh, fresh_sk)]:
-                acc = Acceptor(sk, pub, ChainStore(), 0, 10**9)
+                acc = Acceptor(C.SoftwareKeypair.from_seed(sk), ChainStore(), 0, 10**9)
                 with acc.store.write_txn() as tx:
                     tx.append(base)
                 nodes[pub] = LocalNode(acc, lambda: 100)

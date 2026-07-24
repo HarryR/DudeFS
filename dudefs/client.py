@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from typing import TypedDict
 
 from . import artifacts as A
-from . import compactor, fold, gossip, lmsg, transports, tunables, wire
+from . import compactor, crypto, fold, gossip, lmsg, transports, tunables, wire
 from .artifacts import BLIND, HLC, QC, Op, Receipt, Txn, compute_slot_tag, covered
 from .handlers import data as data_handler
 from .link import Link
@@ -203,8 +203,7 @@ class ClientDaemon:
 
     def __init__(
         self,
-        sk: bytes,
-        pub: bytes,
+        key: crypto.Keypair,
         *,
         roster: list[bytes],
         roster_addrs: list[transports.Endpoint],
@@ -216,8 +215,9 @@ class ClientDaemon:
         genesis_roster: list[bytes] | None = None,
         genesis_epoch: int = 0,
     ):
-        self.sk = sk
-        self.pub = pub
+        # the sole identity: signs ops (asymmetric), authenticates L_msg envelopes, and
+        # unwraps group keys — no raw seed is held (crypto.Keypair hides it).
+        self.key = key
         self.manager_pub = manager_pub
         self.keyepoch = keyepoch
         self.keyring: fold.Keyring = {}  # derived from held wraps once the log is seeded (below)
@@ -231,7 +231,7 @@ class ClientDaemon:
         # manager-signed founding roster (issue #2).
         self._anchor_roster = list(genesis_roster) if genesis_roster is not None else list(roster)
         self._anchor_epoch = genesis_epoch if genesis_roster is not None else epoch
-        self.cfg = QuorumConfig(roster=roster, epoch=epoch, client_fp=pub)
+        self.cfg = QuorumConfig(roster=roster, epoch=epoch, client_fp=self.key.public)
         self._lock = threading.Lock()  # guards store + chain head + frontier
         self._exhausted: set[bytes] = set()  # ops whose drive gave up -> `unknown`
         self._lost: dict[bytes, bytes] = {}  # our_op -> winner (a rival took the slot)
@@ -257,14 +257,14 @@ class ClientDaemon:
         without any key crossing the wire."""
         with self.store.read_txn() as tx:
             ops = tx.all_ops()
-        self.keyring = fold.keyring_from_wraps(ops, self.sk)
+        self.keyring = fold.keyring_from_wraps(ops, self.key)
 
     # ---- chain head + clock ------------------------------------------------ #
     def _chain_head(self) -> tuple[int, bytes]:
         """This client's next (seq, prev) — derived from its own ops in the store
         so a restart resumes the lineage (no session state)."""
         with self.store.read_txn() as tx:
-            mine = [o for o in tx.all_ops() if o.author == self.pub]
+            mine = [o for o in tx.all_ops() if o.author == self.key.public]
         if not mine:
             return 0, A.GENESIS_PREV
         head = max(mine, key=lambda o: o.seq)
@@ -291,7 +291,7 @@ class ClientDaemon:
         if self._closing.is_set():
             return None
         ep, to_pub = self.roster_addrs[node], self.cfg.roster[node]
-        link = Link(self.sk, self.pub, to_pub, ep)
+        link = Link(self.key, crypto.PublicKey(to_pub), ep)
         match link.request(
             b"", wire.encode_request(req), epoch=self.cfg.epoch, ts=int(time.time() * 1000)
         ):
@@ -307,7 +307,7 @@ class ClientDaemon:
         if self._closing.is_set():
             return None
         ep, to_pub = self.roster_addrs[node], self.cfg.roster[node]
-        link = Link(self.sk, self.pub, to_pub, ep)
+        link = Link(self.key, crypto.PublicKey(to_pub), ep)
         match link.request(b"gossip", req_body, epoch=self.cfg.epoch, ts=int(time.time() * 1000)):
             case lmsg.Reply(env):
                 return gossip.Delta.decode(env.body)
@@ -335,8 +335,7 @@ class ClientDaemon:
             hlc = self._next_hlc()
             if slot_tag is not None:
                 op: Op = A.CasOp.build(
-                    author_sk=self.sk,
-                    author_pub=self.pub,
+                    author=self.key,
                     seq=self._seq,
                     prev=self._prev,
                     hlc=hlc,
@@ -347,8 +346,7 @@ class ClientDaemon:
                 )
             else:
                 op = A.BlindPutOp.build(
-                    author_sk=self.sk,
-                    author_pub=self.pub,
+                    author=self.key,
                     seq=self._seq,
                     prev=self._prev,
                     hlc=hlc,

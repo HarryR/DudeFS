@@ -6,7 +6,7 @@ import unittest
 from dudefs import artifacts as A
 from dudefs import compactor, fold
 from dudefs.acceptor import Acceptor
-from dudefs.crypto import SIGNER
+from dudefs.crypto import SIGNER, SoftwareKeypair
 from dudefs.store import ChainStore
 from dudefs.transports.memory import Link, NetworkLinks
 from tests._builders import World, cut_of
@@ -83,7 +83,9 @@ class TestStaleFrontierRoster(unittest.TestCase):
         committed = A.retained_commitment(cr.retained)
 
         nsk = bytes([230] * 32)
-        acc = Acceptor(nsk, SIGNER.public(nsk), ChainStore(), config_epoch=0, delta_ms=10_000)
+        acc = Acceptor(
+            SoftwareKeypair.from_seed(nsk), ChainStore(), config_epoch=0, delta_ms=10_000
+        )
         with acc.store.write_txn() as tx:
             for o in below:
                 tx.append(o)
@@ -93,8 +95,7 @@ class TestStaleFrontierRoster(unittest.TestCase):
             self.assertIsNone(tx.get_op(first.op_hash))  # first is GC'd
 
         rop = A.RosterOp.build(
-            author_sk=w.mgr_sk,
-            author_pub=w.mgr_pub,
+            author=SoftwareKeypair.from_seed(w.mgr_sk),
             seq=0,
             prev=A.GENESIS_PREV,
             hlc=A.HLC(NOW, 0),

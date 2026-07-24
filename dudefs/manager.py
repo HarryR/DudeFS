@@ -12,6 +12,7 @@ import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum, auto
+from typing import TypedDict, Unpack
 
 from . import artifacts as A
 from . import crypto as C
@@ -26,23 +27,45 @@ from .store import ChainStore, ReadTxn
 type NodeRPC = Callable[[bytes, Request], Response | None]
 
 
+class ManagerMeta(TypedDict, total=False):
+    """The manager's non-derivable persisted state (store meta, JSON). NOT log-derived:
+    `masters` are the per-keyepoch group secrets (keyepoch-as-str -> hex, finding 21);
+    `learners`/`roster_seed` are local membership intent (pubkey hex). `total=False` —
+    a write sets one or a few keys at a time."""
+
+    masters: dict[str, str]
+    learners: list[str]
+    roster_seed: list[str]
+
+
+class CertView(TypedDict):
+    """One row of the manager's human-facing cert inventory (re-derived from the log
+    each refold). Hex/decoded for display, not the wire form."""
+
+    subject: str
+    caps: list[str]
+    epoch: int
+    revoked: bool
+
+
 class ManagerError(Exception):
     """An operator-facing precondition failure (bad roster change, missing learner,
     init over existing state). Typed so callers branch on it instead of parsing
     strings; the CLI maps it to an exit code."""
 
 
-def mint_identity(d: str, role: str = "node") -> tuple[bytes, str, bytes]:
+def mint_identity(d: str, role: str = "node") -> tuple[C.PublicKey, str, bytes]:
     """Mint a principal's identity keyfile in its OWN dir (`<role>.key`, 0600) and return
     (pub, keyfile, proof-of-possession). Keys generate where they live (NOTES 58): the sk
     never leaves this dir — only `pub` + `pop` travel to `mgr <role> authorize`. This is the
     `<role> init` primitive; the manager never sees the key."""
     os.makedirs(d, exist_ok=True)
-    key = os.urandom(32)
+    seed = os.urandom(32)
+    kp = C.SoftwareKeypair.from_seed(seed)
     keyfile = os.path.join(d, f"{role}.key")
     with open(os.open(keyfile, os.O_WRONLY | os.O_CREAT, 0o600), "wb") as f:
-        f.write(key)
-    return C.SIGNER.public(key), keyfile, C.prove_possession(key)
+        f.write(seed)
+    return kp.public, keyfile, kp.prove_possession()
 
 
 # --------------------------------------------------------------------------- #
@@ -60,11 +83,12 @@ class ManagerState:
     (transactional with the log), and `root_key` in a 0600 file. Idempotent + resumable
     (MANAGER §2): reload re-folds the log to the same view."""
 
-    def __init__(self, dir: str, store: ChainStore, root_key: bytes, manager_pub: bytes):
+    def __init__(self, dir: str, store: ChainStore, root: C.Keypair):
         self.dir = dir
         self.store = store
-        self.root_key = root_key
-        self.manager_pub = manager_pub
+        # `root` is the manager's sole identity: it signs every control op, authenticates
+        # the root's L_msg drive, and its `.public` is the `manager_pub`. No raw seed held.
+        self.root = root
         self._refold()
 
     @staticmethod
@@ -80,7 +104,7 @@ class ManagerState:
         db_p, key_p = cls._paths(d)
         with open(key_p, "rb") as f:
             root_key = f.read()
-        return cls(d, ChainStore(db_p), root_key, C.SIGNER.public(root_key))
+        return cls(d, ChainStore(db_p), C.SoftwareKeypair.from_seed(root_key))
 
     # ---- non-derivable persistence (secrets + local intent) in store meta --- #
     @staticmethod
@@ -88,7 +112,7 @@ class ManagerState:
         raw = tx.get_meta(key)
         return json.loads(raw) if raw else default
 
-    def _set_meta(self, **kv: object) -> None:
+    def _set_meta(self, **kv: Unpack[ManagerMeta]) -> None:
         """Persist one or more meta values (JSON) in a single transaction, then
         re-derive the view."""
         with self.store.write_txn() as tx:
@@ -98,8 +122,8 @@ class ManagerState:
 
     # ---- the folded view (never hand-mutated) ----------------------------- #
     def _refold(self) -> None:
-        cs = fold.ControlState(self.manager_pub)
-        certs: list[dict] = []
+        cs = fold.ControlState(self.root.public)
+        certs: list[CertView] = []
         with self.store.read_txn() as tx:
             # the manager is the sole author, so its ops fold in hlc (= authoring) order.
             ops = sorted(tx.all_ops(), key=lambda o: (o.hlc.as_tuple(), o.op_hash))
@@ -156,14 +180,13 @@ class ManagerState:
         signs + constructs the op, so an unratified roster change is just a built-but-unpersisted
         op (a crash-retry rebuilds the identical op; the head is unchanged until persist)."""
         return {
-            "author_sk": self.root_key,
-            "author_pub": self.manager_pub,
+            "author": self.root,
             "seq": self.mseq,
             "prev": self.mprev,
             "hlc": A.HLC(self.mhlc + 1, 0),
         }
 
-    def persist(self, op: Op, *, meta: dict[str, object] | None = None) -> None:
+    def persist(self, op: Op, *, meta: ManagerMeta | None = None) -> None:
         """Commit an op to the log — plus any `meta` (secret/intent that must land
         atomically with it, e.g. a rotate's new master) — in ONE write transaction, then
         re-derive the view. A crash leaves log and view consistent because the view IS
@@ -174,7 +197,7 @@ class ManagerState:
                 tx.set_meta(k, json.dumps(v).encode())
         self._refold()
 
-    def author_control(self, op: Op, *, meta: dict[str, object] | None = None) -> Op:
+    def author_control(self, op: Op, *, meta: ManagerMeta | None = None) -> Op:
         """Persist an already-built root-signed control op (the common case: the op is
         effective the moment it is authored — certs, endpoints, rotate, fiat recovery).
         The caller builds the typed leaf via `A.<Leaf>.build(**self._head(), ...)`."""
@@ -260,16 +283,16 @@ class Manager:
         os.makedirs(d, exist_ok=True)
         if ManagerState.exists(d):
             raise ManagerError(f"state already exists at {d} (init is genesis-only)")
-        root_key = os.urandom(32)
+        root_seed = os.urandom(32)
         db_p, key_p = ManagerState._paths(d)
         with open(os.open(key_p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb") as f:
-            f.write(root_key)
+            f.write(root_seed)
         store = ChainStore(db_p)
         with store.write_txn() as tx:  # seed the non-derivable genesis state (one txn)
             tx.set_meta("masters", json.dumps({"0": os.urandom(32).hex()}).encode())  # finding 21
             tx.set_meta("learners", json.dumps([]).encode())
             tx.set_meta("roster_seed", json.dumps([]).encode())
-        return cls(ManagerState(d, store, root_key, C.SIGNER.public(root_key)))
+        return cls(ManagerState(d, store, C.SoftwareKeypair.from_seed(root_seed)))
 
     def node_genesis(self, pub: bytes, pop: bytes, addrs: list[str]) -> Op:
         """Seat the founding voting node at cluster genesis (CLI.md §3), unilaterally — no
@@ -461,7 +484,7 @@ class Manager:
         op = A.RosterOp.build(
             **self.state._head(), from_epoch=epoch, roster=new_roster, sync_frontier=sf
         )
-        ballot = A.Ballot(1, A.slot_priority(tag, self.state.manager_pub))
+        ballot = A.Ballot(1, A.slot_priority(tag, self.state.root.public))
 
         old_qc = self._gather(
             old_roster,

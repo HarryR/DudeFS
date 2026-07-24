@@ -28,8 +28,7 @@ BIG = 1_000_000
 def _daemon(w, i, roster):
     sk = bytes([200 + i] * 32)
     return NodeDaemon(
-        sk,
-        C.SIGNER.public(sk),
+        C.SoftwareKeypair.from_seed(sk),
         roster=roster,
         manager_pub=w.mgr_pub,
         control_ops=w.control_ops,  # certs the clients so the peer gate admits them
@@ -217,8 +216,7 @@ class TestSealedMode(unittest.TestCase):
         op = creation_op(w, 0, b"v")
         assert isinstance(op, A.Slotted)
         link = Link(
-            w.clients[0].sk,
-            w.clients[0].pub,
+            w.clients[0].key,
             d.pub,
             transports.Endpoint(transports.HTTP, uri, sealed=True),
         )
@@ -243,7 +241,7 @@ class TestSealedMode(unittest.TestCase):
         op = creation_op(w, 0, b"v")
         assert isinstance(op, A.Slotted)
         plain = Link(  # a PLAIN link to the sealed endpoint (mismatched profile)
-            w.clients[0].sk, w.clients[0].pub, d.pub, transports.Endpoint(transports.HTTP, uri)
+            w.clients[0].key, d.pub, transports.Endpoint(transports.HTTP, uri)
         )
         out = plain.request(
             b"",
@@ -280,7 +278,7 @@ class TestHttpCarrier(unittest.TestCase):
             w.clients[0].sk, d.pub, N.AcceptReq(op.slot_tag, A.Ballot(1, b"x"), op), ts=d._clock()
         )
         raw = transports.dial(transports.HTTP, uri, out)
-        match lmsg.classify_reply(raw, expect_from=d.pub, expect_to=w.clients[0].pub):
+        match lmsg.classify_reply(raw, expect_from=d.pub, expect_to=w.clients[0].key.public):
             case lmsg.Reply(env):
                 resp = wire.decode_response(env.body)
             case _:
@@ -388,7 +386,9 @@ class TestDaemonAdoption(unittest.TestCase):
         # a quorum-committed checkpoint: a QC over its op_hash from the roster
         sks = [bytes([200 + i] * 32) for i in range(3)]
         recs = [
-            A.Receipt.issue(sks[i], roster[i], ckpt.op_hash, 0, A.Ballot(1, b"c"), 1)
+            A.Receipt.issue(
+                C.SoftwareKeypair.from_seed(sks[i]), ckpt.op_hash, 0, A.Ballot(1, b"c"), 1
+            )
             for i in range(3)
         ]
         with d.store.write_txn() as tx:
@@ -437,7 +437,9 @@ class TestDaemonAdoption(unittest.TestCase):
         fake = [bytes([100 + i] * 32) for i in range(3)]
         fake_pubs = [C.SIGNER.public(s) for s in fake]
         recs = [
-            A.Receipt.issue(fake[i], fake_pubs[i], ckpt.op_hash, 0, A.Ballot(1, b"c"), 1)
+            A.Receipt.issue(
+                C.SoftwareKeypair.from_seed(fake[i]), ckpt.op_hash, 0, A.Ballot(1, b"c"), 1
+            )
             for i in range(3)
         ]
         with d.store.write_txn() as tx:
@@ -486,7 +488,9 @@ class TestDaemonAdoption(unittest.TestCase):
                 tx.append(o)
         sks = [bytes([200 + i] * 32) for i in range(3)]
         recs = [
-            A.Receipt.issue(sks[i], roster[i], ckpt.op_hash, 0, A.Ballot(1, b"c"), 1)
+            A.Receipt.issue(
+                C.SoftwareKeypair.from_seed(sks[i]), ckpt.op_hash, 0, A.Ballot(1, b"c"), 1
+            )
             for i in range(3)
         ]
         with d.store.write_txn() as tx:
@@ -574,7 +578,9 @@ class TestAdoptionValidityGate(unittest.TestCase):
         )
         sks = [bytes([200 + i] * 32) for i in range(3)]
         recs = [
-            A.Receipt.issue(sks[i], roster[i], ckpt.op_hash, 0, A.Ballot(1, b"c"), 1)
+            A.Receipt.issue(
+                C.SoftwareKeypair.from_seed(sks[i]), ckpt.op_hash, 0, A.Ballot(1, b"c"), 1
+            )
             for i in range(3)
         ]
         with d.store.write_txn() as tx:
@@ -764,7 +770,9 @@ class TestFreshBootstrap(unittest.TestCase):
                 tx.append(o)
         sks = [bytes([200 + i] * 32) for i in range(3)]
         recs = [
-            A.Receipt.issue(sks[i], roster[i], ckpt.op_hash, 0, A.Ballot(1, b"c"), 1)
+            A.Receipt.issue(
+                C.SoftwareKeypair.from_seed(sks[i]), ckpt.op_hash, 0, A.Ballot(1, b"c"), 1
+            )
             for i in range(3)
         ]
         with d.store.write_txn() as tx:
@@ -802,8 +810,7 @@ class TestDaemonFence(unittest.TestCase):
         roster = [C.SIGNER.public(bytes([200] * 32))]
         d = _daemon(w, 0, roster)
         rckpt = A.CheckpointOp.build(
-            author_sk=w.mgr_sk,
-            author_pub=w.mgr_pub,
+            author=C.SoftwareKeypair.from_seed(w.mgr_sk),
             seq=0,
             prev=A.GENESIS_PREV,
             hlc=A.HLC(500, 0),
@@ -815,8 +822,7 @@ class TestDaemonFence(unittest.TestCase):
             checkpoint_seq=0,
         )
         rop = A.RosterOp.build(
-            author_sk=w.mgr_sk,
-            author_pub=w.mgr_pub,
+            author=C.SoftwareKeypair.from_seed(w.mgr_sk),
             seq=1,
             prev=rckpt.op_hash,
             hlc=A.HLC(501, 0),
@@ -846,8 +852,7 @@ class TestDaemonEvidence(unittest.TestCase):
         nsk = bytes([200] * 32)
         npub = C.SIGNER.public(nsk)
         d = NodeDaemon(
-            nsk,
-            npub,
+            C.SoftwareKeypair.from_seed(nsk),
             roster=[npub],
             manager_pub=w.mgr_pub,
             control_ops=w.control_ops,
@@ -878,8 +883,7 @@ class TestDaemonEvidence(unittest.TestCase):
         nsk = bytes([200] * 32)
         npub = C.SIGNER.public(nsk)
         d = NodeDaemon(
-            nsk,
-            npub,
+            C.SoftwareKeypair.from_seed(nsk),
             roster=[npub],
             manager_pub=w.mgr_pub,
             control_ops=w.control_ops,
@@ -922,7 +926,7 @@ class TestDaemonSocket(unittest.TestCase):
             cli.sendall(wire.frame(out))
             reply = wire.read_frame(cli.recv)
             assert reply is not None
-            match lmsg.classify_reply(reply, expect_from=d.pub, expect_to=w.clients[0].pub):
+            match lmsg.classify_reply(reply, expect_from=d.pub, expect_to=w.clients[0].key.public):
                 case lmsg.Reply(env):
                     resp = wire.decode_response(env.body)
                 case _:
@@ -950,7 +954,7 @@ class TestJointCertActivation(unittest.TestCase):
         new = [old[0], old[1], fresh]
         nodes = {}
         for pub, sk in zip([*old, fresh], [*old_sks, fresh_sk], strict=True):
-            acc = Acceptor(sk, pub, ChainStore(), 0, BIG)
+            acc = Acceptor(C.SoftwareKeypair.from_seed(sk), ChainStore(), 0, BIG)
             with acc.store.write_txn() as tx:
                 tx.append(base)
             nodes[pub] = LocalNode(acc, lambda: 100)
@@ -959,10 +963,9 @@ class TestJointCertActivation(unittest.TestCase):
 
     def _fresh_daemon(self, m, old, old_sks):
         return NodeDaemon(
-            old_sks[0],
-            old[0],
+            C.SoftwareKeypair.from_seed(old_sks[0]),
             roster=list(old),
-            manager_pub=m.state.manager_pub,
+            manager_pub=m.state.root.public,
             clock=lambda: 100,
             delta_ms=BIG,
         )
@@ -1058,10 +1061,9 @@ class TestLearnerOnboarding(unittest.TestCase):
             base = w.blind(0, [], [[A.Mutation.SET, b"k", b"v"]])  # committed data, held by n0
             daemons = [
                 NodeDaemon(
-                    sks[i],
-                    pubs[i],
+                    C.SoftwareKeypair.from_seed(sks[i]),
                     roster=[pubs[0]],
-                    manager_pub=m.state.manager_pub,
+                    manager_pub=m.state.root.public,
                     control_ops=certs,  # the synced STORE certs -> the gate admits the learners
                     clock=lambda: 100,
                     delta_ms=BIG,

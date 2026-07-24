@@ -83,8 +83,7 @@ class TestReceiptsQCs(unittest.TestCase):
         with s.write_txn() as tx:
             tx.append(op)
         nsk = bytes([5] * 32)
-        npub = C.SIGNER.public(nsk)
-        r = A.Receipt.issue(nsk, npub, op.op_hash, 0, A.BLIND, 1)
+        r = A.Receipt.issue(C.SoftwareKeypair.from_seed(nsk), op.op_hash, 0, A.BLIND, 1)
         with s.write_txn() as tx:
             tx.put_receipt(r)
         with s.read_txn() as tx:

@@ -20,11 +20,10 @@ def make_cluster(
     """n honest LocalNodes (config epoch 0) sharing one injected clock."""
     nodes = []
     for i in range(n):
-        sk = bytes([200 + i] * 32)
-        pub = C.SIGNER.public(sk)
-        acc = Acceptor(sk, pub, ChainStore(), config_epoch=0, delta_ms=delta)
+        key = C.SoftwareKeypair.from_seed(bytes([200 + i] * 32))
+        acc = Acceptor(key, ChainStore(), config_epoch=0, delta_ms=delta)
         nodes.append(N.LocalNode(acc, clock))
-    return nodes, [nd.acc.pub for nd in nodes]
+    return nodes, [nd.acc.node.public for nd in nodes]
 
 
 def cfg_for(roster: list[bytes], client_pub: bytes, **kw) -> QuorumConfig:

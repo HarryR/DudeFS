@@ -406,7 +406,7 @@ class Commit:
             and isinstance(result, Slotted)
             and result.op_hash == self.fetch_hash
             and result.slot_tag == self.tag
-            and result.verify_sig(result.author)
+            and result.verify_sig()
         ):
             self.chosen = result
             return self._begin_accept(now)

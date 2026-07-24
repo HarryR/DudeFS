@@ -29,7 +29,7 @@ from contextlib import contextmanager
 from enum import StrEnum
 
 from . import artifacts as A
-from . import codec, tunables
+from . import codec, crypto, tunables
 from .artifacts import BLIND, HLC, QC, Ballot, Heads, Op, Receipt
 from .errors import DudeFSError
 
@@ -67,7 +67,7 @@ def _wm_from(p) -> A.Watermark:
         HLC(codec.as_int(p[0]), codec.as_int(p[1])),
         codec.as_int(p[2]),
         codec.as_int(p[3]),
-        codec.as_bytes(p[4]),
+        crypto.PublicKey(codec.as_bytes(p[4])),
         codec.as_bytes(p[5]),
     )
 
@@ -156,8 +156,8 @@ class ForkEvidence:
             a.author == b.author == self.author
             and a.seq == b.seq == self.seq
             and a.op_hash != b.op_hash
-            and a.verify_sig(a.author)
-            and b.verify_sig(b.author)
+            and a.verify_sig()
+            and b.verify_sig()
         )
 
 
@@ -385,7 +385,9 @@ class ReadTxn:
     # ---- receipts & QCs --------------------------------------------------- #
 
     def _row_to_receipt(self, oh, ep, ballot, signer, sig, seq) -> Receipt:
-        return A.Receipt(oh, ep, Ballot.decode(codec.decode(ballot)), int(seq), signer, sig)
+        return A.Receipt(
+            oh, ep, Ballot.decode(codec.decode(ballot)), int(seq), crypto.PublicKey(signer), sig
+        )
 
     def receipts_for(self, op_hash: bytes) -> list[Receipt]:
         return [
@@ -617,7 +619,7 @@ class WriteTxn(ReadTxn):
         self._c.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", (key, value))
 
     def append(self, op: Op) -> AppendResult:
-        if not (op.verify_structure() and op.verify_sig(op.author)):
+        if not (op.verify_structure() and op.verify_sig()):
             return AppendResult(AppendStatus.INVALID)  # caller drops (not stored)
         existing = self._c.execute(
             "SELECT op_hash, raw FROM ops WHERE author=? AND seq=?", (op.author, op.seq)

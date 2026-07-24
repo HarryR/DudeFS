@@ -35,12 +35,10 @@ def cmd_init(args: argparse.Namespace) -> int:
 
 def cmd_serve(args: argparse.Namespace) -> int:
     with open(os.path.join(args.dir, "node.key"), "rb") as f:
-        sk = f.read()
-    pub = C.SIGNER.public(sk)
+        seed = f.read()
     b = Bootstrap.read(args.dir)
     d = NodeDaemon(
-        sk,
-        pub,
+        C.SoftwareKeypair.from_seed(seed),
         store_path=os.path.join(args.dir, "store.sqlite"),
         roster=b.roster,
         manager_pub=b.manager_pub,
@@ -51,7 +49,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
     d.refresh_peers()  # dial peers from the ENDPOINT records in the seeded control chain
     stop = threading.Event()
     threading.Thread(target=d.run_periodic, args=(GOSSIP_PERIOD_S, stop), daemon=True).start()
-    print(f"node {pub.hex()[:16]}… serving on {args.listen} (epoch {b.epoch})")
+    print(f"node {d.pub.hex()[:16]}… serving on {args.listen} (epoch {b.epoch})")
     try:
         d.serve_forever(args.listen)
     except KeyboardInterrupt:

@@ -20,7 +20,9 @@
 from __future__ import annotations
 
 import hashlib
+from abc import ABC, abstractmethod
 from collections.abc import Iterable
+from typing import Self
 
 import nacl.bindings
 import nacl.exceptions
@@ -192,6 +194,93 @@ def prove_possession(sk: bytes) -> bytes:
 def verify_possession(pub: bytes, pop: bytes) -> bool:
     """The manager's check before certifying `pub` — never certify an unheld key."""
     return SIGNER.verify(pub, _POP_PREFIX + pub, pop)
+
+
+# --------------------------------------------------------------------------- #
+# PublicKey / Keypair — the typed key face (no raw blobs above L0)             #
+# --------------------------------------------------------------------------- #
+
+
+class PublicKey(bytes):
+    """An Ed25519 verify key — 32 bytes WITH identity. A `bytes` subclass, so it is
+    still a dict key, encodes as itself on the wire, and compares equal to the raw
+    pubkey already stored in envelopes (decode just wraps it — zero wire change). It
+    carries the public-key operations so nothing above L0 hands a raw blob to the
+    suite. Suite-agnostic face (Ed25519 today); maps to a Rust newtype."""
+
+    __slots__ = ()
+
+    def verify(self, msg: bytes, sig: bytes) -> bool:
+        return _ed25519_verify(self, msg, sig)
+
+    def seal(self, msg: bytes) -> bytes:
+        """Wrap `msg` TO this key (sbx1 anonymous sealed box) — group-key distribution
+        in a WRAP_SET (DESIGN §3)."""
+        return seal_to(self, msg)
+
+    def verify_possession(self, pop: bytes) -> bool:
+        """Check the subject's self-attestation that it holds the matching secret."""
+        return self.verify(_POP_PREFIX + self, pop)
+
+    def fingerprint(self) -> bytes:
+        return h(self)
+
+
+class Keypair(ABC):
+    """A signing IDENTITY — the private half of a key as a TRAIT, not a seed. The
+    secret may live in software (`SoftwareKeypair`) or behind a TEE/TPM (a future
+    backend whose `sign` delegates to hardware); consumers hold a `Keypair` and NEVER
+    see a raw secret. Maps to a Rust trait. Signing and decryption share one Ed25519
+    identity today (`open_sealed` uses its X25519 conversion) — a hardware backend may
+    split them (`Signer` + `Decrypter`), the obvious future seam."""
+
+    __slots__ = ()
+
+    @property
+    @abstractmethod
+    def public(self) -> PublicKey: ...
+
+    @abstractmethod
+    def sign(self, msg: bytes) -> bytes: ...
+
+    @abstractmethod
+    def open_sealed(self, blob: bytes) -> bytes | None:
+        """Open a sealed box addressed to this identity (recover a wrapped group key)."""
+
+    def prove_possession(self) -> bytes:
+        """Self-attest holding this identity (NOTES 58) — a default over `sign`, so no
+        backend overrides it. Keys generate where they live; only pub + pop travel."""
+        return self.sign(_POP_PREFIX + self.public)
+
+
+class SoftwareKeypair(Keypair):
+    """The in-process backend: an Ed25519 seed in memory (CLI keyfiles, tests, the sim).
+    The seed is PRIVATE — never exposed on the `Keypair` interface — so swapping in a
+    TEE/TPM backend is transparent to every consumer."""
+
+    __slots__ = ("_public", "_seed")
+
+    def __init__(self, seed: bytes):
+        self._seed = seed
+        self._public = PublicKey(_ed25519_public(seed))
+
+    @classmethod
+    def generate(cls) -> Self:
+        return cls(bytes(nacl.signing.SigningKey.generate()))
+
+    @classmethod
+    def from_seed(cls, seed: bytes) -> Self:
+        return cls(seed)
+
+    @property
+    def public(self) -> PublicKey:
+        return self._public
+
+    def sign(self, msg: bytes) -> bytes:
+        return _ed25519_sign(self._seed, msg)
+
+    def open_sealed(self, blob: bytes) -> bytes | None:
+        return open_sealed(self._seed, blob)
 
 
 # --------------------------------------------------------------------------- #

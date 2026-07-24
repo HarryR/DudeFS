@@ -32,7 +32,10 @@ class TestQCBitmapStrictness(unittest.TestCase):
 
     def test_overlong_bitmap_is_false(self):
         oph = bytes([7] * 32)
-        rs = [A.Receipt.issue(self.sks[i], self.pubs[i], oph, 0, A.BLIND, 1) for i in (0, 1, 2)]
+        rs = [
+            A.Receipt.issue(C.SoftwareKeypair.from_seed(self.sks[i]), oph, 0, A.BLIND, 1)
+            for i in (0, 1, 2)
+        ]
         qc = A.QC.assemble(rs, self.n, self.index)
         self.assertTrue(qc.verify(self.pubs))
         padded = A.QC(
@@ -47,7 +50,10 @@ class TestQCBitmapStrictness(unittest.TestCase):
 
     def test_stray_bits_beyond_n_are_false(self):
         oph = bytes([7] * 32)
-        rs = [A.Receipt.issue(self.sks[i], self.pubs[i], oph, 0, A.BLIND, 1) for i in (0, 1, 2)]
+        rs = [
+            A.Receipt.issue(C.SoftwareKeypair.from_seed(self.sks[i]), oph, 0, A.BLIND, 1)
+            for i in (0, 1, 2)
+        ]
         qc = A.QC.assemble(rs, self.n, self.index)
         bm = bytearray(qc.signer_bitmap)
         bm[-1] |= 0x01  # a bit above roster index n-1; same signer set, second encoding
@@ -200,8 +206,7 @@ class TestLane2Fence(unittest.TestCase):
         w = World(seed=14, n_clients=1)
         ops = list(w.all_control())
         op = A.RotateOp.build(
-            author_sk=w.mgr_sk,
-            author_pub=w.mgr_pub,
+            author=C.SoftwareKeypair.from_seed(w.mgr_sk),
             seq=w._mseq,
             prev=w._mprev,
             hlc=w.tick(),
@@ -256,7 +261,7 @@ class TestSubmitGates(unittest.TestCase):
 
     def _acceptor(self):
         nsk = bytes([77] * 32)
-        return Acceptor(nsk, C.SIGNER.public(nsk), ChainStore(), 0, DELTA)
+        return Acceptor(C.SoftwareKeypair.from_seed(nsk), ChainStore(), 0, DELTA)
 
     def _blind(self, w, ci, hlc_ms):
         txn = A.Txn(slot=None, guards=[], mutations=[[A.Mutation.SET, b"a", b"1"]])

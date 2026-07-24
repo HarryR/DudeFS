@@ -104,7 +104,7 @@ class TestWALConcurrency(unittest.TestCase):
         w = World(seed=3, n_clients=2)
         with tempfile.TemporaryDirectory() as d:
             nsk = bytes([200] * 32)
-            acc = Acceptor(nsk, C.SIGNER.public(nsk), _file_store(d), 0, 10**9)
+            acc = Acceptor(C.SoftwareKeypair.from_seed(nsk), _file_store(d), 0, 10**9)
             guards = [[A.Guard.ABSENT, KEY]]
             op_a = w.cas(0, KEY, A.VERSION_ABSENT, 0, guards, [[A.Mutation.SET, KEY, b"A"]])
             op_b = w.cas(1, KEY, A.VERSION_ABSENT, 0, guards, [[A.Mutation.SET, KEY, b"B"]])
@@ -260,8 +260,7 @@ class TestDurableRestart(unittest.TestCase):
 
             def _node() -> NodeDaemon:
                 return NodeDaemon(
-                    nsk,
-                    roster[0],
+                    C.SoftwareKeypair.from_seed(nsk),
                     path,
                     roster=roster,
                     manager_pub=w.mgr_pub,

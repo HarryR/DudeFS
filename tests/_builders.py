@@ -9,7 +9,7 @@ from __future__ import annotations
 import random
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import partial
 
 from dudefs import artifacts as A
@@ -59,12 +59,13 @@ def unix_peer(pub: bytes, path: str):
 
 def enveloped(sk: bytes, to_pub: bytes, req, *, epoch: int = 0, ts: int | None = None) -> bytes:
     """Wrap a node Request in a signed L_msg envelope — the cluster wire since the
-    §7.5 cutover (a bare request no longer reaches a gated daemon)."""
+    §7.5 cutover (a bare request no longer reaches a gated daemon). Takes a raw seed at
+    this test boundary and lifts it to a Keypair (the sole seed→identity conversion)."""
     from dudefs import lmsg, wire
 
     return lmsg.author(
-        sk,
-        to_pub,
+        C.SoftwareKeypair.from_seed(sk),
+        C.PublicKey(to_pub),
         b"",
         wire.encode_request(req),
         epoch=epoch,
@@ -81,7 +82,8 @@ def call_node(daemon, sk: bytes, req, *, epoch: int = 0, ts: int | None = None):
     reply = daemon.serve(enveloped(sk, daemon.pub, req, epoch=epoch, ts=ts))
     if reply is None:
         return None
-    match lmsg.classify_reply(reply, expect_from=daemon.pub, expect_to=C.SIGNER.public(sk)):
+    expect_to = C.SoftwareKeypair.from_seed(sk).public
+    match lmsg.classify_reply(reply, expect_from=daemon.pub, expect_to=expect_to):
         case lmsg.Reply(env):
             return wire.decode_response(env.body)
         case _fault:  # NoReply / MalformedReply / WrongPeer
@@ -90,7 +92,7 @@ def call_node(daemon, sk: bytes, req, *, epoch: int = 0, ts: int | None = None):
 
 def cut_of(w: World) -> A.Heads:
     """The frontier of everything authored so far (per-author (seq, prev))."""
-    cut = {c.pub: (c.seq - 1, c.prev) for c in w.clients if c.seq > 0}
+    cut: A.Heads = {c.pub: (c.seq - 1, c.prev) for c in w.clients if c.seq > 0}
     cut[w.mgr_pub] = (w._mseq - 1, w._mprev)
     return cut
 
@@ -109,12 +111,18 @@ def _seed_keypair(rng: random.Random) -> tuple[bytes, bytes]:
 
 @dataclass
 class Client:
-    """A client's signing identity + its mutable chain head (seq/prev)."""
+    """A client's signing identity + its mutable chain head (seq/prev). `key` is the
+    typed authoring identity; the raw `sk` is retained for the forging helpers (which
+    hand-sign arbitrary/garbage envelopes the typed builds refuse to author)."""
 
     sk: bytes
     pub: bytes
     seq: int = 0
     prev: bytes = A.GENESIS_PREV
+    key: C.Keypair = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.key = C.SoftwareKeypair.from_seed(self.sk)
 
 
 class World:
@@ -124,6 +132,7 @@ class World:
     def __init__(self, seed: int = 0, n_clients: int = 2, epochs: tuple[int, ...] = (0,)):
         self.rng = random.Random(seed)
         self.mgr_sk, self.mgr_pub = _seed_keypair(self.rng)
+        self.mgr_key: C.Keypair = C.SoftwareKeypair.from_seed(self.mgr_sk)
         self.genesis: fold.Genesis = {"manager_pub": self.mgr_pub}
         # a per-epoch master; the working keyring DERIVES from it (finding 21), and the same
         # master is back-wrapped to each client below so a ClientDaemon reconstructs the very
@@ -164,8 +173,7 @@ class World:
         op is re-ingested via `from_bytes` so its LEAF identity comes from its bytes (a
         malformed body — e.g. an even roster — resolves to InvalidOp, mirroring the wire)."""
         built = build(
-            author_sk=self.mgr_sk,
-            author_pub=self.mgr_pub,
+            author=self.mgr_key,
             seq=self._mseq,
             prev=self._mprev,
             hlc=self.tick(),
@@ -232,12 +240,9 @@ class World:
         baseline = A.Baseline(cut or {}, retained or {}, frozenset(dead or []))
         cseq = seq  # the checkpoint (body) sequence — distinct from the envelope seq below
 
-        def _build(
-            *, author_sk: bytes, author_pub: bytes, seq: int, prev: bytes, hlc: A.HLC
-        ) -> A.Op:
+        def _build(*, author: C.Keypair, seq: int, prev: bytes, hlc: A.HLC) -> A.Op:
             op = A.CheckpointOp.build(
-                author_sk=author_sk,
-                author_pub=author_pub,
+                author=author,
                 seq=seq,
                 prev=prev,
                 hlc=hlc,
@@ -273,8 +278,7 @@ class World:
         op: A.Op
         if slot_tag is None:
             op = A.BlindPutOp.build(
-                author_sk=c.sk,
-                author_pub=c.pub,
+                author=c.key,
                 seq=c.seq,
                 prev=c.prev,
                 hlc=hlc,
@@ -284,8 +288,7 @@ class World:
             )
         else:
             op = A.CasOp.build(
-                author_sk=c.sk,
-                author_pub=c.pub,
+                author=c.key,
                 seq=c.seq,
                 prev=c.prev,
                 hlc=hlc,

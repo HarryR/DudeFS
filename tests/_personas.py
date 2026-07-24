@@ -28,7 +28,7 @@ class EquivocatingAcceptor(Acceptor):
     def on_accept(
         self, tag: bytes, ballot: Ballot, op: Op, now_ms: int, *, receipt_epoch: int | None = None
     ) -> AcceptResult:
-        if not (op.verify_structure() and op.verify_sig(op.author)):
+        if not (op.verify_structure() and op.verify_sig()):
             return Rejected(RejectReason.BAD_STRUCTURE)
         if not isinstance(op, A.Slotted) or op.slot_tag != tag:
             return Rejected(RejectReason.BAD_STRUCTURE)

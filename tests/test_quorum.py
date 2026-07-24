@@ -37,10 +37,11 @@ def _cluster(n, delta=BIG_DELTA):
     nodes = []
     for i in range(n):
         sk = bytes([200 + i] * 32)
-        pub = C.SIGNER.public(sk)
-        acc = Acceptor(sk, pub, ChainStore(), config_epoch=0, delta_ms=delta)
+        acc = Acceptor(
+            C.SoftwareKeypair.from_seed(sk), ChainStore(), config_epoch=0, delta_ms=delta
+        )
         nodes.append(N.LocalNode(acc, clk))
-    roster = [nd.acc.pub for nd in nodes]
+    roster = [nd.acc.node.public for nd in nodes]
     return nodes, roster
 
 

@@ -64,8 +64,7 @@ class _Fixture:
         self.nodes = []
         for i in range(3):
             nd = NodeDaemon(
-                node_sks[i],
-                self.roster[i],
+                C.SoftwareKeypair.from_seed(node_sks[i]),
                 roster=self.roster,
                 manager_pub=w.mgr_pub,
                 control_ops=w.control_ops,
@@ -80,8 +79,7 @@ class _Fixture:
         for i, nd in enumerate(self.nodes):  # wire node gossip so a lagging baseline fills
             nd.peers = [Peer(self.roster[j], addrs[j]) for j in range(3) if j != i]
         self.client = ClientDaemon(
-            w.clients[0].sk,
-            w.clients[0].pub,
+            C.SoftwareKeypair.from_seed(w.clients[0].sk),
             roster=self.roster,
             roster_addrs=addrs,
             manager_pub=w.mgr_pub,
@@ -98,8 +96,7 @@ class _Fixture:
 
     def _new_compactor(self) -> CompactorDaemon:
         return CompactorDaemon(
-            self._comp_sk,
-            self.comp_pub,
+            C.SoftwareKeypair.from_seed(self._comp_sk),
             roster=self.roster,
             roster_addrs=self._addrs,
             manager_pub=self.w.mgr_pub,
@@ -123,8 +120,7 @@ class _Fixture:
     def make_comp2(self) -> CompactorDaemon:
         """A second, distinct-identity compactor on its own durable store (concurrent/failover)."""
         return CompactorDaemon(
-            self._comp2_sk,
-            self.comp2_pub,
+            C.SoftwareKeypair.from_seed(self._comp2_sk),
             roster=self.roster,
             roster_addrs=self._addrs,
             manager_pub=self.w.mgr_pub,

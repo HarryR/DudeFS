@@ -33,7 +33,7 @@ def emit(st: ManagerState) -> dict:
         control_ops = [o.raw.hex() for o in sorted(tx.all_ops(), key=lambda o: o.seq)]
     roster = [{"pub": p.hex(), "ep": _ep_json(st.dial(p.hex()))} for p in st.roster]
     return {
-        "manager_pub": st.manager_pub.hex(),
+        "manager_pub": st.root.public.hex(),
         "epoch": st.epoch,
         "roster": roster,
         "control_ops": control_ops,

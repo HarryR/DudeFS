@@ -481,8 +481,7 @@ class TestAuthzAndVersioning(unittest.TestCase):
         c = w.clients[0]
         txn = A.Txn(None, [], [[A.Mutation.SET, b"k", b"v"]])
         op = A.BlindPutOp.build(
-            author_sk=c.sk,
-            author_pub=c.pub,
+            author=C.SoftwareKeypair.from_seed(c.sk),
             seq=0,
             prev=A.GENESIS_PREV,
             hlc=w.tick(),
@@ -544,8 +543,7 @@ class TestRostersByEpoch(unittest.TestCase):
             w._mgr_op(partial(A.CertIssueOp.build, subject=cpub, caps=[A.Cap.COMPACT], epoch=0))
         )
         forged = A.RosterOp.build(
-            author_sk=csk,
-            author_pub=cpub,
+            author=C.SoftwareKeypair.from_seed(csk),
             seq=0,
             prev=A.GENESIS_PREV,
             hlc=w.tick(),

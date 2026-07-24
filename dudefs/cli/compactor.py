@@ -29,11 +29,10 @@ def cmd_init(args: argparse.Namespace) -> int:
 
 def _daemon(args: argparse.Namespace) -> CompactorDaemon:
     with open(os.path.join(args.dir, "compactor.key"), "rb") as f:
-        sk = f.read()
+        seed = f.read()
     b = Bootstrap.read(args.dir)
     return CompactorDaemon(
-        sk,
-        C.SIGNER.public(sk),
+        C.SoftwareKeypair.from_seed(seed),
         roster=b.roster,
         roster_addrs=b.dial_addrs(),
         manager_pub=b.manager_pub,
@@ -55,7 +54,7 @@ def cmd_once(args: argparse.Namespace) -> int:
 
 def cmd_run(args: argparse.Namespace) -> int:
     comp = _daemon(args)
-    print(f"compactor {comp.pub.hex()[:16]}… running (interval {args.interval}s)")
+    print(f"compactor {comp.key.public.hex()[:16]}… running (interval {args.interval}s)")
     try:
         comp.run(args.interval)
     except KeyboardInterrupt:

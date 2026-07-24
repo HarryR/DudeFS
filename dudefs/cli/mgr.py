@@ -36,7 +36,7 @@ def cmd_init(args: argparse.Namespace) -> int:
         print(f"refusing: {e}", file=sys.stderr)
         return U.REFUSE_EXISTING
     print(f"initialized dudefs manager at {args.dir}")
-    print(f"  manager (root): {m.state.manager_pub.hex()}")
+    print(f"  manager (root): {m.state.root.public.hex()}")
     print("  seat the founding node:  dude mgr node genesis <pub> <pop> <addr>")
     return U.OK
 

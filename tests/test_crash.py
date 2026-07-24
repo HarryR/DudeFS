@@ -23,7 +23,9 @@ SK = bytes([210] * 32)
 
 
 def _acc(path, delta=10_000):
-    return Acceptor(SK, C.SIGNER.public(SK), ChainStore(path), config_epoch=0, delta_ms=delta)
+    return Acceptor(
+        C.SoftwareKeypair.from_seed(SK), ChainStore(path), config_epoch=0, delta_ms=delta
+    )
 
 
 def _op(w):
@@ -103,13 +105,13 @@ class TestCrashRestart(unittest.TestCase):
             store = ChainStore(path)
             with store.write_txn() as tx:
                 seq = tx.reserve_receipt_seq(op.op_hash, b)  # committed
-            before = A.Receipt.issue(SK, C.SIGNER.public(SK), op.op_hash, 0, b, seq)
+            before = A.Receipt.issue(C.SoftwareKeypair.from_seed(SK), op.op_hash, 0, b, seq)
             store.close()  # CRASH before the receipt is stored
 
             store2 = ChainStore(path)  # RESTART
             with store2.write_txn() as tx:
                 self.assertEqual(tx.reserve_receipt_seq(op.op_hash, b), seq)  # same seq
-            after = A.Receipt.issue(SK, C.SIGNER.public(SK), op.op_hash, 0, b, seq)
+            after = A.Receipt.issue(C.SoftwareKeypair.from_seed(SK), op.op_hash, 0, b, seq)
             self.assertEqual(before.sig, after.sig)  # deterministic re-derive
             with store2.read_txn() as tx:
                 self.assertTrue(tx.issuance_gapless())  # no gap opened

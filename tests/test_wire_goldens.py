@@ -56,8 +56,7 @@ def _fixtures() -> dict[str, bytes]:
     )
     tag = A.compute_slot_tag(bytes([9] * 32), b"k", A.VERSION_ABSENT, 0)
     op = A.CasOp.build(
-        author_sk=sk,
-        author_pub=pub,
+        author=C.SoftwareKeypair.from_seed(sk),
         seq=0,
         prev=A.GENESIS_PREV,
         hlc=A.HLC(1000, 0),
@@ -67,12 +66,16 @@ def _fixtures() -> dict[str, bytes]:
         slot_tag=tag,
     )
     heads = {pub: (0, op.op_hash)}
-    promise = A.Promise.issue(sk, pub, tag, bal, A.Ballot(1, b"a"), op.op_hash, A.HLC(999, 0))
-    wm = A.Watermark.issue(sk, pub, A.HLC(500, 0), 0, 3)
-    fb = A.FrontierBundle.issue(sk, pub, heads, op.op_hash, 0, A.HLC(500, 0))
+    promise = A.Promise.issue(
+        C.SoftwareKeypair.from_seed(sk), tag, bal, A.Ballot(1, b"a"), op.op_hash, A.HLC(999, 0)
+    )
+    wm = A.Watermark.issue(C.SoftwareKeypair.from_seed(sk), A.HLC(500, 0), 0, 3)
+    fb = A.FrontierBundle.issue(
+        C.SoftwareKeypair.from_seed(sk), heads, op.op_hash, 0, A.HLC(500, 0)
+    )
     recs = [
         A.Receipt.issue(
-            bytes([200 + i] * 32), C.SIGNER.public(bytes([200 + i] * 32)), op.op_hash, 0, bal, i + 1
+            C.SoftwareKeypair.from_seed(bytes([200 + i] * 32)), op.op_hash, 0, bal, i + 1
         )
         for i in range(3)
     ]
@@ -145,8 +148,7 @@ class TestJsonRpcContract(unittest.TestCase):
 
         w = World(seed=1, n_clients=1)
         return ClientDaemon(
-            w.clients[0].sk,
-            w.clients[0].pub,
+            C.SoftwareKeypair.from_seed(w.clients[0].sk),
             roster=[C.SIGNER.public(bytes([1] * 32))],
             roster_addrs=unix_eps(["/nonexistent.sock"]),
             manager_pub=w.mgr_pub,

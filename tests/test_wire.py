@@ -22,7 +22,10 @@ def _slotted(w):
 def _qc(w, op):
     sks = [bytes([210 + i] * 32) for i in range(3)]
     pubs = [C.SIGNER.public(s) for s in sks]
-    recs = [A.Receipt.issue(sks[i], pubs[i], op.op_hash, 0, A.Ballot(1, b"x"), 1) for i in range(3)]
+    recs = [
+        A.Receipt.issue(C.SoftwareKeypair.from_seed(sks[i]), op.op_hash, 0, A.Ballot(1, b"x"), 1)
+        for i in range(3)
+    ]
     return A.QC.assemble(recs, 3, {p: i for i, p in enumerate(pubs)})
 
 
@@ -75,7 +78,9 @@ class TestResponseCodec(unittest.TestCase):
     def test_all_responses_from_a_real_node_roundtrip(self):
         w = World(seed=2, n_clients=1)
         sk = bytes([200] * 32)
-        nd = N.LocalNode(Acceptor(sk, C.SIGNER.public(sk), ChainStore(), 0, 1_000_000), lambda: 100)
+        nd = N.LocalNode(
+            Acceptor(C.SoftwareKeypair.from_seed(sk), ChainStore(), 0, 1_000_000), lambda: 100
+        )
         op = _slotted(w)
         blind = w.blind(0, [], [[A.Mutation.SET, b"j", b"w"]])
         assert isinstance(op, A.Slotted)

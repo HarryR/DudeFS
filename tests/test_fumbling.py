@@ -26,13 +26,14 @@ NSK = bytes([220] * 32)
 
 
 def _node(path, delta=10_000):
-    return Acceptor(NSK, C.SIGNER.public(NSK), ChainStore(path), config_epoch=0, delta_ms=delta)
+    return Acceptor(
+        C.SoftwareKeypair.from_seed(NSK), ChainStore(path), config_epoch=0, delta_ms=delta
+    )
 
 
 def _roster(msk, mpub, roster, seq, prev, epoch=0, hlc=100):
     return A.RosterOp.build(
-        author_sk=msk,
-        author_pub=mpub,
+        author=C.SoftwareKeypair.from_seed(msk),
         seq=seq,
         prev=prev,
         hlc=A.HLC(hlc, 0),
@@ -46,8 +47,7 @@ def _recovery_pair(msk, mpub, roster, from_epoch=0):
     """A root-signed recovery pair: a recovery checkpoint + a ROSTER op naming it
     via `recovery` (substitutes for the joint certificate, WP1.7 / NOTES 36a)."""
     ckpt = A.CheckpointOp.build(
-        author_sk=msk,
-        author_pub=mpub,
+        author=C.SoftwareKeypair.from_seed(msk),
         seq=0,
         prev=A.GENESIS_PREV,
         hlc=A.HLC(500, 0),
@@ -59,8 +59,7 @@ def _recovery_pair(msk, mpub, roster, from_epoch=0):
         checkpoint_seq=0,
     )
     rop = A.RosterOp.build(
-        author_sk=msk,
-        author_pub=mpub,
+        author=C.SoftwareKeypair.from_seed(msk),
         seq=1,
         prev=ckpt.op_hash,
         hlc=A.HLC(501, 0),
