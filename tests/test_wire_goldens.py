@@ -88,8 +88,8 @@ def _fixtures() -> dict[str, bytes]:
             tx.put_receipt(r)
     empty = ChainStore()
     with empty.read_txn() as etx, st.read_txn() as tx:
-        summ = gossip.summary(tx, 0, None, b"", frozenset())
-        delt = gossip.delta(tx, gossip.summary(etx, 0, None, b"", frozenset()))
+        summ = gossip.Summary.of(tx, 0, None, b"", frozenset())
+        delt = gossip.Delta.owed(tx, gossip.Summary.of(etx, 0, None, b"", frozenset()))
         delt = gossip.Delta(delt.ops, delt.receipts, delt.qcs, baseline=(op,))  # pin baseline field
 
     reqs = {
@@ -120,8 +120,8 @@ def _fixtures() -> dict[str, bytes]:
         "FRONTIER": fb.encode(),
         "QC": qc.encode(),
         "RECEIPT": recs[0].encode(),
-        "SUMMARY": gossip.encode_summary(summ),
-        "DELTA": gossip.encode_delta(delt),
+        "SUMMARY": summ.encode(),
+        "DELTA": delt.encode(),
     }
     out.update({k: wire.frame(wire.encode_request(r)) for k, r in reqs.items()})
     out.update({k: wire.frame(wire.encode_response(r)) for k, r in resps.items()})

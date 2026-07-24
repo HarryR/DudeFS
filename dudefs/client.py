@@ -311,7 +311,7 @@ class ClientDaemon:
         link = Link(self.sk, self.pub, to_pub, ep)
         match link.request(b"gossip", req_body, epoch=self.cfg.epoch, ts=int(time.time() * 1000)):
             case lmsg.Reply(env):
-                return gossip.decode_delta(env.body)
+                return gossip.Delta.decode(env.body)
             case _fault:
                 return None
 
@@ -517,14 +517,14 @@ class ClientDaemon:
         One responsive peer holds the full retained set; an incomplete pull fails loud at
         verify_state_acc (barrier reconstruction) and a later refresh retries."""
         with self.store.read_txn() as tx:
-            summ = gossip.summary(
+            summ = gossip.Summary.of(
                 tx,
                 self.cfg.epoch,
                 tx.cut() or None,
                 tx.get_meta("checkpoint") or b"",
                 tx.cut_dead(),
             )
-        body = codec.encode([b"gossip", gossip.encode_summary(summ)])
+        body = codec.encode([b"gossip", summ.encode()])
         for node in self.cfg.fanout_order:
             d = self._gossip(node, body)
             if d is None or not d.baseline:

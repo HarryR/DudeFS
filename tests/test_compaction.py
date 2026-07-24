@@ -920,7 +920,7 @@ class TestBaselineSync(unittest.TestCase):
             for op in cr.retained:
                 tx.put_op_raw(op)
         with src.read_txn() as tx:
-            s = gossip.summary(tx, cut=cut, checkpoint=b"ckpt")
+            s = gossip.Summary.of(tx, cut=cut, checkpoint=b"ckpt")
         self.assertEqual(s.retained, committed)
         self.assertEqual(s.checkpoint, b"ckpt")
 

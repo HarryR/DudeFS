@@ -52,27 +52,64 @@ class Summary:
     checkpoint: bytes = b""  # the active checkpoint op_hash (b"" = no compaction)
     retained: dict[bytes, A.RetainedEntry] = field(default_factory=dict)  # baseline digest
 
+    @classmethod
+    def of(
+        cls,
+        tx: ReadTxn,
+        epoch: int = 0,
+        cut: Heads | None = None,
+        checkpoint: bytes = b"",
+        dead: frozenset[bytes] = frozenset(),
+    ) -> Summary:
+        """What a store advertises, from a read snapshot. The baseline commits to the
+        RETAINED projection (covered ∖ dead), so a lazy-GC node and a GC'd node advertise
+        the SAME digest (WP1.3). Runs in `tx` so heads/receipts/qcs/cut are one instant."""
+        baseline = baseline_digest(tx.all_ops(), cut, dead) if cut else {}
+        return cls(
+            heads={author: seq for author, (seq, _hh) in tx.heads().items()},
+            receipts=frozenset((r.op_hash, r.signer) for r in tx.all_receipts()),
+            qcs=frozenset(qc.op_hash for qc in tx.all_qcs()),
+            floor=tx.get_attested(),
+            epoch=epoch,
+            checkpoint=checkpoint,
+            retained=baseline,
+        )
 
-def summary(
-    tx: ReadTxn,
-    epoch: int = 0,
-    cut: Heads | None = None,
-    checkpoint: bytes = b"",
-    dead: frozenset[bytes] = frozenset(),
-) -> Summary:
-    # the advertised baseline commits to the RETAINED projection (covered ∖ dead),
-    # so a lazy-GC node and a GC'd node advertise the SAME digest (WP1.3). Runs in the
-    # caller's read snapshot so heads/receipts/qcs/cut all reflect one instant.
-    baseline = baseline_digest(tx.all_ops(), cut, dead) if cut else {}
-    return Summary(
-        heads={author: seq for author, (seq, _hh) in tx.heads().items()},
-        receipts=frozenset((r.op_hash, r.signer) for r in tx.all_receipts()),
-        qcs=frozenset(qc.op_hash for qc in tx.all_qcs()),
-        floor=tx.get_attested(),
-        epoch=epoch,
-        checkpoint=checkpoint,
-        retained=baseline,
-    )
+    def encode(self) -> bytes:
+        return codec.encode(
+            [
+                dict(self.heads),
+                [[oh, sig] for oh, sig in sorted(self.receipts)],
+                sorted(self.qcs),
+                list(self.floor.encode()),
+                int(self.epoch),
+                self.checkpoint,
+                {a: [c, d] for a, (c, d) in self.retained.items()},
+            ]
+        )
+
+    @classmethod
+    def decode(cls, data: bytes) -> Summary:
+        p = codec.as_seq(codec.decode(data))
+        heads = {codec.as_bytes(a): codec.as_int(v) for a, v in codec.as_dict(p[0]).items()}
+        receipts = frozenset(
+            (codec.as_bytes(pair[0]), codec.as_bytes(pair[1]))
+            for pair in (codec.as_seq(x, 2) for x in codec.as_seq(p[1]))
+        )
+        qcs = frozenset(codec.as_bytes(x) for x in codec.as_seq(p[2]))
+        retained: dict[bytes, A.RetainedEntry] = {}
+        for a, entry in codec.as_dict(p[6]).items():
+            c, dig = codec.as_seq(entry, 2)
+            retained[codec.as_bytes(a)] = A.RetainedEntry(codec.as_int(c), codec.as_bytes(dig))
+        return cls(
+            heads,
+            receipts,
+            qcs,
+            HLC.decode(p[3]),
+            codec.as_int(p[4]),
+            codec.as_bytes(p[5]),
+            retained,
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -87,39 +124,55 @@ class Delta:
     qcs: tuple[QC, ...]  # QCs the peer lacks
     baseline: tuple[Op, ...] = ()  # sparse below-cut RETAINED ops — intake CONTIGUITY-FREE
 
+    @classmethod
+    def owed(cls, tx: ReadTxn, peer: Summary) -> Delta:
+        """What a store (via read snapshot `tx`) holds that `peer` (per its Summary) lacks.
+        Ops honor contiguity: only the run from the peer's head up to ours, per author."""
+        ops: list[Op] = []
+        for author, (my_head, _hh) in tx.heads().items():
+            peer_head = peer.heads.get(author, -1)
+            for seq in range(peer_head + 1, my_head + 1):
+                ops.extend(tx.get(author, seq))  # fork siblings included — peer mints evidence
+        ops.sort(key=lambda o: (o.author, o.seq))  # apply prev-before-successor
+        receipts = tuple(r for r in tx.all_receipts() if (r.op_hash, r.signer) not in peer.receipts)
+        qcs = tuple(qc for qc in tx.all_qcs() if qc.op_hash not in peer.qcs)
+        return cls(tuple(ops), receipts, qcs)
 
-def delta(tx: ReadTxn, peer: Summary) -> Delta:
-    """What the store (via read snapshot `tx`) holds that `peer` (per its Summary)
-    lacks. Ops honor contiguity: only the run from the peer's head up to ours, per
-    author."""
-    ops: list[Op] = []
-    for author, (my_head, _hh) in tx.heads().items():
-        peer_head = peer.heads.get(author, -1)
-        for seq in range(peer_head + 1, my_head + 1):
-            ops.extend(tx.get(author, seq))  # fork siblings included — peer mints evidence
-    ops.sort(key=lambda o: (o.author, o.seq))  # apply prev-before-successor
-    receipts = tuple(r for r in tx.all_receipts() if (r.op_hash, r.signer) not in peer.receipts)
-    qcs = tuple(qc for qc in tx.all_qcs() if qc.op_hash not in peer.qcs)
-    return Delta(tuple(ops), receipts, qcs)
+    def apply(self, tx: WriteTxn) -> None:
+        """Merge this Delta into `tx` in ONE write transaction. `baseline` ops (sparse
+        below-cut retained winners, whose predecessors are legitimately GC'd) intake
+        CONTIGUITY-FREE via `put_op_raw` — and FIRST, so the tail's `append` can find its
+        predecessors and a fresh node's adoption sees a complete baseline (WP-E / Finding 1:
+        breaks the bootstrap-vs-cut deadlock; the checkpoint's `retained` commitment vouches
+        for them, and completeness is re-checked at adopt). Tail `ops` go through `append`
+        (contiguity gate + fork evidence); a gap/fork op is simply not stored, retried next."""
+        for op in self.baseline:
+            tx.put_op_raw(op)  # author-signed envelope; no contiguity gate below the cut
+        for op in sorted(self.ops, key=lambda o: (o.author, o.seq)):
+            tx.append(op)
+        for r in self.receipts:
+            tx.put_receipt(r)
+        for qc in self.qcs:
+            tx.put_qc(qc)
 
+    def encode(self) -> bytes:
+        return codec.encode(
+            [
+                [o.raw for o in self.ops],
+                [r.encode() for r in self.receipts],
+                [qc.encode() for qc in self.qcs],
+                [o.raw for o in self.baseline],
+            ]
+        )
 
-def apply_delta(tx: WriteTxn, d: Delta) -> None:
-    """Merge a received Delta in ONE write transaction. `baseline` ops (sparse
-    below-cut retained winners, whose predecessors are legitimately GC'd) intake
-    CONTIGUITY-FREE via `put_op_raw` — and FIRST, so the tail's `append` can find its
-    predecessors and a fresh node's adoption sees a complete baseline (WP-E / Finding 1:
-    breaks the bootstrap-vs-cut deadlock; the checkpoint's `retained` commitment vouches
-    for them, and completeness is re-checked at adopt). Tail `ops` go through `append`
-    (contiguity gate + fork evidence); a gap/fork op is simply not stored and the next
-    round retries."""
-    for op in d.baseline:
-        tx.put_op_raw(op)  # author-signed envelope; no contiguity gate below the cut
-    for op in sorted(d.ops, key=lambda o: (o.author, o.seq)):
-        tx.append(op)
-    for r in d.receipts:
-        tx.put_receipt(r)
-    for qc in d.qcs:
-        tx.put_qc(qc)
+    @classmethod
+    def decode(cls, data: bytes) -> Delta:
+        p = codec.as_seq(codec.decode(data))
+        ops = tuple(A.Op.from_bytes(codec.as_bytes(x)) for x in codec.as_seq(p[0]))
+        receipts = tuple(A.Receipt.decode(codec.as_bytes(x)) for x in codec.as_seq(p[1]))
+        qcs = tuple(A.QC.decode(codec.as_bytes(x)) for x in codec.as_seq(p[2]))
+        baseline = tuple(A.Op.from_bytes(codec.as_bytes(x)) for x in codec.as_seq(p[3]))
+        return cls(ops, receipts, qcs, baseline)
 
 
 def merge(dst: ChainStore, src: ChainStore, dst_epoch: int = 0) -> None:
@@ -128,11 +181,11 @@ def merge(dst: ChainStore, src: ChainStore, dst_epoch: int = 0) -> None:
     pair eventually merges (PROTOCOL §2). Each store access is its own transaction —
     the peer read is not held across the local write."""
     with dst.read_txn() as dtx:
-        summ = summary(dtx, dst_epoch)
+        summ = Summary.of(dtx, dst_epoch)
     with src.read_txn() as stx:
-        d = delta(stx, summ)
+        d = Delta.owed(stx, summ)
     with dst.write_txn() as dtx:
-        apply_delta(dtx, d)
+        d.apply(dtx)
 
 
 def pull_op(dst: ChainStore, src: ChainStore, op_hash: bytes) -> bool:
@@ -212,56 +265,5 @@ def verify_baseline(
 # Wire codec for the epidemic exchange (M7 WP1.2)                              #
 # --------------------------------------------------------------------------- #
 # A gossip round is one request/response: the initiator sends its Summary, the
-# peer replies with the Delta it owes. Serialization lives here (the daemon shell
-# does the sockets), a thin dispatch over the artifacts' own encoders.
-
-
-def encode_summary(s: Summary) -> bytes:
-    return codec.encode(
-        [
-            dict(s.heads),
-            [[oh, sig] for oh, sig in sorted(s.receipts)],
-            sorted(s.qcs),
-            list(s.floor.encode()),
-            int(s.epoch),
-            s.checkpoint,
-            {a: [c, d] for a, (c, d) in s.retained.items()},
-        ]
-    )
-
-
-def decode_summary(data: bytes) -> Summary:
-    p = codec.as_seq(codec.decode(data))
-    heads = {codec.as_bytes(a): codec.as_int(v) for a, v in codec.as_dict(p[0]).items()}
-    receipts = frozenset(
-        (codec.as_bytes(pair[0]), codec.as_bytes(pair[1]))
-        for pair in (codec.as_seq(x, 2) for x in codec.as_seq(p[1]))
-    )
-    qcs = frozenset(codec.as_bytes(x) for x in codec.as_seq(p[2]))
-    retained: dict[bytes, A.RetainedEntry] = {}
-    for a, entry in codec.as_dict(p[6]).items():
-        c, dig = codec.as_seq(entry, 2)
-        retained[codec.as_bytes(a)] = A.RetainedEntry(codec.as_int(c), codec.as_bytes(dig))
-    return Summary(
-        heads, receipts, qcs, HLC.decode(p[3]), codec.as_int(p[4]), codec.as_bytes(p[5]), retained
-    )
-
-
-def encode_delta(d: Delta) -> bytes:
-    return codec.encode(
-        [
-            [o.raw for o in d.ops],
-            [r.encode() for r in d.receipts],
-            [qc.encode() for qc in d.qcs],
-            [o.raw for o in d.baseline],
-        ]
-    )
-
-
-def decode_delta(data: bytes) -> Delta:
-    p = codec.as_seq(codec.decode(data))
-    ops = tuple(A.Op.from_bytes(codec.as_bytes(x)) for x in codec.as_seq(p[0]))
-    receipts = tuple(A.Receipt.decode(codec.as_bytes(x)) for x in codec.as_seq(p[1]))
-    qcs = tuple(A.QC.decode(codec.as_bytes(x)) for x in codec.as_seq(p[2]))
-    baseline = tuple(A.Op.from_bytes(codec.as_bytes(x)) for x in codec.as_seq(p[3]))
-    return Delta(ops, receipts, qcs, baseline)
+# peer replies with the Delta it owes. Serialization is the objects' own encode/decode
+# (Summary.encode / Delta.decode), a thin dispatch over the artifacts' own encoders.

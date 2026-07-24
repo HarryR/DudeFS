@@ -53,7 +53,7 @@ class Peer:
 
 
 def _gossip_request(summ: gossip.Summary) -> bytes:
-    return codec.encode([b"gossip", gossip.encode_summary(summ)])
+    return codec.encode([b"gossip", summ.encode()])
 
 
 def _cut_dominates(
@@ -210,8 +210,8 @@ class NodeDaemon:
         or a node RPC verb (dispatch to the acceptor). Idempotent, local-only."""
         first = codec.as_seq(codec.decode(data))[0]
         if codec.as_bytes(first) == b"gossip":
-            summ = gossip.decode_summary(codec.as_bytes(codec.as_seq(codec.decode(data))[1]))
-            return gossip.encode_delta(self._gossip_reply(summ))
+            summ = gossip.Summary.decode(codec.as_bytes(codec.as_seq(codec.decode(data))[1]))
+            return self._gossip_reply(summ).encode()
         return wire.encode_response(dispatch(self.node, wire.decode_request(data)))
 
     # ---- anti-entropy, sans-io: three pure seams a driver composes -------- #
@@ -228,20 +228,20 @@ class NodeDaemon:
         (WP-E — it rides its OWN field, intaken contiguity-free, not the tail's append
         gate). A pure function of my store + the peer's summary."""
         with self.store.read_txn() as tx:  # the delta + baseline are ONE snapshot
-            d = gossip.delta(tx, summ)
+            d = gossip.Delta.owed(tx, summ)
             base = tuple(self._baseline_ops_for(tx, summ))
             return Delta(d.ops, d.receipts, d.qcs, baseline=base)
 
     def apply_gossip(self, delta: gossip.Delta) -> None:
         """Intake a peer's DELTA into my store (one write transaction) — the APPLY seam."""
         with self.store.write_txn() as tx:
-            gossip.apply_delta(tx, delta)
+            delta.apply(tx)
 
     # ---- the epidemic gossip loop (WP1.2) ---------------------------------- #
     def summary(self) -> gossip.Summary:
         with self.store.read_txn() as tx:
             cut = tx.cut()
-            return gossip.summary(
+            return gossip.Summary.of(
                 tx,
                 self.acc.epoch,
                 cut or None,
@@ -280,7 +280,7 @@ class NodeDaemon:
             b"gossip", _gossip_request(self.summary()), epoch=self.acc.epoch, ts=self._clock()
         ):
             case lmsg.Reply(env):
-                self.apply_gossip(gossip.decode_delta(env.body))
+                self.apply_gossip(gossip.Delta.decode(env.body))
             case _fault:  # NoReply / MalformedReply / WrongPeer — a missed round
                 pass
 
