@@ -27,9 +27,10 @@ def now_ms() -> int:
     return int(time.time() * 1000)
 
 
-def poll_until(pred: Callable[[], object], timeout: float = 6.0, step: float = 0.02):
+def poll_until[T](pred: Callable[[], T], timeout: float = 6.0, step: float = 0.02) -> T:
     """Poll `pred()` until truthy (returns it) or timeout (returns the last value) —
-    the socket tests' async settle loop."""
+    the socket tests' async settle loop. Generic in `pred`'s result so a `-> bool`
+    predicate stays `bool` at the call site (no `object` widening)."""
     deadline = time.monotonic() + timeout
     val = pred()
     while not val and time.monotonic() < deadline:
