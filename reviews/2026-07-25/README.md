@@ -33,6 +33,10 @@ recorded as a finding rather than as a doc update.
 | [THE-UGLY.md](THE-UGLY.md) | Hygiene, doc drift, structural debt, supply chain. Nothing here breaks; all of it costs. |
 | [THE-GOOD.md](THE-GOOD.md) | What is genuinely solid — specific, not flattery. Read this before acting on the rest. |
 | [ROOT-CAUSES.md](ROOT-CAUSES.md) | The four patterns that generate most of the findings. **This is the actual work-plan.** |
+| [FIXED.md](FIXED.md) | Fix log, maintained as findings are closed (not part of the original review). |
+| [FIX-REVIEW.md](FIX-REVIEW.md) | Read-only review of fix wave 1: **1 of 4 fully closed**, C-1 regressed, C-2 unfixed + **self-convicting (FIX-6)**, F-2 partial. Contains a marked **correction** of one of my own recommendations. |
+| [DESIGN-FINDINGS.md](DESIGN-FINDINGS.md) | Structural findings the wave surfaced: request→reply binding (**K-13**), the Promise's redundant signature (**K-14**), unbounded `slot_state` (**D-1**), and two new root causes (**RC-5**, **RC-6**). |
+| [DIRECTIONS.md](DIRECTIONS.md) | **How** to fix, ratified by Harry: RC-1 as a *type* (**D-A**), acceptor named-predicate decomposition (**D-B**), Promise demoted to a response payload (**D-C**). Hierarchy over local patch; construction over enumeration. |
 
 ## Verification status legend
 
