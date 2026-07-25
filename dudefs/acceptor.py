@@ -265,10 +265,16 @@ class Acceptor:
         if not isinstance(op, A.Slotted) or op.slot_tag != tag:
             return Rejected(RejectReason.BAD_STRUCTURE)
         with self.store.write_txn() as tx:
-            skew = self._skew_reason(tx, op, now_ms)
-            if skew:
-                return Rejected(skew)
             s = tx.get_slot(tag)
+            # future/floor gate — skipped for an idempotent re-ACCEPT of the SAME op (review
+            # C-2), matching the BELOW_HORIZON same-op exemption below. A verbatim re-request
+            # must re-yield its receipt (PROTOCOL §0), and after δ the floor sits above op.hlc;
+            # a checkpoint/roster slot has no `attempt` escape, so refusing it deadlocks. A
+            # DIFFERENT op is still floor-gated (a late contender can't win a spent slot).
+            if s.accepted_op != op.op_hash:
+                skew = self._skew_reason(tx, op, now_ms)
+                if skew:
+                    return Rejected(skew)
             if ballot < s.promised:
                 return Nack(s.promised)
             if (

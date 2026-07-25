@@ -230,6 +230,29 @@ class TestK2RosterAcceptGate(unittest.TestCase):
         self.assertIsInstance(r, Rejected)  # not caught up on the OP's declared frontier
 
 
+class TestC2ReacceptAfterDelta(unittest.TestCase):
+    """Review C-2: a verbatim re-ACCEPT of the SAME accepted op must re-yield its receipt
+    (PROTOCOL §0 idempotence) even after δ has lifted the floor above op.hlc. The floor gate
+    runs BEFORE the same-op exemption, so a re-drive after δ is refused BELOW_FLOOR. Data slots
+    escape by bumping `attempt` (a fresh slot); checkpoint/roster slots cannot, so this is a
+    permanent deadlock only clearable by a horizon advance that needs the blocked commit. The
+    BELOW_HORIZON guard already has the same-op exemption; the floor gate should match it."""
+
+    def test_reaccept_of_same_op_after_delta_is_not_below_floor(self):
+        w = World(seed=1, n_clients=1)
+        acc = Acceptor(C.SoftwareKeypair.from_seed(bytes([200] * 32)), ChainStore(), 0, DELTA)
+        op, tag = _slot_op(w, 0, b"a", NOW)
+        ballot = Ballot(1, b"x")
+        r1 = acc.on_accept(tag, ballot, op, NOW)
+        self.assertIsInstance(r1, A.Receipt)
+
+        later = NOW + 50 * DELTA  # δ passes: the floor (now-δ) rises well above op.hlc
+        r2 = acc.on_accept(tag, ballot, op, later)  # verbatim re-ACCEPT of the SAME op
+        assert isinstance(r1, A.Receipt)
+        self.assertIsInstance(r2, A.Receipt)  # idempotent, NOT a BELOW_FLOOR rejection
+        self.assertEqual(getattr(r2, "sig", None), r1.sig)  # the identical stored receipt
+
+
 class TestC1VoidOnMissingEnvelope(unittest.TestCase):
     """Review C-1 (RC-2): on_prepare's void rule fires on `acc is None` (envelope absent) as
     well as below-horizon. But envelope absence is a FETCH problem, not amnesia — a GC path
