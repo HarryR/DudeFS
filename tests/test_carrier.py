@@ -79,27 +79,30 @@ class TestHttpCarrier(unittest.TestCase):
 
 
 class TestParseEndpoint(unittest.TestCase):
-    """The edge decomposer: an operator URL -> the stored (transport, uri, opts) struct,
-    parsed ONCE. Custom composite schemes let one URL replace a pile of flags."""
+    """The edge decomposer: an operator URL -> a dial `Endpoint`, parsed ONCE. Custom
+    composite schemes let one URL replace a pile of flags."""
 
     def test_bare_path_defaults_to_unix(self):
-        self.assertEqual(transports.parse_endpoint("/run/n.sock"), (b"unix", b"/run/n.sock", {}))
+        self.assertEqual(
+            transports.parse_endpoint("/run/n.sock"), transports.Endpoint(b"unix", "/run/n.sock")
+        )
 
     def test_explicit_unix_scheme_strips_to_the_path(self):
         self.assertEqual(
-            transports.parse_endpoint("unix:/run/n.sock"), (b"unix", b"/run/n.sock", {})
+            transports.parse_endpoint("unix:/run/n.sock"),
+            transports.Endpoint(b"unix", "/run/n.sock"),
         )
 
     def test_http_url_keeps_its_base_url(self):
         self.assertEqual(
             transports.parse_endpoint("http://host:8080/dude"),
-            (b"http", b"http://host:8080/dude", {}),
+            transports.Endpoint(b"http", "http://host:8080/dude"),
         )
 
     def test_composite_sealed_http_decomposes_carrier_and_profile(self):
         self.assertEqual(
             transports.parse_endpoint("sealed+http://host/dude"),
-            (b"http", b"http://host/dude", {b"lmsg": b"sealed"}),
+            transports.Endpoint(b"http", "http://host/dude", True),
         )
 
     def test_parse_scheme_splits_modifiers_from_the_carrier(self):

@@ -10,6 +10,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
 
+from ..artifacts import AddrRecord
+
 # A request handler: an inbound payload -> the reply payload, or None for "no reply"
 # (the carrier renders that as its native silence — a closed frame / no stanza / a
 # 404). Pure w.r.t. I/O; the daemon's `serve` is the one wired in.
@@ -46,16 +48,17 @@ class Endpoint:
     sealed: bool = False
 
     @staticmethod
-    def from_record(transport: bytes, uri: bytes, opts: dict[bytes, bytes]) -> Endpoint:
-        """Build the dial struct from a stored ENDPOINT-record addr (transport, uri,
-        opts) — the record IS the decomposition, so this is a view, not a re-parse."""
-        return Endpoint(transport, uri.decode(), opts.get(b"lmsg") == b"sealed")
+    def from_record(rec: AddrRecord) -> Endpoint:
+        """Build the dial struct from a stored ENDPOINT `AddrRecord` — the record IS the
+        decomposition, so this is a view, not a re-parse."""
+        return Endpoint(rec.transport, rec.uri.decode(), rec.opts.get(b"lmsg") == b"sealed")
 
-    def to_record(self) -> tuple[bytes, bytes, dict[bytes, bytes]]:
-        """The inverse of `from_record`: the (transport, uri, opts) addr as an ENDPOINT
-        record stores it. Faithful because `opts` carries only the L_msg profile today, so
-        a read-modify-write of a node's address list (endpoint add/remove) round-trips."""
-        return (self.transport, self.uri.encode(), {b"lmsg": b"sealed"} if self.sealed else {})
+    def to_record(self) -> AddrRecord:
+        """The inverse of `from_record`: the addr as an ENDPOINT `AddrRecord` stores it.
+        Faithful because `opts` carries only the L_msg profile today, so a read-modify-write of
+        a node's address list (endpoint add/remove) round-trips."""
+        opts = {b"lmsg": b"sealed"} if self.sealed else {}
+        return AddrRecord(self.transport, self.uri.encode(), opts)
 
 
 class Server(Protocol):

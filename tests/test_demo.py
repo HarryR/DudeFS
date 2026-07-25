@@ -252,7 +252,9 @@ class TestDemoRunbook(unittest.TestCase):
                 m = Manager.init(md)
                 m.state._set_meta(roster_seed=[p.hex() for p in demo.roster])  # genesis roster
                 for i in range(3):  # publish real ENDPOINT ops -> node_addrs derives
-                    m.set_endpoint(demo.roster[i], [(transports.UNIX, demo.paths[i].encode(), {})])
+                    m.set_endpoint(
+                        demo.roster[i], [transports.Endpoint(transports.UNIX, demo.paths[i])]
+                    )
                 demo.kill_node(1)
                 demo.kill_node(2)  # only node0 survives -> below quorum
 

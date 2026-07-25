@@ -334,7 +334,7 @@ class TestEndpointConsumption(unittest.TestCase):
                 partial(
                     A.EndpointOp.build,
                     subject=roster[i],
-                    addrs=[(b"unix", f"/n{i}.sock".encode(), {})],
+                    addrs=[A.AddrRecord(b"unix", f"/n{i}.sock".encode(), {})],
                 )
             )
             for i in range(len(roster))
@@ -391,14 +391,16 @@ class TestEndpointConsumption(unittest.TestCase):
                     A.EndpointOp.build,
                     subject=roster[0],
                     addrs=[
-                        (b"http", b"http://x/dude", {b"lmsg": b"sealed"}),
-                        (b"unix", b"/n0.sock", {}),
+                        A.AddrRecord(b"http", b"http://x/dude", {b"lmsg": b"sealed"}),
+                        A.AddrRecord(b"unix", b"/n0.sock", {}),
                     ],
                 )
             ),
             w._mgr_op(
                 partial(
-                    A.EndpointOp.build, subject=roster[1], addrs=[(b"http", b"http://y/dude", {})]
+                    A.EndpointOp.build,
+                    subject=roster[1],
+                    addrs=[A.AddrRecord(b"http", b"http://y/dude", {})],
                 )
             ),
         ]

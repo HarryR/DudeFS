@@ -293,9 +293,9 @@ class ControlState:
                 self.pending_pver = max(self.pending_pver, p.activate_pver)
             case A.EndpointOp() as e:
                 if e.addrs:  # latest-wins; empty addrs = removal (NOTES 58)
-                    # decompose the record's (transport, uri, opts) into dial structs here
+                    # interpret each stored AddrRecord as a dial struct here
                     self.endpoints[e.subject] = [
-                        transports.Endpoint.from_record(*a) for a in e.addrs
+                        transports.Endpoint.from_record(rec) for rec in e.addrs
                     ]
                 else:
                     self.endpoints.pop(e.subject, None)

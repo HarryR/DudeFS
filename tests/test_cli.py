@@ -183,7 +183,7 @@ class TestRecoverInterlock(unittest.TestCase):
                 self.assertTrue(ev.wait(2))
                 nodes.append(nd)
                 # publish a durable ENDPOINT op so the reloaded CLI manager can dial it
-                rec = [(transports.UNIX, path.encode(), {})]
+                rec = [A.AddrRecord(transports.UNIX, path.encode(), {})]
                 st.author_control(A.EndpointOp.build(**st._head(), subject=roster[i], addrs=rec))
             st._set_meta(roster_seed=[p.hex() for p in roster])  # seat the genesis roster
 

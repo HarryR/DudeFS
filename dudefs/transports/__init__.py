@@ -30,30 +30,26 @@ __all__ = [
 ]
 
 
-def parse_endpoint(spec: str) -> tuple[bytes, bytes, dict[bytes, bytes]]:
-    """Decompose an operator-supplied endpoint into the STORED struct
-    `(transport, uri, opts)` — ONCE, at the edge (the CLI). Internally we carry the
-    struct and never re-parse the URL. Accepts a custom composite scheme so an operator
-    types one URL instead of a pile of flags; a bare path defaults to a local unix
-    socket. Examples:
+def parse_endpoint(spec: str) -> Endpoint:
+    """Decompose an operator-supplied endpoint into a dial `Endpoint` — ONCE, at the edge
+    (the CLI). Internally we carry the struct and never re-parse the URL. Accepts a custom
+    composite scheme so an operator types one URL instead of a pile of flags; a bare path
+    defaults to a local unix socket. Examples:
 
-        /run/n.sock              -> (b"unix", b"/run/n.sock", {})
-        unix:/run/n.sock         -> (b"unix", b"/run/n.sock", {})
-        http://host:8080/dude    -> (b"http", b"http://host:8080/dude", {})
-        sealed+http://host/dude  -> (b"http", b"http://host/dude", {b"lmsg": b"sealed"})
+        /run/n.sock              -> Endpoint(b"unix", "/run/n.sock")
+        unix:/run/n.sock         -> Endpoint(b"unix", "/run/n.sock")
+        http://host:8080/dude    -> Endpoint(b"http", "http://host:8080/dude")
+        sealed+http://host/dude  -> Endpoint(b"http", "http://host/dude", sealed=True)
     """
     parts = urlsplit(spec)
     if not parts.scheme:  # a bare path -> a local unix socket
-        return UNIX, spec.encode(), {}
+        return Endpoint(UNIX, spec)
     mods, carrier = parse_scheme(parts.scheme.encode())
-    opts: dict[bytes, bytes] = {b"lmsg": b"sealed"} if SEALED in mods else {}
     if carrier == UNIX:
-        uri = parts.path.encode()  # the unix carrier connects to the raw path
+        uri = parts.path  # the unix carrier connects to the raw path
     else:  # a networked carrier keeps its base URL (its dial urlsplits it)
-        uri = urlunsplit(
-            (carrier.decode(), parts.netloc, parts.path, parts.query, parts.fragment)
-        ).encode()
-    return carrier, uri, opts
+        uri = urlunsplit((carrier.decode(), parts.netloc, parts.path, parts.query, parts.fragment))
+    return Endpoint(carrier, uri, SEALED in mods)
 
 
 _DIALERS: dict[bytes, Callable[..., bytes]] = {

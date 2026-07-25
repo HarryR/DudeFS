@@ -1215,22 +1215,38 @@ class PverActivateOp(ControlOp):
         )
 
 
+class AddrRecord(NamedTuple):
+    """One reachability address as an ENDPOINT op stores it (PROTOCOL §7.1, NOTES 58): the
+    carrier `transport` scheme, its `uri`, and `opts` (the L_msg profile today). This is the
+    WIRE form and it owns its own bencode codec; `transports.Endpoint` is its interpreted dial
+    view (via `.from_record` / `.to_record`)."""
+
+    transport: bytes
+    uri: bytes
+    opts: dict[bytes, bytes]
+
+    def encode(self) -> list:
+        return [self.transport, self.uri, dict(self.opts)]
+
+    @classmethod
+    def decode(cls, entry: Bencodable) -> AddrRecord:
+        e = codec.as_seq(entry, 3)
+        opts = {k: codec.as_bytes(v) for k, v in codec.as_dict(e[2]).items()}
+        return cls(codec.as_bytes(e[0]), codec.as_bytes(e[1]), opts)
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class EndpointOp(ControlOp):
     KIND: ClassVar[ControlKind] = ControlKind.ENDPOINT
     subject: bytes
-    addrs: list[tuple[bytes, bytes, dict[bytes, bytes]]]  # (transport, uri, opts); empty = removal
+    addrs: list[AddrRecord]  # (transport, uri, opts) reachability records; empty = removal
 
     @classmethod
     def _from_body(
         cls, env: dict[bytes, Bencodable], raw: bytes, body: dict[bytes, Bencodable]
     ) -> Self:
         # Node reachability (PROTOCOL §7.1, NOTES 58): pubkey -> access methods.
-        addrs: list[tuple[bytes, bytes, dict[bytes, bytes]]] = []
-        for entry in codec.as_seq(codec.field(body, b"addrs")):
-            e = codec.as_seq(entry, 3)
-            opts = {k: codec.as_bytes(v) for k, v in codec.as_dict(e[2]).items()}
-            addrs.append((codec.as_bytes(e[0]), codec.as_bytes(e[1]), opts))
+        addrs = [AddrRecord.decode(entry) for entry in codec.as_seq(codec.field(body, b"addrs"))]
         return cls(
             **cls._kwargs(env, raw),
             subject=codec.as_bytes(codec.field(body, b"subject")),
@@ -1246,7 +1262,7 @@ class EndpointOp(ControlOp):
         prev: bytes,
         hlc: HLC,
         subject: bytes,
-        addrs: list[tuple[bytes, bytes, dict[bytes, bytes]]],
+        addrs: list[AddrRecord],
         pver: int = 0,
     ) -> Self:
         """Latest-wins per subject; an EMPTY `addrs` removes the node."""
@@ -1254,7 +1270,7 @@ class EndpointOp(ControlOp):
             {
                 BK_KIND: cls.KIND,
                 b"subject": subject,
-                b"addrs": [[t, u, dict(o)] for (t, u, o) in addrs],
+                b"addrs": [r.encode() for r in addrs],
             }
         )
         raw, sig = ControlOp._control_raw(author, seq=seq, prev=prev, hlc=hlc, pver=pver, body=body)

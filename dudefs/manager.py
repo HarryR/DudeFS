@@ -386,20 +386,16 @@ class Manager:
         if rec is not None:  # publish a control-plane reachability record (PROTOCOL §7)
             self.set_endpoint(pub, [rec])
 
-    def set_endpoint(
-        self, subject: bytes, addrs: list[tuple[bytes, bytes, dict[bytes, bytes]]]
-    ) -> Op:
-        """Author a root-signed ENDPOINT record for `subject` (PROTOCOL §7 / NOTES
-        58): latest-wins per subject; empty `addrs` removes the node. Root-only. The
-        deliberate replace-all clobber — `endpoint_add`/`_remove` edit the list instead."""
+    def set_endpoint(self, subject: bytes, addrs: list[transports.Endpoint]) -> Op:
+        """Author a root-signed ENDPOINT record for `subject` (PROTOCOL §7 / NOTES 58):
+        latest-wins per subject; empty `addrs` removes the node. Root-only. The deliberate
+        replace-all clobber — `endpoint_add`/`_remove` edit the list instead. Endpoints
+        serialize to their `AddrRecord` wire form at the op boundary."""
         return self.state.author_control(
-            A.EndpointOp.build(**self.state._head(), subject=subject, addrs=addrs)
+            A.EndpointOp.build(
+                **self.state._head(), subject=subject, addrs=[ep.to_record() for ep in addrs]
+            )
         )
-
-    def _addr_records(self, subject: bytes) -> list[tuple[bytes, bytes, dict[bytes, bytes]]]:
-        """The node's current advertised addrs as ENDPOINT records — the settable form of
-        the derived dial-Endpoint list (a faithful round-trip; opts is just the L_msg flag)."""
-        return [ep.to_record() for ep in self.state.node_addrs.get(subject.hex(), [])]
 
     def endpoint_list(self, subject: bytes) -> list[transports.Endpoint]:
         """A node's current dial addresses (multi-homed)."""
@@ -408,15 +404,15 @@ class Manager:
     def endpoint_add(self, subject: bytes, addr: str) -> Op:
         """Append one dial address to the node's record (read-modify-write); a re-add of an
         address it already advertises is a no-op replay, not a duplicate."""
-        rec = transports.parse_endpoint(addr)
-        cur = self._addr_records(subject)
-        return self.set_endpoint(subject, cur if rec in cur else [*cur, rec])
+        ep = transports.parse_endpoint(addr)
+        cur = self.endpoint_list(subject)
+        return self.set_endpoint(subject, cur if ep in cur else [*cur, ep])
 
     def endpoint_remove(self, subject: bytes, addr: str = "") -> Op:
         """Drop one dial address from the node's record; an empty `addr` (or removing the
         last one) removes the whole record — retiring the node's reachability."""
-        cur = self._addr_records(subject)
-        remaining = [r for r in cur if r != transports.parse_endpoint(addr)] if addr else []
+        cur = self.endpoint_list(subject)
+        remaining = [ep for ep in cur if ep != transports.parse_endpoint(addr)] if addr else []
         return self.set_endpoint(subject, remaining)
 
     def node_promote(self, pub: bytes, rpc: NodeRPC) -> RosterChange:

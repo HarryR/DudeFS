@@ -526,8 +526,8 @@ class TestEndpointRecords(unittest.TestCase):
     """ENDPOINT records (PROTOCOL §7 / NOTES 58): root-signed node reachability,
     latest-wins per subject, empty-addrs = removal, root-only authoring."""
 
-    ADDRS1 = [(b"https", b"https://a/dude", {b"lmsg": b"sealed"})]
-    ADDRS2 = [(b"tor", b"http://x.onion/dude", {b"lmsg": b"plain"})]
+    ADDRS1 = [A.AddrRecord(b"https", b"https://a/dude", {b"lmsg": b"sealed"})]
+    ADDRS2 = [A.AddrRecord(b"tor", b"http://x.onion/dude", {b"lmsg": b"plain"})]
 
     def test_folds_latest_wins_and_removal(self):
         w = World(seed=30, n_clients=0)
