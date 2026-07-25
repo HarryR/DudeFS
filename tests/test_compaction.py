@@ -714,7 +714,7 @@ class TestCutAwareStore(unittest.TestCase):
         w = World(seed=20, n_clients=1)
         pub = w.clients[0].pub
         ops = self._creates(w, 0, 4)  # seqs 0,1,2,3
-        cut = {pub: (1, ops[1].op_hash)}  # seqs 0,1 below the cut; 2,3 dense tail
+        cut = {pub: A.HeadEntry(1, ops[1].op_hash)}  # seqs 0,1 below the cut; 2,3 dense tail
 
         store = ChainStore()
         with store.write_txn() as tx:
@@ -744,7 +744,7 @@ class TestCutAwareStore(unittest.TestCase):
         w = World(seed=21, n_clients=1)
         pub = w.clients[0].pub
         ops = self._creates(w, 0, 4)  # seqs 0,1,2,3
-        cut = {pub: (1, ops[1].op_hash)}  # cut_seq = 1
+        cut = {pub: A.HeadEntry(1, ops[1].op_hash)}  # cut_seq = 1
 
         # ACCEPT (exemption): a tail op at cut_seq+1 whose predecessor sits at the
         # cut (legitimately GC'd, absent) is contiguous-by-fiat, not a gap.
@@ -795,7 +795,7 @@ class TestCutAwareStore(unittest.TestCase):
             crypto.SoftwareKeypair.from_seed(sk), store, config_epoch=0, delta_ms=BIG_DELTA
         )
         # a frontier entry BELOW the cut naming the GC'd (dead) envelope:
-        sf = {w.clients[0].pub: (0, first.op_hash)}
+        sf = {w.clients[0].pub: A.HeadEntry(0, first.op_hash)}
         # ACCEPT: baseline is complete (winner + control held) -> possession holds
         self.assertTrue(acc.holds_frontier(sf))
 
@@ -817,7 +817,7 @@ class TestCutAwareStore(unittest.TestCase):
         # gates below it, so it must outlive a restart like the floor.
         w = World(seed=23, n_clients=1)
         pub = w.clients[0].pub
-        cut = {pub: (2, b"\x11" * 32)}
+        cut = {pub: A.HeadEntry(2, b"\x11" * 32)}
         committed = {pub: A.RetainedEntry(1, b"\x22" * 32)}
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "store.db")
@@ -1192,7 +1192,7 @@ class TestHorizonPersistence(unittest.TestCase):
     def test_horizon_restored_backstop_and_void_survive_restart(self):
         w = World(seed=190, n_clients=1)
         nsk = bytes([190] * 32)
-        cut = {w.mgr_pub: (0, b"\x00" * 32)}
+        cut = {w.mgr_pub: A.HeadEntry(0, b"\x00" * 32)}
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "store.db")
             # adopt a checkpoint sealing F=200, then simulate a crash (close+reopen)

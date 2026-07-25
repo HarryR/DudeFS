@@ -28,7 +28,7 @@ def cut_dominates(new: Heads, cur: Heads) -> bool:
     """Does `new` per-author advance-or-hold every author of `cur`? (A checkpoint's cut may add
     authors / higher seqs, but must never take one BACKWARDS — GC past a cut is irreversible,
     WP-F(a)/#4.) Vacuously true against the empty (pre-first-checkpoint) cut."""
-    return all((e := new.get(a)) is not None and e[0] >= seq for a, (seq, _h) in cur.items())
+    return all((e := new.get(a)) is not None and e.dominates(entry) for a, entry in cur.items())
 
 
 # --------------------------------------------------------------------------- #

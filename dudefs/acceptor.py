@@ -403,14 +403,14 @@ class Acceptor:
             have_baseline: dict[bytes, A.RetainedEntry] | None = None  # computed once, lazily
             for author, (seq, head_hash) in sync_frontier.items():
                 centry = cut.get(author)
-                if centry is not None and seq <= centry[0]:
+                if centry is not None and seq <= centry.seq:
                     if have_baseline is None:
                         have_baseline = tx.baseline_commitment()
                     if have_baseline.get(author) != committed.get(author):
                         return False  # incomplete below-cut baseline for this author
                 else:
                     cur = heads.get(author)
-                    if cur is None or cur[0] < seq or tx.get_op(head_hash) is None:
+                    if cur is None or cur.seq < seq or tx.get_op(head_hash) is None:
                         return False
             return True
 

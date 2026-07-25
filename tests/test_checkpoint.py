@@ -54,20 +54,28 @@ def _view(ops, *, cut=None, horizon=H0, adopted_seq=0, qcs=None, epoch=0):
 
 class TestCutDominates(unittest.TestCase):
     def test_advance_or_hold_dominates(self):
-        self.assertTrue(CP.cut_dominates({b"a": (5, b"h")}, {b"a": (3, b"g")}))  # advanced
-        self.assertTrue(CP.cut_dominates({b"a": (3, b"g")}, {b"a": (3, b"g")}))  # held
-        self.assertTrue(CP.cut_dominates({b"a": (3, b"g")}, {}))  # vacuous vs empty
+        self.assertTrue(
+            CP.cut_dominates({b"a": A.HeadEntry(5, b"h")}, {b"a": A.HeadEntry(3, b"g")})
+        )  # advanced
+        self.assertTrue(
+            CP.cut_dominates({b"a": A.HeadEntry(3, b"g")}, {b"a": A.HeadEntry(3, b"g")})
+        )  # held
+        self.assertTrue(CP.cut_dominates({b"a": A.HeadEntry(3, b"g")}, {}))  # vacuous vs empty
 
     def test_regress_or_drop_does_not_dominate(self):
-        self.assertFalse(CP.cut_dominates({b"a": (2, b"h")}, {b"a": (3, b"g")}))  # regressed
-        self.assertFalse(CP.cut_dominates({b"b": (9, b"h")}, {b"a": (3, b"g")}))  # dropped author
+        self.assertFalse(
+            CP.cut_dominates({b"a": A.HeadEntry(2, b"h")}, {b"a": A.HeadEntry(3, b"g")})
+        )  # regressed
+        self.assertFalse(
+            CP.cut_dominates({b"b": A.HeadEntry(9, b"h")}, {b"a": A.HeadEntry(3, b"g")})
+        )  # dropped author
 
 
 class TestAdoptabilityRules(unittest.TestCase):
     """Each WP-F rule in isolation — the whole point of the named-predicate decomposition."""
 
     def test_a_good_checkpoint_is_adoptable(self):
-        op = _ckpt(cut={NODE.public: (0, b"h")})
+        op = _ckpt(cut={NODE.public: A.HeadEntry(0, b"h")})
         v = _view([op], qcs={op.op_hash: _qc(op)})
         self.assertTrue(v.adoptable(op))
 
@@ -110,20 +118,22 @@ class TestAdoptabilityRules(unittest.TestCase):
             data_key=bytes(32),
             txn_bytes=A.Txn(None, [], []).encode(),
         )
-        op = _ckpt(cut={NODE.public: (0, late.op_hash)}, horizon=A.HLC(100))  # F=100 < late's 200
+        op = _ckpt(
+            cut={NODE.public: A.HeadEntry(0, late.op_hash)}, horizon=A.HLC(100)
+        )  # F=100 < late's 200
         self.assertFalse(CP.horizon_covers_cut(_view([op, late]), op))
 
     def test_forward_rejects_stale_seq_and_regressing_cut(self):
-        op = _ckpt(seq=0, cut={NODE.public: (3, b"h")})
+        op = _ckpt(seq=0, cut={NODE.public: A.HeadEntry(3, b"h")})
         self.assertFalse(CP.forward(_view([op], adopted_seq=1), op))  # seq 0 < adopted_seq 1
         # a cut that regresses what I already adopted
-        regress = _view([op], cut={NODE.public: (5, b"g")})
+        regress = _view([op], cut={NODE.public: A.HeadEntry(5, b"g")})
         self.assertFalse(CP.forward(regress, op))
 
 
 class TestSelectMode(unittest.TestCase):
     def test_hot_link_selected_when_baseline_held(self):
-        op = _ckpt(seq=0, cut={NODE.public: (0, b"h")})
+        op = _ckpt(seq=0, cut={NODE.public: A.HeadEntry(0, b"h")})
         v = _view([op], qcs={op.op_hash: _qc(op)}, adopted_seq=0)
         self.assertEqual(v.select(), op)  # empty retained baseline is trivially held
 
@@ -148,18 +158,26 @@ class TestCompactionDecision(unittest.TestCase):
         self.assertEqual(cut[NODE.public][0], 1)
 
     def test_advances_only_when_the_cut_moves(self):
-        self.assertTrue(compactor.advances({NODE.public: (2, b"h")}, {NODE.public: (1, b"g")}))
-        self.assertFalse(compactor.advances({NODE.public: (1, b"h")}, {NODE.public: (1, b"g")}))
+        self.assertTrue(
+            compactor.advances(
+                {NODE.public: A.HeadEntry(2, b"h")}, {NODE.public: A.HeadEntry(1, b"g")}
+            )
+        )
+        self.assertFalse(
+            compactor.advances(
+                {NODE.public: A.HeadEntry(1, b"h")}, {NODE.public: A.HeadEntry(1, b"g")}
+            )
+        )
 
     def test_plan_none_without_advance_or_when_it_would_regress(self):
         ops = [self._data(NODE, 0, 10)]
-        prev = compactor.PrevState({NODE.public: (0, ops[0].op_hash)}, [], {})
+        prev = compactor.PrevState({NODE.public: A.HeadEntry(0, ops[0].op_hash)}, [], {})
         # no advance (cut == prev) -> None
         view = compactor.CompactorView(ops, prev, next_seq=1, committed_cut={})
         self.assertIsNone(view.plan(A.HLC(100)))
         # advance, but the committed chain head is ahead -> would regress -> None (wedge-avoidance)
         ops2 = [self._data(NODE, 0, 10), self._data(NODE, 1, 20)]
-        ahead: A.Heads = {NODE.public: (5, b"h")}
+        ahead: A.Heads = {NODE.public: A.HeadEntry(5, b"h")}
         regressing = compactor.CompactorView(
             ops2, compactor.PrevState({}, [], {}), next_seq=0, committed_cut=ahead
         )

@@ -121,7 +121,7 @@ class TestQuorumArtifacts(unittest.TestCase):
         self.assertTrue(wm.verify())
         wm.floor = A.HLC(9999, 0)
         self.assertFalse(wm.verify())
-        heads = {b"A": (3, bytes([1] * 32)), b"B": (0, bytes([2] * 32))}
+        heads = {b"A": A.HeadEntry(3, bytes([1] * 32)), b"B": A.HeadEntry(0, bytes([2] * 32))}
         fb = A.FrontierBundle.issue(
             C.SoftwareKeypair.from_seed(self.sks[0]), heads, None, 0, A.HLC(5000, 0)
         )

@@ -12,7 +12,7 @@ from collections.abc import Callable
 
 from . import codec
 from .acceptor import Nack, Rejected, RejectReason
-from .artifacts import QC, Ballot, FrontierBundle, Op, Promise, Receipt, Watermark
+from .artifacts import QC, Ballot, FrontierBundle, HeadEntry, Heads, Op, Promise, Receipt, Watermark
 from .node import (
     AcceptReq,
     FetchOpReq,
@@ -28,16 +28,16 @@ from .node import (
 )
 
 
-def _encode_heads(heads: dict[bytes, tuple[int, bytes]]) -> list:
+def _encode_heads(heads: Heads) -> list:
     """Sync-frontier / Heads as a canonical sorted list of [author, seq, hash]."""
     return [[a, s, h] for a, (s, h) in sorted(heads.items())]
 
 
-def _decode_heads(v: codec.Bencodable) -> dict[bytes, tuple[int, bytes]]:
-    out: dict[bytes, tuple[int, bytes]] = {}
+def _decode_heads(v: codec.Bencodable) -> Heads:
+    out: Heads = {}
     for entry in codec.as_seq(v):
         t = codec.as_seq(entry, 3)
-        out[codec.as_bytes(t[0])] = (codec.as_int(t[1]), codec.as_bytes(t[2]))
+        out[codec.as_bytes(t[0])] = HeadEntry(codec.as_int(t[1]), codec.as_bytes(t[2]))
     return out
 
 

@@ -80,15 +80,15 @@ def cut_at(ops: list[Op], f: HLC) -> Heads:
     for o in ops:
         if o.hlc.as_tuple() <= ft:
             cur = cut.get(o.author)
-            if cur is None or o.seq > cur[0]:
-                cut[o.author] = (o.seq, o.op_hash)
+            if cur is None or o.seq > cur.seq:
+                cut[o.author] = A.HeadEntry(o.seq, o.op_hash)
     return cut
 
 
 def advances(cut: Heads, prev_cut: Heads) -> bool:
     """Does `cut` move at least one author's frontier past `prev_cut`? (Finality is monotone, so
     no author ever regresses — so this is exactly 'is there new sealed work'.)"""
-    return any(seq > prev_cut.get(a, (-1, b""))[0] for a, (seq, _h) in cut.items())
+    return any(e.seq > prev_cut.get(a, A.HeadEntry(-1, b"")).seq for a, e in cut.items())
 
 
 def _committed_frontier(tx: ReadTxn) -> tuple[int, Heads]:
@@ -258,9 +258,9 @@ def compact(
     and the successive-checkpoint mask carry-forward (see `_mut_meta`)."""
     prev_retained, prev_attempts, prev_cut = prev.retained, prev.attempts, prev.cut
     # precondition: the cut monotonically advances prev_cut (no author regresses).
-    for author, (pseq, _ph) in prev_cut.items():
+    for author, phead in prev_cut.items():
         entry = cut.get(author)
-        if entry is None or entry[0] < pseq:
+        if entry is None or entry.seq < phead.seq:
             raise ValueError("compact: cut must monotonically advance prev_cut")
 
     prev_data = [o for o in prev_retained if not o.is_control]

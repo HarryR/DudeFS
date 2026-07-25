@@ -462,9 +462,9 @@ class Manager:
             raise ManagerError("could not read a quorum frontier for the sync barrier")
         sf: Heads = {}
         for fb in bundles:
-            for author, (seq, hh) in fb.heads.items():
-                if author not in sf or seq > sf[author][0]:
-                    sf[author] = (seq, hh)
+            for author, entry in fb.heads.items():
+                if author not in sf or entry.seq > sf[author].seq:
+                    sf[author] = entry
         return sf
 
     def change_roster(self, new_roster: list[bytes], rpc: NodeRPC) -> RosterChange:

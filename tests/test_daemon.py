@@ -369,8 +369,8 @@ class TestDaemonAdoption(unittest.TestCase):
             0, b"k", v, at, [[A.Guard.VERSION_EQ, b"k", v]], [[A.Mutation.SET, b"k", b"v2"]]
         )
         below.append(winner)
-        cut = {c.pub: (c.seq - 1, c.prev) for c in w.clients if c.seq > 0}
-        cut[w.mgr_pub] = (w._mseq - 1, w._mprev)
+        cut = {c.pub: A.HeadEntry(c.seq - 1, c.prev) for c in w.clients if c.seq > 0}
+        cut[w.mgr_pub] = A.HeadEntry(w._mseq - 1, w._mprev)
         cr = compactor.compact_genesis(below, w.keyring, w.genesis, cut)
         committed = A.retained_commitment(cr.retained)
         ckpt = w.checkpoint(
@@ -420,8 +420,8 @@ class TestDaemonAdoption(unittest.TestCase):
             0, b"k", v, at, [[A.Guard.VERSION_EQ, b"k", v]], [[A.Mutation.SET, b"k", b"v2"]]
         )
         below.append(winner)
-        cut = {c.pub: (c.seq - 1, c.prev) for c in w.clients if c.seq > 0}
-        cut[w.mgr_pub] = (w._mseq - 1, w._mprev)
+        cut = {c.pub: A.HeadEntry(c.seq - 1, c.prev) for c in w.clients if c.seq > 0}
+        cut[w.mgr_pub] = A.HeadEntry(w._mseq - 1, w._mprev)
         cr = compactor.compact_genesis(below, w.keyring, w.genesis, cut)
         ckpt = w.checkpoint(
             cut=cut,
@@ -472,8 +472,8 @@ class TestDaemonAdoption(unittest.TestCase):
             0, b"k", v, at, [[A.Guard.VERSION_EQ, b"k", v]], [[A.Mutation.SET, b"k", b"v2"]]
         )
         below.append(winner)
-        cut = {c.pub: (c.seq - 1, c.prev) for c in w.clients if c.seq > 0}
-        cut[w.mgr_pub] = (w._mseq - 1, w._mprev)
+        cut = {c.pub: A.HeadEntry(c.seq - 1, c.prev) for c in w.clients if c.seq > 0}
+        cut[w.mgr_pub] = A.HeadEntry(w._mseq - 1, w._mprev)
         cr = compactor.compact_genesis(below, w.keyring, w.genesis, cut)
         # horizon ONE BELOW the highest compacted op -> does not cover the cut
         ckpt = w.checkpoint(
@@ -755,8 +755,8 @@ class TestFreshBootstrap(unittest.TestCase):
             0, b"k", v, at, [[A.Guard.VERSION_EQ, b"k", v]], [[A.Mutation.SET, b"k", b"v2"]]
         )
         below.append(winner)
-        cut = {c.pub: (c.seq - 1, c.prev) for c in w.clients if c.seq > 0}
-        cut[w.mgr_pub] = (w._mseq - 1, w._mprev)
+        cut = {c.pub: A.HeadEntry(c.seq - 1, c.prev) for c in w.clients if c.seq > 0}
+        cut[w.mgr_pub] = A.HeadEntry(w._mseq - 1, w._mprev)
         cr = compactor.compact_genesis(below, w.keyring, w.genesis, cut)
         ckpt = w.checkpoint(
             cut=cut,

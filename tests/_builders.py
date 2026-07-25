@@ -92,8 +92,8 @@ def call_node(daemon, sk: bytes, req, *, epoch: int = 0, ts: int | None = None):
 
 def cut_of(w: World) -> A.Heads:
     """The frontier of everything authored so far (per-author (seq, prev))."""
-    cut: A.Heads = {c.pub: (c.seq - 1, c.prev) for c in w.clients if c.seq > 0}
-    cut[w.mgr_pub] = (w._mseq - 1, w._mprev)
+    cut: A.Heads = {c.pub: A.HeadEntry(c.seq - 1, c.prev) for c in w.clients if c.seq > 0}
+    cut[w.mgr_pub] = A.HeadEntry(w._mseq - 1, w._mprev)
     return cut
 
 

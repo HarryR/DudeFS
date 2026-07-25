@@ -110,7 +110,7 @@ class TestStaleFrontierRoster(unittest.TestCase):
         # sync_frontier names the GC'd `first` (below the cut) -> possession must
         # resolve via baseline completeness, and the accept succeeds (not wedged).
         assert isinstance(rop, A.Slotted)
-        sf = {w.clients[0].pub: (0, first.op_hash)}
+        sf = {w.clients[0].pub: A.HeadEntry(0, first.op_hash)}
         r = acc.on_roster_accept(rop.slot_tag, A.Ballot(1, b"m"), rop, sf, 1, NOW)
         self.assertIsInstance(r, A.Receipt)
 

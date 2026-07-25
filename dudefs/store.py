@@ -372,11 +372,11 @@ class ReadTxn:
             cur = out.get(author)
             if cur is None:
                 if seq == 0:  # no cut for this author: a run starts at the root
-                    out[author] = (seq, oh)
-            elif seq == cur[0] + 1:
-                out[author] = (seq, oh)  # contiguous extension (from pin or root)
-            # seq <= cur[0]: below/at the pin, or an equivocation sibling — skip
-            # seq > cur[0] + 1: beyond a gap — not part of the frontier
+                    out[author] = A.HeadEntry(seq, oh)
+            elif seq == cur.seq + 1:
+                out[author] = A.HeadEntry(seq, oh)  # contiguous extension (from pin or root)
+            # seq <= cur.seq: below/at the pin, or an equivocation sibling — skip
+            # seq > cur.seq + 1: beyond a gap — not part of the frontier
         return out
 
     def all_ops(self) -> list[Op]:
@@ -459,7 +459,7 @@ class ReadTxn:
     def cut(self) -> Heads:
         """The active compaction cut, or {} when uncompacted (pre-M6 behavior)."""
         raw = self.get_meta("cut")
-        return _decode_pairs(raw) if raw else {}
+        return {a: A.HeadEntry(*p) for a, p in _decode_pairs(raw).items()} if raw else {}
 
     def cut_retained(self) -> dict[bytes, A.RetainedEntry]:
         """The checkpoint's signed per-author below-cut commitment (the target a
@@ -643,7 +643,7 @@ class WriteTxn(ReadTxn):
                 # legitimately GC'd and the checkpoint's retained commitment
                 # certifies the below-cut prefix. Only a genuine tail gap defers.
                 entry = self.cut().get(op.author)
-                cut_seq = entry[0] if entry else -1
+                cut_seq = entry.seq if entry else -1
                 if op.seq > cut_seq + 1:
                     return AppendResult(AppendStatus.GAP)
         self._c.execute(

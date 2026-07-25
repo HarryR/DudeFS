@@ -64,8 +64,24 @@ def _require(d: dict[bytes, Bencodable], key: bytes) -> Bencodable:
         raise MissingField(key) from None
 
 
-# Per-author frontier: author-fingerprint -> (head seq, head op_hash).
-type Heads = dict[bytes, tuple[int, bytes]]
+class HeadEntry(NamedTuple):
+    """One author's frontier position: the head op's `seq` and `op_hash`. A NamedTuple —
+    tuple-backed and wire-identical to the [seq, hash] pair it serializes as, so it stays a
+    cheap value while gaining names and the per-author `dominates` comparison the cut rules
+    compose (was a bare `tuple[int, bytes]` destructured `(seq, _h)` everywhere)."""
+
+    seq: int
+    op_hash: bytes
+
+    def dominates(self, other: HeadEntry) -> bool:
+        """Advance-or-hold: my seq is at least as far as `other`'s. A checkpoint cut may add
+        authors / higher seqs but never take one BACKWARDS — GC past a cut is irreversible
+        (WP-F(a)/#4)."""
+        return self.seq >= other.seq
+
+
+# Per-author frontier: author-fingerprint -> head (seq, op_hash).
+type Heads = dict[bytes, HeadEntry]
 
 
 class BytesEnum(bytes, Enum):
@@ -794,7 +810,7 @@ def _heads(v: Bencodable) -> Heads:
     out: Heads = {}
     for author, entry in codec.as_dict(v).items():
         pair = codec.as_seq(entry, 2)
-        out[author] = (_uint(pair[0]), codec.as_bytes(pair[1]))
+        out[author] = HeadEntry(_uint(pair[0]), codec.as_bytes(pair[1]))
     return out
 
 
@@ -1831,7 +1847,7 @@ class FrontierBundle:
         heads = {}
         for a, entry in codec.as_dict(p[0]).items():
             pair = codec.as_seq(entry, 2)
-            heads[codec.as_bytes(a)] = (codec.as_int(pair[0]), codec.as_bytes(pair[1]))
+            heads[codec.as_bytes(a)] = HeadEntry(codec.as_int(pair[0]), codec.as_bytes(pair[1]))
         return FrontierBundle(
             heads,
             ch if (ch := codec.as_bytes(p[1])) else None,

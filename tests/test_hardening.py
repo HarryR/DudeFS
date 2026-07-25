@@ -120,8 +120,8 @@ class TestA4WindowRegression(unittest.TestCase):
         self.assertNotEqual(tomb_v, A.VERSION_ABSENT)  # tombstone anchors the lineage
 
         snap = fold.make_barrier(r_below)
-        cut = {c.pub: (c.seq - 1, c.prev) for c in w.clients if c.seq > 0}
-        cut[w.mgr_pub] = (w._mseq - 1, w._mprev)
+        cut = {c.pub: A.HeadEntry(c.seq - 1, c.prev) for c in w.clients if c.seq > 0}
+        cut[w.mgr_pub] = A.HeadEntry(w._mseq - 1, w._mprev)
 
         # x lands with hlc BELOW the checkpoint op's hlc (normal concurrent
         # traffic while the manager mints) but targets the sealed tombstone.
@@ -233,7 +233,7 @@ class TestLane2Fence(unittest.TestCase):
         ops = list(w.all_control())
         pv = w._mgr_op(partial(A.PverActivateOp.build, activate_pver=fold.SUPPORTED_PVER + 1))
         ops.append(pv)
-        cut = {w.mgr_pub: (w._mseq - 1, w._mprev)}
+        cut = {w.mgr_pub: A.HeadEntry(w._mseq - 1, w._mprev)}
         ckpt = w.checkpoint(cut=cut, keyepoch=0)
         ops.append(ckpt)
         with self.assertRaises(fold.FoldHalted) as cm:

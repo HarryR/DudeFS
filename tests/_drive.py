@@ -242,7 +242,7 @@ class StepDriver:
         self._b1 = _B1State()
         self._floors: dict[int, HLC] = {}
         self.pumps: list[_Pump] = []
-        self._cut: dict[bytes, tuple[int, bytes]] = {}  # active compaction cut (WP2 infra)
+        self._cut: A.Heads = {}  # active compaction cut (WP2 infra)
         self._dead: frozenset[bytes] = frozenset()
 
     def _build_nodes(self, n: int, delta: int) -> list[LocalNode]:

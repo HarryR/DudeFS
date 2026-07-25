@@ -65,7 +65,7 @@ def _fixtures() -> dict[str, bytes]:
         txn_bytes=txn.encode(),
         slot_tag=tag,
     )
-    heads = {pub: (0, op.op_hash)}
+    heads = {pub: A.HeadEntry(0, op.op_hash)}
     promise = A.Promise.issue(
         C.SoftwareKeypair.from_seed(sk), tag, bal, A.Ballot(1, b"a"), op.op_hash, A.HLC(999, 0)
     )

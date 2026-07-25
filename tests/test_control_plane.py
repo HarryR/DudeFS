@@ -367,7 +367,7 @@ class TestPossessionBarrier(unittest.TestCase):
         nodes, _roster = _acc_cluster(3)
         w = World(seed=3, n_clients=1)
         base = w.blind(0, [], [[A.Mutation.SET, b"k", b"v"]])  # a committed op ≤ the frontier
-        sf = {base.author: (0, base.op_hash)}
+        sf = {base.author: A.HeadEntry(0, base.op_hash)}
         with nodes[0].store.write_txn() as tx:
             tx.append(base)  # node 0 is caught up; node 1 is not
         self.assertTrue(nodes[0].holds_frontier(sf))
@@ -391,7 +391,7 @@ class TestPossessionBarrier(unittest.TestCase):
         nodes, _roster = _acc_cluster(2)
         w = World(seed=6, n_clients=1)
         base = w.blind(0, [], [[A.Mutation.SET, b"k", b"v"]])
-        sf = {base.author: (0, base.op_hash)}
+        sf = {base.author: A.HeadEntry(0, base.op_hash)}
         with nodes[0].store.write_txn() as tx:
             tx.append(base)  # the incumbent holds the frontier
         self.assertFalse(nodes[1].holds_frontier(sf))  # fresh learner: empty
@@ -438,7 +438,7 @@ class TestRosterActivation(unittest.TestCase):
         nodes, roster3 = _acc_cluster(3)  # n0 (incumbent) + n1,n2 (caught-up learners)
         w = World(seed=4, n_clients=1)
         base = w.blind(0, [], [[A.Mutation.SET, b"k", b"v"]])
-        sf = {base.author: (0, base.op_hash)}
+        sf = {base.author: A.HeadEntry(0, base.op_hash)}
         for nd in nodes:  # every new-roster node is caught up to the sync frontier
             with nd.store.write_txn() as tx:
                 tx.append(base)

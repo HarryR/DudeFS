@@ -250,8 +250,8 @@ class TestA4Barrier(unittest.TestCase):
         snap = fold.make_barrier(r_below)
         # the checkpoint's pinned per-author heads (DESIGN §12) — EVERY author's
         # chain at the cut, including the manager's own (its cert ops are below).
-        cut_frontier = {c.pub: (c.seq - 1, c.prev) for c in w.clients if c.seq > 0}
-        cut_frontier[w.mgr_pub] = (w._mseq - 1, w._mprev)
+        cut_frontier = {c.pub: A.HeadEntry(c.seq - 1, c.prev) for c in w.clients if c.seq > 0}
+        cut_frontier[w.mgr_pub] = A.HeadEntry(w._mseq - 1, w._mprev)
         ckpt = w.checkpoint(cut=cut_frontier, keyepoch=0)
 
         # tail (hlc after the checkpoint via sequential ticks): all lineages fresh
