@@ -204,6 +204,18 @@ re-home), `_harness.Sim` + `ClientRunner`. **Keeps (lifted to `tests/`):** `Faul
 
 ## 5. Staged plan (each a green `make check`)
 
+> **LANDED (§0–6 all green).** 3019410 (§0 enabling refactor) → 993e39d (§1 StepDriver, proven) →
+> 35c75c5 (§2 test_sim) → 80efa0d (§3–6: test_fumbling/chaos_compaction/personas reforged, then
+> `transports/memory.py` + `_harness.Sim` + `test_transport.py` DELETED, carrier lifted to
+> `tests/_carrier.py`). **Key empirical result (§6.3):** escalation-only held across the ENTIRE
+> suite — including `test_flapping_partition_commit_lands_in_a_healed_window`, whose comment used to
+> credit the sim's 40ms resend; it now commits via the ~200ms round-timeout escalation re-fanning-out
+> into a heal window. No scenario wedged, so NO retransmit was added to the product — the removal was
+> pure dead weight, exactly as §6.2 predicted. Reforge was smaller than first scoped: test_personas /
+> test_chaos_compaction / most of test_fumbling never drive a commit (they call `.accept` / adopt/GC
+> directly), so escalation was moot for them; only test_sim + the fumbling button-masher exercise the
+> commit path, and both passed unchanged. StepDriver kept the sim's B1/B2/B3 invariant hooks intact.
+
 0. **Enabling refactor (§0)** — lift the decisions out of the daemon loops into pure functions
    (`checkpoint.adoptable` / `plan_compaction` / the shared checkpoint-rules module) with unit tests;
    daemons shrink to `loop → tick → steps`. Wire-neutral, behaviour-preserving; land + green FIRST so
