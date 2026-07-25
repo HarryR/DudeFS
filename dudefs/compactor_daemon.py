@@ -23,7 +23,6 @@ from . import compactor
 from .artifacts import HLC, Op
 from .client import ClientDaemon, _drive
 from .quorum import Commit, Committed
-from .store import ReadTxn
 
 
 class CompactorDaemon(ClientDaemon):
@@ -33,31 +32,6 @@ class CompactorDaemon(ClientDaemon):
     checkpoint's state forward — reconstructed from its OWN adopted store each pass — so each
     pass is INCREMENTAL and a RESTART resumes incremental rather than re-folding history
     (cost ∝ churn since the last cut, never ∝ history; DESIGN §12 rev 6)."""
-
-    def _committed_frontier(self, tx: ReadTxn) -> tuple[int, A.Heads]:
-        """The checkpoint-chain head the QUORUM has decided: (next seq to contend, the latest
-        committed checkpoint's cut). Reading committed checkpoints from the synced log — not
-        just my own adopted meta — means a compactor that LOST a slot or is a concurrent/
-        failover peer contends the next UNCONTENDED seq instead of wedging forever on one a
-        rival already decided, and extends the decided CUT rather than a stale local one. Only
-        slot-BOUND checkpoints count (slot_tag == the seq's tag), exactly as adoption enforces,
-        so a mismatched seq claim can neither force a skip nor move the frontier."""
-        best_seq = -1
-        best_cut: A.Heads = {}
-        h = tx.get_meta("checkpoint")
-        own = tx.get_op(h) if h else None
-        if isinstance(own, A.CheckpointOp):  # my adopted head (its QC may be GC'd)
-            best_seq, best_cut = own.checkpoint_seq, own.baseline.cut
-        for op in tx.all_ops():
-            if not isinstance(op, A.CheckpointOp):
-                continue
-            if tx.get_qc(op.op_hash) is None:  # only a COMMITTED checkpoint decides a seq
-                continue
-            if op.slot_tag != A.checkpoint_slot_tag(op.checkpoint_seq):  # seq must bind its slot
-                continue
-            if op.checkpoint_seq > best_seq:
-                best_seq, best_cut = op.checkpoint_seq, op.baseline.cut
-        return best_seq + 1, best_cut
 
     def _author_checkpoint(self, cr: compactor.CompactResult, plan: compactor.CompactionPlan) -> Op:
         """Author the Cap.COMPACT checkpoint op on the compactor's OWN chain (its cert
@@ -86,25 +60,20 @@ class CompactorDaemon(ClientDaemon):
         return op
 
     def compact_once(self) -> bytes | None:
-        """One INCREMENTAL compaction pass: sync -> decide (`compactor.plan_compaction`) -> seal ->
-        commit+adopt. Returns the committed checkpoint's op_hash, or None when there is nothing
-        new+final to seal or the quorum didn't commit. The DECISION is pure (testable without a
-        daemon); the store I/O is `_seal` / `_commit_and_adopt`. Cost ∝ churn since the last cut,
-        never ∝ history; `prev` reads from the durable store, so a restart resumes."""
+        """One INCREMENTAL compaction pass: sync -> decide (`CompactorView.of(tx).plan(F)`) -> seal
+        -> commit+adopt. Returns the committed checkpoint's op_hash, or None when there is nothing
+        new+final to seal or the quorum didn't commit. The read is ONE `.of(tx)` boundary and the
+        DECISION is pure (testable without a daemon); the store I/O is `_seal`/`_commit_and_adopt`.
+        Cost ∝ churn since the last cut, never ∝ history; `prev` reads from the durable store, so a
+        restart resumes."""
         self.sync()  # pull the committed log + set the finalized floor F
         with self._lock:
             f = self._final_frontier
         if f == HLC(0, 0):
             return None  # nothing is final yet — no cut to pin
         with self.store.read_txn() as tx:
-            committed = [
-                o for o in tx.all_ops() if o.is_control or tx.get_qc(o.op_hash) is not None
-            ]
-            prev = compactor.PrevState.of(tx, self.keyring)
-            next_seq, committed_cut = self._committed_frontier(tx)
-        plan = compactor.plan_compaction(
-            committed, prev, horizon=f, next_seq=next_seq, committed_cut=committed_cut
-        )
+            view = compactor.CompactorView.of(tx, self.keyring)
+        plan = view.plan(f)
         if plan is None:
             return None
         ckpt, cr = self._seal(plan)

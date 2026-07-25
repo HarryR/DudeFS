@@ -63,8 +63,8 @@ class PrevState:
 @dataclass(frozen=True)
 class CompactionPlan:
     """A decided compaction pass: the new final `cut`, its chain `seq`, the `committed` band to
-    fold, the `prev` baseline, and the `horizon` F the cut is sealed at. `plan_compaction` returns
-    None when there is no new sealed work, or the cut would regress the decided chain head."""
+    fold, the `prev` baseline, and the `horizon` F the cut is sealed at. `CompactorView.plan`
+    returns None when there is no new sealed work, or the cut would regress the decided head."""
 
     cut: Heads
     seq: int
@@ -93,20 +93,66 @@ def advances(cut: Heads, prev_cut: Heads) -> bool:
     return any(seq > prev_cut.get(a, (-1, b""))[0] for a, (seq, _h) in cut.items())
 
 
-def plan_compaction(
-    committed: list[Op], prev: PrevState, *, horizon: HLC, next_seq: int, committed_cut: Heads
-) -> CompactionPlan | None:
-    """The PURE compaction decision. The new final cut at `horizon`, or None when there is nothing
-    new+final to seal (no advance since the last cut) OR the cut would REGRESS the decided chain
-    head — if my finality lags the latest committed checkpoint's cut, my cut would not dominate it
-    and the nodes would reject it (WP-F(a) gate). Skip and retry once my floor catches up, so a
-    lagging compactor waits rather than wedges."""
-    cut = cut_at(committed, horizon)
-    if not cut or not advances(cut, prev.cut):
-        return None  # no new sealed work since the last checkpoint
-    if not cut_dominates(cut, committed_cut):
-        return None  # would regress the decided chain head -> decided-but-unadoptable = a WEDGE
-    return CompactionPlan(cut=cut, seq=next_seq, committed=committed, prev=prev, horizon=horizon)
+def _committed_frontier(tx: ReadTxn) -> tuple[int, Heads]:
+    """The checkpoint-chain head the QUORUM has decided: (next seq to contend, the latest committed
+    checkpoint's cut). Reading committed checkpoints from the synced log — not just my own adopted
+    meta — means a compactor that LOST a slot or is a concurrent/failover peer contends the next
+    UNCONTENDED seq instead of wedging forever on one a rival already decided, and extends the
+    decided CUT rather than a stale local one. Only slot-BOUND checkpoints count (slot_tag == the
+    seq's tag), exactly as adoption enforces, so a mismatched seq claim can neither force a skip nor
+    move the frontier."""
+    best_seq = -1
+    best_cut: Heads = {}
+    h = tx.get_meta("checkpoint")
+    own = tx.get_op(h) if h else None
+    if isinstance(own, A.CheckpointOp):  # my adopted head (its QC may be GC'd)
+        best_seq, best_cut = own.checkpoint_seq, own.baseline.cut
+    for op in tx.all_ops():
+        if not isinstance(op, A.CheckpointOp):
+            continue
+        if tx.get_qc(op.op_hash) is None:  # only a COMMITTED checkpoint decides a seq
+            continue
+        if op.slot_tag != A.checkpoint_slot_tag(op.checkpoint_seq):  # seq must bind its slot
+            continue
+        if op.checkpoint_seq > best_seq:
+            best_seq, best_cut = op.checkpoint_seq, op.baseline.cut
+    return best_seq + 1, best_cut
+
+
+@dataclass(frozen=True)
+class CompactorView:
+    """Everything the compactor reads from its OWN store to decide a pass: the `committed` band to
+    fold (control ops + QC'd data), its last-adopted baseline (`prev`), and the decided checkpoint-
+    chain head (`next_seq` to contend, `committed_cut` to extend). Like `CheckpointView`: `.of(tx)`
+    is the ONLY store read, so `.plan` unit-tests with a crafted view (HANDOFF-R9 §0)."""
+
+    committed: list[Op]
+    prev: PrevState
+    next_seq: int
+    committed_cut: Heads
+
+    @classmethod
+    def of(cls, tx: ReadTxn, keyring: fold.Keyring) -> CompactorView:
+        """The ONE store read: the committed band, the previous baseline, and the decided head."""
+        committed = [o for o in tx.all_ops() if o.is_control or tx.get_qc(o.op_hash) is not None]
+        prev = PrevState.of(tx, keyring)
+        next_seq, committed_cut = _committed_frontier(tx)
+        return cls(committed, prev, next_seq, committed_cut)
+
+    def plan(self, horizon: HLC) -> CompactionPlan | None:
+        """The PURE compaction decision at the finalized floor `horizon` (F). None when there is
+        nothing new+final to seal (no advance since the last cut) OR the cut would REGRESS the
+        decided chain head — if my finality lags the latest committed checkpoint's cut, my cut would
+        not dominate it and the nodes would reject it (WP-F(a) gate). Skip and retry once my floor
+        catches up, so a lagging compactor waits rather than wedges."""
+        cut = cut_at(self.committed, horizon)
+        if not cut or not advances(cut, self.prev.cut):
+            return None  # no new sealed work since the last checkpoint
+        if not cut_dominates(cut, self.committed_cut):
+            return None  # would regress the decided chain head -> decided-but-unadoptable = a WEDGE
+        return CompactionPlan(
+            cut=cut, seq=self.next_seq, committed=self.committed, prev=self.prev, horizon=horizon
+        )
 
 
 class CompactError(DudeFSError):

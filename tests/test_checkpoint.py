@@ -129,7 +129,7 @@ class TestSelectMode(unittest.TestCase):
 
 
 class TestCompactionDecision(unittest.TestCase):
-    """compactor.plan_compaction / cut_at / advances — pure author-side planning."""
+    """compactor.CompactorView.plan / cut_at / advances — pure author-side planning."""
 
     def _data(self, kp, seq, hlc):
         return A.BlindPutOp.build(
@@ -155,24 +155,22 @@ class TestCompactionDecision(unittest.TestCase):
         ops = [self._data(NODE, 0, 10)]
         prev = compactor.PrevState({NODE.public: (0, ops[0].op_hash)}, [], {})
         # no advance (cut == prev) -> None
-        self.assertIsNone(
-            compactor.plan_compaction(ops, prev, horizon=A.HLC(100), next_seq=1, committed_cut={})
-        )
+        view = compactor.CompactorView(ops, prev, next_seq=1, committed_cut={})
+        self.assertIsNone(view.plan(A.HLC(100)))
         # advance, but the committed chain head is ahead -> would regress -> None (wedge-avoidance)
         ops2 = [self._data(NODE, 0, 10), self._data(NODE, 1, 20)]
-        prev0 = compactor.PrevState({}, [], {})
         ahead: A.Heads = {NODE.public: (5, b"h")}
-        self.assertIsNone(
-            compactor.plan_compaction(
-                ops2, prev0, horizon=A.HLC(100), next_seq=0, committed_cut=ahead
-            )
+        regressing = compactor.CompactorView(
+            ops2, compactor.PrevState({}, [], {}), next_seq=0, committed_cut=ahead
         )
+        self.assertIsNone(regressing.plan(A.HLC(100)))
 
     def test_plan_returns_a_typed_plan_when_new_work_is_final(self):
         ops = [self._data(NODE, 0, 10), self._data(NODE, 1, 20)]
-        plan = compactor.plan_compaction(
-            ops, compactor.PrevState({}, [], {}), horizon=A.HLC(100), next_seq=0, committed_cut={}
+        view = compactor.CompactorView(
+            ops, compactor.PrevState({}, [], {}), next_seq=0, committed_cut={}
         )
+        plan = view.plan(A.HLC(100))
         assert plan is not None
         self.assertEqual(plan.seq, 0)
         self.assertEqual(plan.cut[NODE.public][0], 1)
