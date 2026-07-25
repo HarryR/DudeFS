@@ -218,18 +218,25 @@ class Acceptor:
     def on_prepare(self, tag: bytes, ballot: Ballot) -> PrepareResult:
         with self.store.write_txn() as tx:
             s = tx.get_slot(tag)
-            # void rule (NOTES 27, DESIGN §8): a slot whose accepted op is below the
-            # checkpoint horizon is dead — a reborn creation tag must not make PREPARE
+            # void rule (NOTES 27, DESIGN §8): a slot whose accepted op is BELOW THE
+            # CHECKPOINT HORIZON is dead — a reborn creation tag must not make PREPARE
             # report an ancient decided op that §1.3 would re-propose but can never
             # re-commit (its hlc is below the floor), a livelock until every node GCs.
             # Discard the accept; the promise reports a fresh slot and the new op wins.
+            #
+            # The horizon is the SOLE void authority (review C-1): envelope ABSENCE is a
+            # FETCH problem, never a void trigger. A GC path can drop a still-live slot op's
+            # envelope while its hlc is above the horizon; voiding on `get_op() is None`
+            # would let a fresh op win a slot that already decided — two QCs, no evidence.
+            # An ambiguous "not found" must not stand in for the meaningful below-horizon
+            # test, so we keep the accepted op and simply cannot report its hlc (fetch it).
             accepted_hlc: HLC | None = None
             if s.accepted_op is not None:
                 acc = tx.get_op(s.accepted_op)
-                if acc is None or acc.hlc < tx.get_horizon():
+                if acc is not None and acc.hlc < tx.get_horizon():
                     s.accepted_ballot = None
                     s.accepted_op = None
-                else:
+                elif acc is not None:
                     accepted_hlc = acc.hlc  # reported so the client applies its own guard
             if ballot <= s.promised:
                 return Nack(s.promised)  # no write; the txn commits empty

@@ -196,5 +196,32 @@ class TestSingleDecree(unittest.TestCase):
         assert isinstance(stale, Nack)
 
 
+class TestC1VoidOnMissingEnvelope(unittest.TestCase):
+    """Review C-1 (RC-2): on_prepare's void rule fires on `acc is None` (envelope absent) as
+    well as below-horizon. But envelope absence is a FETCH problem, not amnesia — a GC path
+    (overfull_drop) can drop an envelope while its slot is live and its hlc is NOT below the
+    horizon. Voiding then lets a fresh op win a slot that already decided => two QCs for one
+    slot, no evidence. The horizon must be the SOLE void authority."""
+
+    def test_prepare_does_not_void_when_only_the_envelope_is_missing(self):
+        w = World(seed=1, n_clients=1)
+        acc = Acceptor(C.SoftwareKeypair.from_seed(bytes([200] * 32)), ChainStore(), 0, DELTA)
+        op, tag = _slot_op(w, 0, b"a", NOW)
+        self.assertIsInstance(acc.on_accept(tag, Ballot(1, b"x"), op, NOW), A.Receipt)  # A decided
+
+        # GC the envelope (as overfull_drop would) WITHOUT advancing the horizon; op.hlc is
+        # well ABOVE the (zero) horizon, so this is pure envelope-absence, not amnesia.
+        with acc.store.write_txn() as tx:
+            tx.gc_checkpoint([op.op_hash])
+        with acc.store.read_txn() as tx:
+            self.assertIsNone(tx.get_op(op.op_hash))  # envelope is gone
+            self.assertEqual(tx.get_horizon(), HLC(0, 0))  # but the horizon never advanced
+
+        p = acc.on_prepare(tag, Ballot(2, b"r"))
+        assert isinstance(p, A.Promise)
+        # the slot must STILL report the decided op (fetch it), never void it to let B win:
+        self.assertEqual(p.accepted_op_hash, op.op_hash)
+
+
 if __name__ == "__main__":
     unittest.main()
