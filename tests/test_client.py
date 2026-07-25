@@ -72,7 +72,7 @@ class TestClientLadder(unittest.TestCase):
             cl = _Cluster(tmp, w)
             c = cl.client(w)
             op = c.submit(
-                (b"k", VERSION_ABSENT, 0),
+                A.Slot(b"k", VERSION_ABSENT, 0),
                 [[A.Guard.ABSENT, b"k"]],
                 [[A.Mutation.SET, b"k", b"v1"]],
             )
@@ -92,7 +92,7 @@ class TestClientLadder(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             cl = _Cluster(tmp, w)
             a, b = cl.client(w, 0), cl.client(w, 1)
-            slot = (b"k", VERSION_ABSENT, 0)
+            slot = A.Slot(b"k", VERSION_ABSENT, 0)
             guard = [[A.Guard.ABSENT, b"k"]]
             oa = a.submit(slot, guard, [[A.Mutation.SET, b"k", b"A"]])
             ob = b.submit(slot, guard, [[A.Mutation.SET, b"k", b"B"]])
@@ -123,7 +123,7 @@ class TestClientLadder(unittest.TestCase):
             c = cl.client(w)
             for key, val in ((b"q/items/1", b"a"), (b"q/items/2", b"b")):
                 op = c.submit(
-                    (key, VERSION_ABSENT, 0),
+                    A.Slot(key, VERSION_ABSENT, 0),
                     [[A.Guard.ABSENT, key]],
                     [[A.Mutation.SET, key, val]],
                 )
@@ -148,7 +148,7 @@ class TestReadSideSync(unittest.TestCase):
             cl = _Cluster(tmp, w)
             a, b = cl.client(w, 0), cl.client(w, 1)
             op = a.submit(
-                (b"shared/x", VERSION_ABSENT, 0),
+                A.Slot(b"shared/x", VERSION_ABSENT, 0),
                 [[A.Guard.ABSENT, b"shared/x"]],
                 [[A.Mutation.SET, b"shared/x", b"from-A"]],
             )
@@ -185,19 +185,25 @@ class TestCasUpdate(unittest.TestCase):
             cl = _Cluster(tmp, w)
             c = cl.client(w)
             create = c.submit(
-                (b"k", VERSION_ABSENT, 0), [[A.Guard.ABSENT, b"k"]], [[A.Mutation.SET, b"k", b"v1"]]
+                A.Slot(b"k", VERSION_ABSENT, 0),
+                [[A.Guard.ABSENT, b"k"]],
+                [[A.Mutation.SET, b"k", b"v1"]],
             )
             self.assertTrue(poll_until(lambda: c.status(create).phase == "committed"))
             v1 = c.get(b"k")["version"]  # the created version (op_hash)
 
             upd = c.submit(
-                (b"k", v1, 0), [[A.Guard.VERSION_EQ, b"k", v1]], [[A.Mutation.SET, b"k", b"v2"]]
+                A.Slot(b"k", v1, 0),
+                [[A.Guard.VERSION_EQ, b"k", v1]],
+                [[A.Mutation.SET, b"k", b"v2"]],
             )
             self.assertTrue(poll_until(lambda: c.status(upd).phase == "committed"))
             self.assertEqual(c.get(b"k")["value"], b"v2")
 
             stale = c.submit(
-                (b"k", v1, 0), [[A.Guard.VERSION_EQ, b"k", v1]], [[A.Mutation.SET, b"k", b"v3"]]
+                A.Slot(b"k", v1, 0),
+                [[A.Guard.VERSION_EQ, b"k", v1]],
+                [[A.Mutation.SET, b"k", b"v3"]],
             )
             self.assertTrue(poll_until(lambda: c.status(stale).phase == "lost"))
             self.assertEqual(c.get(b"k")["value"], b"v2")  # unchanged

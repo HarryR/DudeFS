@@ -23,7 +23,7 @@ from typing import TypedDict
 
 from . import artifacts as A
 from . import compactor, crypto, fold, gossip, lmsg, transports, tunables, wire
-from .artifacts import BLIND, HLC, QC, Op, Receipt, Txn, compute_slot_tag, covered
+from .artifacts import BLIND, HLC, QC, Op, Receipt, Slot, Txn, covered
 from .link import Link
 from .node import FetchOpReq, FrontierReq, GetQCReq, PutQCReq, Request, Response, SubmitReq
 from .quorum import (
@@ -45,9 +45,6 @@ from .store import ChainStore, ReadTxn, StoreClosed
 # no-quorum-reachable wall-clock backstop (the sans-io machine gives up earlier via
 # max_rounds/max_polls); BLIND_DEADLINE_MS the idempotent blind-SUBMIT retransmit
 # budget; REFRESH_MS the background read-side sync cadence.
-
-
-type Slot = tuple[bytes, bytes, int]  # (path, version, attempt)
 
 
 @dataclass(frozen=True)
@@ -325,10 +322,7 @@ class ClientDaemon:
         mutations: list[list[bytes]],
     ) -> Op:
         ring = self.keyring[self.keyepoch]
-        slot_tag = None
-        if slot is not None:
-            path, version, attempt = slot
-            slot_tag = compute_slot_tag(ring.slot_secret, path, version, attempt)
+        slot_tag = slot.tag(ring.slot_secret) if slot is not None else None
         txn = Txn(slot=slot, guards=guards, mutations=mutations)
         with self._lock:
             hlc = self._next_hlc()

@@ -171,14 +171,14 @@ def _mutation(m: Any) -> list[bytes]:
     raise WorkerError(-32602, "mutation needs `set` or `del`")
 
 
-def _slot(s: Any) -> tuple[bytes, bytes, int] | None:
+def _slot(s: Any) -> A.Slot | None:
     if s is None:
         return None
     if not isinstance(s, dict) or "path" not in s:
         raise WorkerError(-32602, "slot needs {path, version, attempt}")
     v = s.get("version")
     version = VERSION_ABSENT if v in (None, "⊥", "") else _unhex(v)
-    return (_b(s["path"]), version, int(s.get("attempt", 0)))
+    return A.Slot(_b(s["path"]), version, int(s.get("attempt", 0)))
 
 
 def _guards(raw: object) -> list[list[bytes]]:
@@ -249,12 +249,12 @@ class WorkerAPI:
         path = _b(p["path"])
         expect = p.get("expect")
         if expect in (None, "absent"):
-            slot = (path, VERSION_ABSENT, 0)
+            slot = A.Slot(path, VERSION_ABSENT, 0)
             guards = [[A.Guard.ABSENT, path]]
         else:
             version = _unhex(expect["version"])
             attempt = int(expect.get("attempt", 0))
-            slot = (path, version, attempt)
+            slot = A.Slot(path, version, attempt)
             guards = [[A.Guard.VERSION_EQ, path, version]]
         op = self.d.submit(slot, guards, _mutations(p.get("mutations")))
         return {"op": op.hex()}

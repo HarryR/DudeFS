@@ -154,7 +154,7 @@ class StateView:
 class EvalResult(NamedTuple):
     guards_ok: bool
     mutations: list[list[bytes]]  # list of [op, path, value?]
-    slot_preimage: tuple[bytes, bytes, int] | None  # (key, version, attempt) | None
+    slot_preimage: A.Slot | None  # the restated CAS coordinate (None = blind)
 
 
 def evaluate(txn: Txn, view: StateView) -> EvalResult:
@@ -645,8 +645,8 @@ def fold(
             applied = False
             if not isinstance(d, Opaque):
                 ev = evaluate(d, view)
-                # the restated preimage must match k's *current* lineage, and guards hold
-                if ev.slot_preimage == (k, cur_ver, cur_att) and ev.guards_ok:
+                # the restated coordinate must match k's *current* lineage, and guards hold
+                if ev.slot_preimage == A.Slot(k, cur_ver, cur_att) and ev.guards_ok:
                     _apply_mutations(state, ev.mutations, op.op_hash)
                     applied = True
                     mutated = {m[1] for m in ev.mutations if len(m) >= 2}
@@ -685,7 +685,7 @@ def _attribute(
         m = state.get(k)
         ver = m.version if m is not None else VERSION_ABSENT
         att = m.attempt if m is not None else 0
-        if A.compute_slot_tag(secret, k, ver, att) == tag:
+        if A.Slot(k, ver, att).tag(secret) == tag:
             return k
     return None
 

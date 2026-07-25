@@ -52,9 +52,9 @@ def _fixtures() -> dict[str, bytes]:
     pub = C.SIGNER.public(sk)
     bal = A.Ballot(3, b"pri")
     txn = A.Txn(
-        (b"k", A.VERSION_ABSENT, 0), [[A.Guard.ABSENT, b"k"]], [[A.Mutation.SET, b"k", b"v"]]
+        A.Slot(b"k", A.VERSION_ABSENT, 0), [[A.Guard.ABSENT, b"k"]], [[A.Mutation.SET, b"k", b"v"]]
     )
-    tag = A.compute_slot_tag(bytes([9] * 32), b"k", A.VERSION_ABSENT, 0)
+    tag = A.Slot(b"k", A.VERSION_ABSENT, 0).tag(bytes([9] * 32))
     op = A.CasOp.build(
         author=C.SoftwareKeypair.from_seed(sk),
         seq=0,

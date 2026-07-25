@@ -198,13 +198,13 @@ class TestCompactorDriver(unittest.TestCase):
             fx = _Fixture(tmp, seed=41)
             try:
                 op1 = fx.write(
-                    (b"k", VERSION_ABSENT, 0),
+                    A.Slot(b"k", VERSION_ABSENT, 0),
                     [[A.Guard.ABSENT, b"k"]],
                     [[A.Mutation.SET, b"k", b"v1"]],
                 )
                 v1 = fx.client.get(b"k")["version"]
                 fx.write(
-                    (b"k", v1, 0),
+                    A.Slot(b"k", v1, 0),
                     [[A.Guard.VERSION_EQ, b"k", v1]],
                     [[A.Mutation.SET, b"k", b"v2"]],
                 )  # supersedes v1 -> op1 dead
@@ -223,7 +223,7 @@ class TestCompactorDriver(unittest.TestCase):
             try:
                 # PASS 1 (genesis, prev=∅): create k1
                 fx.write(
-                    (b"k1", VERSION_ABSENT, 0),
+                    A.Slot(b"k1", VERSION_ABSENT, 0),
                     [[A.Guard.ABSENT, b"k1"]],
                     [[A.Mutation.SET, b"k1", b"a1"]],
                 )
@@ -239,12 +239,12 @@ class TestCompactorDriver(unittest.TestCase):
                 # PASS 2 (incremental): supersede k1 (a1 dead) + create k2 in the new band
                 v1 = fx.client.get(b"k1")["version"]  # the a1 op's hash — dead once superseded
                 fx.write(
-                    (b"k1", v1, 0),
+                    A.Slot(b"k1", v1, 0),
                     [[A.Guard.VERSION_EQ, b"k1", v1]],
                     [[A.Mutation.SET, b"k1", b"a2"]],
                 )
                 fx.write(
-                    (b"k2", VERSION_ABSENT, 0),
+                    A.Slot(b"k2", VERSION_ABSENT, 0),
                     [[A.Guard.ABSENT, b"k2"]],
                     [[A.Mutation.SET, b"k2", b"b1"]],
                 )
@@ -294,7 +294,7 @@ class TestCompactorRestart(unittest.TestCase):
 
     def _create(self, fx, key, val):
         return fx.write(
-            (key, VERSION_ABSENT, 0), [[A.Guard.ABSENT, key]], [[A.Mutation.SET, key, val]]
+            A.Slot(key, VERSION_ABSENT, 0), [[A.Guard.ABSENT, key]], [[A.Mutation.SET, key, val]]
         )
 
     def test_restart_resumes_incremental_not_genesis(self):
@@ -313,7 +313,7 @@ class TestCompactorRestart(unittest.TestCase):
                 # new work after the restart -> an incremental pass off the reconstructed prev
                 v1 = fx.client.get(b"k1")["version"]
                 fx.write(
-                    (b"k1", v1, 0),
+                    A.Slot(b"k1", v1, 0),
                     [[A.Guard.VERSION_EQ, b"k1", v1]],
                     [[A.Mutation.SET, b"k1", b"a2"]],
                 )
@@ -393,7 +393,7 @@ class TestCheckpointSequencing(unittest.TestCase):
                 for i in range(3):  # three passes, each with new final work -> a new link
                     key = f"k{i}".encode()
                     fx.write(
-                        (key, VERSION_ABSENT, 0),
+                        A.Slot(key, VERSION_ABSENT, 0),
                         [[A.Guard.ABSENT, key]],
                         [[A.Mutation.SET, key, b"v"]],
                     )
@@ -416,7 +416,7 @@ class TestCheckpointSequencing(unittest.TestCase):
             comp2 = fx.make_comp2()
             try:
                 fx.write(
-                    (b"k0", VERSION_ABSENT, 0),
+                    A.Slot(b"k0", VERSION_ABSENT, 0),
                     [[A.Guard.ABSENT, b"k0"]],
                     [[A.Mutation.SET, b"k0", b"v"]],
                 )
@@ -426,7 +426,7 @@ class TestCheckpointSequencing(unittest.TestCase):
                 self.assertTrue(fx.adopt(ck0))
 
                 fx.write(
-                    (b"k1", VERSION_ABSENT, 0),
+                    A.Slot(b"k1", VERSION_ABSENT, 0),
                     [[A.Guard.ABSENT, b"k1"]],
                     [[A.Mutation.SET, b"k1", b"v"]],
                 )  # new final work so there is a dominating cut to seal at seq 1

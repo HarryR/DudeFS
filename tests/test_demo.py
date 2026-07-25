@@ -115,7 +115,7 @@ class TestDemoRunbook(unittest.TestCase):
                     (
                         a,
                         a.submit(
-                            (_k(f"a/{i}"), VERSION_ABSENT, 0),
+                            A.Slot(_k(f"a/{i}"), VERSION_ABSENT, 0),
                             [[A.Guard.ABSENT, _k(f"a/{i}")]],
                             [[A.Mutation.SET, _k(f"a/{i}"), b"A"]],
                         ),
@@ -125,19 +125,19 @@ class TestDemoRunbook(unittest.TestCase):
                     (
                         b,
                         b.submit(
-                            (_k(f"b/{i}"), VERSION_ABSENT, 0),
+                            A.Slot(_k(f"b/{i}"), VERSION_ABSENT, 0),
                             [[A.Guard.ABSENT, _k(f"b/{i}")]],
                             [[A.Mutation.SET, _k(f"b/{i}"), b"B"]],
                         ),
                     )
                 )
             la = a.submit(
-                (b"lock", VERSION_ABSENT, 0),
+                A.Slot(b"lock", VERSION_ABSENT, 0),
                 [[A.Guard.ABSENT, b"lock"]],
                 [[A.Mutation.SET, b"lock", b"A"]],
             )
             lb = b.submit(
-                (b"lock", VERSION_ABSENT, 0),
+                A.Slot(b"lock", VERSION_ABSENT, 0),
                 [[A.Guard.ABSENT, b"lock"]],
                 [[A.Mutation.SET, b"lock", b"B"]],
             )
@@ -166,7 +166,7 @@ class TestDemoRunbook(unittest.TestCase):
             demo = Demo(tmp, w)
             a = demo.clients[0]
             pre = a.submit(
-                (b"jobs/1", VERSION_ABSENT, 0),
+                A.Slot(b"jobs/1", VERSION_ABSENT, 0),
                 [[A.Guard.ABSENT, b"jobs/1"]],
                 [[A.Mutation.SET, b"jobs/1", b"v"]],
             )
@@ -175,7 +175,7 @@ class TestDemoRunbook(unittest.TestCase):
             demo.kill_node(2)  # chaos, mid-traffic
             # commits STILL land on the surviving quorum (2 of 3)
             during = a.submit(
-                (b"jobs/2", VERSION_ABSENT, 0),
+                A.Slot(b"jobs/2", VERSION_ABSENT, 0),
                 [[A.Guard.ABSENT, b"jobs/2"]],
                 [[A.Mutation.SET, b"jobs/2", b"v"]],
             )
@@ -238,7 +238,7 @@ class TestDemoRunbook(unittest.TestCase):
             demo = Demo(tmp, w)
             a = demo.clients[0]
             op = a.submit(
-                (b"kept", VERSION_ABSENT, 0),
+                A.Slot(b"kept", VERSION_ABSENT, 0),
                 [[A.Guard.ABSENT, b"kept"]],
                 [[A.Mutation.SET, b"kept", b"v"]],
             )

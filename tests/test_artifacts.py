@@ -21,11 +21,11 @@ class TestOp(unittest.TestCase):
 
     def _op(self):
         txn = A.Txn(
-            slot=(b"k", A.VERSION_ABSENT, 0),
+            slot=A.Slot(b"k", A.VERSION_ABSENT, 0),
             guards=[[A.Guard.ABSENT, b"k"]],
             mutations=[[A.Mutation.SET, b"k", b"v"]],
         )
-        tag = A.compute_slot_tag(self.secret, b"k", A.VERSION_ABSENT, 0)
+        tag = A.Slot(b"k", A.VERSION_ABSENT, 0).tag(self.secret)
         return A.CasOp.build(
             author=C.SoftwareKeypair.from_seed(self.sk),
             seq=0,
@@ -137,11 +137,11 @@ class TestGoldenVectors(unittest.TestCase):
         secret = bytes([8] * 32)
         data_key = bytes([9] * 32)
         txn = A.Txn(
-            slot=(b"k", A.VERSION_ABSENT, 0),
+            slot=A.Slot(b"k", A.VERSION_ABSENT, 0),
             guards=[[A.Guard.ABSENT, b"k"]],
             mutations=[[A.Mutation.SET, b"k", b"v"]],
         )
-        tag = A.compute_slot_tag(secret, b"k", A.VERSION_ABSENT, 0)
+        tag = A.Slot(b"k", A.VERSION_ABSENT, 0).tag(secret)
         op = A.CasOp.build(
             author=C.SoftwareKeypair.from_seed(sk),
             seq=0,

@@ -565,11 +565,11 @@ class TestDelegateCheckpointBarrier(unittest.TestCase):
         below = [*w.control_ops, c1, d]
         cut = cut_of(w)
         base = w._hlc
-        tag = A.compute_slot_tag(w.keyring[0].slot_secret, b"k", A.VERSION_ABSENT, 0)
+        tag = A.Slot(b"k", A.VERSION_ABSENT, 0).tag(w.keyring[0].slot_secret)
         c2 = w.data_op(
             0,
             txn=A.Txn(
-                (b"k", A.VERSION_ABSENT, 0),
+                A.Slot(b"k", A.VERSION_ABSENT, 0),
                 [[A.Guard.ABSENT, b"k"]],
                 [[A.Mutation.SET, b"k", b"v2"]],
             ),
@@ -622,13 +622,13 @@ class TestDelegateCheckpointBarrier(unittest.TestCase):
         base = w._hlc
 
         # a reborn creation of k above the cut: byte-identical tag to c1's.
-        tag = A.compute_slot_tag(w.keyring[0].slot_secret, b"k", A.VERSION_ABSENT, 0)
+        tag = A.Slot(b"k", A.VERSION_ABSENT, 0).tag(w.keyring[0].slot_secret)
         assert isinstance(c1, A.Slotted)
         self.assertEqual(tag, c1.slot_tag)  # the reborn collision the barrier resolves
         c2 = w.data_op(
             0,
             txn=A.Txn(
-                (b"k", A.VERSION_ABSENT, 0),
+                A.Slot(b"k", A.VERSION_ABSENT, 0),
                 [[A.Guard.ABSENT, b"k"]],
                 [[A.Mutation.SET, b"k", b"v2"]],
             ),
@@ -1055,10 +1055,10 @@ class TestReceiptFloorBackstop(unittest.TestCase):
         )
 
     def _op(self, w, key, hlc):
-        tag = A.compute_slot_tag(w.keyring[0].slot_secret, key, A.VERSION_ABSENT, 0)
+        tag = A.Slot(key, A.VERSION_ABSENT, 0).tag(w.keyring[0].slot_secret)
         return w.data_op(
             0,
-            txn=A.Txn((key, A.VERSION_ABSENT, 0), [], [[A.Mutation.SET, key, b"v"]]),
+            txn=A.Txn(A.Slot(key, A.VERSION_ABSENT, 0), [], [[A.Mutation.SET, key, b"v"]]),
             slot_tag=tag,
             hlc=hlc,
         )
@@ -1105,11 +1105,11 @@ class TestVoidRule(unittest.TestCase):
         nsk = bytes([200] * 32)
         node = Acceptor(crypto.SoftwareKeypair.from_seed(nsk), ChainStore(), 0, BIG_DELTA)
         w = World(seed=7, n_clients=1)
-        tag = A.compute_slot_tag(w.keyring[0].slot_secret, b"k", A.VERSION_ABSENT, 0)
+        tag = A.Slot(b"k", A.VERSION_ABSENT, 0).tag(w.keyring[0].slot_secret)
         ancient = w.data_op(
             0,
             txn=A.Txn(
-                slot=(b"k", A.VERSION_ABSENT, 0),
+                slot=A.Slot(b"k", A.VERSION_ABSENT, 0),
                 guards=[],
                 mutations=[[A.Mutation.SET, b"k", b"old"]],
             ),
@@ -1134,10 +1134,10 @@ class TestVoidRule(unittest.TestCase):
         nsk = bytes([201] * 32)
         node = Acceptor(crypto.SoftwareKeypair.from_seed(nsk), ChainStore(), 0, BIG_DELTA)
         w = World(seed=17, n_clients=1)
-        tag = A.compute_slot_tag(w.keyring[0].slot_secret, b"k", A.VERSION_ABSENT, 0)
+        tag = A.Slot(b"k", A.VERSION_ABSENT, 0).tag(w.keyring[0].slot_secret)
         op = w.data_op(
             0,
-            txn=A.Txn((b"k", A.VERSION_ABSENT, 0), [], [[A.Mutation.SET, b"k", b"x"]]),
+            txn=A.Txn(A.Slot(b"k", A.VERSION_ABSENT, 0), [], [[A.Mutation.SET, b"k", b"x"]]),
             slot_tag=tag,
             hlc=hlc,
         )
@@ -1181,10 +1181,10 @@ class TestHorizonPersistence(unittest.TestCase):
     below-horizon reborn op after a restart."""
 
     def _op(self, w, key, hlc):
-        tag = A.compute_slot_tag(w.keyring[0].slot_secret, key, A.VERSION_ABSENT, 0)
+        tag = A.Slot(key, A.VERSION_ABSENT, 0).tag(w.keyring[0].slot_secret)
         return w.data_op(
             0,
-            txn=A.Txn((key, A.VERSION_ABSENT, 0), [], [[A.Mutation.SET, key, b"v"]]),
+            txn=A.Txn(A.Slot(key, A.VERSION_ABSENT, 0), [], [[A.Mutation.SET, key, b"v"]]),
             slot_tag=tag,
             hlc=hlc,
         )

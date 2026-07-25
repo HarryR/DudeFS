@@ -313,16 +313,24 @@ BLIND = Ballot(0, b"")
 # --------------------------------------------------------------------------- #
 
 
-def slot_preimage(key: bytes, version: bytes, attempt: int) -> bytes:
-    """Injective preimage `key ‖ version ‖ attempt` as a bencoded 3-list
-    (IMPLEMENTATION §2). `version = VERSION_ABSENT` (empty) while the key is
-    absent — creation CAS is attempt 0 on ⊥."""
-    return codec.encode([key, version, int(attempt)])
+class Slot(NamedTuple):
+    """A CAS coordinate — the injective preimage of a slot tag (DESIGN §6/§7): a key at a
+    (version, attempt) lineage position. `version = VERSION_ABSENT` (empty) while the key is
+    absent — a creation CAS is attempt 0 on ⊥. It owns its tag derivation, so a caller holding
+    the epoch's `slot_secret` asks the coordinate for its tag instead of spreading three fields
+    across a free function. This is the private half of a predicate; the public tag is opaque."""
 
+    key: bytes
+    version: bytes
+    attempt: int
 
-def compute_slot_tag(slot_secret: bytes, key: bytes, version: bytes, attempt: int) -> bytes:
-    """`E(k) = PRF(slot_secret[e], key ‖ version ‖ attempt)` (DESIGN §6/§7)."""
-    return crypto.prf_tag(slot_secret, slot_preimage(key, version, attempt))
+    def preimage(self) -> bytes:
+        """Injective `key ‖ version ‖ attempt` as a bencoded 3-list (IMPLEMENTATION §2)."""
+        return codec.encode([self.key, self.version, int(self.attempt)])
+
+    def tag(self, slot_secret: bytes) -> bytes:
+        """`E(k) = PRF(slot_secret[e], key ‖ version ‖ attempt)` (DESIGN §6/§7) — the public tag."""
+        return crypto.prf_tag(slot_secret, self.preimage())
 
 
 # --------------------------------------------------------------------------- #
@@ -572,8 +580,8 @@ class DataOp(Op):
 @dataclass(frozen=True, slots=True, kw_only=True)
 class CasOp(DataOp, Slotted):
     """A slotted data op — CAS contended on `slot_tag` (guaranteed non-None) via the
-    ballot machinery. The tag is `compute_slot_tag(secret, ...)` over a secret the
-    node cannot see, so its binding is verified in the fold by attribution (§7)."""
+    ballot machinery. The tag is `Slot(key, version, attempt).tag(secret)` over a secret
+    the node cannot see, so its binding is verified in the fold by attribution (§7)."""
 
     slot_tag: bytes
 
@@ -1329,12 +1337,11 @@ class Txn:
 
     def __init__(
         self,
-        slot: tuple[bytes, bytes, int] | None,
+        slot: Slot | None,
         guards: list[list[bytes]],
         mutations: list[list[bytes]],
     ):
-        # slot: None | (key, version, attempt)
-        self.slot = slot
+        self.slot = slot  # None = blind write; else the CAS coordinate
         self.guards = list(guards)
         self.mutations = list(mutations)
 
@@ -1346,8 +1353,7 @@ class Txn:
             TxnField.MUTATIONS: [list(m) for m in self.mutations],
         }
         if self.slot is not None:
-            k, ver, att = self.slot
-            d[TxnField.SLOT] = [k, ver, int(att)]
+            d[TxnField.SLOT] = [self.slot.key, self.slot.version, int(self.slot.attempt)]
         return codec.encode(d)
 
     @staticmethod
@@ -1357,13 +1363,13 @@ class Txn:
         is malformed, full stop. New vocabulary arrives behind a pver bump
         (DESIGN §16 lane 2), never as a silently-skipped row."""
         d = codec.as_dict(codec.decode(data))
-        slot: tuple[bytes, bytes, int] | None = None
+        slot: Slot | None = None
         if TxnField.SLOT in d:
             s = codec.as_seq(d[TxnField.SLOT], 3)
             attempt = codec.as_int(s[2])
             if attempt < 0:
                 raise ArtifactError("slot attempt must be non-negative")
-            slot = (codec.as_bytes(s[0]), codec.as_bytes(s[1]), attempt)
+            slot = Slot(codec.as_bytes(s[0]), codec.as_bytes(s[1]), attempt)
         guards = _rows(d.get(TxnField.GUARDS))
         mutations = _rows(d.get(TxnField.MUTATIONS))
         _validate_rows(guards, _GUARD_ARITY, "guard")

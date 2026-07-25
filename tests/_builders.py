@@ -312,8 +312,8 @@ class World:
         keyepoch: int = 0,
     ) -> A.Op:
         secret = self.keyring[keyepoch].slot_secret
-        tag = A.compute_slot_tag(secret, key, version, attempt)
-        txn = A.Txn(slot=(key, version, attempt), guards=guards, mutations=mutations)
+        tag = A.Slot(key, version, attempt).tag(secret)
+        txn = A.Txn(slot=A.Slot(key, version, attempt), guards=guards, mutations=mutations)
         return self.data_op(ci, txn=txn, slot_tag=tag, keyepoch=keyepoch)
 
     def blind(
