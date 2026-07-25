@@ -187,6 +187,45 @@ class TestA4RetainedBootstrap(unittest.TestCase):
         self.assertNotEqual(bad.state, full.state)  # diverged without the sidecar
 
 
+class TestF2RetainedExcludesDead(unittest.TestCase):
+    """Review F-2 (RC-1): a lazy-GC compactor — checkpoint ADOPTED, `dead` ops not yet
+    physically dropped — must count only `covered ∖ dead` as its retained set, exactly like
+    store.baseline_commitment(). PrevState.of hand-rolled `covered` instead, so a superseded
+    `dead` op still held pollutes the next checkpoint's winners: a committed value is re-folded
+    away and the digest matches the lie. This is the red repro; the fix makes it green."""
+
+    def test_prevstate_excludes_lazy_undropped_dead_ops(self):
+        w = World(seed=1, n_clients=1)
+        below = list(w.control_ops)
+        first = w.cas(
+            0, b"k", A.VERSION_ABSENT, 0, [[A.Guard.ABSENT, b"k"]], [[A.Mutation.SET, b"k", b"v1"]]
+        )
+        below.append(first)
+        v, a = fold.fold(below, w.keyring, w.genesis).lineage(b"k")
+        winner = w.cas(
+            0, b"k", v, a, [[A.Guard.VERSION_EQ, b"k", v]], [[A.Mutation.SET, b"k", b"v2"]]
+        )
+        below.append(winner)
+        cut = cut_of(w)
+        cr = compactor.compact_genesis(below, w.keyring, w.genesis, cut)
+        self.assertIn(first.op_hash, cr.dead)  # the superseded first write IS dead
+
+        store = ChainStore()
+        with store.write_txn() as tx:
+            for o in below:
+                tx.append(o)
+            # ADOPT but do NOT gc_checkpoint -> `first` stays physically present (lazy GC)
+            tx.adopt_checkpoint(
+                A.Baseline(cut, A.retained_commitment(cr.retained), frozenset(cr.dead))
+            )
+        with store.read_txn() as tx:
+            self.assertIsNotNone(tx.get_op(first.op_hash))  # confirm it IS still held (lazy)
+            prev = compactor.PrevState.of(tx, w.keyring)
+        held = {o.op_hash for o in prev.retained}
+        self.assertNotIn(first.op_hash, held)  # the dead op must NOT count as retained
+        self.assertIn(winner.op_hash, held)  # the true winner is retained
+
+
 class TestAttemptsSidecar(unittest.TestCase):
     """WP-A: the attempts sidecar seals into a real checkpoint op's `attempts` field and
     unseals on bootstrap — the PRODUCTION wire path, not a cleartext dict handed in. A

@@ -48,8 +48,12 @@ class PrevState:
         prev_cut = tx.cut()
         if not prev_cut:
             return cls({}, [], {})
-        # after adopt+GC the ops held below the cut ARE the retained set (dead gone)
-        retained = [o for o in tx.all_ops() if covered(o, prev_cut)]
+        # the retained set is `covered ∖ dead` — NOT every held below-cut op (review F-2). GC
+        # is lazy, so a superseded `dead` op may still be physically present; counting it as
+        # retained would re-fold a superseded value over the committed winner. Mask by `dead`,
+        # exactly as store.baseline_commitment() does (which is what adoption checks against).
+        dead = tx.cut_dead()
+        retained = [o for o in tx.all_ops() if covered(o, prev_cut) and o.op_hash not in dead]
         attempts: dict[bytes, int] = {}
         h = tx.get_meta("checkpoint")
         op = tx.get_op(h) if h else None
