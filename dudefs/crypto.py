@@ -421,7 +421,8 @@ class EpochKeys(NamedTuple):
 
 
 # keyepoch -> that epoch's derived working keys (DESIGN §3). The single canonical type;
-# `fold` and `handlers.data` both import it (crypto has no fold/data dep, so no cycle).
+# `fold` re-exports it and `artifacts.DataOp.read_txn` takes it (crypto has no upward dep,
+# so no cycle).
 type Keyring = dict[int, EpochKeys]
 
 

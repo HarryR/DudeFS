@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import Enum, auto
 from functools import total_ordering
 from typing import Any, ClassVar, NamedTuple, Self
 
@@ -512,6 +512,26 @@ class DataOp(Op):
     def open_payload(self, data_key: bytes) -> bytes | None:
         """Decrypt -> plaintext Txn bytes, or None on authentication failure (⊥)."""
         return crypto.AEAD.open(data_key, self.aad_hash(), self.payload)
+
+    def read_txn(self, keyring: crypto.Keyring) -> Txn | Opaque:
+        """Decode this data op's payload into a Txn, or an Opaque with a typed reason
+        (undecryptable / malformed) — the client-side inverse of authoring (DESIGN §5/§6;
+        was `handlers.data.decode`). Total over arbitrary envelopes: a missing keyepoch or
+        an unreadable payload is Opaque, never a raised exception (NOTES item 17). A ZK
+        storage node never calls this — it holds no keyring."""
+        ring = keyring.get(self.keyepoch)
+        if ring is None:
+            return Opaque(OpaqueReason.NO_KEY)
+        try:
+            pt = self.open_payload(ring.data_key)
+        except (ArtifactError, codec.CodecError):
+            return Opaque(OpaqueReason.MALFORMED_TXN)  # unreadable envelope fields
+        if pt is None:
+            return Opaque(OpaqueReason.AEAD_OPEN_FAILED)  # authentication failure (⊥)
+        try:
+            return Txn.decode(pt)
+        except Exception:
+            return Opaque(OpaqueReason.MALFORMED_TXN)
 
     def verify_structure(self) -> bool:
         return super(DataOp, self).verify_structure() and self.keyepoch >= 0
@@ -1349,6 +1369,22 @@ class Txn:
         _validate_rows(guards, _GUARD_ARITY, "guard")
         _validate_rows(mutations, _MUTATION_ARITY, "mutation")
         return Txn(slot, guards, mutations)
+
+
+class OpaqueReason(Enum):
+    """Why a data payload could not be interpreted (diagnostic only — the fold
+    attributes an Opaque purely by tag-equality, DESIGN §6)."""
+
+    NO_KEY = auto()  # no group key held for the op's keyepoch
+    AEAD_OPEN_FAILED = auto()  # authentication failure (⊥)
+    MALFORMED_TXN = auto()  # decrypted, but not a well-formed Txn
+
+
+class Opaque(NamedTuple):
+    """A data payload `DataOp.read_txn` could not interpret (undecryptable, or malformed
+    plaintext) — the alternative to a `Txn`. Carries a typed reason for diagnostics only."""
+
+    reason: OpaqueReason
 
 
 # --------------------------------------------------------------------------- #

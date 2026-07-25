@@ -18,20 +18,18 @@
 # pver activation), fold the tail. The barrier is NOT at the checkpoint op's
 # own hlc position (NOTES item 13).
 #
-# This module (full profile) + the data handler is the FORMAL Lean-oracle
-# target: byte-identical across implementations or bust.
+# This module (full profile) + the format layer's data decode (DataOp.read_txn)
+# is the FORMAL Lean-oracle target: byte-identical across implementations or bust.
 
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import NotRequired, TypedDict
+from typing import NamedTuple, NotRequired, TypedDict
 
 from . import artifacts as A
 from . import crypto, transports, tunables
-from .artifacts import GENESIS_PREV, VERSION_ABSENT, Heads, Op, Txn, covered
+from .artifacts import GENESIS_PREV, VERSION_ABSENT, Heads, Op, Opaque, Txn, covered
 from .errors import DudeFSError
-from .handlers import data as data_handler
-from .handlers.data import Opaque
 
 # The highest fold-semantics version this build understands (DESIGN §16 lane 2).
 # When a control op activates a higher version at a checkpoint barrier, the
@@ -128,8 +126,8 @@ class KeyMeta:
 
 
 class StateView:
-    """Read-only view handed to the data handler for guard evaluation
-    (state produced by predecessors in the total order — A6)."""
+    """Read-only view used by guard evaluation (`evaluate`, below) — state produced
+    by predecessors in the total order (A6)."""
 
     __slots__ = ("_keys",)
 
@@ -143,6 +141,45 @@ class StateView:
             att = m.attempt if m is not None else 0
             return (False, None, ver, att)
         return (True, m.value, m.version, m.attempt)
+
+
+# --------------------------------------------------------------------------- #
+# Txn guard evaluation (DESIGN §6, A6) — decrypted guards vs the state view.   #
+# The `Guard` vocabulary is truth-by-evaluation here, opaque tag-equality at   #
+# L3 (was `handlers.data.evaluate`; the data handler is dissolved into the     #
+# format layer for decode + here for evaluation).                             #
+# --------------------------------------------------------------------------- #
+
+
+class EvalResult(NamedTuple):
+    guards_ok: bool
+    mutations: list[list[bytes]]  # list of [op, path, value?]
+    slot_preimage: tuple[bytes, bytes, int] | None  # (key, version, attempt) | None
+
+
+def evaluate(txn: Txn, view: StateView) -> EvalResult:
+    """Evaluate a decrypted Txn's guards against `view` (state produced by predecessors in
+    the total order — DESIGN §6, A6). Returns the guard result, the mutation list, and the
+    restated slot preimage (which the caller checks against the public tag)."""
+    guards_ok = all(_eval_guard(g, view) for g in txn.guards)
+    return EvalResult(guards_ok, txn.mutations, txn.slot)
+
+
+def _eval_guard(guard: list[bytes], view: StateView) -> bool:
+    if not (isinstance(guard, list) and len(guard) >= 2):
+        return False
+    kind, key = guard[0], guard[1]
+    present, value, version, _attempt = view.get(key)
+    if kind == A.Guard.ABSENT:
+        return not present
+    if kind == A.Guard.PRESENT:
+        return present
+    if kind == A.Guard.VALUE_EQ:
+        return present and len(guard) >= 3 and value == guard[2]
+    if kind == A.Guard.VERSION_EQ:
+        # version-CAS: matches a live value OR a tombstone's anchor version.
+        return len(guard) >= 3 and version == guard[2] and version != A.VERSION_ABSENT
+    return False  # unknown guard predicate -> guard fails (fail-closed)
 
 
 # --------------------------------------------------------------------------- #
@@ -513,8 +550,8 @@ def fold(
     # ---- cached decodes (every client decrypts the same set, DESIGN §6) ----- #
     decoded: dict[bytes, Txn | Opaque] = {}  # op_hash -> parsed payload
     for op in ops_sorted:
-        if not op.is_control:
-            decoded[op.op_hash] = data_handler.decode(op, keyring)
+        if isinstance(op, A.DataOp):  # (== not is_control) — only data ops carry a txn
+            decoded[op.op_hash] = op.read_txn(keyring)
 
     # ---- checkpoint partition: fold covered set, barrier, fold tail (§12) --- #
     stages: list[list[Op]] = []
@@ -582,7 +619,7 @@ def fold(
                 if isinstance(d, Opaque):
                     verdicts[op.op_hash] = Verdict.REJECTED
                     continue
-                ev = data_handler.evaluate(d, view)
+                ev = evaluate(d, view)
                 if ev.guards_ok:
                     _apply_mutations(state, ev.mutations, op.op_hash)
                     verdicts[op.op_hash] = Verdict.APPLIED
@@ -607,7 +644,7 @@ def fold(
 
             applied = False
             if not isinstance(d, Opaque):
-                ev = data_handler.evaluate(d, view)
+                ev = evaluate(d, view)
                 # the restated preimage must match k's *current* lineage, and guards hold
                 if ev.slot_preimage == (k, cur_ver, cur_att) and ev.guards_ok:
                     _apply_mutations(state, ev.mutations, op.op_hash)

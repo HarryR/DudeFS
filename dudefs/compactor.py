@@ -21,11 +21,9 @@ from dataclasses import dataclass
 
 from . import artifacts as A
 from . import codec, crypto, fold
-from .artifacts import HLC, VERSION_ABSENT, Heads, Op, covered
+from .artifacts import HLC, VERSION_ABSENT, Heads, Op, Opaque, covered
 from .checkpoint import cut_dominates
 from .errors import DudeFSError
-from .handlers import data as data_handler
-from .handlers.data import Opaque
 from .store import ReadTxn
 
 # --------------------------------------------------------------------------- #
@@ -229,8 +227,8 @@ def _mut_meta(ops: list[Op], keyring: fold.Keyring) -> dict[bytes, tuple[bool, b
     the real tombstone (finding 13). The compactor feeds it `prev_retained` only,
     then overlays the band's guard-evaluated `r.meta`."""
     meta: dict[bytes, tuple[bool, bytes]] = {}
-    for op in sorted((o for o in ops if not o.is_control), key=fold._total_order_key):
-        d = data_handler.decode(op, keyring)
+    for op in sorted((o for o in ops if isinstance(o, A.DataOp)), key=fold._total_order_key):
+        d = op.read_txn(keyring)
         if isinstance(d, Opaque):
             continue
         for m in d.mutations:
@@ -312,9 +310,9 @@ def compact(
         nxt: set[bytes] = set()
         for wh in frontier:
             w = universe.get(wh)
-            if w is None or w.is_control:
+            if not isinstance(w, A.DataOp):  # (== None or is_control) — no txn to mask-scan
                 continue
-            d = data_handler.decode(w, keyring)
+            d = w.read_txn(keyring)
             if isinstance(d, Opaque):
                 continue
             for m in d.mutations:
@@ -356,8 +354,8 @@ def barrier_state(
     re-evaluation (reading settled state, not re-deciding CAS) — then apply the
     attempts sidecar. A4: equals `make_barrier` of the full fold below the cut."""
     live: dict[bytes, tuple[bytes, bytes]] = {}  # key -> (value, version)
-    for op in sorted((o for o in retained if not o.is_control), key=fold._total_order_key):
-        d = data_handler.decode(op, keyring)
+    for op in sorted((o for o in retained if isinstance(o, A.DataOp)), key=fold._total_order_key):
+        d = op.read_txn(keyring)
         if isinstance(d, Opaque):
             continue
         for m in d.mutations:

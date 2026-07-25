@@ -24,7 +24,6 @@ from typing import TypedDict
 from . import artifacts as A
 from . import compactor, crypto, fold, gossip, lmsg, transports, tunables, wire
 from .artifacts import BLIND, HLC, QC, Op, Receipt, Txn, compute_slot_tag, covered
-from .handlers import data as data_handler
 from .link import Link
 from .node import FetchOpReq, FrontierReq, GetQCReq, PutQCReq, Request, Response, SubmitReq
 from .quorum import (
@@ -823,8 +822,10 @@ class ClientDaemon:
     def _decode_intent(self, op: Op, path: bytes) -> list[list[bytes]] | None:
         """Decode op's Txn (keyring-privileged) and return the mutations touching
         `path`, or None if it does not touch the key / cannot be read."""
-        d = data_handler.decode(op, self.keyring)
-        if isinstance(d, data_handler.Opaque):
+        if not isinstance(op, A.DataOp):
+            return None  # a control op carries no data txn
+        d = op.read_txn(self.keyring)
+        if isinstance(d, A.Opaque):
             return None
         touching = [m for m in d.mutations if len(m) >= 2 and m[1] == path]
         return touching or None
