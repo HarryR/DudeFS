@@ -31,14 +31,27 @@ class Link:
         Seals iff `endpoint.sealed` — sign-then-seal to the peer with a fresh ephemeral
         reply-key, and open the reply with it; otherwise plain."""
         env = lmsg.author(self.identity, self.to_pub, verb, body, epoch=epoch, ts=ts)
+        # the request→reply correlator (K-13): we hold the request here, so this is the one
+        # place that can bind the answer to the question. The peer echoes it in the reply's
+        # nonce; a genuine reply to some OTHER request classifies as WrongRequest.
+        expect = lmsg.request_digest(env)
         if not self.endpoint.sealed:
             raw = transports.dial(
                 self.endpoint.transport, self.endpoint.uri, env.encode(), timeout=timeout
             )
-            return lmsg.classify_reply(raw, expect_from=self.to_pub, expect_to=self.identity.public)
+            return lmsg.classify_reply(
+                raw,
+                expect_from=self.to_pub,
+                expect_to=self.identity.public,
+                expect_nonce=expect,
+            )
         reply = C.SoftwareKeypair.generate()  # ephemeral reply identity, sealed INSIDE the request
         sealed = lmsg.seal_request(env, self.to_pub, reply.public)
         raw = transports.dial(self.endpoint.transport, self.endpoint.uri, sealed, timeout=timeout)
         return lmsg.classify_sealed_reply(
-            raw, reply=reply, expect_from=self.to_pub, expect_to=self.identity.public
+            raw,
+            reply=reply,
+            expect_from=self.to_pub,
+            expect_to=self.identity.public,
+            expect_nonce=expect,
         )

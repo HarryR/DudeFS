@@ -330,7 +330,12 @@ class TestHttpCarrier(unittest.TestCase):
             w.clients[0].sk, d.pub, N.AcceptReq(op.slot_tag, A.Ballot(1, b"x"), op), ts=d._clock()
         )
         raw = transports.dial(transports.HTTP, uri, out)
-        match lmsg.classify_reply(raw, expect_from=d.pub, expect_to=w.clients[0].key.public):
+        match lmsg.classify_reply(
+            raw,
+            expect_from=d.pub,
+            expect_to=w.clients[0].key.public,
+            expect_nonce=lmsg.request_digest(lmsg.Envelope.decode(out)),
+        ):
             case lmsg.Reply(env):
                 resp = wire.decode_response(env.body)
             case _:
@@ -978,7 +983,12 @@ class TestDaemonSocket(unittest.TestCase):
             cli.sendall(wire.frame(out))
             reply = wire.read_frame(cli.recv)
             assert reply is not None
-            match lmsg.classify_reply(reply, expect_from=d.pub, expect_to=w.clients[0].key.public):
+            match lmsg.classify_reply(
+                reply,
+                expect_from=d.pub,
+                expect_to=w.clients[0].key.public,
+                expect_nonce=lmsg.request_digest(lmsg.Envelope.decode(out)),
+            ):
                 case lmsg.Reply(env):
                     resp = wire.decode_response(env.body)
                 case _:

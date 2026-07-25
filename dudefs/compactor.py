@@ -23,6 +23,7 @@ from . import artifacts as A
 from . import codec, crypto, fold
 from .artifacts import HLC, VERSION_ABSENT, Heads, Op, Opaque, covered
 from .checkpoint import cut_dominates
+from .committed import CommittedSet, Rosters
 from .errors import DudeFSError
 from .store import ReadTxn
 
@@ -44,16 +45,24 @@ class PrevState:
     attempts: dict[bytes, int]
 
     @classmethod
-    def of(cls, tx: ReadTxn, keyring: fold.Keyring) -> PrevState:
+    def of(cls, tx: ReadTxn, keyring: fold.Keyring, rosters: Rosters) -> PrevState:
         prev_cut = tx.cut()
         if not prev_cut:
             return cls({}, [], {})
-        # the retained set is `covered ∖ dead` — NOT every held below-cut op (review F-2). GC
-        # is lazy, so a superseded `dead` op may still be physically present; counting it as
-        # retained would re-fold a superseded value over the committed winner. Mask by `dead`,
-        # exactly as store.baseline_commitment() does (which is what adoption checks against).
+        # the retained set is COMMITTED ∧ covered ∖ dead — three conditions, and dropping any
+        # one of them loses committed data (review F-2 / RC-1):
+        #   * COMMITTED — an op held WITHOUT a QC never enters `universe`, is therefore never
+        #     listed in `dead`, and is never GC'd; one pass later it sits below prev_cut and
+        #     would be replayed by `barrier_state`/`_mut_meta` with NO guard evaluation. An
+        #     uncommitted CAS sorting above the real winner then becomes the retained version
+        #     and the winner is marked dead and physically dropped. Masking by `dead` alone
+        #     cannot catch it — `dead` never names it.
+        #   * ∖ dead — GC is lazy (adoption persists `dead`; gc_checkpoint drops it later), so
+        #     a superseded op may still be physically present.
+        # Together this equals store.baseline_commitment(), which adoption checks against.
         dead = tx.cut_dead()
-        retained = [o for o in tx.all_ops() if covered(o, prev_cut) and o.op_hash not in dead]
+        held = [o for o in tx.all_ops() if covered(o, prev_cut) and o.op_hash not in dead]
+        retained = list(CommittedSet.of(held, tx.get_qc, rosters))
         attempts: dict[bytes, int] = {}
         h = tx.get_meta("checkpoint")
         op = tx.get_op(h) if h else None
@@ -134,10 +143,15 @@ class CompactorView:
     committed_cut: Heads
 
     @classmethod
-    def of(cls, tx: ReadTxn, keyring: fold.Keyring) -> CompactorView:
-        """The ONE store read: the committed band, the previous baseline, and the decided head."""
-        committed = [o for o in tx.all_ops() if o.is_control or tx.get_qc(o.op_hash) is not None]
-        prev = PrevState.of(tx, keyring)
+    def of(cls, tx: ReadTxn, keyring: fold.Keyring, rosters: Rosters) -> CompactorView:
+        """The ONE store read: the committed band, the previous baseline, and the decided head.
+
+        `committed` goes through the verifying boundary (RC-1/D-A). It used to test
+        `tx.get_qc(...) is not None` — PRESENCE, not verification — and `put_qc` is an
+        unverified INSERT OR REPLACE reachable as a wire verb (K-5), so a planted QC admitted
+        an arbitrary op into the compaction universe."""
+        committed = list(CommittedSet.of(tx.all_ops(), tx.get_qc, rosters))
+        prev = PrevState.of(tx, keyring, rosters)
         next_seq, committed_cut = _committed_frontier(tx)
         return cls(committed, prev, next_seq, committed_cut)
 

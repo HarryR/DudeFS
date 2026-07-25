@@ -302,36 +302,75 @@ class WrongPeer:
     frm: bytes
 
 
+@dataclass(frozen=True)
+class WrongRequest:
+    """The right peer, correctly addressed to us, correctly signed — but answering a
+    DIFFERENT request (review K-13). Its `nonce` is not the digest of the request we
+    sent, so a carrier (or a relay) substituted one genuine reply for another. Distinct
+    from WrongPeer: the signer is honest and the bytes are sound; the QUESTION is wrong."""
+
+    nonce: bytes
+
+
 # Named per cause (say WHY, not "unusable"): the caller can log exactly what went
 # wrong, and a driver can act on it (an authenticated refusal ≠ an unreachable peer).
-type ReplyOutcome = Reply | NoReply | MalformedReply | WrongPeer
+type ReplyOutcome = Reply | NoReply | MalformedReply | WrongPeer | WrongRequest
 
 
-def _check_reply(env: Envelope, expect_from: C.PublicKey, expect_to: C.PublicKey) -> ReplyOutcome:
+def request_digest(env: Envelope) -> bytes:
+    """The deterministic correlator a reply must echo in its `nonce` (review K-13,
+    TRANSPORT §2). Taken over the request's SIGNED bytes, so it commits to every field the
+    request's signature commits to — `frm`, `to`, `epoch`, `ts`, `verb`, `body` — and two
+    requests differing anywhere get different digests. Pure; no state, no counter, so a
+    replayed request maps to the same digest and needs no per-peer bookkeeping.
+
+    This is what makes a reply answer ONE question. Without it a reply is bound only to the
+    responder and the recipient, so any genuine reply from that peer is accepted for any
+    outstanding request — and it is what lets a reply be matched up LATER, off the request's
+    own connection, which PYTHON-CODESTYLE §5 requires of a message-oriented carrier
+    ("handle the reply as a later inbound event … keyed by request-hash")."""
+    return C.h(env._signed_bytes())
+
+
+def _check_reply(
+    env: Envelope, expect_from: C.PublicKey, expect_to: C.PublicKey, expect_nonce: bytes
+) -> ReplyOutcome:
     """The verify half shared by plain + sealed reply classification."""
     if not env.verify_sig():
         return MalformedReply()  # unsigned / tampered -> not a verifiable reply
     if env.frm != expect_from or env.to != expect_to:
         return WrongPeer(env.frm)
+    if not hmac.compare_digest(env.nonce, expect_nonce):
+        return WrongRequest(env.nonce)  # genuine, but not the answer to what we asked
     return Reply(env)
 
 
 def classify_reply(
-    data: bytes, *, expect_from: C.PublicKey, expect_to: C.PublicKey
+    data: bytes, *, expect_from: C.PublicKey, expect_to: C.PublicKey, expect_nonce: bytes
 ) -> ReplyOutcome:
-    """Validate a PLAIN inbound REPLY frame against the peer we addressed — PURE, no
-    I/O. A reply not signed by `expect_from` back to `expect_to` is not our reply."""
+    """Validate a PLAIN inbound REPLY frame against the peer we addressed AND the request we
+    sent — PURE, no I/O. A reply not signed by `expect_from` back to `expect_to`, or not
+    echoing `request_digest(our_request)` in its nonce, is not our reply.
+
+    `expect_nonce` is REQUIRED, deliberately: an optional correlator is how the `nonce` field
+    sat dead in the envelope for a whole milestone (K-13). Pass `b""` only where the reply is
+    genuinely unsolicited-by-design and you mean it."""
     if not data:
         return NoReply()
     try:
         env = Envelope.decode(data)
     except (codec.CodecError, ValueError, IndexError):
         return MalformedReply()
-    return _check_reply(env, expect_from, expect_to)
+    return _check_reply(env, expect_from, expect_to, expect_nonce)
 
 
 def classify_sealed_reply(
-    data: bytes, *, reply: C.Keypair, expect_from: C.PublicKey, expect_to: C.PublicKey
+    data: bytes,
+    *,
+    reply: C.Keypair,
+    expect_from: C.PublicKey,
+    expect_to: C.PublicKey,
+    expect_nonce: bytes,
 ) -> ReplyOutcome:
     """Validate a SEALED inbound reply: open it with the ephemeral `reply` identity from
     the request, then the same verify as plain. Un-openable bytes are 'not our reply'."""
@@ -340,4 +379,4 @@ def classify_sealed_reply(
     env = unseal_reply(reply, data)
     if env is None:
         return MalformedReply()  # couldn't open with our reply-key -> not ours
-    return _check_reply(env, expect_from, expect_to)
+    return _check_reply(env, expect_from, expect_to, expect_nonce)

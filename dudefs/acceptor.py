@@ -34,7 +34,7 @@ from .artifacts import (
     Receipt,
     Watermark,
 )
-from .store import AppendStatus, ChainStore, ReadTxn, WriteTxn
+from .store import AppendStatus, ChainStore, ReadTxn, SlotState, WriteTxn
 
 # Any node-side response to a coordination verb (DESIGN §8 / PROTOCOL §1.1).
 type SubmitResult = Receipt | Rejected  # blind writes only (rev 5); slotted -> NEEDS_BALLOT
@@ -224,25 +224,24 @@ class Acceptor:
             # re-commit (its hlc is below the floor), a livelock until every node GCs.
             # Discard the accept; the promise reports a fresh slot and the new op wins.
             #
-            # The horizon is the SOLE void authority (review C-1): envelope ABSENCE is a
-            # FETCH problem, never a void trigger. A GC path can drop a still-live slot op's
-            # envelope while its hlc is above the horizon; voiding on `get_op() is None`
-            # would let a fresh op win a slot that already decided — two QCs, no evidence.
-            # An ambiguous "not found" must not stand in for the meaningful below-horizon
-            # test, so we keep the accepted op and simply cannot report its hlc (fetch it).
-            accepted_hlc: HLC | None = None
-            if s.accepted_op is not None:
-                acc = tx.get_op(s.accepted_op)
-                if acc is not None and acc.hlc < tx.get_horizon():
-                    s.accepted_ballot = None
-                    s.accepted_op = None
-                elif acc is not None:
-                    accepted_hlc = acc.hlc  # reported so the client applies its own guard
+            # The horizon is the SOLE void authority (review C-1), and the test is TOTAL
+            # (FIX-1): the accepted op's hlc lives in the slot state, so this never consults
+            # the envelope. That matters because the envelope legitimately disappears — the
+            # adopt path raises the horizon and GCs the `dead` band in ONE txn, and a slot's
+            # accepted op can be in `dead` (it won its slot but folded STALE). Deciding from
+            # the envelope made this predicate PARTIAL, and BOTH answers to the undefined case
+            # are unsafe: voiding on absence is slot amnesia (two QCs for one slot, no
+            # evidence), refusing to void re-opens the NOTES 27 livelock — permanently, since
+            # GC would then be what CAUSES it. With the hlc held here there is no undefined
+            # case, and `accepted_hlc` is always reportable for the client's own guard.
+            if s.accepted_hlc is not None and s.accepted_hlc < tx.get_horizon():
+                s.accepted_ballot = s.accepted_op = s.accepted_hlc = None
             if ballot <= s.promised:
                 return Nack(s.promised)  # no write; the txn commits empty
             s.promised = ballot
             tx.write_slot(tag, s)
             accepted_ballot, accepted_op = s.accepted_ballot, s.accepted_op
+            accepted_hlc = s.accepted_hlc
         # promised ballot is now durable; sign the promise (re-derivable, not stored)
         return A.Promise.issue(self.node, tag, ballot, accepted_ballot, accepted_op, accepted_hlc)
 
@@ -257,6 +256,47 @@ class Acceptor:
     # ------------------------------------------------------------------ #
     # ACCEPT — classic Paxos phase 2 (DESIGN §8 recovery)               #
     # ------------------------------------------------------------------ #
+    # ---- the named ACCEPT guards (DIRECTIONS D-B) -------------------------- #
+    # Pure predicates over `(slot state, ballot, op)`. Each names the ONE thing it stops, so a
+    # test can exercise it directly and a subclass can replace exactly one.
+
+    @staticmethod
+    def _verbatim_reaccept(s: SlotState, ballot: Ballot, op: Op) -> bool:
+        """Is this the SAME op at the SAME ballot we already accepted — a dropped/retried
+        transmit rather than a new proposal? Such a request cannot mint a new artifact:
+        `_issue_receipt` serves the stored receipt for `(op, epoch, ballot)` at its ORIGINAL
+        `issue_seq`, so it re-yields the receipt the caller lost (PROTOCOL §0 idempotence) and
+        creates no new decree. Only then may the future/floor gate be skipped.
+
+        The op alone is NOT enough (review FIX-6). `reserve_receipt_seq` idents on
+        `(op_hash, ballot)`, so a re-ACCEPT at a DIFFERENT ballot mints a receipt at a FRESH
+        `issue_seq`; past δ that receipt sits below a floor this node has already attested, with
+        a higher seq than the watermark — precisely `FloorPerjuryEvidence`. Exempting it makes an
+        honest node convict ITSELF and reopens finding 17: the past gate is exactly what makes
+        that pair structurally unproducible."""
+        return s.accepted_op == op.op_hash and s.accepted_ballot == ballot
+
+    @staticmethod
+    def _equivocates(s: SlotState, ballot: Ballot, op: Op) -> bool:
+        """Would accepting sign a SECOND, different op at one `(tag, ballot)` — the one thing an
+        honest acceptor must never do (DESIGN §8)? Its own two receipts would be a portable
+        DOUBLE_VOTE proof against it. This is the single predicate `_personas`' equivocator
+        overrides; everything else it does is inherited, so it cannot drift from the honest path."""
+        return (
+            s.accepted_ballot == ballot
+            and s.accepted_op is not None
+            and s.accepted_op != op.op_hash
+        )
+
+    @staticmethod
+    def _below_horizon(tx: WriteTxn, s: SlotState, op: Op) -> bool:
+        """§12 receipt-floor-at-horizon backstop (NOTES 34/Q5, third layer): after GC forgets
+        below-horizon slot state, a late contender must NOT win a fresh receipt for a spent slot.
+        Logically implied by the floor (attested ≥ the sealed F), restated as an explicit guard.
+        STRICT: `hlc == horizon` is still committable (`== floor` passes the past gate). Skipped
+        for an idempotent re-accept of the SAME op, so a RERECEIPT is never blocked."""
+        return s.accepted_op != op.op_hash and op.hlc < tx.get_horizon()
+
     def on_accept(
         self, tag: bytes, ballot: Ballot, op: Op, now_ms: int, *, receipt_epoch: int | None = None
     ) -> AcceptResult:
@@ -266,37 +306,25 @@ class Acceptor:
             return Rejected(RejectReason.BAD_STRUCTURE)
         with self.store.write_txn() as tx:
             s = tx.get_slot(tag)
-            # future/floor gate — skipped for an idempotent re-ACCEPT of the SAME op (review
-            # C-2), matching the BELOW_HORIZON same-op exemption below. A verbatim re-request
-            # must re-yield its receipt (PROTOCOL §0), and after δ the floor sits above op.hlc;
-            # a checkpoint/roster slot has no `attempt` escape, so refusing it deadlocks. A
-            # DIFFERENT op is still floor-gated (a late contender can't win a spent slot).
-            if s.accepted_op != op.op_hash:
+            # The guards are NAMED PREDICATES (DIRECTIONS D-B), mirroring checkpoint.py's
+            # `_RULES` decomposition: each states the one attack it stops, each is testable in
+            # isolation, and an adversarial persona overrides exactly ONE instead of hand-copying
+            # this whole body (which is how `accepted_hlc` nearly got missed in _personas).
+            if not self._verbatim_reaccept(s, ballot, op):
                 skew = self._skew_reason(tx, op, now_ms)
                 if skew:
                     return Rejected(skew)
             if ballot < s.promised:
                 return Nack(s.promised)
-            if (
-                s.accepted_ballot == ballot
-                and s.accepted_op is not None
-                and s.accepted_op != op.op_hash
-            ):
-                # would sign two ops at one (tag, ballot) — the one thing an honest
-                # acceptor must never do (DESIGN §8).
+            if self._equivocates(s, ballot, op):
                 return Rejected(RejectReason.EQUIVOCATION_GUARD)
-            # §12 receipt-floor-at-horizon backstop (NOTES 34/Q5 third layer): after
-            # GC forgets below-horizon slot state, a late contender must NOT win a
-            # fresh receipt for a spent slot. Logically implied by the floor (attested
-            # ≥ the sealed F), restated as an explicit guard. Strict: hlc == horizon is
-            # still committable (== floor passes the past gate). Skipped for an
-            # idempotent re-accept of the SAME op, so a RERECEIPT is never blocked.
-            if s.accepted_op != op.op_hash and op.hlc < tx.get_horizon():
+            if self._below_horizon(tx, s, op):
                 return Rejected(RejectReason.BELOW_HORIZON)
             tx.put_op_raw(op)  # self-contained, re-proposable
             s.promised = ballot
             s.accepted_ballot = ballot
             s.accepted_op = op.op_hash
+            s.accepted_hlc = op.hlc  # denormalized WITH the accept, so the void rule is total
             tx.write_slot(tag, s)
             self._advance_hw(tx, op)
             receipt = self._issue_receipt(tx, op.op_hash, ballot, receipt_epoch)

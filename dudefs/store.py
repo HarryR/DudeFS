@@ -313,7 +313,15 @@ CREATE TABLE IF NOT EXISTS qcs (
     PRIMARY KEY (op_hash, epoch, ballot));
 CREATE TABLE IF NOT EXISTS slot_state (
     tag BLOB PRIMARY KEY, promised BLOB NOT NULL,
-    accepted_ballot BLOB, accepted_op BLOB);
+    accepted_ballot BLOB, accepted_op BLOB,
+    -- the accepted op's hlc, DENORMALIZED (review C-1/FIX-1). The §8 void rule asks "is the
+    -- accepted op below the horizon?"; reading the hlc off the envelope made that predicate
+    -- PARTIAL (undefined once GC drops the envelope) and both answers to the undefined case
+    -- are unsafe: voiding on absence is slot amnesia (two QCs), not voiding re-opens the
+    -- NOTES 27 livelock. op_hash -> hlc is a function over an immutable object, so this copy
+    -- can never go stale. Native INTEGER (not an encoded BLOB) so it stays queryable — which
+    -- is also what makes the D-1 prune an indexed DELETE.
+    accepted_wall INTEGER, accepted_ctr INTEGER);
 CREATE TABLE IF NOT EXISTS floor (
     id INTEGER PRIMARY KEY CHECK (id = 0),
     hw_wall INTEGER, hw_ctr INTEGER, att_wall INTEGER, att_ctr INTEGER);
@@ -502,13 +510,16 @@ class ReadTxn:
 
     def get_slot(self, tag: bytes) -> SlotState:
         row = self._c.execute(
-            "SELECT promised, accepted_ballot, accepted_op FROM slot_state WHERE tag=?", (tag,)
+            "SELECT promised, accepted_ballot, accepted_op, accepted_wall, accepted_ctr"
+            " FROM slot_state WHERE tag=?",
+            (tag,),
         ).fetchone()
         if row is None:
-            return SlotState(BLIND, None, None)
+            return SlotState(BLIND, None, None, None)
         promised = Ballot.decode(codec.decode(row[0]))
         ab = Ballot.decode(codec.decode(row[1])) if row[1] is not None else None
-        return SlotState(promised, ab, row[2])
+        hlc = HLC(row[3], row[4]) if row[3] is not None else None
+        return SlotState(promised, ab, row[2], hlc)
 
     def get_hw(self) -> HLC:
         r = self._c.execute("SELECT hw_wall, hw_ctr FROM floor WHERE id=0").fetchone()
@@ -797,13 +808,16 @@ class WriteTxn(ReadTxn):
     # ---- slot acceptor state (DESIGN §8) ---------------------------------- #
 
     def write_slot(self, tag: bytes, s: SlotState) -> None:
+        # positional VALUES — the tuple must move in lockstep with the DDL column order.
         self._c.execute(
-            "INSERT OR REPLACE INTO slot_state VALUES (?,?,?,?)",
+            "INSERT OR REPLACE INTO slot_state VALUES (?,?,?,?,?,?)",
             (
                 tag,
                 codec.encode(s.promised.encode()),
                 codec.encode(s.accepted_ballot.encode()) if s.accepted_ballot else None,
                 s.accepted_op,
+                s.accepted_hlc.wall_ms if s.accepted_hlc is not None else None,
+                s.accepted_hlc.counter if s.accepted_hlc is not None else None,
             ),
         )
 
@@ -1156,9 +1170,18 @@ class ChainStore:
 
 
 class SlotState:
-    __slots__ = ("promised", "accepted_ballot", "accepted_op")
+    __slots__ = ("promised", "accepted_ballot", "accepted_op", "accepted_hlc")
 
-    def __init__(self, promised: Ballot, accepted_ballot: Ballot | None, accepted_op: bytes | None):
+    def __init__(
+        self,
+        promised: Ballot,
+        accepted_ballot: Ballot | None,
+        accepted_op: bytes | None,
+        accepted_hlc: HLC | None = None,
+    ):
         self.promised = promised  # Ballot
         self.accepted_ballot = accepted_ballot  # Ballot | None
         self.accepted_op = accepted_op  # op_hash bytes | None
+        # the accepted op's hlc — carried HERE so the §8 void rule never needs the envelope
+        # (review C-1/FIX-1). Set with `accepted_op`; None exactly when there is no accept.
+        self.accepted_hlc = accepted_hlc  # HLC | None

@@ -10,7 +10,7 @@ import unittest
 from functools import partial
 
 from dudefs import artifacts as A
-from dudefs import compactor, crypto, fold, gossip
+from dudefs import committed, compactor, crypto, fold, gossip
 from dudefs.acceptor import Acceptor, Rejected, RejectReason
 from dudefs.store import AppendStatus, ChainStore
 from tests._builders import World, cut_of
@@ -210,17 +210,25 @@ class TestF2RetainedExcludesDead(unittest.TestCase):
         cr = compactor.compact_genesis(below, w.keyring, w.genesis, cut)
         self.assertIn(first.op_hash, cr.dead)  # the superseded first write IS dead
 
+        # a REAL 1-node roster + QCs: `retained` is now COMMITTED ∧ covered ∖ dead (RC-1/D-A),
+        # so the ops must genuinely be quorum-decided or the winner assertion below would fail.
+        nsk = bytes([201] * 32)
+        npub = crypto.SoftwareKeypair.from_seed(nsk).public
+        rosters: committed.Rosters = {0: [npub]}  # annotated: see TODO name-the-bytes sweep
+
         store = ChainStore()
         with store.write_txn() as tx:
             for o in below:
                 tx.append(o)
+                r = A.Receipt.issue(crypto.SoftwareKeypair.from_seed(nsk), o.op_hash, 0, A.BLIND, 1)
+                tx.put_qc(A.QC.assemble([r], 1, {npub: 0}))
             # ADOPT but do NOT gc_checkpoint -> `first` stays physically present (lazy GC)
             tx.adopt_checkpoint(
                 A.Baseline(cut, A.retained_commitment(cr.retained), frozenset(cr.dead))
             )
         with store.read_txn() as tx:
             self.assertIsNotNone(tx.get_op(first.op_hash))  # confirm it IS still held (lazy)
-            prev = compactor.PrevState.of(tx, w.keyring)
+            prev = compactor.PrevState.of(tx, w.keyring, rosters)
         held = {o.op_hash for o in prev.retained}
         self.assertNotIn(first.op_hash, held)  # the dead op must NOT count as retained
         self.assertIn(winner.op_hash, held)  # the true winner is retained

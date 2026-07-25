@@ -19,11 +19,65 @@ from dudefs import fold as F
 from dudefs.artifacts import VERSION_ABSENT
 from dudefs.client import ClientDaemon, KeyEntry
 from dudefs.daemon import NodeDaemon
+from dudefs.node import Request, Response
 from dudefs.workerapi import WorkerServer
 from tests._builders import World, cut_of, now_ms, poll_until, unix_eps
 
 DELTA = 150  # ms — small enough that finality sweeps ~DELTA after a write, big
 # enough that same-machine client/node clock jitter never trips the skew gate.
+
+
+class _OneShotFetchClient(ClientDaemon):
+    """A client whose fetch seam serves ONE canned response and then goes quiet — an
+    override, not a monkeypatch, so the stub is type-checked against the real signature."""
+
+    canned: Response | None = None
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._serves = 0
+
+    def _one_of(self, req: Request) -> Response | None:
+        self._serves += 1
+        return self.canned if self._serves == 1 else None
+
+
+class TestK8FetchedOpMustMatchTheRequest(unittest.TestCase):
+    """Review K-8 (RC-1/RC-5, CONFIRMED): `_pull_chain` stores whatever a peer returns for a
+    `FetchOpReq(h)` with no `fetched.op_hash == h` check and no `verify_sig()`, then follows
+    `op.prev` — so whoever answers the fetch injects an arbitrary op into the client's store AND
+    steers the rest of the chain walk. Nothing at the envelope layer catches it either (K-13: a
+    reply is not bound to its request), so this is the one place where BOTH layers are silent.
+
+    It composes with F-1: the injected op lands via `put_op_raw`, and `_committed_ops` admits
+    every control op unconditionally — so a substituted CHECKPOINT becomes a fold barrier with
+    no QC verification. K-8 supplies the op; F-1 trusts it."""
+
+    def test_pull_chain_does_not_store_an_op_it_did_not_ask_for(self):
+        w = World(seed=1, n_clients=2)
+        wanted = w.blind(0, [], [[A.Mutation.SET, b"k", b"v1"]])  # the op we ask for
+        other = w.blind(1, [], [[A.Mutation.SET, b"k", b"v2"]])  # an unrelated op, another author
+        self.assertNotEqual(wanted.op_hash, other.op_hash)
+
+        c = _OneShotFetchClient(
+            C.SoftwareKeypair.from_seed(w.clients[0].sk),
+            roster=[C.SIGNER.public(bytes([200 + i] * 32)) for i in range(3)],
+            roster_addrs=unix_eps([f"/nonexistent{i}.sock" for i in range(3)]),
+            manager_pub=w.mgr_pub,
+            control_ops=w.control_ops,
+            epoch=0,
+        )
+        try:
+            # the peer answers the FIRST fetch with the WRONG op, then goes quiet so the walk
+            # terminates instead of chasing the substituted `prev` forever. No sockets involved.
+            c.canned = other
+            c._pull_chain(wanted.op_hash)
+
+            with c.store.read_txn() as tx:
+                # an op that is not the one we asked for must NEVER enter the store
+                self.assertIsNone(tx.get_op(other.op_hash))
+        finally:
+            c.close()
 
 
 class _Cluster:

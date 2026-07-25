@@ -72,7 +72,11 @@ class CompactorDaemon(ClientDaemon):
         if f == HLC(0, 0):
             return None  # nothing is final yet — no cut to pin
         with self.store.read_txn() as tx:
-            view = compactor.CompactorView.of(tx, self.keyring)
+            # rosters-per-epoch from the held control chain — what a QC is VERIFIED against
+            # (RC-1/D-A); the compactor is a ClientDaemon, so this is the same reconstruction
+            # its read path uses.
+            rosters = self._rosters([o for o in tx.all_ops() if o.is_control])
+            view = compactor.CompactorView.of(tx, self.keyring, rosters)
         plan = view.plan(f)
         if plan is None:
             return None

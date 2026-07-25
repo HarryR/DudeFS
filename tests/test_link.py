@@ -22,7 +22,15 @@ def _echo_reply(payload: bytes) -> bytes | None:
     env = lmsg.Envelope.decode(payload)
     if not env.verify_sig():
         return None
-    return lmsg.author(B_KP, env.frm, env.verb, b"pong:" + env.body, epoch=0, ts=env.ts).encode()
+    return lmsg.author(
+        B_KP,
+        env.frm,
+        env.verb,
+        b"pong:" + env.body,
+        epoch=0,
+        ts=env.ts,
+        nonce=lmsg.request_digest(env),  # echo the correlator, as a real daemon's _reply does
+    ).encode()
 
 
 class TestLink(unittest.TestCase):

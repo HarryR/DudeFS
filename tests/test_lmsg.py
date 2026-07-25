@@ -20,6 +20,55 @@ def _member(*pubs):
     return lambda frm: frm in allow
 
 
+class TestK13RequestReplyBinding(unittest.TestCase):
+    """Review K-13 (RC-5): a reply is authenticated but NOT bound to the request it answers.
+    `_check_reply` verifies the signature, `frm` and `to` — and nothing else; it does not even
+    compare the reply's `verb` to the verb that was sent. So a genuine reply from the right peer
+    to the right recipient is accepted as the answer to ANY outstanding request, which is what a
+    relay or MITM needs to substitute one for another.
+
+    The `nonce` field already exists on the envelope, is already covered by the signature, and is
+    already golden-pinned — but no caller ever sets it and nothing ever reads it. The fix is to
+    put a deterministic digest of the request in it (`lmsg.request_digest`) and have
+    `classify_reply` require it, which also unlocks the async/relayed reply PYTHON-CODESTYLE §5
+    anticipates ("keyed by request-hash").
+
+    RED today: `request_digest` does not exist and `classify_reply` takes no `expect_nonce`."""
+
+    def test_a_genuine_reply_to_a_DIFFERENT_request_is_refused(self):
+        # A asks B two different things; B genuinely answers only the first.
+        req_1 = lmsg.author(A_KP, B, b"FRONTIER", b"q1", epoch=0, ts=NOW)
+        req_2 = lmsg.author(A_KP, B, b"FRONTIER", b"q2", epoch=0, ts=NOW)
+        rep_1 = lmsg.author(
+            B_KP, A, b"FRONTIER", b"answer-to-q1", epoch=0, ts=NOW, nonce=lmsg.request_digest(req_1)
+        )
+        # ...and the carrier hands B's answer-to-q1 back as the answer to q2.
+        out = lmsg.classify_reply(
+            rep_1.encode(),
+            expect_from=B,
+            expect_to=A,
+            expect_nonce=lmsg.request_digest(req_2),
+        )
+        self.assertNotIsInstance(out, lmsg.Reply)  # right peer, right recipient, WRONG question
+
+    def test_the_reply_to_my_own_request_is_still_accepted(self):
+        # the other half: binding must not refuse the legitimate answer (no false rejection)
+        req = lmsg.author(A_KP, B, b"FRONTIER", b"q1", epoch=0, ts=NOW)
+        rep = lmsg.author(
+            B_KP, A, b"FRONTIER", b"answer", epoch=0, ts=NOW, nonce=lmsg.request_digest(req)
+        )
+        out = lmsg.classify_reply(
+            rep.encode(), expect_from=B, expect_to=A, expect_nonce=lmsg.request_digest(req)
+        )
+        self.assertIsInstance(out, lmsg.Reply)
+
+    def test_request_digest_is_deterministic_and_separates_requests(self):
+        req_1 = lmsg.author(A_KP, B, b"FRONTIER", b"q1", epoch=0, ts=NOW)
+        req_2 = lmsg.author(A_KP, B, b"FRONTIER", b"q2", epoch=0, ts=NOW)
+        self.assertEqual(lmsg.request_digest(req_1), lmsg.request_digest(req_1))  # deterministic
+        self.assertNotEqual(lmsg.request_digest(req_1), lmsg.request_digest(req_2))
+
+
 class TestPlainEnvelope(unittest.TestCase):
     def test_author_verifies_and_binds_every_field(self):
         env = lmsg.author(A_KP, B, b"FRONTIER", b"payload", epoch=3, ts=NOW, nonce=b"n1")
@@ -209,18 +258,21 @@ class TestClassifyInbound(unittest.TestCase):
 class TestClassifyReply(unittest.TestCase):
     def test_valid_reply_from_the_addressed_peer(self):
         reply = lmsg.author(B_KP, A, b"SUBMIT", b"receipt", epoch=0, ts=NOW)
-        out = lmsg.classify_reply(reply.encode(), expect_from=B, expect_to=A)
+        out = lmsg.classify_reply(reply.encode(), expect_from=B, expect_to=A, expect_nonce=b"")
         self.assertIsInstance(out, lmsg.Reply)
 
     def test_each_fault_is_named_for_its_cause(self):
         # say WHY, not a vague "unusable": absent / malformed / wrong-peer are distinct
-        self.assertIsInstance(lmsg.classify_reply(b"", expect_from=B, expect_to=A), lmsg.NoReply)
         self.assertIsInstance(
-            lmsg.classify_reply(b"junk", expect_from=B, expect_to=A), lmsg.MalformedReply
+            lmsg.classify_reply(b"", expect_from=B, expect_to=A, expect_nonce=b""), lmsg.NoReply
+        )
+        self.assertIsInstance(
+            lmsg.classify_reply(b"junk", expect_from=B, expect_to=A, expect_nonce=b""),
+            lmsg.MalformedReply,
         )
         # a well-formed reply, but from a peer I didn't address -> not my reply
         other = lmsg.author(X_KP, A, b"SUBMIT", b"r", epoch=0, ts=NOW)
-        out = lmsg.classify_reply(other.encode(), expect_from=B, expect_to=A)
+        out = lmsg.classify_reply(other.encode(), expect_from=B, expect_to=A, expect_nonce=b"")
         self.assertIsInstance(out, lmsg.WrongPeer)
         assert isinstance(out, lmsg.WrongPeer)
         self.assertEqual(out.frm, X)  # names who actually signed it
@@ -229,10 +281,14 @@ class TestClassifyReply(unittest.TestCase):
         r_kp = C.SoftwareKeypair.from_seed(bytes([77] * 32))
         reply = lmsg.author(B_KP, A, b"V", b"body", epoch=0, ts=NOW)  # B -> A
         sealed = lmsg.seal_reply(reply, r_kp.public)
-        got = lmsg.classify_sealed_reply(sealed, reply=r_kp, expect_from=B, expect_to=A)
+        got = lmsg.classify_sealed_reply(
+            sealed, reply=r_kp, expect_from=B, expect_to=A, expect_nonce=b""
+        )
         self.assertIsInstance(got, lmsg.Reply)
         # a different reply-key cannot open it -> not our reply
-        bad = lmsg.classify_sealed_reply(sealed, reply=X_KP, expect_from=B, expect_to=A)
+        bad = lmsg.classify_sealed_reply(
+            sealed, reply=X_KP, expect_from=B, expect_to=A, expect_nonce=b""
+        )
         self.assertIsInstance(bad, lmsg.MalformedReply)
 
 

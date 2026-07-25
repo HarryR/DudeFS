@@ -253,6 +253,57 @@ class TestC2ReacceptAfterDelta(unittest.TestCase):
         self.assertEqual(getattr(r2, "sig", None), r1.sig)  # the identical stored receipt
 
 
+class TestC2aReacceptMustNotSelfConvict(unittest.TestCase):
+    """FIX-6 — the landed C-2a fix (`f49e72c`) can make an HONEST node mint FLOOR_PERJURY
+    evidence against itself. The exemption keys on the OP alone, so it also skips the floor
+    gate for a re-ACCEPT at a DIFFERENT ballot — and `reserve_receipt_seq` idents on
+    `(op_hash, ballot)`, so a new ballot mints a receipt at a FRESH issue_seq instead of
+    serving the stored one.
+
+    `FloorPerjuryEvidence.verify` convicts on exactly `op.hlc < wm.floor` AND
+    `rcpt.issue_seq > wm.issue_seq`, and its docstring states the soundness argument the
+    exemption breaks: "an honest node structurally cannot produce it (AFTER ATTESTING F THE
+    PAST GATE REFUSES BELOW-F ACCEPTANCES, and re-issues preserve their original lower seq)".
+    Clause 1 is now gone; clause 2 does not cover a new ballot.
+
+    Harry's ruling — a dropped/retried transmit re-yields its receipt — is safe, because a
+    VERBATIM re-request is the same (op, ballot) and is served from the store at its original
+    lower seq. The fix is wider than the ruling: narrowing the exemption to
+    `s.accepted_op == op.op_hash AND s.accepted_ballot == ballot` restores clause 1 for
+    everything else. This test asserts only the invariant (never self-convict), so it stays
+    valid whichever way the re-ACCEPT is answered."""
+
+    def test_reaccept_at_a_higher_ballot_after_attesting_a_floor_is_not_perjury(self):
+        w = World(seed=1, n_clients=1)
+        acc = Acceptor(C.SoftwareKeypair.from_seed(bytes([200] * 32)), ChainStore(), 0, DELTA)
+        op, tag = _slot_op(w, 0, b"a", NOW)
+
+        r1 = acc.on_accept(tag, Ballot(1, b"x"), op, NOW)  # accepted while op.hlc >= floor
+        assert isinstance(r1, A.Receipt)
+
+        later = NOW + 50 * DELTA  # δ passes; attesting the risen floor is entirely legal
+        wm = acc.issue_watermark(later)
+        self.assertGreater(wm.floor, op.hlc)  # the node has sworn a floor above op.hlc
+        self.assertGreater(wm.issue_seq, r1.issue_seq)  # ...after issuing r1
+
+        # the §1.3 re-drive arrives at a HIGHER ballot (a fresh round, as recovery does)
+        acc.on_accept(tag, Ballot(2, b"x"), op, later)
+
+        with acc.store.write_txn() as tx:
+            proofs = tx.detect_floor_perjury([wm])
+        # an honest node must never be convictable by its own artifacts (finding 17)
+        self.assertEqual(proofs, [])
+
+
+# NOTE — C-2b's repro (`TestC2bRedriveNeedsAQuorum`) is deliberately NOT in this file.
+# It is a genuine RED: the re-drive deadlock is unfixed, and it cannot go green without
+# relaxing a gate — which is FIX-6, the honest-node self-conviction. CI runs `make check`
+# on push, and a red master is exactly what tempts someone to "fix" an acceptance criterion.
+# The test is preserved VERBATIM in reviews/2026-07-25/FIX-REVIEW.md ("The repro — HELD OUT
+# OF TREE"); paste it back here when C-2b is picked up. It needs only `_slot_op`/`World`/
+# `NOW`/`DELTA` from this file.
+
+
 class TestC1VoidOnMissingEnvelope(unittest.TestCase):
     """Review C-1 (RC-2): on_prepare's void rule fires on `acc is None` (envelope absent) as
     well as below-horizon. But envelope absence is a FETCH problem, not amnesia — a GC path
@@ -278,6 +329,45 @@ class TestC1VoidOnMissingEnvelope(unittest.TestCase):
         assert isinstance(p, A.Promise)
         # the slot must STILL report the decided op (fetch it), never void it to let B win:
         self.assertEqual(p.accepted_op_hash, op.op_hash)
+
+
+class TestC1VoidStillFiresBelowHorizon(unittest.TestCase):
+    """FIX-1 (the other half of C-1): fixing the amnesia by *never* voiding on envelope
+    absence re-opens the NOTES 27 livelock, because `SlotState` carries no hlc — so once the
+    envelope is gone NOTHING can classify the slot, and the NORMAL adopt path is exactly what
+    removes it. `daemon._adopt_one` advances the horizon and GCs `dead` in ONE transaction, and
+    `dead` legitimately contains slot-accepted ops (compactor: `keep = winners | masks |
+    control_live`, so an op that won its slot but folded STALE is dead).
+
+    The void rule MUST still fire for a below-horizon op whose envelope was legitimately
+    dropped — otherwise PREPARE reports an ancient decided op that §1.3 forces the proposer to
+    re-propose, no node holds the envelope to fetch, and its hlc is below the floor: a livelock
+    that GC now CAUSES instead of resolving. RED until the accepted hlc is denormalized into
+    the slot state (making the predicate total and envelope-independent)."""
+
+    def test_prepare_voids_a_below_horizon_slot_whose_envelope_was_gcd(self):
+        w = World(seed=1, n_clients=1)
+        acc = Acceptor(C.SoftwareKeypair.from_seed(bytes([200] * 32)), ChainStore(), 0, DELTA)
+        op, tag = _slot_op(w, 0, b"a", NOW)
+        self.assertIsInstance(acc.on_accept(tag, Ballot(1, b"x"), op, NOW), A.Receipt)
+
+        # The REAL adopt pairing (daemon._adopt_one): raise the horizon ABOVE op.hlc and drop
+        # the `dead` band naming this op — one transaction, exactly as production does it.
+        cut: A.Heads = {op.author: A.HeadEntry(op.seq, op.op_hash)}
+        dead = frozenset({op.op_hash})
+        with acc.store.write_txn() as tx:
+            tx.adopt_checkpoint(A.Baseline.of([op], cut, dead), HLC(NOW + 1, 0))
+            tx.gc_checkpoint(sorted(dead))
+        with acc.store.read_txn() as tx:
+            self.assertIsNone(tx.get_op(op.op_hash))  # envelope legitimately GC'd
+            self.assertGreater(tx.get_horizon(), op.hlc)  # AND it is below the horizon
+
+        p = acc.on_prepare(tag, Ballot(2, b"r"))
+        assert isinstance(p, A.Promise)
+        # below the horizon => the slot is dead; the promise must report a FRESH slot so a
+        # reborn tag can be won (NOTES 27). Reporting the ancient op here is the livelock.
+        self.assertIsNone(p.accepted_op_hash)
+        self.assertIsNone(p.accepted_ballot)
 
 
 if __name__ == "__main__":

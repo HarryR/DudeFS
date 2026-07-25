@@ -10,9 +10,8 @@
 
 from __future__ import annotations
 
-from dudefs import artifacts as A
 from dudefs import store
-from dudefs.acceptor import Acceptor, AcceptResult, Nack, Rejected, RejectReason
+from dudefs.acceptor import Acceptor, RejectReason
 from dudefs.artifacts import Ballot, Op
 
 
@@ -25,30 +24,17 @@ class EquivocatingAcceptor(Acceptor):
     collapses the duplicates to one winner per slot; only the node is incriminated.
     """
 
-    def on_accept(
-        self, tag: bytes, ballot: Ballot, op: Op, now_ms: int, *, receipt_epoch: int | None = None
-    ) -> AcceptResult:
-        if not (op.verify_structure() and op.verify_sig()):
-            return Rejected(RejectReason.BAD_STRUCTURE)
-        if not isinstance(op, A.Slotted) or op.slot_tag != tag:
-            return Rejected(RejectReason.BAD_STRUCTURE)
-        with self.store.write_txn() as tx:
-            skew = self._skew_reason(tx, op, now_ms)
-            if skew:
-                return Rejected(skew)
-            s = tx.get_slot(tag)
-            if ballot < s.promised:
-                return Nack(s.promised)
-            # THE misbehavior: no equivocation guard — it re-signs at the same ballot
-            # for a different op, overwriting its accepted slot state.
-            tx.put_op_raw(op)
-            s.promised = ballot
-            s.accepted_ballot = ballot
-            s.accepted_op = op.op_hash
-            tx.write_slot(tag, s)
-            self._advance_hw(tx, op)
-            receipt = self._issue_receipt(tx, op.op_hash, ballot, receipt_epoch)
-        return receipt
+    @staticmethod
+    def _equivocates(s: store.SlotState, ballot: Ballot, op: Op) -> bool:
+        """THE misbehavior, and the WHOLE of it (DIRECTIONS D-B): the honest predicate refuses
+        to sign a second, different op at one (tag, ballot); this one never refuses.
+
+        Everything else — the skew gate, the ballot check, the below-horizon backstop, the slot
+        write, the receipt issuance — is INHERITED, so the persona cannot drift from the honest
+        path. It previously hand-copied the entire `on_accept` body to drop this one line, which
+        meant every field the honest path denormalized into SlotState had to be mirrored by hand
+        (`accepted_hlc`, FIX-1, nearly was not)."""
+        return False
 
 
 class FloorPerjurer(Acceptor):

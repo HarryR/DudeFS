@@ -24,6 +24,7 @@ from typing import TypedDict
 from . import artifacts as A
 from . import compactor, crypto, fold, gossip, lmsg, transports, tunables, wire
 from .artifacts import BLIND, HLC, QC, Op, Receipt, Slot, Txn, covered
+from .committed import CommittedSet
 from .link import Link
 from .node import FetchOpReq, FrontierReq, GetQCReq, PutQCReq, Request, Response, SubmitReq
 from .quorum import (
@@ -493,7 +494,13 @@ class ClientDaemon:
             have = op is not None
             if op is None:
                 fetched = self._one_of(FetchOpReq(h))
-                if not isinstance(fetched, Op):
+                # it must be the op we ASKED for, and it must be genuine (review K-8). Neither
+                # layer used to check: the envelope does not bind a reply to its request (K-13),
+                # so whoever answers a FetchOpReq could inject an arbitrary op AND steer the rest
+                # of this walk via its `prev`. An injected CONTROL op is worse than a stray row —
+                # `_committed_ops` admits control ops unconditionally, so a substituted checkpoint
+                # would become a fold barrier (F-1). Verify at the boundary, not three layers down.
+                if not isinstance(fetched, Op) or fetched.op_hash != h or not fetched.verify_sig():
                     return  # gap we can't fill now; a later round retries
                 op = fetched
                 with self.store.write_txn() as tx:
@@ -586,18 +593,25 @@ class ClientDaemon:
         *,
         final_only: bool = False,
     ) -> list[Op]:
-        """The committed set the daemon holds: all control ops (the authorization chain)
-        + every data op whose QC VERIFIES against its epoch roster (issue #3 — not mere
-        presence). `final_only` keeps only data ops at/under the finality frontier."""
-        out: list[Op] = []
-        for o in all_ops:
-            if o.is_control:
-                out.append(o)
-            elif self._qc_ok(tx.get_qc(o.op_hash), rosters):
-                if final_only and o.hlc > self._final_frontier:
-                    continue
-                out.append(o)
-        return out
+        """The committed set the daemon holds, via the one verifying boundary
+        (`CommittedSet.of` — RC-1/D-A): chain-authority control ops, plus every data op AND
+        CHECKPOINT whose QC verifies against its epoch roster.
+
+        Checkpoints were previously admitted unconditionally with the rest of the control
+        plane — but a checkpoint's authority to place a fold barrier comes from its commit QC,
+        not its author's signature, and `CompactorDaemon` stores its checkpoint locally BEFORE
+        driving the commit. An orphan therefore existed, gossiped, and placed a barrier that a
+        bootstrapping client (which does check the QC) would not, so two clients derived
+        byte-divergent state from the same committed set. That is F-1, and the two-arm rule
+        now lives in the type instead of here.
+
+        `final_only` keeps only data ops at/under the finality frontier."""
+        committed = CommittedSet.of(all_ops, tx.get_qc, rosters)
+        return [
+            o
+            for o in committed
+            if not (final_only and not o.is_control and o.hlc > self._final_frontier)
+        ]
 
     @staticmethod
     def _checkpoint(op: Op) -> A.CheckpointOp | None:

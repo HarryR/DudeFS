@@ -79,14 +79,19 @@ def call_node(daemon, sk: bytes, req, *, epoch: int = 0, ts: int | None = None):
     from dudefs import lmsg, wire
 
     ts = daemon._clock() if ts is None else ts  # stamp within the target's freshness window
-    reply = daemon.serve(enveloped(sk, daemon.pub, req, epoch=epoch, ts=ts))
+    raw_req = enveloped(sk, daemon.pub, req, epoch=epoch, ts=ts)
+    reply = daemon.serve(raw_req)
     if reply is None:
         return None
     expect_to = C.SoftwareKeypair.from_seed(sk).public
-    match lmsg.classify_reply(reply, expect_from=daemon.pub, expect_to=expect_to):
+    # bind the answer to THIS request (K-13), exactly as Link.request does
+    expect_nonce = lmsg.request_digest(lmsg.Envelope.decode(raw_req))
+    match lmsg.classify_reply(
+        reply, expect_from=daemon.pub, expect_to=expect_to, expect_nonce=expect_nonce
+    ):
         case lmsg.Reply(env):
             return wire.decode_response(env.body)
-        case _fault:  # NoReply / MalformedReply / WrongPeer
+        case _fault:  # NoReply / MalformedReply / WrongPeer / WrongRequest
             return None
 
 

@@ -175,9 +175,19 @@ class NodeDaemon:
 
     def _reply(self, env: lmsg.Envelope, body: bytes, reply_key: bytes | None) -> bytes:
         """A signed reply back to the requester (mirrors the request's verb); sealed to
-        the requester's ephemeral reply-key when the inbound was sealed."""
+        the requester's ephemeral reply-key when the inbound was sealed.
+
+        The nonce echoes `request_digest(env)` — the correlator that binds this answer to the
+        ONE request that asked it (K-13). The requester recomputes it from the request it
+        holds, so a carrier cannot pass off a genuine reply to a different question."""
         reply = lmsg.author(
-            self.key, env.frm, env.verb, body, epoch=self.acc.epoch, ts=self._clock()
+            self.key,
+            env.frm,
+            env.verb,
+            body,
+            epoch=self.acc.epoch,
+            ts=self._clock(),
+            nonce=lmsg.request_digest(env),
         )
         if reply_key is None:
             return reply.encode()
