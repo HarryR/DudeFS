@@ -168,7 +168,7 @@ class TestA2UniversalLineageAdvance(unittest.TestCase):
         # the slot is consumed: lineage advanced, the decided tag is never
         # expected again (A2), the next CAS gets a fresh slot.
         self.assertEqual(r2.lineage(KEY), (v, a + 1))
-        fresh = A.compute_slot_tag(w.keyring[0]["slot_secret"], KEY, v, a + 1)
+        fresh = A.compute_slot_tag(w.keyring[0].slot_secret, KEY, v, a + 1)
         assert isinstance(bad, A.Slotted)
         self.assertNotEqual(fresh, bad.slot_tag)
 
@@ -268,7 +268,7 @@ class TestSubmitGates(unittest.TestCase):
         return w.data_op(ci, txn=txn, slot_tag=None, hlc=HLC(hlc_ms, 0))
 
     def _slotted(self, w, ci, key, hlc_ms):
-        tag = A.compute_slot_tag(w.keyring[0]["slot_secret"], key, A.VERSION_ABSENT, 0)
+        tag = A.compute_slot_tag(w.keyring[0].slot_secret, key, A.VERSION_ABSENT, 0)
         txn = A.Txn(
             slot=(key, A.VERSION_ABSENT, 0), guards=[], mutations=[[A.Mutation.SET, key, b"1"]]
         )

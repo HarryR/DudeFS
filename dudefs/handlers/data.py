@@ -12,10 +12,11 @@
 from __future__ import annotations
 
 from enum import Enum, auto
-from typing import Protocol
+from typing import NamedTuple, Protocol
 
 from .. import artifacts as A
 from ..artifacts import Op, Txn
+from ..crypto import Keyring  # keyepoch -> EpochKeys (the canonical type, crypto owns it)
 
 
 class StateReader(Protocol):
@@ -23,10 +24,6 @@ class StateReader(Protocol):
     handler (L6) from the fold's concrete StateView (L5), no circular import."""
 
     def get(self, key: bytes) -> tuple[bool, bytes | None, bytes, int]: ...
-
-
-# keyepoch -> {"data_key": .., "slot_secret": ..} (DESIGN §3).
-type Keyring = dict[int, dict[str, bytes]]
 
 
 class OpaqueReason(Enum):
@@ -38,46 +35,32 @@ class OpaqueReason(Enum):
     MALFORMED_TXN = auto()  # decrypted, but not a well-formed Txn
 
 
-class Opaque:
+class Opaque(NamedTuple):
     """A payload this handler could not interpret (undecryptable, or malformed
     plaintext). Carries a typed reason for diagnostics only."""
 
-    __slots__ = ("reason",)
-
-    def __init__(self, reason: OpaqueReason):
-        self.reason = reason
-
-    def __repr__(self):
-        return f"Opaque({self.reason})"
+    reason: OpaqueReason
 
 
-class EvalResult:
-    __slots__ = ("guards_ok", "mutations", "slot_preimage")
-
-    def __init__(
-        self,
-        guards_ok: bool,
-        mutations: list[list[bytes]],
-        slot_preimage: tuple[bytes, bytes, int] | None,
-    ):
-        self.guards_ok = guards_ok
-        self.mutations = mutations  # list of [op, path, value?]
-        self.slot_preimage = slot_preimage  # (key, version, attempt) | None
+class EvalResult(NamedTuple):
+    guards_ok: bool
+    mutations: list[list[bytes]]  # list of [op, path, value?]
+    slot_preimage: tuple[bytes, bytes, int] | None  # (key, version, attempt) | None
 
 
 def decode(op: Op, keyring: Keyring) -> Txn | Opaque:
-    """Open a data op's payload and parse the Txn, or return Opaque. keyring:
-    {keyepoch: {"data_key":.., "slot_secret":..}} (DESIGN §3). Total over
-    arbitrary envelopes: a missing/mistyped keyepoch or payload field is
-    Opaque, never a raised KeyError (NOTES item 17)."""
+    """Open a data op's payload and parse the Txn, or return Opaque. `keyring` maps
+    keyepoch -> `crypto.EpochKeys` (DESIGN §3). Total over arbitrary envelopes: a
+    missing keyepoch or an unreadable payload field is Opaque, never a raised
+    exception (NOTES item 17)."""
     if not isinstance(op, A.DataOp):
         return Opaque(OpaqueReason.MALFORMED_TXN)  # a control/invalid op carries no data payload
+    ring = keyring.get(op.keyepoch)
+    if ring is None:
+        return Opaque(OpaqueReason.NO_KEY)
     try:
-        ring = keyring.get(op.keyepoch)
-        if ring is None:
-            return Opaque(OpaqueReason.NO_KEY)
-        pt = op.open_payload(ring["data_key"])
-    except (KeyError, A.ArtifactError, A.codec.CodecError):
+        pt = op.open_payload(ring.data_key)
+    except (A.ArtifactError, A.codec.CodecError):
         return Opaque(OpaqueReason.MALFORMED_TXN)  # unreadable envelope fields
     if pt is None:
         return Opaque(OpaqueReason.AEAD_OPEN_FAILED)  # authentication failure (⊥)

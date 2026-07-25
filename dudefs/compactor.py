@@ -56,7 +56,7 @@ class PrevState:
         h = tx.get_meta("checkpoint")
         op = tx.get_op(h) if h else None
         if isinstance(op, A.CheckpointOp):
-            attempts = open_attempts(op.attempts, keyring[op.keyepoch]["data_key"])
+            attempts = open_attempts(op.attempts, keyring[op.keyepoch].data_key)
         return cls(prev_cut, retained, attempts)
 
 

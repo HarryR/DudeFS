@@ -164,7 +164,7 @@ class TestBelowHorizonGuard(unittest.TestCase):
         # client commits a new op at the SAME tag with `horizon` configured.
         nodes, roster = _cluster(3)
         w = World(seed=20, n_clients=2)
-        tag = A.compute_slot_tag(w.keyring[0]["slot_secret"], b"k", A.VERSION_ABSENT, 0)
+        tag = A.compute_slot_tag(w.keyring[0].slot_secret, b"k", A.VERSION_ABSENT, 0)
         ancient = w.data_op(
             0,
             txn=A.Txn((b"k", A.VERSION_ABSENT, 0), [], [[A.Mutation.SET, b"k", b"old"]]),

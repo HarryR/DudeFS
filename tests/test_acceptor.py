@@ -25,7 +25,7 @@ def _node(seed_byte):
 
 def _slot_op(w, ci, val, hlc_ms):
     """A creation-CAS op on KEY at (⊥,0) — two clients produce the SAME tag."""
-    tag = A.compute_slot_tag(w.keyring[0]["slot_secret"], KEY, A.VERSION_ABSENT, 0)
+    tag = A.compute_slot_tag(w.keyring[0].slot_secret, KEY, A.VERSION_ABSENT, 0)
     txn = A.Txn(
         slot=(KEY, A.VERSION_ABSENT, 0),
         guards=[[A.Guard.ABSENT, KEY]],

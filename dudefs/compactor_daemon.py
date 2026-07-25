@@ -39,7 +39,7 @@ class CompactorDaemon(ClientDaemon):
         `checkpoint_slot_tag(seq)` so the quorum serializes it (WP-F(c)). The `attempts`
         sidecar is sealed under the group key; everything else is the plaintext manifest.
         `cr.cut` IS `plan.cut` (compact echoes the cut it was given), so read it off the result."""
-        dk = self.keyring[self.keyepoch]["data_key"]
+        dk = self.keyring[self.keyepoch].data_key
         with self._lock:
             op = A.CheckpointOp.build(
                 author=self.key,

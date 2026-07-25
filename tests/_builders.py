@@ -273,7 +273,7 @@ class World:
     ) -> A.Op:
         c = self.clients[ci]
         hlc = hlc or self.tick()
-        data_key = self.keyring[keyepoch]["data_key"]
+        data_key = self.keyring[keyepoch].data_key
         txn_bytes = txn.encode()
         op: A.Op
         if slot_tag is None:
@@ -311,7 +311,7 @@ class World:
         mutations: list[list[bytes]],
         keyepoch: int = 0,
     ) -> A.Op:
-        secret = self.keyring[keyepoch]["slot_secret"]
+        secret = self.keyring[keyepoch].slot_secret
         tag = A.compute_slot_tag(secret, key, version, attempt)
         txn = A.Txn(slot=(key, version, attempt), guards=guards, mutations=mutations)
         return self.data_op(ci, txn=txn, slot_tag=tag, keyepoch=keyepoch)

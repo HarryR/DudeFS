@@ -71,25 +71,16 @@ class Genesis(TypedDict):
 
 
 # Client-held key material and the checkpoint barrier state (DESIGN §3, §12).
-type Keyring = dict[int, dict[str, bytes]]  # keyepoch -> {data_key, slot_secret}
+Keyring = crypto.Keyring  # re-exported: the canonical type lives in crypto (no fold cycle)
 type BarrierState = dict[bytes, BarrierEntry]  # key -> {value, version, attempt}
 
 
 def keyring_from_masters(masters: dict[int, bytes]) -> Keyring:
     """Build a Keyring by DERIVING each epoch's working keys from its 32-byte master
-    K_epoch (finding 21 / CRYPTO.md §2): `data_key` = the `dude.enc` subkey, the
-    xcs1 AEAD key; `slot_secret` = the `dude.slot` subkey, the slot-tag PRF key. The
-    master is what the wrap-set distributes and escrow holds — a client unwraps ONE
-    secret per epoch and derives the rest here (a deterministic view; the dict shape
-    is kept so every consumer's `ring["data_key"]` / `ring["slot_secret"]` is
-    unchanged)."""
-    return {
-        e: {
-            "data_key": crypto.derive_data_key(k),
-            "slot_secret": crypto.derive_slot_secret(k),
-        }
-        for e, k in masters.items()
-    }
+    K_epoch (finding 21 / CRYPTO.md §2), via `crypto.EpochKeys.derive`. The master is
+    what the wrap-set distributes and escrow holds — a holder unwraps ONE secret per
+    epoch and derives the rest (a deterministic view)."""
+    return {e: crypto.EpochKeys.derive(k) for e, k in masters.items()}
 
 
 def keyring_from_wraps(ops: list[Op], member: crypto.Keypair) -> Keyring:
@@ -604,7 +595,7 @@ def fold(
             if ring is None:
                 verdicts[op.op_hash] = Verdict.STALE  # cannot compute tags for this epoch
                 continue
-            secret = ring["slot_secret"]
+            secret = ring.slot_secret
             k = _attribute(op.slot_tag, secret, universe, state)
             if k is None:
                 verdicts[op.op_hash] = Verdict.STALE
@@ -676,7 +667,7 @@ def _consume_invalid_slot(
     ring = keyring.get(op.keyepoch)
     if ring is None:
         return
-    k = _attribute(op.slot_tag, ring["slot_secret"], universe, state)
+    k = _attribute(op.slot_tag, ring.slot_secret, universe, state)
     if k is not None:
         _bump_attempt(state, k)
 

@@ -518,8 +518,8 @@ class TestWrapSet(unittest.TestCase):
         assert recovered is not None
         self.assertEqual(recovered, k_epoch)
         ring = fold.keyring_from_masters({2: recovered})
-        self.assertEqual(ring[2]["data_key"], C.derive_data_key(k_epoch))
-        self.assertEqual(ring[2]["slot_secret"], C.derive_slot_secret(k_epoch))
+        self.assertEqual(ring[2].data_key, C.derive_data_key(k_epoch))
+        self.assertEqual(ring[2].slot_secret, C.derive_slot_secret(k_epoch))
 
 
 class TestEndpointRecords(unittest.TestCase):

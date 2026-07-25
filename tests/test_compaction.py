@@ -24,7 +24,7 @@ def _boot(w, cr, control_below, tail, cut):
     wire (seal->open, the PRODUCTION codec — not a cleartext dict handed in), then the
     tail. Exercises the real sidecar path in every A4 vector."""
     data_retained = [o for o in cr.retained if not o.is_control]
-    dk = w.keyring[0]["data_key"]
+    dk = w.keyring[0].data_key
     attempts = compactor.open_attempts(compactor.seal_attempts(cr.attempts, dk), dk)
     barrier = compactor.barrier_state(data_retained, attempts, w.keyring)
     return fold.fold(control_below + tail, w.keyring, w.genesis, barrier=barrier, cut_frontier=cut)
@@ -215,7 +215,7 @@ class TestAttemptsSidecar(unittest.TestCase):
         cr = compactor.compact_genesis(below, w.keyring, w.genesis, cut)
         self.assertEqual(cr.attempts, {b"k": 1})  # a live key at a nonzero attempt
 
-        dk = w.keyring[0]["data_key"]
+        dk = w.keyring[0].data_key
         # AUTHOR: seal the sidecar INTO a real checkpoint op's attempts field
         sealed = compactor.seal_attempts(cr.attempts, dk)
         ckpt_op = w.checkpoint(cut=cut, state_acc=cr.state_acc, dead=cr.dead, attempts=sealed)
@@ -232,14 +232,14 @@ class TestAttemptsSidecar(unittest.TestCase):
         cr = compactor.compact_genesis(
             self._nonzero_attempt(w, key), w.keyring, w.genesis, cut_of(w)
         )
-        sealed = compactor.seal_attempts(cr.attempts, w.keyring[0]["data_key"])
+        sealed = compactor.seal_attempts(cr.attempts, w.keyring[0].data_key)
         self.assertNotEqual(sealed, b"")
         self.assertNotIn(key, sealed)  # the key path is confidential, not in cleartext
 
     def test_tampered_sidecar_opens_loud_empty_stays_empty(self):
         w = World(seed=32, n_clients=2)
         cr = compactor.compact_genesis(self._nonzero_attempt(w), w.keyring, w.genesis, cut_of(w))
-        dk = w.keyring[0]["data_key"]
+        dk = w.keyring[0].data_key
         blob = bytearray(compactor.seal_attempts(cr.attempts, dk))
         blob[-1] ^= 0xFF  # flip a tag byte
         with self.assertRaises(compactor.CompactError):
@@ -565,7 +565,7 @@ class TestDelegateCheckpointBarrier(unittest.TestCase):
         below = [*w.control_ops, c1, d]
         cut = cut_of(w)
         base = w._hlc
-        tag = A.compute_slot_tag(w.keyring[0]["slot_secret"], b"k", A.VERSION_ABSENT, 0)
+        tag = A.compute_slot_tag(w.keyring[0].slot_secret, b"k", A.VERSION_ABSENT, 0)
         c2 = w.data_op(
             0,
             txn=A.Txn(
@@ -622,7 +622,7 @@ class TestDelegateCheckpointBarrier(unittest.TestCase):
         base = w._hlc
 
         # a reborn creation of k above the cut: byte-identical tag to c1's.
-        tag = A.compute_slot_tag(w.keyring[0]["slot_secret"], b"k", A.VERSION_ABSENT, 0)
+        tag = A.compute_slot_tag(w.keyring[0].slot_secret, b"k", A.VERSION_ABSENT, 0)
         assert isinstance(c1, A.Slotted)
         self.assertEqual(tag, c1.slot_tag)  # the reborn collision the barrier resolves
         c2 = w.data_op(
@@ -1055,7 +1055,7 @@ class TestReceiptFloorBackstop(unittest.TestCase):
         )
 
     def _op(self, w, key, hlc):
-        tag = A.compute_slot_tag(w.keyring[0]["slot_secret"], key, A.VERSION_ABSENT, 0)
+        tag = A.compute_slot_tag(w.keyring[0].slot_secret, key, A.VERSION_ABSENT, 0)
         return w.data_op(
             0,
             txn=A.Txn((key, A.VERSION_ABSENT, 0), [], [[A.Mutation.SET, key, b"v"]]),
@@ -1105,7 +1105,7 @@ class TestVoidRule(unittest.TestCase):
         nsk = bytes([200] * 32)
         node = Acceptor(crypto.SoftwareKeypair.from_seed(nsk), ChainStore(), 0, BIG_DELTA)
         w = World(seed=7, n_clients=1)
-        tag = A.compute_slot_tag(w.keyring[0]["slot_secret"], b"k", A.VERSION_ABSENT, 0)
+        tag = A.compute_slot_tag(w.keyring[0].slot_secret, b"k", A.VERSION_ABSENT, 0)
         ancient = w.data_op(
             0,
             txn=A.Txn(
@@ -1134,7 +1134,7 @@ class TestVoidRule(unittest.TestCase):
         nsk = bytes([201] * 32)
         node = Acceptor(crypto.SoftwareKeypair.from_seed(nsk), ChainStore(), 0, BIG_DELTA)
         w = World(seed=17, n_clients=1)
-        tag = A.compute_slot_tag(w.keyring[0]["slot_secret"], b"k", A.VERSION_ABSENT, 0)
+        tag = A.compute_slot_tag(w.keyring[0].slot_secret, b"k", A.VERSION_ABSENT, 0)
         op = w.data_op(
             0,
             txn=A.Txn((b"k", A.VERSION_ABSENT, 0), [], [[A.Mutation.SET, b"k", b"x"]]),
@@ -1181,7 +1181,7 @@ class TestHorizonPersistence(unittest.TestCase):
     below-horizon reborn op after a restart."""
 
     def _op(self, w, key, hlc):
-        tag = A.compute_slot_tag(w.keyring[0]["slot_secret"], key, A.VERSION_ABSENT, 0)
+        tag = A.compute_slot_tag(w.keyring[0].slot_secret, key, A.VERSION_ABSENT, 0)
         return w.data_op(
             0,
             txn=A.Txn((key, A.VERSION_ABSENT, 0), [], [[A.Mutation.SET, key, b"v"]]),

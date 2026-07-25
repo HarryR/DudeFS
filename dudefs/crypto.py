@@ -22,7 +22,7 @@ from __future__ import annotations
 import hashlib
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
-from typing import Self
+from typing import NamedTuple, Self
 
 import nacl.bindings
 import nacl.exceptions
@@ -403,6 +403,26 @@ def derive_data_key(master: bytes) -> bytes:
 def derive_slot_secret(master: bytes) -> bytes:
     """The slot-tag PRF secret for `master` (K_epoch), `person=b"dude.slot"`."""
     return _epoch_subkey(master, PERSON_SLOT)
+
+
+class EpochKeys(NamedTuple):
+    """One epoch's working keys, DERIVED from its 32-byte master `K_epoch` (finding 21 /
+    CRYPTO.md §2): the xcs1 AEAD `data_key` and the slot-tag PRF `slot_secret`. A NamedTuple
+    (tuple-backed, immutable, C-level attribute access) — the right shape for a tiny value
+    record read in the fold hot loop. The master is what the wrap-set distributes and escrow
+    holds; a holder unwraps ONE secret per epoch and `.derive`s the rest locally."""
+
+    data_key: bytes
+    slot_secret: bytes
+
+    @classmethod
+    def derive(cls, master: bytes) -> EpochKeys:
+        return cls(derive_data_key(master), derive_slot_secret(master))
+
+
+# keyepoch -> that epoch's derived working keys (DESIGN §3). The single canonical type;
+# `fold` and `handlers.data` both import it (crypto has no fold/data dep, so no cycle).
+type Keyring = dict[int, EpochKeys]
 
 
 # --------------------------------------------------------------------------- #

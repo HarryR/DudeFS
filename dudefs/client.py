@@ -329,7 +329,7 @@ class ClientDaemon:
         slot_tag = None
         if slot is not None:
             path, version, attempt = slot
-            slot_tag = compute_slot_tag(ring["slot_secret"], path, version, attempt)
+            slot_tag = compute_slot_tag(ring.slot_secret, path, version, attempt)
         txn = Txn(slot=slot, guards=guards, mutations=mutations)
         with self._lock:
             hlc = self._next_hlc()
@@ -340,7 +340,7 @@ class ClientDaemon:
                     prev=self._prev,
                     hlc=hlc,
                     keyepoch=self.keyepoch,
-                    data_key=ring["data_key"],
+                    data_key=ring.data_key,
                     txn_bytes=txn.encode(),
                     slot_tag=slot_tag,
                 )
@@ -351,7 +351,7 @@ class ClientDaemon:
                     prev=self._prev,
                     hlc=hlc,
                     keyepoch=self.keyepoch,
-                    data_key=ring["data_key"],
+                    data_key=ring.data_key,
                     txn_bytes=txn.encode(),
                 )
             with self.store.write_txn() as tx:
@@ -642,7 +642,7 @@ class ClientDaemon:
         retained = [
             o for o in all_ops if not o.is_control and covered(o, cut) and o.op_hash not in dead
         ]
-        dk = self.keyring[ck.keyepoch]["data_key"]
+        dk = self.keyring[ck.keyepoch].data_key
         barrier = compactor.barrier_state(
             retained, compactor.open_attempts(ck.attempts, dk), self.keyring
         )

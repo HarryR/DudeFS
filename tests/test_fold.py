@@ -95,7 +95,7 @@ def _build_soup(seed, n_ops, n_keys, epochs):
             elif choice == 6:  # blind LWW
                 ops.append(w.blind(ci, [], [[A.Mutation.SET, key, b"blind"]], ke))
             elif choice == 7:  # opaque (undecryptable) op at k's current tag
-                tag = A.compute_slot_tag(w.keyring[ke]["slot_secret"], key, ver, att)
+                tag = A.compute_slot_tag(w.keyring[ke].slot_secret, key, ver, att)
                 ops.append(w.opaque(ci, tag, ke))
             elif choice == 8:  # stale CAS against a bogus old version
                 ops.append(
@@ -162,7 +162,7 @@ class TestA2NoWedge(unittest.TestCase):
             for ring in w.keyring.values():
                 for key in keys:
                     ver, att = r.lineage(key)
-                    fresh = A.compute_slot_tag(ring["slot_secret"], key, ver, att)
+                    fresh = A.compute_slot_tag(ring.slot_secret, key, ver, att)
                     self.assertNotIn(
                         fresh,
                         existing_tags,
@@ -486,7 +486,7 @@ class TestAuthzAndVersioning(unittest.TestCase):
             prev=A.GENESIS_PREV,
             hlc=w.tick(),
             keyepoch=0,
-            data_key=w.keyring[0]["data_key"],
+            data_key=w.keyring[0].data_key,
             txn_bytes=txn.encode(),
             pver=1,
         )  # fold active pver is 0
