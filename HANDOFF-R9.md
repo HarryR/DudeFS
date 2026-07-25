@@ -189,12 +189,18 @@ class StepDriver:
 | `test_sim.py` (305L) | single-decree/B1, split-vote recovery, minority-parks-majority-commits, one-way-link, flapping-heals, backward-step floor-monotone, past-gate, δ-skew commit, A1 fold-order-independence, B6 fork evidence, B3 finality→applied | A (most) + B (partitions/one-way) |
 | `test_fumbling.py` (318L) | mistaken-recovery parks on heal, over-window lost-commit evidence, recovery-fence root-only under partition, manager retry-storm idempotent, double-press one-activation-across-crash, abandoned-flow never-half-activates, amnesiac reused-seq forks, button-masher random-chaos invariants | A + B |
 | `test_chaos_compaction.py` (115L) | mixed-laziness GC digest stability + no oscillation, stale-frontier-below-cut no-wedge | **NodeDaemon gossip seams** (like `TestSansIoGossipDriver`) |
-| `test_transport.py` (139L) | **tests `MemoryTransport`'s OWN behavior** (loss/dup/reorder/determinism of the mock). The mock is being deleted → most of this EVAPORATES. The real *resilience* claims (hedge-masks-heavy-tail, asymmetric-dead-link-commits-via-others, burst-loss-survives, same-seed-determinism) reforge into a small Tier-B test over `StepDriver`. | B / delete |
+| `test_personas.py` (370L, 12T) | adversarial acceptors — split: the CONTAINMENT cases (`Sim(seed,n,personas={…})`: honest state unaffected by an equivocator/floor-perjurer) reforge onto `StepDriver`; the DIRECT-acceptor EVIDENCE cases ([:115-122](tests/test_personas.py#L115-L122) etc. — `Acceptor(…).on_accept(…)` asserting a portable proof mints, B6) are ALREADY unit-level, keep as-is. `_personas.py` (the persona subclasses) is KEPT — `test_daemon` reuses it. | containment → B; evidence already unit |
+| `test_transport.py` (139L, 8T) | **tests `MemoryTransport`'s OWN behavior** (loss/dup/reorder/determinism of the mock) — the sim carrier's private API, nothing in the product depends on it. **PURE DELETE with the mock.** The real product-resilience claims it gestures at (hedge-masks-heavy-tail, asymmetric-dead-link-commits-via-others, burst-loss-survives, same-seed-determinism) are NOT re-homed FROM here — they are re-authored fresh as `StepDriver` Tier-B cases driving the REAL machine (§1 proves one; the reforged `test_sim` one-way/minority cases cover the rest). | delete (claims re-authored on `StepDriver`) |
 | `_harness.py` (383L) | the `Sim` driver itself (`LoggingNode`, `ClientRunner` pump, `MemoryTransport` wiring) | → becomes `StepDriver` + real nodes |
 
-**Deletes:** `transports/memory.py` (whole), `test_transport.py` (tested the mock), `_harness.Sim`
-+ `ClientRunner`. **Keeps (lifted to `tests/`):** `Faults`, `LinkModel`/`NetworkLinks`/`UniformLinks`
-(fault models), a deterministic clock/order.
+`_harness.Sim` is imported by EXACTLY four files (`test_sim`, `test_fumbling`, `test_chaos_compaction`,
+`test_personas`) — the precise reforge set. `test_carrier.py` is NOT a sim file (it tests the real
+unix/HTTP carriers; it only names `transports.memory` in a comment) — leave it untouched.
+
+**Deletes:** `transports/memory.py` (whole), `test_transport.py` (tested the mock — no invariant to
+re-home), `_harness.Sim` + `ClientRunner`. **Keeps (lifted to `tests/`):** `Faults`,
+`LinkModel`/`NetworkLinks`/`UniformLinks` (fault models), a deterministic clock/order,
+`_personas.py` (persona subclasses, reused by `test_daemon`).
 
 ## 5. Staged plan (each a green `make check`)
 
@@ -212,29 +218,39 @@ class StepDriver:
 3. **Reforge `test_fumbling.py`** — recovery + manager-chaos onto real nodes + real `Manager`.
 4. **Reforge `test_chaos_compaction.py`** — onto real `NodeDaemon` gossip seams (extend the
    `TestSansIoGossipDriver` pattern with fault choices).
-5. **`test_transport.py`** — extract the real resilience claims into one `StepDriver` Tier-B test;
-   delete the rest.
-6. **Delete** `transports/memory.py` + `_harness.Sim`/`ClientRunner`; confirm nothing imports them.
-   `make check` green, coverage checklist (§4) ticked.
+5. **Reforge `test_personas.py` containment cases** — the `Sim(personas={…})` cases onto `StepDriver`
+   over real `Acceptor` personas (the persona subclasses ARE the node's `on_accept`, so they drop
+   straight in); the direct-acceptor evidence cases already stand — no change.
+6. **Delete** `transports/memory.py` + `test_transport.py` + `_harness.Sim`/`ClientRunner`; confirm
+   nothing imports them (`_personas.py` stays). `make check` green, coverage checklist (§4) ticked.
 
 ## 6. Open questions — ITERATE HERE before executing
 
-1. **How thin is thin?** Do we keep `Faults`/`LinkModel` (parametric loss/dup/delay distributions,
-   seeded) as a delivery policy on `StepDriver`, or go fully explicit like `TestSansIoGossipDriver`
-   (the test literally calls `deliver`/`drop`/`dup` in the order it wants)? Explicit = clearest and
-   most real ("who answers, when" is the test's choice); parametric = better for the button-masher /
-   random-chaos fuzz cases. Likely BOTH: explicit for named-scenario tests, a seeded `Faults` policy
-   for the fuzzers. **Your call on where the line is.**
-2. **Node granularity per tier.** Tier-A/B quorum tests against `LocalNode(Acceptor)` (real node
-   logic, no transport shell) vs real `NodeDaemon` (adds lmsg/gossip/socket). Proposal: quorum-logic
-   invariants on `LocalNode` (faster, focused); a few end-to-end on `NodeDaemon` over `inproc`. Is
-   the `NodeDaemon` transport shell worth exercising in these, or is `test_daemon` enough for it?
-3. **The retransmit layer — RESOLVED (see §2).** Production re-sends via the machine's `on_tick`
-   only; the sim added an extra blind retransmit not in the product. `StepDriver` mirrors production;
-   loss-tests that then fail expose a real gap. **Decision needed:** if one does fail, do we (a) add
-   a retransmit to production `_drive` (make the reliability real), or (b) rely on the higher-layer
-   periodic re-drive (`_drive_to_final` re-attempts) and adjust the test's expectation? Lean (b) —
-   verify `_drive_to_final`'s re-attempt cadence covers it.
+1. **How thin is thin? — RESOLVED (Harry).** Faults are expressed as **high-level, semantic delivery
+   choices at the `Send`/`Reply` seam** — a policy `deliver(src, dst, msg, tick) -> bool` (plus
+   dup/delay), keyed on *who/when*, never on message contents or wire bytes. That granularity is
+   verb-agnostic: a new verb still flows through `Send`/`Reply`, so a "drop node N's replies until
+   tick T" fault applies UNCHANGED — it won't be superseded when functionality is added, which was
+   the requirement. BOTH modes over that one seam: explicit ordering for named scenarios
+   (minority-parks, one-way, flapping), a seeded policy for the button-masher fuzz.
+2. **Node granularity / retransmission coupling — RESOLVED (Harry's framing).** The real question was
+   whether correctness is TIGHTLY COUPLED to network-level retransmission — i.e. does a machine that
+   sent a message assume a reply WILL come? **It does not, and the design is sound.** Retransmission
+   is a first-class *protocol* action: `Commit.feed(Tick)` past the round deadline calls `_escalate`,
+   which begins a new round and RE-FANS-OUT Sends ([quorum.py:279-280](dudefs/quorum.py#L279-L280));
+   the deadline `Wake` is armed at every round start ([:310](dudefs/quorum.py#L310),
+   [:323](dudefs/quorum.py#L323)). A lost `Send`/`Reply` just leaves that round's slot empty and the
+   deadline escalates — "even if the Nacks were lost." So `StepDriver` drives the **real machine over
+   real `Acceptor`s** (the node's own `on_*`), injects loss at the delivery seam, and asserts the
+   machine still reaches `Done` via escalation. No transport shell in the quorum-logic tier
+   (`test_daemon` covers `NodeDaemon`'s lmsg/gossip/socket); a lost message that WEDGES is a real
+   finding, surfaced not papered over.
+3. **The extra retransmit — RESOLVED (drop it).** The sim's blind transport-level retransmit was
+   REDUNDANT with the escalation of §6.2 and could mask a genuine wedge by resending where production
+   never would. `StepDriver` mirrors production exactly (escalation only); the reforged loss tests
+   assert escalation recovers. If one can't without the extra resend, that is a design defect to fix
+   in the product (or the higher-layer `_drive_to_final` re-attempt), never a retransmit added back
+   to the harness.
 4. **Determinism contract.** Same-seed-replays-identically is a real property today. On `StepDriver`
    with a seeded delivery order we keep it; with fully-explicit delivery it's trivially deterministic.
    Confirm we still want a seeded-fuzz mode (button-masher) and where its seed lives.
