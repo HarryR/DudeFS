@@ -196,13 +196,11 @@ def _mut_meta(ops: list[Op], keyring: fold.Keyring) -> dict[bytes, tuple[bool, b
 
 
 def compact(
-    prev_retained: list[Op],
-    prev_attempts: dict[bytes, int],
-    prev_cut: Heads,
+    prev: PrevState,
     tail: list[Op],
+    cut: Heads,
     keyring: fold.Keyring,
     genesis: fold.Genesis,
-    cut: Heads,
 ) -> CompactResult:
     """INCREMENTAL compaction (DESIGN §12 rev 6, HANDOFF-R3 WP1.4 / Q4). Advance
     the checkpoint from `prev_cut` to `cut`, given the previous checkpoint's
@@ -214,6 +212,7 @@ def compact(
     new_retained` — the ops a node holding the previous baseline + this tail drops
     to reach the new baseline. A4 holds across BOTH the tail fold (winners/state)
     and the successive-checkpoint mask carry-forward (see `_mut_meta`)."""
+    prev_retained, prev_attempts, prev_cut = prev.retained, prev.attempts, prev.cut
     # precondition: the cut monotonically advances prev_cut (no author regresses).
     for author, (pseq, _ph) in prev_cut.items():
         entry = cut.get(author)
@@ -298,7 +297,7 @@ def compact_genesis(
 ) -> CompactResult:
     """The first checkpoint: the degenerate `prev = ∅` of `compact` — fold the
     whole committed set below `cut` from scratch (DESIGN §12)."""
-    return compact([], {}, {}, committed_ops, keyring, genesis, cut)
+    return compact(PrevState({}, [], {}), committed_ops, cut, keyring, genesis)
 
 
 def barrier_state(

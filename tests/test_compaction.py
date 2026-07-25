@@ -368,7 +368,11 @@ class TestA4TwoCheckpoints(unittest.TestCase):
         tail2 = [w.blind(0, [], [[A.Mutation.SET, b"D", b"1"]])]
         cut2 = cut_of(w)
         ckpt2 = compactor.compact(
-            ckpt1.retained, ckpt1.attempts, cut1, tail2, w.keyring, w.genesis, cut2
+            compactor.PrevState(cut1, ckpt1.retained, ckpt1.attempts),
+            tail2,
+            cut2,
+            w.keyring,
+            w.genesis,
         )
         # THE carry-forward: X survives into ckpt2 though B died below cut1 (the
         # incremental fold's r.meta has no B entry — only _mut_meta over the
@@ -408,7 +412,11 @@ class TestA4TwoCheckpoints(unittest.TestCase):
         tail2 = [second]
         cut2 = cut_of(w)
         ckpt2 = compactor.compact(
-            ckpt1.retained, ckpt1.attempts, cut1, tail2, w.keyring, w.genesis, cut2
+            compactor.PrevState(cut1, ckpt1.retained, ckpt1.attempts),
+            tail2,
+            cut2,
+            w.keyring,
+            w.genesis,
         )
         self.assertIn(first.op_hash, ckpt2.dead)  # prev winner now in the GC delta
         self.assertIn(second.op_hash, {o.op_hash for o in ckpt2.retained})  # new winner kept
@@ -509,7 +517,11 @@ class TestA4PropertyFuzz(unittest.TestCase):
 
             ckpt1 = compactor.compact_genesis(below1_only, w.keyring, w.genesis, cut1)
             ckpt2 = compactor.compact(
-                ckpt1.retained, ckpt1.attempts, cut1, tail1, w.keyring, w.genesis, cut2
+                compactor.PrevState(cut1, ckpt1.retained, ckpt1.attempts),
+                tail1,
+                cut2,
+                w.keyring,
+                w.genesis,
             )
             boot = _boot(w, ckpt2, list(w.control_ops), tail2, cut2)
             full = fold.fold(full_ops, w.keyring, w.genesis)

@@ -59,13 +59,12 @@ class CompactorDaemon(ClientDaemon):
                 best_seq, best_cut = op.checkpoint_seq, op.baseline.cut
         return best_seq + 1, best_cut
 
-    def _author_checkpoint(
-        self, cr: compactor.CompactResult, cut: A.Heads, horizon: HLC, seq: int
-    ) -> Op:
+    def _author_checkpoint(self, cr: compactor.CompactResult, plan: compactor.CompactionPlan) -> Op:
         """Author the Cap.COMPACT checkpoint op on the compactor's OWN chain (its cert
-        authorizes the CHECKPOINT kind), carrying `seq` and sitting on the PUBLIC slot
+        authorizes the CHECKPOINT kind), carrying `plan.seq` and sitting on the PUBLIC slot
         `checkpoint_slot_tag(seq)` so the quorum serializes it (WP-F(c)). The `attempts`
-        sidecar is sealed under the group key; everything else is the plaintext manifest."""
+        sidecar is sealed under the group key; everything else is the plaintext manifest.
+        `cr.cut` IS `plan.cut` (compact echoes the cut it was given), so read it off the result."""
         dk = self.keyring[self.keyepoch]["data_key"]
         with self._lock:
             op = A.CheckpointOp.build(
@@ -73,12 +72,12 @@ class CompactorDaemon(ClientDaemon):
                 seq=self._seq,
                 prev=self._prev,
                 hlc=self._next_hlc(),
-                baseline=A.Baseline(cut, A.retained_commitment(cr.retained), frozenset(cr.dead)),
+                baseline=A.Baseline(cr.cut, A.retained_commitment(cr.retained), frozenset(cr.dead)),
                 state_acc=cr.state_acc,
                 attempts=compactor.seal_attempts(cr.attempts, dk),
                 keyepoch=self.keyepoch,
-                horizon=horizon,
-                checkpoint_seq=seq,
+                horizon=plan.horizon,
+                checkpoint_seq=plan.seq,
             )
             with self.store.write_txn() as tx:
                 tx.put_op_raw(op)
@@ -114,16 +113,8 @@ class CompactorDaemon(ClientDaemon):
     def _seal(self, plan: compactor.CompactionPlan) -> tuple[Op, compactor.CompactResult]:
         """Fold the prev retained set + only the newly-committed band `(prev_cut, cut]` into a
         CompactResult, and author the Cap.COMPACT checkpoint op on my own chain (WP-F(c) slot)."""
-        cr = compactor.compact(
-            plan.prev.retained,
-            plan.prev.attempts,
-            plan.prev.cut,
-            plan.committed,
-            self.keyring,
-            self.genesis,
-            plan.cut,
-        )
-        return self._author_checkpoint(cr, plan.cut, plan.horizon, plan.seq), cr
+        cr = compactor.compact(plan.prev, plan.committed, plan.cut, self.keyring, self.genesis)
+        return self._author_checkpoint(cr, plan), cr
 
     def _commit_and_adopt(
         self, ckpt: Op, cr: compactor.CompactResult, plan: compactor.CompactionPlan
@@ -137,7 +128,7 @@ class CompactorDaemon(ClientDaemon):
             return None  # lost the slot / unreachable — retry next pass
         self._store_qc(outcome.qc)  # persist + gossip the commit proof; nodes then adopt
         with self.store.write_txn() as tx:
-            manifest = A.Baseline(plan.cut, A.retained_commitment(cr.retained), frozenset(cr.dead))
+            manifest = A.Baseline(cr.cut, A.retained_commitment(cr.retained), frozenset(cr.dead))
             tx.adopt_checkpoint(manifest, plan.horizon)
             tx.gc_checkpoint(cr.dead)
             tx.set_meta("checkpoint", ckpt.op_hash)
