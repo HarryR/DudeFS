@@ -1,7 +1,7 @@
 # The L_txport carriers (dudefs.transports): a carrier owns the I/O + framing and takes
 # a pure handler. Tested directly over real unix + HTTP, independent of the daemon.
-# (tests/test_transport.py covers the SIM fault-carrier, dudefs.transports.memory — a
-# different API, in the same package; this file covers the real unix/http carriers.)
+# (The deterministic SIM fault-carrier — tests/_carrier.py — is a different API driven
+# by the quorum property tests; this file covers the real unix/http carriers.)
 
 import os
 import socket

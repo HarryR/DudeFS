@@ -1,5 +1,9 @@
 # WP3.5 / WP4.4 — chaos scenarios that COMPOSE partitions/personas with compaction
-# (they need the checkpoint-aware sim plumbing: adopt/GC hooks + cut-aware gossip).
+# (they need the checkpoint-aware driver plumbing: adopt/GC hooks + cut-aware gossip).
+#
+# HANDOFF-R9 §4: reforged off `_harness.Sim` onto `StepDriver`. No commits are driven
+# here — only the checkpoint adopt/GC/gossip-heal plumbing — so the retransmit removal
+# is irrelevant; the transform is purely the driver's new name.
 
 import unittest
 
@@ -8,9 +12,9 @@ from dudefs import compactor, fold
 from dudefs.acceptor import Acceptor
 from dudefs.crypto import SIGNER, SoftwareKeypair
 from dudefs.store import ChainStore
-from dudefs.transports.memory import Link, NetworkLinks
 from tests._builders import World, cut_of
-from tests._harness import Sim
+from tests._carrier import Link, NetworkLinks
+from tests._drive import StepDriver
 
 NOW = 100
 
@@ -35,39 +39,39 @@ class TestMixedLazinessGC(unittest.TestCase):
 
     def test_digests_stable_and_no_oscillation(self):
         net = NetworkLinks(default=Link(base_ms=2, jitter_ms=1))
-        sim = Sim(seed=20, n=3, net=net)
+        drv = StepDriver(seed=20, n=3, net=net)
         w = World(seed=20, n_clients=1)
         below, first, _winner = _overwrite(w)
         cut = cut_of(w)
         cr = compactor.compact_genesis(below, w.keyring, w.genesis, cut)
         committed = A.retained_commitment(cr.retained)
-        for nd in sim.raw:  # every node holds the full below-cut history
+        for nd in drv.raw:  # every node holds the full below-cut history
             with nd.acc.store.write_txn() as tx:
                 for o in below:
                     tx.append(o)
-        sim.adopt_checkpoint(cut, committed, cr.dead)
+        drv.adopt_checkpoint(cut, committed, cr.dead)
 
-        sim.gc(cr.dead, nodes=[0])  # node 0 GCs now; 1,2 stay lazy (mixed laziness)
+        drv.gc(cr.dead, nodes=[0])  # node 0 GCs now; 1,2 stay lazy (mixed laziness)
         digs = []
-        for nd in sim.raw:
+        for nd in drv.raw:
             with nd.acc.store.read_txn() as tx:
                 digs.append(tx.baseline_commitment())
         self.assertTrue(all(d == committed for d in digs))  # identical despite mixed GC
 
         for _ in range(3):  # cut-aware gossip must not re-introduce the dead `first`
-            sim.gossip_round()
-        with sim.raw[0].acc.store.read_txn() as tx:
+            drv.gossip_round()
+        with drv.raw[0].acc.store.read_txn() as tx:
             self.assertIsNone(tx.get_op(first.op_hash))  # no oscillation
         digs2 = []
-        for nd in sim.raw:
+        for nd in drv.raw:
             with nd.acc.store.read_txn() as tx:
                 digs2.append(tx.baseline_commitment())
         self.assertTrue(all(d == committed for d in digs2))  # still stable
 
-        sim.gc(cr.dead, nodes=[1, 2])  # the lazy nodes finally GC
+        drv.gc(cr.dead, nodes=[1, 2])  # the lazy nodes finally GC
         for _ in range(2):
-            sim.gossip_round()
-        self.assertTrue(sim.converged())  # all fully GC'd -> identical op sets too
+            drv.gossip_round()
+        self.assertTrue(drv.converged())  # all fully GC'd -> identical op sets too
 
 
 class TestStaleFrontierRoster(unittest.TestCase):

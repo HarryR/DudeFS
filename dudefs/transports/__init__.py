@@ -1,7 +1,7 @@
 # dudefs/transports — the L_txport carriers (PROTOCOL §7) and the scheme registry
 # that dispatches to them. A carrier is a dumb pipe (see base.py); one file per
-# carrier (unix.py, http.py, …), plus memory.py (the SIM fault-carrier used by the
-# quorum property tests — a different API, not part of this registry).
+# carrier (unix.py, http.py, …). The deterministic SIM fault-carrier used by the
+# quorum property tests now lives in tests/_carrier.py (a different API, test-only).
 #
 # Selecting a carrier is by SCHEME — the `transport` field of an ENDPOINT record — so
 # a new carrier is one registry entry, not a rewrite of the callers.

@@ -9,9 +9,9 @@
 # DERIVED from the store per poll (ticket = op_hash, NOTES 51) — no session state,
 # restart loses nothing.
 #
-# The quorum I/O here is the real-socket twin of transports/memory.ClientRunner:
-# it pumps a sans-io quorum.Commit / quorum.Finalize machine, executing Sends as
-# node RPCs and Wakes as timers, until the machine says Done.
+# The quorum I/O here is the real-socket twin of the deterministic test driver
+# (tests/_drive._Pump): it pumps a sans-io quorum.Commit / quorum.Finalize machine,
+# executing Sends as node RPCs and Wakes as timers, until the machine says Done.
 
 from __future__ import annotations
 

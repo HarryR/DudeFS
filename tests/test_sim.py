@@ -20,8 +20,8 @@ from dudefs import artifacts as A
 from dudefs import fold
 from dudefs import quorum as Q
 from dudefs.store import AppendStatus
-from dudefs.transports.memory import CLIENT, Faults, Link, NetworkLinks
 from tests._builders import World, create
+from tests._carrier import CLIENT, Faults, Link, NetworkLinks
 from tests._cluster import creation_op
 from tests._drive import StepDriver
 

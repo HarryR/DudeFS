@@ -1,7 +1,12 @@
-# WP3 — adversarial node personas (IMPLEMENTATION §6.4 / RESILIENCE §3). Each
-# persona is a misbehaving sim node; the test asserts BOTH containment (honest
-# state unaffected) AND evidence (the violation mints a portable proof — B6
-# becomes an assertion). TEE profile (NOTES 35): node personas are the priority.
+# WP3 — adversarial node personas (IMPLEMENTATION §6.4 / RESILIENCE §3). Each persona
+# is a misbehaving cluster node; the test asserts BOTH containment (honest state
+# unaffected) AND evidence (the violation mints a portable proof — B6 becomes an
+# assertion). TEE profile (NOTES 35): node personas are the priority.
+#
+# HANDOFF-R9 §5: reforged off `_harness.Sim` onto `StepDriver`. No case drives a
+# commit/run — each calls `drv.nodes[i].accept(...)` / `drv.raw[i].acc` directly, using
+# the driver as an Acceptor-cluster factory plus the continuous B1 hooks — so the
+# retransmit removal is irrelevant; the transform is purely the driver's new name.
 
 import unittest
 from functools import partial
@@ -13,8 +18,8 @@ from dudefs.acceptor import Acceptor
 from dudefs.store import AppendStatus, ChainStore, EvidenceKind
 from tests._builders import World
 from tests._cluster import creation_op
+from tests._drive import StepDriver
 from tests._gossip import merge
-from tests._harness import Sim
 from tests._personas import EquivocatingAcceptor, FloorPerjurer
 
 NOW = 100
@@ -26,7 +31,7 @@ class TestEquivocator(unittest.TestCase):
     are a portable DOUBLE_VOTE proof; honest state collapses the duplicates."""
 
     def test_double_vote_mints_evidence_and_state_is_contained(self):
-        sim = Sim(seed=1, n=3, personas={0: EquivocatingAcceptor})
+        drv = StepDriver(seed=1, n=3, personas={0: EquivocatingAcceptor})
         w = World(seed=1, n_clients=2)
         a = creation_op(w, 0, b"A")  # key k
         b = creation_op(w, 1, b"B")  # key k -> SAME slot as a
@@ -35,31 +40,31 @@ class TestEquivocator(unittest.TestCase):
         tag, ballot = a.slot_tag, A.Ballot(1, b"x")
 
         # the equivocator signs BOTH at one ballot (an honest node would refuse b)
-        ra = sim.nodes[0].accept(tag, ballot, a)
-        rb = sim.nodes[0].accept(tag, ballot, b)
+        ra = drv.nodes[0].accept(tag, ballot, a)
+        rb = drv.nodes[0].accept(tag, ballot, b)
         self.assertIsInstance(ra, A.Receipt)
         self.assertIsInstance(rb, A.Receipt)
 
         # a third party (honest node 1) gossips in the equivocator's ops+receipts
         # and ASSEMBLES the proof (B6): a portable, self-verifying DOUBLE_VOTE.
-        merge(sim.raw[1].acc.store, sim.raw[0].acc.store)
-        with sim.raw[1].acc.store.write_txn() as tx:
+        merge(drv.raw[1].acc.store, drv.raw[0].acc.store)
+        with drv.raw[1].acc.store.write_txn() as tx:
             proofs = tx.detect_double_votes()
         self.assertEqual(len(proofs), 1)
         self.assertTrue(proofs[0].verify())
-        self.assertEqual(proofs[0].signer, sim.roster[0])  # attributed to the equivocator
-        with sim.raw[1].acc.store.read_txn() as tx:
+        self.assertEqual(proofs[0].signer, drv.roster[0])  # attributed to the equivocator
+        with drv.raw[1].acc.store.read_txn() as tx:
             minted = tx.evidence()
         self.assertTrue(any(k == EvidenceKind.DOUBLE_VOTE for k, _ in minted))
 
         # detection is idempotent — re-running mints nothing new
-        with sim.raw[1].acc.store.write_txn() as tx:
+        with drv.raw[1].acc.store.write_txn() as tx:
             self.assertEqual(tx.detect_double_votes(), [])
 
         # CONTAINMENT: a single equivocator never reached a quorum for either op
         # (B1 at the quorum level never fired), and the fold collapses the double
         # vote to exactly ONE winner per slot — honest state is unaffected.
-        self.assertEqual(sim.decided_ops(tag), set())
+        self.assertEqual(drv.decided_ops(tag), set())
         r = fold.fold([*w.all_control(), a, b], w.keyring, w.genesis)
         self.assertIn(r.state.get(b"k"), (b"A", b"B"))  # one value, never both
 
@@ -68,20 +73,20 @@ class TestEquivocator(unittest.TestCase):
         # intersecting only in it). The old STRICT B1 would crash the harness on
         # this documented behavior; the relaxed rule passes it — every duplicate
         # traces to the persona, the fold yields one winner, a proof is assemblable.
-        sim = Sim(seed=3, n=3, personas={0: EquivocatingAcceptor})
+        drv = StepDriver(seed=3, n=3, personas={0: EquivocatingAcceptor})
         w = World(seed=3, n_clients=2)
         a, b = creation_op(w, 0, b"A"), creation_op(w, 1, b"B")  # same slot
         assert isinstance(a, A.Slotted)
         tag, ballot = a.slot_tag, A.Ballot(1, b"x")
         # node 0 (persona) signs BOTH; node 1 signs a, node 2 signs b -> QCs {0,1},{0,2}
-        sim.nodes[0].accept(tag, ballot, a)
-        sim.nodes[0].accept(tag, ballot, b)
-        sim.nodes[1].accept(tag, ballot, a)
-        sim.nodes[2].accept(tag, ballot, b)  # this call reaches the 2nd QC; relaxed B1 must pass
-        self.assertEqual(sim.decided_ops(tag), {a.op_hash, b.op_hash})  # two decrees, allowed
+        drv.nodes[0].accept(tag, ballot, a)
+        drv.nodes[0].accept(tag, ballot, b)
+        drv.nodes[1].accept(tag, ballot, a)
+        drv.nodes[2].accept(tag, ballot, b)  # this call reaches the 2nd QC; relaxed B1 must pass
+        self.assertEqual(drv.decided_ops(tag), {a.op_hash, b.op_hash})  # two decrees, allowed
         # B6's other clauses: proof assemblable + fold still one winner
-        merge(sim.raw[1].acc.store, sim.raw[0].acc.store)
-        with sim.raw[1].acc.store.write_txn() as tx:
+        merge(drv.raw[1].acc.store, drv.raw[0].acc.store)
+        with drv.raw[1].acc.store.write_txn() as tx:
             self.assertTrue(tx.detect_double_votes())
         r = fold.fold([*w.all_control(), a, b], w.keyring, w.genesis)
         self.assertIn(r.state.get(b"k"), (b"A", b"B"))
@@ -89,14 +94,14 @@ class TestEquivocator(unittest.TestCase):
     def test_equivocator_alone_does_not_trip_quorum_b1(self):
         # the honest B1 continuous check (quorum-level) must NOT fire for a lone
         # equivocator: it holds only its own two receipts, never a quorum's.
-        sim = Sim(seed=2, n=3, personas={1: EquivocatingAcceptor})
+        drv = StepDriver(seed=2, n=3, personas={1: EquivocatingAcceptor})
         w = World(seed=2, n_clients=2)
         a, b = creation_op(w, 0, b"A"), creation_op(w, 1, b"B")
         assert isinstance(a, A.Slotted)
         ballot = A.Ballot(1, b"y")
-        sim.nodes[1].accept(a.slot_tag, ballot, a)
-        sim.nodes[1].accept(a.slot_tag, ballot, b)  # would raise if B1 tripped
-        self.assertEqual(sim.decided_ops(a.slot_tag), set())
+        drv.nodes[1].accept(a.slot_tag, ballot, a)
+        drv.nodes[1].accept(a.slot_tag, ballot, b)  # would raise if B1 tripped
+        self.assertEqual(drv.decided_ops(a.slot_tag), set())
 
 
 class TestAmnesiacNode(unittest.TestCase):
@@ -142,19 +147,19 @@ class TestWithholder(unittest.TestCase):
     staleness is never divergence; one honest contact heals the victim."""
 
     def test_withheld_op_heals_via_one_honest_contact(self):
-        sim = Sim(seed=42, n=3)
+        drv = StepDriver(seed=42, n=3)
         w = World(seed=42, n_clients=1)
         op = creation_op(w, 0, b"v")
         # nodes 1,2 hold the committed op; node 0 is eclipsed (withheld from it)
-        with sim.raw[1].acc.store.write_txn() as tx:
+        with drv.raw[1].acc.store.write_txn() as tx:
             tx.append(op)
-        with sim.raw[2].acc.store.write_txn() as tx:
+        with drv.raw[2].acc.store.write_txn() as tx:
             tx.append(op)
-        with sim.raw[0].acc.store.read_txn() as tx:
+        with drv.raw[0].acc.store.read_txn() as tx:
             self.assertIsNone(tx.get_op(op.op_hash))  # victim lacks it
         # a single honest contact (anti-entropy from node 1) heals the victim
-        merge(sim.raw[0].acc.store, sim.raw[1].acc.store)
-        with sim.raw[0].acc.store.read_txn() as tx:
+        merge(drv.raw[0].acc.store, drv.raw[1].acc.store)
+        with drv.raw[0].acc.store.read_txn() as tx:
             self.assertIsNotNone(tx.get_op(op.op_hash))
 
 
@@ -209,11 +214,11 @@ class TestFloorPerjurer(unittest.TestCase):
     (which never finalizes below its own floor) is unaffected."""
 
     def test_floor_perjury_mints_evidence_honest_rejects(self):
-        sim = Sim(seed=1, n=3, delta=10, personas={0: FloorPerjurer})
+        drv = StepDriver(seed=1, n=3, delta=10, personas={0: FloorPerjurer})
         w = World(seed=1, n_clients=1)
         op = creation_op(w, 0, b"v")  # small hlc
         assert isinstance(op, A.Slotted)
-        perjurer = sim.raw[0].acc
+        perjurer = drv.raw[0].acc
 
         wm = perjurer.issue_watermark(1000)  # attests floor ~990
         self.assertGreater(wm.floor.wall_ms, op.hlc.wall_ms)  # op is beneath the sworn floor
@@ -221,13 +226,13 @@ class TestFloorPerjurer(unittest.TestCase):
         # the perjurer receipts the below-floor op; an HONEST node rejects it (B3).
         rc = perjurer.on_accept(op.slot_tag, A.Ballot(1, b"x"), op, 1000)
         self.assertIsInstance(rc, A.Receipt)
-        honest = sim.raw[1].acc
+        honest = drv.raw[1].acc
         honest.issue_watermark(1000)
         hr = honest.on_accept(op.slot_tag, A.Ballot(1, b"y"), op, 1000)
         self.assertNotIsInstance(hr, A.Receipt)  # BELOW_FLOOR
 
         # a third party assembles the proof (B6) from the watermark + receipt + op
-        store = sim.raw[2].acc.store
+        store = drv.raw[2].acc.store
         assert isinstance(rc, A.Receipt)
         with store.write_txn() as tx:
             tx.put_op_raw(op)
@@ -235,7 +240,7 @@ class TestFloorPerjurer(unittest.TestCase):
             proofs = tx.detect_floor_perjury([wm])
         self.assertEqual(len(proofs), 1)
         self.assertTrue(proofs[0].verify())
-        self.assertEqual(proofs[0].signer, sim.roster[0])
+        self.assertEqual(proofs[0].signer, drv.roster[0])
         with store.read_txn() as tx:
             self.assertTrue(any(k == EvidenceKind.FLOOR_PERJURY for k, _ in tx.evidence()))
         with store.write_txn() as tx:
@@ -247,18 +252,18 @@ class TestFloorPerjurer(unittest.TestCase):
         # X.hlc (issue_seq s2 > s1). The naive pair "proves" perjury; the ORDERED
         # pair does not — the receipt was issued BEFORE the attestation. FAILS
         # against the pre-fix detector (which had no seq check).
-        sim = Sim(seed=2, n=3, delta=10_000)  # all honest
+        drv = StepDriver(seed=2, n=3, delta=10_000)  # all honest
         w = World(seed=2, n_clients=1)
         op = creation_op(w, 0, b"v")
         assert isinstance(op, A.Slotted)
-        honest = sim.raw[0].acc
+        honest = drv.raw[0].acc
         rc = honest.on_accept(op.slot_tag, A.Ballot(1, b"x"), op, 100)  # floor(100) < 0 -> legal
         assert isinstance(rc, A.Receipt)
         wm = honest.issue_watermark(1_000_000)  # floor rises far above op.hlc; a LATER seq
         self.assertGreater(wm.floor.wall_ms, op.hlc.wall_ms)  # op below the (later) floor
         self.assertLess(rc.issue_seq, wm.issue_seq)  # ...but receipted BEFORE attesting
 
-        store = sim.raw[1].acc.store
+        store = drv.raw[1].acc.store
         with store.write_txn() as tx:
             tx.put_op_raw(op)
             tx.put_receipt(rc)
@@ -269,11 +274,11 @@ class TestFloorPerjurer(unittest.TestCase):
         # serve-from-store: a resubmitted ACCEPT returns the identical receipt, and a
         # RERECEIPT under e+1 reuses the ACCEPTANCE seq — re-signing fresh would frame
         # the node, so seq stability is load-bearing (not just idempotent bytes).
-        sim = Sim(seed=3, n=3, delta=10_000)
+        drv = StepDriver(seed=3, n=3, delta=10_000)
         w = World(seed=3, n_clients=1)
         op = creation_op(w, 0, b"v")
         assert isinstance(op, A.Slotted)
-        acc = sim.raw[0].acc
+        acc = drv.raw[0].acc
         r1 = acc.on_accept(op.slot_tag, A.Ballot(1, b"x"), op, 100)
         r2 = acc.on_accept(op.slot_tag, A.Ballot(1, b"x"), op, 100)  # resubmission
         assert isinstance(r1, A.Receipt) and isinstance(r2, A.Receipt)

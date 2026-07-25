@@ -11,9 +11,9 @@
 # primitives:
 #   * PRODUCTION — a real network / daemon (tens-to-hundreds-of-ms hops).
 #     Defaults the real components (acceptor, quorum client) and the M7/M8 driver.
-#   * SIMULATION — the discrete-event harness compresses time to a few ticks per
-#     hop. Consumed ONLY by sim-only machinery (fault injector, ClientRunner /
-#     drive, Sim). Nothing here runs for real.
+#   * SIMULATION — the discrete-event carrier compresses time to a few ticks per
+#     hop. Consumed ONLY by test-only machinery (tests/_carrier fault injector +
+#     scheduler, tests/_drive StepDriver). Nothing here runs for real.
 #
 # NOT here: protocol / wire constants (sentinels, the BLIND ballot, suite ids,
 # DIGEST_SIZE, SUPPORTED_PVER, field keys, arities). Changing one breaks the wire

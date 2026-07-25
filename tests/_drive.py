@@ -20,8 +20,8 @@
 #   * B2 (durability)  — a committed op is stored on >= quorum nodes.
 #   * B3 (finality)    — each node's attested watermark floor is monotone.
 #
-# The carrier/clock/fault-models are still imported from `dudefs.transports.memory`
-# transitionally; §6 relocates them here and deletes that module + `_harness.Sim`.
+# The carrier/clock/fault-models live in `tests/_carrier.py` (lifted out of the retired
+# `dudefs/transports/memory.py`); this module owns the driver — `_Pump` + `StepDriver`.
 
 from __future__ import annotations
 
@@ -58,7 +58,7 @@ from dudefs.quorum import (
     Wake,
 )
 from dudefs.store import ChainStore
-from dudefs.transports.memory import CLIENT, Faults, MemoryTransport, NetworkLinks, Scheduler
+from tests._carrier import CLIENT, Faults, MemoryTransport, NetworkLinks, Scheduler
 from tests._gossip import merge, pull_baseline
 
 NO_FAULTS = Faults()
