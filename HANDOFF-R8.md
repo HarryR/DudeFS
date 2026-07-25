@@ -23,6 +23,39 @@
 
 ---
 
+> ## LANDED (this handoff + its deferred tail)
+>
+> **R8 capstone landed at `eea69db`** — `Op` is a decode-once leaf-per-kind hierarchy in
+> `artifacts.py` (§3 shape, exactly as settled). **One deliberate deviation from the §5 plan,
+> at Harry's direction:** the plan kept `Op.build` / `Op.build_data` (stage 1 made `keyepoch`
+> optional on them). During implementation Harry ruled those the *root of the rot* ("you keep
+> modifying both Op.build and Op.build_data which is entirely pointless") — so they were **deleted
+> outright**. Each leaf now authors itself via its own `build` classmethod and decodes itself via
+> cooperative `super()._kwargs` down to an `_OpFields` terminal; there is **no** generic
+> `Op.build`/`build_data`, no free-function decoders (all `_dec_*`/`_body` helpers became
+> `@classmethod`s returning `Self`), and consensus artifacts (Receipt/Promise/…) gained `.issue`.
+> `InvalidOp(ControlOp)` preserves fold totality; `Slotted` owns the non-optional `slot_tag` and is
+> `quorum.Commit`'s type guarantee. Stage 5 (`Sealed` bytes newtype) was NOT taken — deferred as
+> not worth the churn.
+>
+> **The §8 deferred tail has since ALL landed:**
+> - **Keypair abstraction (`6be77f7`)** — a related capstone right after R8: `crypto.PublicKey(bytes)`
+>   subclass + `Keypair(ABC)` + `SoftwareKeypair`, so signing/decryption go through an interface a
+>   TEE/TPM can back without exposing a seed. `Op.author` is a `PublicKey`; no raw seed floats past
+>   the keyfile-load boundary. Symmetric derived secrets (data_key/slot_secret) stay `bytes`. Plus
+>   manager `ManagerMeta`/`CertView` TypedDicts (the §8 "meta-dict string-key review").
+> - **`fold._covered` → `artifacts.covered` (`962fa95`)** — the wrapper collapsed (post-R8
+>   garbage-tolerance is structural).
+> - **Memory-transport rip-out + sim reforge (R9, `993e39d`→`80efa0d`)** — its own handoff
+>   (HANDOFF-R9): `dudefs/transports/memory.py` + `tests/_harness.Sim` DELETED; tests now drive the
+>   real machines via `tests/_drive.StepDriver` (escalation-only, no retransmit); carrier lifted to
+>   `tests/_carrier.py`. R9 §0 also lifted the checkpoint-adoption decision into pure
+>   `checkpoint.CheckpointView` / `compactor.CompactorView` structs (the same `.of(tx)` seam pattern).
+>
+> The design/rationale sections below (§3/§4 especially) remain the settled record — do not reopen.
+
+---
+
 ## 1. Why — the field-bag is the rot generator
 
 `Op` is `Op(raw: bytes, fields: dict[Field, Bencodable])` with a flat accessor per field. Two
