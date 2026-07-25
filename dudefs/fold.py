@@ -134,13 +134,15 @@ class StateView:
     def __init__(self, keys: dict[bytes, KeyMeta]):
         self._keys = keys
 
-    def get(self, key: bytes) -> tuple[bool, bytes | None, bytes, int]:
+    def get(self, key: bytes) -> KeyMeta:
+        """The key's resolved state as a KeyMeta — a MISSING or tombstoned key normalizes to
+        `present=False, value=None` (its version/attempt anchor the dead lineage)."""
         m = self._keys.get(key)
-        if m is None or not m.present:
-            ver = m.version if m is not None else VERSION_ABSENT
-            att = m.attempt if m is not None else 0
-            return (False, None, ver, att)
-        return (True, m.value, m.version, m.attempt)
+        if m is None:
+            return KeyMeta(False, None, VERSION_ABSENT, 0)
+        if not m.present:
+            return KeyMeta(False, None, m.version, m.attempt)
+        return m  # live: the real meta, read-only for the caller
 
 
 # --------------------------------------------------------------------------- #
@@ -169,16 +171,16 @@ def _eval_guard(guard: list[bytes], view: StateView) -> bool:
     if not (isinstance(guard, list) and len(guard) >= 2):
         return False
     kind, key = guard[0], guard[1]
-    present, value, version, _attempt = view.get(key)
+    m = view.get(key)
     if kind == A.Guard.ABSENT:
-        return not present
+        return not m.present
     if kind == A.Guard.PRESENT:
-        return present
+        return m.present
     if kind == A.Guard.VALUE_EQ:
-        return present and len(guard) >= 3 and value == guard[2]
+        return m.present and len(guard) >= 3 and m.value == guard[2]
     if kind == A.Guard.VERSION_EQ:
         # version-CAS: matches a live value OR a tombstone's anchor version.
-        return len(guard) >= 3 and version == guard[2] and version != A.VERSION_ABSENT
+        return len(guard) >= 3 and m.version == guard[2] and m.version != A.VERSION_ABSENT
     return False  # unknown guard predicate -> guard fails (fail-closed)
 
 
