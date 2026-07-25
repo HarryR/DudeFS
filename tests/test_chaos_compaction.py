@@ -98,6 +98,10 @@ class TestStaleFrontierRoster(unittest.TestCase):
         with acc.store.read_txn() as tx:
             self.assertIsNone(tx.get_op(first.op_hash))  # first is GC'd
 
+        # the op DECLARES a sync_frontier naming the GC'd `first` (below the cut) — the acceptor
+        # trusts the OP body, not the wire (review K-2). Possession must resolve via baseline
+        # completeness, and the accept succeeds (not wedged).
+        sf = {w.clients[0].pub: A.HeadEntry(0, first.op_hash)}
         rop = A.RosterOp.build(
             author=SoftwareKeypair.from_seed(w.mgr_sk),
             seq=0,
@@ -105,13 +109,10 @@ class TestStaleFrontierRoster(unittest.TestCase):
             hlc=A.HLC(NOW, 0),
             from_epoch=0,
             roster=[SIGNER.public(nsk)],
-            sync_frontier={},
+            sync_frontier=sf,
         )
-        # sync_frontier names the GC'd `first` (below the cut) -> possession must
-        # resolve via baseline completeness, and the accept succeeds (not wedged).
         assert isinstance(rop, A.Slotted)
-        sf = {w.clients[0].pub: A.HeadEntry(0, first.op_hash)}
-        r = acc.on_roster_accept(rop.slot_tag, A.Ballot(1, b"m"), rop, sf, 1, NOW)
+        r = acc.on_roster_accept(rop.slot_tag, A.Ballot(1, b"m"), rop, {}, 1, NOW)
         self.assertIsInstance(r, A.Receipt)
 
 

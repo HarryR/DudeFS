@@ -37,6 +37,58 @@ def _daemon(w, i, roster):
     )
 
 
+class TestK1RosterEscalation(unittest.TestCase):
+    """Review K-1/K-2 (RC-3): roster ACTIVATION has none of the checkpoint path's rigor — no
+    authz on the op author, no slot binding, and it verifies the new half against the roster
+    the OP ITSELF declares. An ordinary certed client (NOT the manager) can craft
+    RosterOp{roster=[self]}, gather an old-roster QC from the honest nodes (which receipt it
+    with no control-authz check), self-sign the new half against [self], and every honest node
+    seats it as the entire roster — a privilege escalation contradicting DESIGN §15. Asserts
+    the SECURE outcome (roster unchanged) => RED before the authz gate lands."""
+
+    def test_write_certed_client_cannot_seize_the_roster(self):
+        w = World(seed=1, n_clients=1)
+        node_sks = [bytes([200 + i] * 32) for i in range(3)]
+        roster = [C.SIGNER.public(s) for s in node_sks]
+        d = _daemon(w, 0, roster)
+        try:
+            atk_sk = w.clients[0].sk  # an ordinary WRITE-certed client, NOT the manager
+            atk_pub = C.SIGNER.public(atk_sk)
+            rop = A.RosterOp.build(
+                author=C.SoftwareKeypair.from_seed(atk_sk),
+                seq=0,
+                prev=A.GENESIS_PREV,
+                hlc=A.HLC(100, 0),
+                from_epoch=0,
+                roster=[atk_pub],  # the attacker names ITSELF the whole roster
+                sync_frontier={},
+            )
+            assert isinstance(rop, A.Slotted) and rop.slot_tag == A.roster_slot_tag(0)
+            ballot = A.Ballot(1, b"x")
+            # old half: the honest current roster receipts it at epoch 0 (no authz at accept)
+            old_recs = [
+                A.Receipt.issue(C.SoftwareKeypair.from_seed(node_sks[i]), rop.op_hash, 0, ballot, 1)
+                for i in (0, 1)  # a majority of 3
+            ]
+            old_qc = A.QC.assemble(old_recs, 3, {roster[i]: i for i in range(3)})
+            # new half: the attacker self-signs a 1-of-1 QC against its own declared roster
+            atk_kp = C.SoftwareKeypair.from_seed(atk_sk)
+            new_rec = A.Receipt.issue(atk_kp, rop.op_hash, 1, ballot, 1)
+            new_qc = A.QC.assemble([new_rec], 1, {atk_pub: 0})
+            self.assertTrue(old_qc.verify(roster) and new_qc.verify([atk_pub]))
+
+            with d.store.write_txn() as tx:
+                tx.put_op_raw(rop)
+                tx.put_qc(old_qc)
+                tx.put_qc(new_qc)
+            d.observe_roster_activations()
+
+            self.assertEqual(d.roster, roster)  # NOT seized
+            self.assertEqual(d.acc.epoch, 0)  # no unauthorized activation
+        finally:
+            d.close()
+
+
 class TestInprocCluster(unittest.TestCase):
     def test_real_gossip_converges_over_the_inproc_carrier(self):
         # WP-I: drive the REAL serve -> gossip_round -> apply_delta path of 3 daemons

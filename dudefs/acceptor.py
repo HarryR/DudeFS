@@ -426,16 +426,25 @@ class Acceptor:
         tag: bytes,
         ballot: Ballot,
         op: Op,
-        sync_frontier: A.Heads,
-        new_epoch: int,
+        _sync_frontier: A.Heads,
+        _new_epoch: int,
         now_ms: int,
     ) -> AcceptResult:
-        """A NEW-roster node accepting a roster op (DESIGN §13 step 4): gate on the
-        possession barrier, then accept via the ordinary slot machinery but stamp
-        the receipt `new_epoch` (e+1). That receipt is simultaneously the agreement
-        proof and the data-possession proof — the joint certificate's new half. The
-        caller (a manager, L4+) supplies `sync_frontier`/`new_epoch` decoded from the
-        op body, so the acceptor stays free of the L6 control vocabulary."""
-        if not self.holds_frontier(sync_frontier):
+        """A NEW-roster node accepting a roster op (DESIGN §13 step 4): gate on the possession
+        barrier, then accept via the ordinary slot machinery but stamp the receipt e+1. That
+        receipt is simultaneously the agreement proof and the data-possession proof — the joint
+        certificate's new half.
+
+        The acceptor trusts ONLY the signed op body (review K-2): the possession frontier and
+        the new epoch are read from `op`, NEVER the requester's wire values (`_sync_frontier`/
+        `_new_epoch`) — an empty wire frontier would otherwise make the barrier vacuous. In the
+        legit flow the manager authors the same frontier it sends, so this is transparent; it
+        only refuses a requester whose wire values disagree with the op it carries. Only a
+        RosterOp at the node's CURRENT epoch activates a new one (DESIGN §13)."""
+        if not isinstance(op, A.RosterOp):
+            return Rejected(RejectReason.BAD_STRUCTURE)  # only a roster op activates a new epoch
+        if op.from_epoch != self.epoch:
+            return Rejected(RejectReason.BAD_STRUCTURE)  # §13: receipt only when from_epoch == e
+        if not self.holds_frontier(op.sync_frontier):
             return Rejected(RejectReason.UNKNOWN_PREV)  # not caught up — PULL, then retry
-        return self.on_accept(tag, ballot, op, now_ms, receipt_epoch=new_epoch)
+        return self.on_accept(tag, ballot, op, now_ms, receipt_epoch=op.from_epoch + 1)

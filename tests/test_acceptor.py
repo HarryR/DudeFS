@@ -196,6 +196,40 @@ class TestSingleDecree(unittest.TestCase):
         assert isinstance(stale, Nack)
 
 
+class TestK2RosterAcceptGate(unittest.TestCase):
+    """Review K-2: on_roster_accept must trust ONLY the signed op body — reject a non-RosterOp,
+    and run the possession barrier on `op.sync_frontier`, never the requester's wire-supplied
+    frontier (an empty wire frontier would make the barrier vacuous). Asserts the secure
+    outcome => RED before the gate lands."""
+
+    def _acc(self):
+        return Acceptor(C.SoftwareKeypair.from_seed(bytes([200] * 32)), ChainStore(), 0, DELTA)
+
+    def test_rejects_a_non_roster_op(self):
+        w = World(seed=1, n_clients=1)
+        op, tag = _slot_op(w, 0, b"a", NOW)  # a DATA op, not a roster op
+        r = self._acc().on_roster_accept(tag, Ballot(1, b"m"), op, {}, 1, NOW)
+        self.assertIsInstance(r, Rejected)  # only a roster op may activate a new epoch
+
+    def test_barrier_uses_op_frontier_not_the_requesters(self):
+        w = World(seed=2, n_clients=1)
+        nsk = bytes([201] * 32)
+        # the op DECLARES possession of an op the node does not hold; a lying requester passes
+        # an empty wire frontier. The barrier must gate on op.sync_frontier and refuse.
+        rop = A.RosterOp.build(
+            author=C.SoftwareKeypair.from_seed(w.mgr_sk),
+            seq=0,
+            prev=A.GENESIS_PREV,
+            hlc=A.HLC(NOW, 0),
+            from_epoch=0,
+            roster=[C.SIGNER.public(nsk)],
+            sync_frontier={w.clients[0].pub: A.HeadEntry(0, bytes([9] * 32))},  # unheld op
+        )
+        assert isinstance(rop, A.Slotted)
+        r = self._acc().on_roster_accept(rop.slot_tag, A.Ballot(1, b"m"), rop, {}, 1, NOW)
+        self.assertIsInstance(r, Rejected)  # not caught up on the OP's declared frontier
+
+
 class TestC1VoidOnMissingEnvelope(unittest.TestCase):
     """Review C-1 (RC-2): on_prepare's void rule fires on `acc is None` (envelope absent) as
     well as below-horizon. But envelope absence is a FETCH problem, not amnesia — a GC path

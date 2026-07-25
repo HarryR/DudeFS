@@ -935,6 +935,10 @@ class RosterOp(ControlOp, Slotted):
         # without adding tolerance, so they are malformed.
         if len(roster) == 0 or len(roster) % 2 == 0:
             raise codec.CodecError("roster must have an odd, non-zero voting-member count")
+        # members must be UNIQUE (review K-12b): a repeated key would occupy several QC bitmap
+        # indices and satisfy `QC.verify`'s majority alone — the cheapest route to K-1's new half.
+        if len(set(roster)) != len(roster):
+            raise codec.CodecError("roster members must be unique")
         rec = body.get(b"recovery")  # present => the fiat recovery trigger (root-only)
         return cls(
             **cls._kwargs(env, raw),

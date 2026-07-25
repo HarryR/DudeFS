@@ -19,11 +19,13 @@ from . import crypto, gossip, lmsg, transports, tunables, wire
 from .acceptor import Acceptor, Rejected, RejectReason
 from .artifacts import (
     Cap,
+    ControlKind,
     Op,
     RosterOp,
     Watermark,
     covered,
     quorum_size,
+    roster_slot_tag,
 )
 from .checkpoint import CheckpointView
 from .fold import ControlReducer, ControlState, endpoints_of
@@ -384,12 +386,30 @@ class NodeDaemon:
         e = self.acc.epoch
         with self.store.read_txn() as tx:
             qcs = {(qc.op_hash, qc.config_epoch): qc for qc in tx.all_qcs()}
+            all_ops = tx.all_ops()
             cands = [
                 op
-                for op in tx.all_ops()
+                for op in all_ops
                 if isinstance(op, RosterOp) and op.recovery is None and op.from_epoch == e
             ]
+            # authorization state at this position — the roster path's missing rigor (review
+            # K-1/RC-3). The daemon (L4+) owns the control vocabulary, so the authz gate lives
+            # here, not in the L3 acceptor. Built like CheckpointView.of's reducer.
+            authz = ControlReducer(self.manager_pub, e)
+            for op in sorted(all_ops, key=lambda o: (o.hlc.as_tuple(), o.op_hash)):
+                if op.is_control:
+                    authz.observe(op)
         for op in cands:
+            # Mirror the checkpoint adopt predicates (minter_authorized / slot_bound): never seat
+            # a roster whose author did not hold MANAGE_ROSTER at this position (K-1), that does
+            # not sit on the slot its from_epoch binds (F-5 / B4), or whose members are not unique
+            # (K-12b: a repeated key would fill a majority of bitmap slots and self-ratify alone).
+            if not authz.control.can_author_control(op.author, ControlKind.ROSTER):
+                continue  # unauthorized minter — the DESIGN §15 escalation guard
+            if op.slot_tag != roster_slot_tag(op.from_epoch):
+                continue  # the declared from_epoch must bind the slot actually won (B4)
+            if len(set(op.roster)) != len(op.roster):
+                continue  # duplicate members -> the new-half QC is satisfiable by one key
             old_qc, new_qc = qcs.get((op.op_hash, e)), qcs.get((op.op_hash, e + 1))
             if old_qc is None or new_qc is None:
                 continue  # incomplete joint cert for THIS candidate
