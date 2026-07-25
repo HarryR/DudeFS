@@ -1,13 +1,16 @@
 # M2.5 — regression tests for the post-M2 review resolutions (NOTES §M2.5).
 # Each test names the finding it pins down; the doc reference is the rule.
 
+import pathlib
 import random
+import subprocess
+import sys
 import unittest
 from functools import partial
 
 from dudefs import artifacts as A
+from dudefs import codec, fold, wire
 from dudefs import crypto as C
-from dudefs import fold
 from dudefs.acceptor import Acceptor, Rejected, RejectReason
 from dudefs.artifacts import HLC, Ballot
 from dudefs.store import ChainStore
@@ -94,6 +97,66 @@ class TestControlBodyValidation(unittest.TestCase):
         r = fold.fold(ops, w.keyring, w.genesis)
         self.assertEqual(r.verdicts[bad.op_hash], fold.Verdict.INVALID)
         self.assertIsNone(r.control.roster)
+
+
+_REPO = pathlib.Path(__file__).resolve().parent.parent
+
+
+class TestRC4CrashOnly(unittest.TestCase):
+    """Review RC-4, per the ruling: routine, knowingly-recoverable conditions return typed
+    results; everything else is THROWN, kills the thread, and must take the PROCESS with it so a
+    supervisor respawns it and the cause is on the record. Broad `except Exception` at a loop top
+    would be the bug, not the cure — a silently half-dead daemon (no gossip, no adoption, no
+    evidence, `status()` fine) is strictly worse than a dead one.
+
+    The two halves are ordered, and the order is load-bearing: hostile input must FIRST be a
+    typed, expected outcome, or "crash on anything unexpected" hands any unauthenticated peer a
+    remote kill switch."""
+
+    def test_hostile_bencode_is_a_typed_CodecError_not_an_untyped_crash(self):
+        # each of these used to escape the DudeFSError tree entirely (review K-9): a
+        # RecursionError or a bare ValueError from int(), pre-authentication.
+        for name, blob in [
+            ("over-deep nesting", b"l" * 2000 + b"e" * 2000),
+            ("oversized int literal", b"i" + b"9" * 5000 + b"e"),
+            ("oversized length prefix", b"9" * 5000 + b":"),
+        ]:
+            with self.subTest(name), self.assertRaises(codec.CodecError):
+                codec.decode(blob)
+
+    def test_truncated_wire_requests_are_typed_not_IndexError(self):
+        # IndexError is NOT in the DudeFSError tree, so `daemon.serve` never caught it and the
+        # serving thread died on a malformed frame (review IO-11).
+        for name, body in [
+            ("accept missing fields", [b"accept"]),
+            ("getqc missing op_hash", [b"getqc"]),
+            ("empty body", []),
+            ("unknown verb", [b"nope"]),
+        ]:
+            with self.subTest(name), self.assertRaises(codec.CodecError):
+                wire.decode_request(codec.encode(body))
+
+    def test_an_uncaught_thread_exception_kills_the_process(self):
+        # the half that Python gets backwards by default: a `daemon=True` loop thread dies and
+        # the process serves on, silently degraded. Run out-of-process — the whole point is
+        # os._exit, which we cannot assert from inside.
+        prog = "\n".join(
+            [
+                "import threading, logging, sys",
+                f"sys.path.insert(0, {str(_REPO)!r})",
+                "from dudefs import crashonly",
+                "crashonly.configure_logging(logging.CRITICAL)",
+                "crashonly.install()",
+                "def boom(): raise RuntimeError('a genuine bug, not hostile input')",
+                "threading.Thread(target=boom, name='maintenance', daemon=True).start()",
+                "threading.Event().wait(5)",
+                "print('STILL ALIVE')",
+            ]
+        )
+        r = subprocess.run([sys.executable, "-c", prog], capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 70)  # EX_SOFTWARE, not a quiet 0
+        self.assertNotIn("STILL ALIVE", r.stdout)  # never reached the wait
+        self.assertIn("RuntimeError", r.stderr)  # ...and the cause is on the record
 
 
 class TestA4WindowRegression(unittest.TestCase):

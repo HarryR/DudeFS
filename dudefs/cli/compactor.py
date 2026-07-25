@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 import os
 
+from .. import crashonly
 from .. import crypto as C
 from ..compactor_daemon import CompactorDaemon
 from ..manager import mint_identity
@@ -54,6 +55,8 @@ def cmd_once(args: argparse.Namespace) -> int:
 
 def cmd_run(args: argparse.Namespace) -> int:
     comp = _daemon(args)
+    crashonly.configure_logging()
+    crashonly.install()  # RC-4: crash the PROCESS, not just a thread
     print(f"compactor {comp.key.public.hex()[:16]}… running (interval {args.interval}s)")
     try:
         comp.run(args.interval)

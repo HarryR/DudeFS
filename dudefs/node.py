@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from .acceptor import Acceptor, AcceptResult, PrepareResult, SubmitResult
-from .artifacts import QC, Ballot, FrontierBundle, Heads, Op, Watermark
+from .artifacts import QC, Ballot, FrontierBundle, Heads, Op, Receipt, Watermark
 
 # --------------------------------------------------------------------------- #
 # Request vocabulary — the PROTOCOL §1.1 verbs, as data the client sends.      #
@@ -81,6 +81,21 @@ class PutQCReq:
     qc: QC
 
 
+@dataclass(frozen=True)
+class RereceiptReq:
+    """RERECEIPT (PROTOCOL §1.1) — re-issue a receipt for an op this node ALREADY accepted,
+    stamped with the node's CURRENT epoch. `target` is a slot_tag (re-receipt its accepted op
+    at its accepted ballot) or a blind op_hash.
+
+    Its own verb because the epoch differs: the acceptance seq is reused (so it is NOT a new
+    issuance and cannot be back-stamp evidence), but the stamp is fresh, which is what lets a
+    client assemble a single-epoch QC for an op that was in flight across a roster change
+    (DESIGN §13). PROTOCOL §0 promises "retry anything, verbatim" — without this verb on the
+    wire that promise had no cross-epoch path (review C-3)."""
+
+    target: bytes
+
+
 type Request = (
     SubmitReq
     | PrepareReq
@@ -91,6 +106,7 @@ type Request = (
     | FetchOpReq
     | GetQCReq
     | PutQCReq
+    | RereceiptReq
 )
 
 # The result of serving a request — the union of every verb's return type.
@@ -116,6 +132,7 @@ class NodeAPI(Protocol):
     def watermark(self) -> Watermark: ...
     def fetch_op(self, op_hash: bytes) -> Op | None: ...
     def get_qc(self, op_hash: bytes) -> QC | None: ...
+    def rereceipt(self, target: bytes) -> Receipt | None: ...
     def put_qc(self, qc: QC) -> None: ...
 
 
@@ -142,6 +159,8 @@ def dispatch(node: NodeAPI, req: Request) -> Response:
         case PutQCReq(qc):
             node.put_qc(qc)
             return None
+        case RereceiptReq(target):
+            return node.rereceipt(target)
 
 
 # --------------------------------------------------------------------------- #
@@ -188,3 +207,6 @@ class LocalNode:
     def put_qc(self, qc: QC) -> None:
         with self.acc.store.write_txn() as tx:
             tx.put_qc(qc)
+
+    def rereceipt(self, target: bytes) -> Receipt | None:
+        return self.acc.on_rereceipt(target)

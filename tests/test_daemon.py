@@ -8,6 +8,7 @@ import tempfile
 import threading
 import time
 import unittest
+from functools import partial
 
 from dudefs import artifacts as A
 from dudefs import crypto as C
@@ -87,6 +88,64 @@ class TestK1RosterEscalation(unittest.TestCase):
             self.assertEqual(d.acc.epoch, 0)  # no unauthorized activation
         finally:
             d.close()
+
+
+class TestIO2RosterSurvivesRestart(unittest.TestCase):
+    """Review IO-2 (HIGH): the daemon reloaded its durable EPOCH from the DB but took its
+    ROSTER from bootstrap.json, advancing it only IN MEMORY. So a restart after any roster
+    change left an epoch-N node verifying epoch-N QCs against the epoch-0 roster — `qc_final`
+    fails, `select()` returns None forever, the horizon never advances, compaction never GCs,
+    and `_activate_one` can never follow another change. Silently: the node keeps serving and
+    `status()` shows nothing wrong.
+
+    Also CLI.md §7, which is normative: "Only `manager_pub` is trusted … the seed carries peer
+    ADDRESSES, not roster IDENTITY (which is trust-derived, not seeded)."
+
+    Restarts a REAL file-backed daemon with the stale seed, as production does."""
+
+    def test_restart_reseats_the_roster_for_the_durable_epoch(self):
+        w = World(seed=77, n_clients=1)
+        seed_roster = [C.SIGNER.public(bytes([200 + i] * 32)) for i in range(3)]
+        grown = [
+            *seed_roster,
+            C.SIGNER.public(bytes([210] * 32)),
+            C.SIGNER.public(bytes([211] * 32)),
+        ]
+        rop = w._mgr_op(  # a REAL manager-authored roster op (authorized => counted)
+            partial(A.RosterOp.build, from_epoch=0, roster=grown, sync_frontier={})
+        )
+
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "node.db")
+            d1 = NodeDaemon(
+                C.SoftwareKeypair.from_seed(bytes([200] * 32)),
+                path,
+                roster=seed_roster,
+                manager_pub=w.mgr_pub,
+                control_ops=[*w.control_ops, rop],
+                clock=lambda: 100,
+                delta_ms=BIG,
+            )
+            d1.acc.activate_epoch(1)  # the change activates; epoch is DURABLE
+            d1.close()
+
+            # restart with the SAME stale seed bootstrap.json would still carry
+            d2 = NodeDaemon(
+                C.SoftwareKeypair.from_seed(bytes([200] * 32)),
+                path,
+                roster=seed_roster,  # stale hint
+                manager_pub=w.mgr_pub,
+                control_ops=[],
+                clock=lambda: 100,
+                delta_ms=BIG,
+            )
+            try:
+                self.assertEqual(d2.acc.epoch, 1)  # epoch survived (finding 20)
+                # ...and so must the roster it is meant to verify epoch-1 QCs against
+                self.assertEqual(d2.roster, grown)
+                self.assertEqual(d2.quorum, A.quorum_size(len(grown)))
+            finally:
+                d2.close()
 
 
 class TestInprocCluster(unittest.TestCase):

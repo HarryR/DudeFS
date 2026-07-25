@@ -161,16 +161,29 @@ def field(d: Bencodable, key: bytes) -> Bencodable:
     return dd[key]
 
 
-def _decode_at(data: bytes, pos: int) -> tuple[Bencodable, int]:
+# Adversarial-input bounds. Both exist so a hostile frame is a TYPED, expected outcome at the
+# decode boundary rather than an untyped crash in a serving thread (review K-9). Generous
+# enough that no legitimate artifact approaches them.
+_MAX_DEPTH = 64
+_MAX_INT_DIGITS = 4096
+
+
+def _decode_at(data: bytes, pos: int, depth: int = 0) -> tuple[Bencodable, int]:
     if pos >= len(data):
         raise CodecError("unexpected end of input")
+    # Hostile input is EXPECTED input at this boundary (attackers send garbage), so it must
+    # surface as a typed CodecError the caller can handle — never a bare RecursionError, which
+    # is outside the DudeFSError tree and would crash a serving thread. `b"l" * 10**6` from an
+    # UNAUTHENTICATED peer used to do exactly that, before any signature check (review K-9).
+    if depth > _MAX_DEPTH:
+        raise CodecError(f"nesting deeper than {_MAX_DEPTH}")
     tag = data[pos]
     if tag == 0x69:  # 'i'
         return _decode_int(data, pos)
     if tag == 0x6C:  # 'l'
-        return _decode_list(data, pos)
+        return _decode_list(data, pos, depth)
     if tag == 0x64:  # 'd'
-        return _decode_dict(data, pos)
+        return _decode_dict(data, pos, depth)
     if 0x30 <= tag <= 0x39:  # digit -> byte string
         return _decode_bytes(data, pos)
     raise CodecError(f"invalid type tag {tag!r} at offset {pos}")
@@ -202,6 +215,10 @@ def _read_int_token(
         raise CodecError("non-canonical integer (negative zero)")
     if pos >= len(data) or data[pos] != terminator:
         raise CodecError("missing integer terminator")
+    # CPython refuses int() above ~4300 digits with a bare ValueError — typed here, for the
+    # same reason as the depth cap: a hostile literal is expected input, not a crash (K-9).
+    if len(digits) > _MAX_INT_DIGITS:
+        raise CodecError(f"integer literal longer than {_MAX_INT_DIGITS} digits")
     n = int(digits)
     if neg:
         n = -n
@@ -223,7 +240,7 @@ def _decode_bytes(data: bytes, pos: int) -> tuple[bytes, int]:
     return data[start:end], end
 
 
-def _decode_list(data: bytes, pos: int) -> tuple[tuple[Bencodable, ...], int]:
+def _decode_list(data: bytes, pos: int, depth: int = 0) -> tuple[tuple[Bencodable, ...], int]:
     # data[pos] == 'l' — decoded as an immutable tuple (see Bencodable).
     pos += 1
     items: list[Bencodable] = []
@@ -232,11 +249,11 @@ def _decode_list(data: bytes, pos: int) -> tuple[tuple[Bencodable, ...], int]:
             raise CodecError("unterminated list")
         if data[pos] == 0x65:  # 'e'
             return tuple(items), pos + 1
-        item, pos = _decode_at(data, pos)
+        item, pos = _decode_at(data, pos, depth + 1)
         items.append(item)
 
 
-def _decode_dict(data: bytes, pos: int) -> tuple[dict[bytes, Bencodable], int]:
+def _decode_dict(data: bytes, pos: int, depth: int = 0) -> tuple[dict[bytes, Bencodable], int]:
     # data[pos] == 'd'
     pos += 1
     result: dict[bytes, Bencodable] = {}

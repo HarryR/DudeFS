@@ -9,6 +9,7 @@ import argparse
 import contextlib
 import os
 
+from .. import crashonly
 from .. import crypto as C
 from ..client import ClientDaemon
 from ..manager import mint_identity
@@ -46,6 +47,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
     sock = args.sock or os.path.join(args.dir, "worker.sock")
     with contextlib.suppress(FileNotFoundError):
         os.unlink(sock)  # clear a stale socket from a previous run
+    crashonly.configure_logging()
+    crashonly.install()  # RC-4: an uncaught exception kills the PROCESS, not just a thread
     ws = WorkerServer(cd)
     print(f"client {cd.key.public.hex()[:16]}… worker socket {sock} (epoch {b.epoch})")
     try:

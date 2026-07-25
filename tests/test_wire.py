@@ -63,6 +63,7 @@ class TestRequestCodec(unittest.TestCase):
             N.FetchOpReq(op.op_hash),
             N.GetQCReq(op.op_hash),
             N.PutQCReq(_qc(w, op)),
+            N.RereceiptReq(op.slot_tag),  # C-3: the §1.1 verb now EXISTS on the wire
         ]
         for req in reqs:
             msg = wire.read_frame(_bytesource(wire.frame(wire.encode_request(req))))

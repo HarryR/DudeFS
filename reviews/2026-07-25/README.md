@@ -54,6 +54,21 @@ Nothing in here was accepted on plausibility alone; each reviewer was instructed
 check whether another code path already prevents the issue before reporting it, and
 several candidate findings were dropped that way.
 
+## Current state (updated 2026-07-26)
+
+Five fix waves have landed since the review. **Closed:** K-1, K-2, K-12b, F-5, FIX-6, C-1,
+K-8, K-13, F-1, F-2's reported half, K-5's compactor inheritance, C-3, IO-2, D-1, K-9, IO-11,
+IO-3. Root causes **RC-2** and **RC-3** are closed; **RC-1** is mostly closed (K-3/K-4 remain);
+**RC-4** was *superseded* — its stated fix was wrong for this project and the crash-only ruling
+replaced it.
+
+**Still open and worth reading first:** `C-2b` (the re-drive deadlock — an intentional RED
+repro, held out of tree in [FIX-REVIEW.md](FIX-REVIEW.md)), **IO-4/K-7** (no frame-size cap,
+pre-auth), **K-3**/**K-4**/**K-5** (unverified store writes), **IO-1**/**IO-5** (finality
+frontier + bootstrap barrier), **IO-12** (HTTP carrier), and the **D-C** Promise-demotion
+retake — whose demote-vs-promote argument shifted once D-A closed K-5, so it wants re-deciding
+rather than inheriting.
+
 ## Headline verdict
 
 The protocol implementation is careful, and the parts that were hardest to get right

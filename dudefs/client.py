@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import logging
 import queue
 import threading
 import time
@@ -46,6 +47,8 @@ from .store import ChainStore, ReadTxn, StoreClosed
 # no-quorum-reachable wall-clock backstop (the sans-io machine gives up earlier via
 # max_rounds/max_polls); BLIND_DEADLINE_MS the idempotent blind-SUBMIT retransmit
 # budget; REFRESH_MS the background read-side sync cadence.
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -555,8 +558,11 @@ class ClientDaemon:
             try:
                 self.refresh_addrs()  # pick up ENDPOINT records for the roster
                 self.sync()
-            except OSError:
-                pass  # a transient unreachability; the next tick retries
+            except OSError as e:
+                # KNOWINGLY recoverable (RC-4): a peer being unreachable is routine, so it is
+                # caught and retried — but it is recorded, so "quiet" never means "invisible".
+                # Anything NOT in this class is deliberately left to crash the process.
+                log.debug("refresh tick: peer unreachable (%s); retrying next tick", e)
 
     # ---- the folded read model (STATUS/GET/LIST/INSPECT derive from here) --- #
     # Every read helper takes the caller's `tx` (one snapshot per public read) rather

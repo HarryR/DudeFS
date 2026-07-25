@@ -8,6 +8,14 @@ This is the recommended work-plan ordering.
 
 ## RC-1 — "An artifact I hold is an artifact the quorum committed"
 
+> **Status: MOSTLY CLOSED** (wave 3, `DIRECTIONS.md` D-A). `dudefs/committed.py`'s `CommittedSet`
+> is the verifying boundary, wired into `client._committed_ops`, `CompactorView.of` and
+> `PrevState.of`. **Correction:** this cluster OVER-COLLECTED — `_bootstrap_barrier` and
+> `gossip.Summary.of` operate below the cut, where per-op QCs are GC'd by design and the vouch
+> is `state_acc`; gating them would be wrong (it would wedge §13 possession comparison). Still
+> open in the cluster: **K-3** (serve-from-store receipts) and **K-4** (`put_op_raw` fork
+> poisoning). RC-1 applies ABOVE the cut.
+
 **The largest cluster.** The store's write path is *deliberately* unverified —
 `put_op_raw`, `put_receipt`, `put_qc` all store whatever arrives, on the stated theory
 that consumption verifies. `checkpoint.qc_final` even documents it: *"put_qc stores
@@ -51,6 +59,10 @@ That converts this whole cluster into a type error.
 
 ## RC-2 — The horizon is supposed to be the sole GC authority for slot state
 
+> **Status: CLOSED** (wave 2, FIX-1). The first attempt made the predicate PARTIAL and
+> re-opened the NOTES 27 livelock; `slot_state.accepted_wall/accepted_ctr` made it TOTAL, so
+> the void rule never consults the envelope and there is no undefined case to answer wrongly.
+
 DESIGN §8 authorizes exactly one condition for voiding slot state — the accepted op's
 `hlc` below the checkpoint horizon — and states the reason explicitly: *"GC-on-successor-commit
 alone would be unsound: after every node forgets, a late contender could win a second QC
@@ -72,6 +84,10 @@ for any other path that deletes from `ops` without advancing the horizon.
 ---
 
 ## RC-3 — The roster/epoch path never received the checkpoint path's rigor
+
+> **Status: CLOSED** (wave 1 `b0fd1d7` for K-1/K-2/K-12b/F-5; wave 4 for **IO-2**, the roster
+> being seeded rather than trust-derived). **RC-6** (the acceptor is denied requester identity)
+> remains open and is the same layering cause one level down.
 
 The checkpoint adopt path is genuinely well-built: `slot_bound` (declared seq must bind
 the slot actually won), `minter_authorized` (author held the capability at this
@@ -115,6 +131,37 @@ removes a subsystem for the process lifetime while the node keeps answering RPCs
 Related and same-flavored: the **unbounded inputs at the two places bytes first arrive**
 — `wire.read_frame` trusts a 4-byte length up to 4 GiB with no cap (pre-auth), and the
 HTTP carrier's `resp.read()` is unbounded.
+
+> ### ⚠️ SUPERSEDED — the fix direction below is WRONG for this project.
+>
+> **Ruling (Harry, 2026-07-26): crash-only.** Conditions we can *knowingly* recover from as
+> part of routine operation are caught and returned as typed results. **Everything else is
+> thrown** — the thread should die, the daemon should die with it, and the cause should be
+> logged. Respawning a supervised process and reading what killed it beats trying to handle
+> every case in-line. So `except Exception` at a loop top is the **bug**, not the cure: it
+> converts a silent thread death into a silent infinite retry.
+>
+> The real defect this root cause was pointing at is therefore two things, in this order:
+>
+> 1. **Adversarial input must be a TYPED, EXPECTED outcome**, not an untyped crash — "normal
+>    stuff returns a normal result, even adversarial parsing errors, carrying the underlying
+>    error so the type checker can handle it". That is K-9 (`codec` raising `RecursionError` /
+>    bare `ValueError`) and IO-11 (arity-free indexing raising `IndexError`, which is outside
+>    the `DudeFSError` tree and so was never caught by `daemon.serve`).
+> 2. **A genuine bug must kill the PROCESS**, not just a thread. Every long-lived loop runs on
+>    a `daemon=True` thread, so an uncaught exception killed only that thread while the process
+>    kept serving — silently missing gossip, adoption, activation, fences and evidence, with
+>    `status()` showing nothing wrong. A silently half-dead daemon is strictly worse than a
+>    dead one.
+>
+> **The order is load-bearing.** Crash-only without (1) would hand any unauthenticated peer a
+> remote kill switch — one malformed frame would take the node down. Typed parsing first.
+>
+> Logging: per-module `logging.getLogger(__name__)`, configured only at the CLI entry point,
+> so `dudefs.*` slots into standard Python logging and a library embedder keeps control.
+>
+> **Landed in wave 5** — see [FIXED.md](FIXED.md). The original text is kept below for the
+> record.
 
 **Fix direction:** three separate mechanical changes, each cheap —
 (a) a frame-size cap + socket timeouts at both byte-entry points;

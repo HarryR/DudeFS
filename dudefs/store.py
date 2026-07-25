@@ -786,6 +786,53 @@ class WriteTxn(ReadTxn):
         can never regress F."""
         if horizon > self.get_horizon():
             self.set_meta("horizon", codec.encode(list(horizon.encode())))
+            self._prune_slots(horizon)
+
+    def _prune_slots(self, horizon: HLC) -> None:
+        """Drop slot rows the §8 void rule would void anyway (review D-1).
+
+        `slot_state` was the one genuinely UNBOUNDED durable structure in the system: nothing
+        ever deleted from it, the void rule only NULLed the accepted fields, and every CAS
+        attempt mints a fresh tag (`Slot(key, version, attempt)`) — so it grew ~linearly in
+        total writes forever, on every node, in a system whose §12 GC exists to bound storage.
+
+        A slot whose accepted op is below the horizon is already semantically dead, so the ROW
+        can go rather than be blanked: growth collapses to O(live contended slots). Deleting it
+        resets `promised` to BLIND for that tag, which is exactly what the reborn-tag rule
+        already sanctions there — and `on_accept`'s BELOW_HORIZON guard still refuses the
+        ancient op, so only a genuinely fresh op can win the reborn tag.
+
+        TWO conditions, and the second is not optional. A below-horizon slot whose op is STILL
+        HELD must keep its row, because `on_accept`'s same-op exemption and `on_rereceipt` both
+        read `accepted_op`/`accepted_ballot` from it to serve the stored receipt — dropping it
+        would silently break PROTOCOL §0 idempotence and the §13 cross-epoch RERECEIPT (there
+        is a test for exactly that). So the row dies only once its op has been GC'd, i.e. when
+        there is nothing left to serve: `gc_checkpoint` drops the op AND its receipts together,
+        so past that point the row is pure dead weight.
+
+        This is what makes it bounded rather than merely smaller: the unbounded population was
+        slot LOSERS and superseded ops — one per CAS attempt — and those are exactly what lands
+        in `dead` and gets GC'd. Retained winners keep their rows, which is O(live keys).
+
+        Note the envelope check here is a STORAGE decision, never a safety one — the horizon
+        already decided the slot is dead (C-1's lesson was that absence must not stand in for
+        the below-horizon test; here it is an AND, not a substitute).
+
+        Rows with NO accept (a PREPARE that never landed) are KEPT: their `promised` still
+        governs a live contention and there is no hlc to place them against the horizon.
+
+        Runs only on a real horizon ADVANCE, driven by the horizon itself rather than by a
+        caller's `dead` list — `gc_checkpoint` has two callers with opposite semantics (the
+        adopt branch is below-horizon; the `overfull_drop` branch is NOT and does not advance
+        the horizon at all — that asymmetry is what caused C-1), so this must not live there.
+        Indexed on `accepted_wall`, which is only expressible because FIX-1 stored the hlc as
+        native INTEGER columns rather than an encoded BLOB."""
+        self._c.execute(
+            "DELETE FROM slot_state WHERE accepted_wall IS NOT NULL"
+            " AND (accepted_wall < ? OR (accepted_wall = ? AND accepted_ctr < ?))"
+            " AND accepted_op NOT IN (SELECT op_hash FROM ops)",
+            (horizon.wall_ms, horizon.wall_ms, horizon.counter),
+        )
 
     def set_epoch(self, epoch: int) -> None:
         """Persist the config epoch (single-writer: `Acceptor.activate_epoch` is its

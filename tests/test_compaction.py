@@ -234,6 +234,76 @@ class TestF2RetainedExcludesDead(unittest.TestCase):
         self.assertIn(winner.op_hash, held)  # the true winner is retained
 
 
+class TestD1SlotStatePruned(unittest.TestCase):
+    """Review D-1: `slot_state` was the one genuinely UNBOUNDED durable structure — nothing
+    ever deleted from it, the void rule only NULLed the accepted fields, and every CAS attempt
+    mints a fresh tag, so it grew ~linearly in TOTAL WRITES forever, on every node, in a system
+    whose §12 GC exists to bound storage and which advertises "kilobytes of state".
+
+    A below-horizon slot is already semantically void, so the row goes when the horizon passes
+    it. Rows with no accept are kept (their `promised` still governs a live contention)."""
+
+    def _accepted_slot(self, w, acc, val, hlc_ms):
+        op = w.cas(
+            0, b"k", A.VERSION_ABSENT, 0, [[A.Guard.ABSENT, b"k"]], [[A.Mutation.SET, b"k", val]]
+        )
+        assert isinstance(op, A.Slotted)
+        r = acc.on_accept(op.slot_tag, A.Ballot(1, b"x"), op, hlc_ms)
+        assert isinstance(r, A.Receipt)
+        return op
+
+    def test_advancing_the_horizon_drops_below_horizon_slot_rows(self):
+        w = World(seed=91, n_clients=1)
+        acc = Acceptor(
+            crypto.SoftwareKeypair.from_seed(bytes([203] * 32)), ChainStore(), 0, 1_000_000
+        )
+        op = self._accepted_slot(w, acc, b"v", 10_000)
+
+        def rows():
+            with acc.store.read_txn() as tx:
+                return tx._c.execute("SELECT COUNT(*) FROM slot_state").fetchone()[0]
+
+        self.assertEqual(rows(), 1)
+        # horizons derived from the op's OWN hlc — the World's clock is not wall-clock
+        acc.advance_horizon(A.HLC(op.hlc.wall_ms - 1, 0))  # below the accept -> nothing to drop
+        self.assertEqual(rows(), 1)
+        with acc.store.read_txn() as tx:
+            self.assertEqual(tx.get_slot(op.slot_tag).accepted_op, op.op_hash)
+
+        # past the horizon but STILL HELD: the row must survive, because on_accept's same-op
+        # exemption and on_rereceipt serve the stored receipt out of it (PROTOCOL §0).
+        acc.advance_horizon(A.HLC(op.hlc.wall_ms + 1, 0))
+        self.assertEqual(rows(), 1)
+        r = acc.on_accept(op.slot_tag, A.Ballot(1, b"x"), op, 10_000)
+        self.assertIsInstance(r, A.Receipt)  # still served
+
+        # ...and once the op is GC'd there is nothing left to serve -> dead weight, dropped
+        with acc.store.write_txn() as tx:
+            tx.gc_checkpoint([op.op_hash])
+        acc.advance_horizon(A.HLC(op.hlc.wall_ms + 2, 0))
+        self.assertEqual(rows(), 0)
+        # and the slot reads as FRESH, which is exactly what the void rule already decreed
+        with acc.store.read_txn() as tx:
+            self.assertIsNone(tx.get_slot(op.slot_tag).accepted_op)
+
+    def test_a_promised_but_unaccepted_slot_is_kept(self):
+        w = World(seed=92, n_clients=1)
+        acc = Acceptor(
+            crypto.SoftwareKeypair.from_seed(bytes([204] * 32)), ChainStore(), 0, 1_000_000
+        )
+        op = w.cas(
+            0, b"k", A.VERSION_ABSENT, 0, [[A.Guard.ABSENT, b"k"]], [[A.Mutation.SET, b"k", b"v"]]
+        )
+        assert isinstance(op, A.Slotted)
+        b = A.Ballot(5, b"x")
+        self.assertIsInstance(acc.on_prepare(op.slot_tag, b), A.Promise)  # promise, no accept
+
+        acc.advance_horizon(A.HLC(999_999, 0))
+        with acc.store.read_txn() as tx:
+            # `promised` still governs a live contention and has no hlc to judge -> KEEP
+            self.assertEqual(tx.get_slot(op.slot_tag).promised, b)
+
+
 class TestAttemptsSidecar(unittest.TestCase):
     """WP-A: the attempts sidecar seals into a real checkpoint op's `attempts` field and
     unseals on bootstrap — the PRODUCTION wire path, not a cleartext dict handed in. A

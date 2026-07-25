@@ -72,6 +72,50 @@ tautology class this review flagged (A-15/A-16). Construction beat enumeration, 
 
 Gate after wave 3: **ruff + format + `ty` clean; 365 tests, 1 failure** — `C-2b`, intentional.
 
+## Wave 4 — C-3, IO-2, D-1 (uncommitted)
+
+| Finding | Status | Fix | Regression test |
+|---|---|---|---|
+| **C-3** | ✅ FIXED | `RERECEIPT` reached the wire: `RereceiptReq` in the `Request` union, a `NodeAPI` method, `LocalNode` impl, `dispatch` arm, and a `wire` tag. PROTOCOL §1.1 listed a verb the cluster could not speak; §0's "retry anything, verbatim" had no cross-epoch path. Note the `NodeAPI` Protocol immediately caught a test double missing the method — the seam doing its job. | `TestC3RereceiptIsReachable` — drives encode → decode → dispatch → LocalNode → acceptor (the production path, not `on_rereceipt` directly), asserts re-stamping at the CURRENT epoch and that the ACCEPTANCE `issue_seq` is REUSED (so a re-issue can never read as SEQ_REUSE back-stamping). Plus a clean `None` for an unknown target. |
+| **IO-2** | ✅ FIXED | `NodeDaemon._reseat_roster`: the seed roster becomes the genesis ANCHOR and the standing roster is derived from the held control chain via `fold.rosters_by_epoch` at the daemon's DURABLE epoch. Restores CLI.md §7 ("the seed carries peer ADDRESSES, not roster IDENTITY"). | `TestIO2RosterSurvivesRestart` — a REAL file-backed daemon activated to epoch 1, then restarted with the stale seed. **Negative control verified**: fails with `_reseat_roster()` removed, passes with it. |
+| **D-1** | ✅ FIXED | `store._prune_slots`, driven from `advance_horizon` — *not* `gc_checkpoint`, whose two callers have opposite semantics (the `overfull_drop` branch does not advance the horizon at all; that asymmetry caused C-1). Expressible as an indexed `DELETE` only because FIX-1 stored the hlc as native `INTEGER`. | `TestD1SlotStatePruned` ×2 — below-horizon-but-held survives and still serves; below-horizon-AND-GC'd is dropped; a promised-but-unaccepted row is kept. |
+
+### D-1 needed a second condition, and an existing test found it
+
+The first cut pruned on `below horizon` alone and broke
+`TestReceiptFloorBackstop.test_idempotent_reaccept_below_horizon_is_still_served`: `on_accept`'s
+same-op exemption **and** `on_rereceipt` both read `accepted_op`/`accepted_ballot` out of the
+slot row to serve the stored receipt, so dropping it silently breaks PROTOCOL §0 idempotence and
+the §13 cross-epoch RERECEIPT — the very guarantee C-3 had just restored, two fixes apart.
+
+The rule is therefore **below-horizon AND its op already GC'd**: the row dies only when there is
+nothing left to serve (`gc_checkpoint` drops the op and its receipts together). Still bounded —
+the unbounded population was slot losers and superseded ops, one per CAS attempt, which are
+exactly what lands in `dead`. Retained winners keep their rows, which is O(live keys).
+
+The envelope check here is a **storage** decision, never a safety one: the horizon has already
+decided the slot is dead, so absence is an AND, not a substitute for the below-horizon test.
+That distinction is C-1's lesson applied rather than repeated.
+
+## Wave 5 — RC-4, reframed as crash-only (uncommitted)
+
+The review's own prescription for RC-4 (`except Exception` at each loop top) was **wrong for
+this project** and is marked superseded in [ROOT-CAUSES.md](ROOT-CAUSES.md). Under the
+crash-only ruling, broad catching is the bug. Two halves, in a load-bearing order:
+
+| Part | What landed | Test |
+|---|---|---|
+| **1. Typed adversarial input** (K-9, IO-11) | `codec` gained `_MAX_DEPTH` (64) and `_MAX_INT_DIGITS` (4096), so over-deep nesting and oversized literals raise `CodecError` instead of `RecursionError`/bare `ValueError` — both previously escaped the `DudeFSError` tree pre-authentication. `wire.decode_request` now re-reads every arm with an expected arity (`as_seq(v, n)`), so a truncated frame is a typed `CodecError` that `daemon.serve` already renders as carrier silence, not an `IndexError` that killed the serving thread. | `TestRC4CrashOnly` ×2 — three hostile bencode shapes, four malformed request shapes. |
+| **2. Crash-only** (IO-3) | New `dudefs/crashonly.py`: `install()` points `threading.excepthook` and `sys.excepthook` at a handler that logs the traceback at CRITICAL and `os._exit(70)`s. Called from the three `serve` entry points (`cli/node`, `cli/client`, `cli/compactor`) — never on import, so a library embedder is unaffected. `os._exit` rather than `sys.exit` because a non-main thread's `SystemExit` unwinds only that thread, which is the exact failure being fixed. | `TestRC4CrashOnly` — runs out-of-process (the point *is* `os._exit`), asserts exit code **70**, that "STILL ALIVE" was never printed, and that `RuntimeError` reached stderr. |
+
+Logging is per-module `logging.getLogger(__name__)`, configured **only** at the CLI entry
+point via `crashonly.configure_logging()` — so `dudefs.*` slots into standard Python logging
+and an embedder keeps control of handlers. The one knowingly-recoverable swallow in
+`client._refresh_loop` now logs its cause at DEBUG instead of `pass`-ing silently: quiet, but
+never invisible.
+
+Gate after wave 5: **ruff + format + `ty` clean; 373 tests, 1 failure** — `C-2b`, intentional.
+
 ## Still open (confirmed, queued)
 
 **Awaiting a ruling, not a patch:**

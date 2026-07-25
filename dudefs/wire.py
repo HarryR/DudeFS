@@ -21,6 +21,7 @@ from .node import (
     PrepareReq,
     PutQCReq,
     Request,
+    RereceiptReq,
     Response,
     RosterAcceptReq,
     SubmitReq,
@@ -96,20 +97,34 @@ def encode_request(req: Request) -> bytes:
             body = [b"getqc", op_hash]
         case PutQCReq(qc):
             body = [b"putqc", qc.encode()]
+        case RereceiptReq(target):
+            body = [b"rereceipt", target]
     return codec.encode(body)
 
 
 def decode_request(data: bytes) -> Request:
+    """Wire -> typed Request. Every arm re-reads the body with an EXPECTED ARITY
+    (`as_seq(v, n)`), so a truncated or over-long frame from a hostile peer raises a typed
+    CodecError — inside the DudeFSError tree, which `daemon.serve` already renders as carrier
+    silence — instead of a bare IndexError, which is NOT in the tree and killed the serving
+    thread (review IO-11). `codec.as_seq` was built for exactly this and simply was not used
+    here. Hostile input is EXPECTED input at this boundary; only a genuine bug should crash."""
     p = codec.as_seq(codec.decode(data))
+    if not p:
+        raise codec.CodecError("empty request body")
     tag = codec.as_bytes(p[0])
     if tag == b"submit":
+        p = codec.as_seq(codec.decode(data), 2)
         return SubmitReq(Op.from_bytes(codec.as_bytes(p[1])))
     if tag == b"prepare":
+        p = codec.as_seq(codec.decode(data), 3)
         return PrepareReq(codec.as_bytes(p[1]), Ballot.decode(p[2]))
     if tag == b"accept":
+        p = codec.as_seq(codec.decode(data), 4)
         op = Op.from_bytes(codec.as_bytes(p[3]))
         return AcceptReq(codec.as_bytes(p[1]), Ballot.decode(p[2]), op)
     if tag == b"roster_accept":
+        p = codec.as_seq(codec.decode(data), 6)
         op = Op.from_bytes(codec.as_bytes(p[3]))
         return RosterAcceptReq(
             codec.as_bytes(p[1]), Ballot.decode(p[2]), op, _decode_heads(p[4]), codec.as_int(p[5])
@@ -119,11 +134,17 @@ def decode_request(data: bytes) -> Request:
     if tag == b"watermark":
         return WatermarkReq()
     if tag == b"fetch":
+        p = codec.as_seq(codec.decode(data), 2)
         return FetchOpReq(codec.as_bytes(p[1]))
     if tag == b"getqc":
+        p = codec.as_seq(codec.decode(data), 2)
         return GetQCReq(codec.as_bytes(p[1]))
     if tag == b"putqc":
+        p = codec.as_seq(codec.decode(data), 2)
         return PutQCReq(QC.decode(codec.as_bytes(p[1])))
+    if tag == b"rereceipt":
+        p = codec.as_seq(codec.decode(data), 2)
+        return RereceiptReq(codec.as_bytes(p[1]))
     raise codec.CodecError(f"unknown request tag {tag!r}")
 
 

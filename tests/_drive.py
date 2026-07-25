@@ -188,6 +188,9 @@ class LoggingNode:
     def put_qc(self, qc: QC) -> None:
         self.inner.put_qc(qc)
 
+    def rereceipt(self, target: bytes) -> Receipt | None:
+        return self.inner.rereceipt(target)
+
 
 # --------------------------------------------------------------------------- #
 # StepDriver — the composition (Sim's successor, retransmit-free)              #

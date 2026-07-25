@@ -9,6 +9,7 @@ import os
 import threading
 import time
 
+from .. import crashonly
 from .. import crypto as C
 from ..daemon import NodeDaemon
 from . import _util as U
@@ -46,6 +47,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
         clock=lambda: int(time.time() * 1000),
         epoch=b.epoch,
     )
+    crashonly.configure_logging()
+    crashonly.install()  # RC-4: an uncaught exception kills the PROCESS, not just a thread
     d.refresh_peers()  # dial peers from the ENDPOINT records in the seeded control chain
     stop = threading.Event()
     threading.Thread(target=d.run_periodic, args=(GOSSIP_PERIOD_S, stop), daemon=True).start()

@@ -10,12 +10,13 @@
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from . import crypto, gossip, lmsg, transports, tunables, wire
+from . import crypto, fold, gossip, lmsg, transports, tunables, wire
 from .acceptor import Acceptor, Rejected, RejectReason
 from .artifacts import (
     Cap,
@@ -39,6 +40,8 @@ from .store import (
     StoreClosed,
     StoreError,
 )
+
+log = logging.getLogger(__name__)
 
 LOCAL_TRANSPORT = transports.UNIX  # the POC carrier; ENDPOINT addrs are (transport, uri, opts)
 
@@ -109,9 +112,40 @@ class NodeDaemon:
         self.pub = key.public
         self._clock = clock or (lambda: 0)
         self.node = LocalNode(self.acc, self._clock)
-        self.roster = roster or [self.pub]
+        # The SEED roster is the genesis ANCHOR, never the standing truth (review IO-2).
+        # CLI.md §7: "Only `manager_pub` is trusted … `epoch` and `peers` are hints … the seed
+        # carries peer ADDRESSES, not roster IDENTITY (which is trust-derived, not seeded)."
+        self._anchor_roster = roster or [self.pub]
+        self._anchor_epoch = epoch
+        self.roster = self._anchor_roster
         self.quorum = quorum_size(len(self.roster))
+        self._reseat_roster()
         self._rebuild_authz()
+
+    def _reseat_roster(self) -> None:
+        """Derive the roster for my DURABLE epoch from the held control chain (review IO-2).
+
+        The acceptor reloads its epoch from the DB ("finding 20: the DB is the single source of
+        truth") but the roster used to come from `bootstrap.json` and was only ever advanced
+        IN MEMORY by `_activate_one`. So after any restart following a roster change, an
+        epoch-N QC was verified against the epoch-0 roster: `qc_final` failed, `select()`
+        returned None forever, the horizon never advanced, compaction never GC'd, and
+        `_activate_one` could never follow another change — all silently, while the node kept
+        serving reads and `status()` reported nothing wrong.
+
+        `fold.rosters_by_epoch` counts only AUTHORIZED, signature-valid ROSTER ops, so this is
+        trust-derived rather than seeded. A node with no roster ops yet keeps the anchor."""
+        g: fold.Genesis = {
+            "manager_pub": self.manager_pub,
+            "epoch": self._anchor_epoch,
+            "roster": self._anchor_roster,
+        }
+        with self.store.read_txn() as tx:
+            rosters = fold.rosters_by_epoch([o for o in tx.all_ops() if o.is_control], g)
+        seated = rosters.get(self.acc.epoch)
+        if seated:
+            self.roster = seated
+            self.quorum = quorum_size(len(seated))
 
     def _rebuild_authz(self) -> None:
         """Rebuild the request gate's authorization view from the control ops I hold
