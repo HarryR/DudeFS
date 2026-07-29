@@ -1,18 +1,79 @@
-# Ruff — lint + format config (Astral). Dev-only; the runtime stays stdlib.
+# Ruff — lint + format config. Dev-only; the runtime stays stdlib + PyNaCl.
+#
+# The selection principle: enable rules that MECHANICALLY ENFORCE A RULING WE ALREADY MADE, and
+# decline rules that impose a new opinion. A lint that argues with the design is noise; a lint that
+# catches the design being violated is a gate.
+#
+# What the non-obvious families are doing here:
+#
+#   BLE  blind-except      SPEC's crash-only rule as a lint. `except Exception` at a loop top is the
+#                          BUG, not the cure — it turns a silent thread death into a silent infinite
+#                          retry. Currently zero findings; the point is that it stays zero.
+#   ARG  unused-arguments  The DECLARED-BUT-UNWIRED class, mechanically. The previous package held
+#                          eleven instances of a structure asserting a property nothing implemented
+#                          (`Envelope.nonce`, `RosterAcceptReq.sync_frontier`, `slot_priority`…) and
+#                          the parameter half of that class is exactly ARG002.
+#   SLF  private-access    Cross-module reach-through into `_private` members.
+#   S    bandit            A project whose thesis is integrity should hear it when SQL is built by
+#                          string concatenation, or a non-cryptographic RNG is used.
+#   ERA  commented-code    Dead code left in place reads as intent.
+#   C90  complexity        A function that grows four responsibilities gets patched into breakage —
+#                          which happened to `_compact` once already.
+#
+# Deliberately NOT selected, with reasons, so nobody re-adds them expecting an improvement:
+#
+#   TRY003 / EM101 / EM102  demand exception messages be hoisted into variables or subclasses. Our
+#                           errors say WHY in the message on purpose; this trades a readable raise
+#                           for indirection. 80 findings, all of them noise.
+#   PLR2004 magic-value     crypto code compares against widths and tag bytes constantly.
+#   D       pydocstyle      these docstrings carry rationale, not a house format.
+#   ANN     annotations     `ty` already checks types; ANN adds ceremony, not checking.
+
 target-version = "py312"
 line-length = 100
 
 [lint]
-# Pragmatic default set: pyflakes (F), pycodestyle (E/W), isort (I),
-# pyupgrade (UP), flake8-bugbear (B), comprehensions (C4).
-select = ["F", "E", "W", "I", "UP", "B", "C4"]
+select = [
+    "A",    # builtins shadowing
+    "ARG",  # unused arguments        <- declared-but-unwired, mechanically
+    "B",    # bugbear
+    "BLE",  # blind except            <- crash-only, mechanically
+    "C4",   # comprehensions
+    "C90",  # mccabe complexity
+    "E",    # pycodestyle errors
+    "ERA",  # commented-out code
+    "F",    # pyflakes
+    "FURB", # refurb
+    "I",    # isort
+    "N",    # pep8-naming
+    "PERF", # performance antipatterns
+    "PIE",  # misc lints
+    "PL",   # pylint
+    "RET",  # return simplification
+    "RSE",  # raise cleanliness
+    "RUF",  # ruff-specific
+    "S",    # bandit (security)
+    "SIM",  # simplify
+    "SLF",  # private member access
+    "TID",  # tidy imports
+    "TRY",  # exception-handling discipline
+    "UP",   # pyupgrade
+    "W",    # pycodestyle warnings
+]
 ignore = [
-    "E741",   # ambiguous names (l, I) — the crypto/math code uses them deliberately
+    "E741",    # ambiguous names (l, I) — the crypto/math code uses them deliberately
+    "TRY003",  # long message outside the exception class — see the header
+    "EM101",   # string literal in raise — see the header
+    "EM102",   # f-string in raise — see the header
+    "PLR2004", # magic value comparison — widths and tag bytes
+    "TRY300",  # `else` after try — guard-then-return reads better here
+    "TID252",  # relative imports — this is one package; relative is correct within it
 ]
 
 [lint.per-file-ignores]
-# Tests exercise internals and build deliberately-malformed inputs.
-"tests/*" = ["B011"]
+# Tests exercise internals on purpose: they poke private caches to build negative controls, use
+# `assert`, and seed a deliberately NON-cryptographic RNG so runs are reproducible.
+"dude/tests/*" = ["S101", "S311", "SLF001", "PLR0915"]
 
 [format]
 docstring-code-format = false

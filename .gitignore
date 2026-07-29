@@ -24,3 +24,6 @@ __pycache__/
 # coverage data (baseline report is COVERAGE-BASELINE.txt, committed)
 .coverage
 htmlcov/
+oldshit
+old-and-invalid
+experiments

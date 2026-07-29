@@ -1,0 +1,300 @@
+---
+title: DUDEFS — specification
+---
+
+# SPEC
+
+Replaces the numbered spec now in [`old-and-invalid/SPEC.md`](old-and-invalid/SPEC.md). Derived from
+the probes in [`experiments/`](experiments/) and the rulings in [`PLAN.md`](PLAN.md).
+
+## How to cite this
+
+**Every normative statement carries a `#tag`.** Code cites the tag, never a section number:
+
+```python
+"""Content address — over the bytes as received (#content-address)."""
+```
+
+Positional references (`SPEC 11.1`) are brittle by construction — they break whenever a section moves,
+they cannot be grepped in both directions, and they render as dead text rather than links. A tag is a
+stable identifier, resolves as a pandoc anchor, and `grep -rn '#content-address'` finds both the rule
+and everything that depends on it.
+
+**Tags are permanent.** Renaming one is a breaking change; retiring one means marking it
+`RETIRED` here, not deleting it, so a stale citation resolves to an explanation rather than nothing.
+
+Provenance: **`[H]`** Harry's ruling · **`[M]`** established by a model in `experiments/` ·
+**`[I]`** inference, not yet tested.
+
+---
+
+## 1. The log
+
+### One write vocabulary {#one-write-vocabulary}
+
+`[H]` There are two mutations — `set(store, name, value)` and `del(store, name)` — and nothing else.
+No compound operations, no read-modify-write opcodes. A transaction is an **ordered log of steps**,
+each step a mutation carrying its own guards, evaluated in sequence exactly as if applied directly to
+the store.
+
+### Last write wins within a transaction {#last-write-wins}
+
+`[H]` If a transaction writes the same key twice, the later step wins. Step *N*'s guards **and** its
+authority are evaluated against state as evolved by steps 1..*N*-1 — which is what makes
+*authorise → use → revoke* a single atomic transaction rather than three.
+
+### Predicates quote, never recompute {#predicates}
+
+`[H]` A guard is `absent(store, name)` or `holds(store, name, digest)`. `holds` **quotes** a ciphertext
+digest; it never recomputes one, so a node needs no key to evaluate it and the value's cardinality
+stays unobservable. `absent` is genuinely "no row" — deliberately different from holding empty bytes.
+
+### A content address is over the bytes as received {#content-address}
+
+`op_hash = h(raw)`. Not over a re-encoding: an entry is relayed verbatim, so its identity survives
+transport without depending on the canonicaliser agreeing with itself.
+
+### Position is not authored {#position-is-not-authored}
+
+`[H]` A settled index is assigned by settlement and is never part of what an author signs. Reaching
+for one at authoring time is a bug — the index does not exist yet.
+
+## 2. Settlement
+
+### Settlement linearises and drops {#settlement}
+
+`[M]` Settlement evaluates a batch in order against a layer and partitions it: survivors commit,
+rejects carry a **typed reason**. The reasons are not equally final — a bad signature is permanently
+dead, while an authority or guard failure may become satisfiable later.
+
+### Provenance is the last writer {#provenance}
+
+`[H]` A live value records the settled index that last wrote it. `[M]` It is the *current* head only —
+after collection the history behind it is gone, which is why nothing re-adjudicates.
+
+### The quorum gate {#quorum-gate}
+
+`[H]` One module decides what is and is not consensus, and nothing else depends on how it decides.
+Two-thirds by ruling.
+
+`[M]` **`f` is `min(spare, tolerates)`** — how many may vanish while a quorum can still form, and how
+many may lie while safety holds. **Availability binds**: at n=11 two-thirds gives spare=3 and
+tolerates=4, so f=3. Seizure, bankruptcy and outage all remove *availability*.
+
+### Failure domains {#failure-domains}
+
+`[M]` A node carries **opaque labels** — `provider:`, `country:`, `asn:`, `billing:`, `rack:`. Nothing
+parses them; the system only counts. **No domain may hold more than `f` nodes.** Sufficient on its own:
+since that bound is below the quorum size, no quorum can be drawn from a single domain.
+
+Two consequences found by implementing it: the bound is **vacuous below n=4** (no placement makes a
+1-node roster survivable, and enforcing it would forbid the first node), and a sound roster may be
+**unreachable one node at a time** — 3-3-3-2 is fine at n=11 and refused at n=4, so a target roster
+must be reached by a batched change.
+
+### Buckets {#buckets}
+
+`[H]` `bucket = ts / delta`. Boundaries are **computed, never negotiated** — there is no protocol for
+agreeing where a bucket starts. Both a convention and a safety rail, for that reason.
+
+## 3. Authority
+
+### Presence is membership {#presence-is-membership}
+
+`[H]` A node is in the roster because its record exists. Deletion is removal; there is no separate
+status field to disagree with the record.
+
+### A roster change is one transaction {#roster-change-is-atomic}
+
+`[H]` Removal and the rotation that follows it land together, so a node out of the roster but still
+holding a live master is not a reachable state.
+
+### Keys generate where they live {#possession-proof}
+
+`[H]` Only a public half and a proof of possession ever travel. The manager never certifies a key it
+did not see proven.
+
+### Coarse ACL {#coarse-acl}
+
+`[H]` A grant names **store ids** and **operation kinds**, never key paths. A node must be able to
+check authority without reading a key, and the store id is cleartext in every operation.
+
+### Management is a cleartext prefixed keyspace {#management-is-cleartext}
+
+`[H]` Control records are readable and **enumerable** — a node needs the roster and the ACL to
+function, and opaque fixed-width tokens cannot be enumerated.
+
+### Absence is the revocation {#absence-is-revocation}
+
+`[M]` There is no revocation list and no retraction record. Revoking removes the grant; the state root
+commits to state, so the removal is bound to the data. **Selective withholding is therefore
+impossible** — hiding a revocation means serving an older root, i.e. older data too.
+
+Revocation freshness == data freshness: any freshness signal covers both, free.
+
+### Replay does not re-adjudicate {#replay-does-not-readjudicate}
+
+`[M]` A replayer applies at recorded indices and evaluates **nothing**. Forced, not convenient: after
+collection the state a guard referenced is gone, so re-running guards gives *wrong* answers rather
+than missing ones.
+
+## 4. Compaction
+
+### Collection is a log entry {#collection-is-a-log-entry}
+
+`[M]` A collection is an ordinary settled entry, so replay reproduces it.
+
+### A segment is collected whole {#collect-whole-segment}
+
+`[M]` The log is divided into **segments** — physical slices, **not** stores and not ACL domains. The
+id derives from the **settled index**, never the author's clock, because the mempool carries late
+transactions forward and an author-stamped entry could otherwise land in a collected segment.
+
+Collection deletes a segment entirely and subtracts **one accumulator**. No scattered drop set, no
+chain to repair, no run-length problem — a segment *is* a run by construction.
+
+### Collection is refused while live {#collection-refused-while-live}
+
+`[M]` Three refusals, each a correctness property:
+
+- **stragglers remain** — a segment that silently collected live data would lose committed state
+- **the segment is current** — migration writes at the head, so draining a segment into itself is a
+  no-op and the straggler simply reappears
+- **younger than the dedup window** — `op_hash UNIQUE` is what makes a settled transaction
+  unrepeatable, and collection forgets those hashes. Expressed as an **age**, not a segment width: a
+  width is a count and the window is a duration, so comparing them would need an arrival rate nobody
+  has.
+
+### Collection is ratified {#collection-is-ratified}
+
+`[M]` A collection carries `(segment, height, acc_state)` and a **quorum signature over all three**.
+Collection deletes the joiner's only other verification path, so an unratified collection is one
+nobody can ever check. The refusal names the reason plainly — *"no signature"*.
+
+### Migration keeps the fold invariant {#migration-is-state-invariant}
+
+`[M]` Stragglers are rewritten at the head with the **same value**, so no state element changes and
+`A_state` is untouched while provenance moves forward. Without it, collection has a permanent floor:
+genesis grants and roster rows are live for the life of the log.
+
+This is the cheap half of the conveyor; see [#conveyor](#conveyor).
+
+## 5. Accumulators
+
+### Two accumulators {#accumulators}
+
+`A_state` over live `(store, name, value)`; `A_log` over `(index, op_hash)`. Both ECMH: an
+order-independent sum with exact subtraction.
+
+`[M]` **`A_state` is unchanged by collection** — collection removes only superseded history. `A_log`
+changes, and that is correct: the log changed. What must hold is **replay-invariance** (everyone
+replaying the *current* log agrees), not time-invariance, which is impossible once anything is
+rewritten.
+
+## 6. Trust
+
+### Storage nodes are untrusted {#nodes-are-untrusted}
+
+`[H]` They hold no trusted component and no keys. `[M]` The adversary is **failure domains** — seizure,
+provider loss, accidental rollback from a snapshot restore, operator error — not rational actors with
+a payoff. Every node is bought and paid for.
+
+### Authenticity is self-verifying; currency is not {#the-lemma}
+
+`[M]` A signature proves *who spoke*. A hash proves *what*. A proof proves *it was computed
+correctly*. **Nothing proves that nobody has spoken since** — there is no such object, so no
+cryptography produces one.
+
+*"Is this current?"* is unaskable. The answerable form is *"is this too old?"*, which needs a clock and
+a party whose clock you trust.
+
+### Freshness needs f+1; authenticity needs one {#freshness-needs-many}
+
+`[M]` An arm can **withhold** a higher checkpoint, never forge one. So the maximum across `f+1`
+responders is correct. A **returning** client holding a receipt carries its own height floor and needs
+one responder; a **cold** client needs `f+1`.
+
+`[H]` **There is no priest** — the budget will not carry the cluster and a blessing service. Cold
+single-link clients are therefore out of scope.
+
+### Monotonicity is a duty {#monotonicity}
+
+`[M]` Nodes attest a monotone height and never regress; clients take the max. A regression is a
+**signed contradiction** anyone can keep — accountability rather than prevention, which needs durable
+state and no trusted hardware. `[H]` Out-of-band restore is forbidden: it regresses the height and
+convicts the node for an operator convenience.
+
+## 7. Keys
+
+### Two secrets, never one {#two-secrets}
+
+`[H]` A **permanent name key** derives name tokens and never rotates; a **rotating value key** derives
+item keys per epoch. Rotating one must not re-derive the other, or rotation becomes an O(state)
+re-encryption.
+
+### Per-item keys {#per-item-key}
+
+`[H]` `item_key = f(value_key, name_token)`, so no two items share a key.
+
+### Random nonce, no cardinality leak {#random-nonce}
+
+`[H]` The AEAD uses a random nonce and is misuse-resistant. A deterministic nonce would make a key's
+value cardinality observable — and a predicate quotes a ciphertext digest rather than recomputing one,
+so determinism buys nothing.
+
+### Wrapped masters {#wrapped-masters}
+
+`[H]` One sealed copy of the epoch master per authorised holder, distributed atomically: every holder
+gains it together or none does, so no client is left holding data it cannot read.
+
+`[M]` **Retention is refcounted over live values** — a value carries its epoch, so the count is a
+function of live state and survives collection. No history, no policy.
+
+### The conveyor {#conveyor}
+
+`[M]` Forward secrecy comes from **key death**, not from erasing ciphertext — on SSDs, CoW filesystems
+and rented block storage you cannot assert the old bytes are gone.
+
+An old epoch's key can only die when nothing references it, so live values must be **re-encrypted
+forward**. `[H]` Worker bees do this as housekeeping while running their own jobs; effort scales with
+backlog pressure, clamped so housekeeping cannot crowd out work. The idle case needs a heartbeat, not a
+fallback path.
+
+**Rotating keys faster without conveying faster buys nothing.**
+
+## 8. Transport
+
+### Transport adds no trust {#transport-adds-no-trust}
+
+`[H]` A message is **point-to-point** even when the carrier is broadcast. Transports move bytes or
+raise; no retries, no timeouts, no opinions — a hidden retry is a transmission the link layer cannot
+count.
+
+### The screen tag {#screen-tag}
+
+`[H]` `HMAC(key = destination identity, message = sealed bytes)`. Including the sealed bytes is
+essential: keyed on identity alone it would be a constant, i.e. a permanent per-node fingerprint. A
+**hint**, never authentication.
+
+### Sign then seal {#sign-then-seal}
+
+`[H]` Sealing after signing means an observer sees no identity. Signing a ciphertext would leave the
+sender's key in the clear and leak the social graph.
+
+## 9. Errors
+
+### Routine outcomes are returned, not raised {#no-exceptions-for-control-flow}
+
+`[H]` A signature that does not match, a refused admission, a failed guard, an open circuit — all are
+**returned values with closed types**. Not hypothetical: verification briefly raised instead of
+returning, making `if not verify(...)` vacuously true and silently breaking **every** multisig
+verification in the system.
+
+Closed enums reserve **ordinal 0 as `INVALID`**, so a Go port's zero value lands on a named invalid.
+
+---
+
+## Retired tags
+
+None yet. When a rule is retired, its tag stays here with the reason, so a stale citation resolves to
+an explanation rather than to nothing.
