@@ -56,13 +56,13 @@ is `min(n−q, 2q−n−1)` — **seizure is unavailability**, so the availabili
 | 0 — correct the record | **mostly done** — stale docs quarantined, `SPEC.md` rewritten with tags, 112 refs repointed. Outstanding: `FRAMING.md`'s two corrections; `MEMPOOL.md` / `LINKS.md` prose predating segments and the no-priest ruling |
 | 1 — failure domains | **done**, 7 tests |
 | 2 — segments | **done**, 14 tests, all four Fable amendments closed |
-| 3 — state root (SMT) | not started |
+| 3 — state root (SMT) | **done**, 26 tests — and it is signed, so it proves something |
 | 4 — conveyor | **half done** — `Store.migrate` is the same-value half; re-encryption is not written, so no key has ever died |
 | 5 — compactor role | **quorum half done** — collection is driven and ratified in a cluster (below); the compactor's *timestamp* is still unwritten, and `FRONTIER`/`PULL`/`ENTRIES` are still `UNIMPLEMENTED` |
 | 6 — revocation | **collapsed to nothing** — see below |
 | 7 — angel duty | **done**, 38 tests — and grew a second half, cross-attestation (below) |
 
-**161 tests green.** Gate unchanged (bottom of this file).
+**187 tests green.** Gate unchanged (bottom of this file).
 
 ## Step 0 — correct the record  ✅ mostly
 
@@ -133,17 +133,35 @@ component was wrong only once something else had to talk to it.
 drains part of itself back into itself. Sizing, not a bug — but it makes `SEGMENT_WIDTH > live rows`
 a real floor alongside S4's dedup age.
 
-## Step 3 — the state root (SMT)
+## Step 3 — the state root  ✅ ★
 
-**Key-indexed sparse tree with path compression** — **not** sorted-leaf. P20 measured sorted-leaf
-insert as O(n) because positions shift, so **F16's "O(log S) cached" is retracted**; the probe-03/06
-tree is read-only and must not be lifted into production.
+`dude/store/smt.py`: a binary radix tree over `H(store ‖ name)` in which **a subtree holding exactly
+one leaf hashes to that leaf however deep it sits**. That single rule is the whole compression —
+nominally 256 deep, actually ~log2(n), so a proof is ~24 hashes rather than 256. Measured, not
+asserted: `test_depth_stays_logarithmic`.
 
-~768 B proof at 10⁷ keys, depth ~24. Cost is **storage and random IO**, not CPU. Keeps `A_state`
-alongside — ECMH supplements rather than replaces, being O(1) for the equality check nodes do
-constantly.
+**Key-indexed with path compression, as ruled.** Sorted-leaf stays retracted (P20: insert is O(n)
+because positions shift; the probe-03/06 tree is read-only).
 
-**Needs a new tag.** `SPEC.md` has no statement about the state root.
+**What it buys over `A_state`:** a proof about ONE key — and above all a proof of **absence**. That
+makes #absence-is-revocation checkable rather than asserted, since a revocation *is* a grant that is
+gone. It also restores what collection destroys: a joiner that reconstructs state can check it against
+a signed root instead of trusting its own reconstruction. Both commitments are kept — ECMH is O(1) for
+the equality nodes ask constantly, the tree is paid when a proof is served or a checkpoint is cut.
+
+**Canonicity is structural, not maintained.** A subtree's hash is defined purely as a function of the
+leaves in its range, so there is no insert path and no delete path that could disagree, and
+insert-then-delete is byte-identical to never-inserted. That is why there is **no split/merge
+machinery**: the leaves ARE the `live` table indexed by path, and `smt_memo` is a memo of a pure
+function that can be truncated at any moment (`test_the_memo_is_only_a_cache`).
+
+**The branch depth is hashed into every internal node**, so the shape is committed and a proof cannot
+be re-folded at a depth it was not issued for — the ambiguity is removed rather than argued about.
+
+**Signed, or it proves nothing.** `Compaction` and `Attestation` both carry a root: the checkpoint's
+is what a **quorum** vouches for, the attestation's is what **one node** stakes its identity on.
+Ratification covers it — `_on_collect` recomputes the root with the height and the fold, so a node
+claiming a root it did not compute gets no signature.
 
 ## Step 4 — the conveyor  ◐ half
 
