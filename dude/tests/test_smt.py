@@ -75,13 +75,26 @@ class TestProofs(_Fixture):
         self.assertTrue(smt.verify(self.t.root(), D, b"nope", None, self.t.prove(D, b"nope")))
 
     def test_an_absent_key_proves_absent_among_many(self):
-        """The populated case, where the walk ends on somebody ELSE's leaf rather than on emptiness.
-        That neighbour is the proof: it occupies the slot ours would have."""
+        """A walk for a missing key ends one of two ways — on emptiness, or on somebody ELSE's leaf
+        occupying the slot ours would have had. Both are proofs of absence and both must verify, so
+        the test finds one of each rather than assuming which a given name happens to hit."""
         for i in range(200):
             self.put(f"k{i}".encode(), f"v{i}".encode())
-        proof = self.t.prove(D, b"absent")
-        self.assertIsNotNone(proof.occupant, "expected to land on a neighbour, not on emptiness")
-        self.assertTrue(smt.verify(self.t.root(), D, b"absent", None, proof))
+        root = self.t.root()
+
+        empty_case = neighbour_case = None
+        for i in range(200):
+            name = f"absent{i}".encode()
+            proof = self.t.prove(D, name)
+            if proof.occupant is None:
+                empty_case = empty_case or (name, proof)
+            else:
+                neighbour_case = neighbour_case or (name, proof)
+        assert empty_case is not None and neighbour_case is not None, "one terminal never occurred"
+
+        for name, proof in (empty_case, neighbour_case):
+            self.assertTrue(smt.verify(root, D, name, None, proof))
+            self.assertFalse(smt.verify(root, D, name, b"anything", proof))
 
     def test_a_deleted_key_proves_absent(self):
         """The one that makes #absence-is-revocation checkable rather than asserted."""
@@ -252,3 +265,37 @@ class TestThroughTheStore(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDomains(unittest.TestCase):
+    """Domain separation, since the three hashes here are three functions and not one function over
+    three tagged messages (#state-root)."""
+
+    def test_a_domain_changes_the_function(self):
+        same = b"identical bytes"
+        self.assertNotEqual(crypto.h_domain(b"one", same), crypto.h_domain(b"two", same))
+        self.assertNotEqual(crypto.h_domain(b"one", same), crypto.h(same))
+
+    def test_an_over_long_domain_is_refused(self):
+        """Domains are module constants, so this fails at import rather than at the first hash."""
+        with self.assertRaises(ValueError):
+            crypto.h_domain(b"x" * (crypto.PERSON_SIZE + 1), b"")
+
+    def test_a_node_is_bound_to_where_it_sits(self):
+        """Same depth, same children, different prefix -- different hash. Without the position, an
+        internal node's hash would be reusable anywhere the same two children appear."""
+        kids = (crypto.h(b"l"), crypto.h(b"r"))
+        here = smt.branch_hash(3, smt.bounds(crypto.h(b"a"), 3)[0], *kids)
+        there = smt.branch_hash(3, smt.bounds(crypto.h(b"b"), 3)[0], *kids)
+        self.assertNotEqual(here, there)
+
+    def test_a_node_is_bound_to_its_depth(self):
+        """And the depth is needed as well as the prefix: a padded prefix at depth 3 and at depth 4
+        with a zero next bit are the same bytes."""
+        path = bytes(32)
+        self.assertEqual(smt.bounds(path, 3)[0], smt.bounds(path, 4)[0])
+        kids = (crypto.h(b"l"), crypto.h(b"r"))
+        self.assertNotEqual(
+            smt.branch_hash(3, smt.bounds(path, 3)[0], *kids),
+            smt.branch_hash(4, smt.bounds(path, 4)[0], *kids),
+        )

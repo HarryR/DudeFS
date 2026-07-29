@@ -317,9 +317,17 @@ because every later position shifts; probe 20 measured it, and F16's "O(log S) c
 — the probe-03/06 tree is read-only and must not be lifted into production. Depth is ~24 at 10⁷ keys,
 so a proof is ~768 B.
 
-`[M]` **The branch depth is hashed into every internal node**, so the tree's shape is committed and no
-proof can be re-folded at a depth it was not issued for. Empty subtrees hash to a fixed constant at
-every depth, which is what makes the structure sparse.
+`[M]` **Every node is bound to where it sits** — a leaf to its path, an internal node to its depth
+*and* its prefix — so no hash in the tree can be quoted out of position. Position binding is local
+rather than resting on the global argument that a fold must reach the real root, which is what keeps
+it true for any later use of these hashes (subtree proofs, batched proofs). The verifier derives each
+prefix from the key it is asking about, so a proof costs nothing extra and can only ever be folded
+along that key's own path. Empty subtrees are a fixed constant at every depth, which is what makes the
+structure sparse.
+
+`[M]` **Domains are BLAKE2b personalisation, never a tag concatenated onto the message.** Two domains
+are two different hash functions; a prefixed tag is one function over a message someone must prove is
+prefix-free, and that proof gets re-earned at every call site.
 
 `[M]` The root is carried in the ratified checkpoint (#collection-is-ratified) and in a node's
 attestation (#monotonicity), so a proof always verifies against something **signed** — by a quorum in

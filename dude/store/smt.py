@@ -31,12 +31,17 @@ MAX_DEPTH = 256
 
 EMPTY = crypto.Digest(bytes(crypto.DIGEST_SIZE))
 """An empty subtree, at EVERY depth — the constant that makes the structure sparse rather than
-materialised. Distinguishable from a real node only because the domain bytes below never produce it,
-which is the same argument every sparse tree makes."""
+materialised.
 
-_LEAF = b"\x00"
-_BRANCH = b"\x01"
+Zeros rather than a derived constant, deliberately: a port writes `[0u8; 32]` and cannot get it
+subtly wrong, whereas a derived sentinel has to be recomputed identically in every language. It
+cannot be confused with a real node because every real node comes out of a personalised hash."""
+
+# Domain names (BLAKE2b personalisation). A leaf, an internal node and a path are three different
+# hash functions here, not one function over three tagged messages — see `crypto.h_domain`.
 _PATH = b"dude.smt.path"
+_LEAF = b"dude.smt.leaf"
+_BRANCH = b"dude.smt.node"
 
 
 def path_of(store: int, name: bytes) -> bytes:
@@ -45,21 +50,35 @@ def path_of(store: int, name: bytes) -> bytes:
     HASHED, not the key itself: it spreads keys uniformly so depth stays ~log2(n), and it denies an
     author the ability to choose its neighbours — with raw keys, a writer could stuff one subtree
     and drive proof length up for everyone else."""
-    return bytes(crypto.h(_PATH + codec.encode([store, name])))
+    return bytes(crypto.h_domain(_PATH, codec.encode([store, name])))
 
 
 def leaf_hash(path: bytes, vhash: crypto.Digest) -> crypto.Digest:
-    """Binds the leaf to its OWN path, so a leaf cannot be replayed at another position."""
-    return crypto.h(_LEAF + path + vhash)
+    """Binds the leaf to its OWN path, so a leaf cannot be replayed at another position.
+
+    Both fields are fixed width, so plain concatenation is injective and needs no framing."""
+    return crypto.h_domain(_LEAF, path + vhash)
 
 
-def branch_hash(depth: int, left: crypto.Digest, right: crypto.Digest) -> crypto.Digest:
-    """Binds the DEPTH, so the tree's shape is committed.
+def branch_hash(
+    depth: int, prefix: bytes, left: crypto.Digest, right: crypto.Digest
+) -> crypto.Digest:
+    """Binds the node to WHERE IT IS — depth and prefix both — so the tree's shape is committed.
 
-    Without it, `H(left ‖ right)` at depth 3 and at depth 7 are the same bytes, and a proof could be
-    re-folded at a depth it was not issued for. Hashing the depth removes the question rather than
-    leaving it to an argument about whether the ambiguity is exploitable."""
-    return crypto.h(_BRANCH + depth.to_bytes(2, "big") + left + right)
+    The same reasoning as binding a leaf to its path, and it would be strange to do one and not the
+    other. Without the position, `H(left ‖ right)` is the same bytes wherever it sits, and a node's
+    hash is only anchored by the argument that the fold must reach the real root from the top. That
+    argument holds, but it is global and has to be re-made for every new use of these hashes —
+    subtree proofs, batched proofs, anything that quotes an internal node out of context. Binding
+    the position makes every node self-describing instead: "I am the subtree at this prefix, at this
+    depth, with these two children."
+
+    BOTH are needed. A prefix is stored padded to full width, so the prefix bytes at depth 3 and at
+    depth 4 with a zero next bit are identical; the depth is what tells them apart.
+
+    The verifier never receives a prefix — it derives each one from the key it is asking about, so a
+    proof can only ever be folded along that key's own path."""
+    return crypto.h_domain(_BRANCH, depth.to_bytes(2, "big") + prefix + left + right)
 
 
 def bit(path: bytes, i: int) -> int:
@@ -118,11 +137,11 @@ def _fold(
     """Rebuild the root from the bottom, taking each turn from `path`'s own bits."""
     node = terminal
     for depth in reversed(range(len(siblings))):
-        sib = siblings[depth]
+        sib, at = siblings[depth], bounds(path, depth)[0]
         node = (
-            branch_hash(depth, node, sib)
+            branch_hash(depth, at, node, sib)
             if bit(path, depth) == 0
-            else branch_hash(depth, sib, node)
+            else branch_hash(depth, at, sib, node)
         )
     return node
 
@@ -199,7 +218,7 @@ class Tree:
         left, right = bounds(path, depth + 1)[0], bounds(_flip(path, depth), depth + 1)[0]
         if bit(path, depth) == 1:
             left, right = right, left
-        node = branch_hash(depth, self._sub(left, depth + 1), self._sub(right, depth + 1))
+        node = branch_hash(depth, lo, self._sub(left, depth + 1), self._sub(right, depth + 1))
         self.db.execute(
             "INSERT OR REPLACE INTO smt_memo (depth, prefix, hash) VALUES (?,?,?)",
             (depth, lo, node),

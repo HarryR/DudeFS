@@ -282,6 +282,24 @@ def h(data: bytes) -> Digest:
     return Digest(hashlib.blake2b(data, digest_size=DIGEST_SIZE).digest())
 
 
+def h_domain(person: bytes, data: bytes) -> Digest:
+    """Content-address hash INSIDE a domain — BLAKE2b personalisation, not a prefix byte.
+
+    Two domains are two different hash functions, which is what domain separation is supposed to
+    mean. A tag concatenated onto the message is not that: it is one hash function over a message
+    the reader has to prove is prefix-free, and that proof gets re-earned at every call site.
+    Personalisation goes into the compression function's initial state instead, so it costs no
+    extra block and cannot be confused with content.
+
+    `person` is at most `PERSON_SIZE` and BLAKE2b refuses a longer one. Domains are module
+    constants, so an over-long name fails at import rather than at the first hash."""
+    return Digest(hashlib.blake2b(data, person=person, digest_size=DIGEST_SIZE).digest())
+
+
+PERSON_SIZE = hashlib.blake2b.PERSON_SIZE
+"""16 bytes. A domain name must fit; the hash function itself enforces it."""
+
+
 def random_bytes(n: int) -> bytes:
     """Cryptographic randomness, funnelled through one function on purpose.
 

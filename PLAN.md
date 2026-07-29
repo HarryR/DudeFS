@@ -56,13 +56,13 @@ is `min(n−q, 2q−n−1)` — **seizure is unavailability**, so the availabili
 | 0 — correct the record | **mostly done** — stale docs quarantined, `SPEC.md` rewritten with tags, 112 refs repointed. Outstanding: `FRAMING.md`'s two corrections; `MEMPOOL.md` / `LINKS.md` prose predating segments and the no-priest ruling |
 | 1 — failure domains | **done**, 7 tests |
 | 2 — segments | **done**, 14 tests, all four Fable amendments closed |
-| 3 — state root (SMT) | **done**, 26 tests — and it is signed, so it proves something |
+| 3 — state root (SMT) | **done**, 30 tests — and it is signed, so it proves something |
 | 4 — conveyor | **half done** — `Store.migrate` is the same-value half; re-encryption is not written, so no key has ever died |
 | 5 — compactor role | **quorum half done** — collection is driven and ratified in a cluster (below); the compactor's *timestamp* is still unwritten, and `FRONTIER`/`PULL`/`ENTRIES` are still `UNIMPLEMENTED` |
 | 6 — revocation | **collapsed to nothing** — see below |
 | 7 — angel duty | **done**, 38 tests — and grew a second half, cross-attestation (below) |
 
-**187 tests green.** Gate unchanged (bottom of this file).
+**191 tests green.** Gate unchanged (bottom of this file).
 
 ## Step 0 — correct the record  ✅ mostly
 
@@ -155,8 +155,16 @@ insert-then-delete is byte-identical to never-inserted. That is why there is **n
 machinery**: the leaves ARE the `live` table indexed by path, and `smt_memo` is a memo of a pure
 function that can be truncated at any moment (`test_the_memo_is_only_a_cache`).
 
-**The branch depth is hashed into every internal node**, so the shape is committed and a proof cannot
-be re-folded at a depth it was not issued for — the ambiguity is removed rather than argued about.
+**Every node is bound to where it sits `[H]`** — a leaf to its path, an internal node to its depth
+*and* prefix. Binding the leaf and not the branch was asymmetric for no reason: without position, an
+internal node's hash is anchored only by the global argument that the fold must reach the real root,
+and that argument has to be re-made for every later use of these hashes. Local binding costs nothing
+on the wire, since the verifier derives each prefix from the key it is asking about.
+
+**Domains are BLAKE2b personalisation `[H]`**, not a tag concatenated onto the message — matching
+`PERSON_SCREEN` / `PERSON_ENC`, which were already the house idiom. `crypto.h_domain` is the one
+entry point; two domains are two different hash functions rather than one function over a message
+someone has to prove is prefix-free.
 
 **Signed, or it proves nothing.** `Compaction` and `Attestation` both carry a root: the checkpoint's
 is what a **quorum** vouches for, the attestation's is what **one node** stakes its identity on.
