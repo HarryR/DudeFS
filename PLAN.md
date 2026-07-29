@@ -60,9 +60,9 @@ is `min(n−q, 2q−n−1)` — **seizure is unavailability**, so the availabili
 | 4 — conveyor | **half done** — `Store.migrate` is the same-value half; re-encryption is not written, so no key has ever died |
 | 5 — compactor role | **quorum half done** — collection is driven and ratified in a cluster (below); the compactor's *timestamp* is still unwritten, and `FRONTIER`/`PULL`/`ENTRIES` are still `UNIMPLEMENTED` |
 | 6 — revocation | **collapsed to nothing** — see below |
-| 7 — angel duty | not started |
+| 7 — angel duty | **done**, 38 tests — and grew a second half, cross-attestation (below) |
 
-**130 tests green.** Gate unchanged (bottom of this file).
+**161 tests green.** Gate unchanged (bottom of this file).
 
 ## Step 0 — correct the record  ✅ mostly
 
@@ -177,6 +177,53 @@ The priest question is **ruled**: cold manager, no priest, cold single-link clie
 Nodes attest a monotone height and never regress; clients take the max over `f+1` (#monotonicity).
 Catches the *actual* rollback threat here — snapshot revert, restore, operator error — not a
 coordinated adversary. Durable state, no clock, no TEE.
+
+## Step 7 — the angel duty, and who keeps the evidence  ✅ ★
+
+`dude/store/attest.py`: `Attestation` (durable counter, own head as a **hint**, both accumulators,
+and the highest quorum-ratified checkpoint as the **floor**), `SignedAttestation`, `Evidence`,
+`Frontier`, and the pure `contradiction` predicate. `FRONTIER` / `STANDING` on the wire.
+
+**The floor carries the quorum whole.** A node's private opinion of its own height is forgeable
+*upward* at no cost, so #freshness-needs-many's "withhold, never forge" only holds for something
+carrying signatures. The head rides along labelled as a hint and is never a floor.
+
+**The counter is separate from the height**, because ordering two claims by the quantity under
+dispute is circular — if the counter *were* the height, a regression would be unorderable and so
+unconvictable.
+
+**The interlock is the highest-risk part.** `Store.attestation` bumps and COMMITS the counter inside
+one transaction and returns an unsigned claim; only the node signs. Signing over uncommitted state is
+therefore unconstructible rather than merely discouraged. It matters because the consequence is
+asymmetric: peers keep the evidence and conviction is terminal, so a node that attested a height it
+had not made durable would destroy itself on an honest crash. Gaps are free; reuse is fatal.
+
+**Cross-attestation `[H]`** — the plan had this as a small self-contained step and it roughly doubled,
+absorbing `FRONTIER` from step 5. Worth it: accountability otherwise rests on a client having happened
+to be watching, and the accident this catches is a snapshot restored overnight. Peers are the keepers.
+Sightings are **verbatim and peer-signed**, never opinions, so a relay can neither frame a peer nor be
+framed by one — the only lie left is silence, which is measurable against the rest of the cluster.
+
+**Found by the cluster test:** sightings alone do **not** make evidence transitive. A peer that
+convicts keeps the earlier statement and refuses the later one, so relaying sightings relays only the
+*innocent half* — a node cut off from the culprit would keep talking to it forever. `STANDING` carries
+convictions too, and the receiver **recomputes** the verdict (`Store.judge`) rather than believing it,
+which is C1's ratification principle applied again: a relay's word is worth nothing, its signatures
+everything.
+
+**Also found:** the obvious "latest sighting wins by seq" is **wrong** — a regression arrives with the
+highest counter and would overwrite the very statement that proves it. `Store.witness` tests the
+contradiction *before* storing and keeps both halves forever.
+
+**Rulings `[H]`:** conviction is **terminal for the identity** — recovery is re-join as a new node,
+the path a forbidden restore already forces, so no rehabilitation and no un-shun protocol. Shunning is
+**proven self-contradiction only**, never silence, staleness or divergence (a partition makes honest
+nodes look stalled), and it is a **local read policy**: shunned keys drop before the `f+1` count but
+the roster and quorum arithmetic are untouched, so a heavily-shunned cluster **stalls** rather than
+proceeding thin.
+
+**What this does not give you:** freshness. A frozen node attests truthfully forever. That is the
+compactor's *timestamp*, still unwritten in step 5, and the conflation has cost time twice.
 
 ## Not doing, and why
 
