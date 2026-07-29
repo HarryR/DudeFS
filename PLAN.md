@@ -58,7 +58,7 @@ is `min(n−q, 2q−n−1)` — **seizure is unavailability**, so the availabili
 | 2 — segments | **done**, 14 tests, all four Fable amendments closed |
 | 3 — state root (SMT) | **done**, 30 tests — and it is signed, so it proves something |
 | 4 — conveyor | **half done** — `Store.migrate` is the same-value half; re-encryption is not written, so no key has ever died |
-| 5 — compactor role | **quorum half done** — collection is driven and ratified in a cluster (below); the compactor's *timestamp* is still unwritten, and `FRONTIER`/`PULL`/`ENTRIES` are still `UNIMPLEMENTED` |
+| 5 — compactor role | **quorum half done** — collection is driven and ratified in a cluster (below), and `FRONTIER` landed with step 7. Outstanding: the compactor's *timestamp* (the freshness half, unwritten), and `PULL`/`ENTRIES` |
 | 6 — revocation | **collapsed to nothing** — see below |
 | 7 — angel duty | **done**, 38 tests — and grew a second half, cross-attestation (below) |
 
