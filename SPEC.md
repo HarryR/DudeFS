@@ -28,6 +28,103 @@ Provenance: **`[H]`** Harry's ruling · **`[M]`** established by a model in `exp
 
 ---
 
+## 0. Design choices
+
+**Read this section before changing anything.** Everything below §0 is detail; this is the set of
+decisions the detail follows from. Each has been re-derived wrongly at least once, and the cost was
+days rather than minutes — so they are stated as choices with their reasons, not left implicit.
+
+### What this is for {#the-workload}
+
+`[H]` Coordination for **blockchain intent-space** workflow automation. A job is a **register
+overwritten at each checkpoint**: idempotent steps between checkpoints, certainty required at each one
+before the job continues.
+
+`[M]` So the log is **near-total death with a tiny live frontier** — ~90% of it is dead the moment a
+job advances. This is not key-value churn, and reasoning that assumes churn gets the wrong answer.
+
+### Who is trusted, and who is not {#trust-tiers}
+
+| | | |
+|---|---|---|
+| **manager** | root of trust | **cold — offline ~99% of the time** |
+| **workers** (worker bees) | run in TEEs, hold key material, execute steps | ephemeral, come and go |
+| **storage nodes** | ~11 low-spec VPS across jurisdictions | **untrusted; no keys, no trusted component** |
+
+`[H]` **There is no priest.** The budget will not carry the cluster *and* a blessing service. That one
+ruling decides three things at once, and they are not separable:
+
+> **manager offline ⟺ no priest ⟺ cold clients need `f+1`.**
+
+A returning client holding a receipt still works on a single link; a **cold** single-link client is
+out of scope, and no amount of cryptography changes that (#the-lemma).
+
+### You pay for the infrastructure {#no-token-economics}
+
+`[H]` Every node is bought and paid for on 2–4 year prepaid contracts. **There is no staking, no
+incentive layer, no economically rational adversary, and no "paid bulk holders".**
+
+`[M]` The adversary is **failure domains** — seizure, provider bankruptcy, accidental rollback from a
+snapshot restore, operator error. Rollback here is overwhelmingly an **accident**, not an attack, which
+is why monotonicity is worth having and why accountability suffices where deterrence would not.
+
+Importing blockchain incentive reasoning into this design has produced wrong conclusions twice.
+
+### Workers do the housekeeping {#workers-convey}
+
+`[H]` **Clients — the worker bees — perform routine compaction work.** They already hold the keys and
+are already decrypting for their own jobs, so conveying old data forward costs almost nothing extra.
+
+There is no dedicated conveyor service. Effort scales with backlog pressure and is clamped so
+housekeeping cannot crowd out real work; the idle case needs only a **heartbeat**, not a fallback
+conveyance path. A bee reading data it does not own is an **accepted trade-off** — that is what the
+TEEs are for.
+
+### One global log {#one-global-log}
+
+`[H]` A worker must be able to resume **any** job without knowing in advance which. That requires one
+log, not per-job logs — those turn resumption into a discovery problem across 11 nodes.
+
+`[M]` The log is divided **physically** into segments for collection (#collect-whole-segment). Segments
+are storage generations, **not** stores and not ACL domains.
+
+### Durability over latency {#durability-over-latency}
+
+`[H]` 30-second finality is fine; 1–2 minutes is acceptable. That is the **U** in DUDE.
+
+`[M]` It is also what makes the design tractable: 30 s is ~40 full consensus rounds at
+inter-continental RTT, so convergence has room to fail and retry. The binding constraint on job latency
+is **checkpoints per job**, not finality — reducing synchronisation points pays, shaving milliseconds
+does not.
+
+### Compaction is not an optimisation {#compaction-is-required}
+
+`[M]` The live frontier is megabytes while the raw log is gigabytes per day. On prepaid low-spec VPS
+that is the difference between fitting and not. `[H]` *"A car without wheels."*
+
+### Forward secrecy comes from key death {#secrecy-by-key-death}
+
+`[M]` Not from erasing ciphertext — on SSDs, CoW filesystems and rented block storage you cannot assert
+the old bytes are gone, and you do not own the layer that would. **Key destruction is the only erasure
+you control**, which is why live values must be re-encrypted forward (#conveyor).
+
+### Things that have been re-derived wrongly {#known-churn}
+
+Each was argued into place plausibly and then killed by a model. If you find yourself concluding one
+of these, the model that refutes it is in `experiments/`.
+
+| tempting conclusion | why it is wrong |
+|---|---|
+| split storage from attestation, so nodes hold no data | breaks ratification, severs commit-implies-possession, strands key epochs |
+| give each workflow its own log | work portability requires one global log (#one-global-log) |
+| a Merkle/MMR tree over the **log** | a log commits to positions and compaction scatters them |
+| chunking gives early detection of a lying node | detection is ~S/2 for any chunk size; chunking improves **recovery**, not detection |
+| a SNARK can establish that state is current | an old proof is a valid proof — currency is not computational (#the-lemma) |
+| storage nodes can witness their own monotonicity | they are the observed party; a common-mode failure is invisible to them |
+| aggressive key rotation improves forward secrecy | rotation without conveying creates epochs without retiring them (#conveyor) |
+
+---
+
 ## 1. The log
 
 ### One write vocabulary {#one-write-vocabulary}
