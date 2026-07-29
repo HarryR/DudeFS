@@ -221,6 +221,10 @@ class TestClusterCollection(unittest.TestCase):
     AGREE that a segment may be forgotten."""
 
     WIDTH = 8
+    AGE = DEFAULT.mempool.w_admit + DEFAULT.mempool.w_valid_margin + DELTA
+    """How long a segment must age before it may be collected. Every test here used to collect
+    inside this window and pass, because the floor was only applied on the locally-driven path --
+    which is to say those collections would have made their transactions replayable."""
 
     def setUp(self):
         self.c = Cluster()
@@ -252,13 +256,13 @@ class TestClusterCollection(unittest.TestCase):
         assert self.c.nodes[0].drain(seg, now), "nothing to relocate"
         self.c.pump(now)
         self.c.pump(now + DELTA)
-        return now + DELTA
+        return now + DELTA + self.AGE  # past the dedup floor, or collection is rightly refused
 
     def test_every_node_collects_and_they_stay_identical(self):
         """The property the design rests on: a segment is forgotten by all three, and `A_state`
         still agrees afterwards. Collection must lose history without losing state."""
         now = self._churn(12)
-        self._drain(0, now)
+        now = self._drain(0, now)
         before = {n.store.accumulator() for n in self.c.nodes}
 
         for node in self.c.nodes:
@@ -280,7 +284,7 @@ class TestClusterCollection(unittest.TestCase):
         """No distinguished proposer, and no requirement that everyone notice: one node proposes,
         the others ratify what they can recompute, and all three collect."""
         now = self._churn(12)
-        self._drain(0, now)
+        now = self._drain(0, now)
 
         self.assertEqual(self.c.nodes[0].maybe_collect(now), 0)
         self.c.pump(now)
@@ -293,7 +297,7 @@ class TestClusterCollection(unittest.TestCase):
         segment and the fold, not of who spoke first -- so their signatures POOL rather than split
         the quorum between two rival claims."""
         now = self._churn(12)
-        self._drain(0, now)
+        now = self._drain(0, now)
         a, b = self.c.nodes[0], self.c.nodes[1]
 
         self.assertEqual(a.maybe_collect(now), 0)
@@ -307,7 +311,7 @@ class TestClusterCollection(unittest.TestCase):
         """Ratification happens WHILE the evidence still exists. A peer that recomputes a different
         fold signs nothing -- and after collection nobody could ever have checked it."""
         now = self._churn(12)
-        self._drain(0, now)
+        now = self._drain(0, now)
         liar, honest = self.c.nodes[0], self.c.nodes[1]
 
         forged = ops.Compaction(0, honest.store.head(), crypto.ACC_IDENTITY)  # not the real fold
@@ -322,7 +326,7 @@ class TestClusterCollection(unittest.TestCase):
         only its own head, which is a hint; afterwards every node carries a quorum-signed height
         that cannot be forged upward (#monotonicity)."""
         now = self._churn(12)
-        self._drain(0, now)
+        now = self._drain(0, now)
         for node in self.c.nodes:
             self.assertEqual(node.store.floor(), 0, "a floor before any checkpoint existed")
 
@@ -343,7 +347,7 @@ class TestClusterCollection(unittest.TestCase):
         checkpoint than the one it has already attested -- which would read as a regression and
         convict it."""
         now = self._churn(12)
-        self._drain(0, now)
+        now = self._drain(0, now)
         node = self.c.nodes[0]
         self.assertEqual(node.maybe_collect(now), 0)
         self.c.pump(now)
@@ -361,7 +365,7 @@ class TestClusterCollection(unittest.TestCase):
         quorum-signed height can be shown that one key holds one value, and that another key holds
         nothing at all (#state-root). `acc_state` can do neither."""
         now = self._churn(12)
-        self._drain(0, now)
+        now = self._drain(0, now)
         self.assertEqual(self.c.nodes[0].maybe_collect(now), 0)
         self.c.pump(now)
 
@@ -383,7 +387,7 @@ class TestClusterCollection(unittest.TestCase):
         with a root it does not, gets no signature -- otherwise the quorum would be vouching for a
         commitment nobody checked."""
         now = self._churn(12)
-        self._drain(0, now)
+        now = self._drain(0, now)
         liar, honest = self.c.nodes[0], self.c.nodes[1]
 
         forged = ops.Compaction(0, honest.store.head(), honest.store.accumulator(), smt.EMPTY)
@@ -393,11 +397,38 @@ class TestClusterCollection(unittest.TestCase):
         self.assertNotIn(forged.attest_bytes(), honest.shares, "signed a root it did not recompute")
         self.assertIn(0, honest.store.segments())
 
+    def test_a_segment_inside_the_dedup_window_is_refused(self):
+        """The floor, on the PEER-driven path. It used to be a parameter of `maybe_collect` stashed
+        on the node for `_try_collect` to read later, so a collection driven by a peer used whatever
+        a local call had last left behind -- usually zero. Collection forgets `op_hash`, so a
+        segment collected inside the mempool's admission window makes its transactions replayable
+        again, and a floor that applies on one path and not the other is not a floor."""
+        now = self._churn(12)
+        assert self.c.nodes[0].drain(0, now), "nothing to relocate"
+        self.c.pump(now)
+        self.c.pump(now + DELTA)
+        young = now + DELTA  # deliberately NOT past the floor
+
+        self.assertEqual(self.c.nodes[0].maybe_collect(young), 0, "it may still PROPOSE")
+        self.c.pump(young)
+        for i, node in enumerate(self.c.nodes):
+            self.assertIn(0, node.store.segments(), f"node {i} collected a young segment")
+
+        # ...and the same segment collects once it has aged, so the refusal is the floor and not
+        # some other obstacle.
+        older = young + self.AGE
+        for node in self.c.nodes:
+            node.collecting.clear()
+        self.assertEqual(self.c.nodes[0].maybe_collect(older), 0)
+        self.c.pump(older)
+        for i, node in enumerate(self.c.nodes):
+            self.assertNotIn(0, node.store.segments(), f"node {i} never collected")
+
     def test_a_partitioned_node_does_not_collect_alone(self):
         """One node is not a quorum, however sure it is. Collection is irreversible, so the node
         that cannot reach its peers must simply keep the segment."""
         now = self._churn(12)
-        self._drain(0, now)
+        now = self._drain(0, now)
         lone = name_of(self.c.keys[0].public)
         for other in self.c.keys[1:]:
             self.c.board.cut(lone, name_of(other.public))

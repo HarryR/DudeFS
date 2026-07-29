@@ -41,7 +41,7 @@ from .net.envelope import Envelope, Frame, MessageId, SignedEnvelope, new_messag
 from .net.link import LinkTunables, Peer, Transport
 from .net.postman import Postman
 from .net.transports import address_of
-from .store import Commitment, Entry, Store, attest, ops, settle
+from .store import Commitment, Entry, Store, StoreError, attest, ops, settle
 from .store.management import Management
 from .tunables import DEFAULT, Tunables
 
@@ -111,8 +111,6 @@ class Node:
     settled_buckets: set[int] = field(default_factory=set)
     collecting: dict[int, ops.Compaction] = field(default_factory=dict)
     collected: set[int] = field(default_factory=set)
-    dedup_window: int = 0
-    """How long a segment must age before collecting; see `#collection-refused-while-live`."""
     last_probe: Millis = 0
     """When this node last asked its peers where they were (#cross-attestation)."""
     shares: dict[bytes, dict[crypto.PublicKey, crypto.Signature]] = field(default_factory=dict)
@@ -213,7 +211,20 @@ class Node:
         self._flood(Verb.SUBMIT, txn.raw, now)
         return True
 
-    def maybe_collect(self, now: Millis, dedup_window: int = 0) -> int | None:
+    @property
+    def dedup_window(self) -> Millis:
+        """How long a segment must age before it may be collected.
+
+        DERIVED from the mempool's own admission window rather than passed in. It used to be a
+        parameter of `maybe_collect` stashed on the node for `_try_collect` to read later — so a
+        collection driven by a PEER used whatever a local call had last left behind, which was
+        usually zero. The floor exists because collection forgets `op_hash` and the mempool would
+        then re-admit a transaction inside it; a floor that applies on one code path and not the
+        other is not a floor."""
+        t = self.tunables.mempool
+        return t.w_admit + t.w_valid_margin
+
+    def maybe_collect(self, now: Millis) -> int | None:
         """Offer a collection if some segment is ready. Returns the segment, or None.
 
         NO DISTINGUISHED PROPOSER. Any node that notices may say so, and two nodes noticing the same
@@ -228,7 +239,6 @@ class Node:
                 seg, self.store.head(), self.store.accumulator(), self.store.state_root()
             )
             self.collecting[seg] = claim
-            self.dedup_window = dedup_window
             self._ratify_locally(claim, now)
             self._flood(Verb.COLLECT, claim.attest_bytes(), now)
             return seg
@@ -281,7 +291,14 @@ class Node:
         attested = ops.Compaction(
             claim.segment, claim.height, claim.acc_state, claim.root, bitmap, tuple(sigs)
         )
-        self.store.collect(claim.segment, attested, now=now, dedup_window=self.dedup_window)
+        try:
+            self.store.collect(claim.segment, attested, now=now, dedup_window=self.dedup_window)
+        except StoreError:
+            # NOT YET, rather than a fault. The dedup floor is a timing condition: the segment is
+            # still young enough that the mempool would re-admit one of its transactions, and it
+            # will collect once it has aged. Letting this escape would take the node down from a
+            # frame handler, which is the same shape as the duplicate-settlement crash.
+            return
         self.collected.add(claim.segment)
         self.collecting.pop(claim.segment, None)
 
