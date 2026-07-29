@@ -289,11 +289,19 @@ class Store:
         Ordering is NOT decided here either: that is the discriminator's job one layer up (2.13)."""
         settled: list[tuple[Index, crypto.Digest]] = []
         dropped: list[Dropped] = []
+        already = self._settled_hashes(tuple(tx.op_hash for tx in batch))
         self.db.execute("BEGIN IMMEDIATE")
         try:
             acc = self.accumulator()
             idx = self.head()
             for tx in batch:
+                if tx.op_hash in already:
+                    # Already in the log — it arrived by TRANSFER while this bucket was settling.
+                    # A duplicate is a routine outcome and is reported rather than raised: the
+                    # alternative was `entry.op_hash UNIQUE` throwing out of a frame handler, i.e.
+                    # a race reported as corruption (#no-exceptions-for-control-flow).
+                    dropped.append(Dropped(tx.op_hash, settle.Reason.SETTLED))
+                    continue
                 verdict, layer = settle.evaluate(self, tx, auth)
                 # Walrus on `why` rather than `if not verdict`, because a verdict is exactly "no
                 # reason or a reason" — testing the reason IS testing success, and it narrows the
@@ -399,6 +407,18 @@ class Store:
             else:
                 self.db.execute("DELETE FROM live WHERE store=? AND name=?", (m.store, m.name))
         return acc
+
+    def _settled_hashes(self, want: tuple[crypto.Digest, ...]) -> set[bytes]:
+        """Which of these op hashes the log already holds. One query, not one per transaction."""
+        if not want:
+            return set()
+        # The only interpolation is a run of `?`, one per parameter; every value is still bound.
+        marks = ",".join("?" * len(want))
+        rows = self.db.execute(
+            f"SELECT op_hash FROM entry WHERE op_hash IN ({marks})",  # noqa: S608
+            want,
+        )
+        return {r[0] for r in rows}
 
     # -- the invariant, made checkable --------------------------------------- #
 

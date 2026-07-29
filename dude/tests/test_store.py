@@ -730,3 +730,35 @@ class TestClaimRoundTrip(unittest.TestCase):
             ops.Compaction.from_attest_bytes(entry.encode())
         with self.assertRaises(DudeError):
             ops.Compaction.decode(entry.attest_bytes())
+
+
+class TestTransferAndSettlementRace(unittest.TestCase):
+    """A transaction can now reach a node by two roads — settlement through the quorum, and log
+    transfer from a peer that got there first. A node catching up mid-bucket sees both."""
+
+    def setUp(self):
+        self.s = store.Store()
+        self.kp = crypto.Keypair.generate()
+
+    def test_a_transaction_already_in_the_log_is_dropped_not_raised(self):
+        """`entry.op_hash UNIQUE` is what makes a settled transaction unrepeatable, and it used to
+        enforce that by throwing out of a frame handler — a routine race reported as corruption."""
+        t = tx(self.kp, muts=(ops.Set(ops.STORE_DATA, b"k", b"v"),))
+        first = self.s.apply((t,), auth=None)
+        self.assertEqual(len(first.settled), 1)
+
+        again = self.s.apply((t,), auth=None)  # must not raise
+        self.assertEqual(again.settled, ())
+        self.assertEqual([d.why for d in again.dropped], [settle.Reason.SETTLED])
+        self.assertEqual(self.s.head(), 1, "the duplicate took a log position")
+
+    def test_the_survivors_of_a_mixed_batch_still_land(self):
+        """One duplicate must not take the batch down with it."""
+        old = tx(self.kp, muts=(ops.Set(ops.STORE_DATA, b"k", b"v"),))
+        self.s.apply((old,), auth=None)
+        fresh = tx(self.kp, muts=(ops.Set(ops.STORE_DATA, b"j", b"w"),), ts=2)
+
+        got = self.s.apply((old, fresh), auth=None)
+        self.assertEqual(len(got.settled), 1)
+        self.assertEqual([d.why for d in got.dropped], [settle.Reason.SETTLED])
+        self.assertIsNotNone(self.s.get(ops.STORE_DATA, b"j"))

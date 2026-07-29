@@ -28,6 +28,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from . import quorum
@@ -40,9 +41,12 @@ from .net.envelope import Envelope, Frame, MessageId, SignedEnvelope, new_messag
 from .net.link import LinkTunables, Peer, Transport
 from .net.postman import Postman
 from .net.transports import address_of
-from .store import Store, attest, ops, settle
+from .store import Entry, Store, attest, ops, settle
 from .store.management import Management
 from .tunables import DEFAULT, Tunables
+
+_PULL_MAX = 256
+"""Entries per `ENTRIES` reply. A bound on message size, not on how far a joiner may be behind."""
 
 type Millis = int
 
@@ -64,6 +68,8 @@ HANDLED = frozenset(
         Verb.RATIFY,
         Verb.FRONTIER,
         Verb.STANDING,
+        Verb.PULL,
+        Verb.ENTRIES,
     }
 )
 """Verbs this node acts on."""
@@ -142,29 +148,18 @@ class Node:
         self._handle(got.envelope, now)
 
     def _handle(self, env: SignedEnvelope, now: Millis) -> None:
-        match env.env.verb:
-            case Verb.SUBMIT:
-                self._on_submit(env, now)
-            case Verb.PROPOSE:
-                self._on_propose(env, now)
-            case Verb.ENDORSE:
-                self._on_endorse(env, now)
-            case Verb.COLLECT:
-                self._on_collect(env, now)
-            case Verb.RATIFY:
-                self._on_ratify(env, now)
-            case Verb.FRONTIER:
-                self._on_frontier(env, now)
-            case Verb.STANDING:
-                self._on_standing(env, now)
-            case Verb.PING:
-                self._reply(env, Verb.PONG, b"", now)
-            case _:
-                # Either a reply (already correlated by the postman) or a verb we have not built.
-                # Both are no-ops HERE, but they are different facts — see `REPLIES` /
-                # `UNIMPLEMENTED`, which say which is which rather than leaving one default branch
-                # to mean both.
-                pass
+        """Dispatch by verb.
+
+        A TABLE rather than a chain of cases: it is the same statement `HANDLED` already makes, and
+        keeping the two in one place means a verb cannot be listed as handled while having nowhere
+        to go. A missing entry is not a silent default — see `REPLIES` and `UNIMPLEMENTED`, which
+        say which of the two kinds of nothing it is."""
+        fn = _DISPATCH.get(env.env.verb)
+        if fn is not None:
+            fn(self, env, now)
+
+    def _on_ping(self, env: SignedEnvelope, now: Millis) -> None:
+        self._reply(env, Verb.PONG, b"", now)
 
     def _on_submit(self, env: SignedEnvelope, now: Millis) -> None:
         """A transaction offered by a client, or relayed by a peer.
@@ -340,12 +335,69 @@ class Node:
             self.store.sightings(), now, self.tunables.attest.fresh_within, self.shunned()
         )
 
+    # -- log transfer (#collect-whole-segment) -------------------------------------------------- #
+
+    def catch_up(self, now: Millis) -> None:
+        """Ask the peer that claims the longest log for what we are missing.
+
+        Driven by what the gossip already told us: a sighting carries that peer's head, so being
+        behind is something a node NOTICES rather than something it has to be told. One peer, not
+        all of them — the reply is bulk, and asking everyone would multiply it by the roster."""
+        mine = self.store.head()
+        ahead = [s for s in self.store.sightings() if s.claim.head > mine]
+        if not ahead:
+            return
+        best = max(ahead, key=lambda s: s.claim.head)
+        env = Envelope(best.by, Verb.PULL, _mid(), codec.encode([mine + 1])).sign(self.me, now)
+        self.postman.mailbox.post(env, now, self.tunables.net.ttl)
+
+    def _on_pull(self, env: SignedEnvelope, now: Millis) -> None:
+        """Serve a run of settled entries from `frm`.
+
+        BOUNDED, because a joiner asking from 1 would otherwise pull the whole log into one message.
+        The requester asks again from where it got to, so the bound costs round trips and never
+        correctness."""
+        frm = codec.as_int(codec.as_seq(codec.decode(env.env.body), 1)[0])
+        run = []
+        for e in self.store.entries(max(frm, 1)):
+            if len(run) >= _PULL_MAX:
+                break
+            kind = (
+                ops.KIND_COMPACTION if isinstance(e.item, ops.Compaction) else ops.KIND_TRANSACTION
+            )
+            run.append([e.idx, kind, e.item.raw])
+        self._reply(env, Verb.ENTRIES, codec.encode(run), now)
+
+    def _on_entries(self, env: SignedEnvelope, _now: Millis) -> None:
+        """Replay what we were sent, at the indices it was settled at.
+
+        Only what is strictly ahead of our head: `replay` preserves positions, so re-applying an
+        entry we already hold would collide rather than be idempotent. Signatures are verified
+        inside `replay` — a bulk transfer is exactly where trusting the sender would be cheapest and
+        worst."""
+        want = self.store.head() + 1
+        run: list[Entry] = []
+        for row in codec.as_seq(codec.decode(env.env.body)):
+            f = codec.as_seq(row, 3)
+            idx, kind, raw = codec.as_int(f[0]), codec.as_int(f[1]), codec.as_bytes(f[2])
+            if idx < want:
+                continue
+            item = (
+                ops.Compaction.decode(raw)
+                if kind == ops.KIND_COMPACTION
+                else ops.SignedTransaction.decode(raw)
+            )
+            run.append(Entry(idx, item))
+        if run:
+            self.store.replay(run)
+
     # -- the round ----------------------------------------------------------------------------- #
 
     def tick(self, now: Millis) -> None:
         """Advance: send what is due, reap expiries, then propose for any closed bucket."""
         if now - self.last_probe >= self.tunables.attest.probe_every:
             self.probe(now)
+        self.catch_up(now)
         self.postman.tick(now)
         self._propose(now)
 
@@ -470,3 +522,13 @@ def _claim_from(body: bytes) -> ops.Compaction | None:
         return ops.Compaction.from_attest_bytes(body)
     except DudeError:
         return None
+
+
+_DISPATCH: dict[Verb, Callable[[Node, SignedEnvelope, Millis], None]] = {
+    v: getattr(Node, f"_on_{v.name.lower()}") for v in HANDLED
+}
+"""Verb to handler, DERIVED from `HANDLED` rather than listed beside it.
+
+So the two cannot drift: a verb added to `HANDLED` without a matching `_on_<verb>` fails at import,
+and a handler with no verb is unreachable and obvious. The convention is load-bearing, which is the
+only kind worth having."""

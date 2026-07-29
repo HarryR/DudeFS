@@ -12,11 +12,11 @@ from __future__ import annotations
 
 import unittest
 
-from ..core import crypto
+from ..core import codec, crypto
 from ..net import Verb
 from ..net.envelope import Envelope, Frame, seal
 from ..net.transports import InProc, Switchboard, address_of, name_of
-from ..node import HANDLED, REPLIES, UNIMPLEMENTED, Node
+from ..node import _DISPATCH, HANDLED, REPLIES, UNIMPLEMENTED, Node
 from ..store import Store, attest, ops, smt
 from ..store.management import Management, Role
 from ..tunables import DEFAULT
@@ -181,19 +181,16 @@ class TestVerbCoverage(unittest.TestCase):
         self.assertEqual(HANDLED | REPLIES | UNIMPLEMENTED, frozenset(Verb))
         self.assertFalse(HANDLED & REPLIES)
 
-    def test_the_unimplemented_set_is_exactly_gossip_and_sync(self):
-        """Two clusters, and both are known work rather than open questions:
+    def test_the_unimplemented_set_is_exactly_mempool_dissemination(self):
+        """One cluster left, and it is known work rather than an open question: `ANNOUNCE` /
+        `FETCH` are MEMPOOL.md §3's flood-announce-pull-bodies dissemination. Today a transaction
+        spreads by re-flooding the whole `SUBMIT`, which works and does not scale."""
+        self.assertEqual(UNIMPLEMENTED, {Verb.ANNOUNCE, Verb.FETCH})
 
-        * `ANNOUNCE` / `FETCH` — MEMPOOL.md §3's flood-announce-pull-bodies dissemination. Today a
-          transaction spreads by re-flooding the whole `SUBMIT`, which works and does not scale.
-        * `PULL` / `ENTRIES` — SPEC §8 log transfer, which is what BOOTSTRAP needs: a joining node
-          holds the manager key and one address, and learns the log from it. `FRONTIER` was the
-          third of these and is now built, because the attestation duty needed exactly its
-          question — "where are you now" (#cross-attestation)."""
-        self.assertEqual(
-            UNIMPLEMENTED,
-            {Verb.ANNOUNCE, Verb.FETCH, Verb.PULL, Verb.ENTRIES},
-        )
+    def test_every_handled_verb_has_a_handler(self):
+        """Derived, not listed: `_DISPATCH` is built from `HANDLED`, so a verb claimed as handled
+        with no `_on_<verb>` fails at import rather than falling into a silent default."""
+        self.assertEqual(set(_DISPATCH), HANDLED)
 
     def test_an_unimplemented_verb_is_ignored_not_fatal(self):
         """A peer sending a verb we have not built must cost its message and nothing more."""
@@ -644,3 +641,103 @@ class TestTheAngelDuty(unittest.TestCase):
         self.assertIn(victim.me.public, node.shunned())
         self.assertEqual(node.roster(), before, "shunning changed the roster")
         self.assertIn(victim.me.public, node.roster())
+
+
+class TestCatchUp(unittest.TestCase):
+    """Log transfer (`PULL` / `ENTRIES`). A node that fell behind must be able to come back on its
+    own -- out-of-band restore is forbidden, so this is the ONLY way back for a node that is merely
+    behind, and the first half of the only way back for one that is wiped."""
+
+    def setUp(self):
+        self.c = Cluster()
+        self.client = self.c.mgr
+
+    def _write(self, n: int, now: int = T0, deaf=()) -> int:
+        """Write `n` transactions. Nodes in `deaf` are simply not ticked or delivered to, which is
+        a cleaner model of "was down" than cutting links: it misses the round entirely."""
+        for i in range(n):
+            tx = ops.writes(ops.Set(D, crypto.h(f"k{i}".encode()), f"v{i}".encode())).sign(
+                self.client, now
+            )
+            self.c.submit(self.client, tx, to=_first_awake(self.c, deaf), now=now)
+            for when in (now, now + DELTA):
+                for node in self.c.nodes:
+                    if node.me.public in deaf:
+                        continue
+                    node.tick(when)
+                for node in self.c.nodes:
+                    if node.me.public in deaf:
+                        continue
+                    for frame in self.c.board.drain(name_of(node.me.public)):
+                        node.receive(frame, when)
+            now += DELTA
+        return now
+
+    def test_a_node_that_missed_everything_catches_up(self):
+        """The whole point, end to end: it slept, it woke, it asked, it is level."""
+        asleep = self.c.nodes[2]
+        now = self._write(4, deaf={asleep.me.public})
+        self.assertLess(asleep.store.head(), self.c.nodes[0].store.head(), "it did not fall behind")
+
+        for _ in range(4):
+            for node in self.c.nodes:
+                node.tick(now)
+            for node in self.c.nodes:
+                for frame in self.c.board.drain(name_of(node.me.public)):
+                    node.receive(frame, now)
+            now += DELTA
+
+        self.assertEqual(asleep.store.head(), self.c.nodes[0].store.head())
+        self.assertEqual(asleep.store.accumulator(), self.c.nodes[0].store.accumulator())
+        self.assertEqual(asleep.store.state_root(), self.c.nodes[0].store.state_root())
+
+    def test_being_behind_is_noticed_not_announced(self):
+        """A node learns it is behind from the gossip it already runs -- a sighting carries the
+        peer's head -- so nobody has to tell it, and nobody could lie it into a false sense of
+        being level without forging a signature."""
+        asleep = self.c.nodes[2]
+        now = self._write(3, deaf={asleep.me.public})
+
+        # Hand-driven rather than pumped, because a pump would close the gap in the same breath as
+        # revealing it -- `tick` catches up -- and then there would be nothing left to observe.
+        asleep.probe(now)
+        asleep.tick(now)
+        for node in self.c.nodes[:2]:
+            for frame in self.c.board.drain(name_of(node.me.public)):
+                node.receive(frame, now)
+            node.tick(now)
+        for frame in self.c.board.drain(name_of(asleep.me.public)):
+            asleep.receive(frame, now)
+
+        ahead = [s for s in asleep.store.sightings() if s.claim.head > asleep.store.head()]
+        self.assertNotEqual(ahead, [], "the gossip did not reveal the gap")
+
+    def test_a_pull_is_bounded(self):
+        """A joiner asking from 1 must not pull the entire log into one message. It asks again from
+        where it got to, so the bound costs round trips and never correctness."""
+        now = self._write(3)
+        a, b = self.c.nodes[0], self.c.nodes[1]
+        env = Envelope(a.me.public, Verb.PULL, b"m" * 16, codec.encode([1])).sign(b.me, now)
+        a.receive(seal(env), now)
+        frames = self.c.board.drain(name_of(b.me.public))
+        self.assertNotEqual(frames, [], "no reply to a PULL")
+
+    def test_replaying_what_we_already_hold_is_refused_not_duplicated(self):
+        """`replay` preserves positions, so an entry we already hold would COLLIDE rather than be
+        idempotent. The filter is what makes a re-sent range harmless."""
+        now = self._write(3)
+        a, b = self.c.nodes[0], self.c.nodes[1]
+        before = b.store.head()
+        env = Envelope(b.me.public, Verb.PULL, b"m" * 16, codec.encode([1])).sign(a.me, now)
+        b.receive(seal(env), now)
+        for frame in self.c.board.drain(name_of(a.me.public)):
+            a.receive(frame, now)  # everything here is already held
+        self.assertEqual(a.store.head(), before)
+        self.assertEqual(a.store.accumulator(), b.store.accumulator())
+
+
+def _first_awake(c: Cluster, deaf) -> int:
+    for i, node in enumerate(c.nodes):
+        if node.me.public not in deaf:
+            return i
+    raise AssertionError("every node is deaf")

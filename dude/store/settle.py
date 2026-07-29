@@ -72,6 +72,14 @@ class Reason(Enum):
     """May become satisfiable — a grant can be re-issued."""
     GUARD = "guard"
     """May become satisfiable — a predicate can become true again."""
+    SETTLED = "settled"
+    """Permanently dead, and NOT a failure: this transaction is already in the log.
+
+    It exists because a transaction can now reach a node by two roads — settlement through the
+    quorum, and log transfer from a peer that got there first (#collect-whole-segment). A node
+    catching up while the same bucket settles will see both. `entry.op_hash UNIQUE` is what makes a
+    settled transaction unrepeatable, and without this it enforced that by raising out of a frame
+    handler: a routine race, reported as corruption."""
 
 
 @dataclass(frozen=True, slots=True)
