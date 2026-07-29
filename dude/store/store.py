@@ -73,12 +73,15 @@ CREATE TABLE IF NOT EXISTS live (
     name   BLOB NOT NULL,
     head   INTEGER NOT NULL,           -- the settled index of the last write (#provenance)
     value  BLOB NOT NULL,              -- ciphertext; held here so it outlives its log entry
+    epoch  INTEGER NOT NULL DEFAULT 0, -- which keyepoch `value` is under (#conveyor)
     path   BLOB NOT NULL,              -- H(store||name): where this key sits in the state root
     PRIMARY KEY (store, name)
 );
 -- UNIQUE deliberately: `path` is a hash of the primary key, so a duplicate is a collision, and a
 -- collision must be an error rather than two keys silently sharing one leaf (#state-root).
 CREATE UNIQUE INDEX IF NOT EXISTS live_by_path ON live(path);
+-- The conveyor's whole question -- "is this epoch drained yet" -- is one indexed count.
+CREATE INDEX IF NOT EXISTS live_by_epoch ON live(epoch);
 
 -- Internal nodes of the state root. A MEMO OF A PURE FUNCTION and nothing more: every row is
 -- recomputable from `live` alone, so truncating this table costs time and cannot cost correctness.
@@ -235,9 +238,9 @@ class Store:
         chain behind it is a traversal (`history`), and compaction may have collapsed it
         (#provenance)."""
         row = self.db.execute(
-            "SELECT head, value FROM live WHERE store=? AND name=?", (store, name)
+            "SELECT head, value, epoch FROM live WHERE store=? AND name=?", (store, name)
         ).fetchone()
-        return Held(row[0], row[1]) if row else None
+        return Held(row[0], row[1], row[2]) if row else None
 
     def prefix(self, store: int, pre: bytes) -> Iterator[Row]:
         """Every live `(name, provenance, value)` in `store` whose name starts with `pre`, in name
@@ -253,17 +256,17 @@ class Store:
         # is what stops a reordered SELECT silently transposing provenance and value.
         if hi is None:  # the prefix is all 0xFF; nothing sorts above it
             rows = self.db.execute(
-                "SELECT name, head, value FROM live WHERE store=? AND name>=? ORDER BY name",
+                "SELECT name, head, value, epoch FROM live WHERE store=? AND name>=? ORDER BY name",
                 (store, pre),
             )
         else:
             rows = self.db.execute(
-                "SELECT name, head, value FROM live"
+                "SELECT name, head, value, epoch FROM live"
                 " WHERE store=? AND name>=? AND name<? ORDER BY name",
                 (store, pre, hi),
             )
-        for name, head, value in rows:
-            yield Row(name, head, value)
+        for name, head, value, epoch in rows:
+            yield Row(name, head, value, epoch)
 
     def holds(self, pred: ops.Predicate) -> bool:
         """Evaluate one predicate against committed state. See the free `holds`, which is the one
@@ -388,9 +391,9 @@ class Store:
             self.tree.invalidate(path)
             if isinstance(m, ops.Set):
                 self.db.execute(
-                    "INSERT OR REPLACE INTO live (store, name, head, value, path)"
-                    " VALUES (?,?,?,?,?)",
-                    (m.store, m.name, idx, m.value, path),
+                    "INSERT OR REPLACE INTO live (store, name, head, value, path, epoch)"
+                    " VALUES (?,?,?,?,?,?)",
+                    (m.store, m.name, idx, m.value, path, m.epoch),
                 )
                 acc = crypto.acc_add(acc, element(m.store, m.name, m.value))
             else:
@@ -582,6 +585,30 @@ class Store:
         if self.accumulator() != before:
             raise StoreError("collection changed the state accumulator")
         return at
+
+    # -- THE CONVEYOR (#conveyor) ---------------------------------------------- #
+
+    def epoch_live(self, epoch: int) -> int:
+        """How many live values are still encrypted under `epoch`.
+
+        A pure function of live state, so every node computes the same number at the same log
+        position and nobody has to be trusted about it. Zero is the ONLY condition under which that
+        epoch's key may die — retire one value too early and that value is unreadable by everyone,
+        forever, which is the failure this whole system exists to prevent."""
+        row = self.db.execute("SELECT COUNT(*) FROM live WHERE epoch=?", (epoch,)).fetchone()
+        return row[0] or 0
+
+    def epochs(self) -> dict[int, int]:
+        """Live values per epoch, `EPOCH_NONE` excluded — the conveyor's backlog, by age.
+
+        Sorted, since a caller wants the oldest first: that is the epoch closest to dying."""
+        return {
+            r[0]: r[1]
+            for r in self.db.execute(
+                "SELECT epoch, COUNT(*) FROM live WHERE epoch<>? GROUP BY epoch ORDER BY epoch",
+                (ops.EPOCH_NONE,),
+            )
+        }
 
     # -- THE STATE ROOT (#state-root) ------------------------------------------ #
 

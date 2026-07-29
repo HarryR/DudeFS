@@ -509,6 +509,36 @@ fallback path.
 
 **Rotating keys faster without conveying faster buys nothing.**
 
+`[M]` **A value carries its epoch in CLEARTEXT.** Retention is refcounted over live values
+(#wrapped-masters), and a node that cannot decrypt must still be able to count — put the epoch inside
+the AEAD and the refcount becomes underivable, so no key can ever die. The leak is therefore forced
+rather than chosen: which epoch a value sits under is public, and so is roughly when it was last
+written or conveyed.
+
+`[M]` **Retirement is an ordinary transaction guarded by `Drained`** — the one predicate that ranges
+over all keys, because it answers the one question that must. Every node evaluates it identically at
+the same log position, replay reproduces it, and the entry records in the log what it was conditional
+on. A retirement that should not have happened settles nowhere.
+
+`[H]` The ordering is the safety. Re-encryption **drains the last references**; deletion becomes
+possible only at zero. Retire an epoch one value early and that value is unreadable by everyone
+forever — the loss of committed state this system exists to prevent — so the guard refuses, exactly
+as #collection-refused-while-live refuses a segment that still holds live values.
+
+`[M]` **A stale write cannot resurrect a dead epoch**, and needs no special rule to stop it: an epoch
+outlives a validity window by orders of magnitude, so a client writing under a retired epoch is a
+client far outside the admission window and is refused there. `[H]` The windows are an implicit
+liveness contract on both sides — a node whose clock is broken cannot play — and the coherence they
+provide is relied on here rather than re-earned.
+
+`[M]` **What retirement can and cannot do.** Deleting the wraps makes a master unobtainable *from the
+record*, and #state-root proves that absence to anyone holding the root — key death is a revocation,
+and #absence-is-revocation now has a proof. Whether a holder that once had the master in memory
+forgot it is not provable by anyone. That is the accepted TEE trade-off, not a gap this closes.
+
+`[M]` One conveyance does two jobs: it drains the old epoch **and** vacates the old segment, since it
+writes at the head. The belt moves once and two things fall off the back.
+
 ## 8. Transport
 
 ### Transport adds no trust {#transport-adds-no-trust}

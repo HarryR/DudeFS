@@ -32,6 +32,9 @@ class Held(NamedTuple):
 
     provenance: Index
     value: bytes
+    epoch: int = ops.EPOCH_NONE
+    """Which keyepoch `value` is under. A reader needs it to pick a key, and the conveyor needs it
+    to count (#conveyor)."""
 
 
 class Row(NamedTuple):
@@ -43,6 +46,7 @@ class Row(NamedTuple):
     name: bytes
     provenance: Index
     value: bytes
+    epoch: int = ops.EPOCH_NONE
 
 
 class Reader(Protocol):
@@ -53,6 +57,8 @@ class Reader(Protocol):
     def get(self, store: int, name: bytes) -> Held | None: ...
 
     def prefix(self, store: int, pre: bytes) -> Iterator[Row]: ...
+
+    def epoch_live(self, epoch: int) -> int: ...
 
 
 class Layer:
@@ -74,7 +80,7 @@ class Layer:
     def __init__(self, base: Reader):
         self._base = base
         # None == tombstone; a key absent from the dict falls through to the base
-        self._delta: dict[tuple[int, bytes], bytes | None] = {}
+        self._delta: dict[tuple[int, bytes], Held | None] = {}
         self._log: list[ops.Mutation] = []
 
     # -- Reader ------------------------------------------------------------- #
@@ -83,32 +89,47 @@ class Layer:
         key = (store, name)
         if key not in self._delta:
             return self._base.get(store, name)
-        hit = self._delta[key]
-        return None if hit is None else Held(PENDING, hit)
+        return self._delta[key]
 
     def prefix(self, store: int, pre: bytes) -> Iterator[Row]:
         """Merged view. A tombstone in this layer HIDES a base row — without that, a deleted key
         would reappear in an enumeration, which is how `Management.nodes()` would resurrect a node
         removed earlier in the same transaction."""
         rows: dict[bytes, Held] = {
-            name: Held(prov, val) for name, prov, val in self._base.prefix(store, pre)
+            name: Held(prov, val, ep) for name, prov, val, ep in self._base.prefix(store, pre)
         }
-        for (st, name), val in self._delta.items():
+        for (st, name), held in self._delta.items():
             if st != store or not name.startswith(pre):
                 continue
-            if val is None:
+            if held is None:
                 rows.pop(name, None)
             else:
-                rows[name] = Held(PENDING, val)
+                rows[name] = held
         for name in sorted(rows):
-            prov, val = rows[name]
-            yield Row(name, prov, val)
+            yield Row(name, rows[name].provenance, rows[name].value, rows[name].epoch)
+
+    def epoch_live(self, epoch: int) -> int:
+        """The base count, corrected for what this layer has done to it.
+
+        A layer that only delegated would let a transaction retire an epoch it is itself writing
+        under, in the same batch — the count has to see uncommitted work for the same reason a
+        guard does."""
+        n = self._base.epoch_live(epoch)
+        for (st, name), held in self._delta.items():
+            was = self._base.get(st, name)
+            if was is not None and was.epoch == epoch:
+                n -= 1
+            if held is not None and held.epoch == epoch:
+                n += 1
+        return n
 
     # -- writes ------------------------------------------------------------- #
 
     def apply(self, m: ops.Mutation) -> None:
         """Record one mutation. Nothing reaches the underlying store."""
-        self._delta[(m.store, m.name)] = m.value if isinstance(m, ops.Set) else None
+        self._delta[(m.store, m.name)] = (
+            Held(PENDING, m.value, m.epoch) if isinstance(m, ops.Set) else None
+        )
         self._log.append(m)
 
     @property
@@ -129,6 +150,8 @@ def holds(reader: Reader, pred: ops.Predicate) -> bool:
     `absent` is a presence test; `holds` compares the digest the author QUOTED against the stored
     ciphertext (11.4d), never a value the node derived. Taking a `Reader` rather than a `Store` is
     what lets a guard see mutations from earlier steps of its own transaction."""
+    if isinstance(pred, ops.Drained):
+        return reader.epoch_live(pred.epoch) == 0
     cur = reader.get(pred.store, pred.name)
     if isinstance(pred, ops.Absent):
         return cur is None

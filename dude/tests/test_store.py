@@ -28,8 +28,11 @@ def tx(kp, preds=(), muts=(), st=ops.STORE_DATA, ts=1):
 
 
 def _at(st, m):
-    """Re-home a mutation written without a store onto `st`."""
-    return ops.Set(st, m.name, m.value) if isinstance(m, ops.Set) else ops.Del(st, m.name)
+    """Re-home a mutation written without a store onto `st`.
+
+    Carries the epoch through. It did not, and every conveyor test silently wrote `EPOCH_NONE` --
+    a builder that quietly drops a field tests something other than what it says."""
+    return ops.Set(st, m.name, m.value, m.epoch) if isinstance(m, ops.Set) else ops.Del(st, m.name)
 
 
 class TestSettlement(unittest.TestCase):
@@ -43,7 +46,7 @@ class TestSettlement(unittest.TestCase):
         r = self.s.apply((tx(self.kp, (), (ops.Set(0, self.K, b"v1"),)),))
         self.assertEqual(len(r.settled), 1)
         idx, _ = r.settled[0]
-        self.assertEqual(self.s.get(ops.STORE_DATA, self.K), (idx, b"v1"))
+        self.assertEqual(self.s.get(ops.STORE_DATA, self.K), (idx, b"v1", ops.EPOCH_NONE))
         self.assertEqual(self.s.head(), idx)
 
     def test_absent_is_not_empty_bytes(self):
@@ -320,7 +323,8 @@ class TestCrossStorePredicates(unittest.TestCase):
         )
         back = ops.SignedTransaction.decode(t.raw)
         self.assertEqual(back, t)
-        self.assertEqual([p.store for p in back.txn.guards], [7, 9])
+        keyed = [p for p in back.txn.guards if not isinstance(p, ops.Drained)]
+        self.assertEqual([p.store for p in keyed], [7, 9])
         self.assertTrue(back.verify())
 
 

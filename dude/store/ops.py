@@ -59,6 +59,10 @@ STORE_DATA = 1  # 1+ are data stores
 # Mutations                                                                    #
 # --------------------------------------------------------------------------- #
 
+EPOCH_NONE = 0
+"""Not encrypted under any keyepoch — management rows, and anything else with no key to retire.
+Epochs are minted from 1, so a zero here is a statement rather than a missing field."""
+
 _SET = b"s"
 _DEL = b"d"
 
@@ -71,9 +75,19 @@ class Set:
     store: int
     name: bytes
     value: bytes
+    epoch: int = EPOCH_NONE
+    """Which keyepoch `value` is encrypted under (#conveyor).
+
+    CLEARTEXT, and it has to be: retention is refcounted over live values (#wrapped-masters), and a
+    node that cannot decrypt must still be able to count. Putting it inside the AEAD would make the
+    refcount underivable and key death impossible.
+
+    The leak is therefore forced rather than chosen — which epoch a value sits under is public, so
+    roughly when it was last written or conveyed is public. That belongs on the closed leakage
+    list, not in a footnote."""
 
     def encode(self) -> list:
-        return [_SET, self.store, self.name, self.value]
+        return [_SET, self.store, self.name, self.value, self.epoch]
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,8 +110,10 @@ def _mutation_from(v: codec.Bencodable) -> Mutation:
     p = codec.as_seq(v)
     tag = codec.as_bytes(p[0]) if p else b""
     if tag == _SET:
-        p = codec.as_seq(v, 4)
-        return Set(codec.as_int(p[1]), codec.as_bytes(p[2]), codec.as_bytes(p[3]))
+        p = codec.as_seq(v, 5)
+        return Set(
+            codec.as_int(p[1]), codec.as_bytes(p[2]), codec.as_bytes(p[3]), codec.as_int(p[4])
+        )
     if tag == _DEL:
         p = codec.as_seq(v, 3)
         return Del(codec.as_int(p[1]), codec.as_bytes(p[2]))
@@ -110,6 +126,7 @@ def _mutation_from(v: codec.Bencodable) -> Mutation:
 
 _ABSENT = b"a"
 _HOLDS = b"h"
+_DRAINED = b"d"
 
 # Entry kinds, as stored in the log (#collection-is-a-log-entry: a compaction is an entry like any
 # other).
@@ -145,7 +162,24 @@ class Holds:
         return [_HOLDS, self.store, self.name, self.digest]
 
 
-type Predicate = Absent | Holds
+@dataclass(frozen=True, slots=True)
+class Drained:
+    """No live value anywhere is encrypted under `epoch` — so its key may die (#conveyor).
+
+    A PREDICATE rather than a special case in settlement, which buys three things at once: every
+    node evaluates it identically at the same log position, replay reproduces it, and the retirement
+    entry says in the log what it was conditional on. Retirement is then an ordinary transaction.
+
+    It is the one predicate that is not about a single key, because it is the one question whose
+    answer must range over all of them."""
+
+    epoch: int
+
+    def encode(self) -> list:
+        return [_DRAINED, self.epoch]
+
+
+type Predicate = Absent | Holds | Drained
 
 
 def _predicate_from(v: codec.Bencodable) -> Predicate:
@@ -154,6 +188,8 @@ def _predicate_from(v: codec.Bencodable) -> Predicate:
     if tag == _ABSENT:
         p = codec.as_seq(v, 3)
         return Absent(codec.as_int(p[1]), codec.as_bytes(p[2]))
+    if tag == _DRAINED:
+        return Drained(codec.as_int(codec.as_seq(v, 2)[1]))
     if tag == _HOLDS:
         p = codec.as_seq(v, 4)
         return Holds(
@@ -244,10 +280,15 @@ class Transaction:
         return tuple(seen)
 
     def reads(self) -> tuple[tuple[int, bytes], ...]:
-        """Every `(store, key)` a guard depends on."""
+        """Every `(store, key)` a guard depends on.
+
+        `Drained` contributes none: it depends on every key at once, so naming its dependencies is
+        not something this can express. It is evaluated at settlement like any other guard, which
+        is where a whole-state question has a single well-defined answer."""
         seen: dict[tuple[int, bytes], None] = {}
         for g in self.guards:
-            seen.setdefault((g.store, g.name), None)
+            if not isinstance(g, Drained):
+                seen.setdefault((g.store, g.name), None)
         return tuple(seen)
 
     def stores(self) -> frozenset[int]:
@@ -330,7 +371,7 @@ class SignedTransaction:
         return self.txn.effects()
 
 
-def _satisfied_by(pred: Predicate, post: crypto.Digest | None) -> bool:
+def _satisfied_by(pred: Absent | Holds, post: crypto.Digest | None) -> bool:
     """Would `pred` hold against a key left in state `post`?"""
     if isinstance(pred, Absent):
         return post is None
@@ -339,12 +380,20 @@ def _satisfied_by(pred: Predicate, post: crypto.Digest | None) -> bool:
 
 def falsifies(a: SignedTransaction, b: SignedTransaction) -> bool:
     """Would `a`'s effects invalidate any of `b`'s predicates? Compared per `(store, key)`, so a
-    name in one store never falsifies a predicate about the same name in another."""
+    name in one store never falsifies a predicate about the same name in another.
+
+    `Drained` is skipped: it is not about a key, so there is no effect to compare it against. That
+    costs nothing, because a guard is evaluated again at settlement — two transactions that would
+    invalidate each other simply both enter the bucket, and the second one's guard fails there. The
+    backstop is the same one that makes guards meaningful in the first place."""
     eff = a.effects()
-    return any(
-        (p.store, p.name) in eff and not _satisfied_by(p, eff[(p.store, p.name)])
-        for p in b.txn.guards
-    )
+    for p in b.txn.guards:
+        if isinstance(p, Drained):
+            continue
+        key = (p.store, p.name)
+        if key in eff and not _satisfied_by(p, eff[key]):
+            return True
+    return False
 
 
 # --------------------------------------------------------------------------- #
