@@ -58,11 +58,11 @@ is `min(n−q, 2q−n−1)` — **seizure is unavailability**, so the availabili
 | 2 — segments | **done**, 14 tests, all four Fable amendments closed |
 | 3 — state root (SMT) | **done**, 30 tests — and it is signed, so it proves something |
 | 4 — conveyor | **half done** — `Store.migrate` is the same-value half; re-encryption is not written, so no key has ever died |
-| 5 — compactor role | **quorum half done** — collection is driven and ratified in a cluster (below), and `FRONTIER` landed with step 7. Outstanding: the compactor's *timestamp* (the freshness half, unwritten), and `PULL`/`ENTRIES` |
+| 5 — compactor role | **done bar log transfer** — collection is driven and ratified in a cluster; `FRONTIER` landed with step 7; the timestamp role is **struck**, not built (below). Outstanding: `PULL`/`ENTRIES` and join-as-recovery |
 | 6 — revocation | **collapsed to nothing** — see below |
-| 7 — angel duty | **done**, 38 tests — and grew a second half, cross-attestation (below) |
+| 7 — angel duty | **done**, 49 tests — grew two more halves: cross-attestation and gathered freshness (below) |
 
-**191 tests green.** Gate unchanged (bottom of this file).
+**202 tests green.** Gate unchanged (bottom of this file).
 
 ## Step 0 — correct the record  ✅ mostly
 
@@ -170,6 +170,32 @@ someone has to prove is prefix-free.
 is what a **quorum** vouches for, the attestation's is what **one node** stakes its identity on.
 Ratification covers it — `_on_collect` recomputes the root with the height and the fold, so a node
 claiming a root it did not compute gets no signature.
+
+## Step 5 — the compactor's timestamp: STRUCK  ✅ ★
+
+`[H]` **A timestamp cannot be ratified, only asserted.** Ratification is *recompute, don't trust* —
+a peer signs a collection claim because it re-derived the fold — and **nobody can re-derive somebody
+else's clock**. The sketched design had ratifiers vouching for something they could not check.
+
+So the compactor's timestamp role is **deleted rather than built**, and freshness rides the
+attestation gossip that already exists: `Attestation.at` is the time that node's own clock read.
+One less tier, which is the direction the budget has pushed throughout.
+
+**What it buys is a BOUND.** An adversary without `f+1` keys cannot manufacture recent statements —
+only replay old ones, and old ones look old. Silent staleness becomes **visible** staleness, and
+`attest.staleness` turns "how far behind am I" from an unknown into a number. `[H]` A **diagnostic**;
+adversarial liveness is not available here and is not claimed.
+
+**The single-link cold client is back in scope, without a priest.** A relay holds no key but its own,
+so one link is enough to *gather* `f+1` signed statements the client verifies itself — which was the
+priest's entire job. `#freshness-needs-many`'s strike is lifted.
+
+**Rulings `[H]`:** the window is a **cluster-wide tunable** (`fresh_within`) because two clients
+disagreeing about whether one bundle is fresh is a defect; it is **symmetric**, since a future
+timestamp would still read as recent when replayed tomorrow; and it **must exceed `probe_every`**, or
+a bundle is stale by construction — the same shape as S4's dedup floor. A **clock fault is never
+convictable**: an NTP step backwards is a road bump, it degrades what a node contributes and drops it
+from the `f+1`, and `contradiction` still never looks at time.
 
 ## Step 4 — the conveyor  ◐ half
 
