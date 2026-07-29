@@ -1,0 +1,181 @@
+"""Attestations, and what two of them prove (#monotonicity, #cross-attestation).
+
+The asymmetry worth remembering while reading these: a missed rollback costs a stale read, and a
+false conviction permanently kills a paid-for node. Several tests below exist only to pin the
+NON-faults — the honest crash, the partition, the node that merely made progress.
+"""
+
+import itertools
+import tempfile
+import unittest
+
+from dude.core import crypto
+from dude.core.errors import DudeError
+from dude.store import attest, ops, store
+
+D = ops.STORE_DATA
+
+
+def _claim(seq: int, head: int, floor: int = 0, acc: bytes = b"s") -> attest.Attestation:
+    """A claim with the two monotone quantities set independently, so a test can move one."""
+    ck = ops.Compaction(0, floor, crypto.ACC_IDENTITY) if floor else None
+    return attest.Attestation(seq, head, crypto.acc_element(acc), crypto.acc_element(b"log"), ck)
+
+
+class TestEncoding(unittest.TestCase):
+    """Both halves of every pair, because C1 shipped an `attest_bytes` with no inverse and every
+    claim on the wire decoded to nothing in total silence."""
+
+    def setUp(self):
+        self.kp = crypto.Keypair.generate()
+
+    def test_a_claim_round_trips(self):
+        c = _claim(7, 4242, floor=4000)
+        self.assertEqual(attest.Attestation.decode(c.encode()), c)
+
+    def test_a_claim_with_no_checkpoint_round_trips(self):
+        """The young-cluster case: no collection has happened, so there is no floor to carry."""
+        c = _claim(1, 3)
+        self.assertIsNone(c.ratified)
+        self.assertEqual(attest.Attestation.decode(c.encode()).floor, 0)
+
+    def test_a_signed_attestation_round_trips_and_verifies(self):
+        s = attest.SignedAttestation.make(self.kp, _claim(7, 4242))
+        back = attest.SignedAttestation.decode(s.encode())
+        self.assertEqual(back, s)
+        self.assertTrue(back.verify())
+
+    def test_a_tampered_claim_does_not_verify(self):
+        """The signature covers the claim, so raising the head after signing is not a lie anyone
+        will believe -- it is simply not a signed statement any more."""
+        s = attest.SignedAttestation.make(self.kp, _claim(7, 4242))
+        forged = attest.SignedAttestation(s.by, _claim(7, 999_999), s.sig)
+        self.assertFalse(forged.verify())
+
+    def test_an_entry_is_not_an_attestation(self):
+        """An attestation is a statement ABOUT a log, not an entry IN one. Neither decodes as the
+        other, so a domain confusion is refused rather than half-read."""
+        with self.assertRaises(DudeError):
+            attest.Attestation.decode(ops.Compaction(1, 2, crypto.ACC_IDENTITY).encode())
+
+
+class TestContradiction(unittest.TestCase):
+    def setUp(self):
+        self.kp = crypto.Keypair.generate()
+        self.other = crypto.Keypair.generate()
+
+    def _sign(self, claim, kp=None):
+        return attest.SignedAttestation.make(kp or self.kp, claim)
+
+    def test_progress_is_not_a_fault(self):
+        """The overwhelmingly common case, and the one a false positive would destroy."""
+        a, b = self._sign(_claim(1, 100)), self._sign(_claim(2, 140))
+        self.assertIsNone(attest.contradiction(a, b))
+
+    def test_a_regression_convicts(self):
+        a, b = self._sign(_claim(1, 100)), self._sign(_claim(2, 90))
+        ev = attest.contradiction(a, b)
+        assert ev is not None
+        self.assertEqual(ev.fault, attest.Fault.REGRESSION)
+        self.assertEqual(ev.culprit, self.kp.public)
+        self.assertEqual((ev.earlier.claim.head, ev.later.claim.head), (100, 90))
+
+    def test_a_dropped_floor_convicts_even_when_the_head_climbs(self):
+        """A restored node can replay traffic and pass its old head while having LOST the
+        checkpoint it once attested. The head alone would miss it; the floor does not."""
+        a = self._sign(_claim(1, 100, floor=90))
+        b = self._sign(_claim(2, 120, floor=50))
+        ev = attest.contradiction(a, b)
+        assert ev is not None
+        self.assertEqual(ev.fault, attest.Fault.REGRESSION)
+
+    def test_equivocation_convicts(self):
+        a, b = self._sign(_claim(4, 100)), self._sign(_claim(4, 101))
+        ev = attest.contradiction(a, b)
+        assert ev is not None
+        self.assertEqual(ev.fault, attest.Fault.EQUIVOCATION)
+
+    def test_the_same_statement_twice_is_not_equivocation(self):
+        """A node re-serves its current attestation to everyone who asks. Identical bytes at one
+        counter value are one statement, not two -- otherwise answering twice would be fatal."""
+        c = _claim(4, 100)
+        self.assertIsNone(attest.contradiction(self._sign(c), self._sign(c)))
+
+    def test_argument_order_does_not_matter(self):
+        a, b = self._sign(_claim(1, 100)), self._sign(_claim(2, 90))
+        self.assertEqual(attest.contradiction(a, b), attest.contradiction(b, a))
+
+    def test_two_keys_are_never_a_conviction(self):
+        """Divergence, not conviction. Two nodes disagreeing proves something is wrong and NOTHING
+        about who -- and shunning on it would let a liar get an honest node shunned."""
+        a = self._sign(_claim(1, 100, acc=b"one"))
+        b = self._sign(_claim(1, 100, acc=b"two"), kp=self.other)
+        self.assertIsNone(attest.contradiction(a, b))
+
+    def test_unsigned_bytes_are_not_evidence(self):
+        """Anyone can WRITE an incriminating claim. Only the key can make it evidence."""
+        real = self._sign(_claim(1, 100))
+        planted = attest.SignedAttestation(self.kp.public, _claim(2, 5), real.sig)
+        self.assertIsNone(attest.contradiction(real, planted))
+
+    def test_a_stalled_node_is_not_convicted(self):
+        """Silence and staleness are not faults (#cross-attestation). A frozen node attests
+        truthfully forever -- it is not FRESH, which is a different property this cannot supply."""
+        a, b = self._sign(_claim(1, 100)), self._sign(_claim(9, 100))
+        self.assertIsNone(attest.contradiction(a, b))
+
+
+class TestTheInterlock(unittest.TestCase):
+    """`Store.attestation` is where an honest crash could manufacture evidence against an honest
+    node, and conviction is terminal. These are the tests that keep that from happening."""
+
+    def setUp(self):
+        self.s = store.Store()
+        self.kp = crypto.Keypair.generate()
+
+    def test_the_counter_strictly_increases(self):
+        seqs = [self.s.attestation().seq for _ in range(5)]
+        self.assertEqual(seqs, sorted(set(seqs)), "a reused counter is a self-conviction")
+        self.assertEqual(seqs[0], 1)
+
+    def test_the_counter_is_committed_before_the_caller_can_sign(self):
+        """The crash case: build a claim, never sign it, crash. The counter must NOT come back:
+        a gap costs nothing, and reuse over different bytes convicts by the node's own key."""
+        dropped = self.s.attestation()  # signed by nobody; the process died here
+        again = self.s.attestation()
+        self.assertGreater(again.seq, dropped.seq, "the counter came back after a crash")
+
+    def test_a_reopened_store_does_not_reuse_the_counter(self):
+        """Same, across a restart rather than a dropped claim: the counter is durable, not a
+        process-lifetime variable. On disk, because that is where a restore happens."""
+        with tempfile.TemporaryDirectory() as d:
+            path = f"{d}/log.db"
+            first = store.Store(path)
+            seq = first.attestation().seq
+            first.close()
+            self.assertGreater(store.Store(path).attestation().seq, seq)
+
+    def test_the_snapshot_is_coherent(self):
+        """One transaction, so head and both folds belong to the same moment. Five separate reads
+        could attest a head whose accumulator came from before it."""
+        a = self.s.attestation()
+        self.assertEqual(a.head, self.s.head())
+        self.assertEqual(a.acc_state, self.s.accumulator())
+        self.assertEqual(a.acc_log, self.s.log_accumulator())
+
+    def test_there_is_no_floor_before_the_first_checkpoint(self):
+        """A young cluster attests zero and only the hint carries information. Freshness starts at
+        the first collection, not at genesis."""
+        self.assertIsNone(self.s.checkpoint())
+        self.assertEqual(self.s.attestation().floor, 0)
+
+    def test_an_honest_node_never_convicts_itself(self):
+        """The property the whole design hangs on, stated directly: every consecutive pair of a
+        healthy node's own attestations must be clean."""
+        signed = [attest.SignedAttestation.make(self.kp, self.s.attestation()) for _ in range(6)]
+        for a, b in itertools.pairwise(signed):
+            self.assertIsNone(attest.contradiction(a, b), "an honest node convicted itself")
+
+
+if __name__ == "__main__":
+    unittest.main()

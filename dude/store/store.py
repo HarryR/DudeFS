@@ -31,7 +31,7 @@ from typing import NamedTuple
 
 from ..core import codec, crypto
 from ..core.errors import DudeError
-from . import ops, settle
+from . import attest, ops, settle
 from .layer import Held, Index, Row, _prefix_upper, holds
 
 _SCHEMA = """
@@ -533,6 +533,13 @@ class Store:
         self._log_add(at, marker.op_hash)
         self._segment_add(self.segment_of(at), at, marker.op_hash)
 
+        # The checkpoint is RETAINED here rather than derived from the log later, because this
+        # marker is itself an entry and a later collection will delete it -- and a node that
+        # forgot its own floor would attest zero and look like it had regressed. Monotone by
+        # policy at exactly one place: a node never adopts a checkpoint older than its floor.
+        if marker.height > self.floor():
+            self._set_meta("checkpoint", marker.raw)
+
         row = self.db.execute("SELECT acc FROM segment WHERE id=?", (seg,)).fetchone()
         if row is not None:
             # ONE subtraction, not a per-entry fold. This is what a segment buys.
@@ -545,6 +552,45 @@ class Store:
         if self.accumulator() != before:
             raise StoreError("collection changed the state accumulator")
         return at
+
+    # -- ATTESTATION (#monotonicity) ------------------------------------------ #
+
+    def checkpoint(self) -> ops.Compaction | None:
+        """The highest quorum-ratified checkpoint this node holds, or None before the first."""
+        raw = self._get_meta("checkpoint", b"")
+        return ops.Compaction.decode(raw) if raw else None
+
+    def floor(self) -> Index:
+        """That checkpoint's height. Zero until one exists — a young cluster has no floor."""
+        ck = self.checkpoint()
+        return ck.height if ck is not None else 0
+
+    def attestation(self) -> attest.Attestation:
+        """Bump the counter and read one coherent snapshot to attest.
+
+        THE INTERLOCK, and the highest-risk line in the design: the counter is bumped and
+        COMMITTED here, and the caller signs only what this returns. Signing over uncommitted
+        state is therefore not expressible rather than merely discouraged.
+
+        It matters because the consequence is asymmetric (#cross-attestation): peers keep the
+        evidence and conviction is terminal, so a node that signed a height it had not yet made
+        durable would destroy itself on an honest crash. A crash here SKIPS a counter value
+        instead, and a gap means nothing to anyone.
+
+        One transaction for the same reason: five separate reads could interleave with a
+        settlement and attest a head whose accumulator belongs to a different moment."""
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            seq = int.from_bytes(self._get_meta("attest_seq", b"")) + 1
+            self._set_meta("attest_seq", seq.to_bytes(8))
+            claim = attest.Attestation(
+                seq, self.head(), self.accumulator(), self.log_accumulator(), self.checkpoint()
+            )
+            self.db.execute("COMMIT")
+        except Exception:
+            self.db.execute("ROLLBACK")
+            raise
+        return claim
 
     def stragglers(self, seg: int) -> tuple[tuple[int, bytes], ...]:
         """The `(store, name)` pairs this segment still holds live.

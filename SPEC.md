@@ -328,10 +328,68 @@ single-link clients are therefore out of scope.
 
 ### Monotonicity is a duty {#monotonicity}
 
-`[M]` Nodes attest a monotone height and never regress; clients take the max. A regression is a
-**signed contradiction** anyone can keep — accountability rather than prevention, which needs durable
-state and no trusted hardware. `[H]` Out-of-band restore is forbidden: it regresses the height and
-convicts the node for an operator convenience.
+`[M]` Nodes attest a monotone height and never regress; clients take the max over `f+1`. A regression
+is a **signed contradiction** anyone can keep — accountability rather than prevention, which needs
+durable state and no trusted hardware.
+
+`[M]` The attested floor is the **highest quorum-ratified checkpoint** the node holds. Its own head
+rides along as a **hint** and is never a floor: a private opinion of one's own height is forgeable
+*upward* at no cost, and #freshness-needs-many's "withhold, never forge" holds only for something
+carrying the quorum's signatures. Before the first collection there is no floor, so a young cluster
+attests zero and only the hint carries information.
+
+`[M]` **`head` must remain monotone under collection.** It is `MAX(idx)`, and collection writes its
+marker at `head+1` before deleting the segment it collects. Were it a count instead, every honest node
+would convict itself the moment it collected.
+
+`[M]` The attestation is a **pure function of committed store state**, and the counter is committed
+*before* it is signed. Signing over uncommitted state is then unconstructible rather than merely
+discouraged: a crash **skips** a counter value, and skipping is free where reuse is fatal. This is the
+highest-risk interlock in the design — see #cross-attestation, where an honest node convicting itself
+is permanent.
+
+`[M]` The counter is separate from the height. Ordering two claims by the quantity under dispute is
+circular: if the counter *were* the height, a regression would be unorderable and so unconvictable.
+
+`[H]` Out-of-band restore is forbidden: it regresses the height and convicts the node for an operator
+convenience.
+
+### Peers keep the evidence {#cross-attestation}
+
+`[M]` A node relays the latest attestation it holds for each peer, **verbatim and signed by that
+peer**, never as an opinion about it. A relay can therefore neither forge nor alter one — it cannot
+frame a peer and cannot be framed by one — so the only lie left anywhere in the scheme is **silence**,
+which is measurable against the rest of the cluster.
+
+`[M]` Peers are the **keepers**. Accountability otherwise rests on some client having happened to be
+watching, and the accident this catches — a snapshot restored overnight — happens precisely when
+nobody is. Every peer a node ever spoke to holds evidence against its future self.
+
+`[M]` Relayed evidence **only ever convicts, never vouches**. A sighting is worth exactly the signature
+it carries, so no reputation accrues and collusive vouching buys nothing.
+
+`[M]` This is the partial repair of #known-churn's refutation: a node cannot witness its own
+monotonicity, but it can witness its peers'. Single-node and minority rollback become obvious. A
+genuine common-mode failure — everything rolling back together — stays invisible.
+
+`[M]` **Conviction is a single key contradicting itself**: the same counter over different bytes, or
+an increased counter over a decreased height. Clock-free, self-contained, permanent, and attributable.
+Accumulators are deliberately not in the predicate — they are unordered, so nothing can regress.
+
+`[M]` **Divergence is not conviction.** Two keys claiming the same head with different accumulators
+proves something is wrong and *nothing about who*; resolving it needs the data. Shunning on divergence
+would let a liar get an honest node shunned.
+
+`[H]` Conviction is **terminal for the identity**. Recovery is re-join as a new node — the path a
+forbidden restore already forces (#monotonicity), so this adds no mechanism. There is no
+rehabilitation and no un-shun protocol.
+
+`[H]` Shunning follows **proven self-contradiction only** — never silence, staleness, or divergence. A
+partition makes honest nodes look stalled, and a cluster that shunned on staleness would eat itself.
+
+`[M]` Shunning is a **local read policy**: it does not alter the roster or the quorum arithmetic. A
+shunned node still counts toward `n`, so a heavily-shunned cluster **stalls rather than proceeding** on
+a thinned quorum, which is the correct direction under #durability-over-latency.
 
 ## 7. Keys
 
