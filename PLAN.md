@@ -57,12 +57,12 @@ is `min(n−q, 2q−n−1)` — **seizure is unavailability**, so the availabili
 | 1 — failure domains | **done**, 7 tests |
 | 2 — segments | **done**, 14 tests, all four Fable amendments closed |
 | 3 — state root (SMT) | **done**, 30 tests — and it is signed, so it proves something |
-| 4 — conveyor | **half done** — `Store.migrate` is the same-value half; re-encryption is not written, so no key has ever died |
+| 4 — conveyor | **done**, 17 tests — a key can now die |
 | 5 — compactor role | **done bar log transfer** — collection is driven and ratified in a cluster; `FRONTIER` landed with step 7; the timestamp role is **struck**, not built (below). Outstanding: `PULL`/`ENTRIES` and join-as-recovery |
 | 6 — revocation | **collapsed to nothing** — see below |
 | 7 — angel duty | **done**, 49 tests — grew two more halves: cross-attestation and gathered freshness (below) |
 
-**202 tests green.** Gate unchanged (bottom of this file).
+**219 tests green.** Gate unchanged (bottom of this file).
 
 ## Step 0 — correct the record  ✅ mostly
 
@@ -170,6 +170,74 @@ someone has to prove is prefix-free.
 is what a **quorum** vouches for, the attestation's is what **one node** stakes its identity on.
 Ratification covers it — `_on_collect` recomputes the root with the height and the fold, so a node
 claiming a root it did not compute gets no signature.
+
+## Step 5 — the compactor's timestamp: STRUCK  ✅ ★
+
+`[H]` **A timestamp cannot be ratified, only asserted.** Ratification is *recompute, don't trust* —
+a peer signs a collection claim because it re-derived the fold — and **nobody can re-derive somebody
+else's clock**. The sketched design had ratifiers vouching for something they could not check.
+
+So the compactor's timestamp role is **deleted rather than built**, and freshness rides the
+attestation gossip that already exists: `Attestation.at` is the time that node's own clock read.
+One less tier, which is the direction the budget has pushed throughout.
+
+**What it buys is a BOUND.** An adversary without `f+1` keys cannot manufacture recent statements —
+only replay old ones, and old ones look old. Silent staleness becomes **visible** staleness, and
+`attest.staleness` turns "how far behind am I" from an unknown into a number. `[H]` A **diagnostic**;
+adversarial liveness is not available here and is not claimed.
+
+**The single-link cold client is back in scope, without a priest.** A relay holds no key but its own,
+so one link is enough to *gather* `f+1` signed statements the client verifies itself — which was the
+priest's entire job. `#freshness-needs-many`'s strike is lifted.
+
+**Rulings `[H]`:** the window is a **cluster-wide tunable** (`fresh_within`) because two clients
+disagreeing about whether one bundle is fresh is a defect; it is **symmetric**, since a future
+timestamp would still read as recent when replayed tomorrow; and it **must exceed `probe_every`**, or
+a bundle is stale by construction — the same shape as S4's dedup floor. A **clock fault is never
+convictable**: an NTP step backwards is a road bump, it degrades what a node contributes and drops it
+from the `f+1`, and `contradiction` still never looks at time.
+
+## Step 4 — the conveyor  ✅ ★
+
+**The first time forward secrecy is real.** `#secrecy-by-key-death` said secrecy comes from keys
+dying rather than from erasing ciphertext, and until now **no key had ever died** — nothing could say
+which epoch a value was under, so nothing could tell when one was finished with.
+
+`ops.Set` carries `epoch` in **cleartext**. Forced, not chosen: a node that cannot decrypt must still
+be able to count, so an epoch inside the AEAD makes the refcount underivable and key death impossible.
+The leak — which epoch a value sits under, hence roughly when it was last conveyed — goes on §7's
+closed list rather than into a footnote.
+
+**Retirement is an ordinary transaction guarded by `ops.Drained`**, a new predicate and the only one
+that ranges over all keys, because it answers the one question that must. Every node evaluates it
+identically at the same position, replay reproduces it, and the entry records in the log what it was
+conditional on — so an early retirement settles nowhere. It is the exact twin of `collect()` refusing
+a segment that still holds live values, and it matters for the same reason squared: retire one value
+early and that value is unreadable **by everyone, forever**.
+
+`Layer.epoch_live` corrects the base count by its own delta, so a transaction cannot retire an epoch
+it is itself writing under — a guard has to see uncommitted work or it is not a guard.
+
+**A stale write cannot resurrect a dead epoch, and needs no rule to stop it `[H]`.** An epoch outlives
+a validity window by orders of magnitude, so a client writing under a retired epoch is far outside the
+admission window and is refused there. The windows are an implicit liveness contract on both sides;
+that coherence is relied on rather than re-earned. *(I had proposed a second guard here; it was
+redundant machinery for a case the window already excludes.)*
+
+**What retirement can and cannot do.** Deleting the wraps makes a master unobtainable *from the
+record*, and #state-root proves that absence — key death is a revocation, and #absence-is-revocation
+finally has a proof. Whether a holder that once had it in memory forgot is provable by nobody: the
+accepted TEE trade-off, not a gap this closes.
+
+**One conveyance does two jobs** — drains the old epoch *and* vacates the old segment, since it writes
+at the head. The belt moves once, two things fall off the back.
+
+**Found while testing:** the shared `tx` builder dropped the epoch when re-homing a mutation onto a
+store, so every conveyor test silently wrote `EPOCH_NONE`. A builder that quietly drops a field tests
+something other than what it claims.
+
+**Pressure is deliberately basic** `[H]`: `Store.epochs()` is the work queue, oldest first, since the
+oldest epoch is the one closest to dying. Tunable later; the mechanics are what had to be right.
 
 ## Step 5 — the compactor's timestamp: STRUCK  ✅ ★
 
