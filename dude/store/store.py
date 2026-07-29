@@ -120,6 +120,18 @@ class Entry:
     item: ops.LogEntry
 
 
+class Commitment(NamedTuple):
+    """What a node has SIGNED about its own state at one height (#monotonicity).
+
+    Handed to `replay` so a bulk transfer is checked against something the sender put its identity
+    behind, rather than believed because it arrived."""
+
+    head: Index
+    acc_state: crypto.Accumulator
+    acc_log: crypto.Accumulator
+    root: crypto.Digest
+
+
 class Dropped(NamedTuple):
     """A transaction that did not settle, and the reason. Named so a caller reads `d.why` rather
     than `d[1]`, and so a port cannot reverse the pair."""
@@ -320,7 +332,7 @@ class Store:
             raise
         return Applied(tuple(settled), tuple(dropped))
 
-    def replay(self, items: Iterable[Entry]) -> None:
+    def replay(self, items: Iterable[Entry], expect: Commitment | None = None) -> None:
         """Apply already-settled entries **at their recorded indices**, without re-adjudicating.
 
         This is #replay-does-not-readjudicate, and it differs from `apply` in two ways that
@@ -336,7 +348,12 @@ class Store:
           check is the accumulator against a quorum attestation (#collection-is-ratified),
           not a re-decision.
 
-        Signatures ARE verified: self-contained, always possible, and there is never an excuse."""
+        Signatures ARE verified: self-contained, always possible, and there is never an excuse.
+
+        `expect` is the sender's own signed commitment. When the run reaches the height it names,
+        every commitment must agree or the whole batch is ROLLED BACK — before it is committed, not
+        detected afterwards. Signatures alone are not enough here: they say an entry was authored,
+        never that the quorum settled it or that this is the log everyone else holds."""
         self.db.execute("BEGIN IMMEDIATE")
         try:
             acc = self.accumulator()
@@ -353,10 +370,27 @@ class Store:
                 self._require_verified(e)
                 acc = self._commit(e.idx, e.item, e.item.txn.mutations, acc)
             self._set_meta("acc", acc)
+            if expect is not None and self.head() == expect.head:
+                self._agrees(expect)
             self.db.execute("COMMIT")
         except Exception:
             self.db.execute("ROLLBACK")
             raise
+
+    def _agrees(self, expect: Commitment) -> None:
+        """Every commitment, not just one. `A_state` alone would pass a log that differs by any
+        number of superseded entries — exactly the divergence this system has already been bitten
+        by once."""
+        for what, mine, theirs in (
+            ("state", self.accumulator(), expect.acc_state),
+            ("log", self.log_accumulator(), expect.acc_log),
+            ("root", self.state_root(), expect.root),
+        ):
+            if mine != theirs:
+                raise StoreError(
+                    f"transferred log disagrees with the sender's signed {what} "
+                    f"at height {expect.head}"
+                )
 
     @staticmethod
     def _require_verified(e: Entry) -> None:

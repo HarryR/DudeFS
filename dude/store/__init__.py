@@ -22,12 +22,13 @@ from .ops import (
     writes,
 )
 from .settle import Verdict, evaluate, would_apply
-from .store import Applied, Entry, Index, Store, StoreError, element
+from .store import Applied, Commitment, Entry, Index, Store, StoreError, element
 
 __all__ = [
     "PENDING",
     "Absent",
     "Applied",
+    "Commitment",
     "Compaction",
     "Del",
     "Entry",

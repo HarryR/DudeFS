@@ -41,7 +41,7 @@ from .net.envelope import Envelope, Frame, MessageId, SignedEnvelope, new_messag
 from .net.link import LinkTunables, Peer, Transport
 from .net.postman import Postman
 from .net.transports import address_of
-from .store import Entry, Store, attest, ops, settle
+from .store import Commitment, Entry, Store, attest, ops, settle
 from .store.management import Management
 from .tunables import DEFAULT, Tunables
 
@@ -73,6 +73,13 @@ HANDLED = frozenset(
     }
 )
 """Verbs this node acts on."""
+
+SOLICITED = frozenset({Verb.ENTRIES})
+"""Verbs that are only ever an ANSWER to something this node asked for.
+
+An unsolicited one is dropped before dispatch. Without that, anyone at all could hand a node a run
+of log entries and have them applied — which was demonstrable: a stranger holding no grant and no
+roster seat added itself to a catching-up node's roster with one frame."""
 
 UNIMPLEMENTED = frozenset(Verb) - HANDLED - REPLIES
 """Specified, not yet built. Derived rather than listed, so it cannot drift from the other two, and
@@ -145,6 +152,8 @@ class Node:
             got = self.postman.deliver(frame, now)
         except DudeError:
             return  # their fault: drop the frame, keep serving
+        if got.envelope.env.verb in SOLICITED and got.reply is None:
+            return  # nobody asked; see `SOLICITED`
         self._handle(got.envelope, now)
 
     def _handle(self, env: SignedEnvelope, now: Millis) -> None:
@@ -389,6 +398,8 @@ class Node:
         entry we already hold would collide rather than be idempotent. Signatures are verified
         inside `replay` — a bulk transfer is exactly where trusting the sender would be cheapest and
         worst."""
+        if env.frm not in self.roster():
+            return  # bulk state from outside the roster is not a thing that happens
         want = self.store.head() + 1
         run: list[Entry] = []
         for row in codec.as_seq(codec.decode(env.env.body)):
@@ -402,8 +413,17 @@ class Node:
                 else ops.SignedTransaction.decode(raw)
             )
             run.append(Entry(idx, item))
-        if run:
-            self.store.replay(run)
+        if not run:
+            return
+        # Checked against what the sender SIGNED, and rolled back if it disagrees. `replay` verifies
+        # signatures, which says an entry was authored and never that the quorum settled it.
+        said = self.store.sighting(env.frm)
+        expect = (
+            Commitment(said.claim.head, said.claim.acc_state, said.claim.acc_log, said.claim.root)
+            if said is not None
+            else None
+        )
+        self.store.replay(run, expect)
 
     # -- the round ----------------------------------------------------------------------------- #
 

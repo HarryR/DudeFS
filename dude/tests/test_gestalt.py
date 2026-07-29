@@ -13,12 +13,13 @@ from __future__ import annotations
 import unittest
 
 from ..core import codec, crypto
+from ..core.errors import DudeError
 from ..net import Verb
 from ..net.envelope import Envelope, Frame, seal
 from ..net.transports import InProc, Switchboard, address_of, name_of
 from ..node import _DISPATCH, HANDLED, REPLIES, UNIMPLEMENTED, Node
 from ..store import Store, attest, ops, smt
-from ..store.management import Management, Role
+from ..store.management import P_NODE, Management, Role
 from ..tunables import DEFAULT
 
 WINDOW = DEFAULT.attest.fresh_within
@@ -750,3 +751,91 @@ def _first_awake(c: Cluster, deaf) -> int:
         if node.me.public not in deaf:
             return i
     raise AssertionError("every node is deaf")
+
+
+class TestTransferIsNotTrusted(unittest.TestCase):
+    """Bulk transfer moves state, so it is the single richest thing to lie to. Each test here is a
+    lie that WAS believed: an unsolicited run of entries could rewrite a catching-up node's roster,
+    which is to say its quorum."""
+
+    def setUp(self):
+        self.c = Cluster()
+        self.client = self.c.mgr
+        self.victim = self.c.nodes[2]
+        self.mgmt = Management(self.victim.store)
+
+    def _forged_roster_entry(self, author, at=None):
+        """A well-formed transaction that adds `author` to the roster, signed by `author`."""
+        who = P_NODE + bytes(author.public)
+        tx = ops.writes(
+            ops.Set(ops.STORE_MANAGEMENT, who, codec.encode([[b"attacker:1234"], []]))
+        ).sign(author, T0)
+        idx = self.victim.store.head() + 1 if at is None else at
+        return codec.encode([[idx, ops.KIND_TRANSACTION, tx.raw]])
+
+    def test_an_unsolicited_transfer_is_dropped(self):
+        """THE regression. A stranger holding no grant and no roster seat used to add itself to a
+        catching-up node's roster with one frame -- and a roster is a quorum."""
+        stranger = crypto.Keypair.generate()
+        before = self.mgmt.node_set()
+        env = Envelope(
+            self.victim.me.public, Verb.ENTRIES, b"z" * 16, self._forged_roster_entry(stranger)
+        ).sign(stranger, T0)
+        self.victim.receive(seal(env), T0)
+
+        self.assertEqual(self.mgmt.node_set(), before, "an unsolicited transfer was applied")
+        self.assertNotIn(stranger.public, self.mgmt.node_set())
+
+    def test_an_unsolicited_transfer_from_a_roster_member_is_dropped_too(self):
+        """Being in the roster does not make a shout an answer. Solicitation is checked before
+        membership, so a peer cannot push state at us either."""
+        peer = self.c.keys[0]
+        before = self.mgmt.node_set()
+        env = Envelope(
+            self.victim.me.public, Verb.ENTRIES, b"z" * 16, self._forged_roster_entry(peer)
+        ).sign(peer, T0)
+        self.victim.receive(seal(env), T0)
+        self.assertEqual(self.mgmt.node_set(), before)
+
+    def test_a_transfer_disagreeing_with_the_senders_signature_is_rolled_back(self):
+        """The sender signed a head, both accumulators and a root. A run that does not reproduce
+        them is refused BEFORE it commits -- not detected afterwards."""
+        peer, now = self.c.nodes[0], T0
+        awake = self.c.nodes[:2]
+        for i in range(3):  # the victim is never ticked, so it stays behind
+            tx = ops.writes(ops.Set(D, crypto.h(f"k{i}".encode()), b"v")).sign(self.client, now)
+            self.c.submit(self.client, tx, to=0, now=now)
+            for when in (now, now + DELTA):
+                for node in awake:
+                    node.tick(when)
+                for node in awake:
+                    for frame in self.c.board.drain(name_of(node.me.public)):
+                        node.receive(frame, when)
+            now += DELTA
+        before = self.victim.store.head()
+        self.assertLess(before, peer.store.head(), "the victim is not behind")
+
+        # A signed position that does not match the log the peer is about to send.
+        real = peer.store.attestation(now)
+        lie = attest.Attestation(
+            real.seq,
+            real.head,
+            crypto.acc_element(b"not the real fold"),
+            real.acc_log,
+            at=real.at,
+            root=real.root,
+        )
+        self.victim.store.witness(attest.SignedAttestation.make(peer.me, lie))
+
+        run = []
+        for e in peer.store.entries(before + 1):
+            kind = (
+                ops.KIND_COMPACTION if isinstance(e.item, ops.Compaction) else ops.KIND_TRANSACTION
+            )
+            run.append([e.idx, kind, e.item.raw])
+        env = Envelope(self.victim.me.public, Verb.ENTRIES, b"z" * 16, codec.encode(run)).sign(
+            peer.me, now
+        )
+        with self.assertRaises(DudeError):
+            self.victim._on_entries(env, now)
+        self.assertEqual(self.victim.store.head(), before, "a disagreeing run was committed")
