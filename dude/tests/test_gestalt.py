@@ -244,11 +244,14 @@ class TestClusterCollection(unittest.TestCase):
             self.c.pump(now)
         return now
 
-    def _drain(self, seg: int, now: int) -> None:
-        """Every node migrates the segment's stragglers forward for itself. Same values, so
-        `A_state` is unchanged -- which is exactly why the nodes still agree afterwards."""
-        for node in self.c.nodes:
-            node.store.migrate(seg, node.me, now)
+    def _drain(self, seg: int, now: int) -> int:
+        """ONE node offers the relocation; the quorum settles it. Every node then holds the same
+        entries, which per-node migration did not give -- it left `A_state` and the head identical
+        while the logs themselves differed."""
+        assert self.c.nodes[0].drain(seg, now), "nothing to relocate"
+        self.c.pump(now)
+        self.c.pump(now + DELTA)
+        return now + DELTA
 
     def test_every_node_collects_and_they_stay_identical(self):
         """The property the design rests on: a segment is forgotten by all three, and `A_state`
@@ -265,6 +268,12 @@ class TestClusterCollection(unittest.TestCase):
             self.assertNotIn(0, node.store.segments(), f"node {i} did not collect")
         self.assertEqual({n.store.accumulator() for n in self.c.nodes}, before, "state moved")
         self.assertEqual(len({n.store.head() for n in self.c.nodes}), 1, "log lengths diverged")
+        # A_LOG, not just A_state. Per-node migration used to leave these three assertions' worth
+        # of agreement -- same state, same head -- over byte-different logs, and only this one
+        # noticed. It is the assertion that was missing when the divergence shipped.
+        self.assertEqual(
+            len({n.store.log_accumulator() for n in self.c.nodes}), 1, "the LOGS diverged"
+        )
 
     def test_one_node_noticing_is_enough(self):
         """No distinguished proposer, and no requirement that everyone notice: one node proposes,

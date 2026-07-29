@@ -504,9 +504,14 @@ class TestSegments(unittest.TestCase):
         pinned = self.s.stragglers(0)
         self.assertTrue(pinned, "segment 0 still pins live values")
         before = self.s.accumulator()
-        moved = self.s.migrate(0, self.kp, now=2)
-        self.assertEqual(len(moved), len(pinned))
-        self.assertEqual(self.s.accumulator(), before, "same-value migration is A_state-invariant")
+        # Authored, then SETTLED — never applied behind settlement's back, which is what let
+        # migration write into the management store with authority checking off.
+        txn = self.s.migration(0, self.kp, now=2)
+        assert txn is not None
+        got = self.s.apply((txn,))
+        self.assertEqual(got.dropped, (), "the relocation was refused")
+        self.assertEqual(len(txn.steps), len(pinned))
+        self.assertEqual(self.s.accumulator(), before, "relocation is A_state-invariant")
         self.assertEqual(self.s.stragglers(0), ())
         self.s.collect(0)  # now possible
         self.assertNotIn(0, self.s.segments())
@@ -557,6 +562,15 @@ class TestSegments(unittest.TestCase):
 
 
 class TestCollectionIsRatified(unittest.TestCase):
+    def _relocate(self) -> None:
+        """Author segment 0's relocation and SETTLE it, so the segment can be collected. Settled
+        rather than applied directly: that is the whole correction — a migration is a log entry the
+        quorum agrees, not something a node writes to itself with authority checking off."""
+        txn = self.s.migration(0, self.mgr, now=2)
+        assert txn is not None, "nothing to relocate"
+        got = self.s.apply((txn,), auth=self.mgmt)
+        assert got.dropped == (), f"the relocation was refused: {got.dropped}"
+
     """S1: collection deletes the joiner's only other verification path, so the collect entry must
     carry a quorum-ratified `(height, A_state)`. An unratified collection is one nobody checks."""
 
@@ -603,20 +617,20 @@ class TestCollectionIsRatified(unittest.TestCase):
 
     def test_an_unratified_collection_is_refused_with_a_plain_complaint(self):
         """The complaint a log line can carry, rather than an obscure failure further downstream."""
-        self.s.migrate(0, self.mgr, now=2)
+        self._relocate()
         with self.assertRaises(store.StoreError) as cm:
             self.s.collect(0)
         self.assertIn("no signature", str(cm.exception))
 
     def test_a_ratified_collection_proceeds(self):
-        self.s.migrate(0, self.mgr, now=2)
+        self._relocate()
         self.s.collect(0, self._ratified(0))
         self.assertNotIn(0, self.s.segments())
 
     def test_a_signature_over_a_different_claim_is_refused(self):
         """The attestation binds SEGMENT, HEIGHT and FOLD together; signing one claim and then
         presenting another must not verify."""
-        self.s.migrate(0, self.mgr, now=2)
+        self._relocate()
         good = self._ratified(0)
         forged = ops.Compaction(
             0, good.height + 99, good.acc_state, good.root, good.signers, good.sigs
@@ -626,7 +640,7 @@ class TestCollectionIsRatified(unittest.TestCase):
         self.assertIn("does not match", str(cm.exception))
 
     def test_an_attestation_naming_another_segment_is_refused(self):
-        self.s.migrate(0, self.mgr, now=2)
+        self._relocate()
         with self.assertRaises(store.StoreError) as cm:
             self.s.collect(0, self._ratified(1))
         self.assertIn("different segment", str(cm.exception))
@@ -762,3 +776,105 @@ class TestTransferAndSettlementRace(unittest.TestCase):
         self.assertEqual(len(got.settled), 1)
         self.assertEqual([d.why for d in got.dropped], [settle.Reason.SETTLED])
         self.assertIsNotNone(self.s.get(ops.STORE_DATA, b"j"))
+
+
+class TestRelocation(unittest.TestCase):
+    """`ops.Move` (#conveyor). Migration used to author a `Set` of the same value and settle it
+    locally with authority checking disabled. That put node-signed writes into the management
+    store, displaced the manager's signature over the roster, and left honest nodes holding
+    byte-different logs. Each of those is a test below."""
+
+    def setUp(self):
+        self.s = store.Store()
+        self.mgr = crypto.Keypair.generate()
+        self.node = crypto.Keypair.generate()
+        self.mgmt = management.Management(self.s)
+        grant = self.mgmt.authorise(
+            self.mgr.public,
+            management.Role.MANAGER,
+            frozenset({ops.STORE_MANAGEMENT, D}),
+            frozenset(),
+            self.mgr.prove_possession(),
+        )
+        self.s.apply((grant.sign(self.mgr, 1),))
+        self.s.apply(
+            (self.mgmt.add_node(self.node.public, (b"inproc:0",)).sign(self.mgr, 1),),
+            auth=self.mgmt,
+        )
+        self.roster_key = management.P_NODE + bytes(self.node.public)
+
+    def _move(self, author, credential=None, ts=2):
+        cred = (
+            self.s.credential(ops.STORE_MANAGEMENT, self.roster_key)
+            if credential is None
+            else credential
+        )
+        move = ops.Move(ops.STORE_MANAGEMENT, self.roster_key, cred)
+        return self.s.apply((ops.writes(move).sign(author, ts),), auth=self.mgmt)
+
+    def test_a_relocation_moves_provenance_and_nothing_else(self):
+        before = self.s.get(ops.STORE_MANAGEMENT, self.roster_key)
+        assert before is not None
+        got = self._move(self.node)
+        self.assertEqual(got.dropped, (), "an honest relocation was refused")
+        after = self.s.get(ops.STORE_MANAGEMENT, self.roster_key)
+        assert after is not None
+        self.assertEqual(after.value, before.value)
+        self.assertGreater(after.provenance, before.provenance)
+
+    def test_a_relocation_is_state_invariant(self):
+        """`A_state` AND the root. A move that changed either would be a write wearing a
+        relocation's clothes."""
+        acc, root = self.s.accumulator(), self.s.state_root()
+        self._move(self.node)
+        self.assertEqual(self.s.accumulator(), acc)
+        self.assertEqual(self.s.state_root(), root)
+
+    def test_a_node_cannot_smuggle_a_write_through_a_relocation(self):
+        """THE fix. A `Move` carries no value, so there is no field in which to put a different
+        one -- the dangerous thing is inexpressible rather than merely refused."""
+        self.assertFalse(hasattr(ops.Move(0, b"k"), "value"))
+
+    def test_a_relocation_without_a_credential_is_refused(self):
+        """Management rows must keep their authority. Dropping the credential is exactly what the
+        old `Set`-based migration did, and it is what discarded the manager's signature."""
+        got = self._move(self.node, credential=b"")
+        self.assertEqual([d.why for d in got.dropped], [settle.Reason.RELOCATION])
+
+    def test_a_credential_from_an_unauthorised_author_is_refused(self):
+        """A stranger's signature over the right bytes vouches for nothing."""
+        stranger = crypto.Keypair.generate()
+        held = self.s.get(ops.STORE_MANAGEMENT, self.roster_key)
+        assert held is not None
+        forged = ops.writes(ops.Set(ops.STORE_MANAGEMENT, self.roster_key, held.value)).sign(
+            stranger, 1
+        )
+        got = self._move(self.node, credential=forged.raw)
+        self.assertEqual([d.why for d in got.dropped], [settle.Reason.RELOCATION])
+
+    def test_a_credential_for_a_different_value_is_refused(self):
+        """An old signature over a value nobody holds any more vouches for nothing either."""
+        stale = ops.writes(
+            ops.Set(ops.STORE_MANAGEMENT, self.roster_key, b"some other roster")
+        ).sign(self.mgr, 1)
+        got = self._move(self.node, credential=stale.raw)
+        self.assertEqual([d.why for d in got.dropped], [settle.Reason.RELOCATION])
+
+    def test_the_managers_signature_survives_relocation(self):
+        """What the credential is FOR: after any number of moves, the roster row can still be
+        traced back to the manager key, without trusting the quorum that the roster defines."""
+        for n in range(3):
+            # A distinct timestamp per move: identical bytes would be the same transaction, and
+            # `op_hash UNIQUE` would refuse the second as already settled.
+            self.assertEqual(self._move(self.node, ts=2 + n).dropped, ())
+        cred = ops.SignedTransaction.decode(
+            self.s.credential(ops.STORE_MANAGEMENT, self.roster_key)
+        )
+        self.assertEqual(cred.author, self.mgr.public, "the manager's signature was lost")
+        self.assertTrue(cred.verify())
+
+    def test_a_relocation_of_an_absent_key_is_refused(self):
+        """A move cannot create. Without this it would be a `Set` with the value left implicit."""
+        move = ops.Move(ops.STORE_MANAGEMENT, b"never/existed", b"")
+        got = self.s.apply((ops.writes(move).sign(self.node, 2),), auth=self.mgmt)
+        self.assertEqual([d.why for d in got.dropped], [settle.Reason.RELOCATION])

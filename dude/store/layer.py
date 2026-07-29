@@ -127,9 +127,17 @@ class Layer:
 
     def apply(self, m: ops.Mutation) -> None:
         """Record one mutation. Nothing reaches the underlying store."""
-        self._delta[(m.store, m.name)] = (
-            Held(PENDING, m.value, m.epoch) if isinstance(m, ops.Set) else None
-        )
+        if isinstance(m, ops.Move):
+            # Carries no value: it moves whatever is already there, so the layer copies the current
+            # row forward rather than inventing one. A move of a key that is absent records
+            # nothing — settlement refuses it separately, with a reason.
+            held = self.get(m.store, m.name)
+            if held is not None:
+                self._delta[(m.store, m.name)] = Held(PENDING, held.value, held.epoch)
+        else:
+            self._delta[(m.store, m.name)] = (
+                Held(PENDING, m.value, m.epoch) if isinstance(m, ops.Set) else None
+            )
         self._log.append(m)
 
     @property

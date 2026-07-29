@@ -75,6 +75,7 @@ CREATE TABLE IF NOT EXISTS live (
     value  BLOB NOT NULL,              -- ciphertext; held here so it outlives its log entry
     epoch  INTEGER NOT NULL DEFAULT 0, -- which keyepoch `value` is under (#conveyor)
     path   BLOB NOT NULL,              -- H(store||name): where this key sits in the state root
+    cred   BLOB NOT NULL DEFAULT x'',  -- the signed transaction that authorised `value` (#conveyor)
     PRIMARY KEY (store, name)
 );
 -- UNIQUE deliberately: `path` is a hash of the primary key, so a duplicate is a collision, and a
@@ -377,6 +378,11 @@ class Store:
         already produced it in order — and because replay hands over the same shape without any
         evaluation having happened (#replay-does-not-readjudicate)."""
         seg = self.segment_of(idx)
+        # The credential a `Set` leaves behind is the transaction doing it: management rows only,
+        # because that store IS the authority and is the one place "who said so" must outlive the
+        # log. Recording it for every data row would double the live view for a chain that data
+        # rows already derive from management state.
+        cred = tx.raw
         self.db.execute(
             "INSERT INTO entry (idx, kind, op_hash, raw, author, ts, segment)"
             " VALUES (?,?,?,?,?,?,?)",
@@ -390,18 +396,32 @@ class Store:
         #    subtract the prior element twice, which is exactly the bug the set-then-del identity
         #    test caught.
         for m in mutations:
+            if isinstance(m, ops.Move):
+                # BEFORE the accumulator arithmetic, and that placement is the whole correctness of
+                # it: the loop below subtracts the current element for every mutation and only a
+                # `Set` adds one back, so falling through here would have deleted the moved row
+                # from `A_state` while leaving it in the live view. Provenance moves; nothing else
+                # does — the value, its epoch and both commitments are untouched, and the
+                # credential travels with the row so the chain back to whoever authorised this
+                # value outlives the entry that set it.
+                self.db.execute(
+                    "UPDATE live SET head=?, cred=? WHERE store=? AND name=?",
+                    (idx, m.credential, m.store, m.name),
+                )
+                continue
             cur = self.get(m.store, m.name)
             if cur:
                 acc = crypto.acc_sub(acc, element(m.store, m.name, cur[1]))
             path = smt.path_of(m.store, m.name)
+            keep = cred if m.store == ops.STORE_MANAGEMENT else b""
             # Both commitments move together, in this transaction, for the same reason the live
             # view does: two truths about one state is the failure the store exists to prevent.
             self.tree.invalidate(path)
             if isinstance(m, ops.Set):
                 self.db.execute(
-                    "INSERT OR REPLACE INTO live (store, name, head, value, path, epoch)"
-                    " VALUES (?,?,?,?,?,?)",
-                    (m.store, m.name, idx, m.value, path, m.epoch),
+                    "INSERT OR REPLACE INTO live (store, name, head, value, path, epoch, cred)"
+                    " VALUES (?,?,?,?,?,?,?)",
+                    (m.store, m.name, idx, m.value, path, m.epoch, keep),
                 )
                 acc = crypto.acc_add(acc, element(m.store, m.name, m.value))
             else:
@@ -487,27 +507,36 @@ class Store:
 
         return Management(self).node_set()
 
-    def migrate(
-        self, seg: int, author: crypto.Keypair, now: int
-    ) -> tuple[ops.SignedTransaction, ...]:
-        """Rewrite this segment's stragglers at the head, SAME VALUE, so the segment can collect.
+    def credential(self, store: int, name: bytes) -> bytes:
+        """The signed transaction that authorised this row's value, or empty if none is kept."""
+        row = self.db.execute(
+            "SELECT cred FROM live WHERE store=? AND name=?", (store, name)
+        ).fetchone()
+        return row[0] if row else b""
 
-        `A_state`-invariant by construction: re-setting a key to the value it already holds changes
-        no state element, so the accumulator is untouched while provenance moves forward. That is
-        the cheap half of the conveyor — the forward-secrecy half re-encrypts under the current
-        epoch and belongs with the worker bees.
+    def migration(self, seg: int, author: crypto.Keypair, now: int) -> ops.SignedTransaction | None:
+        """AUTHOR the transaction that moves this segment's stragglers forward. Settles nothing.
 
-        Without this, collection has a permanent floor: genesis grants and roster rows are live for
-        the life of the log, so segment 0 could never be collected at all."""
-        moves = []
-        for st, name in self.stragglers(seg):
-            held = self.get(st, name)
-            if held is None:  # raced with a writer; it has already moved on
-                continue
-            moves.append(ops.writes(ops.Set(st, name, held.value)).sign(author, now))
-        if moves:
-            self.apply(tuple(moves))
-        return tuple(moves)
+        Two things this deliberately does NOT do, both of which it used to.
+
+        It does not `Set` the same value back: that is indistinguishable from setting a different
+        one, so it needed write authority the author does not have, and migration acquired it by
+        applying with authority checking off — which put node-signed writes into the management
+        store and displaced the manager's signature over the roster. `ops.Move` asserts nothing and
+        so needs nothing (#conveyor).
+
+        It does not APPLY. Migration entries are log entries like any other and must be agreed by
+        the quorum, or every node authors its own and three honest nodes end up holding
+        byte-different logs at identical indices — `A_state` agreeing throughout, which is exactly
+        why it went unnoticed."""
+        moves = [
+            ops.Move(st, name, self.credential(st, name))
+            for st, name in self.stragglers(seg)
+            if self.get(st, name) is not None  # raced with a writer; it has already moved on
+        ]
+        if not moves:
+            return None
+        return ops.writes(*moves).sign(author, now)
 
     def collect(
         self,

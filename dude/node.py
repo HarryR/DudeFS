@@ -190,6 +190,20 @@ class Node:
 
     # -- collection (#collection-is-driven-by-any-node) ----------------------------------------- #
 
+    def drain(self, seg: int, now: Millis) -> bool:
+        """Offer this segment's stragglers for relocation. Returns whether there was anything.
+
+        SUBMITTED, not applied. A migration is a log entry like any other and has to be agreed by
+        the quorum — a node applying its own would diverge the log from its peers' while leaving
+        `A_state` and the head identical, which is precisely how that went unnoticed before."""
+        txn = self.store.migration(seg, self.me, now)
+        if txn is None:
+            return False
+        if self.mempool.admit(txn, now) is not None:
+            return False
+        self._flood(Verb.SUBMIT, txn.raw, now)
+        return True
+
     def maybe_collect(self, now: Millis, dedup_window: int = 0) -> int | None:
         """Offer a collection if some segment is ready. Returns the segment, or None.
 
