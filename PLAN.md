@@ -1,6 +1,6 @@
 # PLAN.md — from the current tree to the segmented, attested design
 
-Derived from 32 probes in [experiments/](experiments/). Every step cites the finding that motivates it
+Derived from 35 probes in [experiments/](experiments/). Every step cites the finding that motivates it
 and states what it **deletes**, because the net effect of this plan is less code, not more.
 
 Sequencing principle: **replacements before additions.** A replacement is testable against a harness
@@ -49,108 +49,111 @@ rewritten), not `test_gestalt.py`, which exercises no compaction path at all.
 the **new-node join** is now load-bearing (it is the recovery path) and needs its own step; step 1's `f`
 is `min(n−q, 2q−n−1)` — **seizure is unavailability**, so the availability bound binds (3 at n=11).
 
-## Step 0 — correct the record (half a day)
+## Status
 
-`FRAMING.md` still carries the disinterest framing that probe 29 undercut, and `experiments/SPECv1.md`
-predates segments. Both will be read as authoritative by whoever picks this up.
+| step | state |
+|---|---|
+| 0 — correct the record | **mostly done** — stale docs quarantined, `SPEC.md` rewritten with tags, 112 refs repointed. Outstanding: `FRAMING.md`'s two corrections; `MEMPOOL.md` / `LINKS.md` prose predating segments and the no-priest ruling |
+| 1 — failure domains | **done**, 7 tests |
+| 2 — segments | **done**, 14 tests, all four Fable amendments closed |
+| 3 — state root (SMT) | not started |
+| 4 — conveyor | **half done** — `Store.migrate` is the same-value half; re-encryption is not written, so no key has ever died |
+| 5 — compactor role | not started; `FRONTIER`/`PULL`/`ENTRIES` still `UNIMPLEMENTED` |
+| 6 — revocation | **collapsed to nothing** — see below |
+| 7 — angel duty | not started |
 
-- FRAMING: threat model is **failure domains, not incentives** (P29). There is no disinterested party —
-  every node is bought and paid for. The angel's job is **accident detection** (snapshot revert,
-  restore-from-backup), not adversarial deterrence.
-- FRAMING §3.2: correct the over-unification. τ, H and L are **three** parameters, not one.
-- SPECv1: supersede §4's entry-level mechanism with segments (F46).
+**123 tests green.** Gate unchanged (bottom of this file).
 
-## Step 1 — failure domains (small, self-contained, no dependencies)
+## Step 0 — correct the record  ✅ mostly
 
-**Motivated by:** P29 (`f` is set by the largest correlated group), P32 (one invariant suffices).
+`SPEC.md` is rewritten and **cites by `#tag`, never by section number** — positional refs broke
+whenever a section moved, could not be grepped in both directions, and rendered as dead text.
+36 tags; a retired tag stays listed with its reason so a stale citation resolves to an explanation.
 
-- `NodeRecord` gains `domains: frozenset[bytes]` — **opaque labels**, never parsed.
-- `management.domain_groups(reader)` and `check_domains(reader, rule)` — pure functions over the
-  management store.
-- `add_node` / `change_roster` **refuse** a roster that would violate `no domain > f`.
+Old design docs are in `old-and-invalid/` with a README saying *why* each is invalid.
 
-**Test:** a 3-3-3-2 spread across four providers passes; 4-4-3 fails; adding a 12th node to an existing
-provider is caught. Note that *adding* a node can *reduce* effective tolerance.
+**Outstanding:** `FRAMING.md` still carries the disinterest framing P29 undercut, and its §3.2
+over-unifies τ/H/L. `MEMPOOL.md` and `LINKS.md` contain prose predating segments and the no-priest
+ruling.
 
-**Deletes:** nothing. ~80 lines.
+## Step 1 — failure domains  ✅
 
-## Step 2 — segments replace entry-level compaction ★ the big one
+`NodeRecord.domains` (opaque labels), `domain_groups`, `check_domains`, `Rule.max_domain`,
+`add_node` refusing violating rosters. **Two things implementation found:**
 
-**Motivated by:** F46 (time-segmented global log), F36/F37 (wholesale deletion, explicit trigger),
-F39 (interleaving destroys run length), F23/F25 (both made unnecessary).
+- the bound is **vacuous below n=4** — no placement makes a 1-node roster survivable, and enforcing it
+  would have forbidden the first node, making bootstrap impossible
+- a sound roster can be **unreachable one node at a time** — 3-3-3-2 is fine at n=11 and refused at
+  n=4, so a target roster must be reached by a **batched** change
 
-- Log gains a **segment id** = `ts / segment_width`. Segments are *physical slices of the one logical
-  log* — **not** stores, not ACL domains (F38 is the trap; F41 explains why it does not arise here).
-- Per-segment accumulator, so collection is one subtraction.
-- `collect_segment(id)` — wholesale deletion when live fraction falls below a threshold.
-- Stragglers migrate forward (the conveyor, step 4).
+## Step 2 — segments replace entry-level compaction  ✅ ★
 
-**Deletes:** `ChainLink`, `_derive_links`, the drop-set machinery, `Compaction.drops`/`links`, and the
-gap-filler concept entirely. **This is the largest code removal available** — a segment *is* a run, so
-run-length, chain repair and scattered-drop handling all stop existing.
+`entry.segment`, `segment(id, acc, sealed)`, `segment_of` / `segments` / `segment_live` /
+`stragglers` / `migrate` / `collect`. `Compaction` went from `(drops, links)` to
+`(segment, height, acc_state, signers, sigs)`.
 
-**Test:** extend `test_gestalt.py` — jobs advance, segments age out, state and accumulators identical
-across all nodes after collection. The harness already exists.
+**Deleted:** the `touch` table, `history()`, `ChainLink`, `_derive_links`, `_compact`, `compact()`,
+per-write chain maintenance.
+
+**All four amendments closed** — S1 ratified collect entry, S2 straggler migration, S3 settlement-bucket
+id, S4 dedup floor. Two corrections implementation forced:
+
+- **S4 is an AGE, not a width.** A width is a count of entries and the dedup window is a duration;
+  comparing them needs an arrival rate nobody has. The newest entry's timestamp answers it directly.
+- **A segment cannot be drained into itself.** Migration writes at the head, so `collect` refuses a
+  segment the log has not moved past — otherwise the straggler simply reappears.
+
+**Harness:** `test_store.py`, not `test_gestalt.py` — which exercises no compaction path at all.
+
+**Also found here:** every multisig verification was returning `False`, because splitting
+`_ed25519_verify` into typed errors made it raise instead of return. Now `VerifyFailure | None`,
+matching every other decision type in the codebase (#no-exceptions-for-control-flow), with regression
+tests.
 
 ## Step 3 — the state root (SMT)
 
-**Motivated by:** F7 (compaction-invariant), F15 (640 B proof, 8 µs verify at 10⁶), F17 (non-inclusion),
-F19 (the ~4500× startup reduction that makes ephemeral workers viable).
+**Key-indexed sparse tree with path compression** — **not** sorted-leaf. P20 measured sorted-leaf
+insert as O(n) because positions shift, so **F16's "O(log S) cached" is retracted**; the probe-03/06
+tree is read-only and must not be lifted into production.
 
-- **Key-indexed sparse tree with path compression** — **not** sorted-leaf. P20: sorted-leaf insert is
-  O(n) because positions shift; the tree used in probes 03/06 is read-only and **F16's "O(log S) with a
-  cached tree" is retracted**.
-- Persisted alongside data (~0.6 GB per 5 GB). Cost is **storage and random IO**, not CPU.
-- Root per checkpoint; every node recomputes it to ratify (F34).
-- Non-inclusion answered by the empty slot — no adjacency proofs.
+~768 B proof at 10⁷ keys, depth ~24. Cost is **storage and random IO**, not CPU. Keeps `A_state`
+alongside — ECMH supplements rather than replaces, being O(1) for the equality check nodes do
+constantly.
 
-**Keeps:** ECMH `A_state` as well. It **supplements**, not replaces (F16): O(1) update for the equality
-check nodes perform constantly; the tree is paid only when a proof is served or a checkpoint is cut.
+**Needs a new tag.** `SPEC.md` has no statement about the state root.
 
-## Step 4 — the conveyor
+## Step 4 — the conveyor  ◐ half
 
-**Motivated by:** F61 (it is the **forward-secrecy engine**, not a defragmenter — correcting F25),
-F62 (secrecy lag is bounded by conveyor rate, not rotation rate), F60 (one straggler pins an epoch key).
+`Store.migrate` rewrites stragglers at the head with the **same value**, `A_state`-invariant. That is
+the half that makes segments collectable.
 
-- Migrate live values forward, re-encrypting under the current epoch.
-- Drives `refcount(epoch) -> 0`, letting wraps be collected and **the old key die**.
-- Rate is the forward-secrecy guarantee, statable as a number (**L**).
+**Not written:** re-encryption under the current epoch, which is what lets an old key epoch die
+(#conveyor). Worker bees do it as housekeeping; effort scales with backlog pressure, clamped so it
+cannot crowd out work; the idle case needs a heartbeat, not a fallback path.
 
-**Note:** rotating keys faster without conveying faster buys *nothing*.
+**Needs tags** for the mechanism — `#conveyor` states the *why*, not the *how*.
 
 ## Step 5 — the compactor role
 
-**Motivated by:** F33 (a trust tier solves freshness where no cryptography can), F34 (two signatures,
-different jobs), F35 (compromise is bounded and degrades to the no-compactor case).
+Compactor proposes with a **timestamp**; nodes **ratify** by recomputing. Two signatures, two jobs.
+The quorum half exists (#collection-is-ratified); **the timestamp half has no tag and no code**, and it
+is what gives a single-link client freshness.
 
-- Proposes `(height, state_root, A_state, A_log, drops)`; signs **with a timestamp**.
-- Nodes **ratify** — they hold the data, so they recompute and refuse a wrong fold. A lying compactor is
-  caught *at the time*; only later is it unverifiable, which is why later verifiers trust the
-  ratification rather than the compactor.
+Also: wire `FRONTIER` / `PULL` / `ENTRIES`.
 
-## Step 6 — revocation, and the priest question
+## Step 6 — revocation  ✅ nothing to build
 
-**Motivated by:** P31 (**already bound** — the management prefix is in state, so revoking changes the
-state root), P30 (the CRL/short-lived-cert trade).
+Collapsed. **Absence *is* the revocation** — the grant is simply gone, and the state root commits to
+state, so the removal is bound to the data (#absence-is-revocation). No CRL, no retraction record, no
+never-forget bookkeeping. Revocation freshness == data freshness.
 
-- **No CRL, no never-forget bookkeeping.** *Absence is the revocation* — you do not remember a
-  retraction, the grant is simply gone, and the root commits to that.
-- Selective withholding becomes impossible: hiding a revocation means serving an older root, i.e. older
-  data too.
-- **Revocation freshness == data freshness**, so any freshness signal covers both for free.
+The priest question is **ruled**: cold manager, no priest, cold single-link clients out of scope.
 
-**The coupling to state plainly:** *manager offline ⟺ no priest ⟺ cold clients need f+1.* One decision,
-not three. Recommendation: take the cold manager; a priest that must re-bless every τ for 2–4 years is a
-liability designed in. Build the priest only if single-link **cold** clients are required.
+## Step 7 — the angel duty
 
-## Step 7 — the angel duty (optional, cheap)
-
-Nodes attest a **monotone** height and never regress; clients take the max over f+1. Catches the *actual*
-rollback threat in this deployment — snapshot revert, restore-from-backup, operator error (P29) — not a
-coordinated adversary. Self-convicting: a regression is a signed contradiction (P25). Needs durable
-state, no clock, no TEE.
-
----
+Nodes attest a monotone height and never regress; clients take the max over `f+1` (#monotonicity).
+Catches the *actual* rollback threat here — snapshot revert, restore, operator error — not a
+coordinated adversary. Durable state, no clock, no TEE.
 
 ## Not doing, and why
 
