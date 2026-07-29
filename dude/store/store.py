@@ -31,7 +31,7 @@ from typing import NamedTuple
 
 from ..core import codec, crypto
 from ..core.errors import DudeError
-from . import attest, ops, settle
+from . import attest, ops, settle, smt
 from .layer import Held, Index, Row, _prefix_upper, holds
 
 _SCHEMA = """
@@ -73,7 +73,20 @@ CREATE TABLE IF NOT EXISTS live (
     name   BLOB NOT NULL,
     head   INTEGER NOT NULL,           -- the settled index of the last write (#provenance)
     value  BLOB NOT NULL,              -- ciphertext; held here so it outlives its log entry
+    path   BLOB NOT NULL,              -- H(store||name): where this key sits in the state root
     PRIMARY KEY (store, name)
+);
+-- UNIQUE deliberately: `path` is a hash of the primary key, so a duplicate is a collision, and a
+-- collision must be an error rather than two keys silently sharing one leaf (#state-root).
+CREATE UNIQUE INDEX IF NOT EXISTS live_by_path ON live(path);
+
+-- Internal nodes of the state root. A MEMO OF A PURE FUNCTION and nothing more: every row is
+-- recomputable from `live` alone, so truncating this table costs time and cannot cost correctness.
+CREATE TABLE IF NOT EXISTS smt_memo (
+    depth  INTEGER NOT NULL,
+    prefix BLOB NOT NULL,
+    hash   BLOB NOT NULL,
+    PRIMARY KEY (depth, prefix)
 );
 
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v BLOB NOT NULL);
@@ -162,6 +175,7 @@ class Store:
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA foreign_keys=ON")
         self.db.executescript(_SCHEMA)
+        self.tree = smt.Tree(self.db)
 
     def close(self) -> None:
         self.db.close()
@@ -368,10 +382,15 @@ class Store:
             cur = self.get(m.store, m.name)
             if cur:
                 acc = crypto.acc_sub(acc, element(m.store, m.name, cur[1]))
+            path = smt.path_of(m.store, m.name)
+            # Both commitments move together, in this transaction, for the same reason the live
+            # view does: two truths about one state is the failure the store exists to prevent.
+            self.tree.invalidate(path)
             if isinstance(m, ops.Set):
                 self.db.execute(
-                    "INSERT OR REPLACE INTO live (store, name, head, value) VALUES (?,?,?,?)",
-                    (m.store, m.name, idx, m.value),
+                    "INSERT OR REPLACE INTO live (store, name, head, value, path)"
+                    " VALUES (?,?,?,?,?)",
+                    (m.store, m.name, idx, m.value, path),
                 )
                 acc = crypto.acc_add(acc, element(m.store, m.name, m.value))
             else:
@@ -563,6 +582,21 @@ class Store:
         if self.accumulator() != before:
             raise StoreError("collection changed the state accumulator")
         return at
+
+    # -- THE STATE ROOT (#state-root) ------------------------------------------ #
+
+    def state_root(self) -> crypto.Digest:
+        """One commitment to all live state, against which a single key can be PROVED.
+
+        Kept alongside `A_state` rather than replacing it: the accumulator answers "do we agree" in
+        O(1) and nodes ask that constantly, while this is paid when a proof is served or a
+        checkpoint is cut."""
+        return self.tree.root()
+
+    def prove(self, store: int, name: bytes) -> smt.Proof:
+        """Presence or absence, by the same walk. Absence is the valuable half — it is what makes
+        a revocation checkable rather than asserted (#absence-is-revocation)."""
+        return self.tree.prove(store, name)
 
     # -- ATTESTATION (#monotonicity) ------------------------------------------ #
 

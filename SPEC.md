@@ -290,6 +290,41 @@ This is the cheap half of the conveyor; see [#conveyor](#conveyor).
 
 ## 5. Accumulators
 
+### The state root {#state-root}
+
+`[M]` A **compressed sparse Merkle tree** over live state, keyed by `H(store ‖ name)`, gives what no
+accumulator can: a proof about **one key**, checkable by a client holding nothing but the root.
+
+`[M]` **Absence is the point.** #absence-is-revocation makes a revocation nothing more than a grant
+that is gone — and until now there was no way to *prove* something is gone. A non-inclusion proof is a
+proof of revocation, so revocation freshness becomes data freshness in fact rather than by assertion.
+
+`[M]` It also restores what collection destroys. #collect-whole-segment deletes the joiner's replay
+path, which is why collection must be ratified; a state root gives a **second** verification path — a
+node that reconstructs state can check it against a root the quorum signed, rather than trusting that
+it reconstructed correctly.
+
+`[M]` **Both commitments are kept.** ECMH answers "do we hold the same state" in O(1) and nodes ask
+that constantly (#accumulators); the tree is paid only when a proof is served or a checkpoint is cut.
+Neither replaces the other.
+
+`[M]` **The root is a function of the live set alone.** Insert-then-delete is indistinguishable from
+never-inserted, so two nodes holding the same state agree on the root regardless of how they got
+there. No history enters the root — history is the log's job.
+
+`[M]` **Key-indexed with path compression, never sorted-leaf.** A sorted-leaf tree's insert is O(n)
+because every later position shifts; probe 20 measured it, and F16's "O(log S) cached" is **retracted**
+— the probe-03/06 tree is read-only and must not be lifted into production. Depth is ~24 at 10⁷ keys,
+so a proof is ~768 B.
+
+`[M]` **The branch depth is hashed into every internal node**, so the tree's shape is committed and no
+proof can be re-folded at a depth it was not issued for. Empty subtrees hash to a fixed constant at
+every depth, which is what makes the structure sparse.
+
+`[M]` The root is carried in the ratified checkpoint (#collection-is-ratified) and in a node's
+attestation (#monotonicity), so a proof always verifies against something **signed** — by a quorum in
+the first case, by a convictable single node in the second.
+
 ### Two accumulators {#accumulators}
 
 `A_state` over live `(store, name, value)`; `A_log` over `(index, op_hash)`. Both ECMH: an
