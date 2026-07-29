@@ -16,7 +16,7 @@ from dataclasses import dataclass
 
 from dude.core import codec, crypto
 from dude.core.errors import DudeError
-from dude.store import ops
+from dude.store import ops, smt
 
 _KIND_ATTESTATION = 2
 """Domain tag. Distinct from the entry kinds in `ops` because an attestation is NOT a log entry:
@@ -52,6 +52,14 @@ class Attestation:
     """Signed so that two nodes claiming one head with different folds is DETECTABLE. That is
     divergence, not conviction: it proves something is wrong and nothing about who."""
 
+    root: crypto.Digest = smt.EMPTY
+    """The state root at this node's own head (#state-root).
+
+    Signed, so a client can check a single key against a node's CURRENT state rather than only
+    against the last checkpoint — and if the node lies about it, the statement is convictable like
+    any other. The floor below is what a quorum vouches for; this is what one node stakes its
+    identity on."""
+
     ratified: ops.Compaction | None = None
     """The highest quorum-ratified checkpoint the node holds — the actual floor.
 
@@ -67,20 +75,21 @@ class Attestation:
     def encode(self) -> bytes:
         ck = self.ratified.encode() if self.ratified is not None else b""
         return codec.encode(
-            [_KIND_ATTESTATION, self.seq, self.head, self.acc_state, self.acc_log, ck]
+            [_KIND_ATTESTATION, self.seq, self.head, self.acc_state, self.acc_log, self.root, ck]
         )
 
     @classmethod
     def decode(cls, raw: bytes) -> Attestation:
-        p = codec.as_seq(codec.decode(raw), 6)
+        p = codec.as_seq(codec.decode(raw), 7)
         if codec.as_int(p[0]) != _KIND_ATTESTATION:
             raise AttestError("not an attestation")
-        ck = codec.as_bytes(p[5])
+        ck = codec.as_bytes(p[6])
         return cls(
             codec.as_int(p[1]),
             codec.as_int(p[2]),
             crypto.Accumulator(codec.as_bytes(p[3])),
             crypto.Accumulator(codec.as_bytes(p[4])),
+            crypto.Digest(codec.as_bytes(p[5])),
             ops.Compaction.decode(ck) if ck else None,
         )
 

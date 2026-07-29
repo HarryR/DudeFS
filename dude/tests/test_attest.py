@@ -19,7 +19,9 @@ D = ops.STORE_DATA
 def _claim(seq: int, head: int, floor: int = 0, acc: bytes = b"s") -> attest.Attestation:
     """A claim with the two monotone quantities set independently, so a test can move one."""
     ck = ops.Compaction(0, floor, crypto.ACC_IDENTITY) if floor else None
-    return attest.Attestation(seq, head, crypto.acc_element(acc), crypto.acc_element(b"log"), ck)
+    return attest.Attestation(
+        seq, head, crypto.acc_element(acc), crypto.acc_element(b"log"), ratified=ck
+    )
 
 
 class TestEncoding(unittest.TestCase):

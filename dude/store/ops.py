@@ -34,6 +34,7 @@ from dataclasses import dataclass
 
 from ..core import codec, crypto
 from ..core.errors import DudeError
+from . import smt
 
 
 class OpError(DudeError):
@@ -380,6 +381,12 @@ class Compaction:
     """The fold AFTER collecting. Collection is state-preserving, so this equals the fold before —
     which is exactly what makes it checkable by anyone still holding the segment."""
 
+    root: crypto.Digest = smt.EMPTY
+    """The state root at this height (#state-root). Collection preserves state, so this too is
+    unchanged by collecting — and it is what makes the checkpoint useful to a CLIENT rather than
+    only to the cluster: `acc_state` proves two nodes agree and proves nothing about any one key,
+    while a quorum-signed root turns a single key's proof into something worth having."""
+
     signers: crypto.SignerBitmap = crypto.NO_SIGNERS
     sigs: tuple[crypto.Signature, ...] = ()
     """The quorum's ratification. Not decoration: collection deletes the joiner's only other
@@ -389,7 +396,7 @@ class Compaction:
 
     def attest_bytes(self) -> bytes:
         """What the quorum signs: the claim, without the signatures over it."""
-        return codec.encode([KIND_COMPACTION, self.segment, self.height, self.acc_state])
+        return codec.encode([KIND_COMPACTION, self.segment, self.height, self.acc_state, self.root])
 
     @classmethod
     def from_attest_bytes(cls, raw: bytes) -> Compaction:
@@ -399,13 +406,14 @@ class Compaction:
         the quorum signs — the signatures are what the claim is being circulated to collect. The
         pair has to exist because the claim travels: without it every COLLECT on the wire decodes
         to nothing and is dropped in silence, which is how this was found."""
-        p = codec.as_seq(codec.decode(raw), 4)
+        p = codec.as_seq(codec.decode(raw), 5)
         if codec.as_int(p[0]) != KIND_COMPACTION:
             raise OpError("not a collection claim")
         return cls(
             codec.as_int(p[1]),
             codec.as_int(p[2]),
             crypto.Accumulator(codec.as_bytes(p[3])),
+            crypto.Digest(codec.as_bytes(p[4])),
         )
 
     def attested(self, roster: list[crypto.PublicKey]) -> str | None:
@@ -427,6 +435,7 @@ class Compaction:
                 self.segment,
                 self.height,
                 self.acc_state,
+                self.root,
                 self.signers,
                 list(self.sigs),
             ]
@@ -442,15 +451,16 @@ class Compaction:
 
     @classmethod
     def decode(cls, raw: bytes) -> Compaction:
-        p = codec.as_seq(codec.decode(raw), 6)
+        p = codec.as_seq(codec.decode(raw), 7)
         if codec.as_int(p[0]) != KIND_COMPACTION:
             raise OpError("not a compaction entry")
         return cls(
             codec.as_int(p[1]),
             codec.as_int(p[2]),
             crypto.Accumulator(codec.as_bytes(p[3])),
-            crypto.SignerBitmap(codec.as_bytes(p[4])),
-            tuple(crypto.Signature(codec.as_bytes(s)) for s in codec.as_seq(p[5])),
+            crypto.Digest(codec.as_bytes(p[4])),
+            crypto.SignerBitmap(codec.as_bytes(p[5])),
+            tuple(crypto.Signature(codec.as_bytes(s)) for s in codec.as_seq(p[6])),
         )
 
 

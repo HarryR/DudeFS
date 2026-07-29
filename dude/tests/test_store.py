@@ -586,7 +586,7 @@ class TestCollectionIsRatified(unittest.TestCase):
 
     def _ratified(self, seg, signers=None):
         roster = list(self.s.roster())
-        claim = ops.Compaction(seg, self.s.head(), self.s.accumulator())
+        claim = ops.Compaction(seg, self.s.head(), self.s.accumulator(), self.s.state_root())
         chosen = signers if signers is not None else self.nodes
         shares = {
             roster.index(kp.public): crypto.Ed25519ListMultiSig.sign_share(
@@ -595,7 +595,7 @@ class TestCollectionIsRatified(unittest.TestCase):
             for kp in chosen
         }
         bitmap, sigs = crypto.Ed25519ListMultiSig.combine(shares, len(roster))
-        return ops.Compaction(seg, claim.height, claim.acc_state, bitmap, tuple(sigs))
+        return ops.Compaction(seg, claim.height, claim.acc_state, claim.root, bitmap, tuple(sigs))
 
     def test_an_unratified_collection_is_refused_with_a_plain_complaint(self):
         """The complaint a log line can carry, rather than an obscure failure further downstream."""
@@ -614,7 +614,9 @@ class TestCollectionIsRatified(unittest.TestCase):
         presenting another must not verify."""
         self.s.migrate(0, self.mgr, now=2)
         good = self._ratified(0)
-        forged = ops.Compaction(0, good.height + 99, good.acc_state, good.signers, good.sigs)
+        forged = ops.Compaction(
+            0, good.height + 99, good.acc_state, good.root, good.signers, good.sigs
+        )
         with self.assertRaises(store.StoreError) as cm:
             self.s.collect(0, forged)
         self.assertIn("does not match", str(cm.exception))
@@ -717,7 +719,9 @@ class TestClaimRoundTrip(unittest.TestCase):
     def test_an_entry_is_not_a_claim(self):
         """The two encodings are NOT interchangeable, and each refuses the other's bytes rather
         than half-decoding into a claim that says something nobody signed."""
-        entry = ops.Compaction(7, 4242, crypto.ACC_IDENTITY, crypto.SignerBitmap(b"\x01"), ())
+        entry = ops.Compaction(
+            7, 4242, crypto.ACC_IDENTITY, signers=crypto.SignerBitmap(b"\x01"), sigs=()
+        )
         with self.assertRaises(DudeError):
             ops.Compaction.from_attest_bytes(entry.encode())
         with self.assertRaises(DudeError):

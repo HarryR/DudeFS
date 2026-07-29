@@ -17,7 +17,7 @@ from ..net import Verb
 from ..net.envelope import Envelope, Frame, seal
 from ..net.transports import InProc, Switchboard, address_of, name_of
 from ..node import HANDLED, REPLIES, UNIMPLEMENTED, Node
-from ..store import Store, attest, ops
+from ..store import Store, attest, ops, smt
 from ..store.management import Management, Role
 from ..tunables import DEFAULT
 
@@ -347,6 +347,43 @@ class TestClusterCollection(unittest.TestCase):
         node.store._collect(1, at=node.store.head() + 1, marker=stale)
         self.assertEqual(node.store.floor(), was, "an older checkpoint lowered the floor")
 
+    def test_the_checkpoint_carries_a_state_root_a_client_can_use(self):
+        """The point of putting the root in the checkpoint: a client holding nothing but a
+        quorum-signed height can be shown that one key holds one value, and that another key holds
+        nothing at all (#state-root). `acc_state` can do neither."""
+        now = self._churn(12)
+        self._drain(0, now)
+        self.assertEqual(self.c.nodes[0].maybe_collect(now), 0)
+        self.c.pump(now)
+
+        node = self.c.nodes[0]
+        ck = node.store.checkpoint()
+        assert ck is not None
+        self.assertIsNone(ck.attested(list(node.roster())), "the root is not quorum-signed")
+
+        hot = crypto.h(b"hot")
+        held = node.store.get(D, hot)
+        assert held is not None
+        self.assertTrue(smt.verify(ck.root, D, hot, held.value, node.store.prove(D, hot)))
+        self.assertTrue(
+            smt.verify(ck.root, D, b"never-written", None, node.store.prove(D, b"never-written"))
+        )
+
+    def test_a_wrong_root_is_refused_like_a_wrong_fold(self):
+        """Ratification covers the root too. A node that claims a height and a fold it really has,
+        with a root it does not, gets no signature -- otherwise the quorum would be vouching for a
+        commitment nobody checked."""
+        now = self._churn(12)
+        self._drain(0, now)
+        liar, honest = self.c.nodes[0], self.c.nodes[1]
+
+        forged = ops.Compaction(0, honest.store.head(), honest.store.accumulator(), smt.EMPTY)
+        env = Envelope(honest.me.public, Verb.COLLECT, b"z" * 16, forged.attest_bytes())
+        honest.receive(seal(env.sign(liar.me, now)), now)
+
+        self.assertNotIn(forged.attest_bytes(), honest.shares, "signed a root it did not recompute")
+        self.assertIn(0, honest.store.segments())
+
     def test_a_partitioned_node_does_not_collect_alone(self):
         """One node is not a quorum, however sure it is. Collection is irreversible, so the node
         that cannot reach its peers must simply keep the segment."""
@@ -485,6 +522,28 @@ class TestTheAngelDuty(unittest.TestCase):
         node.store.attestation()  # built, never signed: the process died here
         self.assertIsNone(watcher.store.witness(node.attestation()))
         self.assertEqual(watcher.shunned(), frozenset())
+
+    def test_a_single_node_can_be_held_to_its_own_root(self):
+        """The floor is what a quorum vouches for; the root in an attestation is what ONE node
+        stakes its identity on. A client can check a key against the node's current state and, if
+        the node lied, keep a signed statement saying so."""
+        self._write(4)
+        node = self.c.nodes[0]
+        said = node.attestation()
+        self.assertTrue(said.verify())
+
+        k0 = crypto.h(b"k0")
+        held = node.store.get(D, k0)
+        assert held is not None
+        self.assertTrue(smt.verify(said.claim.root, D, k0, held.value, node.store.prove(D, k0)))
+        self.assertTrue(
+            smt.verify(
+                said.claim.root, D, b"nothing-here", None, node.store.prove(D, b"nothing-here")
+            )
+        )
+        self.assertFalse(
+            smt.verify(said.claim.root, D, k0, b"not what it holds", node.store.prove(D, k0))
+        )
 
     def test_the_floor_needs_more_than_one_answer(self):
         """#freshness-needs-many, in a cluster: a lone responder does not answer the freshness

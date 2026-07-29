@@ -206,7 +206,9 @@ class Node:
                 continue
             if self.store.stragglers(seg):
                 continue  # migrate first -- the caller's business, not a side effect of asking
-            claim = ops.Compaction(seg, self.store.head(), self.store.accumulator())
+            claim = ops.Compaction(
+                seg, self.store.head(), self.store.accumulator(), self.store.state_root()
+            )
             self.collecting[seg] = claim
             self.dedup_window = dedup_window
             self._ratify_locally(claim, now)
@@ -222,7 +224,9 @@ class Node:
         claim = _claim_from(env.env.body)
         if claim is None:
             return
-        mine = ops.Compaction(claim.segment, self.store.head(), self.store.accumulator())
+        mine = ops.Compaction(
+            claim.segment, self.store.head(), self.store.accumulator(), self.store.state_root()
+        )
         if mine.attest_bytes() != claim.attest_bytes():
             return  # we disagree about the fold; silence IS the refusal
         self.collecting.setdefault(claim.segment, claim)
@@ -256,8 +260,10 @@ class Node:
             return
         idx = {roster.index(k): s for k, s in got.items() if k in roster}
         bitmap, sigs = crypto.Ed25519ListMultiSig.combine(idx, len(roster))
-        attest = ops.Compaction(claim.segment, claim.height, claim.acc_state, bitmap, tuple(sigs))
-        self.store.collect(claim.segment, attest, now=now, dedup_window=self.dedup_window)
+        attested = ops.Compaction(
+            claim.segment, claim.height, claim.acc_state, claim.root, bitmap, tuple(sigs)
+        )
+        self.store.collect(claim.segment, attested, now=now, dedup_window=self.dedup_window)
         self.collected.add(claim.segment)
         self.collecting.pop(claim.segment, None)
 
