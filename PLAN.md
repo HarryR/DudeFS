@@ -58,11 +58,11 @@ is `min(n−q, 2q−n−1)` — **seizure is unavailability**, so the availabili
 | 2 — segments | **done**, 14 tests, all four Fable amendments closed |
 | 3 — state root (SMT) | **done**, 30 tests — and it is signed, so it proves something |
 | 4 — conveyor | **done**, 17 tests — a key can now die |
-| 5 — compactor role | **done bar log transfer** — collection is driven and ratified in a cluster; `FRONTIER` landed with step 7; the timestamp role is **struck**, not built (below). Outstanding: `PULL`/`ENTRIES` and join-as-recovery |
+| 5 — compactor role | **done bar STATE transfer** — `PULL`/`ENTRIES` landed; only the far-behind/wiped path is left — collection is driven and ratified in a cluster; `FRONTIER` landed with step 7; the timestamp role is **struck**, not built (below). Outstanding: `PULL`/`ENTRIES` and join-as-recovery |
 | 6 — revocation | **collapsed to nothing** — see below |
 | 7 — angel duty | **done**, 49 tests — grew two more halves: cross-attestation and gathered freshness (below) |
 
-**219 tests green.** Gate unchanged (bottom of this file).
+**237 tests green.** Gate unchanged (bottom of this file).
 
 ## Step 0 — correct the record  ✅ mostly
 
@@ -344,6 +344,43 @@ proceeding thin.
 
 **What this does not give you:** freshness. A frozen node attests truthfully forever. That is the
 compactor's *timestamp*, still unwritten in step 5, and the conflation has cost time twice.
+
+## The relocation wave — three defects and what they cost  ★
+
+Found by review, not by tests. `Store.migrate` authored a `Set` of the same value and settled it
+locally with authority checking off, which gave: **nodes writing into the management store
+unauthorised**, **the manager's signature over the roster displaced by a node's**, and **three honest
+nodes holding byte-different logs at identical indices** — `A_state` and `head` agreeing throughout,
+which is exactly why nothing noticed.
+
+`ops.Move` carries no value: it cannot express a change, so it needs no authority and forges nothing.
+`[H]` **The credential travels with the row** — a Move over a management row carries the
+manager-signed transaction that authorised the value, checked against live state and current
+authority. The chain back to the manager key survives any amount of compaction, so a joiner need not
+take the roster on the word of the quorum the roster defines.
+
+Two more fell out of fixing it: `_commit` subtracted the element for every mutation and only a `Set`
+added one back, so a Move **deleted its own row from `A_state`**; and `Compaction.op_hash` covered the
+signature set, so nodes collecting the same segment with different shares produced different entries —
+`A_log` diverging for a second, unrelated reason. The op hash is over the **claim** now: the log
+commits to what was agreed, not to which shares arrived first.
+
+**The assertion that catches this class is `A_log` across nodes, not `A_state`.** It was one line away
+when the divergence shipped, and it caught the second instance within a minute of being added.
+
+## Transfer, and the audit  ★
+
+`PULL`/`ENTRIES` landed and immediately opened a hole: a stranger with no grant and no roster seat
+added itself to a catching-up node's roster — its quorum — with one unsolicited frame. Now: `SOLICITED`
+gates before dispatch, the sender must be in the roster, and the run is checked against the sender's
+**signed** commitment (head, both accumulators, root) and rolled back before commit.
+
+**The audit found the dedup floor was never enforced on the peer-driven path.** `maybe_collect` took
+`dedup_window` as a parameter and stashed it on the node for `_try_collect` to read later, so a
+peer-driven collection used whatever a local call had left behind — nothing. Collection forgets
+`op_hash`, so those collections would have made their transactions replayable. Derived from the
+mempool's window now; turning it on broke nine cluster tests, every one of which had been collecting
+inside the window.
 
 ## Not doing, and why
 
