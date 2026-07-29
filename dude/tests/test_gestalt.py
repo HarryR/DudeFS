@@ -211,3 +211,111 @@ class TestVerbCoverage(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestClusterCollection(unittest.TestCase):
+    """Collection, in a cluster. Everything above was end-to-end but never touched a compaction
+    path; `Store.collect` was only ever unit-tested alone. This is the first time nodes have to
+    AGREE that a segment may be forgotten."""
+
+    WIDTH = 8
+
+    def setUp(self):
+        self.c = Cluster()
+        self.client = self.c.mgr
+        for node in self.c.nodes:
+            # Narrow segments so a handful of writes ages one out. Width has to exceed the number
+            # of stragglers migrated in one go, or migration -- which writes at the HEAD -- lands
+            # part of its own output back inside the segment it is draining.
+            node.store.SEGMENT_WIDTH = self.WIDTH
+
+    def _churn(self, n: int) -> int:
+        """Overwrite one key repeatedly, so early entries are entirely superseded. Returns `now`.
+
+        A settled bucket will not reopen, so each write needs its own bucket -- which is also the
+        realistic shape: this is a register rewritten over time, not a burst."""
+        now = T0
+        for i in range(n):
+            tx = ops.writes(ops.Set(D, crypto.h(b"hot"), f"v{i}".encode())).sign(self.client, now)
+            self.c.submit(self.client, tx, to=i % len(self.c.nodes), now=now)
+            self.c.pump(now)
+            now += DELTA
+            self.c.pump(now)
+        return now
+
+    def _drain(self, seg: int, now: int) -> None:
+        """Every node migrates the segment's stragglers forward for itself. Same values, so
+        `A_state` is unchanged -- which is exactly why the nodes still agree afterwards."""
+        for node in self.c.nodes:
+            node.store.migrate(seg, node.me, now)
+
+    def test_every_node_collects_and_they_stay_identical(self):
+        """The property the design rests on: a segment is forgotten by all three, and `A_state`
+        still agrees afterwards. Collection must lose history without losing state."""
+        now = self._churn(12)
+        self._drain(0, now)
+        before = {n.store.accumulator() for n in self.c.nodes}
+
+        for node in self.c.nodes:
+            self.assertEqual(node.maybe_collect(now), 0, "every node found segment 0 collectable")
+        self.c.pump(now)
+
+        for i, node in enumerate(self.c.nodes):
+            self.assertNotIn(0, node.store.segments(), f"node {i} did not collect")
+        self.assertEqual({n.store.accumulator() for n in self.c.nodes}, before, "state moved")
+        self.assertEqual(len({n.store.head() for n in self.c.nodes}), 1, "log lengths diverged")
+
+    def test_one_node_noticing_is_enough(self):
+        """No distinguished proposer, and no requirement that everyone notice: one node proposes,
+        the others ratify what they can recompute, and all three collect."""
+        now = self._churn(12)
+        self._drain(0, now)
+
+        self.assertEqual(self.c.nodes[0].maybe_collect(now), 0)
+        self.c.pump(now)
+
+        for i, node in enumerate(self.c.nodes):
+            self.assertNotIn(0, node.store.segments(), f"node {i} did not collect")
+
+    def test_concurrent_proposals_are_byte_identical(self):
+        """Two nodes proposing the same segment is harmless because the claim is a function of the
+        segment and the fold, not of who spoke first -- so their signatures POOL rather than split
+        the quorum between two rival claims."""
+        now = self._churn(12)
+        self._drain(0, now)
+        a, b = self.c.nodes[0], self.c.nodes[1]
+
+        self.assertEqual(a.maybe_collect(now), 0)
+        self.assertEqual(b.maybe_collect(now), 0)
+        self.assertEqual(a.collecting[0].attest_bytes(), b.collecting[0].attest_bytes())
+        self.c.pump(now)
+        for node in self.c.nodes:
+            self.assertNotIn(0, node.store.segments())
+
+    def test_a_wrong_fold_is_refused(self):
+        """Ratification happens WHILE the evidence still exists. A peer that recomputes a different
+        fold signs nothing -- and after collection nobody could ever have checked it."""
+        now = self._churn(12)
+        self._drain(0, now)
+        liar, honest = self.c.nodes[0], self.c.nodes[1]
+
+        forged = ops.Compaction(0, honest.store.head(), crypto.ACC_IDENTITY)  # not the real fold
+        env = Envelope(honest.me.public, Verb.COLLECT, b"z" * 16, forged.attest_bytes())
+        honest.receive(seal(env.sign(liar.me, now)), now)
+
+        self.assertNotIn(forged.attest_bytes(), honest.shares, "signed a fold it cannot reproduce")
+        self.assertIn(0, honest.store.segments(), "and collected on one node's word")
+
+    def test_a_partitioned_node_does_not_collect_alone(self):
+        """One node is not a quorum, however sure it is. Collection is irreversible, so the node
+        that cannot reach its peers must simply keep the segment."""
+        now = self._churn(12)
+        self._drain(0, now)
+        lone = name_of(self.c.keys[0].public)
+        for other in self.c.keys[1:]:
+            self.c.board.cut(lone, name_of(other.public))
+            self.c.board.cut(name_of(other.public), lone)
+
+        self.assertEqual(self.c.nodes[0].maybe_collect(now), 0, "it may still PROPOSE")
+        self.c.pump(now)
+        self.assertIn(0, self.c.nodes[0].store.segments(), "no quorum, no collection")

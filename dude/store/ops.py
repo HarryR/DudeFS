@@ -391,6 +391,23 @@ class Compaction:
         """What the quorum signs: the claim, without the signatures over it."""
         return codec.encode([KIND_COMPACTION, self.segment, self.height, self.acc_state])
 
+    @classmethod
+    def from_attest_bytes(cls, raw: bytes) -> Compaction:
+        """The inverse of `attest_bytes`, for a claim received from a peer.
+
+        `decode` cannot serve: it reads the six-field ENTRY, and a claim is the four-field thing
+        the quorum signs — the signatures are what the claim is being circulated to collect. The
+        pair has to exist because the claim travels: without it every COLLECT on the wire decodes
+        to nothing and is dropped in silence, which is how this was found."""
+        p = codec.as_seq(codec.decode(raw), 4)
+        if codec.as_int(p[0]) != KIND_COMPACTION:
+            raise OpError("not a collection claim")
+        return cls(
+            codec.as_int(p[1]),
+            codec.as_int(p[2]),
+            crypto.Accumulator(codec.as_bytes(p[3])),
+        )
+
     def attested(self, roster: list[crypto.PublicKey]) -> str | None:
         """`None` if the ratification holds, else why not — in words a log line can carry."""
         if not self.sigs:

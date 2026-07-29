@@ -268,6 +268,18 @@ chain to repair, no run-length problem — a segment *is* a run by construction.
 Collection deletes the joiner's only other verification path, so an unratified collection is one
 nobody can ever check. The refusal names the reason plainly — *"no signature"*.
 
+### Any node may drive a collection {#collection-is-driven-by-any-node}
+
+`[I]` A collection needs no distinguished proposer. Any node that finds a segment collectable —
+below the liveness threshold, past the dedup age, not current — migrates its stragglers and proposes
+it. Peers **recompute the fold** and sign only if they agree; at quorum every node collects using the
+same ratified attestation.
+
+Two nodes proposing the same segment is harmless: the proposals are identical, because a collection is
+a function of the segment and the fold rather than of who noticed first. A node that proposes a wrong
+fold is refused by everyone who still holds the data — which is the whole reason ratification happens
+**while the evidence exists** (#collection-is-ratified).
+
 ### Migration keeps the fold invariant {#migration-is-state-invariant}
 
 `[M]` Stragglers are rewritten at the head with the **same value**, so no state element changes and

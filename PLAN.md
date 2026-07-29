@@ -58,11 +58,11 @@ is `min(n−q, 2q−n−1)` — **seizure is unavailability**, so the availabili
 | 2 — segments | **done**, 14 tests, all four Fable amendments closed |
 | 3 — state root (SMT) | not started |
 | 4 — conveyor | **half done** — `Store.migrate` is the same-value half; re-encryption is not written, so no key has ever died |
-| 5 — compactor role | not started; `FRONTIER`/`PULL`/`ENTRIES` still `UNIMPLEMENTED` |
+| 5 — compactor role | **quorum half done** — collection is driven and ratified in a cluster (below); the compactor's *timestamp* is still unwritten, and `FRONTIER`/`PULL`/`ENTRIES` are still `UNIMPLEMENTED` |
 | 6 — revocation | **collapsed to nothing** — see below |
 | 7 — angel duty | not started |
 
-**123 tests green.** Gate unchanged (bottom of this file).
+**130 tests green.** Gate unchanged (bottom of this file).
 
 ## Step 0 — correct the record  ✅ mostly
 
@@ -109,6 +109,29 @@ id, S4 dedup floor. Two corrections implementation forced:
 `_ed25519_verify` into typed errors made it raise instead of return. Now `VerifyFailure | None`,
 matching every other decision type in the codebase (#no-exceptions-for-control-flow), with regression
 tests.
+
+## Step 5a — collection in a cluster  ✅ ★
+
+`Store.collect` worked alone; nothing drove it. Now `Node.maybe_collect` proposes, peers ratify by
+**recomputing the fold**, and at quorum every node calls the same `Store.collect` — one path, not a
+second one. Verbs `COLLECT` / `RATIFY` (#collection-is-driven-by-any-node).
+
+**No distinguished proposer, and the risk the plan flagged did not materialise.** Two nodes noticing
+the same segment propose byte-identical claims, because a claim is a function of the segment and the
+fold rather than of who spoke first — so their signatures **pool** instead of splitting the quorum.
+Shares are therefore keyed by **claim bytes, not by segment**: a node disagreeing about the fold must
+not be able to borrow signatures given to a different claim.
+
+**Found by the cluster test:** `attest_bytes` had **no inverse**. `Compaction.decode` reads the
+six-field *entry*; a claim is the four-field thing the quorum signs. So every `COLLECT` on the wire
+decoded to nothing and was **dropped in silence** — no error, no refusal, the cluster simply never
+collected. `Compaction.from_attest_bytes` is the missing half, with round-trip tests pinning that the
+two encodings refuse each other's bytes. This is the third time in this plan that a unit-tested
+component was wrong only once something else had to talk to it.
+
+**Also found:** migration writes at the HEAD, so a segment narrower than its own straggler count
+drains part of itself back into itself. Sizing, not a bug — but it makes `SEGMENT_WIDTH > live rows`
+a real floor alongside S4's dedup age.
 
 ## Step 3 — the state root (SMT)
 

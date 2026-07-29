@@ -7,6 +7,7 @@ import unittest
 
 from dude import quorum
 from dude.core import codec, crypto
+from dude.core.errors import DudeError
 from dude.store import management, ops, settle, store
 
 D = ops.STORE_DATA
@@ -700,3 +701,24 @@ class TestDedupFloor(unittest.TestCase):
         with self.assertRaises(store.StoreError):
             self.s.collect(0, now=1_000_010, dedup_window=30_000)
         self.s.collect(0, now=1_000_100 + 30_000, dedup_window=30_000)  # aged past it
+
+
+class TestClaimRoundTrip(unittest.TestCase):
+    """A claim travels between nodes, so `attest_bytes` needs an inverse. It had none: `decode`
+    reads the six-field entry, and every COLLECT on the wire decoded to nothing and was DROPPED IN
+    SILENCE — the cluster simply never collected, with no error anywhere."""
+
+    def test_a_claim_survives_the_wire(self):
+        claim = ops.Compaction(7, 4242, crypto.acc_element(b"a fold that is not the identity"))
+        back = ops.Compaction.from_attest_bytes(claim.attest_bytes())
+        self.assertEqual(back.attest_bytes(), claim.attest_bytes())
+        self.assertEqual((back.segment, back.height), (7, 4242))
+
+    def test_an_entry_is_not_a_claim(self):
+        """The two encodings are NOT interchangeable, and each refuses the other's bytes rather
+        than half-decoding into a claim that says something nobody signed."""
+        entry = ops.Compaction(7, 4242, crypto.ACC_IDENTITY, crypto.SignerBitmap(b"\x01"), ())
+        with self.assertRaises(DudeError):
+            ops.Compaction.from_attest_bytes(entry.encode())
+        with self.assertRaises(DudeError):
+            ops.Compaction.decode(entry.attest_bytes())

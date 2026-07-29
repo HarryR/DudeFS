@@ -54,7 +54,7 @@ correlated them and retired the pending entry, so reaching `_handle` means the u
 Named so "no handler" is a statement rather than an omission — otherwise a reply looks exactly
 like a verb somebody forgot."""
 
-HANDLED = frozenset({Verb.SUBMIT, Verb.PROPOSE, Verb.ENDORSE, Verb.PING})
+HANDLED = frozenset({Verb.SUBMIT, Verb.PROPOSE, Verb.ENDORSE, Verb.PING, Verb.COLLECT, Verb.RATIFY})
 """Verbs this node acts on."""
 
 UNIMPLEMENTED = frozenset(Verb) - HANDLED - REPLIES
@@ -85,6 +85,13 @@ class Node:
     otherwise one peer could manufacture a quorum by repeating itself."""
 
     settled_buckets: set[int] = field(default_factory=set)
+    collecting: dict[int, ops.Compaction] = field(default_factory=dict)
+    collected: set[int] = field(default_factory=set)
+    dedup_window: int = 0
+    """How long a segment must age before collecting; see `#collection-refused-while-live`."""
+    shares: dict[bytes, dict[crypto.PublicKey, crypto.Signature]] = field(default_factory=dict)
+    """Shares keyed by CLAIM BYTES, not by segment: two nodes disagreeing about the fold produce
+    two different claims, and neither may borrow the other's signatures."""
 
     def __post_init__(self) -> None:
         self.postman = Postman(self.me, window=self.tunables.net.window)
@@ -129,6 +136,10 @@ class Node:
                 self._on_propose(env, now)
             case Verb.ENDORSE:
                 self._on_endorse(env, now)
+            case Verb.COLLECT:
+                self._on_collect(env, now)
+            case Verb.RATIFY:
+                self._on_ratify(env, now)
             case Verb.PING:
                 self._reply(env, Verb.PONG, b"", now)
             case _:
@@ -164,6 +175,74 @@ class Node:
     def _on_endorse(self, env: SignedEnvelope, now: Millis) -> None:
         bucket, ids = _decode_slice(env.env.body)
         self._count(bucket, _slice_digest(bucket, ids), env.frm, now)
+
+    # -- collection (#collection-is-driven-by-any-node) ----------------------------------------- #
+
+    def maybe_collect(self, now: Millis, dedup_window: int = 0) -> int | None:
+        """Offer a collection if some segment is ready. Returns the segment, or None.
+
+        NO DISTINGUISHED PROPOSER. Any node that notices may say so, and two nodes noticing the same
+        segment is harmless — the claim is a function of the segment and the fold, not of who spoke
+        first, so both propose byte-identical bytes."""
+        for seg in self.store.segments():
+            if seg in self.collecting or seg >= self.store.segment_of(self.store.head() + 1):
+                continue
+            if self.store.stragglers(seg):
+                continue  # migrate first -- the caller's business, not a side effect of asking
+            claim = ops.Compaction(seg, self.store.head(), self.store.accumulator())
+            self.collecting[seg] = claim
+            self.dedup_window = dedup_window
+            self._ratify_locally(claim, now)
+            self._flood(Verb.COLLECT, claim.attest_bytes(), now)
+            return seg
+        return None
+
+    def _on_collect(self, env: SignedEnvelope, now: Millis) -> None:
+        """A peer claims a segment is collectable. Recompute the fold and sign only if it agrees.
+
+        This is the check that has to happen WHILE the evidence exists: after collection nobody can
+        re-derive it, so a wrong fold is refusable now and never again."""
+        claim = _claim_from(env.env.body)
+        if claim is None:
+            return
+        mine = ops.Compaction(claim.segment, self.store.head(), self.store.accumulator())
+        if mine.attest_bytes() != claim.attest_bytes():
+            return  # we disagree about the fold; silence IS the refusal
+        self.collecting.setdefault(claim.segment, claim)
+        self._ratify_locally(claim, now)
+        share = self.me.sign(claim.attest_bytes())
+        self._flood(Verb.RATIFY, codec.encode([claim.attest_bytes(), share]), now)
+
+    def _on_ratify(self, env: SignedEnvelope, now: Millis) -> None:
+        f = codec.as_seq(codec.decode(env.env.body), 2)
+        body, sig = codec.as_bytes(f[0]), crypto.Signature(codec.as_bytes(f[1]))
+        claim = _claim_from(body)
+        if claim is None or claim.segment in self.collected:
+            return
+        if not env.frm.verify(body, sig):
+            return
+        self.shares.setdefault(body, {})[env.frm] = sig
+        self._try_collect(claim, now)
+
+    def _ratify_locally(self, claim: ops.Compaction, now: Millis) -> None:
+        body = claim.attest_bytes()
+        # `Keypair.sign` rather than `sign_share(seed, ...)`: identical ed25519 signature, and it
+        # does not require reaching for the private seed to produce one.
+        self.shares.setdefault(body, {})[self.me.public] = self.me.sign(body)
+        self._try_collect(claim, now)
+
+    def _try_collect(self, claim: ops.Compaction, now: Millis) -> None:
+        """Collect once a quorum has signed the SAME claim; `dude.quorum` defines that."""
+        roster = list(self.roster())
+        got = self.shares.get(claim.attest_bytes(), {})
+        if not roster or not quorum.satisfied(len(roster), len(got)):
+            return
+        idx = {roster.index(k): s for k, s in got.items() if k in roster}
+        bitmap, sigs = crypto.Ed25519ListMultiSig.combine(idx, len(roster))
+        attest = ops.Compaction(claim.segment, claim.height, claim.acc_state, bitmap, tuple(sigs))
+        self.store.collect(claim.segment, attest, now=now, dedup_window=self.dedup_window)
+        self.collected.add(claim.segment)
+        self.collecting.pop(claim.segment, None)
 
     # -- the round ----------------------------------------------------------------------------- #
 
@@ -285,3 +364,11 @@ def _slice_digest(bucket: int, ids: tuple[crypto.Digest, ...]) -> crypto.Digest:
 
 def _mid() -> MessageId:
     return new_message_id()
+
+
+def _claim_from(body: bytes) -> ops.Compaction | None:
+    """Decode a collection claim, or None. Malformed bytes from a peer are routine."""
+    try:
+        return ops.Compaction.from_attest_bytes(body)
+    except DudeError:
+        return None

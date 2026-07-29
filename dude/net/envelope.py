@@ -70,6 +70,12 @@ class Verb(IntEnum):
     PROPOSE = 20
     ENDORSE = 21
 
+    # -- collection (#collection-is-driven-by-any-node) ----------------------------------------- #
+    COLLECT = 40
+    """"Segment S is collectable, and the fold after collecting is X." Any node may say it."""
+    RATIFY = 41
+    """A signature over that claim, from a node that recomputed the fold and agrees."""
+
     # -- log transfer (SPEC §8) ----------------------------------------------------------------- #
     FRONTIER = 30
     PULL = 31
