@@ -224,6 +224,22 @@ class Node:
         t = self.tunables.mempool
         return t.w_admit + t.w_valid_margin
 
+    def _commitment(
+        self, seg: int
+    ) -> tuple[int, Millis, crypto.Accumulator, crypto.Accumulator, crypto.Digest]:
+        """This node's claim about a segment: everything a checkpoint commits to, in one place.
+
+        One constructor for the claim a node PROPOSES and the one it RECOMPUTES to ratify, so the
+        two cannot drift — a peer that built its comparison differently would refuse honest claims,
+        or worse, accept dishonest ones."""
+        return (
+            seg,
+            self.store.head(),
+            self.store.accumulator(),
+            self.store.log_accumulator(),
+            self.store.state_root(),
+        )
+
     def maybe_collect(self, now: Millis) -> int | None:
         """Offer a collection if some segment is ready. Returns the segment, or None.
 
@@ -235,9 +251,7 @@ class Node:
                 continue
             if self.store.stragglers(seg):
                 continue  # migrate first -- the caller's business, not a side effect of asking
-            claim = ops.Compaction(
-                seg, self.store.head(), self.store.accumulator(), self.store.state_root()
-            )
+            claim = ops.Compaction(*self._commitment(seg))
             self.collecting[seg] = claim
             self._ratify_locally(claim, now)
             self._flood(Verb.COLLECT, claim.attest_bytes(), now)
@@ -252,9 +266,7 @@ class Node:
         claim = _claim_from(env.env.body)
         if claim is None:
             return
-        mine = ops.Compaction(
-            claim.segment, self.store.head(), self.store.accumulator(), self.store.state_root()
-        )
+        mine = ops.Compaction(*self._commitment(claim.segment))
         if mine.attest_bytes() != claim.attest_bytes():
             return  # we disagree about the fold; silence IS the refusal
         self.collecting.setdefault(claim.segment, claim)
@@ -289,7 +301,13 @@ class Node:
         idx = {roster.index(k): s for k, s in got.items() if k in roster}
         bitmap, sigs = crypto.Ed25519ListMultiSig.combine(idx, len(roster))
         attested = ops.Compaction(
-            claim.segment, claim.height, claim.acc_state, claim.root, bitmap, tuple(sigs)
+            claim.segment,
+            claim.height,
+            claim.acc_state,
+            claim.acc_log,
+            claim.root,
+            bitmap,
+            tuple(sigs),
         )
         try:
             self.store.collect(claim.segment, attested, now=now, dedup_window=self.dedup_window)

@@ -470,6 +470,23 @@ class Compaction:
     """The fold AFTER collecting. Collection is state-preserving, so this equals the fold before —
     which is exactly what makes it checkable by anyone still holding the segment."""
 
+    acc_log: crypto.Accumulator = crypto.ACC_IDENTITY
+    """The LOG fold at `height` (#accumulators).
+
+    Here because a joiner cannot compute it. `acc_state` and `root` describe live state, which a
+    joiner receives; `acc_log` is a fold over every entry ever, minus what has been collected, and a
+    node that never held the collected entries has no way to reconstruct it. It must be ADOPTED, and
+    until it was carried here there was nothing signed to adopt — so a bootstrapped node would have
+    diverged from every peer permanently, on the one commitment C2 signs and checks.
+
+    Taken at `height`, before this marker is written, for the same reason it is not taken after: the
+    marker's own hash covers this field, so committing to a value that included the marker would be
+    circular.
+
+    With this the checkpoint carries `(height, acc_state, acc_log, root)` — which is exactly
+    `store.Commitment`, the tuple a transfer is already verified against. Adoption and verification
+    become the same object."""
+
     root: crypto.Digest = smt.EMPTY
     """The state root at this height (#state-root). Collection preserves state, so this too is
     unchanged by collecting — and it is what makes the checkpoint useful to a CLIENT rather than
@@ -485,7 +502,16 @@ class Compaction:
 
     def attest_bytes(self) -> bytes:
         """What the quorum signs: the claim, without the signatures over it."""
-        return codec.encode([KIND_COMPACTION, self.segment, self.height, self.acc_state, self.root])
+        return codec.encode(
+            [
+                KIND_COMPACTION,
+                self.segment,
+                self.height,
+                self.acc_state,
+                self.acc_log,
+                self.root,
+            ]
+        )
 
     @classmethod
     def from_attest_bytes(cls, raw: bytes) -> Compaction:
@@ -495,14 +521,15 @@ class Compaction:
         the quorum signs — the signatures are what the claim is being circulated to collect. The
         pair has to exist because the claim travels: without it every COLLECT on the wire decodes
         to nothing and is dropped in silence, which is how this was found."""
-        p = codec.as_seq(codec.decode(raw), 5)
+        p = codec.as_seq(codec.decode(raw), 6)
         if codec.as_int(p[0]) != KIND_COMPACTION:
             raise OpError("not a collection claim")
         return cls(
             codec.as_int(p[1]),
             codec.as_int(p[2]),
             crypto.Accumulator(codec.as_bytes(p[3])),
-            crypto.Digest(codec.as_bytes(p[4])),
+            crypto.Accumulator(codec.as_bytes(p[4])),
+            crypto.Digest(codec.as_bytes(p[5])),
         )
 
     def attested(self, roster: list[crypto.PublicKey]) -> str | None:
@@ -524,6 +551,7 @@ class Compaction:
                 self.segment,
                 self.height,
                 self.acc_state,
+                self.acc_log,
                 self.root,
                 self.signers,
                 list(self.sigs),
@@ -550,16 +578,17 @@ class Compaction:
 
     @classmethod
     def decode(cls, raw: bytes) -> Compaction:
-        p = codec.as_seq(codec.decode(raw), 7)
+        p = codec.as_seq(codec.decode(raw), 8)
         if codec.as_int(p[0]) != KIND_COMPACTION:
             raise OpError("not a compaction entry")
         return cls(
             codec.as_int(p[1]),
             codec.as_int(p[2]),
             crypto.Accumulator(codec.as_bytes(p[3])),
-            crypto.Digest(codec.as_bytes(p[4])),
-            crypto.SignerBitmap(codec.as_bytes(p[5])),
-            tuple(crypto.Signature(codec.as_bytes(s)) for s in codec.as_seq(p[6])),
+            crypto.Accumulator(codec.as_bytes(p[4])),
+            crypto.Digest(codec.as_bytes(p[5])),
+            crypto.SignerBitmap(codec.as_bytes(p[6])),
+            tuple(crypto.Signature(codec.as_bytes(s)) for s in codec.as_seq(p[7])),
         )
 
 

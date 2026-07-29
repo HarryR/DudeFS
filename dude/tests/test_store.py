@@ -604,7 +604,9 @@ class TestCollectionIsRatified(unittest.TestCase):
 
     def _ratified(self, seg, signers=None):
         roster = list(self.s.roster())
-        claim = ops.Compaction(seg, self.s.head(), self.s.accumulator(), self.s.state_root())
+        claim = ops.Compaction(
+            seg, self.s.head(), self.s.accumulator(), self.s.log_accumulator(), self.s.state_root()
+        )
         chosen = signers if signers is not None else self.nodes
         shares = {
             roster.index(kp.public): crypto.Ed25519ListMultiSig.sign_share(
@@ -613,7 +615,9 @@ class TestCollectionIsRatified(unittest.TestCase):
             for kp in chosen
         }
         bitmap, sigs = crypto.Ed25519ListMultiSig.combine(shares, len(roster))
-        return ops.Compaction(seg, claim.height, claim.acc_state, claim.root, bitmap, tuple(sigs))
+        return ops.Compaction(
+            seg, claim.height, claim.acc_state, claim.acc_log, claim.root, bitmap, tuple(sigs)
+        )
 
     def test_an_unratified_collection_is_refused_with_a_plain_complaint(self):
         """The complaint a log line can carry, rather than an obscure failure further downstream."""
@@ -633,7 +637,7 @@ class TestCollectionIsRatified(unittest.TestCase):
         self._relocate()
         good = self._ratified(0)
         forged = ops.Compaction(
-            0, good.height + 99, good.acc_state, good.root, good.signers, good.sigs
+            0, good.height + 99, good.acc_state, good.acc_log, good.root, good.signers, good.sigs
         )
         with self.assertRaises(store.StoreError) as cm:
             self.s.collect(0, forged)
@@ -728,8 +732,24 @@ class TestClaimRoundTrip(unittest.TestCase):
     reads the six-field entry, and every COLLECT on the wire decoded to nothing and was DROPPED IN
     SILENCE — the cluster simply never collected, with no error anywhere."""
 
+    def test_the_claim_and_the_entry_agree_on_field_count(self):
+        """Pinned by COUNT, not by round-trip. Adding `acc_log` to the entry and to the decoder
+        but not to `attest_bytes` left the two one field apart, and the failure mode is silence:
+        every COLLECT on the wire decodes to nothing and the cluster quietly stops collecting.
+        Second time that exact shape has cost an hour."""
+        claim = ops.Compaction(
+            7, 4242, crypto.acc_element(b"s"), crypto.acc_element(b"l"), crypto.h(b"root")
+        )
+        self.assertEqual(
+            len(codec.as_seq(codec.decode(claim.attest_bytes()))),
+            len(codec.as_seq(codec.decode(claim.encode()))) - 2,  # minus signers and sigs
+            "attest_bytes and encode disagree about how many fields a claim has",
+        )
+
     def test_a_claim_survives_the_wire(self):
-        claim = ops.Compaction(7, 4242, crypto.acc_element(b"a fold that is not the identity"))
+        claim = ops.Compaction(
+            7, 4242, crypto.acc_element(b"a fold"), crypto.acc_element(b"a log fold")
+        )
         back = ops.Compaction.from_attest_bytes(claim.attest_bytes())
         self.assertEqual(back.attest_bytes(), claim.attest_bytes())
         self.assertEqual((back.segment, back.height), (7, 4242))

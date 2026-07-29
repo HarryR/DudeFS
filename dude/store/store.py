@@ -611,7 +611,9 @@ class Store:
             # drainable once the log has moved past it. Found by writing the test.
             raise StoreError(f"segment {seg} is still current (head is in segment {current})")
         roster = self.roster()
-        marker = attest or ops.Compaction(seg, self.head(), self.accumulator(), self.state_root())
+        marker = attest or ops.Compaction(
+            seg, self.head(), self.accumulator(), self.log_accumulator(), self.state_root()
+        )
         if roster:
             # Enforced here, not left to a caller: collection deletes the joiner's only other way
             # to check this log, so an unratified collection is one nobody can ever verify. The
@@ -640,7 +642,7 @@ class Store:
         """`collect`'s body, assuming an open transaction and no stragglers."""
         before = self.accumulator()
         if marker is None:
-            marker = ops.Compaction(seg, at - 1, before, self.state_root())
+            marker = ops.Compaction(seg, at - 1, before, self.log_accumulator(), self.state_root())
         self.db.execute(
             "INSERT INTO entry (idx, kind, op_hash, raw, author, ts, segment)"
             " VALUES (?,?,?,?,NULL,NULL,?)",

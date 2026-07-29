@@ -390,7 +390,13 @@ class TestClusterCollection(unittest.TestCase):
         now = self._drain(0, now)
         liar, honest = self.c.nodes[0], self.c.nodes[1]
 
-        forged = ops.Compaction(0, honest.store.head(), honest.store.accumulator(), smt.EMPTY)
+        forged = ops.Compaction(
+            0,
+            honest.store.head(),
+            honest.store.accumulator(),
+            honest.store.log_accumulator(),
+            smt.EMPTY,
+        )
         env = Envelope(honest.me.public, Verb.COLLECT, b"z" * 16, forged.attest_bytes())
         honest.receive(seal(env.sign(liar.me, now)), now)
 
