@@ -78,6 +78,11 @@ class Verb(IntEnum):
 
     # -- log transfer (SPEC §8) ----------------------------------------------------------------- #
     FRONTIER = 30
+    """"Where are you now?" Carries nothing: the question has no parameters."""
+    STANDING = 33
+    """The answer — own attestation, plus the latest heard of every peer (#cross-attestation).
+    A reply that DOES need a handler, unlike those in `REPLIES`: the sightings it carries are the
+    evidence channel, so dropping it on the floor would discard the whole point of asking."""
     PULL = 31
     ENTRIES = 32
 

@@ -11,6 +11,7 @@ and carries no author, so attributing one to a key that did not sign it is not c
 from __future__ import annotations
 
 import enum
+from collections.abc import Container, Iterable
 from dataclasses import dataclass
 
 from dude.core import codec, crypto
@@ -139,6 +140,18 @@ class Evidence:
     def culprit(self) -> crypto.PublicKey:
         return self.later.by
 
+    def encode(self) -> bytes:
+        return codec.encode([self.fault.value, self.earlier.encode(), self.later.encode()])
+
+    @classmethod
+    def decode(cls, raw: bytes) -> Evidence:
+        p = codec.as_seq(codec.decode(raw), 3)
+        return cls(
+            Fault(codec.as_int(p[0])),
+            SignedAttestation.decode(codec.as_bytes(p[1])),
+            SignedAttestation.decode(codec.as_bytes(p[2])),
+        )
+
 
 def contradiction(a: SignedAttestation, b: SignedAttestation) -> Evidence | None:
     """Do these two statements convict the key that signed them? Pure (#cross-attestation).
@@ -162,3 +175,79 @@ def contradiction(a: SignedAttestation, b: SignedAttestation) -> Evidence | None
     if later.claim.head < earlier.claim.head or later.claim.floor < earlier.claim.floor:
         return Evidence(Fault.REGRESSION, earlier, later)
     return None
+
+
+@dataclass(frozen=True, slots=True)
+class Frontier:
+    """A node's answer to "where are you now": itself, and the latest it has heard of everyone else.
+
+    ONE LEVEL DEEP, deliberately. If a sighting carried its own sightings the structure would
+    recurse without terminating, so a relayed attestation is bare — a node speaks for itself and
+    couriers others verbatim."""
+
+    own: SignedAttestation
+    sightings: tuple[SignedAttestation, ...] = ()
+    """Verbatim and signed by the peer they describe, never an opinion ABOUT a peer. A relay holds
+    no key but its own, so it can neither forge a sighting nor alter one: it cannot frame a peer
+    and cannot be framed by one. The only lie left is silence (#cross-attestation)."""
+
+    convictions: tuple[Evidence, ...] = ()
+    """Proven contradictions this node holds.
+
+    Carried because sightings alone do NOT make evidence transitive: a peer that convicts keeps
+    the earlier statement and refuses the later one, so relaying sightings would relay only the
+    innocent half and the pair would never travel. A node cut off from the culprit would then keep
+    talking to it forever. Evidence is self-verifying, so a relay adds nothing and risks nothing —
+    and the receiver RECOMPUTES the verdict rather than believing it."""
+
+    def encode(self) -> bytes:
+        return codec.encode(
+            [
+                self.own.encode(),
+                [s.encode() for s in self.sightings],
+                [e.encode() for e in self.convictions],
+            ]
+        )
+
+    @classmethod
+    def decode(cls, raw: bytes) -> Frontier:
+        p = codec.as_seq(codec.decode(raw), 3)
+        return cls(
+            SignedAttestation.decode(codec.as_bytes(p[0])),
+            tuple(SignedAttestation.decode(codec.as_bytes(s)) for s in codec.as_seq(p[1])),
+            tuple(Evidence.decode(codec.as_bytes(e)) for e in codec.as_seq(p[2])),
+        )
+
+
+def attested_floor(
+    atts: Iterable[SignedAttestation],
+    need: int,
+    shunned: Container[crypto.PublicKey] = (),
+) -> int | None:
+    """The height a client may rely on: the MAX floor over at least `need` distinct responders.
+
+    Max, not majority, because an arm can WITHHOLD a higher checkpoint and never forge one — the
+    floor carries the quorum's signatures, so the highest honest answer wins and a lagging node
+    cannot drag it down (#freshness-needs-many). `need` is `f+1`, which is why a lone responder
+    does not answer this question at all.
+
+    `None` when too few distinct keys answered. Shunned keys are dropped BEFORE counting, so a
+    convicted node cannot make up part of the f+1 it is supposed to be checked against."""
+    seen: dict[crypto.PublicKey, int] = {}
+    for a in atts:
+        if a.by in shunned or not a.verify():
+            continue
+        seen[a.by] = max(seen.get(a.by, 0), a.claim.floor)
+    if len(seen) < need:
+        return None
+    return max(seen.values())
+
+
+@dataclass(frozen=True, slots=True)
+class AttestTunables:
+    """This module's dials (`dude.tunables` holds the instance)."""
+
+    probe_every: int = 30_000
+    """How often a node asks its peers where they are. Sets how quickly a rollback is SEEN, not
+    whether it is provable — evidence keeps forever. The freshness question this does not answer
+    is the compactor timestamp's job."""

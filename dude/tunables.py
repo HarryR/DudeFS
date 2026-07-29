@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from .mempool import Tunables as MempoolTunables
 from .net.link import LinkTunables
 from .net.plan import PlanTunables
+from .store.attest import AttestTunables
 
 type Millis = int
 
@@ -52,6 +53,7 @@ class Tunables:
     link: LinkTunables = field(default_factory=LinkTunables)
     plan: PlanTunables = field(default_factory=PlanTunables)
     mempool: MempoolTunables = field(default_factory=MempoolTunables)
+    attest: AttestTunables = field(default_factory=AttestTunables)
 
 
 DEFAULT = Tunables()

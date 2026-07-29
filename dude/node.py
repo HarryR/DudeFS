@@ -40,7 +40,7 @@ from .net.envelope import Envelope, Frame, MessageId, SignedEnvelope, new_messag
 from .net.link import LinkTunables, Peer, Transport
 from .net.postman import Postman
 from .net.transports import address_of
-from .store import Store, ops, settle
+from .store import Store, attest, ops, settle
 from .store.management import Management
 from .tunables import DEFAULT, Tunables
 
@@ -54,7 +54,18 @@ correlated them and retired the pending entry, so reaching `_handle` means the u
 Named so "no handler" is a statement rather than an omission — otherwise a reply looks exactly
 like a verb somebody forgot."""
 
-HANDLED = frozenset({Verb.SUBMIT, Verb.PROPOSE, Verb.ENDORSE, Verb.PING, Verb.COLLECT, Verb.RATIFY})
+HANDLED = frozenset(
+    {
+        Verb.SUBMIT,
+        Verb.PROPOSE,
+        Verb.ENDORSE,
+        Verb.PING,
+        Verb.COLLECT,
+        Verb.RATIFY,
+        Verb.FRONTIER,
+        Verb.STANDING,
+    }
+)
 """Verbs this node acts on."""
 
 UNIMPLEMENTED = frozenset(Verb) - HANDLED - REPLIES
@@ -89,6 +100,8 @@ class Node:
     collected: set[int] = field(default_factory=set)
     dedup_window: int = 0
     """How long a segment must age before collecting; see `#collection-refused-while-live`."""
+    last_probe: Millis = 0
+    """When this node last asked its peers where they were (#cross-attestation)."""
     shares: dict[bytes, dict[crypto.PublicKey, crypto.Signature]] = field(default_factory=dict)
     """Shares keyed by CLAIM BYTES, not by segment: two nodes disagreeing about the fold produce
     two different claims, and neither may borrow the other's signatures."""
@@ -140,6 +153,10 @@ class Node:
                 self._on_collect(env, now)
             case Verb.RATIFY:
                 self._on_ratify(env, now)
+            case Verb.FRONTIER:
+                self._on_frontier(env, now)
+            case Verb.STANDING:
+                self._on_standing(env, now)
             case Verb.PING:
                 self._reply(env, Verb.PONG, b"", now)
             case _:
@@ -244,10 +261,69 @@ class Node:
         self.collected.add(claim.segment)
         self.collecting.pop(claim.segment, None)
 
+    # -- attestation (#monotonicity, #cross-attestation) ---------------------------------------- #
+
+    def attestation(self) -> attest.SignedAttestation:
+        """Sign one committed snapshot of this node's own store.
+
+        Signed here and unsigned in `Store.attestation`, which is the whole division: the store
+        holds the durable state and no key, the node holds the key and no state.
+
+        The store bumps and commits the counter; this only signs what it returns. That ordering is
+        the whole safety of it — see `Store.attestation`."""
+        return attest.SignedAttestation.make(self.me, self.store.attestation())
+
+    def probe(self, now: Millis) -> None:
+        """Ask every peer where it is. Cheap, and the only thing that makes a rollback VISIBLE
+        rather than merely provable-in-principle."""
+        self.last_probe = now
+        self._flood(Verb.FRONTIER, b"", now)
+
+    def _on_frontier(self, env: SignedEnvelope, now: Millis) -> None:
+        """Answer "where are you now" with everything needed to judge us and the cluster at once:
+        our own signed position, and the latest we have heard of everyone else."""
+        held = self.store.convictions()
+        reply = attest.Frontier(self.attestation(), self.store.sightings(), tuple(held.values()))
+        self._reply(env, Verb.STANDING, reply.encode(), now)
+
+    def _on_standing(self, env: SignedEnvelope, _now: Millis) -> None:
+        """Take a peer's position and everything it has heard.
+
+        The relayed sightings are witnessed too, which is what makes evidence TRANSITIVE: a node
+        that never spoke to the culprit directly can still hold the pair that convicts it."""
+        try:
+            said = attest.Frontier.decode(env.env.body)
+        except DudeError:
+            return  # malformed bytes from a peer are routine, not exceptional
+        for one in (said.own, *said.sightings):
+            if one.by == self.me.public:
+                continue  # our own statements come from our own store, never from a relay
+            self.store.witness(one)
+        for claimed in said.convictions:
+            if claimed.culprit != self.me.public:
+                self.store.judge(claimed)
+
+    def shunned(self) -> frozenset[crypto.PublicKey]:
+        """Keys proven to have contradicted themselves.
+
+        A LOCAL READ POLICY (#cross-attestation): it does not touch the roster or the quorum
+        arithmetic, so a heavily-shunned cluster stalls rather than proceeding on a thinned
+        quorum. Ejection is a manager action on the evidence; there is no rehabilitation here,
+        because recovery is re-join as a new identity."""
+        return frozenset(self.store.convictions())
+
+    def floor(self, need: int) -> int | None:
+        """The height this node would rely on, taking the max over `need` distinct peers and
+        itself, ignoring anyone convicted. `None` if too few answered (#freshness-needs-many)."""
+        heard = [self.attestation(), *self.store.sightings()]
+        return attest.attested_floor(heard, need, self.shunned())
+
     # -- the round ----------------------------------------------------------------------------- #
 
     def tick(self, now: Millis) -> None:
         """Advance: send what is due, reap expiries, then propose for any closed bucket."""
+        if now - self.last_probe >= self.tunables.attest.probe_every:
+            self.probe(now)
         self.postman.tick(now)
         self._propose(now)
 
