@@ -52,6 +52,18 @@ class Attestation:
     """Signed so that two nodes claiming one head with different folds is DETECTABLE. That is
     divergence, not conviction: it proves something is wrong and nothing about who."""
 
+    at: int = 0
+    """What this node's OWN clock read when it signed (#freshness-is-gathered).
+
+    An assertion, never a ratified fact: no peer can recompute somebody else's clock, so a timestamp
+    only ever speaks for one key. It is worth having anyway, because an adversary holding fewer than
+    `f+1` keys cannot manufacture recent ones — it can replay, and a replay looks old. That turns
+    silent staleness into visible staleness, which is the whole gain: a DIAGNOSTIC, not an
+    adversarial liveness guarantee.
+
+    Deliberately absent from `contradiction`: a clock stepping backwards is an NTP correction, and
+    conviction is terminal."""
+
     root: crypto.Digest = smt.EMPTY
     """The state root at this node's own head (#state-root).
 
@@ -75,21 +87,31 @@ class Attestation:
     def encode(self) -> bytes:
         ck = self.ratified.encode() if self.ratified is not None else b""
         return codec.encode(
-            [_KIND_ATTESTATION, self.seq, self.head, self.acc_state, self.acc_log, self.root, ck]
+            [
+                _KIND_ATTESTATION,
+                self.seq,
+                self.head,
+                self.acc_state,
+                self.acc_log,
+                self.at,
+                self.root,
+                ck,
+            ]
         )
 
     @classmethod
     def decode(cls, raw: bytes) -> Attestation:
-        p = codec.as_seq(codec.decode(raw), 7)
+        p = codec.as_seq(codec.decode(raw), 8)
         if codec.as_int(p[0]) != _KIND_ATTESTATION:
             raise AttestError("not an attestation")
-        ck = codec.as_bytes(p[6])
+        ck = codec.as_bytes(p[7])
         return cls(
             codec.as_int(p[1]),
             codec.as_int(p[2]),
             crypto.Accumulator(codec.as_bytes(p[3])),
             crypto.Accumulator(codec.as_bytes(p[4])),
-            crypto.Digest(codec.as_bytes(p[5])),
+            codec.as_int(p[5]),
+            crypto.Digest(codec.as_bytes(p[6])),
             ops.Compaction.decode(ck) if ck else None,
         )
 
@@ -228,28 +250,71 @@ class Frontier:
         )
 
 
+def fresh(
+    atts: Iterable[SignedAttestation],
+    now: int,
+    window: int,
+    shunned: Container[crypto.PublicKey] = (),
+) -> dict[crypto.PublicKey, SignedAttestation]:
+    """The statements worth counting: verified, unshunned, and timestamped inside the window.
+
+    The window is SYMMETRIC, though the two sides mean different things. Too old is ordinary — a
+    slow or dead node. Too far ahead is a clock fault or an attempt to look permanently fresh, since
+    a future timestamp would still read as recent when replayed tomorrow. One number covers both,
+    which is what makes it a cluster-wide tunable rather than a per-client judgement call
+    (#freshness-is-gathered).
+
+    Excluding a node here is NOT a punishment. A bad clock degrades what a node contributes; it does
+    not convict it, and `contradiction` never looks at time."""
+    keep: dict[crypto.PublicKey, SignedAttestation] = {}
+    for a in atts:
+        if a.by in shunned or not a.verify() or abs(now - a.claim.at) > window:
+            continue
+        held = keep.get(a.by)
+        if held is None or a.claim.seq > held.claim.seq:
+            keep[a.by] = a
+    return keep
+
+
 def attested_floor(
     atts: Iterable[SignedAttestation],
     need: int,
+    now: int,
+    window: int,
     shunned: Container[crypto.PublicKey] = (),
 ) -> int | None:
-    """The height a client may rely on: the MAX floor over at least `need` distinct responders.
+    """The height a client may rely on: the MAX floor over at least `need` FRESH responders.
 
     Max, not majority, because an arm can WITHHOLD a higher checkpoint and never forge one — the
     floor carries the quorum's signatures, so the highest honest answer wins and a lagging node
     cannot drag it down (#freshness-needs-many). `need` is `f+1`, which is why a lone responder
     does not answer this question at all.
 
-    `None` when too few distinct keys answered. Shunned keys are dropped BEFORE counting, so a
-    convicted node cannot make up part of the f+1 it is supposed to be checked against."""
-    seen: dict[crypto.PublicKey, int] = {}
-    for a in atts:
-        if a.by in shunned or not a.verify():
-            continue
-        seen[a.by] = max(seen.get(a.by, 0), a.claim.floor)
-    if len(seen) < need:
+    A single-link client can still satisfy `need`: a relay holds no key but its own, so it can
+    withhold or replay but never forge, and one link is enough to GATHER `f+1` signed statements
+    the client checks for itself. That is what returned cold single-link clients to scope.
+
+    `None` when too few distinct keys answered inside the window."""
+    keep = fresh(atts, now, window, shunned)
+    if len(keep) < need:
         return None
-    return max(seen.values())
+    return max(a.claim.floor for a in keep.values())
+
+
+def staleness(
+    atts: Iterable[SignedAttestation],
+    now: int,
+    window: int,
+    shunned: Container[crypto.PublicKey] = (),
+) -> int | None:
+    """How far behind the client is, at worst: the age of the freshest statement it can verify.
+
+    A NUMBER rather than an unknown, which is the whole point. It is an upper bound on staleness and
+    never a proof of currency — between that timestamp and now, anything may have happened."""
+    keep = fresh(atts, now, window, shunned)
+    if not keep:
+        return None
+    return now - max(a.claim.at for a in keep.values())
 
 
 @dataclass(frozen=True, slots=True)
@@ -258,5 +323,14 @@ class AttestTunables:
 
     probe_every: int = 30_000
     """How often a node asks its peers where they are. Sets how quickly a rollback is SEEN, not
-    whether it is provable — evidence keeps forever. The freshness question this does not answer
-    is the compactor timestamp's job."""
+    whether it is provable — evidence keeps forever."""
+
+    fresh_within: int = 120_000
+    """How recent a statement must be to count toward `f+1` (#freshness-is-gathered).
+
+    MUST EXCEED `probe_every`, and by a comfortable margin: gathered statements are as old as the
+    last probe round, so a window at or below the probe interval makes every bundle stale by
+    construction and the floor unanswerable. Cluster-wide, because two clients disagreeing about
+    whether the same bundle is fresh is a defect.
+
+    Also absorbs an NTP step, which is a road bump of tens of seconds rather than a fault."""

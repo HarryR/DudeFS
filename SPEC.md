@@ -366,8 +366,45 @@ a party whose clock you trust.
 responders is correct. A **returning** client holding a receipt carries its own height floor and needs
 one responder; a **cold** client needs `f+1`.
 
-`[H]` **There is no priest** — the budget will not carry the cluster and a blessing service. Cold
-single-link clients are therefore out of scope.
+`[H]` **There is no priest** — the budget will not carry the cluster and a blessing service.
+
+`[H]` **Cold single-link clients are back in scope** (#freshness-is-gathered). A relay cannot forge
+its peers' signatures, so one link is enough to *gather* `f+1` independently signed statements, which
+the client checks itself. That was the priest's whole job, and the cluster now does it as a side
+effect of gossip it already performs.
+
+### Freshness is gathered, never proved {#freshness-is-gathered}
+
+`[H]` A node signs the time **its own clock** reads when it attests. Nobody ratifies a timestamp:
+ratification is *recompute, don't trust* (#collection-is-driven-by-any-node), and no peer can
+recompute another's clock. A timestamp is therefore always an assertion by exactly one key, never a
+quorum claim — which is why the compactor's timestamp role is **struck** and freshness rides the
+attestation gossip instead. One less tier.
+
+`[M]` **What this buys is a BOUND, not a proof.** A client learns "at `T`, the frontier was at least
+`F`" and never "`F` is the frontier now" — #the-lemma is not repealed by signing a clock. The gain is
+that staleness becomes **visible** instead of silent: an adversary without `f+1` keys can only replay
+old statements, and old statements look old. The client can be denied; it cannot be fooled into
+believing it is current.
+
+`[H]` **This is a diagnostic, not adversarial liveness.** Full liveness guarantees are not available
+here and are not being claimed.
+
+`[M]` Freshness therefore rests on the **clock honesty of `f+1` nodes** — a genuinely new dependency,
+though on the same trust base as everything else. A node signing a *future* timestamp would look
+maximally fresh until that time arrived, so a statement outside the window is discarded on the same
+grounds a stale one is.
+
+`[H]` **The window is a cluster-wide tunable, not a per-client choice.** Consistency matters more
+than letting each client pick its own risk appetite: two clients disagreeing about whether the same
+bundle is fresh is a defect, not a feature. It must exceed the probe interval, or nothing is ever
+fresh by construction.
+
+`[H]` **A clock fault is never convictable.** An NTP step backwards is a road bump — annoying,
+infrequent, and normal. It is excluded from the conviction predicate for the same reason accumulators
+are (#cross-attestation): a bad clock **degrades** a node's contribution, and the client's window
+check drops it from the `f+1`. Shunning is terminal and is reserved for what a node proves against
+itself.
 
 ### Monotonicity is a duty {#monotonicity}
 

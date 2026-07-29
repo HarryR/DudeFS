@@ -269,7 +269,7 @@ class Node:
 
     # -- attestation (#monotonicity, #cross-attestation) ---------------------------------------- #
 
-    def attestation(self) -> attest.SignedAttestation:
+    def attestation(self, now: Millis) -> attest.SignedAttestation:
         """Sign one committed snapshot of this node's own store.
 
         Signed here and unsigned in `Store.attestation`, which is the whole division: the store
@@ -277,7 +277,7 @@ class Node:
 
         The store bumps and commits the counter; this only signs what it returns. That ordering is
         the whole safety of it — see `Store.attestation`."""
-        return attest.SignedAttestation.make(self.me, self.store.attestation())
+        return attest.SignedAttestation.make(self.me, self.store.attestation(now))
 
     def probe(self, now: Millis) -> None:
         """Ask every peer where it is. Cheap, and the only thing that makes a rollback VISIBLE
@@ -289,7 +289,7 @@ class Node:
         """Answer "where are you now" with everything needed to judge us and the cluster at once:
         our own signed position, and the latest we have heard of everyone else."""
         held = self.store.convictions()
-        reply = attest.Frontier(self.attestation(), self.store.sightings(), tuple(held.values()))
+        reply = attest.Frontier(self.attestation(now), self.store.sightings(), tuple(held.values()))
         self._reply(env, Verb.STANDING, reply.encode(), now)
 
     def _on_standing(self, env: SignedEnvelope, _now: Millis) -> None:
@@ -318,11 +318,27 @@ class Node:
         because recovery is re-join as a new identity."""
         return frozenset(self.store.convictions())
 
-    def floor(self, need: int) -> int | None:
-        """The height this node would rely on, taking the max over `need` distinct peers and
-        itself, ignoring anyone convicted. `None` if too few answered (#freshness-needs-many)."""
-        heard = [self.attestation(), *self.store.sightings()]
-        return attest.attested_floor(heard, need, self.shunned())
+    def gathered(self, now: Millis) -> list[attest.SignedAttestation]:
+        """Every statement this node can vouch for by holding: its own, plus every peer's, each
+        still carrying the signature of whoever made it (#freshness-is-gathered)."""
+        return [self.attestation(now), *self.store.sightings()]
+
+    def floor(self, need: int, now: Millis) -> int | None:
+        """The height this node would rely on: the max over `need` distinct FRESH peers and itself,
+        ignoring anyone convicted. `None` if too few answered (#freshness-needs-many)."""
+        return attest.attested_floor(
+            self.gathered(now), need, now, self.tunables.attest.fresh_within, self.shunned()
+        )
+
+    def staleness(self, now: Millis) -> Millis | None:
+        """How long since this node last heard from ANYONE — `None` if nobody is inside the window.
+
+        Peers only: a node's own statement is stamped with the clock it is asking about, so it is
+        fresh by construction and would report zero forever. The question worth answering is about
+        the view of the cluster, not about itself."""
+        return attest.staleness(
+            self.store.sightings(), now, self.tunables.attest.fresh_within, self.shunned()
+        )
 
     # -- the round ----------------------------------------------------------------------------- #
 

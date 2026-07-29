@@ -21,6 +21,8 @@ from ..store import Store, attest, ops, smt
 from ..store.management import Management, Role
 from ..tunables import DEFAULT
 
+WINDOW = DEFAULT.attest.fresh_within
+
 D = ops.STORE_DATA
 M = ops.STORE_MANAGEMENT
 T0 = 1_700_000_000_000
@@ -325,7 +327,7 @@ class TestClusterCollection(unittest.TestCase):
             ck = node.store.checkpoint()
             assert ck is not None, f"node {i} collected without keeping the checkpoint"
             self.assertIsNone(ck.attested(list(node.roster())), f"node {i}: floor not ratified")
-            self.assertEqual(node.attestation().claim.floor, ck.height)
+            self.assertEqual(node.attestation(now).claim.floor, ck.height)
             floors.add(ck.height)
         self.assertEqual(len(floors), 1, "nodes disagree about the attested floor")
 
@@ -441,7 +443,8 @@ class TestTheAngelDuty(unittest.TestCase):
         self.c.pump(now)
 
         rolled_back = attest.Attestation(
-            victim.store.attestation().seq + 5,  # a restored image still moves its counter forward
+            victim.store.attestation(now).seq
+            + 5,  # a restored image still moves its counter forward
             1,  # ...but its head went backwards
             crypto.acc_element(b"stale"),
             crypto.acc_element(b"stale"),
@@ -471,7 +474,10 @@ class TestTheAngelDuty(unittest.TestCase):
         forged = attest.SignedAttestation.make(
             a.me,
             attest.Attestation(
-                a.store.attestation().seq + 5, 1, crypto.acc_element(b"x"), crypto.acc_element(b"x")
+                a.store.attestation(now).seq + 5,
+                1,
+                crypto.acc_element(b"x"),
+                crypto.acc_element(b"x"),
             ),
         )
         b.store.witness(forged)
@@ -516,20 +522,20 @@ class TestTheAngelDuty(unittest.TestCase):
     def test_a_restart_does_not_convict(self):
         """The interlock, end to end: attest, drop the claim as a crash would, attest again. The
         counter skips and nothing is provable — a gap is free where reuse is fatal."""
-        self._write(2)
+        now = self._write(2)
         node, watcher = self.c.nodes[0], self.c.nodes[1]
-        watcher.store.witness(node.attestation())
-        node.store.attestation()  # built, never signed: the process died here
-        self.assertIsNone(watcher.store.witness(node.attestation()))
+        watcher.store.witness(node.attestation(now))
+        node.store.attestation(now)  # built, never signed: the process died here
+        self.assertIsNone(watcher.store.witness(node.attestation(now)))
         self.assertEqual(watcher.shunned(), frozenset())
 
     def test_a_single_node_can_be_held_to_its_own_root(self):
         """The floor is what a quorum vouches for; the root in an attestation is what ONE node
         stakes its identity on. A client can check a key against the node's current state and, if
         the node lied, keep a signed statement saying so."""
-        self._write(4)
+        now = self._write(4)
         node = self.c.nodes[0]
-        said = node.attestation()
+        said = node.attestation(now)
         self.assertTrue(said.verify())
 
         k0 = crypto.h(b"k0")
@@ -550,11 +556,59 @@ class TestTheAngelDuty(unittest.TestCase):
         question at all, and the max is taken over f+1."""
         now = self._write(3)
         node = self.c.nodes[0]
-        self.assertIsNone(node.floor(need=4), "four distinct answers do not exist here")
+        self.assertIsNone(node.floor(need=4, now=now), "four distinct answers do not exist here")
         for n in self.c.nodes:
             n.probe(now)
         self.c.pump(now)
-        self.assertIsNotNone(node.floor(need=3))
+        self.assertIsNotNone(node.floor(need=3, now=now))
+
+    def test_one_link_is_enough_to_gather_the_whole_cluster(self):
+        """THE SINGLE-LINK CLIENT, back in scope without a priest (#freshness-is-gathered).
+
+        A client reaching exactly ONE node still ends up holding f+1 statements, each signed by the
+        node that made it. The relay can withhold or replay; it holds no key but its own, so it
+        cannot forge, and the client checks every signature itself."""
+        now = self._write(3)
+        for node in self.c.nodes:
+            node.probe(now)
+        self.c.pump(now)
+
+        relay = self.c.nodes[0]
+        bundle = relay.gathered(now)
+        self.assertEqual(len({a.by for a in bundle}), 3, "one link did not reach the cluster")
+        for one in bundle:
+            self.assertTrue(one.verify(), "a relayed statement lost its own signature")
+        self.assertIsNotNone(attest.attested_floor(bundle, 3, now, WINDOW))
+
+    def test_a_starved_client_sees_that_it_is_starved(self):
+        """The gain, stated as the failure it prevents. A relay that goes quiet cannot make a
+        client believe it is current -- the bundle it holds ages in plain sight."""
+        now = self._write(3)
+        for node in self.c.nodes:
+            node.probe(now)
+        self.c.pump(now)
+        relay = self.c.nodes[0]
+        bundle = relay.gathered(now)
+
+        much_later = now + WINDOW * 10
+        self.assertIsNone(attest.attested_floor(bundle, 3, much_later, WINDOW))
+        self.assertIsNone(attest.staleness(bundle, much_later, WINDOW))
+        self.assertEqual(attest.staleness(bundle, now + 5_000, WINDOW), 5_000)
+
+    def test_a_node_reports_how_long_since_it_heard_from_anyone(self):
+        """Peers only. A node's own statement carries the clock it is asking about, so counting it
+        would report zero forever and measure nothing."""
+        now = self._write(2)
+        node = self.c.nodes[0]
+        # Nobody called `probe` here: `tick` does it on its own cadence, which is what keeps the
+        # duty from being machinery that only ever runs because a test asked it to.
+        self.assertIsNotNone(node.staleness(now), "the probe cadence never fired")
+
+        node.probe(now)
+        self.c.pump(now)
+        self.assertEqual(node.staleness(now), 0)
+        self.assertEqual(node.staleness(now + 20_000), 20_000)
+        self.assertIsNone(node.staleness(now + WINDOW * 10), "an old view still read as fresh")
 
     def test_a_shunned_node_cannot_make_up_the_quorum_it_is_checked_against(self):
         """Shunned keys are dropped BEFORE counting, not after — otherwise a convicted node would
@@ -564,7 +618,7 @@ class TestTheAngelDuty(unittest.TestCase):
         for n in self.c.nodes:
             n.probe(now)
         self.c.pump(now)
-        self.assertIsNotNone(node.floor(need=3))
+        self.assertIsNotNone(node.floor(need=3, now=now))
 
         node.store.witness(
             attest.SignedAttestation.make(
@@ -573,7 +627,7 @@ class TestTheAngelDuty(unittest.TestCase):
             )
         )
         self.assertIn(victim.me.public, node.shunned())
-        self.assertIsNone(node.floor(need=3), "a convicted node still counted toward f+1")
+        self.assertIsNone(node.floor(need=3, now=now), "a convicted node still counted toward f+1")
 
     def test_the_roster_is_untouched_by_shunning(self):
         """A local read policy. Shunning must not thin the quorum — a heavily-shunned cluster

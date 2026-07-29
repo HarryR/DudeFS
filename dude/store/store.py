@@ -610,7 +610,7 @@ class Store:
         ck = self.checkpoint()
         return ck.height if ck is not None else 0
 
-    def attestation(self) -> attest.Attestation:
+    def attestation(self, now: int) -> attest.Attestation:
         """Bump the counter and read one coherent snapshot to attest.
 
         THE INTERLOCK, and the highest-risk line in the design: the counter is bumped and
@@ -623,7 +623,10 @@ class Store:
         instead, and a gap means nothing to anyone.
 
         One transaction for the same reason: five separate reads could interleave with a
-        settlement and attest a head whose accumulator belongs to a different moment."""
+        settlement and attest a head whose accumulator belongs to a different moment.
+
+        `now` is passed IN. The store keeps no clock — a timestamp is the node's assertion about
+        its own clock (#freshness-is-gathered), and nothing here can check it."""
         self.db.execute("BEGIN IMMEDIATE")
         try:
             seq = int.from_bytes(self._get_meta("attest_seq", b"")) + 1
@@ -633,6 +636,7 @@ class Store:
                 self.head(),
                 self.accumulator(),
                 self.log_accumulator(),
+                now,
                 self.state_root(),
                 self.checkpoint(),
             )

@@ -16,11 +16,17 @@ from dude.store import attest, ops, store
 D = ops.STORE_DATA
 
 
-def _claim(seq: int, head: int, floor: int = 0, acc: bytes = b"s") -> attest.Attestation:
-    """A claim with the two monotone quantities set independently, so a test can move one."""
+NOW = 1_700_000_000_000
+WINDOW = 120_000
+
+
+def _claim(
+    seq: int, head: int, floor: int = 0, acc: bytes = b"s", at: int = NOW
+) -> attest.Attestation:
+    """A claim with each quantity settable on its own, so a test can move exactly one."""
     ck = ops.Compaction(0, floor, crypto.ACC_IDENTITY) if floor else None
     return attest.Attestation(
-        seq, head, crypto.acc_element(acc), crypto.acc_element(b"log"), ratified=ck
+        seq, head, crypto.acc_element(acc), crypto.acc_element(b"log"), at=at, ratified=ck
     )
 
 
@@ -136,15 +142,15 @@ class TestTheInterlock(unittest.TestCase):
         self.kp = crypto.Keypair.generate()
 
     def test_the_counter_strictly_increases(self):
-        seqs = [self.s.attestation().seq for _ in range(5)]
+        seqs = [self.s.attestation(NOW).seq for _ in range(5)]
         self.assertEqual(seqs, sorted(set(seqs)), "a reused counter is a self-conviction")
         self.assertEqual(seqs[0], 1)
 
     def test_the_counter_is_committed_before_the_caller_can_sign(self):
         """The crash case: build a claim, never sign it, crash. The counter must NOT come back:
         a gap costs nothing, and reuse over different bytes convicts by the node's own key."""
-        dropped = self.s.attestation()  # signed by nobody; the process died here
-        again = self.s.attestation()
+        dropped = self.s.attestation(NOW)  # signed by nobody; the process died here
+        again = self.s.attestation(NOW)
         self.assertGreater(again.seq, dropped.seq, "the counter came back after a crash")
 
     def test_a_reopened_store_does_not_reuse_the_counter(self):
@@ -153,14 +159,14 @@ class TestTheInterlock(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             path = f"{d}/log.db"
             first = store.Store(path)
-            seq = first.attestation().seq
+            seq = first.attestation(NOW).seq
             first.close()
-            self.assertGreater(store.Store(path).attestation().seq, seq)
+            self.assertGreater(store.Store(path).attestation(NOW).seq, seq)
 
     def test_the_snapshot_is_coherent(self):
         """One transaction, so head and both folds belong to the same moment. Five separate reads
         could attest a head whose accumulator came from before it."""
-        a = self.s.attestation()
+        a = self.s.attestation(NOW)
         self.assertEqual(a.head, self.s.head())
         self.assertEqual(a.acc_state, self.s.accumulator())
         self.assertEqual(a.acc_log, self.s.log_accumulator())
@@ -169,15 +175,82 @@ class TestTheInterlock(unittest.TestCase):
         """A young cluster attests zero and only the hint carries information. Freshness starts at
         the first collection, not at genesis."""
         self.assertIsNone(self.s.checkpoint())
-        self.assertEqual(self.s.attestation().floor, 0)
+        self.assertEqual(self.s.attestation(NOW).floor, 0)
 
     def test_an_honest_node_never_convicts_itself(self):
         """The property the whole design hangs on, stated directly: every consecutive pair of a
         healthy node's own attestations must be clean."""
-        signed = [attest.SignedAttestation.make(self.kp, self.s.attestation()) for _ in range(6)]
+        signed = [attest.SignedAttestation.make(self.kp, self.s.attestation(NOW)) for _ in range(6)]
         for a, b in itertools.pairwise(signed):
             self.assertIsNone(attest.contradiction(a, b), "an honest node convicted itself")
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestFreshness(unittest.TestCase):
+    """#freshness-is-gathered. What is being tested is a BOUND becoming visible, not currency
+    becoming provable — a client that is being starved must be able to SEE that it is."""
+
+    def setUp(self):
+        self.keys = [crypto.Keypair.generate() for _ in range(4)]
+
+    def _bundle(self, at: int = NOW, floor: int = 100, n: int = 3):
+        return [
+            attest.SignedAttestation.make(kp, _claim(1, floor + 10, floor=floor, at=at))
+            for kp in self.keys[:n]
+        ]
+
+    def test_a_fresh_bundle_answers_the_question(self):
+        got = attest.attested_floor(self._bundle(), 3, NOW, WINDOW)
+        self.assertEqual(got, 100)
+        self.assertEqual(attest.staleness(self._bundle(), NOW, WINDOW), 0)
+
+    def test_a_replayed_bundle_is_visibly_old(self):
+        """The only lie an adversary without f+1 keys can tell. It cannot manufacture recent
+        statements, so a starved client sees old timestamps rather than believing it is current."""
+        old = self._bundle(at=NOW - WINDOW * 3)
+        self.assertIsNone(attest.attested_floor(old, 3, NOW, WINDOW))
+        self.assertIsNone(attest.staleness(old, NOW, WINDOW))
+
+    def test_staleness_is_a_number_not_an_unknown(self):
+        """The client's actual gain: it can say how far behind it is at worst."""
+        lagged = self._bundle(at=NOW - 45_000)
+        self.assertEqual(attest.staleness(lagged, NOW, WINDOW), 45_000)
+        self.assertEqual(attest.attested_floor(lagged, 3, NOW, WINDOW), 100)
+
+    def test_a_future_timestamp_is_discarded(self):
+        """A statement dated tomorrow would still read as recent when replayed tomorrow, so it is
+        refused now -- the same window logic the envelope applies to a conversation."""
+        ahead = self._bundle(at=NOW + WINDOW * 2)
+        self.assertIsNone(attest.attested_floor(ahead, 3, NOW, WINDOW))
+
+    def test_one_stale_arm_does_not_stop_the_others(self):
+        """A node with a bad clock DEGRADES its own contribution and nothing else. It is dropped
+        from the count, never convicted."""
+        mixed = [*self._bundle(n=2), *self._bundle(at=NOW - WINDOW * 5, n=1)]
+        self.assertIsNone(
+            attest.attested_floor(mixed, 3, NOW, WINDOW), "the stale arm still counted"
+        )
+        self.assertEqual(attest.attested_floor(mixed, 2, NOW, WINDOW), 100)
+
+    def test_a_lagging_arm_cannot_drag_the_floor_down(self):
+        """Max, not majority: withholding is the only lie available, so the highest honest answer
+        wins (#freshness-needs-many)."""
+        behind = attest.SignedAttestation.make(self.keys[3], _claim(1, 20, floor=10))
+        self.assertEqual(attest.attested_floor([*self._bundle(), behind], 4, NOW, WINDOW), 100)
+
+    def test_a_clock_stepping_backwards_convicts_nobody(self):
+        """An NTP correction is a road bump. `contradiction` never looks at time, because
+        conviction is terminal and a paid-for node must not die of a clock."""
+        kp = self.keys[0]
+        a = attest.SignedAttestation.make(kp, _claim(1, 100, at=NOW))
+        b = attest.SignedAttestation.make(kp, _claim(2, 140, at=NOW - 30_000))
+        self.assertIsNone(attest.contradiction(a, b))
+
+    def test_the_window_must_exceed_the_probe_interval(self):
+        """Otherwise every gathered statement is stale by construction, since a bundle is as old as
+        the last probe round, and the floor becomes permanently unanswerable."""
+        t = attest.AttestTunables()
+        self.assertGreater(t.fresh_within, t.probe_every)
