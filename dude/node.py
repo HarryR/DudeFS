@@ -13,16 +13,16 @@
 # It contributes exactly one thing of its own: a `handle` mapping an inbound verb to an action, and
 # a `tick` that advances the round. Anything more belongs in one of the parts.
 #
-# THE ROUND IS INCOMPLETE, NOT UNDECIDED — and the difference matters. #buckets-2.28 specify the
-# mechanism (bucketing, observations, the `>= k` rule, the three-wave cadence); 2.29 is open about
-# the **correctness argument** under partition and skew — a modelling task, not a missing design.
+# THE ROUND IS INCOMPLETE, NOT UNDECIDED — and the difference matters. #buckets specifies the
+# mechanism (bucketing, observations, the `>= k` rule, the three-wave cadence); what is open is the
+# **correctness argument** under partition and skew — a modelling task, not a missing design.
 #
-# What is implemented here: bucket arithmetic, one batch per node per bucket (§4.1), endorsement
-# counted by `dude.quorum` against a slice DIGEST, settlement through the one evaluator, rejects
-# returned by `Mempool.reenter`.
+# What is implemented here: bucket arithmetic, one batch per node per bucket (MEMPOOL.md §4.1),
+# endorsement counted by `dude.quorum` against a slice DIGEST, settlement through the one evaluator,
+# rejects returned by `Mempool.reenter`.
 #
-# What is specified and NOT yet implemented: 2.22's `>= k` observation rule — this floods `PROPOSE`
-# and counts endorsements instead of deriving the batch from who observed what — and the explicit
+# What is specified and NOT yet implemented: the `>= k` observation rule (#buckets) — this floods
+# `PROPOSE` and counts endorsements instead of deriving the batch from who observed what — and the
 # three-wave cadence, which is collapsed into one pass here. Both are known gaps against a written
 # spec, and neither is waiting on a decision.
 

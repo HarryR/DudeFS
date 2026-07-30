@@ -1,4 +1,4 @@
-# dude.store — the log and the derived store. See ../../SPEC.md §11.
+# dude.store — the log and the derived store. See SPEC.md (#settlement).
 #
 # THE BOTTOM LAYER. Everything above hands it input that has ALREADY BEEN DECIDED: an ordered batch
 # to settle, a set of entries to compact. It decides nothing about ordering, membership or quorums —

@@ -23,14 +23,35 @@ and everything that depends on it.
 **Tags are permanent.** Renaming one is a breaking change; retiring one means marking it
 `RETIRED` here, not deleting it, so a stale citation resolves to an explanation rather than nothing.
 
-Provenance: **`[H]`** Harry's ruling · **`[M]`** established by a model in `experiments/` ·
-**`[I]`** inference, not yet tested.
+**Sections are not numbered, so a positional citation cannot be written.** Numbered refs went stale
+the moment a section moved, and eleven of them in the code still pointed at the numbering of a spec
+that was replaced.
+
+## What this document is
+
+**Requirements, and nothing else.** Every statement here says what an implementation MUST or MUST NOT
+do, in a form a reader can check against code.
+
+There are no provenance markers. Who first proposed a requirement does not change the obligation to
+meet it, and marking one as *inference not yet ruled on* invited the failure this file was rewritten
+to stop: an objection, recorded with its reasoning intact, reads as the more detailed and therefore
+more authoritative text, and gets implemented in place of the rule it was arguing against.
+
+Rationale, rejected alternatives, measurements and history are **not** here. `git log` holds them, and
+`PLAN.md` records what is not being done and why. Where a requirement would otherwise look arbitrary,
+it carries at most one clause naming what goes wrong without it.
+
+**Every requirement that a check can carry appears in the enforcement table with the symbol that
+enforces it.** A requirement with no enforcer is not satisfied by prose; it is marked OWED.
+
+Conversion is in progress: **Compaction, Accumulators, Replication and Trust** are in this form. The
+remaining sections still carry the old descriptive style and their markers, and are next.
 
 ---
 
-## 0. Design choices
+## Design choices
 
-**Read this section before changing anything.** Everything below §0 is detail; this is the set of
+**Read this section before changing anything.** Everything after it is detail; this is the set of
 decisions the detail follows from. Each has been re-derived wrongly at least once, and the cost was
 days rather than minutes — so they are stated as choices with their reasons, not left implicit.
 
@@ -125,7 +146,7 @@ of these, the model that refutes it is in `experiments/`.
 
 ---
 
-## 1. The log
+## The log
 
 ### One write vocabulary {#one-write-vocabulary}
 
@@ -156,7 +177,7 @@ transport without depending on the canonicaliser agreeing with itself.
 `[H]` A settled index is assigned by settlement and is never part of what an author signs. Reaching
 for one at authoring time is a bug — the index does not exist yet.
 
-## 2. Settlement
+## Settlement
 
 ### Settlement linearises and drops {#settlement}
 
@@ -194,7 +215,7 @@ must be reached by a batched change.
 `[H]` `bucket = ts / delta`. Boundaries are **computed, never negotiated** — there is no protocol for
 agreeing where a bucket starts. Both a convention and a safety rail, for that reason.
 
-## 3. Authority
+## Authority
 
 ### Presence is membership {#presence-is-membership}
 
@@ -235,243 +256,245 @@ Revocation freshness == data freshness: any freshness signal covers both, free.
 collection the state a guard referenced is gone, so re-running guards gives *wrong* answers rather
 than missing ones.
 
-## 4. Compaction
+## Compaction
 
 ### Collection is a log entry {#collection-is-a-log-entry}
 
-`[M]` A collection is an ordinary settled entry, so replay reproduces it.
+- A collection MUST be an ordinary settled entry at its own index.
+- Replay MUST reproduce a collection exactly as settlement produced it.
 
 ### A segment is collected whole {#collect-whole-segment}
 
-`[M]` The log is divided into **segments** — physical slices, **not** stores and not ACL domains. The
-id derives from the **settled index**, never the author's clock, because the mempool carries late
-transactions forward and an author-stamped entry could otherwise land in a collected segment.
-
-Collection deletes a segment entirely and subtracts **one accumulator**. No scattered drop set, no
-chain to repair, no run-length problem — a segment *is* a run by construction.
+- The log MUST be divided into segments.
+- A segment id MUST derive from the settled index, never from the author's timestamp (the mempool
+  carries late transactions forward, so an author-stamped entry can otherwise land in a segment that
+  has already been collected).
+- A segment MUST NOT be used as a store id or as an ACL domain.
+- Collection MUST delete every entry of the segment and MUST subtract exactly one accumulator.
 
 ### Collection is refused while live {#collection-refused-while-live}
 
-`[M]` Three refusals, each a correctness property:
+Collection MUST be refused when any of these holds:
 
-- **stragglers remain** — a segment that silently collected live data would lose committed state
-- **the segment is current** — migration writes at the head, so draining a segment into itself is a
-  no-op and the straggler simply reappears
-- **younger than the dedup window** — `op_hash UNIQUE` is what makes a settled transaction
-  unrepeatable, and collection forgets those hashes. Expressed as an **age**, not a segment width: a
-  width is a count and the window is a duration, so comparing them would need an arrival rate nobody
-  has.
+- the segment still holds a live value;
+- the segment is current — it contains, or would contain, `head + 1`;
+- the newest entry in the segment is younger than the dedup window. This MUST be measured as an
+  **age** against author timestamps, never as a segment width (a width is a count and a window is a
+  duration; comparing them requires an arrival rate nobody has).
 
 ### Collection is ratified {#collection-is-ratified}
 
-`[M]` A collection carries `(segment, height, acc_state)` and a **quorum signature over all three**.
-Collection deletes the joiner's only other verification path, so an unratified collection is one
-nobody can ever check. The refusal names the reason plainly — *"no signature"*.
+- A collection marker MUST carry `(segment, height, acc_state, acc_log, root)`.
+- It MUST carry a quorum signature over all five.
+- A marker MUST NOT be applied on **any** path — settlement, replay, or bulk transfer — unless its
+  signatures verify against the roster **and** the number of distinct signers satisfies the quorum
+  rule (#quorum-gate). Verifying signatures without counting them is not ratification.
+- The marker's identity MUST be over the claim alone, never over the signature set, so nodes that
+  collect the same segment with different shares produce the same entry.
+- A refusal MUST name its reason.
 
 ### Any node may drive a collection {#collection-is-driven-by-any-node}
 
-`[I]` A collection needs no distinguished proposer. Any node that finds a segment collectable —
-below the liveness threshold, past the dedup age, not current — migrates its stragglers and proposes
-it. Peers **recompute the fold** and sign only if they agree; at quorum every node collects using the
-same ratified attestation.
-
-Two nodes proposing the same segment is harmless: the proposals are identical, because a collection is
-a function of the segment and the fold rather than of who noticed first. A node that proposes a wrong
-fold is refused by everyone who still holds the data — which is the whole reason ratification happens
-**while the evidence exists** (#collection-is-ratified).
+- Any node MAY propose a collection. There MUST be no distinguished proposer.
+- A proposal MUST be a function of the segment and the fold alone, never of who proposed it, so two
+  nodes proposing the same segment produce byte-identical claims and their signatures pool.
+- A peer MUST recompute the claim and MUST sign only if its own computation matches byte for byte.
+- Ratification MUST happen while the evidence still exists; a wrong fold is refusable now and never
+  again.
+- At quorum every node MUST collect using the same ratified marker.
 
 ### Migration keeps the fold invariant {#migration-is-state-invariant}
 
-`[M]` Stragglers are rewritten at the head with the **same value**, so no state element changes and
-`A_state` is untouched while provenance moves forward. Without it, collection has a permanent floor:
-genesis grants and roster rows are live for the life of the log.
+- A migration MUST rewrite a straggler with the value it already holds, changing no state element.
+- `A_state` MUST be unchanged by migration and by collection.
+- A migration MUST assert nothing about the value, so that it requires no write authority.
+- A relocation of a management row MUST carry the credential that authorised the value it moves, and
+  that credential's author MUST be authorised at the time of the relocation.
+- Migration MUST be agreed by the quorum like any other entry. A node MUST NOT apply its own
+  migration locally.
 
-This is the cheap half of the conveyor; see [#conveyor](#conveyor).
-
-## 5. Accumulators
+## Accumulators
 
 ### The state root {#state-root}
 
-`[M]` A **compressed sparse Merkle tree** over live state, keyed by `H(store ‖ name)`, gives what no
-accumulator can: a proof about **one key**, checkable by a client holding nothing but the root.
-
-`[M]` **Absence is the point.** #absence-is-revocation makes a revocation nothing more than a grant
-that is gone — and until now there was no way to *prove* something is gone. A non-inclusion proof is a
-proof of revocation, so revocation freshness becomes data freshness in fact rather than by assertion.
-
-`[M]` It also restores what collection destroys. #collect-whole-segment deletes the joiner's replay
-path, which is why collection must be ratified; a state root gives a **second** verification path — a
-node that reconstructs state can check it against a root the quorum signed, rather than trusting that
-it reconstructed correctly.
-
-`[M]` **Both commitments are kept.** ECMH answers "do we hold the same state" in O(1) and nodes ask
-that constantly (#accumulators); the tree is paid only when a proof is served or a checkpoint is cut.
-Neither replaces the other.
-
-`[M]` **The root is a function of the live set alone.** Insert-then-delete is indistinguishable from
-never-inserted, so two nodes holding the same state agree on the root regardless of how they got
-there. No history enters the root — history is the log's job.
-
-`[M]` **Key-indexed with path compression, never sorted-leaf.** A sorted-leaf tree's insert is O(n)
-because every later position shifts; probe 20 measured it, and F16's "O(log S) cached" is **retracted**
-— the probe-03/06 tree is read-only and must not be lifted into production. Depth is ~24 at 10⁷ keys,
-so a proof is ~768 B.
-
-`[M]` **Every node is bound to where it sits** — a leaf to its path, an internal node to its depth
-*and* its prefix — so no hash in the tree can be quoted out of position. Position binding is local
-rather than resting on the global argument that a fold must reach the real root, which is what keeps
-it true for any later use of these hashes (subtree proofs, batched proofs). The verifier derives each
-prefix from the key it is asking about, so a proof costs nothing extra and can only ever be folded
-along that key's own path. Empty subtrees are a fixed constant at every depth, which is what makes the
-structure sparse.
-
-`[M]` **Domains are BLAKE2b personalisation, never a tag concatenated onto the message.** Two domains
-are two different hash functions; a prefixed tag is one function over a message someone must prove is
-prefix-free, and that proof gets re-earned at every call site.
-
-`[M]` The root is carried in the ratified checkpoint (#collection-is-ratified) and in a node's
-attestation (#monotonicity), so a proof always verifies against something **signed** — by a quorum in
-the first case, by a convictable single node in the second.
+- The state root MUST be a compressed sparse Merkle tree over live state, keyed by `H(store ‖ name)`.
+- It MUST support non-inclusion proofs, which are what make #absence-is-revocation checkable.
+- It MUST NOT be a sorted-leaf tree.
+- The root MUST be a function of the live set alone: insert-then-delete MUST be indistinguishable
+  from never-inserted, and no history may enter the root.
+- Every leaf MUST be bound to its own path, and every internal node to its depth **and** its prefix,
+  so no hash can be quoted out of position.
+- Empty subtrees MUST hash to a fixed constant per depth.
+- Domain separation MUST use BLAKE2b personalisation, never a tag concatenated onto the message.
+- The root and `A_state` MUST both be maintained; neither replaces the other.
+- The root MUST be carried in every ratified checkpoint (#collection-is-ratified) and in every
+  attestation (#monotonicity).
+- **A party that receives state MUST verify what it receives against a quorum-signed root before
+  acting on it.** Serving a proof nobody verifies satisfies nothing.
 
 ### Two accumulators {#accumulators}
 
-`A_state` over live `(store, name, value)`; `A_log` over `(index, op_hash)`. Both ECMH: an
-order-independent sum with exact subtraction.
+- `A_state` MUST be an ECMH sum over live `(store, name, value)`.
+- `A_log` MUST be an ECMH sum over `(index, op_hash)` for the entries currently retained.
+- `A_state` MUST be unchanged by collection.
+- `A_log` MUST lose exactly the collected segment's accumulator, and nothing else.
+- Replay-invariance MUST hold: every node replaying the *current* log agrees on both. Time-invariance
+  MUST NOT be expected — the log changes when anything is collected.
+- `A_log` cannot be computed by a node that never held the collected entries, so it MUST be adopted
+  from a signed commitment rather than derived.
 
-`[M]` **`A_state` is unchanged by collection** — collection removes only superseded history. `A_log`
-changes, and that is correct: the log changed. What must hold is **replay-invariance** (everyone
-replaying the *current* log agrees), not time-invariance, which is impossible once anything is
-rewritten.
+## Replication {#replication}
 
-## 6. Trust
+### A transfer is verified, not believed {#transfer-is-verified}
+
+- A run of entries MUST be applied at the indices it names, without re-adjudicating predicates
+  (#replay-does-not-readjudicate).
+- A run MUST be contiguous from the recipient's head. A gap, a repeated index and a reordering are
+  one failure: an entry that is not at the position owed.
+- Every entry's signature MUST be verified before it is applied.
+- Where a run reaches a height for which the recipient holds a **quorum-ratified** commitment, it
+  MUST reconcile with that commitment. The sender's own attestation MUST NOT be sufficient: a node
+  that signs a statement matching the history it invented is self-consistent, not authentic.
+- A refusal MUST be returned, never raised (#no-exceptions-for-control-flow). A run that does not
+  reconcile is an ordinary outcome of a bounded transfer racing the sender's own progress.
+- Bulk state MUST be accepted only from a roster member, and only in answer to a request the
+  recipient made.
+
+### The floor authorises the hole {#the-floor-authorises}
+
+- A compacted log is expected to have gaps, so completeness MUST NOT be required of the whole log.
+- `(floor, head]` MUST be complete, where `floor` is the height of the highest quorum-ratified
+  checkpoint the node holds. Below the floor, absence MUST be authorised by that checkpoint.
+- A node MUST NOT adopt a checkpoint whose signatures it cannot verify.
+- A node MAY hold a floor above its own head. That is the signed statement *"the cluster has ratified
+  state I do not hold"*, and it MUST NOT be refused: it is the condition that requires a bootstrap.
+- Catching up MUST fill `(floor, head]`. A node that cannot obtain that range MUST bootstrap instead,
+  and MUST NOT accept a partial or discontiguous run in its place.
+- A server that no longer holds a requested range MUST say so, rather than answering with what it
+  happens to still hold.
+
+### Bootstrap has one anchor {#bootstrap-anchor}
+
+The chain below MUST be established in order, and every step MUST be checked against the step before
+it. Nothing in it may rest on the word of the cluster being joined.
+
+1. The **manager public key** MUST be supplied out of band when a node is provisioned, and retained
+   across a re-bootstrap. It is the only value not derived from something else.
+2. The log's own manager grant MUST name that key. A log that does not is a different cluster's log
+   and MUST be refused.
+3. Roster membership MUST be verified against the manager key: every roster row by the credential
+   that authorised it, and its presence under a signed root. A roster MUST NOT be taken on the word
+   of the quorum it defines.
+4. Roster membership MUST be verifiable as **complete**, so that a subset cannot be presented — a
+   smaller roster is a smaller quorum.
+5. The checkpoint MUST then be verified against that roster (#collection-is-ratified).
+6. State MUST then be verified against the checkpoint's root (#state-root).
+
+- A floor MUST NOT be relied upon without `f+1` fresh corroboration (#freshness-needs-many). The
+  chain above establishes *who*; it establishes nothing about *when*.
+
+## Trust
 
 ### Storage nodes are untrusted {#nodes-are-untrusted}
 
-`[H]` They hold no trusted component and no keys. `[M]` The adversary is **failure domains** — seizure,
-provider loss, accidental rollback from a snapshot restore, operator error — not rational actors with
-a payoff. Every node is bought and paid for.
+- A node MUST hold no trusted component and no data keys.
+- The adversary MUST be modelled as failure domains — seizure, provider loss, rollback from a
+  snapshot restore, operator error — not as a rational actor with a payoff.
 
 ### Authenticity is self-verifying; currency is not {#the-lemma}
 
-`[M]` A signature proves *who spoke*. A hash proves *what*. A proof proves *it was computed
-correctly*. **Nothing proves that nobody has spoken since** — there is no such object, so no
-cryptography produces one.
-
-*"Is this current?"* is unaskable. The answerable form is *"is this too old?"*, which needs a clock and
-a party whose clock you trust.
+- Currency MUST NOT be treated as provable. A signature proves who spoke, a hash proves what, a proof
+  proves it was computed correctly; nothing proves that nobody has spoken since.
+- A signed position MUST be interpreted as *"at `T`, the frontier was at least `F`"*, and MUST NOT be
+  interpreted as *"`F` is the frontier now"*.
 
 ### Freshness needs f+1; authenticity needs one {#freshness-needs-many}
 
-`[M]` An arm can **withhold** a higher checkpoint, never forge one. So the maximum across `f+1`
-responders is correct. A **returning** client holding a receipt carries its own height floor and needs
-one responder; a **cold** client needs `f+1`.
-
-`[H]` **There is no priest** — the budget will not carry the cluster and a blessing service.
-
-`[H]` **Cold single-link clients are back in scope** (#freshness-is-gathered). A relay cannot forge
-its peers' signatures, so one link is enough to *gather* `f+1` independently signed statements, which
-the client checks itself. That was the priest's whole job, and the cluster now does it as a side
-effect of gossip it already performs.
+- A cold client MUST gather `f+1` independently signed statements and MUST check them itself.
+- A returning client holding a receipt MAY rely on one responder, since it carries its own floor.
+- The floor MUST be the **maximum** over those responders, never a majority vote: an arm can withhold
+  a higher checkpoint but cannot forge one.
+- Only a floor whose quorum signatures verify may contribute. An unverifiable floor MUST count as
+  zero.
+- There MUST be no third party that vouches for freshness. No priest.
 
 ### Freshness is gathered, never proved {#freshness-is-gathered}
 
-`[H]` A node signs the time **its own clock** reads when it attests. Nobody ratifies a timestamp:
-ratification is *recompute, don't trust* (#collection-is-driven-by-any-node), and no peer can
-recompute another's clock. A timestamp is therefore always an assertion by exactly one key, never a
-quorum claim — which is why the compactor's timestamp role is **struck** and freshness rides the
-attestation gossip instead. One less tier.
-
-`[M]` **What this buys is a BOUND, not a proof.** A client learns "at `T`, the frontier was at least
-`F`" and never "`F` is the frontier now" — #the-lemma is not repealed by signing a clock. The gain is
-that staleness becomes **visible** instead of silent: an adversary without `f+1` keys can only replay
-old statements, and old statements look old. The client can be denied; it cannot be fooled into
-believing it is current.
-
-`[H]` **This is a diagnostic, not adversarial liveness.** Full liveness guarantees are not available
-here and are not being claimed.
-
-`[M]` Freshness therefore rests on the **clock honesty of `f+1` nodes** — a genuinely new dependency,
-though on the same trust base as everything else. A node signing a *future* timestamp would look
-maximally fresh until that time arrived, so a statement outside the window is discarded on the same
-grounds a stale one is.
-
-`[H]` **The window is a cluster-wide tunable, not a per-client choice.** Consistency matters more
-than letting each client pick its own risk appetite: two clients disagreeing about whether the same
-bundle is fresh is a defect, not a feature. It must exceed the probe interval, or nothing is ever
-fresh by construction.
-
-`[H]` **A clock fault is never convictable.** An NTP step backwards is a road bump — annoying,
-infrequent, and normal. It is excluded from the conviction predicate for the same reason accumulators
-are (#cross-attestation): a bad clock **degrades** a node's contribution, and the client's window
-check drops it from the `f+1`. Shunning is terminal and is reserved for what a node proves against
-itself.
+- A node MUST sign the time its **own** clock reads when it attests.
+- A timestamp MUST NOT be ratified by anyone: no peer can recompute another's clock.
+- A statement outside the freshness window MUST be discarded, in both directions — a future timestamp
+  would read as maximally fresh until that time arrived.
+- The window MUST be a cluster-wide tunable, and MUST exceed the probe interval.
+- A clock fault MUST NOT be convictable. It MUST only drop that node from the `f+1`.
 
 ### Monotonicity is a duty {#monotonicity}
 
-`[M]` Nodes attest a monotone height and never regress; clients take the max over `f+1`. A regression
-is a **signed contradiction** anyone can keep — accountability rather than prevention, which needs
-durable state and no trusted hardware.
-
-`[M]` The attested floor is the **highest quorum-ratified checkpoint** the node holds. Its own head
-rides along as a **hint** and is never a floor: a private opinion of one's own height is forgeable
-*upward* at no cost, and #freshness-needs-many's "withhold, never forge" holds only for something
-carrying the quorum's signatures. Before the first collection there is no floor, so a young cluster
-attests zero and only the hint carries information.
-
-`[M]` **`head` must remain monotone under collection.** It is `MAX(idx)`, and collection writes its
-marker at `head+1` before deleting the segment it collects. Were it a count instead, every honest node
-would convict itself the moment it collected.
-
-`[M]` The attestation is a **pure function of committed store state**, and the counter is committed
-*before* it is signed. Signing over uncommitted state is then unconstructible rather than merely
-discouraged: a crash **skips** a counter value, and skipping is free where reuse is fatal. This is the
-highest-risk interlock in the design — see #cross-attestation, where an honest node convicting itself
-is permanent.
-
-`[M]` The counter is separate from the height. Ordering two claims by the quantity under dispute is
-circular: if the counter *were* the height, a regression would be unorderable and so unconvictable.
-
-`[H]` Out-of-band restore is forbidden: it regresses the height and convicts the node for an operator
-convenience.
+- A node MUST attest a monotone height and MUST NOT regress.
+- The attested floor MUST be the highest quorum-ratified checkpoint the node holds.
+- A node's own head MUST be carried as a hint and MUST NOT be used as a floor by anyone: a private
+  opinion of one's own height is forgeable upward at no cost.
+- `head` MUST remain monotone under collection. It MUST be `MAX(idx)`, and a collection MUST write its
+  marker at `head + 1` before deleting the segment it collects. A count would make every honest node
+  convict itself the moment it collected.
+- An attestation MUST be a pure function of committed state.
+- The attestation counter MUST be committed before the claim is signed. A crash MUST therefore skip a
+  counter value: skipping is free, reuse is fatal.
+- The counter MUST be separate from the height. Ordering two claims by the quantity under dispute is
+  circular.
+- Out-of-band restore MUST be forbidden, or MUST force an identity reset.
 
 ### Peers keep the evidence {#cross-attestation}
 
-`[M]` A node relays the latest attestation it holds for each peer, **verbatim and signed by that
-peer**, never as an opinion about it. A relay can therefore neither forge nor alter one — it cannot
-frame a peer and cannot be framed by one — so the only lie left anywhere in the scheme is **silence**,
-which is measurable against the rest of the cluster.
+- A node MUST relay the latest attestation it holds for each peer verbatim and signed by that peer,
+  never as an opinion about it.
+- A relay MUST carry convictions as well as sightings. A node that convicts keeps the earlier
+  statement and refuses the later one, so relaying sightings alone relays only the innocent half.
+- A receiver MUST recompute a relayed verdict and MUST NOT believe it.
+- Relayed evidence MUST only ever convict, never vouch. No reputation accrues.
+- Conviction MUST require a single key contradicting itself: the same counter over different bytes, or
+  an increased counter over a decreased height or a decreased floor.
+- Accumulators and timestamps MUST NOT enter the conviction predicate.
+- Divergence MUST NOT convict. Two keys claiming one height with different accumulators proves
+  something is wrong and nothing about who.
+- Conviction MUST be terminal for the identity. Recovery MUST be re-join as a new node; there MUST be
+  no rehabilitation and no un-shun protocol.
+- Shunning MUST follow proven self-contradiction only — never silence, staleness or divergence.
+- Shunning MUST be a local read policy. It MUST NOT alter the roster or the quorum arithmetic, so a
+  heavily shunned cluster stalls rather than proceeding on a thinned quorum.
 
-`[M]` Peers are the **keepers**. Accountability otherwise rests on some client having happened to be
-watching, and the accident this catches — a snapshot restored overnight — happens precisely when
-nobody is. Every peer a node ever spoke to holds evidence against its future self.
+## Enforcement
 
-`[M]` Relayed evidence **only ever convicts, never vouches**. A sighting is worth exactly the signature
-it carries, so no reputation accrues and collusive vouching buys nothing.
+Covers Compaction, Accumulators, Replication and Trust. **A row with no enforcer is a requirement nothing
+obliges**, which is the defect this table exists to make visible rather than plausible.
 
-`[M]` This is the partial repair of #known-churn's refutation: a node cannot witness its own
-monotonicity, but it can witness its peers'. Single-node and minority rollback become obvious. A
-genuine common-mode failure — everything rolling back together — stays invisible.
-
-`[M]` **Conviction is a single key contradicting itself**: the same counter over different bytes, or
-an increased counter over a decreased height. Clock-free, self-contained, permanent, and attributable.
-Accumulators are deliberately not in the predicate — they are unordered, so nothing can regress.
-
-`[M]` **Divergence is not conviction.** Two keys claiming the same head with different accumulators
-proves something is wrong and *nothing about who*; resolving it needs the data. Shunning on divergence
-would let a liar get an honest node shunned.
-
-`[H]` Conviction is **terminal for the identity**. Recovery is re-join as a new node — the path a
-forbidden restore already forces (#monotonicity), so this adds no mechanism. There is no
-rehabilitation and no un-shun protocol.
-
-`[H]` Shunning follows **proven self-contradiction only** — never silence, staleness, or divergence. A
-partition makes honest nodes look stalled, and a cluster that shunned on staleness would eat itself.
-
-`[M]` Shunning is a **local read policy**: it does not alter the roster or the quorum arithmetic. A
-shunned node still counts toward `n`, so a heavily-shunned cluster **stalls rather than proceeding** on
-a thinned quorum, which is the correct direction under #durability-over-latency.
-
-## 7. Keys
+| requirement | enforced by |
+|---|---|
+| a marker is ratified before it is applied, on every path | `Store.replay`, `Store.collect` |
+| ratification counts distinct signers against the quorum rule | `ops.Compaction.attested` |
+| a peer signs only a claim it recomputed | `Node._on_collect` |
+| collection is refused while live, current, or too young | `Store.collect` |
+| `A_state` is unchanged by collection | `Store._collect` (raises `InvariantError`) |
+| a relocation of a management row is currently vouched for | `settle._relocates`, `settle._vouches` |
+| a run is contiguous from the recipient's head | `node._uncontiguous` |
+| every replayed entry's signature verifies | `store._unverified` |
+| a run reconciles with a ratified commitment where it reaches one | `Store._anchors`, `Store._disagrees` |
+| a refusal is returned, not raised | `Store.replay` return type |
+| bulk state is solicited and from a roster member | `node.SOLICITED`, `Node._on_entries` |
+| a checkpoint is adopted only if its signatures verify | `Store.adopt` |
+| an unverifiable floor counts as zero | `attest.attested_floor` |
+| a statement outside the window is discarded | `attest.fresh` |
+| the attestation counter is committed before signing | `Store.attestation` |
+| conviction is self-contradiction only | `attest.contradiction` |
+| a relayed verdict is recomputed | `Store.judge` |
+| shunning does not alter quorum arithmetic | `Node.shunned` |
+| every inbound frame is checked against the screen tag | `Postman.deliver` |
+| received state is verified against a signed root | **OWED** — no verb serves a proof; the joiner is the first consumer |
+| roster membership is verified against the manager key | **OWED** — the bootstrap chain is unbuilt |
+| roster completeness is verifiable | **OWED** — needs a manager-signed membership commitment |
+| a floor is corroborated by `f+1` fresh responders before use | **OWED** — `attested_floor` exists; nothing calls it on the bootstrap path |
+| a node that cannot obtain `(floor, head]` bootstraps instead | **OWED** — no decision point exists |
+| a server says what it no longer holds | **OWED** — `_on_pull` answers with what it has |
+## Keys
 
 ### Two secrets, never one {#two-secrets}
 
@@ -539,7 +562,7 @@ forgot it is not provable by anyone. That is the accepted TEE trade-off, not a g
 `[M]` One conveyance does two jobs: it drains the old epoch **and** vacates the old segment, since it
 writes at the head. The belt moves once and two things fall off the back.
 
-## 8. Transport
+## Transport
 
 ### Transport adds no trust {#transport-adds-no-trust}
 
@@ -558,7 +581,7 @@ essential: keyed on identity alone it would be a constant, i.e. a permanent per-
 `[H]` Sealing after signing means an observer sees no identity. Signing a ciphertext would leave the
 sender's key in the clear and leak the social graph.
 
-## 9. Errors
+## Errors
 
 ### Routine outcomes are returned, not raised {#no-exceptions-for-control-flow}
 

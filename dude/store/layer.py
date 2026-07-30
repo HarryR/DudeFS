@@ -1,4 +1,4 @@
-# dude.store.layer — the read surface, and the writable delta over it. See ../../SPEC.md §11.
+# dude.store.layer — the read surface, and the writable delta over it. See SPEC.md (#settlement).
 #
 # WHY THIS IS ITS OWN MODULE. Evaluating a transaction — guards, authority — must be possible
 # WITHOUT a store: the mempool screens candidates speculatively, thousands of times, and none

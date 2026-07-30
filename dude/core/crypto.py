@@ -278,7 +278,7 @@ class AeadBlob(bytes):
 
 
 def h(data: bytes) -> Digest:
-    """Content-address hash. `op_hash = h(bytes-as-received)` (IMPLEMENTATION §2)."""
+    """Content-address hash. `op_hash = h(bytes-as-received)` (#content-address)."""
     return Digest(hashlib.blake2b(data, digest_size=DIGEST_SIZE).digest())
 
 
@@ -555,7 +555,7 @@ class Ed25519ListMultiSig:
     """The concatenated-signature-list instantiation (DESIGN §8, decided for
     v1): a signer bitmap plus one Ed25519 signature per signer, all over the
     identical message. A drop-in for a future BLS aggregate behind this same
-    interface (ARCHITECTURE L0). No proof-of-possession needed (lists don't
+    interface. No proof-of-possession needed (lists don't
     aggregate)."""
 
     suite_id = MULTISIG_SUITE
@@ -690,7 +690,7 @@ type Keyring = dict[int, EpochKeys]
 
 
 # --------------------------------------------------------------------------- #
-# AEAD — data payloads (DESIGN §5, staged per IMPLEMENTATION §1)               #
+# AEAD — data payloads (#per-item-key, #random-nonce)                          #
 # --------------------------------------------------------------------------- #
 
 

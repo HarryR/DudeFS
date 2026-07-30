@@ -1,4 +1,4 @@
-# dude.store.management — the management store, as an API. See ../../SPEC.md §9, §10.
+# dude.store.management — the management store, as an API. See SPEC.md (#management-is-cleartext).
 #
 # Two halves, and the split is the whole point:
 #
@@ -12,8 +12,8 @@
 # several helpers with `+`, signs the union ONCE, and applies that — so a partial removal
 # (a node out of the roster but still holding a live master) is not a state the API can reach.
 #
-# and it satisfies 1.4b: there is no compound `remove_node` OPERATION, only a helper emitting
-# `set` and `del`. Nothing here is a new opcode.
+# and it satisfies #one-write-vocabulary: there is no compound `remove_node` OPERATION, only a
+# helper emitting `set` and `del`. Nothing here is a new opcode.
 #
 # KEYS ARE CLEARTEXT PATHS, not derived tokens. #management-is-cleartext makes control operations
 # readable to
@@ -45,7 +45,8 @@ class ManagementError(DudeError):
 
 class Role(Enum):
     """Who someone is. Coarse, per #coarse-acl — the grant is by store or by operation kind, never
-    by path prefix, because a node must be able to check it without reading a key (9.3a)."""
+    by path prefix, because a node must check it without reading a key
+    (#management-is-cleartext)."""
 
     MANAGER = b"manager"
     NODE = b"node"
@@ -79,7 +80,7 @@ class NodeRecord:
 @dataclass(frozen=True, slots=True)
 class Grant:
     """What an identity may write. `stores` is the set of store ids; `kinds` the operation kinds
-    (9.2's compactor grant is a kind, not a store — there is no compaction store, 9.2a)."""
+    (the compactor's grant is a KIND, not a store — there is no compaction store, #coarse-acl)."""
 
     identity: crypto.PublicKey
     role: Role
@@ -163,7 +164,7 @@ class Management:
 
     def may_write(self, reader: Reader, who: crypto.PublicKey, store_id: int) -> bool:
         """#coarse-acl's coarse check, and the ONLY authority question a node can answer blind: the
-        store id is cleartext in every operation (9.3b), so this needs no key and no path.
+        store id is cleartext in every operation (#coarse-acl), so this needs no key and no path.
 
         Takes the `reader` per call so it satisfies `settle.Authoriser`: during evaluation that is
         the transaction's own layer, which is how a grant made by an earlier STEP is visible to a
@@ -179,7 +180,7 @@ class Management:
 
     def may_send(self, who: crypto.PublicKey, kind: int) -> bool:
         """Whether `who` may author an operation of this kind — the grant that has no store, e.g. a
-        compaction (9.2a)."""
+        compaction (#coarse-acl)."""
         g = self.grant_of(who)
         if g is None:
             return False
@@ -333,12 +334,12 @@ class Management:
         #replay-does-not-readjudicate says an endorsement is valid for the node set in force
         *at its position*, which
         invites a historical query. But compaction may have collected the management operations that
-        would answer it — a node added and later removed annihilates entirely (5.3) — so for old
-        enough positions the answer is genuinely unrecoverable.
+        would answer it — a node added and later removed annihilates entirely (#accumulators) — so
+        for old enough positions the answer is genuinely unrecoverable.
 
-        That is not a gap, because nothing needs it: replay does not re-adjudicate (8.13), and
-        a replayer's check is the accumulator against a quorum attestation
-        (#collection-is-ratified). Historical
+        That is not a gap, because nothing needs it: replay does not re-adjudicate
+        (#replay-does-not-readjudicate), and a replayer's check is the accumulator against a quorum
+        attestation (#collection-is-ratified). Historical
         node sets are needed only to verify an endorsement *while in use*, which is near-current.
 
         Left as an explicit refusal rather than absent, so a caller reaching for it discovers

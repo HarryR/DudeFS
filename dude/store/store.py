@@ -1,10 +1,10 @@
-# dude.store.store — the log and the derived view, on SQLite. See ../../SPEC.md §11.
+# dude.store.store — the log and the derived view, on SQLite. See SPEC.md (#settlement).
 #
-# TWO COMPONENTS, ONE DATABASE (#one-write-vocabulary, 11.0a). They are separate in interface — the
+# TWO COMPONENTS, ONE DATABASE (#one-write-vocabulary). They are separate in interface — the
 # log is a
 # sequence, the store is derived state — and share one SQLite file because a settlement must
 # append entries, update chain pointers, update the live view and update the accumulator
-# ATOMICALLY. That single transaction is what makes 11.1's "only the log is authoritative"
+# ATOMICALLY. That single transaction is what makes "only the log is authoritative"
 # survivable across a crash mid-settlement; hand-rolling it would mean re-earning transactionality
 # SQLite already has.
 #
@@ -243,7 +243,8 @@ class Store:
         return row[0] or 0
 
     def entries(self, frm: Index = 1, to: Index | None = None) -> Iterator[Entry]:
-        """Replay range, inclusive. The only way anyone derives state (SPEC §8)."""
+        """Replay range, inclusive. The only way anyone derives state
+        (#replay-does-not-readjudicate)."""
         hi = self.head() if to is None else to
         for idx, kind, raw in self.db.execute(
             "SELECT idx, kind, raw FROM entry WHERE idx BETWEEN ? AND ? ORDER BY idx", (frm, hi)

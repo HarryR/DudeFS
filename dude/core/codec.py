@@ -1,17 +1,15 @@
-# DudeFS L1 — canonical bencode codec.
-#
-# IMPLEMENTATION.md §2 / ARCHITECTURE L1 / PROTOCOL §5 / FORMAL §1.
+# dude.core.codec — canonical bencode. See SPEC.md (#content-address).
 #
 # Four types only: int, bytes, list, dict (byte-string keys, strictly sorted &
 # unique). No floats, no bools, no str — bytes carry human-readable text by
 # UTF-8 convention. Two iron properties this module must guarantee, because
-# everything signed or PRF'd rests on them (FORMAL §1):
+# everything signed rests on them:
 #
 #   * injective  — length-prefixed throughout, so distinct values -> distinct bytes;
 #   * canonical  — exactly one encoding per value (sorted keys, minimal ints),
 #                  and the decoder *rejects* any non-canonical input rather than
 #                  silently accepting it. Identity is the received bytes
-#                  (ARCHITECTURE L1), so a lax decoder would let two byte strings
+#                  layer, so a lax decoder would let two byte strings
 #                  denote one value and break content addressing.
 #
 # Grammar (all ASCII framing bytes):

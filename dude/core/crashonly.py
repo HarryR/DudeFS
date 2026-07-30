@@ -47,7 +47,7 @@ def _die(kind: str, exc: BaseException | None, tb: types.TracebackType | None) -
     # os._exit, not sys.exit: we are (usually) on a non-main thread, where SystemExit would
     # only unwind THAT thread and leave the half-dead process alive — the exact failure we are
     # here to prevent. No atexit/finalizers: the store's durability is fsync-on-COMMIT, so
-    # there is nothing to flush that correctness depends on (RESILIENCE §0).
+    # there is nothing to flush that correctness depends on.
     os._exit(70)  # EX_SOFTWARE
 
 

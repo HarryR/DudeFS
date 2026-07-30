@@ -1,4 +1,4 @@
-# dude.net — the wire. Three layers, kept apart (TRANSPORT.md, SPEC.md §7).
+# dude.net — the wire. Three layers, kept apart (TRANSPORT.md, SPEC.md #transport-adds-no-trust).
 #
 #   inner     authenticated content, DISTRIBUTABLE  (dude.store.ops.SignedTransaction)
 #   envelope  one hop, sender-authenticated, addressed, correlated, timestamped and GATED

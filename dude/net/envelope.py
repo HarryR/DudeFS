@@ -1,4 +1,4 @@
-# dude.net.envelope — point-to-point message framing. See ../../TRANSPORT.md, ../../SPEC.md §7.
+# dude.net.envelope — point-to-point message framing. See TRANSPORT.md, SPEC.md (#sign-then-seal).
 #
 # THREE LAYERS, and keeping them apart is the whole design [H]:
 #
@@ -76,7 +76,7 @@ class Verb(IntEnum):
     RATIFY = 41
     """A signature over that claim, from a node that recomputed the fold and agrees."""
 
-    # -- log transfer (SPEC §8) ----------------------------------------------------------------- #
+    # -- log transfer (#replication) -------------------------------------------------------- #
     FRONTIER = 30
     """"Where are you now?" Carries nothing: the question has no parameters."""
     STANDING = 33

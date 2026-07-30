@@ -1,4 +1,4 @@
-# dude — the operation vocabulary. See ../SPEC.md §1.
+# dude — the operation vocabulary. See SPEC.md (#one-write-vocabulary).
 #
 # The whole write surface, and it is deliberately this small (#one-write-vocabulary, RISC not CISC):
 #

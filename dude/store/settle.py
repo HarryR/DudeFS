@@ -1,4 +1,4 @@
-# dude.store.settle — deciding whether a transaction may land. See ../../SPEC.md §2.11, §9.2.
+# dude.store.settle — deciding whether a transaction may land. See SPEC.md (#settlement).
 #
 # PURE. Takes a `Reader`, returns a verdict and the mutations that would result. No store, no
 # SQLite, no clock, no I/O — which is what makes it usable in three places that look different
@@ -11,8 +11,8 @@
 # One evaluator, so all three agree. The previous package answered that question in several
 # places with different answers, and the differences were where its worst defects lived.
 #
-# EVALUATION IS A SEQUENCE, exactly as if each step were applied directly to the store (SPEC
-# 1.4): step N's guards, and step N's AUTHORITY, are checked against state as evolved by steps
+# EVALUATION IS A SEQUENCE, exactly as if each step were applied directly to the store — see
+# #one-write-vocabulary. Step N's guards, and step N's AUTHORITY, see state as evolved by steps
 # 1..N-1. That is what makes *authorise -> use it -> revoke it* one atomic transaction rather
 # than three, and why there is one behavioural model instead of one for the store and another
 # for transactions.

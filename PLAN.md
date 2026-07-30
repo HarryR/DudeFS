@@ -78,9 +78,25 @@ three sections is how this file went stale in the first place.
 
 ## Step 0 — correct the record  ✅ mostly
 
-`SPEC.md` is rewritten and **cites by `#tag`, never by section number** — positional refs broke
-whenever a section moved, could not be grepped in both directions, and rendered as dead text.
-36 tags; a retired tag stays listed with its reason so a stale citation resolves to an explanation.
+`SPEC.md` **cites by `#tag`, never by section number**, and **section numbers are now gone entirely**,
+so a positional citation cannot be written. They had already rotted: eleven refs in the code pointed at
+the numbering of the spec that replaced them (`store.py` cited a `§11` that does not exist), and a
+further thirteen pointed at documents that are not in this repository at all — `IMPLEMENTATION.md`,
+`ARCHITECTURE`, `FORMAL`, `PROTOCOL`, `RESILIENCE`, `ROUND-AGREEMENT`. All twenty-four repointed to
+tags; a test-free check is that every `#tag` cited from code resolves in SPEC.
+
+**SPEC states requirements and nothing else `[H]`.** Compaction, Accumulators, Replication and Trust
+are converted: 97 MUST/MUST NOT lines where there were **zero**, plus an **enforcement table** naming
+the symbol that enforces each requirement — and marking six as OWED, which is how a requirement that
+nothing obliges becomes visible instead of plausible. Rationale, rejected alternatives, measurements
+and probe archaeology are deleted; `git log` holds them and this file records what is not being done.
+
+**The `[H]`/`[M]`/`[I]` provenance markers are abolished in the converted sections.** Who first
+proposed a requirement does not change the obligation to meet it, and `[I]` — defined as *"inference
+not yet ruled on, not load-bearing"* — was in practice load-bearing in at least eight shipped
+mechanisms, one of which (MEMPOOL §5) quoted an `[H]` ruling and then replaced it. An objection
+recorded with its reasoning intact reads as the more authoritative text and gets built in place of the
+rule it argued against. Inferences do not belong in a spec; open questions go to Harry.
 
 Old design docs are in `old-and-invalid/` with a README saying *why* each is invalid.
 

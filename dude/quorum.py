@@ -1,11 +1,11 @@
-# dude.quorum — the gate. See ../SPEC.md §2.3.
+# dude.quorum — the gate. See SPEC.md (#quorum-gate).
 #
 # "It decides what is and is not consensus, and nothing else in this document may depend on how it
 # decides." So this module is deliberately tiny and has no dependencies: given a node count, how
 # many must agree. Replaceable at will — including by a deterministic chaos monkey.
 #
 # THE ARITHMETIC THAT ACTUALLY MATTERS, because the choice of rule and the tolerable fault count are
-# ONE decision, not two (#quorum-gate, ROUND-AGREEMENT §5):
+# ONE decision, not two (#quorum-gate):
 #
 #   two quorums of size q drawn from n intersect in at least   2q - n   members
 #   for that intersection to be guaranteed to contain an HONEST node:   2q - n > f
