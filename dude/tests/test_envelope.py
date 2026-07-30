@@ -9,6 +9,7 @@ import unittest
 
 from ..core import codec, crypto
 from ..net import Envelope, EnvelopeError, Frame, SignedEnvelope, Verb, request, seal, unseal
+from ..net.postman import Postman
 from ..store import ops
 
 T0 = 1_700_000_000_000
@@ -217,6 +218,28 @@ class TestSealing(unittest.TestCase):
         self.assertTrue(self.frame.addressed_to(self.b.public))
         self.assertTrue(other.addressed_to(self.b.public))
         self.assertFalse(self.frame.addressed_to(self.eve.public))
+
+    def test_a_frame_tagged_for_someone_else_is_declined_at_the_door(self):
+        """The other half of the tag's job, and it was performed by no layer at all.
+
+        `crypto.screen_tag` says the receiver keys on its OWN identity and compares, and that this
+        is what makes garbage cost ONE HASH rather than an ECDH against an ephemeral key. Nothing
+        compared: the transports never touch the tag and `Postman.deliver` went straight to
+        `unseal`. So the check was not "pushed into the transport" -- it was nowhere, and only the
+        sealed box declining to open kept a misaddressed frame out.
+
+        The box here WOULD open, which is what makes this test about ordering rather than about
+        secrecy: the sealed blob is genuinely ours and only the tag says otherwise. Under the old
+        code it was accepted."""
+        openable = Frame(crypto.screen_tag(self.eve.public, self.frame.sealed), self.frame.sealed)
+        self.assertEqual(unseal(openable, self.b), self.env, "the box really is ours")
+
+        post = Postman(self.b)
+        with self.assertRaises(EnvelopeError) as cm:
+            post.deliver(openable, T0)
+        self.assertIn("not addressed to us", str(cm.exception))
+
+        self.assertEqual(post.deliver(self.frame, T0).envelope, self.env, "the honest frame lands")
 
     def test_the_tag_is_a_hint_and_authorises_nothing(self):
         """A tampered frame keeps a matching tag if the tag is recomputed over it, so `addressed_to`

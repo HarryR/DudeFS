@@ -596,25 +596,13 @@ class Ed25519ListMultiSig:
                 return False
         return True
 
-    @staticmethod
-    def verify_each(
-        bitmap: SignerBitmap,
-        sigs: list[Signature],
-        msgs: list[bytes],
-        roster_pubkeys: list[PublicKey],
-    ) -> bool:
-        """Verify each listed signature against ITS OWN message (finding-17): the
-        shares no longer sign an identical message — each carries the signer's own
-        `issue_seq` — so `msgs[i]` is the message for the i-th named signer (index
-        order). Bitmap-count / quorum sizing stays the QC layer's job."""
-        n = len(roster_pubkeys)
-        indices = bitmap_indices(bitmap, n)
-        if len(indices) != len(sigs) or len(indices) != len(msgs):
-            return False
-        for idx, sig, msg in zip(indices, sigs, msgs, strict=False):
-            if not roster_pubkeys[idx].verify(msg, sig):  # bool wrapper, see `verify` above
-                return False
-        return True
+    # `verify_each` -- per-signer messages -- is STRUCK, not kept `[H]` (smallest-correct, no
+    # option-keeping). It had no caller anywhere, tests included, and it was salvage from the
+    # previous package: its docstring cited a `finding-17` and an `issue_seq` field that do not
+    # exist here. Every share signs identical bytes by construction (`Compaction.attest_bytes`
+    # is a function of the claim alone), which is what lets signatures POOL across nodes that
+    # independently noticed the same segment. If per-signer messages are ever needed, the thing to
+    # write is the one the caller then needs, not this.
 
 
 MULTISIG = Ed25519ListMultiSig

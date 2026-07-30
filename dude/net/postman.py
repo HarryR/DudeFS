@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from typing import NamedTuple
 
 from ..core import crypto
-from .envelope import Frame, SignedEnvelope, seal, unseal
+from .envelope import EnvelopeError, Frame, SignedEnvelope, seal, unseal
 from .link import Link, Peer
 from .mailbox import Expired, Mailbox, Millis, Reply, Transmit
 from .plan import Decision, GiveUp, Plan, Send, Wait
@@ -103,7 +103,27 @@ class Postman:
         The envelope is never `None` — the old signature said it might be, which was unreachable
         since a frame that will not unseal or verify RAISES rather than returning.
 
-        Refuses by raising: strict in what we accept, and loudly (LINKS.md anti-rule)."""
+        Refuses by raising: strict in what we accept, and loudly (LINKS.md anti-rule).
+
+        THE SCREEN TAG IS CHECKED HERE, and it was checked nowhere `[H]`. `crypto.screen_tag` states
+        the intended flow — *"the sender keys on the target's identity; the receiver keys on its OWN
+        and compares"* — and names what it buys: a non-member knows no identity, so it cannot
+        forge a tag, and **garbage costs one hash** instead of an ECDH against an ephemeral key.
+        No layer performed the comparison: the transports never touch the tag, so every junk frame
+        paid for a full sealed-box attempt, and a frame tagged for somebody else was opened.
+
+        It belongs HERE rather than in a transport, because this is the one door every carrier comes
+        through — a check that lives in `InProc` is a check a socket transport would not have, and
+        an obligation that differs per carrier is not an obligation.
+
+        This is addressing, NOT authentication, and the two must not be confused: a matching tag
+        proves nothing about who sent the frame or what they may ask for (see
+        `test_the_tag_is_a_hint_and_authorises_nothing`), and everything that matters still happens
+        in `accept` after unsealing. Acting on a mismatch costs nothing even though the field is
+        unauthenticated: whoever can rewrite a tag in flight can drop the frame instead, so refusing
+        one grants an attacker no capability it lacked."""
+        if not frame.addressed_to(self.me.public):
+            raise EnvelopeError("frame is not addressed to us (screen tag does not match)")
         env = unseal(frame, self.me)
         env.accept(self.me.public, now, self.window)
         reply = self.mailbox.arrived(env, now)

@@ -8,7 +8,7 @@ ruff format dude -q && ruff check dude && ty check dude/ \
   && python3 -m unittest discover -s dude/tests -t . -q
 ```
 
-**253 tests: 252 green, 1 RED ON PURPOSE.** Lint, format and typecheck are clean. The red is
+**257 tests: 256 green, 1 RED ON PURPOSE.** Lint, format and typecheck are clean. The red is
 `test_a_pull_for_a_collected_range_is_not_answered_with_a_hole` — it asserts what §2 owes and fails
 until that lands. **The tree is not broken and it is not flaky** (six consecutive runs). Do not delete
 it to get a green gate; everything else must stay green.
@@ -20,14 +20,18 @@ does not scale).
 
 **The rule this codebase keeps proving** `[H]`: *"we decided on a mitigation, tested that mitigation
 — without mitigating anything."* It builds a check correctly, tests the check in isolation, and then
-never consults it where the decision is made. **Five** instances were open in node-to-node sync and are
-now closed (PLAN.md, "The anchor wave"); the fifth was `attested()` verifying signatures without ever
-COUNTING them, so "ratified" meant *"one roster member signed"* — every consumer of a floor inherited
-it, and a unit test of the multisig could never have shown it.
+never consults it where the decision is made. **Six** instances were open and are now closed (PLAN.md,
+"The anchor wave"); each passed its own tests, because its own tests exercised the primitive rather
+than the path. The last two are the clearest: `attested()` verified signatures and never COUNTED
+them, so "ratified" meant *"one roster member signed"*; and the screen tag was compared by no layer
+and no transport, so `crypto.screen_tag`'s stated property — a non-member cannot forge a tag, so
+**garbage costs one hash** — was simply not delivered.
 
-**So review by grepping for the verification CALL, never for the signing code**, and ask of each
-mitigation: which line refuses, and what breaks if I delete it? A test that exercises the primitive
-proves nothing about whether anything asks.
+**`dude/tests/test_wired.py` now enforces the cheap half of this mechanically**: every check named in
+`WIRED` must have a production caller, matched on the AST so a mention in prose does not count, and
+anything genuinely not consumed yet sits in `OWED` with its reason and its future consumer. Verified
+to fail when a check loses its last caller. It cannot catch a check that is called but INCOMPLETE, so
+the review question stands: **which line refuses, and what breaks if I delete it?**
 
 ---
 
