@@ -1,4 +1,4 @@
-# Every check must have a caller that acts on it.
+# Every check must have a caller that acts on it; every duty must have a driver that performs it.
 #
 # THE FAILURE THIS EXISTS TO CATCH, and it has now happened six times in this codebase `[H]`:
 # *"we decided on a mitigation, tested that mitigation... without mitigating anything."* A check is
@@ -13,6 +13,14 @@
 #   the ratified checkpoint never adopted, so a transfer was checked against the SENDER's word
 #   `attested_floor`        took a max over floors whose signatures it never verified
 #   `addressed_to`          the screen tag was compared by no layer, in no transport
+#
+# AND THE SAME FAILURE FOR DUTIES, which hid longer because it looks like nothing at all. A thing
+# can be specified, built, unit-tested and correct while nothing in the round ever calls it. The
+# whole compaction and conveyor subsystem is in that state: `Management.retire` kills an epoch and
+# has no caller, `Node.drain` migrates stragglers and has no caller, `Node.maybe_collect` proposes
+# a collection and has no caller, and `Store.epochs` is the backlog queue with no reader. So nothing
+# migrates, nothing collects, nothing retires, and forward secrecy — the point of the conveyor — is
+# unreachable, while every primitive underneath is correct and tested.
 #
 # WHAT THIS FILE CAN AND CANNOT DO. It catches a check with no caller — which was four of those six.
 # It cannot catch a check that is called but incomplete (`attested` counting nothing), or one
@@ -81,19 +89,35 @@ neither, so the test below fails as soon as an entry becomes wired."""
 
 
 def _called(tree: ast.AST) -> set[str]:
-    """Every name this module CALLS, bare and qualified. Only `ast.Call` nodes count: a mention in a
-    docstring, a comment or an import is not a consumer, and grepping cannot tell the difference."""
+    """Every name this module CALLS, as the FULL dotted path and as each suffix of it.
+
+    Only `ast.Call` nodes count: a mention in a docstring, a comment or an import is not a consumer,
+    and grepping cannot tell the difference.
+
+    THE WHOLE CHAIN, not just the attribute, because two duties can share a method name: `retire` is
+    both `Mempool.retire`, which the round calls, and `Management.retire`, which nothing calls. A
+    detector that recorded only `retire` reported the second as driven — a guard against believing
+    things happen, satisfied by a coincidence of names for the second time."""
     names: set[str] = set()
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
+        parts: list[str] = []
         f = node.func
-        if isinstance(f, ast.Attribute):
-            names.add(f.attr)
-            if isinstance(f.value, ast.Name):
-                names.add(f"{f.value.id}.{f.attr}")
-        elif isinstance(f, ast.Name):
-            names.add(f.id)
+        while isinstance(f, ast.Attribute):
+            parts.append(f.attr)
+            f = f.value
+        if isinstance(f, ast.Name):
+            parts.append(f.id)
+        elif parts:
+            parts.append("?")  # a call or subscript at the root: the chain is still usable
+        else:
+            continue
+        chain = ".".join(reversed(parts))
+        names.add(chain)
+        # every suffix, so a list can key on "mgmt.retire" without knowing it is reached via `self`
+        for i in range(1, len(parts)):
+            names.add(".".join(reversed(parts[:i])))
     return names
 
 
@@ -102,6 +126,52 @@ def _production_calls() -> set[str]:
     for p in _PROD:
         out |= _called(ast.parse(p.read_text()))
     return out
+
+
+DRIVEN = {
+    # the duty                what performs it, each round
+    "mempool.evict": "ages out what can no longer be endorsed",
+    "mempool.admit": "screens what a client offers",
+    "mempool.reenter": "re-evaluates what settlement kicked",
+    "mempool.propose": "offers this node's batch for a closed bucket",
+    "mempool.retire": "forgets what landed in the log",
+    "probe": "asks peers where they are, so a rollback is seen",
+    "catch_up": "asks the longest peer for what we are missing",
+    "postman.tick": "sends what is due and reaps what expired",
+    "store.apply": "settles the agreed slice",
+}
+"""Duties that MUST be performed by the round. Keyed by the dotted call as production writes it.
+
+A duty differs from a check: a check refuses something, a duty makes something happen. Both fail the
+same way — no caller — but an unperformed duty leaves no trace at all, because nothing refuses and
+nothing errors. The system simply never does the thing."""
+
+UNDRIVEN = {
+    "maybe_collect": (
+        "Nothing proposes a collection, so no segment is ever collected in production and the log "
+        "grows without bound. #compaction-is-required says compaction is not an optimisation. Owed "
+        "by `Node.tick`."
+    ),
+    "drain": (
+        "Nothing migrates stragglers, so segment 0 keeps its genesis grants and roster rows and "
+        "and can never be collected — the case #migration-is-state-invariant exists for. Owed by "
+        "`Node.tick`."
+    ),
+    "mgmt.retire": (
+        "Nothing retires a drained epoch, so no key ever dies and #secrecy-by-key-death is "
+        "unreachable even when an epoch does reach zero live values. Owed by `Node.tick`."
+    ),
+    "store.epochs": (
+        "The conveyor's work queue, oldest epoch first, with no reader and no verb — the layer "
+        "would convey cannot ask what to convey. Owed by a transfer verb plus the worker/client "
+        "layer that holds data keys. A node holds none, so re-encryption is correctly absent from "
+        "this tree and is recorded OWED in SPEC's enforcement table rather than here."
+    ),
+}
+"""Duties with no driver YET, each naming what owes it.
+
+Same contract as `OWED`: cheap and honest to add, dishonest to leave for ever, and the test below
+fails the moment one becomes driven so the list cannot rot into "we believe this happens"."""
 
 
 class TestEveryCheckIsConsulted(unittest.TestCase):
@@ -132,3 +202,29 @@ class TestEveryCheckIsConsulted(unittest.TestCase):
     def test_the_two_lists_do_not_overlap(self):
         """A name cannot be both consulted and owed. Overlap means one of the two is a guess."""
         self.assertEqual(set(WIRED) & set(OWED), set())
+
+
+class TestEveryDutyIsDriven(unittest.TestCase):
+    def test_every_duty_has_a_driver(self):
+        """A duty nothing calls is not implemented, however correct it is."""
+        called = _production_calls()
+        missing = {n: why for n, why in DRIVEN.items() if n not in called}
+        self.assertEqual(missing, {}, "these duties are never performed by the round")
+
+    def test_an_undriven_duty_that_became_driven_is_removed_from_the_debt_list(self):
+        """The anti-rot half, and the one that will fire when compaction is finally driven."""
+        called = _production_calls()
+        stale = sorted(n for n in UNDRIVEN if n in called)
+        self.assertEqual(
+            stale, [], "these are driven now: delete them from UNDRIVEN and add them to DRIVEN"
+        )
+
+    def test_the_duty_lists_do_not_overlap(self):
+        self.assertEqual(set(DRIVEN) & set(UNDRIVEN), set())
+
+    def test_a_duty_is_not_confused_with_a_check(self):
+        """`retire` is both `Mempool.retire`, which the round calls, and `Management.retire`, which
+        nothing calls. Keying on the bare attribute reported the second as driven."""
+        called = _production_calls()
+        self.assertIn("mempool.retire", called)
+        self.assertNotIn("mgmt.retire", called)

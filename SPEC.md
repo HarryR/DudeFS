@@ -44,8 +44,9 @@ it carries at most one clause naming what goes wrong without it.
 **Every requirement that a check can carry appears in the enforcement table with the symbol that
 enforces it.** A requirement with no enforcer is not satisfied by prose; it is marked OWED.
 
-Conversion is in progress: **Compaction, Accumulators, Replication and Trust** are in this form. The
-remaining sections still carry the old descriptive style and their markers, and are next.
+Conversion is in progress: **Compaction, Accumulators, Replication, Trust, Timing, the mempool and
+the conveyor** are in this form. The remaining sections still carry the old descriptive style and
+their markers, and are next.
 
 ---
 
@@ -562,6 +563,16 @@ obliges**, which is the defect this table exists to make visible rather than pla
 | exclusion is resolved by selection, not refusal | `Mempool.propose` via `settle.would_apply` |
 | an endorser refuses a slice past `w_valid` | `Node._stale` via `Mempool.endorsable` |
 | nothing is retained past its endorsable life | `Mempool.evict`, called from `Node.tick` |
+| a value carries its epoch in cleartext | `ops.Set.epoch`, `live.epoch` |
+| an epoch is not retired while a value references it | `ops.Drained` via `layer.holds` |
+| retirement is an ordinary guarded transaction | `Management.retire` (built) |
+| **retirement is driven when an epoch drains** | **OWED** — `Management.retire` has no caller |
+| **the backlog is readable, oldest first** | **OWED** — `Store.epochs` has no reader and no verb |
+| **live values are re-encrypted forward** | **OWED to the worker/client layer** — a node holds no data keys |
+| **stragglers are migrated so a segment can be collected** | **OWED** — `Node.drain` has no caller |
+| **a collectable segment is proposed for collection** | **OWED** — `Node.maybe_collect` has no caller |
+| the dedup floor applies on every collection path | `Store.collect` — **but defaults to off** |
+| a hole in the log is explained by a ratified collection | **OWED** — the ledger is unbuilt |
 ## Keys
 
 ### Two secrets, never one {#two-secrets}
@@ -590,45 +601,35 @@ function of live state and survives collection. No history, no policy.
 
 ### The conveyor {#conveyor}
 
-`[M]` Forward secrecy comes from **key death**, not from erasing ciphertext — on SSDs, CoW filesystems
-and rented block storage you cannot assert the old bytes are gone.
-
-An old epoch's key can only die when nothing references it, so live values must be **re-encrypted
-forward**. `[H]` Worker bees do this as housekeeping while running their own jobs; effort scales with
-backlog pressure, clamped so housekeeping cannot crowd out work. The idle case needs a heartbeat, not a
-fallback path.
-
-**Rotating keys faster without conveying faster buys nothing.**
-
-`[M]` **A value carries its epoch in CLEARTEXT.** Retention is refcounted over live values
-(#wrapped-masters), and a node that cannot decrypt must still be able to count — put the epoch inside
-the AEAD and the refcount becomes underivable, so no key can ever die. The leak is therefore forced
-rather than chosen: which epoch a value sits under is public, and so is roughly when it was last
-written or conveyed.
-
-`[M]` **Retirement is an ordinary transaction guarded by `Drained`** — the one predicate that ranges
-over all keys, because it answers the one question that must. Every node evaluates it identically at
-the same log position, replay reproduces it, and the entry records in the log what it was conditional
-on. A retirement that should not have happened settles nowhere.
-
-`[H]` The ordering is the safety. Re-encryption **drains the last references**; deletion becomes
-possible only at zero. Retire an epoch one value early and that value is unreadable by everyone
-forever — the loss of committed state this system exists to prevent — so the guard refuses, exactly
-as #collection-refused-while-live refuses a segment that still holds live values.
-
-`[M]` **A stale write cannot resurrect a dead epoch**, and needs no special rule to stop it: an epoch
-outlives a validity window by orders of magnitude, so a client writing under a retired epoch is a
-client far outside the admission window and is refused there. `[H]` The windows are an implicit
-liveness contract on both sides — a node whose clock is broken cannot play — and the coherence they
-provide is relied on here rather than re-earned.
-
-`[M]` **What retirement can and cannot do.** Deleting the wraps makes a master unobtainable *from the
-record*, and #state-root proves that absence to anyone holding the root — key death is a revocation,
-and #absence-is-revocation now has a proof. Whether a holder that once had the master in memory
-forgot it is not provable by anyone. That is the accepted TEE trade-off, not a gap this closes.
-
-`[M]` One conveyance does two jobs: it drains the old epoch **and** vacates the old segment, since it
-writes at the head. The belt moves once and two things fall off the back.
+- Forward secrecy MUST come from **key death**, never from erasing ciphertext: on SSDs, CoW
+  filesystems and rented block storage the old bytes cannot be asserted gone.
+- An epoch's key MUST NOT be retired while any live value still references it. Retire one value early
+  and that value is unreadable by everyone for ever, which is the loss of committed state this system
+  exists to prevent.
+- Live values MUST therefore be **re-encrypted forward**, which is what drains the last references.
+  This is a duty of the layer that holds data keys — a worker or a client — because a node holds
+  none.
+- That layer MUST scale its effort to the backlog, clamped so housekeeping cannot crowd out work, and
+  MUST use a heartbeat for the idle case rather than a second conveying path.
+- The backlog MUST be readable, oldest epoch first, so the conveying layer can ask what to work on.
+- Key rotation MUST NOT be treated as forward secrecy on its own: rotating faster without conveying
+  faster buys nothing.
+- A value MUST carry its epoch in **cleartext**. It MUST NOT be inside the AEAD: retention is
+  refcounted over live values, a node that cannot decrypt must still be able to count, and an
+  encrypted epoch makes the refcount underivable, so no key could ever die. The leak is forced rather
+  than chosen — which epoch a value sits under is public, and so is roughly when it was last written
+  or conveyed.
+- Retirement MUST be an ordinary transaction guarded by `Drained`, the one predicate that ranges over
+  all keys. Every node MUST evaluate it identically at the same log position, and replay MUST
+  reproduce it, so a retirement that should not have happened settles nowhere.
+- A retired epoch MUST NOT be resurrectable by a stale write, and **no additional rule may be added
+  to prevent it**: an epoch outlives a validity window by orders of magnitude, so such a client is
+  outside the admission window and is refused there (#timing).
+- Retirement MUST NOT be claimed to do more than it does. Deleting the wraps makes a master
+  unobtainable *from the record*, and #state-root proves that absence to anyone holding the root.
+  Whether a holder that once had the master in memory forgot it is provable by nobody.
+- A conveyance MUST write at the head, so one conveyance drains the old epoch **and** vacates the old
+  segment. The belt moves once and two things fall off the back.
 
 ## Transport
 
