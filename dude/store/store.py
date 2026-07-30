@@ -410,10 +410,18 @@ class Store:
                     return why
                 acc = self._commit(e.idx, e.item, e.item.txn.mutations, acc)
             self._set_meta("acc", acc)
-            for anchor in self._anchors(expect):
-                if self.head() == anchor.head and (why := self._disagrees(anchor)) is not None:
+            for at in self._anchors(expect):
+                if self.head() == at.head and (why := self._disagrees(at)) is not None:
                     self.db.execute("ROLLBACK")
                     return why
+            # THE CLUSTER'S IDENTITY, checked AFTER applying and rolled back if it is wrong. A
+            # from-scratch replay begins with genesis, so the manager grant does not exist until
+            # the run is applied: checking first would refuse the only run that could establish it.
+            # Checking after refuses a STRANGER'S genesis, which is the case that matters: a log
+            # introducing its own manager checks out against itself, and only the anchor can say no.
+            if self.anchor() is not None and (why := self.wrong_cluster()) is not None:
+                self.db.execute("ROLLBACK")
+                return f"refusing a log this node's anchor does not authorise: {why}"
             self.db.execute("COMMIT")
         except Exception:
             # Still here, and still re-raising: a bug of OURS mid-replay must not be reported as a
@@ -825,6 +833,58 @@ class Store:
         report a gap that cannot exist."""
         return max(1, self.horizon() * self.SEGMENT_WIDTH)
 
+    def anchor(self) -> crypto.PublicKey | None:
+        """The manager public key this node was provisioned with, or None if it was not.
+
+        THE ONE VALUE NOT DERIVED FROM ANYTHING `[H]`: *"the manager public key is provided to the
+        new node when it bootstraps and would be retained through a new bootstrap."* Everything else
+        a node believes is reached from here — the roster by the credentials the manager signed, the
+        quorum by that roster, the state by the quorum's root — so it is the axiom of the bootstrap
+        chain (#bootstrap-anchor).
+
+        IN `meta` AND NOT IN THE LOG, deliberately. It is what VALIDATES the log, so taking it from
+        the log would be circular: a forged genesis would introduce its own manager and check out
+        against itself. Durable because it must survive the wipe that makes a node re-bootstrap; if
+        it does not survive, the node is unprovisioned and cannot verify anything."""
+        raw = self._get_meta("anchor", b"")
+        return crypto.PublicKey(raw) if raw else None
+
+    def provision(self, manager: crypto.PublicKey) -> None:
+        """Record the anchor. Idempotent for the same key, and REFUSED for a different one.
+
+        Re-provisioning to a different manager would move a node between clusters silently, taking
+        its identity and its attestation history with it — and its monotone height, which is the one
+        thing #monotonicity says cannot be forged. An operator who genuinely means it deletes the
+        store, which is the same act as retiring the identity."""
+        held = self.anchor()
+        if held is not None and held != manager:
+            raise InvariantError(
+                "this node is provisioned to a different manager; re-provisioning would move it "
+                "between clusters while keeping its identity and its attested height"
+            )
+        self._set_meta("anchor", manager)
+
+    def wrong_cluster(self) -> str | None:
+        """`None` if the log we hold is the one our anchor authorises, else why not.
+
+        The second step of the chain: the log's own manager grant MUST name the key we were given.
+        A log that does not is a different cluster's, and adopting anything from it — a roster, a
+        checkpoint, a state root — would be believing a stranger's whole world.
+
+        An unprovisioned node cannot answer this and says so rather than passing: it holds no
+        axiom, so nothing it could check would mean anything."""
+        from .management import Management, Role  # noqa: PLC0415 -- management reads through Store
+
+        held = self.anchor()
+        if held is None:
+            return "no anchor: this node was never provisioned with a manager key"
+        grant = Management(self).grant_of(held)
+        if grant is None:
+            return "the log holds no grant for the manager we were provisioned with"
+        if grant.role is not Role.MANAGER:
+            return f"our anchor holds {grant.role.value} in this log, not manager"
+        return None
+
     def adopt(self, ck: ops.Compaction) -> str | None:
         """Take a checkpoint somebody else holds, if the quorum signed it. `None` if adopted, else
         why not.
@@ -843,6 +903,12 @@ class Store:
         A floor ABOVE our own head is not an error and must not be refused: it is the true, signed,
         locally-checkable statement *"the cluster has ratified state I do not hold"* — which is
         precisely the bootstrap trigger, and refusing it would discard the one fact that says so."""
+        if (why := self.wrong_cluster()) is not None:
+            # The chain has an ORDER (#bootstrap-anchor): a checkpoint is verified against the
+            # roster, and the roster is worth something only if the log holding it is the one our
+            # anchor authorises. Adopting first and verifying later would take a floor — and so a
+            # monotone height — from a cluster we were never provisioned into.
+            return why
         roster = list(self.roster())
         if not roster:
             return "no roster to check a checkpoint against"

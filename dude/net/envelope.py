@@ -50,8 +50,16 @@ class Verb(IntEnum):
     Closed rather than an open byte string for three reasons: the request gate must be able to
     enumerate its domain to be auditable; a Rust or Go port gets exhaustive matching instead of a
     default branch, and default branches are where two implementations quietly diverge; and it is a
-    small int on every message. Adding a verb is a version bump, which for a permissioned system
-    with a key-issuing manager is the correct cost."""
+    small int on every message.
+
+    ADDING A VERB COSTS A CODE CHANGE AND NOTHING ELSE, at present `[H]`: *"there are no versions
+    yet, this is version -1."* There is no deployed peer to stay compatible with, so a new verb is
+    not a migration and needs no ceremony. Once there is one it becomes a version bump, which for a
+    permissioned system with a key-issuing manager is the correct cost — but pricing that in now
+    buys nothing, and has already made one decision look more expensive than it was.
+
+    The SHAPE still deserves care, for the reason above rather than for compatibility: a verb is a
+    closed enumeration two implementations must agree on exhaustively."""
 
     # -- liveness ------------------------------------------------------------------------------- #
     PING = 1

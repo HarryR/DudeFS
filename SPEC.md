@@ -391,16 +391,25 @@ The chain below MUST be established in order, and every step MUST be checked aga
 it. Nothing in it may rest on the word of the cluster being joined.
 
 1. The **manager public key** MUST be supplied out of band when a node is provisioned, and retained
-   across a re-bootstrap. It is the only value not derived from something else.
-2. The log's own manager grant MUST name that key. A log that does not is a different cluster's log
-   and MUST be refused.
-3. Roster membership MUST be verified against the manager key: every roster row by the credential
+   across a re-bootstrap. It is the only value not derived from something else, and it MUST NOT be
+   taken from the log: a forged log introduces its own manager and checks out against itself.
+2. A node MUST NOT be re-provisioned to a different manager. That would move it between clusters
+   while keeping its identity, its attestation history and its monotone height — the one quantity
+   #monotonicity says cannot be forged. Changing clusters MUST mean a new identity.
+3. The log's own manager grant MUST name that key. A log that does not is a different cluster's and
+   MUST be refused, and refused as a whole: a run that fails this MUST leave nothing behind.
+4. The check MUST be applied after a run is applied and rolled back on failure, not before. A
+   from-scratch replay begins with genesis, so the manager grant does not exist until the run lands;
+   checking first would refuse the only run that could establish it.
+5. A node with no anchor MUST NOT be treated as verified by default. It holds no axiom, so it MUST
+   NOT adopt a floor.
+6. Roster membership MUST be verified against the manager key: every roster row by the credential
    that authorised it, and its presence under a signed root. A roster MUST NOT be taken on the word
    of the quorum it defines.
-4. Roster membership MUST be verifiable as **complete**, so that a subset cannot be presented — a
+7. Roster membership MUST be verifiable as **complete**, so that a subset cannot be presented — a
    smaller roster is a smaller quorum.
-5. The checkpoint MUST then be verified against that roster (#collection-is-ratified).
-6. State MUST then be verified against the checkpoint's root (#state-root).
+8. The checkpoint MUST then be verified against that roster (#collection-is-ratified).
+9. State MUST then be verified against the checkpoint's root (#state-root).
 
 - A floor MUST NOT be relied upon without `f+1` fresh corroboration (#freshness-needs-many). The
   chain above establishes *who*; it establishes nothing about *when*.
@@ -558,7 +567,11 @@ obliges**, which is the defect this table exists to make visible rather than pla
 | shunning does not alter quorum arithmetic | `Node.shunned` |
 | every inbound frame is checked against the screen tag | `Postman.deliver` |
 | received state is verified against a signed root | **OWED** — no verb serves a proof; the joiner is the first consumer |
-| roster membership is verified against the manager key | **OWED** — the bootstrap chain is unbuilt |
+| the manager key is supplied out of band and retained | `Store.provision`, `Store.anchor` |
+| a node is not re-provisioned to another manager | `Store.provision` (raises `InvariantError`) |
+| the log's manager grant names our anchor | `Store.wrong_cluster`, enforced in `Store.replay` |
+| a checkpoint from another cluster is not adopted | `Store.adopt` |
+| roster membership is verified against the manager key | **OWED** — step 6 of the chain |
 | roster completeness is verifiable | **OWED** — needs a manager-signed membership commitment |
 | a floor is corroborated by `f+1` fresh responders before use | **OWED** — `attested_floor` exists; nothing calls it on the bootstrap path |
 | a node that cannot obtain `(floor, head]` bootstraps instead | **OWED** — no decision point exists |

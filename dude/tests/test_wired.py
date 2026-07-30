@@ -59,6 +59,8 @@ WIRED = {
     "_unverified": "a replayed entry whose signature does not verify",
     "_uncontiguous": "a run that would land somewhere other than the position owed",
     "adopt": "a checkpoint whose quorum signatures do not verify",
+    "wrong_cluster": "a log our provisioned manager key does not authorise",
+    "provision": "re-provisioning a node into a different cluster",
 }
 """Checks that must have a live consumer in production code.
 

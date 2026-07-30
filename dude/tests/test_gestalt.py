@@ -46,7 +46,10 @@ class Cluster:
         genesis = self._genesis()
         for kp in self.keys:
             store = Store()
-            # The anchor: the manager's own grant has to precede the authority that checks it.
+            # PROVISIONED with the manager key before anything else: it is the axiom the rest of the
+            # chain hangs from, and `adopt` refuses a checkpoint from a log it does not authorise.
+            store.provision(self.mgr.public)
+            # The manager's own grant has to precede the authority that checks it.
             store.apply(genesis, auth=None)
             node = Node(kp, store)
             self.board.bind(name_of(kp.public))
@@ -71,6 +74,17 @@ class Cluster:
             )
             tx = tx + mgmt.add_node(kp.public, (address_of(kp.public).encode(),))
         return (tx.sign(self.mgr, T0),)
+
+    def provisioned(self) -> Store:
+        """A store as a JOINER really arrives: provisioned with the manager key, holding genesis.
+
+        The anchor is the axiom of the bootstrap chain, so a store without one verifies nothing and
+        `Store.adopt` refuses it a floor. Tests that hand-built a bare `Store()` relied on that
+        check not existing."""
+        s = Store()
+        s.provision(self.mgr.public)
+        s.apply(self._genesis(), auth=None)
+        return s
 
     def pump(self, now: int, rounds: int = 6) -> None:
         """Advance every node, then deliver everything in flight, `rounds` times.
@@ -205,6 +219,86 @@ class TestGestalt(unittest.TestCase):
         self.assertFalse(
             issubclass(InvariantError, DudeError), "our error became catchable as theirs"
         )
+
+
+class TestTheBootstrapAnchor(unittest.TestCase):
+    """Steps 1 and 2 of #bootstrap-anchor: the one value not derived from anything, and the check
+    that ties a log to it.
+
+    `[H]` *"the manager public key is provided to the new node when it bootstraps and would be
+    retained through a new bootstrap."* Everything else a node believes is reached from here, so a
+    log that introduces its OWN manager checks out against itself; only the anchor can refuse it."""
+
+    def setUp(self):
+        self.c = Cluster()
+        self.client = self.c.mgr
+
+    def test_a_provisioned_node_recognises_its_own_cluster(self):
+        node = self.c.nodes[0]
+        self.assertEqual(node.store.anchor(), self.c.mgr.public)
+        self.assertIsNone(node.store.wrong_cluster())
+
+    def test_an_unprovisioned_node_can_verify_nothing_and_says_so(self):
+        """It holds no axiom, so it does not pass by default — and `adopt` refuses it a floor, which
+        bounds what an unprovisioned node can be talked into."""
+        bare = Store()
+        bare.apply(self.c._genesis(), auth=None)
+        self.assertIsNone(bare.anchor())
+        why = bare.wrong_cluster()
+        assert why is not None
+        self.assertIn("never provisioned", why)
+
+    def test_re_provisioning_to_another_manager_is_refused(self):
+        """It would move a node between clusters while keeping its identity, its attestation history
+        and its monotone height — the one quantity #monotonicity says cannot be forged. An operator
+        who means it deletes the store, which is the same act as retiring the identity."""
+        node = self.c.nodes[0]
+        node.store.provision(self.c.mgr.public)  # idempotent for the same key
+
+        with self.assertRaises(InvariantError) as cm:
+            node.store.provision(crypto.Keypair.generate().public)
+        self.assertIn("different manager", str(cm.exception))
+
+    def test_a_strangers_genesis_is_refused_and_rolled_back(self):
+        """THE ATTACK THE ANCHOR EXISTS FOR. A whole coherent log — its own manager, its own
+        roster, internally consistent, correctly signed throughout — offered to a provisioned but
+        empty node. Every signature verifies. Only the anchor can say it is the wrong world."""
+        stranger = Cluster()  # a different manager, a different roster, all of it valid
+        joiner = Store()
+        joiner.provision(self.c.mgr.public)  # ours
+        run = list(stranger.nodes[0].store.entries())
+
+        why = joiner.replay(run)
+
+        assert why is not None, "a stranger's whole log was adopted"
+        self.assertIn("anchor does not authorise", why)
+        self.assertEqual(joiner.head(), 0, "it kept part of a foreign log")
+        self.assertEqual(joiner.roster(), (), "it took a foreign roster")
+
+    def test_our_own_genesis_replays_into_an_empty_provisioned_node(self):
+        """The control, and the reason the check runs AFTER applying: a from-scratch replay begins
+        with genesis, so the manager grant does not exist until the run lands. Checking first would
+        refuse the only run that could ever establish it."""
+        joiner = Store()
+        joiner.provision(self.c.mgr.public)
+
+        self.assertIsNone(joiner.replay(list(self.c.nodes[0].store.entries())))
+
+        self.assertIsNone(joiner.wrong_cluster())
+        self.assertEqual(joiner.roster(), self.c.nodes[0].store.roster())
+
+    def test_a_checkpoint_from_another_cluster_is_not_adopted(self):
+        """The chain has an order: a checkpoint is verified against the roster, and the roster is
+        worth something only if the log holding it is the one our anchor authorises."""
+        joiner = self.c.provisioned()
+        foreign = Cluster()
+        for node in foreign.nodes:
+            node.store.SEGMENT_WIDTH = 8
+        joiner.provision(self.c.mgr.public)
+        rogue = ops.Compaction(0, 500, crypto.ACC_IDENTITY)
+
+        self.assertIsNotNone(joiner.adopt(rogue))
+        self.assertEqual(joiner.floor(), 0)
 
 
 class TestCompactionRunsByItself(unittest.TestCase):
@@ -625,8 +719,7 @@ class TestClusterCollection(unittest.TestCase):
         self.assertEqual(source.maybe_collect(now), 0)
         self.c.pump(now)
 
-        joiner = Node(crypto.Keypair.generate(), Store())
-        joiner.store.apply(self.c._genesis(), auth=None)
+        joiner = Node(crypto.Keypair.generate(), self.c.provisioned())
         joiner.connect(source.me.public, InProc(name_of(joiner.me.public), self.c.board))
         joiner.store.witness(source.attestation(now))  # carries the ratified marker
 
@@ -659,8 +752,7 @@ class TestClusterCollection(unittest.TestCase):
         ck = source.store.checkpoint()
         assert ck is not None
 
-        joiner = Store()
-        joiner.apply(self.c._genesis(), auth=None)  # provisioned, so it knows the roster
+        joiner = self.c.provisioned()
         self.assertEqual(joiner.floor(), 0, "a floor out of nowhere")
 
         joiner.witness(source.attestation(now))  # the ordinary gossip path, nothing bespoke
@@ -671,8 +763,7 @@ class TestClusterCollection(unittest.TestCase):
     def test_a_floor_nobody_signed_is_not_adopted(self):
         """`attested_floor`'s licence to take a MAX is that a floor carries the quorum. A node that
         could name any height and be believed would defeat #monotonicity outright."""
-        joiner = Store()
-        joiner.apply(self.c._genesis(), auth=None)
+        joiner = self.c.provisioned()
         liar = crypto.Keypair.generate()
         forged = ops.Compaction(0, 999_999, crypto.ACC_IDENTITY)  # a height nobody ratified
 
@@ -691,8 +782,7 @@ class TestClusterCollection(unittest.TestCase):
         Adoption is where the missing count would have hurt most: a joiner's floor is the anchor it
         checks every later transfer against, so one member minting a height would have been believed
         about everything downstream of it."""
-        joiner = Store()
-        joiner.apply(self.c._genesis(), auth=None)
+        joiner = self.c.provisioned()
         roster = list(joiner.roster())
         claim = ops.Compaction(0, 500, crypto.ACC_IDENTITY)
         lone = next(k for k in self.c.keys if k.public == roster[0])
@@ -737,12 +827,10 @@ class TestClusterCollection(unittest.TestCase):
         )
         run = list(rogue.entries(2))
 
-        gullible = Store()  # no collection, so no floor: it has only the sender's word
-        gullible.apply(self.c._genesis(), auth=None)
+        gullible = self.c.provisioned()  # no collection, so no floor: only the sender's word
         self.assertIsNone(gullible.replay(run, told), "the lie is not even self-consistent")
 
-        joiner = Store()
-        joiner.apply(self.c._genesis(), auth=None)
+        joiner = self.c.provisioned()
         self.assertIsNone(joiner.adopt(ck))
 
         why = joiner.replay(run, told)
