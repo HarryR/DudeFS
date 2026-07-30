@@ -331,7 +331,7 @@ class TestOnlyThePeerWeAskedMayAnswer(unittest.TestCase):
 
     def _question(self):
         env = request(self.me, self.asked.public, Verb.PULL, T0)
-        self.box.post(env, T0, ttl=10_000)
+        self.box.post(env, T0, ttl=10_000, await_reply=True)
         return env
 
     def test_the_peer_we_asked_is_answered(self):

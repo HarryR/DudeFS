@@ -350,6 +350,22 @@ Collection MUST be refused when any of these holds:
   attestation (#monotonicity).
 - **A party that receives state MUST verify what it receives against a quorum-signed root before
   acting on it.** Serving a proof nobody verifies satisfies nothing.
+- A node that cannot be reached by the log MUST perform a state walk, and the ROUND MUST drive it. A
+  walk nothing starts is not a recovery path.
+- Whether the log can still reach a node MUST be decided against a frontier `f+1` fresh peers vouch
+  for, never against the node's own checkpoint: a node absent while the cluster collected holds no
+  newer checkpoint, so its own answer is stale by exactly the amount that matters.
+- A subtree hash MUST be checkable in BOTH readings — an ordinary branch, and the compressed lone
+  leaf — because the two are indistinguishable from the child hashes alone. Accepting only the
+  compressed one refuses honest answers about most interior nodes of a sparse tree.
+- Every question a walk asks MUST be recorded as outstanding until it is answered, whichever verb
+  carries it, and every answer MUST say which question it answers. A queue that empties while
+  replies are in flight reports success indistinguishably from a walk that worked.
+- A walk that does not corroborate MUST end, so that another can begin. Re-seeding an outstanding
+  question that nothing will answer ends the node's ability to sync at all.
+- **A request whose answer is only ever solicited MUST be registered as awaiting a reply.** An
+  unregistered request is answered correctly and the answer discarded at the door, which is silent:
+  nothing errors and the node simply never syncs.
 
 ### Two accumulators {#accumulators}
 
@@ -649,12 +665,15 @@ obliges**, which is the defect this table exists to make visible rather than pla
 | the walk descends only where subtree hashes differ | `Store.subtree`, `Node._on_hashes` |
 | a row is served with its own proof | `Node._on_leaves` |
 | the verifier chooses the descent depth | `NetTunables.walk_depth`, `Node._on_hashes` |
-| a subtree hash is rebuilt from the answer, not believed | `node._folds_to` |
+| a subtree hash is rebuilt from the answer, not believed, in either reading | `node._folds_to` |
 | a finished walk is corroborated against the signed fold | `Store.adopted_at`, `Node._walk_done` |
 | every leaf commits to the credential that authorised it | `smt.leaf_hash` |
 | a relocation cannot alter a credential | `settle._relocates`, `Store._commit` |
 | collection preserves the root as well as the fold | `Store._collect` |
 | a transferred row arrives with its credential | `Store.rows_under`, `Store.adopt_state` |
+| the round drives the walk when catching up cannot work | `Node.tick` -> `Node.bootstrap` |
+| the frontier that decides it is the corroborated one | `Store.frontier` |
+| a request awaiting a solicited answer says so | `Mailbox.post(await_reply=...)` |
 | an adopted height is monotone and durable | `Store.adopted_height` |
 | `f+1` is decided by the quorum module | `quorum.corroboration` |
 | a reply is correlated to the peer we asked | `Mailbox.arrived` |

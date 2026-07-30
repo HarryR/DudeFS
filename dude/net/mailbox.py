@@ -137,7 +137,7 @@ class Mailbox:
         envelope: SignedEnvelope,
         now: Millis,
         ttl: Millis,
-        await_reply: bool = False,
+        await_reply: bool,
     ) -> None:
         """Queue a message.
 
@@ -147,7 +147,18 @@ class Mailbox:
 
         `await_reply` says the caller cares about an answer — the ONLY place request/reply exists,
         and it is a sender-side intention rather than a property of the message. The receiver cannot
-        tell, and nothing on the wire records it."""
+        tell, and nothing on the wire records it.
+
+        NO DEFAULT `[H]`, and it had one. Every production caller took it, so every request's entry
+        was deleted the moment the bytes left (`sent`), so every answer arrived uncorrelated and was
+        dropped by `Node.SOLICITED` as unsolicited. `PULL`, `SUBTREE` and `LEAVES` were all posted
+        that way: the questions went out, the answers were served correctly, and the asker threw
+        every one of them away. Nothing errored, so a node simply never caught up and never walked —
+        the exact signature of a quiet network.
+
+        A default that is right for one caller and silently wrong for another is not a default. This
+        is the same medicine as `Held.cred`: make the wrong thing unsayable rather than merely
+        discouraged, so the next caller is asked the question at the point of writing it."""
         self.pending[envelope.env.mid] = _Pending(
             envelope=envelope,
             to=envelope.env.to,

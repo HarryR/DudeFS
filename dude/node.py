@@ -512,7 +512,11 @@ class Node:
             return
         best = max(ahead, key=lambda s: s.claim.head)
         env = Envelope(best.by, Verb.PULL, _mid(), codec.encode([mine + 1])).sign(self.me, now)
-        self.postman.mailbox.post(env, now, self.tunables.net.ttl)
+        # AWAITING A REPLY, and that is not bookkeeping: `ENTRIES` is in `SOLICITED`, so an answer
+        # this node did not register as expected is dropped at the door. Posted without it, the
+        # pending entry died the instant the bytes left and every correctly-served run was thrown
+        # away unread — `catch_up` had never once caught anything up in a cluster.
+        self.postman.mailbox.post(env, now, self.tunables.net.ttl, await_reply=True)
 
     def behind_the_horizon(self) -> bool:
         """Are the entries this node needs already collected everywhere?
@@ -523,11 +527,11 @@ class Node:
         from one ratified marker: if the frontier has passed our head, the range we need does not
         exist anywhere and no number of round trips will produce it.
 
-        WHAT IT DOES NOT DO YET, stated so it is not mistaken for finished: the action this calls
-        for is a bootstrap — adopt the checkpoint, take state against its root, replay forward — and
-        that needs a state-transfer verb which does not exist. Until then this stops a node
-        asking for what cannot be served, which is honest rather than useful. See SPEC's enforcement
-        table, where the bootstrap is OWED."""
+        WHAT IT DECIDES AND WHAT IT DOES NOT. This stops a node asking for what cannot be served.
+        It does NOT decide whether to bootstrap, and must not: it reads THIS node's checkpoint, and
+        a node that was absent while the cluster collected holds no newer one — so the node that
+        most needs a walk is exactly the node this returns False for. `bootstrap` asks the same
+        question of the marker f+1 fresh peers vouch for (`Store.frontier`)."""
         return self.store.retained_from() > self.store.head() + 1
 
     def _on_pull(self, env: SignedEnvelope, now: Millis) -> None:
@@ -625,7 +629,9 @@ class Node:
             [store, name, value, cred, self.store.prove(store, name).encode()]
             for store, name, value, cred in self.store.rows_under(prefix, depth)
         ]
-        self._reply(env, Verb.ROWS, codec.encode(rows), now)
+        # Echoed, for the same reason `HASHES` echoes: an answer that does not say what it answers
+        # can only be paired by arrival order, and replies are asynchronous.
+        self._reply(env, Verb.ROWS, codec.encode([prefix, depth, rows]), now)
 
     def _on_hashes(self, env: SignedEnvelope, now: Millis) -> None:
         """A peer's child hashes, CHECKED AGAINST THE SIGNED ROOT before they are acted on.
@@ -665,11 +671,13 @@ class Node:
                 continue  # this whole subtree already agrees: never transferred
             if remote == smt.EMPTY:
                 continue  # they hold nothing here; deletion is the log's business, not the walk's
-            if depth + 1 >= self.tunables.net.walk_depth:
-                self._ask(env.frm, Verb.LEAVES, child, depth + 1, now)
-            else:
-                walk[(child, depth + 1)] = remote
-                self._ask(env.frm, Verb.SUBTREE, child, depth + 1, now)
+            # TRACKED EITHER WAY. A `LEAVES` question used to be asked and not recorded, so the
+            # queue could empty while rows were still in flight — the walk declared itself finished,
+            # failed to corroborate, and threw away the transfer that was about to complete it.
+            # Outstanding means outstanding, whichever verb is carrying it.
+            walk[(child, depth + 1)] = remote
+            verb = Verb.LEAVES if depth + 1 >= self.tunables.net.walk_depth else Verb.SUBTREE
+            self._ask(env.frm, verb, child, depth + 1, now)
         if (ck := self.store.checkpoint()) is not None:
             self._walk_done(ck)
 
@@ -680,10 +688,17 @@ class Node:
         the root, so a bad chunk costs one reply rather than poisoning a transfer checked only at
         the end — which is what lets the walk be optimistic at all."""
         ck = self.store.checkpoint()
-        if self.walking is None or ck is None:
+        if (walk := self.walking) is None or ck is None:
             return
+        f = codec.as_seq(codec.decode(env.env.body), 3)
+        prefix, depth = codec.as_bytes(f[0]), codec.as_int(f[1])
+        if (prefix, depth) not in walk:
+            return  # not something we asked for
+        # Retired whether or not the rows survive verification: the question HAS been answered, and
+        # leaving it outstanding would strand the walk on a peer that answered badly once.
+        del walk[(prefix, depth)]
         rows: list[tuple[int, bytes, bytes, bytes, smt.Proof]] = []
-        for row in codec.as_seq(codec.decode(env.env.body)):
+        for row in codec.as_seq(f[2]):
             r = codec.as_seq(row, 5)
             rows.append(
                 (
@@ -706,21 +721,24 @@ class Node:
 
         A walk that does not corroborate STARTS AGAIN rather than failing: sync is a convergence
         loop, and the honest response to "I do not hold what was committed" is to go and get the
-        rest."""
+        rest. It starts again BY ENDING, so `bootstrap` opens the next one from the round — this
+        used to reseed `walking` with the top of the tree and never ask the question, which left a
+        permanently outstanding entry that nothing would answer and no new walk could replace, since
+        `bootstrap` refuses to start one while a walk is live. The retry belongs to whatever decided
+        a walk was needed, and that decision is re-made every tick from the same condition."""
         if self.walking is None or self.walking:
             return
-        if self.store.adopted_at(ck) is None:
-            self.walking = None
-            return
-        top = bytes(crypto.DIGEST_SIZE)
-        self.walking = {(top, 0): ck.root}
+        self.store.adopted_at(ck)
+        self.walking = None
 
     def _ask(
         self, peer: crypto.PublicKey, verb: Verb, prefix: bytes, depth: int, now: Millis
     ) -> None:
         """Post one walk question. The body is `[prefix, depth]` for both verbs."""
         env = Envelope(peer, verb, _mid(), codec.encode([prefix, depth])).sign(self.me, now)
-        self.postman.mailbox.post(env, now, self.tunables.net.ttl)
+        # See `catch_up`: `HASHES` and `ROWS` are both `SOLICITED`, so a walk that does not register
+        # its question discards the answer and finishes holding nothing.
+        self.postman.mailbox.post(env, now, self.tunables.net.ttl, await_reply=True)
 
     def corroborated(self, now: Millis) -> ops.Compaction | None:
         """The highest ratified checkpoint that `f+1` FRESH responders vouch for, or None.
@@ -774,6 +792,17 @@ class Node:
             return False
         if (ck := self.corroborated(now)) is None:
             return False  # nothing f+1 fresh responders vouch for: there is nothing to walk toward
+        if self.store.frontier(ck) <= self.store.head() + 1:
+            # What we are missing is still retained somewhere, so `catch_up` can reach us and a
+            # walk would move the whole state to save a PULL.
+            #
+            # AGAINST THE CORROBORATED MARKER, NOT `behind_the_horizon`. That reads our OWN
+            # checkpoint, and a node that was absent while the cluster collected has no newer
+            # checkpoint to read — its horizon is stale by exactly the amount that matters, so it
+            # would answer "I can still catch up" for ever while every PULL was refused. The
+            # frontier that decides this is the one f+1 fresh peers vouch for, which is the same
+            # reason freshness is the precondition for everything else here.
+            return False
         peer = next((s.by for s in self.store.sightings() if s.by in self.roster()), None)
         if peer is None:
             return False
@@ -793,6 +822,12 @@ class Node:
         if now - self.last_probe >= self.tunables.attest.probe_every:
             self.probe(now)
         self.catch_up(now)
+        # AND THE ALTERNATIVE WHEN CATCHING UP CANNOT WORK. `bootstrap` decides for itself whether
+        # it is needed, so this is unconditional here: the round drives it, and a node that can
+        # still be reached by the log starts no walk. Without this line every check in the state
+        # walk was real and nothing ever performed one — the node that needed it sat asking for
+        # entries no one holds, for ever, and the failure looked exactly like a quiet network.
+        self.bootstrap(now)
         self.mempool.evict(now)
         self.housekeep(now)
         self.postman.tick(now)
@@ -878,13 +913,15 @@ class Node:
             if who in (self.me.public, skip):
                 continue
             env = Envelope(who, verb, _mid(), body).sign(self.me, now)
-            self.postman.mailbox.post(env, now, self.tunables.net.ttl)
+            # An announcement, so no answer is awaited: `BODIES` and `REFUSED` are `REPLIES`, which
+            # `deliver` retires without needing a registered question.
+            self.postman.mailbox.post(env, now, self.tunables.net.ttl, await_reply=False)
 
     def _reply(self, to: SignedEnvelope, verb: Verb, body: bytes, now: Millis) -> None:
         if to.frm not in self.postman.peers:
             return
         self.postman.mailbox.post(
-            to.answer(verb, body).sign(self.me, now), now, self.tunables.net.ttl
+            to.answer(verb, body).sign(self.me, now), now, self.tunables.net.ttl, await_reply=False
         )
 
 
@@ -902,17 +939,26 @@ def _folds_to(
     `branch_hash(depth, lo, left, right)`, so an answer that does not rebuild what the root commits
     to is refused rather than acted on.
 
-    Compression is part of the rule. A subtree holding exactly one leaf hashes AS that leaf however
-    deep it sits, so a node with one empty child equals its other child — checking `branch_hash`
-    there would reject every honest sparse answer, which is most of a sparse tree."""
+    Compression is part of the rule, and BOTH reconstructions must be accepted. A subtree holding
+    exactly one leaf hashes AS that leaf however deep it sits — but a subtree with one empty child
+    and SEVERAL leaves on the other side is an ordinary branch over `EMPTY` and that side. The two
+    are indistinguishable from the hashes alone: the asker cannot know how many leaves sit under a
+    digest, which is the entire point of a digest.
+
+    Taking only the compressed reading stalled every walk that met the second shape, which in a
+    sparse tree is most interior nodes. The walk did not fail — it simply kept that question
+    outstanding for ever, so the queue never emptied, the node never adopted, and it looked exactly
+    like a peer that had gone quiet.
+
+    Accepting both grants a peer nothing. Either way it must produce children that rebuild a hash
+    the root already commits to, and claiming compression to hide a subtree only withholds rows —
+    which any peer can do by not answering, and which the fold at the end of the walk catches."""
     lo, _ = smt.bounds(prefix, depth)
     if left == smt.EMPTY and right == smt.EMPTY:
         return expect == smt.EMPTY
-    if left == smt.EMPTY:
-        return expect == right
-    if right == smt.EMPTY:
-        return expect == left
-    return expect == smt.branch_hash(depth, lo, left, right)
+    if expect == smt.branch_hash(depth, lo, left, right):
+        return True
+    return (left == smt.EMPTY and expect == right) or (right == smt.EMPTY and expect == left)
 
 
 def _uncontiguous(run: list[Entry], frm: int) -> str | None:

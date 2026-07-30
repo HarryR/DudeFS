@@ -138,6 +138,7 @@ DRIVEN = {
     "mempool.retire": "forgets what landed in the log",
     "probe": "asks peers where they are, so a rollback is seen",
     "catch_up": "asks the longest peer for what we are missing",
+    "bootstrap": "takes state against a signed root when the log can no longer reach us",
     "postman.tick": "sends what is due and reaps what expired",
     "store.apply": "settles the agreed slice",
 }
@@ -158,12 +159,6 @@ UNDRIVEN = {
         "`Store.provision` refuses re-provisioning into another cluster, and only tests call it: "
         "the provisioning path — an operator standing a node up — does not exist in this tree. The "
         "refusal is real and its caller is owed, which is the same shape as `mgmt.retire`."
-    ),
-    "bootstrap": (
-        "`Node.bootstrap` starts the state walk and nothing calls it. `behind_the_horizon` already "
-        "identifies the node that needs one, so this is a line in `tick` plus the question of what "
-        "a walk does when it finishes — adopt the checkpoint's height and resume catching up. Owed "
-        "by the next wave, and listed so it cannot be mistaken for finished."
     ),
     "store.epochs": (
         "The conveyor's work queue, oldest epoch first, with no reader and no verb, so the layer "

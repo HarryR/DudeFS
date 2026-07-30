@@ -18,7 +18,16 @@ from ..core.errors import DudeError, InvariantError
 from ..net import Verb
 from ..net.envelope import Envelope, Frame, seal, unseal
 from ..net.transports import InProc, Switchboard, address_of, name_of
-from ..node import _DISPATCH, HANDLED, REPLIES, UNIMPLEMENTED, Node, _encode_slice, _slice_digest
+from ..node import (
+    _DISPATCH,
+    HANDLED,
+    REPLIES,
+    UNIMPLEMENTED,
+    Node,
+    _encode_slice,
+    _folds_to,
+    _slice_digest,
+)
 from ..store import Commitment, Entry, Store, attest, ops, settle, smt
 from ..store.management import P_NODE, P_ROSTER, Management, Role
 from ..store.store import StoreError
@@ -101,6 +110,21 @@ class Cluster:
                 node.tick(now)
             for node in self.nodes:
                 for frame in self.board.drain(name_of(node.me.public)):
+                    node.receive(frame, now)
+
+    def pump_without(self, now: int, away: set[int], rounds: int = 6) -> None:
+        """`pump`, with some nodes switched OFF — not ticked, and their traffic lost rather than
+        queued. A node that was down did not receive what was sent to it while it was down, and
+        letting the switchboard hold it would make the backlog do the catching up."""
+        for _ in range(rounds):
+            for i, node in enumerate(self.nodes):
+                if i not in away:
+                    node.tick(now)
+            for i, node in enumerate(self.nodes):
+                frames = self.board.drain(name_of(node.me.public))
+                if i in away:
+                    continue
+                for frame in frames:
                     node.receive(frame, now)
 
     def submit(self, client: crypto.Keypair, tx: ops.SignedTransaction, to: int, now: int) -> None:
@@ -748,6 +772,64 @@ class TestAFinishedWalkIsCorroborated(unittest.TestCase):
 
         self.assertEqual(joiner.accumulator(), self.source.store.accumulator())
         self.assertEqual(joiner.state_root(), self.ck.root)
+
+    def test_an_honest_answer_with_one_empty_child_is_accepted(self):
+        """THE STALL. A subtree with one empty child and SEVERAL leaves on the other side is an
+        ordinary branch over `EMPTY`, not a compressed lone leaf — and the two are indistinguishable
+        from the hashes alone, because a digest does not say how many leaves are under it.
+
+        Taking only the compressed reading refused the honest answer, and refusing keeps the
+        question outstanding: the walk never emptied its queue, never adopted, and looked precisely
+        like a peer that had stopped replying. Found by a node re-joining, not by a unit test —
+        which is the point, since every walk test until then handed `_on_hashes` its own answers."""
+        src = self.source.store
+        # A REAL node from a real tree, found by descending it — not a hand-built shape, because
+        # the bug was that this shape is ordinary and the code assumed it could not occur.
+        shape, frontier = None, [(bytes(crypto.DIGEST_SIZE), 0)]
+        while frontier and shape is None:
+            prefix, depth = frontier.pop()
+            left, right = src.subtree(prefix, depth)
+            kids = (smt.with_bit(prefix, depth, 0), smt.with_bit(prefix, depth, 1))
+            if (left == smt.EMPTY) != (right == smt.EMPTY):
+                solid = kids[1] if left == smt.EMPTY else kids[0]
+                if len(src.rows_under(solid, depth + 1)) > 1:
+                    shape = (prefix, depth, left, right)
+                    break
+            if depth < 12:
+                frontier += [
+                    (k, depth + 1)
+                    for k, h in zip(kids, (left, right), strict=True)
+                    if h != smt.EMPTY
+                ]
+        assert shape is not None, "no such node in this tree; the test proves nothing"
+
+        prefix, depth, left, right = shape
+        expect = src.tree.hash_under(prefix, depth)
+
+        self.assertTrue(
+            _folds_to(expect, prefix, depth, left, right),
+            "an honest answer about a sparse subtree was refused, which stalls the walk",
+        )
+        # The SOLID side replaced, not the empty one: zeroing the empty child changes nothing, so
+        # that negative would have passed against a check that accepted everything.
+        forged = crypto.h(b"not this subtree")
+        bad = (left, forged) if right != smt.EMPTY else (forged, right)
+        self.assertFalse(
+            _folds_to(expect, prefix, depth, *bad), "the check accepts anything at all"
+        )
+
+    def test_a_walk_that_does_not_corroborate_leaves_room_for_another(self):
+        """It restarts BY ENDING, and that distinction is the whole of it. The old restart reseeded
+        `walking` with the top of the tree and never asked the question — so the entry stayed
+        outstanding for ever, and `bootstrap`, which refuses to start while a walk is live, could
+        never open another. A walk that failed to corroborate ended the node's ability to sync."""
+        joiner = Node(crypto.Keypair.generate(), self._bare())
+        joiner.walking = {}  # nothing outstanding, and nothing transferred either
+
+        joiner._walk_done(self.ck)
+
+        self.assertIsNone(joiner.walking, "a failed walk left one outstanding that nothing answers")
+        self.assertEqual(joiner.store.head(), 0, "it adopted a height it had not earned")
 
     def test_a_short_walk_is_refused_however_valid_each_row_was(self):
         """THE CASE THIS EXISTS FOR. Every row that arrived verified against the root — they are
@@ -1991,3 +2073,106 @@ class TestTransferIsNotTrusted(unittest.TestCase):
         self.assertIn("state", why)
         self.assertEqual(s.head(), 0, "a refused run was committed anyway")
         self.assertIsNone(s.replay([Entry(1, tx)]), "an unchecked run should apply")
+
+
+class TestANodeRejoinsByItself(unittest.TestCase):
+    """THE POINT OF ALL OF IT, driven by nothing but `tick`.
+
+    Every part of the state walk was tested by calling it. Nothing called it: `bootstrap` had no
+    caller in the round, so a node too far behind to catch up sat asking for entries no one holds,
+    for ever, and the failure was indistinguishable from a quiet network. Here the round does it.
+
+    The absent node misses a whole collection, so the entries it needs are gone from every log in
+    the cluster. It cannot be told what it missed; it has to take state instead."""
+
+    WIDTH = 8
+    AGE = DEFAULT.mempool.w_admit + DEFAULT.mempool.w_valid_margin + DELTA
+
+    def setUp(self):
+        self.c = Cluster()
+        self.client = self.c.mgr
+        for node in self.c.nodes:
+            node.store.SEGMENT_WIDTH = self.WIDTH
+        self.away = len(self.c.nodes) - 1
+        self.present = [i for i in range(len(self.c.nodes)) if i != self.away]
+
+    def _churn_without_it(self) -> int:
+        """Write, relocate and collect while one node is off. Two of three is a quorum, so the
+        cluster makes progress without it — which is why it can fall this far behind at all."""
+        now = T0
+        for i in range(12):
+            tx = ops.writes(ops.Set(D, crypto.h(b"hot"), f"v{i}".encode())).sign(self.client, now)
+            self.c.submit(self.client, tx, to=self.present[i % len(self.present)], now=now)
+            self.c.pump_without(now, {self.away})
+            now += DELTA
+            self.c.pump_without(now, {self.away})
+        # HOUSEKEEPING IS NOT DRIVEN BY THE TEST. `tick` migrates and collects on its own, so all
+        # this does is let time pass the dedup floor and keep ticking. A test that drove the
+        # collection itself would prove the collection works and say nothing about whether the
+        # cluster performs one.
+        now += self.AGE
+        for _ in range(8):
+            now += DELTA
+            self.c.pump_without(now, {self.away})
+        assert self.c.nodes[self.present[0]].store.checkpoint() is not None, (
+            "the cluster never collected, so nothing is behind any horizon"
+        )
+        return now
+
+    def test_a_node_that_missed_a_collection_rejoins_from_the_round_alone(self):
+        now = self._churn_without_it()
+        rip = self.c.nodes[self.away]
+        live = self.c.nodes[self.present[0]]
+        self.assertLess(rip.store.head(), live.store.retained_from(), "it is not actually stranded")
+        self.assertIsNone(rip.store.checkpoint(), "it already knows about the collection")
+
+        # It comes back. Nobody tells it anything: it ticks, like every other node.
+        for _ in range(8):
+            now += DELTA
+            self.c.pump(now)
+
+        self.assertEqual(rip.store.state_root(), live.store.state_root(), "it did not converge")
+        self.assertEqual(rip.store.accumulator(), live.store.accumulator())
+        self.assertGreaterEqual(
+            rip.store.head(), live.store.retained_from(), "it is still behind the frontier"
+        )
+
+    def test_it_took_state_rather_than_being_told_the_entries(self):
+        """The distinction the whole horizon exists for. The entries between its head and the
+        frontier were collected everywhere, so no `PULL` could have produced this state — it can
+        only have come from a walk checked against a root the quorum signed."""
+        now = self._churn_without_it()
+        rip = self.c.nodes[self.away]
+        stranded_at = rip.store.head()
+
+        for _ in range(8):
+            now += DELTA
+            self.c.pump(now)
+
+        held = rip.store.get(D, crypto.h(b"hot"))
+        assert held is not None, "the value never arrived"
+        self.assertEqual(held.value, b"v11", "it holds a stale value")
+        self.assertEqual(
+            tuple(rip.store.entries(stranded_at + 1, 1)),
+            (),
+            "it was handed entries that no log retains",
+        )
+
+    def test_a_node_that_is_merely_behind_catches_up_instead(self):
+        """The cheap path stays the default: a walk moves the whole state, so it must fire only
+        when the log genuinely cannot reach a node. Nothing was collected here."""
+        now = T0
+        for i in range(3):
+            tx = ops.writes(ops.Set(D, crypto.h(b"warm"), f"v{i}".encode())).sign(self.client, now)
+            self.c.submit(self.client, tx, to=self.present[0], now=now)
+            self.c.pump_without(now, {self.away})
+            now += DELTA
+            self.c.pump_without(now, {self.away})
+        rip = self.c.nodes[self.away]
+
+        for _ in range(4):
+            now += DELTA
+            self.c.pump(now)
+
+        self.assertIsNone(rip.walking, "it started a walk it did not need")
+        self.assertEqual(rip.store.state_root(), self.c.nodes[0].store.state_root())

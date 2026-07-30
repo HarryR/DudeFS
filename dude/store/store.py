@@ -995,7 +995,20 @@ class Store:
         Floored at 1 because indices start there: with nothing collected the horizon is segment 0
         and the arithmetic would name index 0, which no log holds — so a completeness check would
         report a gap that cannot exist."""
-        return max(1, self.horizon() * self.SEGMENT_WIDTH)
+        return self.frontier(self.checkpoint())
+
+    def frontier(self, ck: ops.Compaction | None) -> Index:
+        """The lowest index a log holding THIS checkpoint is obliged to retain.
+
+        Split out from `retained_from` so a node can ask the question about SOMEBODY ELSE'S marker.
+        A node that was absent while the cluster collected holds no newer checkpoint, so its own
+        answer is stale by exactly the amount that matters — it would believe the log could still
+        reach it while every `PULL` was refused. `Node.bootstrap` asks this about the marker f+1
+        fresh peers vouch for instead.
+
+        One expression, two callers, deliberately: the frontier arithmetic being written twice is
+        how the two answers would come to disagree."""
+        return max(1, ((ck.segment + 1) if ck is not None else 0) * self.SEGMENT_WIDTH)
 
     def anchor(self) -> crypto.PublicKey | None:
         """The manager public key this node was provisioned with, or None if it was not.
