@@ -30,7 +30,7 @@ from dataclasses import dataclass
 from typing import NamedTuple
 
 from ..core import codec, crypto
-from ..core.errors import DudeError
+from ..core.errors import DudeError, InvariantError
 from . import attest, ops, settle, smt
 from .layer import Held, Index, Row, _prefix_upper, holds
 
@@ -183,6 +183,17 @@ def element(store: int, name: bytes, value: bytes) -> crypto.Accumulator:
     return crypto.acc_element(codec.encode([store, name, value]))
 
 
+def _unverified(e: Entry) -> str | None:
+    """`None` if this replayed entry carries a good signature, else why not.
+
+    Self-contained and always checkable, so there is never an excuse to skip it — unlike its
+    predicates (#replay-does-not-readjudicate). A bad signature in a transferred run is THEIR
+    fault, so it is returned rather than raised, like every other refusal on that path."""
+    if isinstance(e.item, ops.SignedTransaction) and not e.item.verify():
+        return f"entry {e.idx} does not verify"
+    return None
+
+
 class Store:
     """The log plus its derived view, over one SQLite connection."""
 
@@ -332,7 +343,7 @@ class Store:
             raise
         return Applied(tuple(settled), tuple(dropped))
 
-    def replay(self, items: Iterable[Entry], expect: Commitment | None = None) -> None:
+    def replay(self, items: Iterable[Entry], expect: Commitment | None = None) -> str | None:
         """Apply already-settled entries **at their recorded indices**, without re-adjudicating.
 
         This is #replay-does-not-readjudicate, and it differs from `apply` in two ways that
@@ -353,7 +364,14 @@ class Store:
         `expect` is the sender's own signed commitment. When the run reaches the height it names,
         every commitment must agree or the whole batch is ROLLED BACK — before it is committed, not
         detected afterwards. Signatures alone are not enough here: they say an entry was authored,
-        never that the quorum settled it or that this is the log everyone else holds."""
+        never that the quorum settled it or that this is the log everyone else holds.
+
+        RETURNS THE REFUSAL, and raises nothing for it `[H]`. A run that does not reconcile is
+        THEIR fault and a routine outcome — a bounded `PULL` races the sender's own progress, a
+        sighting goes stale, a peer lies — so it comes back as a reason a log line can carry, in
+        the house idiom of `Compaction.attested` (#no-exceptions-for-control-flow). It used to be a
+        `StoreError` out of a frame handler, i.e. one peer's ordinary message taking a node's
+        process down. `None` means the run was applied; anything else means nothing was."""
         self.db.execute("BEGIN IMMEDIATE")
         try:
             acc = self.accumulator()
@@ -367,18 +385,31 @@ class Store:
                     self._collect(e.item.segment, at=e.idx)
                     acc = self.accumulator()
                     continue
-                self._require_verified(e)
+                if (why := _unverified(e)) is not None:
+                    self.db.execute("ROLLBACK")
+                    return why
                 acc = self._commit(e.idx, e.item, e.item.txn.mutations, acc)
             self._set_meta("acc", acc)
-            if expect is not None and self.head() == expect.head:
-                self._agrees(expect)
+            if (
+                expect is not None
+                and self.head() == expect.head
+                and (why := self._disagrees(expect)) is not None
+            ):
+                self.db.execute("ROLLBACK")
+                return why
             self.db.execute("COMMIT")
         except Exception:
+            # Still here, and still re-raising: a bug of OURS mid-replay must not be reported as a
+            # refusal of THEIRS. `InvariantError` travels this path (see core/errors.py).
             self.db.execute("ROLLBACK")
             raise
+        return None
 
-    def _agrees(self, expect: Commitment) -> None:
-        """Every commitment, not just one. `A_state` alone would pass a log that differs by any
+    def _disagrees(self, expect: Commitment) -> str | None:
+        """`None` if every commitment agrees, else which one did not — in words a log line can
+        carry, the same shape as `Compaction.attested`.
+
+        Every commitment, not just one. `A_state` alone would pass a log that differs by any
         number of superseded entries — exactly the divergence this system has already been bitten
         by once."""
         for what, mine, theirs in (
@@ -387,17 +418,11 @@ class Store:
             ("root", self.state_root(), expect.root),
         ):
             if mine != theirs:
-                raise StoreError(
+                return (
                     f"transferred log disagrees with the sender's signed {what} "
                     f"at height {expect.head}"
                 )
-
-    @staticmethod
-    def _require_verified(e: Entry) -> None:
-        """A replayed entry must carry a good signature. Self-contained, always checkable, so there
-        is never an excuse to skip it — unlike its predicates (#replay-does-not-readjudicate)."""
-        if isinstance(e.item, ops.SignedTransaction) and not e.item.verify():
-            raise StoreError(f"entry {e.idx} does not verify")
+        return None
 
     def _commit(
         self,
@@ -668,7 +693,10 @@ class Store:
         self.db.execute("DELETE FROM segment WHERE id=?", (seg,))
 
         if self.accumulator() != before:
-            raise StoreError("collection changed the state accumulator")
+            # A HARD INVARIANT `[H]`, and therefore not a `DudeError`: collection is defined as
+            # state-preserving, so this firing means our own fold is wrong, not that somebody sent
+            # us something bad. Nothing may catch it (core/errors.py).
+            raise InvariantError("collection changed the state accumulator")
         return at
 
     # -- THE CONVEYOR (#conveyor) ---------------------------------------------- #

@@ -13,13 +13,14 @@ from __future__ import annotations
 import unittest
 
 from ..core import codec, crypto
-from ..core.errors import DudeError
+from ..core.errors import DudeError, InvariantError
 from ..net import Verb
-from ..net.envelope import Envelope, Frame, seal
+from ..net.envelope import Envelope, Frame, seal, unseal
 from ..net.transports import InProc, Switchboard, address_of, name_of
 from ..node import _DISPATCH, HANDLED, REPLIES, UNIMPLEMENTED, Node
-from ..store import Store, attest, ops, smt
+from ..store import Commitment, Entry, Store, attest, ops, smt
 from ..store.management import P_NODE, Management, Role
+from ..store.store import StoreError
 from ..tunables import DEFAULT
 
 WINDOW = DEFAULT.attest.fresh_within
@@ -169,6 +170,41 @@ class TestGestalt(unittest.TestCase):
         self.c.pump(T0)
         self.c.pump(T0 + DELTA)
         self.assertIsNotNone(node.store.get(D, key), "the node stopped working after junk")
+
+    def test_a_garbage_body_costs_a_frame_too_not_the_process(self):
+        """The frame-level test above passed while this one would have killed the node, because the
+        catch only covered `deliver` and a handler's first act is to DECODE a peer-supplied body.
+
+        A STRANGER -- no grant, no roster seat, signature proving only *who* -- sends `SUBMIT` with
+        twelve bytes of non-bencode. With `crashonly` installed, the escaping `CodecError` is
+        `os._exit`: the unauthenticated remote kill switch that crashonly.py names as the one thing
+        its typed-parsing precondition exists to prevent. `SOLICITED` is no help, since `SUBMIT` is
+        not an answer to anything."""
+        node = self.c.nodes[0]
+        stranger = crypto.Keypair.generate()
+        for body in (b"\xff\x00not-bencode", codec.encode([1, 2, 3])):  # bad tag, then bad arity
+            env = Envelope(node.me.public, Verb.SUBMIT, b"c" * 16, body).sign(stranger, T0)
+            node.receive(seal(env), T0)  # must not raise
+
+        key = crypto.h(b"after-garbage-body")
+        tx = ops.writes(ops.Set(D, key, b"still-alive")).sign(self.client, T0)
+        self.c.submit(self.client, tx, to=0, now=T0)
+        self.c.pump(T0)
+        self.c.pump(T0 + DELTA)
+        self.assertIsNotNone(node.store.get(D, key), "the node stopped working after a bad body")
+
+    def test_our_error_is_structurally_not_their_error(self):
+        """The boundary catches `DudeError` and nothing else, so the ONLY thing keeping our own
+        broken invariants from being swallowed as "hostile input" is that they are not in that tree.
+
+        Pinned as a type relationship rather than trusted as a convention `[H]`: if someone makes
+        `InvariantError` a `DudeError` for convenience, every `except DudeError` in the codebase
+        silently becomes a place where "our fold is wrong" is discarded — which is the failure the
+        two-tree split exists to make unconstructible (core/errors.py)."""
+        self.assertTrue(issubclass(StoreError, DudeError))
+        self.assertFalse(
+            issubclass(InvariantError, DudeError), "our error became catchable as theirs"
+        )
 
 
 class TestVerbCoverage(unittest.TestCase):
@@ -320,6 +356,41 @@ class TestClusterCollection(unittest.TestCase):
 
         self.assertNotIn(forged.attest_bytes(), honest.shares, "signed a fold it cannot reproduce")
         self.assertIn(0, honest.store.segments(), "and collected on one node's word")
+
+    def test_a_pull_for_a_collected_range_is_not_answered_with_a_hole(self):
+        """REPRODUCER — RED ON PURPOSE, and it is the open step's missing DECISION (HANDOFF.md §2).
+
+        A joiner asks from `head+1`. If collection has deleted that range, `_on_pull` answers from
+        `entries(frm)` -- which simply begins at the first index it still holds. Nobody lied and
+        nothing was detected: the reply is a run with a hole at the front, which the joiner commits.
+
+        The server has no way to say *"that range is gone, bootstrap instead"*, and the joiner has
+        no way to conclude it. Until one of them can, being too far behind to catch up is
+        indistinguishable from being slightly behind -- which is the whole of the work that is
+        left."""
+        now = self._churn(12)
+        now = self._drain(0, now)
+        server, asker = self.c.nodes[0], self.c.nodes[1]
+        self.assertEqual(server.maybe_collect(now), 0)
+        self.c.pump(now)
+        self.assertNotIn(0, server.store.segments(), "the segment was never collected")
+        self.c.board.drain(name_of(asker.me.public))  # clear unrelated traffic first
+
+        frm = 2  # inside the collected prefix, and therefore gone
+        env = Envelope(server.me.public, Verb.PULL, b"m" * 16, codec.encode([frm])).sign(
+            asker.me, now
+        )
+        server.receive(seal(env), now)
+        server.tick(now)  # `_reply` posts to the mailbox; a tick is what puts it on the wire
+
+        opened = [unseal(f, asker.me) for f in self.c.board.drain(name_of(asker.me.public))]
+        replies = [e for e in opened if e.env.verb == Verb.ENTRIES]
+        self.assertNotEqual(replies, [], "no reply to a PULL")
+        run = codec.as_seq(codec.decode(replies[0].env.body))
+        if not run:
+            return  # an empty answer is honest: it holds nothing from `frm` and said so
+        first = codec.as_int(codec.as_seq(run[0], 3)[0])
+        self.assertEqual(first, frm, "served a run starting past what was asked for")
 
     def test_collection_gives_every_node_an_attested_floor(self):
         """Where C1 meets C2. Before the first collection there is no floor at all and a node has
@@ -782,12 +853,75 @@ class TestCatchUp(unittest.TestCase):
         self.assertEqual(a.store.head(), before)
         self.assertEqual(a.store.accumulator(), b.store.accumulator())
 
+    def test_a_run_with_a_hole_in_it_is_refused(self):
+        """Head unchanged, refused — never a partial commit.
+
+        A compacted log is SUPPOSED to have gaps -- collection deletes whole segments -- so the
+        invariant is not "no holes". It is that `(floor, head]` is complete: below the ratified
+        floor a checkpoint authorises the absence, above it nothing does. Here nothing has been
+        collected at all, so every index is owed, and a missing one is simply lost.
+
+        Nothing used to require an `ENTRIES` run to be contiguous with our head, so the run was
+        applied anyway -- and `catch_up` then asks from the NEW head, so that gap was never
+        revisited and never filled.
+
+        This is not only what a liar can send. An honest server answers a `PULL` from its own
+        `entries(frm)`, which silently starts at the first index it still holds, so the far-behind
+        joiner is served exactly this run by a node doing nothing wrong."""
+        asleep, peer = self.c.nodes[2], self.c.nodes[0]
+        now = self._write(4, deaf={asleep.me.public})
+        want = asleep.store.head() + 1
+        before = asleep.store.head()
+        self.assertLess(asleep.store.head(), peer.store.head(), "it did not fall behind")
+
+        run = [row for row in _run_from(peer, want) if row[0] != want + 1]
+        self.assertNotIn(want + 1, [row[0] for row in run], "the run under test has no hole in it")
+        env = Envelope(asleep.me.public, Verb.ENTRIES, b"z" * 16, codec.encode(run)).sign(
+            peer.me, now
+        )
+        asleep._on_entries(env, now)  # refused, and refusing raises nothing `[H]`
+
+        self.assertEqual(asleep.store.head(), before, "part of a holed run was committed")
+        self.assertEqual(
+            _gaps_above_the_floor(asleep.store),
+            (),
+            "an unauthorised gap was committed into the log",
+        )
+
 
 def _first_awake(c: Cluster, deaf) -> int:
     for i, node in enumerate(c.nodes):
         if node.me.public not in deaf:
             return i
     raise AssertionError("every node is deaf")
+
+
+def _run_from(peer: Node, frm: int) -> list:
+    """The rows an `ENTRIES` reply carries, built exactly as `_on_pull` builds them."""
+    run = []
+    for e in peer.store.entries(frm):
+        kind = ops.KIND_COMPACTION if isinstance(e.item, ops.Compaction) else ops.KIND_TRANSACTION
+        run.append([e.idx, kind, e.item.raw])
+    return run
+
+
+def _gaps_above_the_floor(store: Store) -> tuple[int, ...]:
+    """Indices missing from `(floor, head]` — the part of the log that must be COMPLETE.
+
+    "No holes" is the wrong invariant and it matters: collection deletes whole segments, so a
+    compacted log is *supposed* to have gaps. What separates a legitimate gap from a missing entry
+    is the quorum-ratified checkpoint. Below the floor, the checkpoint is the authority and entry
+    presence says nothing; above it, every index must be held, because nothing has authorised
+    forgetting any of them.
+
+    It holds whatever ORDER segments are collected in, which is why the floor is the right line to
+    draw and "no holes" is not. `collect` refuses the segment holding `head+1`, so a collectable
+    segment lies entirely at or below the head at the moment it is collected — and that head is the
+    height its own checkpoint records. A collected index is therefore always below the floor, even
+    when a straggler-blocked segment is skipped and a later one goes first."""
+    floor = store.floor()
+    have = {e.idx for e in store.entries()}
+    return tuple(i for i in range(floor + 1, store.head() + 1) if i not in have)
 
 
 class TestTransferIsNotTrusted(unittest.TestCase):
@@ -834,9 +968,38 @@ class TestTransferIsNotTrusted(unittest.TestCase):
         self.victim.receive(seal(env), T0)
         self.assertEqual(self.mgmt.node_set(), before)
 
+    def test_a_run_repeating_an_index_is_refused_not_a_crash(self):
+        """Head unchanged, refused — and nothing raised.
+
+        `want` is computed once before the filter loop, so two rows claiming ONE index both survived
+        it and the second INSERT reached `entry.idx PRIMARY KEY`. `sqlite3.IntegrityError` is not a
+        `DudeError`, so it escaped the frame boundary and took the PROCESS down -- trap 3 exactly,
+        and the same shape as the duplicate-settlement crash already fixed once here.
+
+        Two entries claiming one position is a malformed run: THEIR fault, routine, and therefore
+        refused rather than raised `[H]`."""
+        peer = self.c.keys[0]
+        at = self.victim.store.head() + 1
+        one = ops.writes(ops.Set(D, crypto.h(b"one"), b"v")).sign(self.client, T0)
+        two = ops.writes(ops.Set(D, crypto.h(b"two"), b"v")).sign(self.client, T0)
+        run = [[at, ops.KIND_TRANSACTION, one.raw], [at, ops.KIND_TRANSACTION, two.raw]]
+        env = Envelope(self.victim.me.public, Verb.ENTRIES, b"z" * 16, codec.encode(run)).sign(
+            peer, T0
+        )
+        before = self.victim.store.head()
+
+        self.victim._on_entries(env, T0)  # no raise: not a crash, and not an exception either
+
+        self.assertEqual(self.victim.store.head(), before, "half a malformed run was committed")
+
     def test_a_transfer_disagreeing_with_the_senders_signature_is_rolled_back(self):
         """The sender signed a head, both accumulators and a root. A run that does not reproduce
-        them is refused BEFORE it commits -- not detected afterwards."""
+        them is refused BEFORE it commits -- not detected afterwards.
+
+        The refusal is RETURNED, not raised `[H]`. A bounded `PULL` races the sender's own progress
+        and a sighting goes stale, so this is a routine outcome of honest operation as much as a
+        lie -- and raising it out of a frame handler made one peer's ordinary message able to take
+        this node's process down."""
         peer, now = self.c.nodes[0], T0
         awake = self.c.nodes[:2]
         for i in range(3):  # the victim is never ticked, so it stays behind
@@ -873,6 +1036,20 @@ class TestTransferIsNotTrusted(unittest.TestCase):
         env = Envelope(self.victim.me.public, Verb.ENTRIES, b"z" * 16, codec.encode(run)).sign(
             peer.me, now
         )
-        with self.assertRaises(DudeError):
-            self.victim._on_entries(env, now)
+        self.victim._on_entries(env, now)
         self.assertEqual(self.victim.store.head(), before, "a disagreeing run was committed")
+
+    def test_the_refusal_says_which_commitment_disagreed(self):
+        """The reason is returned in words a log line can carry, so "refused" and "applied" are not
+        the same silence. `None` means it landed; anything else means nothing did."""
+        s = Store()
+        kp = crypto.Keypair.generate()
+        tx = ops.writes(ops.Set(D, crypto.h(b"k"), b"v")).sign(kp, T0)
+        expect = Commitment(1, crypto.ACC_IDENTITY, crypto.ACC_IDENTITY, smt.EMPTY)
+
+        why = s.replay([Entry(1, tx)], expect)
+
+        assert why is not None, "a disagreeing run reported success"
+        self.assertIn("state", why)
+        self.assertEqual(s.head(), 0, "a refused run was committed anyway")
+        self.assertIsNone(s.replay([Entry(1, tx)]), "an unchecked run should apply")

@@ -145,14 +145,23 @@ class Node:
         CATCHES `DudeError` DELIBERATELY. This is the crash-only boundary the error review flagged:
         hostile bytes are an EXPECTED outcome at a decode boundary, so one peer sending garbage must
         cost it its frame and nothing else. Anything outside the tree still escapes and takes the
-        process down, which is the contract `crashonly` relies on."""
+        process down, which is the contract `crashonly` relies on.
+
+        THE HANDLER IS INSIDE THE CATCH, and it was not `[H]`. Only `deliver` used to be, so any
+        typed error a handler raised escaped `receive` — and a handler's first act is usually to
+        DECODE a peer-supplied body. A stranger with no grant and no roster seat could send `SUBMIT`
+        with twelve bytes of non-bencode and the `CodecError` went straight past this boundary; with
+        `crashonly` installed that is `os._exit`, i.e. the unauthenticated remote kill switch
+        crashonly.py names as the one thing its precondition exists to prevent. Typed parsing was
+        already right; the catch was in the wrong place. `InvariantError` is deliberately not a
+        `DudeError`, so OUR bugs still take the process down (core/errors.py)."""
         try:
             got = self.postman.deliver(frame, now)
+            if got.envelope.env.verb in SOLICITED and got.reply is None:
+                return  # nobody asked; see `SOLICITED`
+            self._handle(got.envelope, now)
         except DudeError:
             return  # their fault: drop the frame, keep serving
-        if got.envelope.env.verb in SOLICITED and got.reply is None:
-            return  # nobody asked; see `SOLICITED`
-        self._handle(got.envelope, now)
 
     def _handle(self, env: SignedEnvelope, now: Millis) -> None:
         """Dispatch by verb.
@@ -432,7 +441,14 @@ class Node:
         Only what is strictly ahead of our head: `replay` preserves positions, so re-applying an
         entry we already hold would collide rather than be idempotent. Signatures are verified
         inside `replay` — a bulk transfer is exactly where trusting the sender would be cheapest and
-        worst."""
+        worst.
+
+        THE SHAPE IS CHECKED, NOT ONLY THE CONTENT. A run is applied at the indices it names, so a
+        run that skips one leaves a permanent hole — `catch_up` asks from the NEW head and never
+        looks back — and two rows naming ONE index used to reach `entry.idx PRIMARY KEY` and raise
+        `sqlite3.IntegrityError`, which is not a `DudeError` and so was a crash rather than a
+        refusal. `_uncontiguous` is one predicate for all three failures: a gap, a repeat and a
+        reordering are each "this index is not the one owed"."""
         if env.frm not in self.roster():
             return  # bulk state from outside the roster is not a thing that happens
         want = self.store.head() + 1
@@ -448,8 +464,8 @@ class Node:
                 else ops.SignedTransaction.decode(raw)
             )
             run.append(Entry(idx, item))
-        if not run:
-            return
+        if not run or _uncontiguous(run, want) is not None:
+            return  # nothing owed, or a run that would not land where it says it does
         # Checked against what the sender SIGNED, and rolled back if it disagrees. `replay` verifies
         # signatures, which says an entry was authored and never that the quorum settled it.
         said = self.store.sighting(env.frm)
@@ -458,6 +474,10 @@ class Node:
             if said is not None
             else None
         )
+        # The refusal comes BACK now rather than being raised (#no-exceptions-for-control-flow).
+        # Nothing to do with it here: the run did not land, our state is untouched, and `catch_up`
+        # will ask again. That a node which can NEVER reconcile keeps asking forever is the open
+        # step's missing decision, not something this handler can answer.
         self.store.replay(run, expect)
 
     # -- the round ----------------------------------------------------------------------------- #
@@ -561,6 +581,24 @@ class Node:
 # --------------------------------------------------------------------------------------------- #
 # Slice encoding — the only wire shape this module owns.                                        #
 # --------------------------------------------------------------------------------------------- #
+
+
+def _uncontiguous(run: list[Entry], frm: int) -> str | None:
+    """`None` if `run` is exactly the indices `frm, frm+1, …`, else which index broke it.
+
+    ONE predicate for three failures, because they are the same failure: an entry at the wrong
+    position. A gap loses entries nothing authorised forgetting — only a quorum-ratified checkpoint
+    can license an absence, and a `PULL` reply is not one. A repeat is two entries claiming one
+    position. A reordering is both at once.
+
+    Returned rather than raised: a peer sending a malformed run is THEIR fault and routine
+    (core/errors.py)."""
+    want = frm
+    for e in run:
+        if e.idx != want:
+            return f"run is not contiguous from {frm}: expected {want}, got {e.idx}"
+        want += 1
+    return None
 
 
 def _encode_slice(bucket: int, ids: tuple[crypto.Digest, ...]) -> bytes:
