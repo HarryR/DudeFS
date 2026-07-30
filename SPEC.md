@@ -403,9 +403,15 @@ it. Nothing in it may rest on the word of the cluster being joined.
    checking first would refuse the only run that could establish it.
 5. A node with no anchor MUST NOT be treated as verified by default. It holds no axiom, so it MUST
    NOT adopt a floor.
-6. Roster membership MUST be verified against the manager key: every roster row by the credential
-   that authorised it, and its presence under a signed root. A roster MUST NOT be taken on the word
-   of the quorum it defines.
+6. Roster membership MUST be verified against **the anchor itself**, not against whichever key the
+   log calls a manager: every roster row by the credential that authorised it. `replay` does not
+   re-adjudicate authority, so a forged log can hold a `grant` row naming a manager nobody
+   authorised, and "signed by a manager in this log" would accept the roster that manager wrote. A
+   roster MUST NOT be taken on the word of the quorum it defines.
+   Manager rotation therefore requires walking the chain of grants forward from the anchor, and is
+   NOT yet supported: a row vouched by a successor key MUST fail this check rather than pass it.
+   A party that does not hold the state MUST additionally verify each row's presence under a signed
+   root — see step 9, which is where a proof is needed at all.
 7. Roster membership MUST be verifiable as **complete**, so that a subset cannot be presented — a
    smaller roster is a smaller quorum.
 8. The checkpoint MUST then be verified against that roster (#collection-is-ratified).
@@ -571,7 +577,8 @@ obliges**, which is the defect this table exists to make visible rather than pla
 | a node is not re-provisioned to another manager | `Store.provision` (raises `InvariantError`) |
 | the log's manager grant names our anchor | `Store.wrong_cluster`, enforced in `Store.replay` |
 | a checkpoint from another cluster is not adopted | `Store.adopt` |
-| roster membership is verified against the manager key | **OWED** — step 6 of the chain |
+| roster membership traces to the anchor | `Store.unvouched_roster`, enforced in `Store.replay` |
+| one implementation of "does this credential vouch for this row" | `settle.vouched` |
 | roster completeness is verifiable | **OWED** — needs a manager-signed membership commitment |
 | a floor is corroborated by `f+1` fresh responders before use | **OWED** — `attested_floor` exists; nothing calls it on the bootstrap path |
 | a node that cannot obtain `(floor, head]` bootstraps instead | **OWED** — no decision point exists |

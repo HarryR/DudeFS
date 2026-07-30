@@ -301,6 +301,84 @@ class TestTheBootstrapAnchor(unittest.TestCase):
         self.assertEqual(joiner.floor(), 0)
 
 
+class TestTheRosterTracesToTheAnchor(unittest.TestCase):
+    """Step 6 of #bootstrap-anchor: every roster row vouched by the key we were provisioned with.
+
+    This is what the credential travelling with the row is FOR. Collection eventually forgets the
+    entry that first set a roster row, so without the carried credential a joiner could only take
+    the roster on the word of the quorum — and the roster is what defines that quorum."""
+
+    def setUp(self):
+        self.c = Cluster()
+        self.client = self.c.mgr
+
+    def test_an_honest_roster_traces_to_the_anchor(self):
+        node = self.c.nodes[0]
+        self.assertIsNone(node.store.unvouched_roster())
+
+    def test_a_roster_row_with_its_credential_stripped_is_refused(self):
+        """Not a hypothetical: collection deletes the entry that authorised the row, so a row whose
+        credential did not travel is exactly what a compacted log would leave behind."""
+        node = self.c.nodes[0]
+        who = node.store.roster()[0]
+        node.store.db.execute(
+            "UPDATE live SET cred=x'' WHERE store=? AND name=?", (M, P_NODE + bytes(who))
+        )
+
+        why = node.store.unvouched_roster()
+
+        assert why is not None, "a roster row with no credential was accepted"
+        self.assertIn("no credential", why)
+
+    def test_a_roster_the_log_calls_authorised_but_the_anchor_never_signed(self):
+        """THE CASE THAT DECIDES ANCHOR-vs-MANAGER. `replay` does not re-adjudicate authority, so a
+        forged log can carry a `grant` row naming a manager nobody ever authorised — and a roster
+        vouched by that manager. Checking "signed by some manager in this log" accepts it; checking
+        against the anchor does not.
+
+        Built the way an attacker would: its own manager, its own node, internally consistent, every
+        signature valid, replayed into a store provisioned to OUR manager."""
+        forger = crypto.Keypair.generate()
+        mgmt = Management(Store())
+        tx = mgmt.authorise(
+            forger.public, Role.MANAGER, frozenset({M, D}), frozenset(), forger.prove_possession()
+        )
+        tx = tx + mgmt.add_node(forger.public, (b"attacker:1",))
+        theirs = tx.sign(forger, T0)
+
+        victim = Store()
+        victim.provision(self.c.mgr.public)  # ours, not the forger's
+
+        why = victim.replay([Entry(1, theirs)])
+
+        assert why is not None, "a self-authorised manager wrote the roster"
+        self.assertEqual(victim.roster(), (), "it took a roster the anchor never signed")
+
+    def test_a_migrated_roster_row_still_traces_to_the_anchor(self):
+        """The property the conveyor has to preserve. A `Move` relocates provenance to the head and
+        carries the credential with it, so a row that has been through compaction is still vouched.
+        That is the whole reason `ops.Move` carries one."""
+        node = self.c.nodes[0]
+        node.store.SEGMENT_WIDTH = 8
+        node.last_housekept = 1 << 62  # this test drives the migration itself
+        before = node.store.credential(M, P_NODE + bytes(node.store.roster()[0]))
+        self.assertNotEqual(before, b"")
+
+        now = T0
+        for i in range(12):
+            tx = ops.writes(ops.Set(D, crypto.h(b"hot"), f"v{i}".encode())).sign(self.client, now)
+            self.c.submit(self.client, tx, to=0, now=now)
+            self.c.pump(now)
+            now += DELTA
+            self.c.pump(now)
+        self.assertTrue(node.drain(0, now), "there was nothing to relocate")
+        self.c.pump(now)
+        self.c.pump(now + DELTA)
+
+        self.assertEqual(node.store.stragglers(0), (), "the roster rows never moved")
+        self.assertIsNone(node.store.unvouched_roster(), "a relocated row lost its credential")
+
+
 class TestCompactionRunsByItself(unittest.TestCase):
     """The round performs the duties, with no test reaching in to drive them.
 

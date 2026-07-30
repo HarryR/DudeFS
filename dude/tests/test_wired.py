@@ -60,7 +60,8 @@ WIRED = {
     "_uncontiguous": "a run that would land somewhere other than the position owed",
     "adopt": "a checkpoint whose quorum signatures do not verify",
     "wrong_cluster": "a log our provisioned manager key does not authorise",
-    "provision": "re-provisioning a node into a different cluster",
+    "unvouched_roster": "a roster row that does not trace to the anchor",
+    "vouched": "a credential that does not vouch for the value a row currently holds",
 }
 """Checks that must have a live consumer in production code.
 
@@ -154,6 +155,11 @@ UNDRIVEN = {
         "MANAGER operation, and a manager already may write the management store — deleting a "
         "client's wraps rides along with rotating that client. Listed because it still has no "
         "caller anywhere, not because the round owes it."
+    ),
+    "provision": (
+        "`Store.provision` refuses re-provisioning into another cluster, and only tests call it: "
+        "the provisioning path — an operator standing a node up — does not exist in this tree. The "
+        "refusal is real and its caller is owed, which is the same shape as `mgmt.retire`."
     ),
     "store.epochs": (
         "The conveyor's work queue, oldest epoch first, with no reader and no verb, so the layer "

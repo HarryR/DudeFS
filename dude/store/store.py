@@ -410,24 +410,37 @@ class Store:
                     return why
                 acc = self._commit(e.idx, e.item, e.item.txn.mutations, acc)
             self._set_meta("acc", acc)
-            for at in self._anchors(expect):
-                if self.head() == at.head and (why := self._disagrees(at)) is not None:
-                    self.db.execute("ROLLBACK")
-                    return why
-            # THE CLUSTER'S IDENTITY, checked AFTER applying and rolled back if it is wrong. A
-            # from-scratch replay begins with genesis, so the manager grant does not exist until
-            # the run is applied: checking first would refuse the only run that could establish it.
-            # Checking after refuses a STRANGER'S genesis, which is the case that matters: a log
-            # introducing its own manager checks out against itself, and only the anchor can say no.
-            if self.anchor() is not None and (why := self.wrong_cluster()) is not None:
+            if (why := self._unacceptable(expect)) is not None:
                 self.db.execute("ROLLBACK")
-                return f"refusing a log this node's anchor does not authorise: {why}"
+                return why
             self.db.execute("COMMIT")
         except Exception:
             # Still here, and still re-raising: a bug of OURS mid-replay must not be reported as a
             # refusal of THEIRS. `InvariantError` travels this path (see core/errors.py).
             self.db.execute("ROLLBACK")
             raise
+        return None
+
+    def _unacceptable(self, expect: Commitment | None) -> str | None:
+        """Everything judged AFTER a run is applied and BEFORE it is committed. `None` to commit.
+
+        AFTERWARDS IS THE POINT, not laziness: a from-scratch replay begins with genesis, so neither
+        the manager grant nor the roster exists until the run lands. Checking first would refuse the
+        only run that could ever establish them. Checking after refuses a STRANGER'S log, which is
+        the case that matters — a log introducing its own manager and its own roster checks out
+        against itself, and only the anchor can say no.
+
+        Two kinds of question, in order. Does this agree with something SIGNED (the ratified
+        checkpoint, then the sender's own claim), and is this the log our anchor authorises (its
+        manager grant, then every roster row's credential)."""
+        for at in self._anchors(expect):
+            if self.head() == at.head and (why := self._disagrees(at)) is not None:
+                return why
+        if self.anchor() is None:
+            return None  # unprovisioned: it cannot answer, and `adopt` already refuses it a floor
+        for why in (self.wrong_cluster(), self.unvouched_roster()):
+            if why is not None:
+                return f"refusing a log this node's anchor does not authorise: {why}"
         return None
 
     def _anchors(self, expect: Commitment | None) -> tuple[Commitment, ...]:
@@ -883,6 +896,42 @@ class Store:
             return "the log holds no grant for the manager we were provisioned with"
         if grant.role is not Role.MANAGER:
             return f"our anchor holds {grant.role.value} in this log, not manager"
+        return None
+
+    def unvouched_roster(self) -> str | None:
+        """`None` if every roster row traces to our anchor, else the first one that does not.
+
+        STEP 6 OF THE CHAIN (#bootstrap-anchor), and the reason the credential travels with the row:
+        collection eventually forgets the entry that first set a roster row, so without the carried
+        credential a joiner could only take the roster on the word of the quorum — and the roster is
+        what defines that quorum. Circular, and this is the way out.
+
+        VOUCHED BY THE ANCHOR ITSELF, not by "a manager". `replay` does not re-adjudicate authority,
+        so a forged log can hold a `grant` row naming a manager nobody authorised, and a check that
+        accepted "signed by some manager in this log" would accept a roster that manager wrote.
+        The anchor is the only key not taken from the log, so it is the only one worth checking
+        against.
+
+        MANAGER ROTATION IS THEREFORE NOT YET SUPPORTED HERE: a row vouched by a successor key would
+        need the chain of grants from the anchor forward, walked and verified. `[H]` the manager is
+        cold and is not revoked, so nothing needs it today — but a rotation would break this check,
+        which is the correct direction to fail in.
+
+        Unprovisioned nodes get "no anchor": holding no axiom, they cannot answer the question."""
+        from .management import P_NODE, Management  # noqa: PLC0415 -- reads through Store
+
+        held = self.anchor()
+        if held is None:
+            return "no anchor: this node was never provisioned with a manager key"
+        for who in Management(self).node_set():
+            name = P_NODE + who
+            author = settle.vouched(self, ops.STORE_MANAGEMENT, name, self.credential(0, name))
+            if author is None:
+                return (
+                    f"roster row for {who.hex()[:8]} carries no credential vouching for its value"
+                )
+            if author != held:
+                return f"roster row for {who.hex()[:8]} is vouched by {author.hex()[:8]}, not by us"
         return None
 
     def adopt(self, ck: ops.Compaction) -> str | None:

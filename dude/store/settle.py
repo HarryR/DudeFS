@@ -159,26 +159,46 @@ def _relocates(reader: Reader, m: ops.Move, auth: Authoriser | None) -> bool:
     return _vouches(reader, m, auth)
 
 
-def _vouches(reader: Reader, m: ops.Move, auth: Authoriser | None) -> bool:
-    held = reader.get(m.store, m.name)
-    if held is None or not m.credential:
-        return False
+def vouched(reader: Reader, store: int, name: bytes, credential: bytes) -> crypto.PublicKey | None:
+    """WHO vouches for the value this key currently holds, or `None` if nobody does.
+
+    One question, asked by two callers with different answers to a second question. This decides
+    whether a credential is well formed, signed, and actually about THIS key's CURRENT value; the
+    caller decides whether that author is good enough. `_vouches` asks "may they write this store",
+    because a relocation must not smuggle in an authority the author lacks. The bootstrap chain asks
+    "are they the anchor", because a log that is being verified cannot be trusted to say who its
+    managers are — `replay` does not re-adjudicate, so a forged log may contain a `grant` row naming
+    a manager nobody authorised.
+
+    Splitting it this way is deliberate: the alternative was two copies of the credential logic that
+    agree today."""
+    held = reader.get(store, name)
+    if held is None or not credential:
+        return None
     try:
-        cred = ops.SignedTransaction.decode(m.credential)
+        cred = ops.SignedTransaction.decode(credential)
     except DudeError:
-        return False
+        return None
     if not cred.verify():
-        return False
-    if auth is not None and not auth.may_write(reader, cred.author, m.store):
-        return False
+        return None
     want = ops.value_digest(held.value)
-    return any(
-        step.mutation.store == m.store
-        and step.mutation.name == m.name
-        and isinstance(step.mutation, ops.Set)
-        and ops.value_digest(step.mutation.value) == want
-        for step in cred.steps
-    )
+    for step in cred.steps:
+        m = step.mutation
+        if (
+            m.store == store
+            and m.name == name
+            and isinstance(m, ops.Set)
+            and ops.value_digest(m.value) == want
+        ):
+            return cred.author
+    return None
+
+
+def _vouches(reader: Reader, m: ops.Move, auth: Authoriser | None) -> bool:
+    who = vouched(reader, m.store, m.name, m.credential)
+    if who is None:
+        return False
+    return auth is None or auth.may_write(reader, who, m.store)
 
 
 class Reject(NamedTuple):
