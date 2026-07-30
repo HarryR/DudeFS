@@ -482,8 +482,11 @@ it. Nothing in it may rest on the word of the cluster being joined.
   `w_valid`, and MUST be derived rather than set, because a transaction is unendorsable once
   `|now − ts| > w_valid` and any surplus is a window in which a stale compare-and-swap can be
   re-proposed.
-- A retry schedule MUST fit inside the deadline it is spent against, and a backoff ceiling MUST NOT
-  exceed that deadline.
+- A backoff ceiling MUST NOT exceed the deadline it is spent against. The deadline is the real limit
+  on retrying — it is checked first and clamps every wait — so an attempt count is a backstop and MUST
+  NOT be derived from the deadline.
+- A check MUST NOT re-implement what it checks. A second model of one rule can disagree with the
+  first, and the copy that is wrong is the one nobody runs.
 - The freshness window MUST exceed the probe interval that feeds it, with room for a missed probe.
 - **A dial MUST have exactly one home**: the group belonging to the object that decides with it. The
   same dial declared in two groups can disagree, and the copy that loses is whichever the caller did
@@ -523,9 +526,9 @@ obliges**, which is the defect this table exists to make visible rather than pla
 | a floor is corroborated by `f+1` fresh responders before use | **OWED** — `attested_floor` exists; nothing calls it on the bootstrap path |
 | a node that cannot obtain `(floor, head]` bootstraps instead | **OWED** — no decision point exists |
 | a server says what it no longer holds | **OWED** — `_on_pull` answers with what it has |
-| every dial sits at or above its derived floor | `tests/test_timing.py` |
+| every dial sits at or above its derived floor | `Tunables.__post_init__` (raises `InvariantError`) |
 | nothing is retained past the point it can settle | `MempoolTunables.evict_after` (a property) |
-| the retry schedule fits its deadline | `timing.retry_total` + `tests/test_timing.py` |
+| a backoff ceiling does not exceed its deadline | `Tunables.__post_init__` |
 | one dial has one home | `tests/test_timing.py` |
 | tunables are consensus-agreed at a log position | **OWED** — they are per-node defaults today |
 ## Keys

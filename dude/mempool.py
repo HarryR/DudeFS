@@ -36,7 +36,7 @@ class Tunables:
     """Bucket width. `bucket = ts / delta`, so boundaries are COMPUTED, never negotiated — there
     is no protocol for agreeing where a bucket starts.
 
-    FLOOR: `timing.BUCKET_FLOOR` (850 ms at the declared quantities) — a bucket narrower than
+    FLOOR: `timing.dissemination` (850 ms at the declared quantities) — a bucket narrower than
     dissemination closes before its transactions could have reached the nodes that must propose
     them. 1 s is the next round value above it.
 
@@ -48,7 +48,7 @@ class Tunables:
     """The door. A transaction is refused if its `ts` is further than this from the receiving node's
     now, in either direction.
 
-    FLOOR: `timing.ADMISSION_FLOOR` (25.6 s) — the client's tolerated clock error plus a round trip.
+    FLOOR: `timing.admission_floor` (25.6 s) — the client's tolerated clock error plus a round trip.
     This is also the REPLAY bound: a captured transaction stays admittable for roughly this long, so
     generosity above the floor is paid for in replay window rather than in latency."""
 

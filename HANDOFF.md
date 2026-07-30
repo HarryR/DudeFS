@@ -8,7 +8,7 @@ ruff format dude -q && ruff check dude && ty check dude/ \
   && python3 -m unittest discover -s dude/tests -t . -q
 ```
 
-**269 tests: 268 green, 1 RED ON PURPOSE.** Lint, format and typecheck are clean. The red is
+**272 tests: 271 green, 1 RED ON PURPOSE.** Lint, format and typecheck are clean. The red is
 `test_a_pull_for_a_collected_range_is_not_answered_with_a_hole` — it asserts what §2 owes and fails
 until that lands. **The tree is not broken and it is not flaky** (six consecutive runs). Do not delete
 it to get a green gate; everything else must stay green.

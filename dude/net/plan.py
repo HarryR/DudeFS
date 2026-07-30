@@ -17,7 +17,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
 
-from ..core import crypto, timing
+from ..core import crypto
 from .link import Estimator, Link, Peer
 
 type Millis = int
@@ -81,15 +81,17 @@ type Decision = Send | Wait | GiveUp
 class PlanTunables:
     """Destined for the one consolidated tunables surface (LINKS.md §5) — no literal below."""
 
-    backoff_base: Millis = timing.RTT_MAX // 3
-    """First retry delay, 100 ms. A third of `RTT_MAX`, so the first retry is cheap on a fast link
-    and the schedule reaches a full round trip by its third attempt."""
+    backoff_base: Millis = 100
+    """First retry delay, and the FLOOR of every delay: `backoff` never returns less. A third of a
+    tolerable round trip, so a first retry is cheap on a fast link."""
 
     backoff_cap: Millis = 5_000
-    """Ceiling on one delay. MUST NOT exceed the deadline it is spent against (`net.ttl`), or the
-    cap can never be applied — it was 30 s against a 10 s TTL, a dial with no reachable effect."""
+    """Ceiling on one delay, before jitter. MUST NOT exceed `net.ttl`, the deadline it is spent
+    against: `Plan.next` clamps every wait to the deadline anyway, so a cap above it is incoherent
+    rather than wrong — it states a limit the deadline has already imposed. It was 30 s against a
+    10 s TTL, and `Tunables.__post_init__` refuses that combination now."""
 
-    stagger_cap: Millis = timing.RTT_MAX
+    stagger_cap: Millis = 250
     """R7's Connection Attempt Delay, as a CAP rather than the value.
 
     RFC 8305 specifies a flat 250 ms because a browser has no RTT history for a freshly resolved
@@ -102,14 +104,16 @@ class PlanTunables:
     """How many links one message may be in flight on at once. Two is the Happy Eyeballs shape;
     every attempt beyond the first also costs a budget token, so this is an upper bound rather than
     a target."""
-    max_attempts: int = 6
+    max_attempts: int = 8
     """A backstop, not the real limit — the deadline and the budget are. It exists so a pathological
     peer cannot be attempted thousands of times inside one long TTL.
 
-    CHECKED against the deadline: `timing.retry_total(base, cap, attempts)` MUST fit inside
-    `net.ttl`. It was 8, which spends 25.5 s against a 10 s TTL, so the last three attempts were
-    unreachable — the schedule and the deadline had been chosen independently and disagreed. Six
-    spends 6.3 s."""
+    NOT DERIVED FROM THE DEADLINE, and an earlier commit wrongly said it must be. `backoff` is
+    decorrelated jitter — `max(base, random(base, min(cap, base·3^attempts)))` — so a run's spend is
+    not a fixed sum: its minimum is `attempts · base`, 800 ms here, and `Plan.next` checks the
+    deadline explicitly and distinguishes `Stalled.ATTEMPTS` from
+    `Stalled.DEADLINE`. Nothing is silently unreachable. The claim came from re-implementing this
+    schedule in a checker with the wrong growth base."""
 
 
 @dataclass(frozen=True, slots=True)

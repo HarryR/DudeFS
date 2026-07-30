@@ -38,7 +38,7 @@ from .mempool import Mempool
 from .net import Verb
 from .net.address import Endpoint
 from .net.envelope import Envelope, Frame, MessageId, SignedEnvelope, new_message_id
-from .net.link import LinkTunables, Peer, Transport
+from .net.link import Peer, Transport
 from .net.postman import Postman
 from .net.transports import address_of
 from .store import Commitment, Entry, Store, StoreError, attest, ops, settle
@@ -127,7 +127,7 @@ class Node:
     def connect(self, peer: crypto.PublicKey, transport: Transport) -> None:
         """Add a peer reachable in-process. A real deployment reads endpoints from the management
         store instead; this is the same `Peer` either way."""
-        p = Peer(peer, lambda _e: transport, LinkTunables())
+        p = Peer(peer, lambda _e: transport, self.tunables.link)
         p.reconfigure((Endpoint(address_of(peer)),))
         self.postman.peers[peer] = p
 
