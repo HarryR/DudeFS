@@ -45,11 +45,19 @@ was overstated. Understated elsewhere: the entire **`touch` table, `history()` a
 maintenance** become dead with no production caller. The real harness is **`test_store.py`** (~180 lines
 rewritten), not `test_gestalt.py`, which exercises no compaction path at all.
 
-**Gaps to fold in:** `FRONTIER`/`PULL`/`ENTRIES` appear in no step and no repair path exists in code;
-the **new-node join** is now load-bearing (it is the recovery path) and needs its own step; step 1's `f`
-is `min(n−q, 2q−n−1)` — **seizure is unavailability**, so the availability bound binds (3 at n=11).
+**Gaps to fold in** *(all three now closed or promoted)*: `FRONTIER`/`PULL`/`ENTRIES` appeared in no
+step — they are wired, `FRONTIER` under step 7 and the other two under step 5; the **new-node join** is
+load-bearing because it is the recovery path, and it is now its own step (see "The open step"); step
+1's `f` is `min(n−q, 2q−n−1)` — **seizure is unavailability**, so the availability bound binds (3 at
+n=11), and that is what shipped.
 
 ## Status
+
+**This file is a status board, revised in place — not a journal.** It used to be appended to, which
+left three steps present twice: an early section written when the step was planned and a later one
+written when it landed, with nothing saying which was current. A reader hit the stale copy first and
+believed the conveyor was half-built and the struck compactor timestamp was still owed. If you want
+the history, it is in `git log`; if you change what is true, change it *here*.
 
 | step | state |
 |---|---|
@@ -57,12 +65,16 @@ is `min(n−q, 2q−n−1)` — **seizure is unavailability**, so the availabili
 | 1 — failure domains | **done**, 7 tests |
 | 2 — segments | **done**, 14 tests, all four Fable amendments closed |
 | 3 — state root (SMT) | **done**, 30 tests — and it is signed, so it proves something |
-| 4 — conveyor | **done**, 17 tests — a key can now die |
-| 5 — compactor role | **done bar STATE transfer** — `PULL`/`ENTRIES` landed; only the far-behind/wiped path is left — collection is driven and ratified in a cluster; `FRONTIER` landed with step 7; the timestamp role is **struck**, not built (below). Outstanding: `PULL`/`ENTRIES` and join-as-recovery |
+| 4 — conveyor | **done** — `ops.Set` carries its epoch, `ops.Drained` guards retirement, a key can die |
+| 5 — compactor role | **done bar STATE transfer.** Collection is driven and ratified in a cluster; `PULL`/`ENTRIES` and `FRONTIER` landed; the timestamp role is **struck**, not built (below). Outstanding: **the far-behind / wiped node** — see below and HANDOFF.md §2 |
 | 6 — revocation | **collapsed to nothing** — see below |
 | 7 — angel duty | **done**, 49 tests — grew two more halves: cross-attestation and gathered freshness (below) |
 
-**237 tests green.** Gate unchanged (bottom of this file).
+**One step of real work is left: the node that cannot catch up incrementally must decide that and
+sync from scratch.** Everything else above is landed. See "The open step" below.
+
+Test count and gate live at the bottom of this file, in one place, because three different numbers in
+three sections is how this file went stale in the first place.
 
 ## Step 0 — correct the record  ✅ mostly
 
@@ -239,51 +251,6 @@ something other than what it claims.
 **Pressure is deliberately basic** `[H]`: `Store.epochs()` is the work queue, oldest first, since the
 oldest epoch is the one closest to dying. Tunable later; the mechanics are what had to be right.
 
-## Step 5 — the compactor's timestamp: STRUCK  ✅ ★
-
-`[H]` **A timestamp cannot be ratified, only asserted.** Ratification is *recompute, don't trust* —
-a peer signs a collection claim because it re-derived the fold — and **nobody can re-derive somebody
-else's clock**. The sketched design had ratifiers vouching for something they could not check.
-
-So the compactor's timestamp role is **deleted rather than built**, and freshness rides the
-attestation gossip that already exists: `Attestation.at` is the time that node's own clock read.
-One less tier, which is the direction the budget has pushed throughout.
-
-**What it buys is a BOUND.** An adversary without `f+1` keys cannot manufacture recent statements —
-only replay old ones, and old ones look old. Silent staleness becomes **visible** staleness, and
-`attest.staleness` turns "how far behind am I" from an unknown into a number. `[H]` A **diagnostic**;
-adversarial liveness is not available here and is not claimed.
-
-**The single-link cold client is back in scope, without a priest.** A relay holds no key but its own,
-so one link is enough to *gather* `f+1` signed statements the client verifies itself — which was the
-priest's entire job. `#freshness-needs-many`'s strike is lifted.
-
-**Rulings `[H]`:** the window is a **cluster-wide tunable** (`fresh_within`) because two clients
-disagreeing about whether one bundle is fresh is a defect; it is **symmetric**, since a future
-timestamp would still read as recent when replayed tomorrow; and it **must exceed `probe_every`**, or
-a bundle is stale by construction — the same shape as S4's dedup floor. A **clock fault is never
-convictable**: an NTP step backwards is a road bump, it degrades what a node contributes and drops it
-from the `f+1`, and `contradiction` still never looks at time.
-
-## Step 4 — the conveyor  ◐ half
-
-`Store.migrate` rewrites stragglers at the head with the **same value**, `A_state`-invariant. That is
-the half that makes segments collectable.
-
-**Not written:** re-encryption under the current epoch, which is what lets an old key epoch die
-(#conveyor). Worker bees do it as housekeeping; effort scales with backlog pressure, clamped so it
-cannot crowd out work; the idle case needs a heartbeat, not a fallback path.
-
-**Needs tags** for the mechanism — `#conveyor` states the *why*, not the *how*.
-
-## Step 5 — the compactor role
-
-Compactor proposes with a **timestamp**; nodes **ratify** by recomputing. Two signatures, two jobs.
-The quorum half exists (#collection-is-ratified); **the timestamp half has no tag and no code**, and it
-is what gives a single-link client freshness.
-
-Also: wire `FRONTIER` / `PULL` / `ENTRIES`.
-
 ## Step 6 — revocation  ✅ nothing to build
 
 Collapsed. **Absence *is* the revocation** — the grant is simply gone, and the state root commits to
@@ -291,12 +258,6 @@ state, so the removal is bound to the data (#absence-is-revocation). No CRL, no 
 never-forget bookkeeping. Revocation freshness == data freshness.
 
 The priest question is **ruled**: cold manager, no priest, cold single-link clients out of scope.
-
-## Step 7 — the angel duty
-
-Nodes attest a monotone height and never regress; clients take the max over `f+1` (#monotonicity).
-Catches the *actual* rollback threat here — snapshot revert, restore, operator error — not a
-coordinated adversary. Durable state, no clock, no TEE.
 
 ## Step 7 — the angel duty, and who keeps the evidence  ✅ ★
 
@@ -342,8 +303,10 @@ nodes look stalled), and it is a **local read policy**: shunned keys drop before
 the roster and quorum arithmetic are untouched, so a heavily-shunned cluster **stalls** rather than
 proceeding thin.
 
-**What this does not give you:** freshness. A frozen node attests truthfully forever. That is the
-compactor's *timestamp*, still unwritten in step 5, and the conflation has cost time twice.
+**What this does not give you:** freshness. A frozen node attests truthfully forever. Monotonicity and
+freshness are two questions and the conflation has cost time twice — but do **not** read this as owing
+a compactor timestamp. That role is **struck** (above): freshness is *gathered* from `Attestation.at`
+over `f+1`, and it is a bound and a diagnostic rather than adversarial liveness.
 
 ## The relocation wave — three defects and what they cost  ★
 
@@ -382,6 +345,50 @@ peer-driven collection used whatever a local call had left behind — nothing. C
 mempool's window now; turning it on broke nine cluster tests, every one of which had been collecting
 inside the window.
 
+## The open step — the node that cannot catch up  ◐
+
+The last real work, and the only step not landed. Stated in full in **HANDOFF.md §2**; the summary is
+that `PULL`/`ENTRIES` serves a node with a valid *uncollected* prefix, and nothing serves the one whose
+prefix was collected. `[H]` **re-join as if new** (rulings table): the joiner discards and runs the
+new-node join, which is a **chunk-diff** over the SMT — a subtree hash *is* a chunk hash — so cost
+degrades smoothly with absence instead of falling off a cliff at H.
+
+**The missing half is a decision, not a mechanism.** `catch_up` always asks from `head()+1` and has no
+way to conclude *"the range I need is gone, bootstrap instead"*. An honest server answers such a
+request from whatever it still holds, so the reply is a run with a hole in it. The joiner half of that
+is now fixed — a run must be contiguous from what is owed, and a refusal is returned rather than raised
+(below) — but **the server still cannot say what it no longer has**, which is the remaining red test.
+
+`[H]` **The floor is what authorises a hole**, and that is the frame for the whole step: a compacted
+log is *supposed* to have gaps, so `(floor, head]` must be complete and below the floor a
+quorum-ratified checkpoint licenses the absence. **Catching up fills `(floor, head]`; bootstrapping
+raises the floor** so the missing prefix stops being owed. Nothing in the code raises a floor except a
+collection the node performed itself, which is why a wiped joiner cannot bootstrap at all today.
+
+Two questions **OPEN** before the walk is written, both about the server's horizon moving *during* a
+sync: whether the server pins retention at `H1`, and what a joiner does with a collection marker
+inside the range it replays. HANDOFF.md §2 has the detail.
+
+## Their error and ours — the boundary was in the wrong place  ★
+
+`[H]` Two error trees, not one: `DudeError` is **their** fault (routine, expected, costs one frame),
+`InvariantError` is **ours** (a violated postcondition) and is deliberately not a `DudeError`, so no
+`except DudeError` can swallow it. Catchability became structural instead of a convention nobody can
+enforce at the catch site.
+
+**What it was hiding.** `receive` wrapped only `postman.deliver`, leaving `_handle` outside the catch —
+and a handler's first act is to decode a peer-supplied body. A stranger with no grant and no roster
+seat could send `SUBMIT` with twelve bytes of non-bencode; the `CodecError` escaped, and with
+`crashonly` installed that is `os._exit`. crashonly.py's own header names that as the one thing its
+typed-parsing precondition exists to prevent. The parsing was already right; the catch was in the
+wrong place.
+
+`Store.replay` now **returns** its refusal (`str | None`, the `Compaction.attested` idiom) instead of
+raising, and `_on_entries` checks the run's SHAPE — one predicate, `_uncontiguous`, for a gap, a repeat
+and a reordering, because all three are "this entry is not at the position owed". The duplicate-index
+case used to reach `entry.idx PRIMARY KEY` and raise `sqlite3.IntegrityError`, which is not a
+`DudeError` at all: trap 3 for the third time.
+
 ## Not doing, and why
 
 | | |
@@ -392,7 +399,20 @@ inside the window.
 | recurrent PCD at the priest | genuinely sound (F/§3.5) but only if step 6 builds a priest at all |
 | per-workflow logs | F44 — work portability requires one global log |
 
-## Verification throughout
+## Verification — the one place the numbers live
 
-`ruff format && ruff check && ty check dude/ && python3 -m unittest discover -s dude/tests -t . -q`
-(108 tests green today). Every step extends `test_gestalt.py` rather than adding a parallel harness.
+```
+ruff format dude -q && ruff check dude && ty check dude/ \
+  && python3 -m unittest discover -s dude/tests -t . -q
+```
+
+Or `make check`, which is the same thing with `ruff format --check` so it writes nothing.
+
+**245 tests: 244 green, 1 red on purpose.** Lint, format and typecheck are clean. The red is
+`test_a_pull_for_a_collected_range_is_not_answered_with_a_hole`: an honest `PULL` for a collected range
+is still answered with a run starting past what was asked for (`8 != 2`), because the server has no way
+to say *"that range is gone"*. It asserts what the open step owes and fails until that lands. **If you
+find it red, that is the tree telling you the truth; do not delete it to get a green gate.**
+
+Test counts are stated here and nowhere else. Every step extends `test_gestalt.py` rather than adding a
+parallel harness, and a found defect lands as an in-repo regression test before it is fixed.
