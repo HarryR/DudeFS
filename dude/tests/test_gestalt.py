@@ -394,16 +394,13 @@ class TestClusterCollection(unittest.TestCase):
         self.assertIn(0, honest.store.segments(), "and collected on one node's word")
 
     def test_a_pull_for_a_collected_range_is_not_answered_with_a_hole(self):
-        """REPRODUCER — RED ON PURPOSE, and it is the open step's missing DECISION (HANDOFF.md §2).
+        """A joiner asks from `head+1`. If collection deleted that range, `entries(frm)` would begin
+        at the first index still held -- a run with a hole at the front, through no lie by anybody,
+        which the joiner commits and never revisits, since `catch_up` asks from the NEW head.
 
-        A joiner asks from `head+1`. If collection has deleted that range, `_on_pull` answers from
-        `entries(frm)` -- which simply begins at the first index it still holds. Nobody lied and
-        nothing was detected: the reply is a run with a hole at the front, which the joiner commits.
-
-        The server has no way to say *"that range is gone, bootstrap instead"*, and the joiner has
-        no way to conclude it. Until one of them can, being too far behind to catch up is
-        indistinguishable from being slightly behind -- which is the whole of the work that is
-        left."""
+        Serving nothing is the honest answer: below `retained_from` those entries exist nowhere, so
+        no reply can be both complete and non-empty. The requester learns the frontier from the
+        ratified marker gossip already carries, and concludes it must bootstrap."""
         now = self._churn(12)
         now = self._drain(0, now)
         server, asker = self.c.nodes[0], self.c.nodes[1]
@@ -421,12 +418,11 @@ class TestClusterCollection(unittest.TestCase):
 
         opened = [unseal(f, asker.me) for f in self.c.board.drain(name_of(asker.me.public))]
         replies = [e for e in opened if e.env.verb == Verb.ENTRIES]
-        self.assertNotEqual(replies, [], "no reply to a PULL")
+        self.assertNotEqual(replies, [], "a PULL below the horizon went unanswered entirely")
         run = codec.as_seq(codec.decode(replies[0].env.body))
-        if not run:
-            return  # an empty answer is honest: it holds nothing from `frm` and said so
-        first = codec.as_int(codec.as_seq(run[0], 3)[0])
-        self.assertEqual(first, frm, "served a run starting past what was asked for")
+
+        self.assertEqual(list(run), [], "served a run beginning past what was asked for")
+        self.assertLess(frm, server.store.retained_from(), "the range under test is not collected")
 
     def test_collection_gives_every_node_an_attested_floor(self):
         """Where C1 meets C2. Before the first collection there is no floor at all and a node has
@@ -497,6 +493,67 @@ class TestClusterCollection(unittest.TestCase):
         self.assertIn("not ratified", why)
         self.assertEqual(victim.head(), held, "state moved on a refused collection")
         self.assertIn(0, victim.segments(), "the segment was forgotten anyway")
+
+    def test_the_horizon_is_the_frontier_of_collection(self):
+        """One ratified marker describes where the retained log starts, because collection is
+        oldest-first. A per-collection ledger would explain the same holes and would be the only
+        structure in the system that grows without bound."""
+        now = self._churn(12)
+        now = self._drain(0, now)
+        node = self.c.nodes[0]
+        self.assertEqual(node.store.horizon(), 0, "a frontier before anything was collected")
+        self.assertEqual(node.store.retained_from(), 1, "index 0 is not a thing a log holds")
+
+        self.assertEqual(node.maybe_collect(now), 0)
+        self.c.pump(now)
+
+        self.assertEqual(node.store.horizon(), 1, "segment 0 is collected, so 1 is the frontier")
+        self.assertEqual(node.store.retained_from(), self.WIDTH)
+        self.assertEqual(_gaps_in_the_retained_log(node.store), (), "the suffix is not contiguous")
+
+    def test_a_blocked_segment_stops_a_later_one_from_being_collected(self):
+        """IN ORDER, and it breaks rather than skips. Skipping a straggler-blocked segment let a
+        later one collect, which is what produced interior holes — and an interior hole can only be
+        explained by a record per collection, which grows for ever.
+
+        The cost is visible here: segment 0 holds genesis roster rows, so until they are migrated
+        NOTHING is collected, even though a later segment is entirely dead. That obligation belongs
+        to `drain`, and it is why migration is not optional housekeeping."""
+        now = self._churn(20)  # several segments, all but the first entirely superseded
+        node = self.c.nodes[0]
+        self.assertGreater(len(node.store.segments()), 2, "not enough segments to skip past")
+        self.assertNotEqual(node.store.stragglers(0), (), "segment 0 is not blocked")
+        self.assertEqual(node.store.stragglers(1), (), "segment 1 is not collectable anyway")
+
+        self.assertIsNone(node.maybe_collect(now), "it skipped past a blocked segment")
+
+    def test_a_node_behind_the_frontier_stops_asking(self):
+        """The decision the sync path did not have. `catch_up` asked from `head + 1` for ever and a
+        server answered from whatever it still held, so being too far behind to catch up was
+        indistinguishable from being slightly behind.
+
+        The action this calls for -- bootstrap -- is still OWED, so this only stops a node asking
+        for what cannot be served: honest rather than useful, and where §2 continues."""
+        now = self._churn(12)
+        now = self._drain(0, now)
+        source = self.c.nodes[0]
+        self.assertEqual(source.maybe_collect(now), 0)
+        self.c.pump(now)
+
+        joiner = Node(crypto.Keypair.generate(), Store())
+        joiner.store.apply(self.c._genesis(), auth=None)
+        joiner.connect(source.me.public, InProc(name_of(joiner.me.public), self.c.board))
+        joiner.store.witness(source.attestation(now))  # carries the ratified marker
+
+        self.assertGreater(joiner.store.retained_from(), joiner.store.head() + 1)
+        self.assertTrue(joiner.behind_the_horizon(), "it thinks it can still catch up")
+
+        before = len(joiner.postman.mailbox.due(now))
+        joiner.catch_up(now)
+
+        self.assertEqual(
+            len(joiner.postman.mailbox.due(now)), before, "it asked for what cannot be served"
+        )
 
     def test_a_far_behind_node_adopts_a_ratified_floor_from_gossip(self):
         """The only way a node that has never collected gets an anchor at all.
@@ -1082,7 +1139,7 @@ class TestCatchUp(unittest.TestCase):
 
         self.assertEqual(asleep.store.head(), before, "part of a holed run was committed")
         self.assertEqual(
-            _gaps_above_the_floor(asleep.store),
+            _gaps_in_the_retained_log(asleep.store),
             (),
             "an unauthorised gap was committed into the log",
         )
@@ -1104,23 +1161,19 @@ def _run_from(peer: Node, frm: int) -> list:
     return run
 
 
-def _gaps_above_the_floor(store: Store) -> tuple[int, ...]:
-    """Indices missing from `(floor, head]` — the part of the log that must be COMPLETE.
+def _gaps_in_the_retained_log(store: Store) -> tuple[int, ...]:
+    """Indices missing from `[retained_from, head]` — the part of the log that must be COMPLETE.
 
-    "No holes" is the wrong invariant and it matters: collection deletes whole segments, so a
-    compacted log is *supposed* to have gaps. What separates a legitimate gap from a missing entry
-    is the quorum-ratified checkpoint. Below the floor, the checkpoint is the authority and entry
-    presence says nothing; above it, every index must be held, because nothing has authorised
-    forgetting any of them.
+    "No holes" is the wrong invariant: collection deletes whole segments, so a compacted log is
+    *supposed* to have gaps. What separates a legitimate gap from a lost entry is the HORIZON, the
+    frontier of collection named by the one ratified marker the node retains. Below it absence is
+    accounted for; at or above it every index is owed.
 
-    It holds whatever ORDER segments are collected in, which is why the floor is the right line to
-    draw and "no holes" is not. `collect` refuses the segment holding `head+1`, so a collectable
-    segment lies entirely at or below the head at the moment it is collected — and that head is the
-    height its own checkpoint records. A collected index is therefore always below the floor, even
-    when a straggler-blocked segment is skipped and a later one goes first."""
-    floor = store.floor()
+    This used the floor, which is the wrong quantity: the floor is the head at the moment of
+    collecting, so it sits far ABOVE the indices that were actually forgotten. Collection being
+    oldest-first is what makes a single frontier sufficient."""
     have = {e.idx for e in store.entries()}
-    return tuple(i for i in range(floor + 1, store.head() + 1) if i not in have)
+    return tuple(i for i in range(store.retained_from(), store.head() + 1) if i not in have)
 
 
 class TestTransferIsNotTrusted(unittest.TestCase):

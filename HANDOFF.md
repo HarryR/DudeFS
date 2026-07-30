@@ -8,10 +8,9 @@ ruff format dude -q && ruff check dude && ty check dude/ \
   && python3 -m unittest discover -s dude/tests -t . -q
 ```
 
-**281 tests: 280 green, 1 RED ON PURPOSE.** Lint, format and typecheck are clean. The red is
-`test_a_pull_for_a_collected_range_is_not_answered_with_a_hole` — it asserts what §2 owes and fails
-until that lands. **The tree is not broken and it is not flaky** (six consecutive runs). Do not delete
-it to get a green gate; everything else must stay green.
+**284 tests, all green** — lint, format and typecheck clean, six consecutive runs. The marker test
+that was red on purpose (`test_a_pull_for_a_collected_range_is_not_answered_with_a_hole`) now passes:
+a server no longer answers a `PULL` below its frontier with a gapped run.
 
 Every step of the plan is landed **except one**: a node that cannot catch up incrementally has to
 decide that and sync from scratch (§2). `UNIMPLEMENTED` is down to `ANNOUNCE` / `FETCH` (mempool

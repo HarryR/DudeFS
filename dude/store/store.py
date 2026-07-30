@@ -788,6 +788,35 @@ class Store:
         ck = self.checkpoint()
         return ck.height if ck is not None else 0
 
+    def horizon(self) -> int:
+        """The lowest segment this log still retains. Zero until anything is collected.
+
+        THE FRONTIER, NOT A SET, and that is the whole of why nothing here grows without bound.
+        Collection is oldest-first (`Node.maybe_collect`), so the retained log is a contiguous
+        suffix and one ratified marker describes where it starts: the marker names the segment it
+        collected, so the next one up is the frontier. A per-collection ledger would explain the
+        same holes and would be the only structure in the system that grows for ever — the log is
+        bounded by collection, sightings and convictions by the roster, and that would be bounded
+        by nothing.
+
+        Distinct from `floor`, the HEIGHT that checkpoint attests, being the head at the moment of
+        collecting. A client relies on the floor; the horizon is what explains an absence."""
+        ck = self.checkpoint()
+        return ck.segment + 1 if ck is not None else 0
+
+    def retained_from(self) -> Index:
+        """The lowest index this log is obliged to hold. Below it, absence is authorised.
+
+        THE COMPLETENESS RULE in one expression: an index at or above this MUST be present, and one
+        below it is accounted for by the ratified collection that removed it. It replaces the
+        `(floor, head]` phrasing, which used the wrong quantity: the floor is the head at collection
+        time, while the frontier says which indices were forgotten.
+
+        Floored at 1 because indices start there: with nothing collected the horizon is segment 0
+        and the arithmetic would name index 0, which no log holds — so a completeness check would
+        report a gap that cannot exist."""
+        return max(1, self.horizon() * self.SEGMENT_WIDTH)
+
     def adopt(self, ck: ops.Compaction) -> str | None:
         """Take a checkpoint somebody else holds, if the quorum signed it. `None` if adopted, else
         why not.

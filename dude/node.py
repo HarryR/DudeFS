@@ -267,12 +267,27 @@ class Node:
 
         NO DISTINGUISHED PROPOSER. Any node that notices may say so, and two nodes noticing the same
         segment is harmless — the claim is a function of the segment and the fold, not of who spoke
-        first, so both propose byte-identical bytes."""
+        first, so both propose byte-identical bytes.
+
+        IN ORDER, AND IT BREAKS RATHER THAN SKIPS `[H]`. A blocked segment used to be skipped so a
+        later one could collect, which left interior holes — and a hole in the middle of the log can
+        only be explained by a per-collection record that grows for ever. Collecting oldest-first
+        makes the retained log a contiguous SUFFIX, so one ratified marker names the frontier and
+        nothing unbounded is needed. The collector then points the same way the conveyor already
+        does: both work the oldest end of the belt.
+
+        The cost is real and is paid by migration: one undrained segment stalls collection
+        everywhere, so `drain` is not optional housekeeping but the thing that lets space be
+        reclaimed at all.
+
+        RE-PROPOSING IS DELIBERATE. Skipping a segment already in `collecting` would stall for ever
+        if its quorum never formed — the old `continue` hid that by moving to a later segment. The
+        claim is byte-identical every time, so shares pool and a re-flood costs one message."""
         for seg in self.store.segments():
-            if seg in self.collecting or seg >= self.store.segment_of(self.store.head() + 1):
-                continue
+            if seg >= self.store.segment_of(self.store.head() + 1):
+                break  # not collectable, and neither is anything above it
             if self.store.stragglers(seg):
-                continue  # migrate first -- the caller's business, not a side effect of asking
+                break  # in order: this one is migrated first, or nothing moves
             claim = ops.Compaction(*self._commitment(seg))
             self.collecting[seg] = claim
             self._ratify_locally(claim, now)
@@ -433,6 +448,8 @@ class Node:
         behind is something a node NOTICES rather than something it has to be told. One peer, not
         all of them — the reply is bulk, and asking everyone would multiply it by the roster."""
         mine = self.store.head()
+        if self.behind_the_horizon():
+            return  # a PULL cannot be served; see `behind_the_horizon`
         ahead = [s for s in self.store.sightings() if s.claim.head > mine]
         if not ahead:
             return
@@ -440,13 +457,38 @@ class Node:
         env = Envelope(best.by, Verb.PULL, _mid(), codec.encode([mine + 1])).sign(self.me, now)
         self.postman.mailbox.post(env, now, self.tunables.net.ttl)
 
+    def behind_the_horizon(self) -> bool:
+        """Are the entries this node needs already collected everywhere?
+
+        THE DECISION THE SYNC PATH DID NOT HAVE. `catch_up` asked from `head + 1` for ever, and a
+        server answered from whatever it still held, so being too far behind to catch up was
+        indistinguishable from being slightly behind. This is that distinction, and it is decidable
+        from one ratified marker: if the frontier has passed our head, the range we need does not
+        exist anywhere and no number of round trips will produce it.
+
+        WHAT IT DOES NOT DO YET, stated so it is not mistaken for finished: the action this calls
+        for is a bootstrap — adopt the checkpoint, take state against its root, replay forward — and
+        that needs a state-transfer verb which does not exist. Until then this stops a node
+        asking for what cannot be served, which is honest rather than useful. See SPEC's enforcement
+        table, where the bootstrap is OWED."""
+        return self.store.retained_from() > self.store.head() + 1
+
     def _on_pull(self, env: SignedEnvelope, now: Millis) -> None:
         """Serve a run of settled entries from `frm`.
 
         BOUNDED, because a joiner asking from 1 would otherwise pull the whole log into one message.
         The requester asks again from where it got to, so the bound costs round trips and never
-        correctness."""
+        correctness.
+
+        AND IT DOES NOT ANSWER WITH A HOLE. Below `retained_from` the entries are collected, and
+        `entries(frm)` would happily begin at the first index still held — a run with a gap at the
+        front, through no lie by anybody, which the requester then committed. Serving nothing is the
+        honest answer: the requester cannot use a gapped run, and it learns the horizon from the
+        ratified marker that gossip already carries, which is what tells it to bootstrap instead."""
         frm = codec.as_int(codec.as_seq(codec.decode(env.env.body), 1)[0])
+        if frm < self.store.retained_from():
+            self._reply(env, Verb.ENTRIES, codec.encode([]), now)
+            return
         run = []
         for e in self.store.entries(max(frm, 1)):
             if len(run) >= self.tunables.net.pull_max:

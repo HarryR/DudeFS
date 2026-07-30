@@ -364,15 +364,26 @@ Collection MUST be refused when any of these holds:
 ### The floor authorises the hole {#the-floor-authorises}
 
 - A compacted log is expected to have gaps, so completeness MUST NOT be required of the whole log.
-- `(floor, head]` MUST be complete, where `floor` is the height of the highest quorum-ratified
-  checkpoint the node holds. Below the floor, absence MUST be authorised by that checkpoint.
+- **Collection MUST proceed oldest segment first.** The retained log is then a contiguous suffix, and
+  one ratified marker describes where it starts — the segment it collected, so the next one up is the
+  frontier. A collector free to skip a blocked segment leaves interior holes, and an interior hole can
+  only be explained by a record per collection, which would be the one structure here that grows
+  without bound.
+- `[retained_from, head]` MUST be complete, where `retained_from` is that frontier in index terms.
+  Below it, absence is accounted for by the ratified collection that removed those indices; at or
+  above it, every index MUST be held.
+- A node MUST NOT retain a per-collection ledger to explain its holes. A frontier is sufficient and is
+  O(1) for ever; a set is not bounded by anything.
 - A node MUST NOT adopt a checkpoint whose signatures it cannot verify.
 - A node MAY hold a floor above its own head. That is the signed statement *"the cluster has ratified
   state I do not hold"*, and it MUST NOT be refused: it is the condition that requires a bootstrap.
 - Catching up MUST fill `(floor, head]`. A node that cannot obtain that range MUST bootstrap instead,
   and MUST NOT accept a partial or discontiguous run in its place.
-- A server that no longer holds a requested range MUST say so, rather than answering with what it
-  happens to still hold.
+- A server that no longer holds a requested range MUST NOT answer with what it happens to still hold.
+  A run beginning past what was asked for is a hole the requester cannot use and will not revisit.
+- A node whose needed range lies below the frontier MUST stop asking for it and bootstrap instead. The
+  frontier reaches it on the ratified marker that gossip already carries, so this is decidable without
+  a new message.
 
 ### Bootstrap has one anchor {#bootstrap-anchor}
 
@@ -572,7 +583,11 @@ obliges**, which is the defect this table exists to make visible rather than pla
 | **stragglers are migrated so a segment can be collected** | **OWED** — `Node.drain` has no caller |
 | **a collectable segment is proposed for collection** | **OWED** — `Node.maybe_collect` has no caller |
 | the dedup floor applies on every collection path | `Store.collect` — **but defaults to off** |
-| a hole in the log is explained by a ratified collection | **OWED** — the ledger is unbuilt |
+| a hole is explained by the frontier, with no growing set | `Store.horizon`, `Store.retained_from` |
+| collection proceeds oldest segment first | `Node.maybe_collect` |
+| a server never answers a PULL with a hole | `Node._on_pull` |
+| a node behind the frontier stops asking | `Node.behind_the_horizon` |
+| **it then bootstraps** | **OWED** — no state-transfer verb exists |
 ## Keys
 
 ### Two secrets, never one {#two-secrets}

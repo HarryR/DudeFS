@@ -456,11 +456,9 @@ ruff format dude -q && ruff check dude && ty check dude/ \
 
 Or `make check`, which is the same thing with `ruff format --check` so it writes nothing.
 
-**281 tests: 280 green, 1 red on purpose.** Lint, format and typecheck are clean. The red is
-`test_a_pull_for_a_collected_range_is_not_answered_with_a_hole`: an honest `PULL` for a collected range
-is still answered with a run starting past what was asked for (`8 != 2`), because the server has no way
-to say *"that range is gone"*. It asserts what the open step owes and fails until that lands. **If you
-find it red, that is the tree telling you the truth; do not delete it to get a green gate.**
+**284 tests, all green.** Lint, format and typecheck clean, six consecutive runs. The long-standing
+red marker is closed: a server below its frontier now answers nothing rather than a gapped run, and a
+node behind the frontier stops asking. What remains OWED is the bootstrap it should then perform.
 
 Test counts are stated here and nowhere else. Every step extends `test_gestalt.py` rather than adding a
 parallel harness, and a found defect lands as an in-repo regression test before it is fixed.
