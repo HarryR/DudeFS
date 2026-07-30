@@ -424,7 +424,18 @@ it. Nothing in it may rest on the word of the cluster being joined.
    set with no commitment is unverifiable rather than merely undocumented.
    The high-water serial MUST be durable, or a restart reopens the window it closes.
 8. The checkpoint MUST then be verified against that roster (#collection-is-ratified).
-9. State MUST then be verified against the checkpoint's root (#state-root).
+9. State MUST then be verified against the checkpoint's root (#state-root), **row by row, on
+   arrival**. A transfer checked only at the end cannot say which part was wrong and cannot be taken
+   optimistically; a row that folds to the signed root can be kept the moment it lands.
+   The walk MUST compare subtree hashes and descend only where they differ, so cost tracks absence
+   rather than state size.
+   The party doing the verifying MUST choose the depth at which it stops descending and asks for
+   rows. A server that decided this would be deciding how much its client takes on one reply, which
+   is why hashes and rows are two verbs and not one.
+   A row MUST arrive with its own proof. Without one a reply cannot be checked in isolation, which is
+   the property the whole walk rests on.
+   State adopted this way MUST NOT set the head or `A_log`: history is not what is being transferred.
+   Those come from the checkpoint and from replaying forward afterwards.
 
 - A floor MUST NOT be relied upon without `f+1` fresh corroboration (#freshness-needs-many). The
   chain above establishes *who*; it establishes nothing about *when*.
@@ -581,7 +592,11 @@ obliges**, which is the defect this table exists to make visible rather than pla
 | a relayed verdict is recomputed | `Store.judge` |
 | shunning does not alter quorum arithmetic | `Node.shunned` |
 | every inbound frame is checked against the screen tag | `Postman.deliver` |
-| received state is verified against a signed root | **OWED** — no verb serves a proof; the joiner is the first consumer |
+| received state is verified against a signed root, row by row | `Store.adopt_state` via `smt.verify` |
+| the walk descends only where subtree hashes differ | `Store.subtree`, `Node._on_hashes` |
+| a row is served with its own proof | `Node._on_leaves` |
+| the verifier chooses the descent depth | `NetTunables.walk_depth`, `Node._on_hashes` |
+| **a bootstrap is driven when catching up is impossible** | **OWED** — `Node.bootstrap` has no caller |
 | the manager key is supplied out of band and retained | `Store.provision`, `Store.anchor` |
 | a node is not re-provisioned to another manager | `Store.provision` (raises `InvariantError`) |
 | the log's manager grant names our anchor | `Store.wrong_cluster`, enforced in `Store.replay` |

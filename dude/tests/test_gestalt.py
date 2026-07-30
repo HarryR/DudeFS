@@ -465,6 +465,96 @@ class TestTheRosterIsComplete(unittest.TestCase):
         self.assertEqual(joiner.roster_serial(), 1, "the high-water mark did not advance")
 
 
+class TestTheStateWalk(unittest.TestCase):
+    """Step 9 of #bootstrap-anchor: state taken against the root a quorum signed.
+
+    This is the half a log cannot do. Past the frontier the entries that built the state are gone,
+    so a joiner cannot replay them — it takes the STATE and checks every piece against the root the
+    ratified checkpoint carries. `smt.verify` gets its first production caller here."""
+
+    def setUp(self):
+        self.c = Cluster()
+        self.client = self.c.mgr
+        for i in range(6):
+            tx = ops.writes(ops.Set(D, crypto.h(f"k{i}".encode()), f"v{i}".encode())).sign(
+                self.client, T0
+            )
+            self.c.submit(self.client, tx, to=0, now=T0)
+        self.c.pump(T0)
+        self.c.pump(T0 + DELTA)
+        self.source = self.c.nodes[0]
+        self.root = self.source.store.state_root()
+
+    def _rows_with_proofs(self, prefix=b"", depth=0):
+        return [
+            (store, name, value, self.source.store.prove(store, name))
+            for store, name, value in self.source.store.rows_under(prefix, depth)
+        ]
+
+    def test_a_wiped_node_takes_the_whole_state_against_the_root(self):
+        """The case the walk exists for: no log, no entries to replay, and the state arrives anyway
+        — verified row by row against something the quorum signed."""
+        wiped = Store()
+        wiped.provision(self.c.mgr.public)
+
+        self.assertIsNone(wiped.adopt_state(self._rows_with_proofs(), self.root))
+
+        self.assertEqual(wiped.state_root(), self.root, "the rebuilt tree is a different tree")
+        self.assertEqual(wiped.accumulator(), self.source.store.accumulator())
+        for i in range(6):
+            got = wiped.get(D, crypto.h(f"k{i}".encode()))
+            assert got is not None, f"k{i} did not arrive"
+            self.assertEqual(got.value, f"v{i}".encode())
+
+    def test_a_row_that_does_not_fold_to_the_root_is_refused(self):
+        """A chunk is refused WHERE IT ARRIVES, which is what lets the walk be optimistic: a bad
+        reply costs one round trip instead of poisoning a transfer checked only at the end."""
+        wiped = Store()
+        wiped.provision(self.c.mgr.public)
+        rows = self._rows_with_proofs()
+        store, name, _value, proof = rows[0]
+        rows[0] = (store, name, b"not-what-was-committed", proof)
+
+        why = wiped.adopt_state(rows, self.root)
+
+        assert why is not None, "a value the root does not commit to was applied"
+        self.assertIn("does not verify", why)
+        self.assertEqual(wiped.get(store, name), None, "part of a poisoned chunk landed")
+
+    def test_a_subtree_that_already_agrees_is_never_transferred(self):
+        """Cost degrades smoothly with absence: the walk descends only where the hashes differ, so a
+        node that is slightly stale moves almost nothing."""
+        mirror = Store()
+        mirror.provision(self.c.mgr.public)
+        mirror.adopt_state(self._rows_with_proofs(), self.root)
+
+        left, right = self.source.store.subtree(b"", 0)
+        self.assertEqual(mirror.subtree(b"", 0), (left, right), "an identical store disagreed")
+        self.assertEqual(mirror.state_root(), self.source.store.state_root())
+
+    def test_the_walk_asks_only_where_the_two_trees_differ(self):
+        """The comparison step, through the real handler: a joiner that already agrees asks for
+        nothing at all, which is the property that makes cost track absence."""
+        joiner = self.c.nodes[2]
+        joiner.walking = [(bytes(crypto.DIGEST_SIZE), 0)]
+        left, right = self.source.store.subtree(b"", 0)
+        body = codec.encode([left, right])
+        env = Envelope(joiner.me.public, Verb.HASHES, b"h" * 16, body).sign(self.source.me, T0)
+
+        joiner._on_hashes(env, T0)
+
+        self.assertEqual(joiner.walking, [], "it queued work for a subtree it already agrees on")
+
+    def test_a_walk_needs_a_ratified_root_to_check_against(self):
+        """Without a checkpoint there is nothing signed to verify rows against, so there is nothing
+        to start. Refusing here is what stops a walk becoming "trust whoever answered"."""
+        joiner = Node(crypto.Keypair.generate(), self.c.provisioned())
+        self.assertIsNone(joiner.store.checkpoint())
+
+        self.assertFalse(joiner.bootstrap(T0))
+        self.assertIsNone(joiner.walking)
+
+
 class TestCompactionRunsByItself(unittest.TestCase):
     """The round performs the duties, with no test reaching in to drive them.
 

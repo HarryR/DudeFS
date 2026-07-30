@@ -41,7 +41,7 @@ from .net.envelope import Envelope, Frame, MessageId, SignedEnvelope, new_messag
 from .net.link import Peer, Transport
 from .net.postman import Postman
 from .net.transports import address_of
-from .store import Commitment, Entry, Store, StoreError, attest, ops, settle
+from .store import Commitment, Entry, Store, StoreError, attest, ops, settle, smt
 from .store.management import Management
 from .tunables import DEFAULT, Tunables
 
@@ -67,11 +67,15 @@ HANDLED = frozenset(
         Verb.STANDING,
         Verb.PULL,
         Verb.ENTRIES,
+        Verb.SUBTREE,
+        Verb.HASHES,
+        Verb.LEAVES,
+        Verb.ROWS,
     }
 )
 """Verbs this node acts on."""
 
-SOLICITED = frozenset({Verb.ENTRIES})
+SOLICITED = frozenset({Verb.ENTRIES, Verb.HASHES, Verb.ROWS})
 """Verbs that are only ever an ANSWER to something this node asked for.
 
 An unsolicited one is dropped before dispatch. Without that, anyone at all could hand a node a run
@@ -112,6 +116,8 @@ class Node:
     """When this node last asked its peers where they were (#cross-attestation)."""
     last_housekept: int = -1
     """The last bucket in which this node did compaction housekeeping. See `housekeep`."""
+    walking: list[tuple[bytes, int]] | None = None
+    """Prefixes still to compare, while a state walk is in flight. `None` when not bootstrapping."""
     shares: dict[bytes, dict[crypto.PublicKey, crypto.Signature]] = field(default_factory=dict)
     """Shares keyed by CLAIM BYTES, not by segment: two nodes disagreeing about the fold produce
     two different claims, and neither may borrow the other's signatures."""
@@ -582,6 +588,99 @@ class Node:
         # will ask again. That a node which can NEVER reconcile keeps asking forever is the open
         # step's missing decision, not something this handler can answer.
         self.store.replay(run, expect)
+
+    # -- state transfer (#bootstrap-anchor step 9) ---------------------------------------------- #
+
+    def _on_subtree(self, env: SignedEnvelope, now: Millis) -> None:
+        """Answer with the two child hashes under a prefix. The comparison step of the walk."""
+        f = codec.as_seq(codec.decode(env.env.body), 2)
+        prefix, depth = codec.as_bytes(f[0]), codec.as_int(f[1])
+        left, right = self.store.subtree(prefix, depth)
+        self._reply(env, Verb.HASHES, codec.encode([left, right]), now)
+
+    def _on_leaves(self, env: SignedEnvelope, now: Millis) -> None:
+        """Answer with the rows under a prefix, EACH WITH ITS PROOF.
+
+        The proof is what lets the asker check a row the moment it arrives, against a root a quorum
+        signed, rather than trusting a transfer until some later reconciliation. Serving a row
+        without one would make the reply unverifiable in isolation, which is the property the whole
+        walk is built on."""
+        f = codec.as_seq(codec.decode(env.env.body), 2)
+        prefix, depth = codec.as_bytes(f[0]), codec.as_int(f[1])
+        rows = [
+            [store, name, value, self.store.prove(store, name).encode()]
+            for store, name, value in self.store.rows_under(prefix, depth)
+        ]
+        self._reply(env, Verb.ROWS, codec.encode(rows), now)
+
+    def _on_hashes(self, env: SignedEnvelope, now: Millis) -> None:
+        """A peer's child hashes. Descend where they differ from ours, ask for rows where they are
+        small enough to take whole.
+
+        THE DEPTH IS OURS TO CHOOSE, which is why there are two verbs: the server never decides
+        how much we take at once."""
+        if (walk := self.walking) is None:
+            return  # we are not bootstrapping; an unsolicited answer decides nothing
+        f = codec.as_seq(codec.decode(env.env.body), 2)
+        theirs = (crypto.Digest(codec.as_bytes(f[0])), crypto.Digest(codec.as_bytes(f[1])))
+        prefix, depth = walk.pop()
+        for bit, remote in enumerate(theirs):
+            child = smt.with_bit(prefix, depth, bit)
+            if self.store.tree.hash_under(child, depth + 1) == remote:
+                continue  # this whole subtree already agrees: never transferred
+            if depth + 1 >= self.tunables.net.walk_depth:
+                self._ask(env.frm, Verb.LEAVES, child, depth + 1, now)
+            else:
+                walk.append((child, depth + 1))
+                self._ask(env.frm, Verb.SUBTREE, child, depth + 1, now)
+
+    def _on_rows(self, env: SignedEnvelope, _now: Millis) -> None:
+        """Rows with proofs. Verified against the ratified root, or dropped.
+
+        A CHUNK IS REFUSED WHERE IT ARRIVES. `Store.adopt_state` folds each row's own siblings to
+        the root, so a bad chunk costs one reply rather than poisoning a transfer checked only at
+        the end — which is what lets the walk be optimistic at all."""
+        ck = self.store.checkpoint()
+        if self.walking is None or ck is None:
+            return
+        rows = []
+        for row in codec.as_seq(codec.decode(env.env.body)):
+            r = codec.as_seq(row, 4)
+            rows.append(
+                (
+                    codec.as_int(r[0]),
+                    codec.as_bytes(r[1]),
+                    codec.as_bytes(r[2]),
+                    smt.Proof.decode(codec.as_bytes(r[3])),
+                )
+            )
+        self.store.adopt_state(rows, ck.root)
+
+    def _ask(
+        self, peer: crypto.PublicKey, verb: Verb, prefix: bytes, depth: int, now: Millis
+    ) -> None:
+        """Post one walk question. The body is `[prefix, depth]` for both verbs."""
+        env = Envelope(peer, verb, _mid(), codec.encode([prefix, depth])).sign(self.me, now)
+        self.postman.mailbox.post(env, now, self.tunables.net.ttl)
+
+    def bootstrap(self, now: Millis) -> bool:
+        """Start a state walk against the ratified root, for a node the log cannot reach.
+
+        `behind_the_horizon` says catching up is impossible; this is the thing to do instead. It
+        begins at the top of the tree and descends only where the hashes disagree, so a slightly
+        stale node transfers almost nothing and a wiped one transfers everything — the same code,
+        with cost degrading smoothly, which is what `[H]` "re-join as if new" asked for.
+
+        Returns whether a walk was started. Nothing here applies state: `_on_rows` does that, and
+        only against a root the quorum signed."""
+        if self.walking is not None or self.store.checkpoint() is None:
+            return False
+        peer = next((s.by for s in self.store.sightings() if s.by in self.roster()), None)
+        if peer is None:
+            return False
+        self.walking = [(bytes(crypto.DIGEST_SIZE), 0)]
+        self._ask(peer, Verb.SUBTREE, bytes(crypto.DIGEST_SIZE), 0, now)
+        return True
 
     # -- the round ----------------------------------------------------------------------------- #
 

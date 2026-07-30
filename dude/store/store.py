@@ -812,6 +812,73 @@ class Store:
         checkpoint is cut."""
         return self.tree.root()
 
+    def subtree(self, prefix: bytes, depth: int) -> tuple[crypto.Digest, crypto.Digest]:
+        """The two child hashes one bit below `prefix`. The walk's comparison step.
+
+        A subtree hash IS a chunk hash (#state-root), so a joiner descends only where its own hash
+        differs from the server's and never transfers a region it agrees about. Cost degrades
+        smoothly with absence, which is what `[H]` "re-join as if new" asked for."""
+        return (
+            self.tree.hash_under(smt.with_bit(prefix, depth, 0), depth + 1),
+            self.tree.hash_under(smt.with_bit(prefix, depth, 1), depth + 1),
+        )
+
+    def rows_under(self, prefix: bytes, depth: int) -> tuple[tuple[int, bytes, bytes], ...]:
+        """Every live `(store, name, value)` whose path falls under `prefix`'s first `depth` bits.
+
+        A subtree is a contiguous range in path order, so this is an index scan, not a walk."""
+        lo, hi = smt.bounds(prefix, depth)
+        return tuple(
+            (int(s), n, val)
+            for s, n, val in self.db.execute(
+                "SELECT store, name, value FROM live WHERE path BETWEEN ? AND ? ORDER BY path",
+                (lo, hi),
+            )
+        )
+
+    def adopt_state(
+        self, rows: Iterable[tuple[int, bytes, bytes, smt.Proof]], root: crypto.Digest
+    ) -> str | None:
+        """Apply state this node never held, each row checked against a root the quorum signed.
+
+        THE FIRST WRITE PATH THAT IS NOT THE LOG, and it has to be: a joiner past the frontier
+        cannot replay the entries that built the state, because collection deleted them. What it can
+        do is take the state and check every piece against `root` — which is why the root rides in
+        the ratified checkpoint (#state-root) and not only in an attestation.
+
+        EVERY ROW, SEPARATELY, ON ARRIVAL. `smt.verify` folds the row's own siblings to the root, so
+        a chunk that does not belong is refused where it arrives instead of poisoning a whole
+        transfer that is only checked at the end. That per-chunk property is what lets the walk be
+        optimistic — pull, verify, discard the bad — rather than all-or-nothing.
+
+        It does NOT touch `A_log` or the head: history is not what is being transferred. Those come
+        from the checkpoint the root belongs to, and from replaying forward afterwards."""
+        checked: list[tuple[int, bytes, bytes]] = []
+        for store, name, value, proof in rows:
+            if not smt.verify(root, store, name, value, proof):
+                return f"a row for store {store} does not verify against the signed root"
+            checked.append((store, name, value))
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            acc = self.accumulator()
+            for store, name, value in checked:
+                if (cur := self.get(store, name)) is not None:
+                    acc = crypto.acc_sub(acc, element(store, name, cur[1]))
+                path = smt.path_of(store, name)
+                self.tree.invalidate(path)
+                self.db.execute(
+                    "INSERT OR REPLACE INTO live (store, name, head, value, path, epoch, cred)"
+                    " VALUES (?,?,?,?,?,?,?)",
+                    (store, name, 0, value, path, ops.EPOCH_NONE, b""),
+                )
+                acc = crypto.acc_add(acc, element(store, name, value))
+            self._set_meta("acc", acc)
+            self.db.execute("COMMIT")
+        except Exception:
+            self.db.execute("ROLLBACK")
+            raise
+        return None
+
     def prove(self, store: int, name: bytes) -> smt.Proof:
         """Presence or absence, by the same walk. Absence is the valuable half — it is what makes
         a revocation checkable rather than asserted (#absence-is-revocation)."""

@@ -94,6 +94,22 @@ class Verb(IntEnum):
     PULL = 31
     ENTRIES = 32
 
+    # -- state transfer, for a node past the frontier (#bootstrap-anchor step 9) ----------------- #
+    SUBTREE = 34
+    """"What are the two child hashes under this prefix?" The comparison step of the walk."""
+    HASHES = 35
+    """The answer: two digests, and nothing else."""
+    LEAVES = 36
+    """"Send me the rows under this prefix." Asked only where the hashes already differ."""
+    ROWS = 37
+    """The answer: each row WITH ITS PROOF, so it is checked on arrival rather than at the end.
+
+    TWO VERBS RATHER THAN ONE `[H]`, and the reason is which side decides: a single verb returning
+    hashes-or-leaves would let the SERVER choose when to stop descending, i.e. how much a client
+    takes in one bite. The client holds the root it verifies against, so the descending policy is
+    its own. It also keeps each reply's decode unambiguous — a union-typed reply is how an
+    encode/decode pair drifts."""
+
     # -- diagnostics ---------------------------------------------------------------------------- #
     REFUSED = 90
     """A refusal, carrying a reason. Never silence: a client can only correct a clock fault if it is

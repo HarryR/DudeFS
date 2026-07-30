@@ -63,6 +63,7 @@ WIRED = {
     "unvouched_roster": "a roster row that does not trace to the anchor",
     "roster_incomplete": "a roster that is a subset, unstated, or older than one already seen",
     "vouched": "a credential that does not vouch for the value a row currently holds",
+    "smt.verify": "a state row that does not fold to the root the quorum signed",
 }
 """Checks that must have a live consumer in production code.
 
@@ -70,14 +71,6 @@ Keyed by the callable's name — `smt.verify`-style qualified names work too, fo
 ambiguous on its own."""
 
 OWED = {
-    "smt.verify": (
-        "No proof is served on the wire — there is no verb for one, and `Store.prove` has no "
-        "production caller either, so nothing is trusting an UNVERIFIED proof; the proof half of "
-        "#state-root is absent at both ends. Its first consumer is the joiner, which verifies "
-        "roster rows present and revoked ones absent against a signed root (HANDOFF.md §1, §2). "
-        "The root itself IS checked: recomputed in `_on_collect` before this node will sign, and "
-        "compared in `_disagrees` on every transfer."
-    ),
     "conflicts": (
         "RULING PENDING: wire the exclusion rule into batch selection, or strike it. Sound either "
         "way -- settlement re-evaluates every guard, which is the backstop `falsifies` names -- so "
@@ -161,6 +154,12 @@ UNDRIVEN = {
         "`Store.provision` refuses re-provisioning into another cluster, and only tests call it: "
         "the provisioning path — an operator standing a node up — does not exist in this tree. The "
         "refusal is real and its caller is owed, which is the same shape as `mgmt.retire`."
+    ),
+    "bootstrap": (
+        "`Node.bootstrap` starts the state walk and nothing calls it. `behind_the_horizon` already "
+        "identifies the node that needs one, so this is a line in `tick` plus the question of what "
+        "a walk does when it finishes — adopt the checkpoint's height and resume catching up. Owed "
+        "by the next wave, and listed so it cannot be mistaken for finished."
     ),
     "store.epochs": (
         "The conveyor's work queue, oldest epoch first, with no reader and no verb, so the layer "

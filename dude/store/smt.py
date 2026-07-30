@@ -85,6 +85,18 @@ def bit(path: bytes, i: int) -> int:
     return (path[i // 8] >> (7 - i % 8)) & 1
 
 
+def with_bit(path: bytes, depth: int, bit: int) -> bytes:
+    """`path` with the bit at `depth` set, so a caller can name either child of a prefix.
+
+    Public because BOTH SIDES of a state walk need it: the server to answer about a child, the
+    joiner to ask about one. A path operation belongs with the paths."""
+    padded = bytes(path).ljust(crypto.DIGEST_SIZE, b"\x00")
+    byte, off = divmod(depth, 8)
+    mask = 1 << (7 - off)
+    val = (padded[byte] | mask) if bit else (padded[byte] & ~mask & 0xFF)
+    return padded[:byte] + bytes([val]) + padded[byte + 1 :]
+
+
 def bounds(path: bytes, depth: int) -> tuple[bytes, bytes]:
     """The range of paths under `path`'s first `depth` bits — the lowest and highest possible.
 
@@ -197,7 +209,7 @@ class Tree:
             )
         ]
 
-    def _sub(self, path: bytes, depth: int) -> crypto.Digest:
+    def hash_under(self, path: bytes, depth: int) -> crypto.Digest:
         """The hash of the subtree under `path`'s first `depth` bits.
 
         Recursive and memoised, but the memo is only ever a cache: this function's value is fixed by
@@ -218,7 +230,9 @@ class Tree:
         left, right = bounds(path, depth + 1)[0], bounds(_flip(path, depth), depth + 1)[0]
         if bit(path, depth) == 1:
             left, right = right, left
-        node = branch_hash(depth, lo, self._sub(left, depth + 1), self._sub(right, depth + 1))
+        node = branch_hash(
+            depth, lo, self.hash_under(left, depth + 1), self.hash_under(right, depth + 1)
+        )
         self.db.execute(
             "INSERT OR REPLACE INTO smt_memo (depth, prefix, hash) VALUES (?,?,?)",
             (depth, lo, node),
@@ -226,7 +240,7 @@ class Tree:
         return node
 
     def root(self) -> crypto.Digest:
-        return self._sub(bytes(crypto.DIGEST_SIZE), 0)
+        return self.hash_under(bytes(crypto.DIGEST_SIZE), 0)
 
     def invalidate(self, path: bytes) -> None:
         """Drop every memo on this key's path. Called for each mutation, inside its transaction.
@@ -249,7 +263,7 @@ class Tree:
             found = self._leaves(path, depth)
             if len(found) <= 1:
                 return Proof(tuple(siblings), found[0] if found else None)
-            siblings.append(self._sub(_flip(path, depth), depth + 1))
+            siblings.append(self.hash_under(_flip(path, depth), depth + 1))
             depth += 1
         return Proof(tuple(siblings), None)
 
