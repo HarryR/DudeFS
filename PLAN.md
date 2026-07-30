@@ -400,6 +400,7 @@ new cryptography: the signatures already existed and already arrived on the wire
 | a collection inside a transferred run | applied with **no ratification check at all** — one peer could make a catching-up node forget a segment, i.e. bulk transfer was a data-loss primitive. `Store.collect` was the only place that ever verified a marker |
 | the marker a replay applies | **fabricated locally**, with no signers and no sigs, and written to `checkpoint` meta as the node's floor. It then advertised that fabrication as `ratified`, so an unverifiable floor SPREAD |
 | what a transfer is checked against | the **sender's own attestation** — self-consistency, not authenticity. A roster member could serve any history it liked provided it signed a statement matching it |
+| a quorum's signatures on a checkpoint | **verified but never COUNTED** — `attested()` checked that the claimed signers really signed and returned success, so "ratified" meant *"at least one roster member signed"*. `quorum.satisfied` was consulted only where a marker is PRODUCED, which is the half a Byzantine node does not run. One member could mint a floor and order a segment collected |
 | a peer's ratified checkpoint | **never adopted**, though it rides on every attestation. `checkpoint` meta was written only by a collection the node performed itself, so a node that never collected had floor 0 for ever and no anchor for anything. And `attested_floor` read `claim.floor` **without verifying one signature**, while its own docstring gave "the floor carries the quorum's signatures" as the reason it may take a MAX |
 
 Now: `replay` verifies a marker against the roster **as of that point in the replay** (read at the
@@ -438,7 +439,7 @@ ruff format dude -q && ruff check dude && ty check dude/ \
 
 Or `make check`, which is the same thing with `ruff format --check` so it writes nothing.
 
-**250 tests: 249 green, 1 red on purpose.** Lint, format and typecheck are clean. The red is
+**253 tests: 252 green, 1 red on purpose.** Lint, format and typecheck are clean. The red is
 `test_a_pull_for_a_collected_range_is_not_answered_with_a_hole`: an honest `PULL` for a collected range
 is still answered with a run starting past what was asked for (`8 != 2`), because the server has no way
 to say *"that range is gone"*. It asserts what the open step owes and fails until that lands. **If you

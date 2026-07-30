@@ -507,6 +507,29 @@ class TestClusterCollection(unittest.TestCase):
         joiner.witness(attest.SignedAttestation.make(liar, told))
         self.assertEqual(joiner.floor(), 0, "a forged floor rode in on a valid signature")
 
+    def test_a_floor_one_node_signed_is_not_adopted(self):
+        """A signature that verifies is not a quorum that agreed.
+
+        Adoption is where the missing count would have hurt most: a joiner's floor is the anchor it
+        checks every later transfer against, so one member minting a height would have been believed
+        about everything downstream of it."""
+        joiner = Store()
+        joiner.apply(self.c._genesis(), auth=None)
+        roster = list(joiner.roster())
+        claim = ops.Compaction(0, 500, crypto.ACC_IDENTITY)
+        lone = next(k for k in self.c.keys if k.public == roster[0])
+        shares = {0: crypto.Ed25519ListMultiSig.sign_share(lone._seed, claim.attest_bytes())}
+        bitmap, sigs = crypto.Ed25519ListMultiSig.combine(shares, len(roster))
+        minted = ops.Compaction(
+            0, claim.height, claim.acc_state, claim.acc_log, claim.root, bitmap, tuple(sigs)
+        )
+
+        why = joiner.adopt(minted)
+
+        assert why is not None, "one node's signature was taken for a quorum"
+        self.assertIn("quorum is", why)
+        self.assertEqual(joiner.floor(), 0, "one node minted a floor")
+
     def test_a_self_consistent_lie_is_refused_by_the_quorums_checkpoint(self):
         """THE test for anchoring on the quorum rather than on the sender.
 

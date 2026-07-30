@@ -643,6 +643,24 @@ class TestCollectionIsRatified(unittest.TestCase):
             self.s.collect(0, forged)
         self.assertIn("does not match", str(cm.exception))
 
+    def test_a_lone_signature_is_not_a_quorum(self):
+        """`attested` verified that the claimed signers really signed and never counted them, so
+        "ratified" meant "one roster member signed" -- and `quorum.satisfied` was consulted only
+        where a marker is PRODUCED, which is the half a Byzantine node does not run. One node could
+        mint a floor and order a segment collected. The mitigation existed and mitigated nothing."""
+        self._relocate()
+        with self.assertRaises(store.StoreError) as cm:
+            self.s.collect(0, self._ratified(0, signers=self.nodes[:1]))
+        self.assertIn("quorum is", str(cm.exception))
+        self.assertIn(0, self.s.segments(), "a segment was forgotten on one node's word")
+
+    def test_exactly_a_quorum_is_enough(self):
+        """The boundary from the other side, so the check cannot be tightened into refusing honest
+        collections: two of three IS the rule (`quorum.DEFAULT`), and unanimity is not required."""
+        self._relocate()
+        self.s.collect(0, self._ratified(0, signers=self.nodes[:2]))
+        self.assertNotIn(0, self.s.segments())
+
     def test_an_attestation_naming_another_segment_is_refused(self):
         self._relocate()
         with self.assertRaises(store.StoreError) as cm:

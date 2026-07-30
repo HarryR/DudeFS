@@ -32,6 +32,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .. import quorum
 from ..core import codec, crypto
 from ..core.errors import DudeError
 from . import smt
@@ -533,11 +534,29 @@ class Compaction:
         )
 
     def attested(self, roster: list[crypto.PublicKey]) -> str | None:
-        """`None` if the ratification holds, else why not — in words a log line can carry."""
+        """`None` if the ratification holds, else why not — in words a log line can carry.
+
+        IT COUNTS THE SIGNATURES, and it did not `[H]`. It verified that the claimed signers really
+        signed and that the bitmap was the right width, and then returned success — so "ratified"
+        meant *"at least one roster member signed"*. `quorum.satisfied` was consulted only where a
+        marker is PRODUCED (`Node._try_collect`), which is the half that a Byzantine node does not
+        run. One member could therefore mint a floor, and order a segment collected, and every
+        consumer downstream — `Store.collect`, `Store.adopt`, `replay`'s anchor — inherited it. The
+        mitigation existed, was tested, and mitigated nothing.
+
+        The threshold is DERIVED from the roster rather than passed in, so no caller can forget it
+        and no two callers can disagree about it: it is the same `quorum.DEFAULT` rule the producing
+        side counts with, which is the property that makes the two ends comparable at all."""
         if not self.sigs:
             return "no signature"
         if len(self.signers) != crypto.bitmap_size(len(roster)):
             return "signer bitmap does not match the roster"
+        # Distinct by construction: a bitmap names each member at most once, so "three signatures
+        # from one member" is not expressible rather than merely rejected.
+        signed = crypto.bitmap_indices(self.signers, len(roster))
+        if not quorum.satisfied(len(roster), len(signed)):
+            need = quorum.size(len(roster))
+            return f"{len(signed)} of {len(roster)} signed; a quorum is {need}"
         if not crypto.Ed25519ListMultiSig.verify(
             self.signers, list(self.sigs), self.attest_bytes(), roster
         ):

@@ -8,7 +8,7 @@ ruff format dude -q && ruff check dude && ty check dude/ \
   && python3 -m unittest discover -s dude/tests -t . -q
 ```
 
-**250 tests: 249 green, 1 RED ON PURPOSE.** Lint, format and typecheck are clean. The red is
+**253 tests: 252 green, 1 RED ON PURPOSE.** Lint, format and typecheck are clean. The red is
 `test_a_pull_for_a_collected_range_is_not_answered_with_a_hole` — it asserts what §2 owes and fails
 until that lands. **The tree is not broken and it is not flaky** (six consecutive runs). Do not delete
 it to get a green gate; everything else must stay green.
@@ -18,11 +18,16 @@ decide that and sync from scratch (§2). `UNIMPLEMENTED` is down to `ANNOUNCE` /
 dissemination — a transaction currently spreads by re-flooding the whole `SUBMIT`, which works and
 does not scale).
 
-**The rule this codebase keeps proving**, and worth carrying into any review: **it builds a signature
-correctly and then never consults it at the point where something is decided.** Four instances of that
-were open in node-to-node sync and are now closed (PLAN.md, "The anchor wave"); each survived unit
-tests because both halves were right in isolation. Expect more of the same shape, and grep for the
-verification call rather than for the signing code.
+**The rule this codebase keeps proving** `[H]`: *"we decided on a mitigation, tested that mitigation
+— without mitigating anything."* It builds a check correctly, tests the check in isolation, and then
+never consults it where the decision is made. **Five** instances were open in node-to-node sync and are
+now closed (PLAN.md, "The anchor wave"); the fifth was `attested()` verifying signatures without ever
+COUNTING them, so "ratified" meant *"one roster member signed"* — every consumer of a floor inherited
+it, and a unit test of the multisig could never have shown it.
+
+**So review by grepping for the verification CALL, never for the signing code**, and ask of each
+mitigation: which line refuses, and what breaks if I delete it? A test that exercises the primitive
+proves nothing about whether anything asks.
 
 ---
 
@@ -67,41 +72,6 @@ Two smaller things this wave leaves behind:
 - **A far-behind node's floor can exceed its head**, deliberately. That is the bootstrap trigger and
   it must stay expressible; do not "fix" it. Note `(floor, head]` completeness is vacuous while it
   holds, which is correct — such a node owes no entries, it owes a bootstrap.
-
-### 3. The credential in every leaf — RULED, not yet built
-
-`[H]` Harry: *"why not just put it in all leaves? It's an authenticated data store."*
-
-Today `live.cred` holds the authorising transaction for **management rows only**, and the SMT leaf is
-`H(path ‖ H(value))` — so the root commits to values but not to who authorised them. The ruling is to
-carry it for every row and hash it into the leaf, so a proof answers *"this key holds this value, and
-here is the signature that put it there"* in one step.
-
-Four things shape the work, none of them obvious from the code:
-
-- **A `Move` must carry byte-for-byte the credential the row already holds.** `_commit` currently
-  writes `m.credential` unconditionally. Once the credential is in the leaf, a Move swapping one
-  valid credential for another — both vouching for the same value, e.g. the manager writing the same
-  value twice — would **change the root**, and relocation would stop being state-invariant. That
-  breaks the whole migration story. Guard it and invariance becomes provable rather than incidental.
-- **`_relocates`' data-store shortcut stops being safe.** [settle.py:157-158](dude/store/settle.py#L157-L158)
-  returns `True` for any non-management Move without looking at the credential — correct today,
-  because a data row's `cred` is `b""` and nothing commits to it. Once the leaf hashes the credential,
-  an unvouched Move can write an arbitrary one into a data row and the root will commit to it. Either
-  `_vouches` runs for every store, or the byte-identity guard above becomes the universal rule and
-  vouching is what it degrades to when the row holds no credential yet.
-- **Relocation-invariance becomes a claim about the ROOT, and nothing asserts that.** `_collect`
-  checks only that `A_state` did not move ([store.py:670](dude/store/store.py#L670)) — and it never
-  will, since `element()` is over `(store, name, value)` and the credential is not in it. That is
-  where the root check belongs.
-- **Storage wants dedup, later.** A credential is a whole signed transaction, so a transaction
-  writing 100 keys stores 100 copies. The natural fix is a credential table keyed by `op_hash` with
-  live rows referencing it — the same refcount shape as epochs, possibly sharing machinery. Inline is
-  fine for now; at 10⁷ keys it is the difference between ~300 MB and several GB. Note it, defer it.
-
-Expect every root in the test suite to change. `[H]` **that churn is fine, and tests should assert
-structure rather than pinned roots** until the design is in a much more solid position — a golden root
-is a test of arithmetic nobody is doubting, and it re-costs an hour every time the leaf changes.
 
 ### 2. State sync — the node that CANNOT catch up
 
@@ -164,6 +134,41 @@ sender's attested head, and a checkpoint carries exactly `store.Commitment`.
   without holding the segment being collected, so its `acc_log` arithmetic diverges from the
   server's (`_collect` tolerates a missing segment and subtracts nothing). Either adoption starts
   strictly after the marker, or the marker commits to the segment accumulator it removes.
+
+### 3. The credential in every leaf — RULED, not yet built
+
+`[H]` Harry: *"why not just put it in all leaves? It's an authenticated data store."*
+
+Today `live.cred` holds the authorising transaction for **management rows only**, and the SMT leaf is
+`H(path ‖ H(value))` — so the root commits to values but not to who authorised them. The ruling is to
+carry it for every row and hash it into the leaf, so a proof answers *"this key holds this value, and
+here is the signature that put it there"* in one step.
+
+Four things shape the work, none of them obvious from the code:
+
+- **A `Move` must carry byte-for-byte the credential the row already holds.** `_commit` currently
+  writes `m.credential` unconditionally. Once the credential is in the leaf, a Move swapping one
+  valid credential for another — both vouching for the same value, e.g. the manager writing the same
+  value twice — would **change the root**, and relocation would stop being state-invariant. That
+  breaks the whole migration story. Guard it and invariance becomes provable rather than incidental.
+- **`_relocates`' data-store shortcut stops being safe.** [settle.py:157-158](dude/store/settle.py#L157-L158)
+  returns `True` for any non-management Move without looking at the credential — correct today,
+  because a data row's `cred` is `b""` and nothing commits to it. Once the leaf hashes the credential,
+  an unvouched Move can write an arbitrary one into a data row and the root will commit to it. Either
+  `_vouches` runs for every store, or the byte-identity guard above becomes the universal rule and
+  vouching is what it degrades to when the row holds no credential yet.
+- **Relocation-invariance becomes a claim about the ROOT, and nothing asserts that.** `_collect`
+  checks only that `A_state` did not move ([store.py:670](dude/store/store.py#L670)) — and it never
+  will, since `element()` is over `(store, name, value)` and the credential is not in it. That is
+  where the root check belongs.
+- **Storage wants dedup, later.** A credential is a whole signed transaction, so a transaction
+  writing 100 keys stores 100 copies. The natural fix is a credential table keyed by `op_hash` with
+  live rows referencing it — the same refcount shape as epochs, possibly sharing machinery. Inline is
+  fine for now; at 10⁷ keys it is the difference between ~300 MB and several GB. Note it, defer it.
+
+Expect every root in the test suite to change. `[H]` **that churn is fine, and tests should assert
+structure rather than pinned roots** until the design is in a much more solid position — a golden root
+is a test of arithmetic nobody is doubting, and it re-costs an hour every time the leaf changes.
 
 ### 4. Residual softness in what just landed
 
