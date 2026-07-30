@@ -611,7 +611,9 @@ class Store:
         ).fetchone()
         return row[0] if row else b""
 
-    def migration(self, seg: int, author: crypto.Keypair, now: int) -> ops.SignedTransaction | None:
+    def migration(
+        self, seg: int, author: crypto.Keypair, now: int, at_most: int
+    ) -> ops.SignedTransaction | None:
         """AUTHOR the transaction that moves this segment's stragglers forward. Settles nothing.
 
         Two things this deliberately does NOT do, both of which it used to.
@@ -622,13 +624,19 @@ class Store:
         store and displaced the manager's signature over the roster. `ops.Move` asserts nothing and
         so needs nothing (#conveyor).
 
+        CLAMPED, and the clamp is required rather than defaulted. A segment may hold up to
+        `SEGMENT_WIDTH` live rows, and a management row carries a signed transaction as its
+        credential, so relocating every straggler at once builds a transaction no frame can carry.
+        Taking `at_most` per call makes draining a segment converge over rounds rather than fail in
+        one.
+
         It does not APPLY. Migration entries are log entries like any other and must be agreed by
         the quorum, or every node authors its own and three honest nodes end up holding
         byte-different logs at identical indices — `A_state` agreeing throughout, which is exactly
         why it went unnoticed."""
         moves = [
             ops.Move(st, name, self.credential(st, name))
-            for st, name in self.stragglers(seg)
+            for st, name in self.stragglers(seg)[:at_most]
             if self.get(st, name) is not None  # raced with a writer; it has already moved on
         ]
         if not moves:

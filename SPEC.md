@@ -577,12 +577,14 @@ obliges**, which is the defect this table exists to make visible rather than pla
 | a value carries its epoch in cleartext | `ops.Set.epoch`, `live.epoch` |
 | an epoch is not retired while a value references it | `ops.Drained` via `layer.holds` |
 | retirement is an ordinary guarded transaction | `Management.retire` (built) |
-| **retirement is driven when an epoch drains** | **OWED** — `Management.retire` has no caller |
+| retirement is a manager operation, not a duty of the round | `Management.retire`, authored by a manager |
 | **the backlog is readable, oldest first** | **OWED** — `Store.epochs` has no reader and no verb |
 | **live values are re-encrypted forward** | **OWED to the worker/client layer** — a node holds no data keys |
-| **stragglers are migrated so a segment can be collected** | **OWED** — `Node.drain` has no caller |
-| **a collectable segment is proposed for collection** | **OWED** — `Node.maybe_collect` has no caller |
+| stragglers are migrated so a segment can be collected | `Node.housekeep` → `Node.drain` |
+| a collectable segment is proposed for collection | `Node.housekeep` → `Node.maybe_collect` |
 | the dedup floor applies on every collection path | `Store.collect` — **but defaults to off** |
+| effort scales with backlog, with a clamp | `CompactionTunables`, `Store.migration(at_most=)` |
+| the current segment is never drained into itself | `Node.housekeep` |
 | a hole is explained by the frontier, with no growing set | `Store.horizon`, `Store.retained_from` |
 | collection proceeds oldest segment first | `Node.maybe_collect` |
 | a server never answers a PULL with a hole | `Node._on_pull` |
@@ -624,8 +626,17 @@ function of live state and survives collection. No history, no policy.
 - Live values MUST therefore be **re-encrypted forward**, which is what drains the last references.
   This is a duty of the layer that holds data keys — a worker or a client — because a node holds
   none.
-- That layer MUST scale its effort to the backlog, clamped so housekeeping cannot crowd out work, and
-  MUST use a heartbeat for the idle case rather than a second conveying path.
+- Any layer doing this work MUST scale its effort to the backlog, clamped so housekeeping cannot
+  crowd out work, and MUST use a heartbeat for the idle case rather than a second conveying path.
+- The **threshold** and the **clamp** MUST both exist as tunables. `[H]` The rate at which compaction
+  converges is not yet decided, and a threshold of zero — "whenever there is any work" — is the floor
+  of the same dial rather than a separate always-on mode.
+- A node MUST NOT relocate rows out of the segment that contains the head: migration writes at the
+  head, so that returns them to the segment they were in.
+- Retirement MUST NOT be a duty of the round. `[H]` Wrap rows are not deleted as housekeeping; the
+  management store is low churn, so deleting a client's wraps belongs with the manager operation that
+  rotates that client. No node or worker therefore needs management-store authority to keep the belt
+  moving.
 - The backlog MUST be readable, oldest epoch first, so the conveying layer can ask what to work on.
 - Key rotation MUST NOT be treated as forward secrecy on its own: rotating faster without conveying
   faster buys nothing.

@@ -506,7 +506,7 @@ class TestSegments(unittest.TestCase):
         before = self.s.accumulator()
         # Authored, then SETTLED — never applied behind settlement's back, which is what let
         # migration write into the management store with authority checking off.
-        txn = self.s.migration(0, self.kp, now=2)
+        txn = self.s.migration(0, self.kp, now=2, at_most=1_000)
         assert txn is not None
         got = self.s.apply((txn,))
         self.assertEqual(got.dropped, (), "the relocation was refused")
@@ -566,7 +566,7 @@ class TestCollectionIsRatified(unittest.TestCase):
         """Author segment 0's relocation and SETTLE it, so the segment can be collected. Settled
         rather than applied directly: that is the whole correction — a migration is a log entry the
         quorum agrees, not something a node writes to itself with authority checking off."""
-        txn = self.s.migration(0, self.mgr, now=2)
+        txn = self.s.migration(0, self.mgr, now=2, at_most=1_000)
         assert txn is not None, "nothing to relocate"
         got = self.s.apply((txn,), auth=self.mgmt)
         assert got.dropped == (), f"the relocation was refused: {got.dropped}"

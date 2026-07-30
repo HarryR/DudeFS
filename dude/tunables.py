@@ -139,6 +139,26 @@ class NetTunables:
 
 
 @dataclass(frozen=True, slots=True)
+class CompactionTunables:
+    """How hard a node works at housekeeping, and how much of it it does at once.
+
+    `[H]` *"effort scales with backlog"* is a deliberate carve-out: the shape is necessary, the
+    value is not yet known. Compaction converges towards a defragmented log over time; at what rate
+    is open, so these exist to give the answer somewhere to live rather than to assert it."""
+
+    migrate_when: int = 0
+    """Stragglers at the frontier before migration is worth a round. A THRESHOLD, and zero means
+    "whenever there are any" `[H]` — always-on is the threshold at its floor rather than a separate
+    mode, which is why this is a number and not a flag."""
+
+    migrate_at_most: int = 64
+    """Stragglers relocated per round. THE CLAMP, and it is not optional: a segment may hold up to
+    `SEGMENT_WIDTH` live rows, and a management row carries a whole signed transaction as its
+    credential, so an unclamped migration is a frame nothing will carry. Housekeeping must not crowd
+    out work, so it takes many small bites instead of one impossible one."""
+
+
+@dataclass(frozen=True, slots=True)
 class Tunables:
     """The one surface. Pass this down; do not reach for a group's defaults directly."""
 
@@ -147,6 +167,7 @@ class Tunables:
     link: LinkTunables = field(default_factory=LinkTunables)
     plan: PlanTunables = field(default_factory=PlanTunables)
     mempool: MempoolTunables = field(default_factory=MempoolTunables)
+    compaction: CompactionTunables = field(default_factory=CompactionTunables)
     attest: AttestTunables = field(default_factory=AttestTunables)
 
     def __post_init__(self) -> None:

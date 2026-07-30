@@ -110,6 +110,8 @@ class Node:
     collected: set[int] = field(default_factory=set)
     last_probe: Millis = 0
     """When this node last asked its peers where they were (#cross-attestation)."""
+    last_housekept: int = -1
+    """The last bucket in which this node did compaction housekeeping. See `housekeep`."""
     shares: dict[bytes, dict[crypto.PublicKey, crypto.Signature]] = field(default_factory=dict)
     """Shares keyed by CLAIM BYTES, not by segment: two nodes disagreeing about the fold produce
     two different claims, and neither may borrow the other's signatures."""
@@ -225,7 +227,7 @@ class Node:
         SUBMITTED, not applied. A migration is a log entry like any other and has to be agreed by
         the quorum — a node applying its own would diverge the log from its peers' while leaving
         `A_state` and the head identical, which is precisely how that went unnoticed before."""
-        txn = self.store.migration(seg, self.me, now)
+        txn = self.store.migration(seg, self.me, now, self.tunables.compaction.migrate_at_most)
         if txn is None:
             return False
         if self.mempool.admit(txn, now, self.store, self.mgmt) is not None:
@@ -245,6 +247,43 @@ class Node:
         other is not a floor."""
         t = self.tunables.mempool
         return t.w_admit + t.w_valid_margin
+
+    def housekeep(self, now: Millis) -> None:
+        """Migrate the frontier's stragglers, then offer a collection. ONCE PER BUCKET.
+
+        THE DUTIES THIS PERFORMS HAD NO DRIVER. `drain` and `maybe_collect` were both correct,
+        tested, and called by nothing, so no node ever migrated or collected: the log grew without
+        bound while `#compaction-is-required` says compaction is not an optimisation.
+
+        THE FRONTIER, and only the frontier. Collection is oldest-first, so the one segment worth
+        draining is the lowest retained — draining any other reclaims nothing, because a blocked
+        segment below it stops collection anyway.
+
+        ONCE PER BUCKET, and for `drain` that is a correctness matter rather than politeness:
+        `migration` signs with `now`, so authoring the same relocation twice yields two different
+        op_hashes, both valid — a `Move` asserts nothing, so the second still applies — and both
+        consume log entries. A collection claim is byte-identical every time and does not have that
+        problem, but shares the gate for quietness.
+
+        PRESSURE IS A THRESHOLD, NOT A MODE `[H]`: `migrate_when` at zero means "whenever there are
+        stragglers", so always-on is the floor of the same dial rather than a second code path. The
+        clamp is separate and lives with the work, in `Store.migration`.
+
+        IT REFUSES TO DRAIN THE CURRENT SEGMENT, which the first version of this did. Migration
+        writes at the head, so relocating a straggler out of the segment that contains the head puts
+        it back in the same segment — pointless traffic every bucket, for the whole life of a young
+        cluster. `Store.collect` refuses a current segment for the same reason."""
+        bucket = self.tunables.mempool.bucket(now)
+        if bucket <= self.last_housekept:
+            return
+        self.last_housekept = bucket
+        seg = self.store.horizon()
+        if seg >= self.store.segment_of(self.store.head() + 1):
+            return  # the frontier is the CURRENT segment: draining it into itself is a no-op
+        pressure = len(self.store.stragglers(seg))
+        if pressure and pressure >= self.tunables.compaction.migrate_when:
+            self.drain(seg, now)
+        self.maybe_collect(now)
 
     def _commitment(
         self, seg: int
@@ -556,6 +595,7 @@ class Node:
             self.probe(now)
         self.catch_up(now)
         self.mempool.evict(now)
+        self.housekeep(now)
         self.postman.tick(now)
         self._propose(now)
 

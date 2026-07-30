@@ -147,25 +147,17 @@ same way — no caller — but an unperformed duty leaves no trace at all, becau
 nothing errors. The system simply never does the thing."""
 
 UNDRIVEN = {
-    "maybe_collect": (
-        "Nothing proposes a collection, so no segment is ever collected in production and the log "
-        "grows without bound. #compaction-is-required says compaction is not an optimisation. Owed "
-        "by `Node.tick`."
-    ),
-    "drain": (
-        "Nothing migrates stragglers, so segment 0 keeps its genesis grants and roster rows and "
-        "and can never be collected — the case #migration-is-state-invariant exists for. Owed by "
-        "`Node.tick`."
-    ),
     "mgmt.retire": (
-        "Nothing retires a drained epoch, so no key ever dies and #secrecy-by-key-death is "
-        "unreachable even when an epoch does reach zero live values. Owed by `Node.tick`."
+        "NOT a duty of the round `[H]`: wrap rows are not deleted as housekeeping. Retirement is a "
+        "MANAGER operation, and a manager already may write the management store — deleting a "
+        "client's wraps rides along with rotating that client. Listed because it still has no "
+        "caller anywhere, not because the round owes it."
     ),
     "store.epochs": (
-        "The conveyor's work queue, oldest epoch first, with no reader and no verb — the layer "
-        "would convey cannot ask what to convey. Owed by a transfer verb plus the worker/client "
-        "layer that holds data keys. A node holds none, so re-encryption is correctly absent from "
-        "this tree and is recorded OWED in SPEC's enforcement table rather than here."
+        "The conveyor's work queue, oldest epoch first, with no reader and no verb, so the layer "
+        "that would convey cannot ask what to convey. Owed by a verb plus the worker/client layer "
+        "that holds data keys. A node holds none, so re-encryption is correctly absent from this "
+        "tree and is recorded OWED in SPEC's enforcement table rather than here."
     ),
 }
 """Duties with no driver YET, each naming what owes it.

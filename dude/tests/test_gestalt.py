@@ -207,6 +207,85 @@ class TestGestalt(unittest.TestCase):
         )
 
 
+class TestCompactionRunsByItself(unittest.TestCase):
+    """The round performs the duties, with no test reaching in to drive them.
+
+    `Node.drain` and `Node.maybe_collect` were correct, tested and called by NOTHING, so no node
+    ever migrated or collected: the log grew for ever while #compaction-is-required says compaction
+    is not an optimisation. Every other collection test here drives the sequence by hand, which is
+    how that went unnoticed so long — so this one is forbidden from touching either."""
+
+    WIDTH = 8
+    AGE = DEFAULT.mempool.w_admit + DEFAULT.mempool.w_valid_margin + DELTA
+
+    def setUp(self):
+        self.c = Cluster()
+        self.client = self.c.mgr
+        for node in self.c.nodes:
+            node.store.SEGMENT_WIDTH = self.WIDTH
+
+    def test_a_cluster_left_alone_migrates_and_collects(self):
+        """One key rewritten repeatedly, then time passes. Nothing else."""
+        now = T0
+        for i in range(12):
+            tx = ops.writes(ops.Set(D, crypto.h(b"hot"), f"v{i}".encode())).sign(self.client, now)
+            self.c.submit(self.client, tx, to=i % len(self.c.nodes), now=now)
+            self.c.pump(now)
+            now += DELTA
+            self.c.pump(now)
+        node = self.c.nodes[0]
+        self.assertEqual(
+            node.store.stragglers(0), (), "housekeeping never migrated the genesis roster rows"
+        )
+        self.assertIn(0, node.store.segments(), "collected before the dedup floor allowed it")
+
+        # Past the dedup floor, still doing nothing but advancing the clock.
+        for _ in range(4):
+            now += self.AGE
+            self.c.pump(now)
+
+        for i, n in enumerate(self.c.nodes):
+            self.assertGreaterEqual(n.store.horizon(), 1, f"node {i} never collected anything")
+            self.assertNotIn(0, n.store.segments(), f"node {i} still holds segment 0")
+        self.assertEqual(
+            len({n.store.horizon() for n in self.c.nodes}), 1, "the frontiers diverged"
+        )
+        self.assertEqual(
+            len({n.store.log_accumulator() for n in self.c.nodes}), 1, "the LOGS diverged"
+        )
+        self.assertEqual(len({n.store.accumulator() for n in self.c.nodes}), 1, "state moved")
+
+    def test_the_current_segment_is_never_drained_into_itself(self):
+        """Migration writes at the head, so relocating out of the segment that holds the head puts
+        the row back where it was. The first version of `housekeep` did exactly that, every bucket,
+        for the whole life of a young cluster."""
+        node = self.c.nodes[0]
+        self.assertEqual(node.store.horizon(), 0)
+        self.assertEqual(
+            node.store.segment_of(node.store.head() + 1), 0, "segment 0 is not current"
+        )
+        before = node.store.head()
+
+        for r in range(3):
+            self.c.pump(T0 + r * DELTA)
+
+        self.assertEqual(node.store.head(), before, "it relocated rows inside the current segment")
+
+    def test_housekeeping_happens_once_per_bucket(self):
+        """`migration` signs with `now`, so authoring the same relocation twice yields two different
+        op_hashes, both valid — a `Move` asserts nothing, so the second still applies — and both
+        consume log entries. The gate is a correctness matter, not politeness."""
+        node = self.c.nodes[0]
+        node.last_housekept = -1
+        bucket = node.tunables.mempool.bucket(T0)
+
+        node.housekeep(T0)
+        self.assertEqual(node.last_housekept, bucket)
+        node.housekeep(T0 + 1)  # same bucket
+
+        self.assertEqual(node.last_housekept, bucket, "it housekept twice in one bucket")
+
+
 class TestEndorsementHasABound(unittest.TestCase):
     """`Mempool.endorsable` is the `w_valid` bound, and it had NO CALLER — so the rule whose stated
     purpose is "to stop an unguarded write being replayable indefinitely" was enforced nowhere, and
@@ -306,6 +385,12 @@ class TestClusterCollection(unittest.TestCase):
             # of stragglers migrated in one go, or migration -- which writes at the HEAD -- lands
             # part of its own output back inside the segment it is draining.
             node.store.SEGMENT_WIDTH = self.WIDTH
+            # THESE TESTS DRIVE HOUSEKEEPING THEMSELVES, one step at a time, because most of them
+            # are about what a collection REFUSES. `Node.tick` now migrates and collects on its own
+            # (`housekeep`), which would race every sequence below. Suppressed by moving the
+            # once-per-bucket marker past any bucket the test reaches -- a real field, not a
+            # production off-switch, so nothing here can pass because the driver was disabled.
+            node.last_housekept = 1 << 62
 
     def _churn(self, n: int) -> int:
         """Overwrite one key repeatedly, so early entries are entirely superseded. Returns `now`.
