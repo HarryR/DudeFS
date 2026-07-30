@@ -66,6 +66,8 @@ WIRED = {
     "smt.verify": "a state row that does not fold to the root the quorum signed",
     "_folds_to": "a subtree hash the signed root does not commit to",
     "corroborated": "acting on a checkpoint fewer than f+1 fresh responders vouch for",
+    "adopted_at": "calling a walk finished when it does not hold what was committed",
+    "corroboration": "open-coding f+1 outside the module that owns quorum arithmetic",
 }
 """Checks that must have a live consumer in production code.
 

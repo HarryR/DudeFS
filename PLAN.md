@@ -456,7 +456,7 @@ ruff format dude -q && ruff check dude && ty check dude/ \
 
 Or `make check`, which is the same thing with `ruff format --check` so it writes nothing.
 
-**317 tests, all green.** Lint, format and typecheck clean, six consecutive runs. The long-standing
+**322 tests, all green.** Lint, format and typecheck clean, six consecutive runs. The long-standing
 red marker is closed: a server below its frontier now answers nothing rather than a gapped run, and a
 node behind the frontier stops asking. What remains OWED is the bootstrap it should then perform.
 

@@ -131,6 +131,21 @@ def size(n: int, rule: Rule = DEFAULT) -> int:
     return q
 
 
+def corroboration(n: int, rule: Rule = DEFAULT) -> int:
+    """How many INDEPENDENT FRESH statements a floor needs before it may be relied on: `f + 1`.
+
+    A DIFFERENT QUESTION FROM `size`, and the reason this lives here rather than at the call site
+    (#quorum-gate: one module decides, and nothing else depends on how it decides). A quorum is how
+    many must AGREE for something to be consensus; this is how many must ANSWER before at least one
+    of them is honest. At n=3 two-thirds tolerates no faults, so a single honest fresh answer is
+    already `f+1`, while a quorum is two — demanding the quorum there would refuse a cluster that is
+    answering correctly.
+
+    `f` is what the rule tolerates at this `n`, so a deployment that changes the rule moves this too
+    without anything else being edited."""
+    return rule.tolerates(n) + 1
+
+
 def satisfied(n: int, agreeing: int, rule: Rule = DEFAULT) -> bool:
     """Whether `agreeing` of `n` is consensus. The whole interface the layers above use."""
     return agreeing >= size(n, rule)

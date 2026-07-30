@@ -670,6 +670,8 @@ class Node:
             else:
                 walk[(child, depth + 1)] = remote
                 self._ask(env.frm, Verb.SUBTREE, child, depth + 1, now)
+        if (ck := self.store.checkpoint()) is not None:
+            self._walk_done(ck)
 
     def _on_rows(self, env: SignedEnvelope, _now: Millis) -> None:
         """Rows with proofs. Verified against the ratified root, or dropped.
@@ -680,7 +682,7 @@ class Node:
         ck = self.store.checkpoint()
         if self.walking is None or ck is None:
             return
-        rows = []
+        rows: list[tuple[int, bytes, bytes, smt.Proof]] = []
         for row in codec.as_seq(codec.decode(env.env.body)):
             r = codec.as_seq(row, 4)
             rows.append(
@@ -692,6 +694,25 @@ class Node:
                 )
             )
         self.store.adopt_state(rows, ck.root)
+        self._walk_done(ck)
+
+    def _walk_done(self, ck: ops.Compaction) -> None:
+        """Finish the walk if nothing is outstanding — but only if the state agrees with `ck`.
+
+        THE QUEUE EMPTYING IS NOT SUCCESS. A walk that lost replies, or was steered into asking for
+        nothing, empties its queue exactly like one that worked. The checkpoint's fold is O(1) and
+        already signed, so corroborating against it is what makes the difference observable.
+
+        A walk that does not corroborate STARTS AGAIN rather than failing: sync is a convergence
+        loop, and the honest response to "I do not hold what was committed" is to go and get the
+        rest."""
+        if self.walking is None or self.walking:
+            return
+        if self.store.adopted_at(ck) is None:
+            self.walking = None
+            return
+        top = bytes(crypto.DIGEST_SIZE)
+        self.walking = {(top, 0): ck.root}
 
     def _ask(
         self, peer: crypto.PublicKey, verb: Verb, prefix: bytes, depth: int, now: Millis
@@ -710,9 +731,16 @@ class Node:
         world, correctly signed throughout, and only the count of fresh independent statements
         distinguishes that from the truth (#freshness-needs-many, #the-lemma).
 
-        MAX, NOT MAJORITY, and that is not credulity: a floor carries the quorum's signatures, so a
-        responder can WITHHOLD a higher checkpoint and cannot forge one. The highest one that
-        verifies wins, and a lagging or lying responder cannot drag it down.
+        MAX BY HEIGHT, NOT BY SIGNATURE COUNT, and not by majority. A floor carries the quorum's
+        signatures, so a responder can WITHHOLD a higher checkpoint and cannot forge one: the
+        highest one that verifies wins and a lagging or lying responder cannot drag it down.
+
+        The count is a THRESHOLD rather than a score. `Compaction.op_hash` covers the claim and not
+        the signature set precisely because that set "is an artefact of which shares happened to
+        arrive first, and it differs between nodes that all collected the same segment for the same
+        reason" — so eleven signatures are not more true than eight, and preferring the
+        better-signed one would systematically prefer the OLDER one, since shares accumulate with
+        time. `attested` counts to the threshold; height decides which.
 
         `f+1` is also, as you put it, learning a subset of the roster: `f+1` identities of which at
         least one is honest. That is why it comes before adopting anything — including before the
@@ -721,11 +749,7 @@ class Node:
         n = len(self.roster())
         if not n:
             return None
-        # `f + 1`, and `f` is what the RULE tolerates at this `n` -- not the quorum size, which is a
-        # different question. At n=3 two-thirds tolerates 0, so one honest fresh answer IS f+1;
-        # at n=11 it tolerates 4 and five are needed. Reading `size()` here would demand a quorum
-        # for a question that is not a quorum's to answer (#freshness-needs-many).
-        floor = self.floor(quorum.DEFAULT.tolerates(n) + 1, now, include_self=False)
+        floor = self.floor(quorum.corroboration(n), now, include_self=False)
         if floor is None:
             return None  # too few fresh answers: denied, not deceived
         best = max(

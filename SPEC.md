@@ -444,8 +444,17 @@ it. Nothing in it may rest on the word of the cluster being joined.
    way to delete the question.
    A row MUST arrive with its own proof. Without one a reply cannot be checked in isolation, which is
    the property the whole walk rests on.
-   State adopted this way MUST NOT set the head or `A_log`: history is not what is being transferred.
-   Those come from the checkpoint and from replaying forward afterwards.
+   State adopted this way MUST NOT set the head or `A_log` as it arrives: history is not what is
+   being transferred.
+   A walk MUST NOT be treated as finished because nothing is outstanding. It MUST be **corroborated
+   against the checkpoint's fold and root** — a walk that lost replies, or was steered into asking
+   for nothing, empties its queue exactly like one that worked, and the fold is O(1) and already
+   signed. A walk that does not corroborate MUST start again rather than fail: sync is a convergence
+   loop.
+   Only once corroborated MAY a node adopt that checkpoint's height as its own, and it MUST then
+   adopt `A_log` from the same marker — a node that held none of the entries cannot compute it.
+   Adoption of a height MUST be monotone and durable, or a node holding no entries reports a head of
+   zero, believes itself behind the frontier for ever, and bootstraps again every round.
 
 - **`f+1` fresh corroboration MUST come first, before anything else is adopted or walked**
   (#freshness-needs-many). Every other step of this chain establishes AUTHENTICITY; none establishes
@@ -457,8 +466,14 @@ it. Nothing in it may rest on the word of the cluster being joined.
   is `f+1`.
 - A node MUST NOT count its own attestation toward that corroboration. Asking whether our view is
   current and answering with our own view decides nothing — and with one peer it would decide it.
-- The checkpoint taken MUST be the **maximum** across those responders, since a floor carries the
-  quorum's signatures: a responder can withhold a higher one and cannot forge one.
+- The checkpoint taken MUST be the **maximum by HEIGHT** across those responders, since a floor
+  carries the quorum's signatures: a responder can withhold a higher one and cannot forge one.
+- The signature count MUST be a threshold, never a score. A marker's identity covers the claim and
+  not the signature set, because that set is an artefact of which shares arrived first — so a
+  better-signed checkpoint is not a truer one, and preferring it would systematically prefer the
+  older one, since shares accumulate with time.
+- `f+1` MUST be computed by the quorum module and nowhere else (#quorum-gate). It is a different
+  question from the quorum size and must not be open-coded at the point of use.
 
 ## Trust
 
@@ -617,6 +632,9 @@ obliges**, which is the defect this table exists to make visible rather than pla
 | a row is served with its own proof | `Node._on_leaves` |
 | the verifier chooses the descent depth | `NetTunables.walk_depth`, `Node._on_hashes` |
 | a subtree hash is rebuilt from the answer, not believed | `node._folds_to` |
+| a finished walk is corroborated against the signed fold | `Store.adopted_at`, `Node._walk_done` |
+| an adopted height is monotone and durable | `Store.adopted_height` |
+| `f+1` is decided by the quorum module | `quorum.corroboration` |
 | a reply is correlated to the peer we asked | `Mailbox.arrived` |
 | **a bootstrap is driven when catching up is impossible** | **OWED** — `Node.bootstrap` has no caller |
 | the manager key is supplied out of band and retained | `Store.provision`, `Store.anchor` |

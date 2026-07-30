@@ -8,7 +8,7 @@ ruff format dude -q && ruff check dude && ty check dude/ \
   && python3 -m unittest discover -s dude/tests -t . -q
 ```
 
-**317 tests, all green** — lint, format and typecheck clean, six consecutive runs. The marker test
+**322 tests, all green** — lint, format and typecheck clean, six consecutive runs. The marker test
 that was red on purpose (`test_a_pull_for_a_collected_range_is_not_answered_with_a_hole`) now passes:
 a server no longer answers a `PULL` below its frontier with a gapped run.
 

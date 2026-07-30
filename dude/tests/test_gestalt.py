@@ -666,6 +666,114 @@ class TestFreshnessIsThePrecondition(unittest.TestCase):
         self.assertEqual(Store().seeds(), (), "an unprovisioned node invented an address")
 
 
+class TestAFinishedWalkIsCorroborated(unittest.TestCase):
+    """An empty queue is not success. A walk that lost replies — or was steered into asking for
+    nothing — empties exactly like one that worked, so the finish is checked against the fold the
+    quorum signed. That fold is O(1) and already in the checkpoint."""
+
+    WIDTH = 8
+    AGE = DEFAULT.mempool.w_admit + DEFAULT.mempool.w_valid_margin + DELTA
+
+    def setUp(self):
+        self.c = Cluster()
+        self.client = self.c.mgr
+        for node in self.c.nodes:
+            node.store.SEGMENT_WIDTH = self.WIDTH
+        now = T0
+        for i in range(12):
+            tx = ops.writes(ops.Set(D, crypto.h(f"k{i}".encode()), b"v")).sign(self.client, now)
+            self.c.submit(self.client, tx, to=i % 3, now=now)
+            self.c.pump(now)
+            now += DELTA
+            self.c.pump(now)
+        for _ in range(4):
+            now += self.AGE
+            self.c.pump(now)
+        self.now = now
+        self.source = self.c.nodes[0]
+        ck = self.source.store.checkpoint()
+        assert ck is not None, "nothing was collected, so there is no checkpoint to walk to"
+        self.ck = ck  # narrowed before it is stored, so every use below is a Compaction
+
+    def _bare(self) -> Store:
+        """Provisioned and EMPTY: the state a bootstrapping node is actually in. It holds the anchor
+        and nothing else, which is why its head is zero until a walk is corroborated."""
+        s = Store()
+        s.provision(self.c.mgr.public, seeds=[b"inproc:0"])
+        return s
+
+    def _walked(self) -> Store:
+        joiner = self._bare()
+        rows = [
+            (store, name, value, self.source.store.prove(store, name))
+            for store, name, value in self.source.store.rows_under(b"", 0)
+        ]
+        assert joiner.adopt_state(rows, self.ck.root) is None
+        return joiner
+
+    def test_a_walk_that_holds_what_was_committed_is_accepted(self):
+        joiner = self._walked()
+
+        self.assertIsNone(joiner.adopted_at(self.ck))
+
+        self.assertEqual(joiner.accumulator(), self.source.store.accumulator())
+        self.assertEqual(joiner.state_root(), self.ck.root)
+
+    def test_a_short_walk_is_refused_however_valid_each_row_was(self):
+        """THE CASE THIS EXISTS FOR. Every row that arrived verified against the root — they are
+        genuine rows. The walk simply did not finish, and only the fold can say so."""
+        joiner = self._bare()
+        rows = [
+            (store, name, value, self.source.store.prove(store, name))
+            for store, name, value in self.source.store.rows_under(b"", 0)
+        ][:3]
+        self.assertIsNone(joiner.adopt_state(rows, self.ck.root))
+
+        why = joiner.adopted_at(self.ck)
+
+        assert why is not None, "a partial walk was taken as complete"
+        self.assertIn("does not match", why)
+
+    def test_adoption_gives_the_node_a_height_it_can_carry_on_from(self):
+        """`MAX(idx)` alone would report zero for a node holding no entries, so it would be behind
+        the frontier for ever and bootstrap again every round — the walk succeeding and changing
+        nothing."""
+        joiner = self._walked()
+        self.assertEqual(joiner.head(), 0, "it had a height before it corroborated anything")
+
+        self.assertIsNone(joiner.adopted_at(self.ck))
+
+        self.assertEqual(joiner.head(), self.ck.height)
+        self.assertEqual(joiner.log_accumulator(), self.ck.acc_log, "A_log was not adopted")
+
+    def test_a_log_fold_a_joiner_cannot_compute_is_adopted_not_derived(self):
+        """`A_log` is a fold over every entry ever, minus what has been collected. A node that held
+        none of them cannot compute it, which is why the ratified marker carries it."""
+        joiner = self._walked()
+        self.assertEqual(joiner.log_accumulator(), crypto.ACC_IDENTITY, "it computed one somehow")
+
+        joiner.adopted_at(self.ck)
+
+        self.assertEqual(joiner.log_accumulator(), self.ck.acc_log)
+        self.assertNotEqual(
+            joiner.log_accumulator(),
+            self.source.store.log_accumulator(),
+            "the checkpoint's fold is at ITS height, not the source's current one -- the joiner is "
+            "at the checkpoint and catches up from there",
+        )
+
+    def test_adoption_never_steps_back(self):
+        joiner = self._walked()
+        self.assertIsNone(joiner.adopted_at(self.ck))
+        older = ops.Compaction(
+            0, self.ck.height - 5, self.ck.acc_state, crypto.ACC_IDENTITY, self.ck.root
+        )
+
+        self.assertIsNone(joiner.adopted_at(older))
+
+        self.assertEqual(joiner.head(), self.ck.height, "an older checkpoint moved it backwards")
+
+
 class TestCompactionRunsByItself(unittest.TestCase):
     """The round performs the duties, with no test reaching in to drive them.
 

@@ -238,9 +238,43 @@ class Store:
     # -- LOG ----------------------------------------------------------------- #
 
     def head(self) -> Index:
-        """The highest settled index, or 0 for an empty log (indices start at 1)."""
+        """The highest settled index, or the adopted height if state was taken without the log.
+
+        `MAX(idx)` ALONE IS WRONG AFTER A BOOTSTRAP. A node that took state against a checkpoint's
+        root holds no entries at all, so the log's maximum is zero while the state it holds is the
+        state at the checkpoint's height. Reporting zero would say it is behind the frontier for
+        ever, and it would bootstrap again on every round — the walk would succeed and change
+        nothing.
+
+        The adopted height is durable and monotone, and it is only ever set once the walk has been
+        CORROBORATED against the same checkpoint's fold (`Store.adopted_at`)."""
         row = self.db.execute("SELECT MAX(idx) FROM entry").fetchone()
-        return row[0] or 0
+        return max(row[0] or 0, self.adopted_height())
+
+    def adopted_height(self) -> Index:
+        """The height this node's state was taken AT, if it was taken rather than replayed."""
+        return int.from_bytes(self._get_meta("adopted_height", b""))
+
+    def adopted_at(self, ck: ops.Compaction) -> str | None:
+        """Declare this node to be at `ck`, having verified it holds exactly what `ck` commits to.
+
+        THE CORROBORATION IS THE WHOLE POINT, and it is cheap: the fold is O(1) and already signed,
+        so "the walk's queue emptied" becomes "the state I hold is the state that was committed".
+        Without it, a walk that lost replies — or was steered into asking for nothing — finishes
+        looking exactly like one that succeeded.
+
+        `A_log` is ADOPTED here rather than computed, because a joiner cannot compute it: it is a
+        fold over every entry ever, minus what has been collected, and this node held none of them.
+        That is why the ratified marker carries it (#accumulators)."""
+        if self.accumulator() != ck.acc_state:
+            return "the state walked does not match the fold the quorum signed"
+        if self.state_root() != ck.root:
+            return "the state walked does not match the root the quorum signed"
+        if ck.height <= self.adopted_height():
+            return None  # already at or past it; adoption is monotone, never a step back
+        self._set_meta("adopted_height", ck.height.to_bytes(8))
+        self._set_meta("acc_log", ck.acc_log)
+        return None
 
     def entries(self, frm: Index = 1, to: Index | None = None) -> Iterator[Entry]:
         """Replay range, inclusive. The only way anyone derives state
