@@ -116,8 +116,14 @@ class Node:
     """When this node last asked its peers where they were (#cross-attestation)."""
     last_housekept: int = -1
     """The last bucket in which this node did compaction housekeeping. See `housekeep`."""
-    walking: list[tuple[bytes, int]] | None = None
-    """Prefixes still to compare, while a state walk is in flight. `None` when not bootstrapping."""
+    walking: dict[tuple[bytes, int], crypto.Digest] | None = None
+    """Prefixes still outstanding in a state walk, each with THE HASH WE EXPECT for it.
+
+    Keyed by the question rather than stacked, because replies are asynchronous: a stack pairs an
+    answer with whatever was asked last, which is wrong as soon as two are in flight. The expected
+    hash is what makes an answer checkable — it is seeded from the checkpoint's signed root and
+    every verified reply yields its children's, so the whole descent folds to something the quorum
+    signed. `None` when not bootstrapping."""
     shares: dict[bytes, dict[crypto.PublicKey, crypto.Signature]] = field(default_factory=dict)
     """Shares keyed by CLAIM BYTES, not by segment: two nodes disagreeing about the fold produce
     two different claims, and neither may borrow the other's signatures."""
@@ -453,12 +459,18 @@ class Node:
         because recovery is re-join as a new identity."""
         return frozenset(self.store.convictions())
 
-    def gathered(self, now: Millis) -> list[attest.SignedAttestation]:
+    def gathered(self, now: Millis, me: bool = True) -> list[attest.SignedAttestation]:
         """Every statement this node can vouch for by holding: its own, plus every peer's, each
-        still carrying the signature of whoever made it (#freshness-is-gathered)."""
-        return [self.attestation(now), *self.store.sightings()]
+        still carrying the signature of whoever made it (#freshness-is-gathered).
 
-    def floor(self, need: int, now: Millis) -> int | None:
+        `me=False` DROPS OUR OWN, and the currency question needs that: asking "is my view current"
+        and counting our own attestation toward the answer is asking ourselves. Worse at the size
+        that matters — a bootstrapping node with one peer would reach `f+1` on its own statement
+        plus that one peer, so a single responder would decide."""
+        mine = [self.attestation(now)] if me else []
+        return [*mine, *self.store.sightings()]
+
+    def floor(self, need: int, now: Millis, include_self: bool = True) -> int | None:
         """The height this node would rely on: the max over `need` distinct FRESH peers and itself,
         ignoring anyone convicted, and counting only floors whose quorum signatures verify.
 
@@ -466,7 +478,7 @@ class Node:
         and a checkpoint signed by a roster we no longer recognise is one we cannot check, which is
         a bootstrap problem (§1) rather than something to paper over here."""
         return attest.attested_floor(
-            self.gathered(now),
+            self.gathered(now, me=include_self),
             need,
             now,
             self.tunables.attest.fresh_within,
@@ -596,7 +608,9 @@ class Node:
         f = codec.as_seq(codec.decode(env.env.body), 2)
         prefix, depth = codec.as_bytes(f[0]), codec.as_int(f[1])
         left, right = self.store.subtree(prefix, depth)
-        self._reply(env, Verb.HASHES, codec.encode([left, right]), now)
+        # Echoed, so the answer names its own question: a reply that does not say what it answers
+        # can only be paired by arrival order, which is not an order.
+        self._reply(env, Verb.HASHES, codec.encode([prefix, depth, left, right]), now)
 
     def _on_leaves(self, env: SignedEnvelope, now: Millis) -> None:
         """Answer with the rows under a prefix, EACH WITH ITS PROOF.
@@ -614,24 +628,47 @@ class Node:
         self._reply(env, Verb.ROWS, codec.encode(rows), now)
 
     def _on_hashes(self, env: SignedEnvelope, now: Millis) -> None:
-        """A peer's child hashes. Descend where they differ from ours, ask for rows where they are
-        small enough to take whole.
+        """A peer's child hashes, CHECKED AGAINST THE SIGNED ROOT before they are acted on.
 
-        THE DEPTH IS OURS TO CHOOSE, which is why there are two verbs: the server never decides
-        how much we take at once."""
+        The answer echoes its own question, so it pairs with what we asked rather than with whatever
+        was asked most recently — replies are asynchronous and a stack got that wrong.
+
+        AND IT IS VERIFIABLE, which the first version of this was not. A node's hash is
+        `branch_hash(depth, lo, left, right)`, so knowing what we expect for a prefix lets us
+        RECOMPUTE it from the answer. We expect the checkpoint's root at the top, and each verified
+        reply gives us its children's expected hashes, so the descent folds to something a quorum
+        signed at every step. Without that a peer could echo our own hashes back, we would descend
+        nowhere, and the walk would finish holding nothing — the failure being indistinguishable
+        from success.
+
+        The compression case is part of the rule, not an exception to it: a subtree holding one leaf
+        hashes AS that leaf however deep it sits, so exactly one empty child means the parent equals
+        the other child rather than the branch of the two.
+
+        THE DEPTH IS OURS TO CHOOSE, which is why there are two verbs: the server never decides how
+        much we take at once."""
         if (walk := self.walking) is None:
             return  # we are not bootstrapping; an unsolicited answer decides nothing
-        f = codec.as_seq(codec.decode(env.env.body), 2)
-        theirs = (crypto.Digest(codec.as_bytes(f[0])), crypto.Digest(codec.as_bytes(f[1])))
-        prefix, depth = walk.pop()
-        for bit, remote in enumerate(theirs):
+        f = codec.as_seq(codec.decode(env.env.body), 4)
+        prefix, depth = codec.as_bytes(f[0]), codec.as_int(f[1])
+        left = crypto.Digest(codec.as_bytes(f[2]))
+        right = crypto.Digest(codec.as_bytes(f[3]))
+        expect = walk.get((prefix, depth))
+        if expect is None or not _folds_to(expect, prefix, depth, left, right):
+            return  # not something we asked, or not what the root commits to
+        # Removed only once the answer is ACCEPTED. Popping first let a bad answer delete the
+        # question, which is the steering attack by a quieter route: we would never ask it again.
+        del walk[(prefix, depth)]
+        for bit, remote in enumerate((left, right)):
             child = smt.with_bit(prefix, depth, bit)
             if self.store.tree.hash_under(child, depth + 1) == remote:
                 continue  # this whole subtree already agrees: never transferred
+            if remote == smt.EMPTY:
+                continue  # they hold nothing here; deletion is the log's business, not the walk's
             if depth + 1 >= self.tunables.net.walk_depth:
                 self._ask(env.frm, Verb.LEAVES, child, depth + 1, now)
             else:
-                walk.append((child, depth + 1))
+                walk[(child, depth + 1)] = remote
                 self._ask(env.frm, Verb.SUBTREE, child, depth + 1, now)
 
     def _on_rows(self, env: SignedEnvelope, _now: Millis) -> None:
@@ -663,6 +700,41 @@ class Node:
         env = Envelope(peer, verb, _mid(), codec.encode([prefix, depth])).sign(self.me, now)
         self.postman.mailbox.post(env, now, self.tunables.net.ttl)
 
+    def corroborated(self, now: Millis) -> ops.Compaction | None:
+        """The highest ratified checkpoint that `f+1` FRESH responders vouch for, or None.
+
+        THE PRECONDITION FOR EVERYTHING ELSE `[H]`: *"we were supposed to first verify f+1 nodes'
+        attestations before doing anything else."* Every other check in this system establishes
+        AUTHENTICITY — that a thing was signed by who it claims, and traces to our anchor. None of
+        them establishes CURRENCY: a malicious node can serve a perfectly authentic, perfectly stale
+        world, correctly signed throughout, and only the count of fresh independent statements
+        distinguishes that from the truth (#freshness-needs-many, #the-lemma).
+
+        MAX, NOT MAJORITY, and that is not credulity: a floor carries the quorum's signatures, so a
+        responder can WITHHOLD a higher checkpoint and cannot forge one. The highest one that
+        verifies wins, and a lagging or lying responder cannot drag it down.
+
+        `f+1` is also, as you put it, learning a subset of the roster: `f+1` identities of which at
+        least one is honest. That is why it comes before adopting anything — including before the
+        state walk, which would otherwise verify beautifully against a root nobody current vouches
+        for."""
+        n = len(self.roster())
+        if not n:
+            return None
+        # `f + 1`, and `f` is what the RULE tolerates at this `n` -- not the quorum size, which is a
+        # different question. At n=3 two-thirds tolerates 0, so one honest fresh answer IS f+1;
+        # at n=11 it tolerates 4 and five are needed. Reading `size()` here would demand a quorum
+        # for a question that is not a quorum's to answer (#freshness-needs-many).
+        floor = self.floor(quorum.DEFAULT.tolerates(n) + 1, now, include_self=False)
+        if floor is None:
+            return None  # too few fresh answers: denied, not deceived
+        best = max(
+            (s.claim.ratified for s in self.gathered(now, me=False) if s.claim.floor == floor),
+            key=lambda ck: ck.height if ck else -1,
+            default=None,
+        )
+        return best if best is not None and self.store.adopt(best) is None else None
+
     def bootstrap(self, now: Millis) -> bool:
         """Start a state walk against the ratified root, for a node the log cannot reach.
 
@@ -673,13 +745,16 @@ class Node:
 
         Returns whether a walk was started. Nothing here applies state: `_on_rows` does that, and
         only against a root the quorum signed."""
-        if self.walking is not None or self.store.checkpoint() is None:
+        if self.walking is not None:
             return False
+        if (ck := self.corroborated(now)) is None:
+            return False  # nothing f+1 fresh responders vouch for: there is nothing to walk toward
         peer = next((s.by for s in self.store.sightings() if s.by in self.roster()), None)
         if peer is None:
             return False
-        self.walking = [(bytes(crypto.DIGEST_SIZE), 0)]
-        self._ask(peer, Verb.SUBTREE, bytes(crypto.DIGEST_SIZE), 0, now)
+        top = bytes(crypto.DIGEST_SIZE)
+        self.walking = {(top, 0): ck.root}  # the root is what every answer must fold back to
+        self._ask(peer, Verb.SUBTREE, top, 0, now)
         return True
 
     # -- the round ----------------------------------------------------------------------------- #
@@ -791,6 +866,28 @@ class Node:
 # --------------------------------------------------------------------------------------------- #
 # Slice encoding — the only wire shape this module owns.                                        #
 # --------------------------------------------------------------------------------------------- #
+
+
+def _folds_to(
+    expect: crypto.Digest, prefix: bytes, depth: int, left: crypto.Digest, right: crypto.Digest
+) -> bool:
+    """Do these two children reconstruct the hash we were expecting for this node?
+
+    The whole of what makes a `HASHES` answer trustworthy: an internal node is
+    `branch_hash(depth, lo, left, right)`, so an answer that does not rebuild what the root commits
+    to is refused rather than acted on.
+
+    Compression is part of the rule. A subtree holding exactly one leaf hashes AS that leaf however
+    deep it sits, so a node with one empty child equals its other child — checking `branch_hash`
+    there would reject every honest sparse answer, which is most of a sparse tree."""
+    lo, _ = smt.bounds(prefix, depth)
+    if left == smt.EMPTY and right == smt.EMPTY:
+        return expect == smt.EMPTY
+    if left == smt.EMPTY:
+        return expect == right
+    if right == smt.EMPTY:
+        return expect == left
+    return expect == smt.branch_hash(depth, lo, left, right)
 
 
 def _uncontiguous(run: list[Entry], frm: int) -> str | None:

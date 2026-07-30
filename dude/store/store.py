@@ -941,7 +941,20 @@ class Store:
         raw = self._get_meta("anchor", b"")
         return crypto.PublicKey(raw) if raw else None
 
-    def provision(self, manager: crypto.PublicKey) -> None:
+    def seeds(self) -> tuple[bytes, ...]:
+        """The addresses this node was provisioned with, to reach the cluster at all.
+
+        THE SECOND THING THAT CANNOT BE DERIVED `[H]`: *"we need to know the manager key, we need
+        f+1 nodes to determine freshness"* — and reaching `f+1` nodes needs `f+1` addresses, which
+        cannot be obtained by asking, because asking requires an address. So they are provisioning
+        input alongside the anchor, and retained for the same reason.
+
+        Addresses only. WHO answers is established by their signatures and by the anchor chain; a
+        seed that turns out to be a stranger costs a wasted connection and nothing else."""
+        raw = self._get_meta("seeds", b"")
+        return tuple(codec.as_bytes(a) for a in codec.as_seq(codec.decode(raw))) if raw else ()
+
+    def provision(self, manager: crypto.PublicKey, seeds: Iterable[bytes] = ()) -> None:
         """Record the anchor. Idempotent for the same key, and REFUSED for a different one.
 
         Re-provisioning to a different manager would move a node between clusters silently, taking
@@ -955,6 +968,8 @@ class Store:
                 "between clusters while keeping its identity and its attested height"
             )
         self._set_meta("anchor", manager)
+        if seeds:
+            self._set_meta("seeds", codec.encode(sorted(seeds)))
 
     def wrong_cluster(self) -> str | None:
         """`None` if the log we hold is the one our anchor authorises, else why not.

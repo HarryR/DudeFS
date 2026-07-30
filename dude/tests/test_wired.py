@@ -64,6 +64,8 @@ WIRED = {
     "roster_incomplete": "a roster that is a subset, unstated, or older than one already seen",
     "vouched": "a credential that does not vouch for the value a row currently holds",
     "smt.verify": "a state row that does not fold to the root the quorum signed",
+    "_folds_to": "a subtree hash the signed root does not commit to",
+    "corroborated": "acting on a checkpoint fewer than f+1 fresh responders vouch for",
 }
 """Checks that must have a live consumer in production code.
 

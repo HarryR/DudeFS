@@ -248,11 +248,23 @@ class Mailbox:
 
         Correlation itself is by `mid` and NEVER by the link it arrived on (R1) — send on A, receive
         on B is ordinary traffic. `SignedEnvelope.accept` has already established that it is
-        addressed to us, fresh, correctly signed, and echoes the right id."""
+        addressed to us, fresh, correctly signed, and echoes the right id.
+
+        AND BY THE PEER WE ASKED `[H]`, which it was not. LINKS.md states the rule and the reason —
+        *"the dedup key is `(frm, mid)`, never `mid` alone... `mid` is chosen by the sender"* — and
+        `arrived` popped on the id alone, so ANY identity that learned an outstanding id could have
+        its answer taken as solicited. Frames are sealed, so an id is not observable; but the peer
+        we asked knows it, and can pass it on. That matters most where a reply is not otherwise
+        verifiable: a `HASHES` answer steers a state walk, and `SOLICITED` is all that stands
+        between it and a stranger.
+
+        The table is keyed by id because these ids are OURS — we generate them, so they do not
+        collide. The binding that matters is the destination, checked here."""
         reply_to = envelope.env.reply_to
-        p = self.pending.pop(reply_to, None) if reply_to else None
-        if p is None:
-            return None
+        p = self.pending.get(reply_to) if reply_to else None
+        if p is None or p.to != envelope.frm:
+            return None  # nobody asked THEM, whatever they are echoing
+        del self.pending[reply_to]
         match = self._attribute(p, envelope.env.reply_ts)
         if match is None:
             return Reply(reply_to, None, None)

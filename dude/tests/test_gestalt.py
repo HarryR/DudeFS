@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import unittest
 
+from .. import quorum
 from ..core import codec, crypto
 from ..core.errors import DudeError, InvariantError
 from ..net import Verb
@@ -536,14 +537,46 @@ class TestTheStateWalk(unittest.TestCase):
         """The comparison step, through the real handler: a joiner that already agrees asks for
         nothing at all, which is the property that makes cost track absence."""
         joiner = self.c.nodes[2]
-        joiner.walking = [(bytes(crypto.DIGEST_SIZE), 0)]
-        left, right = self.source.store.subtree(b"", 0)
-        body = codec.encode([left, right])
+        top = bytes(crypto.DIGEST_SIZE)
+        joiner.walking = {(top, 0): self.root}
+        left, right = self.source.store.subtree(top, 0)
+        body = codec.encode([top, 0, left, right])
         env = Envelope(joiner.me.public, Verb.HASHES, b"h" * 16, body).sign(self.source.me, T0)
 
         joiner._on_hashes(env, T0)
 
-        self.assertEqual(joiner.walking, [], "it queued work for a subtree it already agrees on")
+        self.assertEqual(joiner.walking, {}, "it queued work for a subtree it already agrees on")
+
+    def test_hashes_that_do_not_fold_to_the_root_are_ignored(self):
+        """THE STEERING ATTACK, and the reason this reply is verified rather than believed. A peer
+        that answers with anything the root does not commit to — including our own hashes echoed
+        back, which would end the walk holding nothing — is refused before it can direct a single
+        descent."""
+        joiner = Node(crypto.Keypair.generate(), self.c.provisioned())
+        top = bytes(crypto.DIGEST_SIZE)
+        joiner.walking = {(top, 0): self.root}
+        lies = codec.encode([top, 0, crypto.h(b"not"), crypto.h(b"the-root")])
+        env = Envelope(joiner.me.public, Verb.HASHES, b"h" * 16, lies).sign(self.source.me, T0)
+
+        joiner._on_hashes(env, T0)
+
+        self.assertEqual(joiner.walking, {(top, 0): self.root}, "a lie steered the walk")
+        self.assertEqual(len(joiner.postman.mailbox.due(T0)), 0, "and it asked a question on it")
+
+    def test_an_answer_to_a_question_we_did_not_ask_is_ignored(self):
+        """Replies are asynchronous, so an answer must name its own question. Pairing by arrival
+        order — which a stack does — attributes an answer to whatever was asked most recently."""
+        joiner = Node(crypto.Keypair.generate(), self.c.provisioned())
+        top = bytes(crypto.DIGEST_SIZE)
+        joiner.walking = {(top, 0): self.root}
+        elsewhere = smt.with_bit(top, 0, 1)
+        left, right = self.source.store.subtree(elsewhere, 1)
+        body = codec.encode([elsewhere, 1, left, right])
+        env = Envelope(joiner.me.public, Verb.HASHES, b"h" * 16, body).sign(self.source.me, T0)
+
+        joiner._on_hashes(env, T0)
+
+        self.assertEqual(joiner.walking, {(top, 0): self.root}, "it acted on an unasked answer")
 
     def test_a_walk_needs_a_ratified_root_to_check_against(self):
         """Without a checkpoint there is nothing signed to verify rows against, so there is nothing
@@ -553,6 +586,84 @@ class TestTheStateWalk(unittest.TestCase):
 
         self.assertFalse(joiner.bootstrap(T0))
         self.assertIsNone(joiner.walking)
+
+
+class TestFreshnessIsThePrecondition(unittest.TestCase):
+    """`[H]` *"we were supposed to first verify f+1 nodes' attestations before anything else."*
+
+    Every other check establishes AUTHENTICITY. None establishes CURRENCY — a malicious node can
+    serve a perfectly authentic, perfectly stale world, correctly signed throughout, and only the
+    count of fresh independent statements tells that from the truth."""
+
+    WIDTH = 8
+    AGE = DEFAULT.mempool.w_admit + DEFAULT.mempool.w_valid_margin + DELTA
+
+    def setUp(self):
+        self.c = Cluster()
+        self.client = self.c.mgr
+        for node in self.c.nodes:
+            node.store.SEGMENT_WIDTH = self.WIDTH
+
+    def _collected(self) -> int:
+        now = T0
+        for i in range(12):
+            tx = ops.writes(ops.Set(D, crypto.h(b"hot"), f"v{i}".encode())).sign(self.client, now)
+            self.c.submit(self.client, tx, to=i % 3, now=now)
+            self.c.pump(now)
+            now += DELTA
+            self.c.pump(now)
+        for _ in range(4):
+            now += self.AGE
+            self.c.pump(now)
+        assert self.c.nodes[0].store.checkpoint() is not None, "nothing was ever collected"
+        return now
+
+    def test_a_checkpoint_f_plus_one_fresh_responders_vouch_for_is_taken(self):
+        now = self._collected()
+        node = self.c.nodes[0]
+
+        ck = node.corroborated(now)
+
+        assert ck is not None, "a cluster all talking to each other could not corroborate anything"
+        self.assertEqual(ck.height, node.store.floor())
+
+    def test_a_node_does_not_count_its_own_view_toward_currency(self):
+        """Asking "is my view current" and counting our own attestation is asking ourselves. At the
+        size that matters it decides the answer: with one peer, self plus peer reaches two."""
+        now = self._collected()
+        alone = Node(crypto.Keypair.generate(), self.c.provisioned())
+        alone.store.witness(self.c.nodes[0].attestation(now))
+
+        self.assertEqual(len(alone.gathered(now)), 2)
+        self.assertEqual(len(alone.gathered(now, me=False)), 1, "it counted itself as a responder")
+
+    def test_f_plus_one_is_f_plus_one_not_a_quorum(self):
+        """Different questions. At n=3 two-thirds tolerates 0 faults, so ONE honest fresh answer is
+        `f+1` and demanding a quorum would refuse a cluster that is answering correctly; at n=11 it
+        tolerates 4 and five are needed. Reading `size()` here asks a quorum a question that is not
+        a quorum's to answer."""
+        self.assertEqual(quorum.DEFAULT.tolerates(3) + 1, 1)
+        self.assertEqual(quorum.DEFAULT.tolerates(11) + 1, 5)
+        self.assertEqual(quorum.size(3), 2, "the two numbers are not the same number")
+
+    def test_stale_answers_do_not_count_however_many(self):
+        """An adversary without `f+1` keys can only replay old statements, and old statements look
+        old. The window is what makes staleness visible rather than silent."""
+        now = self._collected()
+        node = self.c.nodes[0]
+        self.assertIsNotNone(node.corroborated(now))
+
+        much_later = now + DEFAULT.attest.fresh_within * 10
+
+        self.assertIsNone(node.corroborated(much_later), "a bundle nobody refreshed stayed current")
+
+    def test_the_seeds_are_provisioning_input_like_the_anchor(self):
+        """`f+1` responders need `f+1` addresses, and an address cannot be obtained by asking,
+        because asking requires one."""
+        s = Store()
+        s.provision(self.c.mgr.public, seeds=[b"inproc:a", b"inproc:b"])
+        self.assertEqual(s.seeds(), (b"inproc:a", b"inproc:b"))
+        self.assertEqual(Store().seeds(), (), "an unprovisioned node invented an address")
 
 
 class TestCompactionRunsByItself(unittest.TestCase):

@@ -390,8 +390,10 @@ Collection MUST be refused when any of these holds:
 The chain below MUST be established in order, and every step MUST be checked against the step before
 it. Nothing in it may rest on the word of the cluster being joined.
 
-1. The **manager public key** MUST be supplied out of band when a node is provisioned, and retained
-   across a re-bootstrap. It is the only value not derived from something else, and it MUST NOT be
+1. The **manager public key AND `f+1` node addresses** MUST be supplied out of band when a node is
+   provisioned, and retained across a re-bootstrap. Reaching `f+1` responders needs `f+1` addresses,
+   and an address cannot be obtained by asking, because asking requires one.
+   The manager key MUST be retained It is the only value not derived from something else, and it MUST NOT be
    taken from the log: a forged log introduces its own manager and checks out against itself.
 2. A node MUST NOT be re-provisioned to a different manager. That would move it between clusters
    while keeping its identity, its attestation history and its monotone height — the one quantity
@@ -432,13 +434,31 @@ it. Nothing in it may rest on the word of the cluster being joined.
    The party doing the verifying MUST choose the depth at which it stops descending and asks for
    rows. A server that decided this would be deciding how much its client takes on one reply, which
    is why hashes and rows are two verbs and not one.
+   **Subtree hashes MUST be verified, not believed.** An internal node is a function of its two
+   children, so a reply MUST rebuild the hash already expected for that node — seeded by the signed
+   root and carried down by each verified reply. Otherwise a peer can echo a walker's own hashes
+   back, the walk descends nowhere, and finishing holding nothing is indistinguishable from success.
+   A reply MUST name the question it answers. Replies are asynchronous, so pairing by arrival order
+   attributes an answer to whatever was asked most recently.
+   An unaccepted reply MUST NOT retire the question it failed to answer, or refusing a lie becomes a
+   way to delete the question.
    A row MUST arrive with its own proof. Without one a reply cannot be checked in isolation, which is
    the property the whole walk rests on.
    State adopted this way MUST NOT set the head or `A_log`: history is not what is being transferred.
    Those come from the checkpoint and from replaying forward afterwards.
 
-- A floor MUST NOT be relied upon without `f+1` fresh corroboration (#freshness-needs-many). The
-  chain above establishes *who*; it establishes nothing about *when*.
+- **`f+1` fresh corroboration MUST come first, before anything else is adopted or walked**
+  (#freshness-needs-many). Every other step of this chain establishes AUTHENTICITY; none establishes
+  CURRENCY, and a malicious node can serve a perfectly authentic, perfectly stale world, correctly
+  signed throughout. The count of fresh independent statements is the only thing that tells the two
+  apart.
+- `f+1` MUST be computed from what the quorum rule TOLERATES at this `n`, not from the quorum size:
+  they answer different questions, and at n=3 two-thirds tolerates zero, so one honest fresh answer
+  is `f+1`.
+- A node MUST NOT count its own attestation toward that corroboration. Asking whether our view is
+  current and answering with our own view decides nothing — and with one peer it would decide it.
+- The checkpoint taken MUST be the **maximum** across those responders, since a floor carries the
+  quorum's signatures: a responder can withhold a higher one and cannot forge one.
 
 ## Trust
 
@@ -596,6 +616,8 @@ obliges**, which is the defect this table exists to make visible rather than pla
 | the walk descends only where subtree hashes differ | `Store.subtree`, `Node._on_hashes` |
 | a row is served with its own proof | `Node._on_leaves` |
 | the verifier chooses the descent depth | `NetTunables.walk_depth`, `Node._on_hashes` |
+| a subtree hash is rebuilt from the answer, not believed | `node._folds_to` |
+| a reply is correlated to the peer we asked | `Mailbox.arrived` |
 | **a bootstrap is driven when catching up is impossible** | **OWED** — `Node.bootstrap` has no caller |
 | the manager key is supplied out of band and retained | `Store.provision`, `Store.anchor` |
 | a node is not re-provisioned to another manager | `Store.provision` (raises `InvariantError`) |
@@ -606,7 +628,9 @@ obliges**, which is the defect this table exists to make visible rather than pla
 | membership is one manager-signed commitment, matching the rows | `Store.roster_incomplete` |
 | a roster serial never goes backwards | `Store.roster_incomplete`, `Store.roster_serial` |
 | roster completeness is verifiable | **OWED** — needs a manager-signed membership commitment |
-| a floor is corroborated by `f+1` fresh responders before use | **OWED** — `attested_floor` exists; nothing calls it on the bootstrap path |
+| `f+1` fresh corroboration precedes anything else | `Node.corroborated`, gating `Node.bootstrap` |
+| a node does not count itself toward `f+1` | `Node.gathered(me=False)` |
+| seed addresses are provisioning input | `Store.provision(seeds=)`, `Store.seeds` |
 | a node that cannot obtain `(floor, head]` bootstraps instead | **OWED** — no decision point exists |
 | a server says what it no longer holds | **OWED** — `_on_pull` answers with what it has |
 | every dial sits at or above its derived floor | `Tunables.__post_init__` (raises `InvariantError`) |

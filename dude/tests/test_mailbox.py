@@ -315,5 +315,42 @@ class TestMaybeReply(unittest.TestCase):
         self.assertEqual(e.why, Expiry.UNDELIVERED)  # never attempted, so not "unanswered"
 
 
+class TestOnlyThePeerWeAskedMayAnswer(unittest.TestCase):
+    """LINKS.md's rule, which the code did not follow: *"the dedup key is `(frm, mid)`, never `mid`
+    alone... `mid` is chosen by the sender."*
+
+    Correlation popped on the id alone, so any identity that learned an outstanding id had its
+    answer taken as solicited. Frames are sealed so an id is not observable — but the peer we asked
+    knows it, and `SOLICITED` is all that stands between a `HASHES` reply and a stranger."""
+
+    def setUp(self):
+        self.me = crypto.Keypair.generate()
+        self.asked = crypto.Keypair.generate()
+        self.other = crypto.Keypair.generate()
+        self.box = Mailbox()
+
+    def _question(self):
+        env = request(self.me, self.asked.public, Verb.PULL, T0)
+        self.box.post(env, T0, ttl=10_000)
+        return env
+
+    def test_the_peer_we_asked_is_answered(self):
+        env = self._question()
+        reply = env.answer(Verb.ENTRIES).sign(self.asked, T0 + 5)
+
+        self.assertIsNotNone(self.box.arrived(reply, T0 + 5), "the peer we asked was not credited")
+
+    def test_a_third_party_echoing_the_id_is_not(self):
+        """The stranger's envelope is perfectly valid — signed, addressed to us, in window, echoing
+        a live id. Only the destination we recorded says it is not an answer to our question."""
+        env = self._question()
+        theirs = env.answer(Verb.ENTRIES).sign(self.other, T0 + 5)
+
+        self.assertIsNone(
+            self.box.arrived(theirs, T0 + 5), "a stranger's answer was taken as solicited"
+        )
+        self.assertEqual(len(self.box), 1, "and it retired the question we were still asking")
+
+
 if __name__ == "__main__":
     unittest.main()
