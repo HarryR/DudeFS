@@ -8,7 +8,7 @@ ruff format dude -q && ruff check dude && ty check dude/ \
   && python3 -m unittest discover -s dude/tests -t . -q
 ```
 
-**322 tests, all green** — lint, format and typecheck clean, six consecutive runs. The marker test
+**332 tests, all green** — lint, format and typecheck clean, six consecutive runs. The marker test
 that was red on purpose (`test_a_pull_for_a_collected_range_is_not_answered_with_a_hole`) now passes:
 a server no longer answers a `PULL` below its frontier with a gapped run.
 
@@ -138,40 +138,25 @@ sender's attested head, and a checkpoint carries exactly `store.Commitment`.
   server's (`_collect` tolerates a missing segment and subtracts nothing). Either adoption starts
   strictly after the marker, or the marker commits to the segment accumulator it removes.
 
-### 3. The credential in every leaf — RULED, not yet built
+### 3. The credential in every leaf — BUILT
 
-`[H]` Harry: *"why not just put it in all leaves? It's an authenticated data store."*
+`[H]` Harry: *"why not just put it in all leaves? It's an authenticated data store."* Ruled on 29
+July, recorded here, and then not built for two days while the code carried a comment arguing the
+opposite case as settled design — which is how it came to be re-derived from scratch as though it
+were a discovery. **A ruling recorded in a handoff doc while the code argues against it is invisible
+to everyone who reads the code, including whoever reads it next.** `test_wired.py` catches a check
+with no caller; nothing catches a decision with no code.
 
-Today `live.cred` holds the authorising transaction for **management rows only**, and the SMT leaf is
-`H(path ‖ H(value))` — so the root commits to values but not to who authorised them. The ruling is to
-carry it for every row and hash it into the leaf, so a proof answers *"this key holds this value, and
-here is the signature that put it there"* in one step.
+Landed: `smt.leaf_hash(path, vhash, chash)`; `Proof.occupant` now quotes the LEAF HASH rather than
+the value hash; `smt.verify` takes `(value, credential)` or `None`; `Held.cred` with no default and
+`live.cred` with no SQL default; byte-identity relocation for every store; `_commit` no longer
+writes a credential on a Move at all, so relocation-invariance is structural; `_collect` checks the
+root as well as `A_state`; `rows_under`/`adopt_state`/the ROWS verb carry credentials.
 
-Four things shape the work, none of them obvious from the code:
-
-- **A `Move` must carry byte-for-byte the credential the row already holds.** `_commit` currently
-  writes `m.credential` unconditionally. Once the credential is in the leaf, a Move swapping one
-  valid credential for another — both vouching for the same value, e.g. the manager writing the same
-  value twice — would **change the root**, and relocation would stop being state-invariant. That
-  breaks the whole migration story. Guard it and invariance becomes provable rather than incidental.
-- **`_relocates`' data-store shortcut stops being safe.** [settle.py:157-158](dude/store/settle.py#L157-L158)
-  returns `True` for any non-management Move without looking at the credential — correct today,
-  because a data row's `cred` is `b""` and nothing commits to it. Once the leaf hashes the credential,
-  an unvouched Move can write an arbitrary one into a data row and the root will commit to it. Either
-  `_vouches` runs for every store, or the byte-identity guard above becomes the universal rule and
-  vouching is what it degrades to when the row holds no credential yet.
-- **Relocation-invariance becomes a claim about the ROOT, and nothing asserts that.** `_collect`
-  checks only that `A_state` did not move ([store.py:670](dude/store/store.py#L670)) — and it never
-  will, since `element()` is over `(store, name, value)` and the credential is not in it. That is
-  where the root check belongs.
-- **Storage wants dedup, later.** A credential is a whole signed transaction, so a transaction
-  writing 100 keys stores 100 copies. The natural fix is a credential table keyed by `op_hash` with
-  live rows referencing it — the same refcount shape as epochs, possibly sharing machinery. Inline is
-  fine for now; at 10⁷ keys it is the difference between ~300 MB and several GB. Note it, defer it.
-
-Expect every root in the test suite to change. `[H]` **that churn is fine, and tests should assert
-structure rather than pinned roots** until the design is in a much more solid position — a golden root
-is a test of arithmetic nobody is doubting, and it re-costs an hour every time the leaf changes.
+Still open, deliberately: **storage dedup.** A credential is a whole signed transaction, so a
+transaction writing 100 keys stores 100 copies. A credential table keyed by `op_hash` with live rows
+referencing it is the natural fix — the same refcount shape as epochs. At 10⁷ keys it is the
+difference between ~300 MB and several GB. Inline until the numbers say otherwise.
 
 ### 4. Residual softness in what just landed
 

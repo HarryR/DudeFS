@@ -23,7 +23,7 @@ def _bare() -> sqlite3.Connection:
     db = sqlite3.connect(":memory:", isolation_level=None)
     db.executescript(
         "CREATE TABLE live (store INTEGER, name BLOB, head INTEGER, value BLOB, path BLOB,"
-        " PRIMARY KEY (store, name));"
+        " cred BLOB NOT NULL, PRIMARY KEY (store, name));"
         "CREATE UNIQUE INDEX live_by_path ON live(path);"
         "CREATE TABLE smt_memo (depth INTEGER, prefix BLOB, hash BLOB,"
         " PRIMARY KEY (depth, prefix));"
@@ -36,12 +36,25 @@ class _Fixture(unittest.TestCase):
         self.db = _bare()
         self.t = smt.Tree(self.db)
 
-    def put(self, name: bytes, value: bytes, st: int = D) -> None:
+    def cred(self, name: bytes, st: int = D) -> bytes:
+        """Stand-in for the transaction that authorised a row.
+
+        DISTINCT PER KEY, because the leaf commits to it: a fixture writing one shared blob
+        everywhere would let a leaf that ignored the credential pass every test here."""
+        return b"cred:" + bytes([st]) + name
+
+    def held(self, name: bytes, value: bytes, st: int = D) -> tuple[bytes, bytes]:
+        """What `verify` asks about — a value and the credential that authorised it, never one
+        without the other."""
+        return value, self.cred(name, st)
+
+    def put(self, name: bytes, value: bytes, st: int = D, cred: bytes | None = None) -> None:
         path = smt.path_of(st, name)
         self.t.invalidate(path)
         self.db.execute(
-            "INSERT OR REPLACE INTO live (store, name, head, value, path) VALUES (?,?,0,?,?)",
-            (st, name, value, path),
+            "INSERT OR REPLACE INTO live (store, name, head, value, path, cred)"
+            " VALUES (?,?,0,?,?,?)",
+            (st, name, value, path, self.cred(name, st) if cred is None else cred),
         )
 
     def drop(self, name: bytes, st: int = D) -> None:
@@ -55,7 +68,9 @@ class TestProofs(_Fixture):
 
     def test_a_present_key_proves_present(self):
         self.put(b"k", b"v")
-        self.assertTrue(smt.verify(self.t.root(), D, b"k", b"v", self.t.prove(D, b"k")))
+        self.assertTrue(
+            smt.verify(self.t.root(), D, b"k", self.held(b"k", b"v"), self.t.prove(D, b"k"))
+        )
 
     def test_a_present_key_proves_present_among_many(self):
         """Depth is what makes this different from the one-key case: the fold has to take the right
@@ -65,11 +80,15 @@ class TestProofs(_Fixture):
         root = self.t.root()
         for i in (0, 7, 99, 199):
             k = f"k{i}".encode()
-            self.assertTrue(smt.verify(root, D, k, f"v{i}".encode(), self.t.prove(D, k)))
+            self.assertTrue(
+                smt.verify(root, D, k, self.held(k, f"v{i}".encode()), self.t.prove(D, k))
+            )
 
     def test_the_wrong_value_does_not_verify(self):
         self.put(b"k", b"v")
-        self.assertFalse(smt.verify(self.t.root(), D, b"k", b"other", self.t.prove(D, b"k")))
+        self.assertFalse(
+            smt.verify(self.t.root(), D, b"k", self.held(b"k", b"other"), self.t.prove(D, b"k"))
+        )
 
     def test_an_absent_key_proves_absent_in_an_empty_tree(self):
         self.assertTrue(smt.verify(self.t.root(), D, b"nope", None, self.t.prove(D, b"nope")))
@@ -94,7 +113,7 @@ class TestProofs(_Fixture):
 
         for name, proof in (empty_case, neighbour_case):
             self.assertTrue(smt.verify(root, D, name, None, proof))
-            self.assertFalse(smt.verify(root, D, name, b"anything", proof))
+            self.assertFalse(smt.verify(root, D, name, self.held(name, b"anything"), proof))
 
     def test_a_deleted_key_proves_absent(self):
         """The one that makes #absence-is-revocation checkable rather than asserted."""
@@ -102,7 +121,9 @@ class TestProofs(_Fixture):
             self.put(f"k{i}".encode(), b"v")
         self.drop(b"k7")
         self.assertTrue(smt.verify(self.t.root(), D, b"k7", None, self.t.prove(D, b"k7")))
-        self.assertFalse(smt.verify(self.t.root(), D, b"k7", b"v", self.t.prove(D, b"k7")))
+        self.assertFalse(
+            smt.verify(self.t.root(), D, b"k7", self.held(b"k7", b"v"), self.t.prove(D, b"k7"))
+        )
 
     def test_a_present_key_cannot_be_proved_absent(self):
         for i in range(50):
@@ -115,16 +136,22 @@ class TestProofs(_Fixture):
         self.put(b"n", b"data", st=D)
         self.put(b"n", b"mgmt", st=M)
         root = self.t.root()
-        self.assertTrue(smt.verify(root, D, b"n", b"data", self.t.prove(D, b"n")))
-        self.assertTrue(smt.verify(root, M, b"n", b"mgmt", self.t.prove(M, b"n")))
-        self.assertFalse(smt.verify(root, D, b"n", b"mgmt", self.t.prove(D, b"n")))
+        self.assertTrue(smt.verify(root, D, b"n", self.held(b"n", b"data"), self.t.prove(D, b"n")))
+        self.assertTrue(
+            smt.verify(root, M, b"n", self.held(b"n", b"mgmt", st=M), self.t.prove(M, b"n"))
+        )
+        self.assertFalse(smt.verify(root, D, b"n", self.held(b"n", b"mgmt"), self.t.prove(D, b"n")))
 
     def test_a_proof_round_trips(self):
         for i in range(20):
             self.put(f"k{i}".encode(), b"v")
         proof = self.t.prove(D, b"k3")
         self.assertEqual(smt.Proof.decode(proof.encode()), proof)
-        self.assertTrue(smt.verify(self.t.root(), D, b"k3", b"v", smt.Proof.decode(proof.encode())))
+        self.assertTrue(
+            smt.verify(
+                self.t.root(), D, b"k3", self.held(b"k3", b"v"), smt.Proof.decode(proof.encode())
+            )
+        )
 
     def test_an_absence_proof_round_trips(self):
         for i in range(20):
@@ -143,7 +170,9 @@ class TestForgery(_Fixture):
         self.root = self.t.root()
 
     def test_a_neighbours_proof_does_not_prove_our_key(self):
-        self.assertFalse(smt.verify(self.root, D, b"k1", b"v2", self.t.prove(D, b"k2")))
+        self.assertFalse(
+            smt.verify(self.root, D, b"k1", self.held(b"k1", b"v2"), self.t.prove(D, b"k2"))
+        )
 
     def test_a_leaf_cannot_be_replayed_at_another_position(self):
         """The leaf hash binds its own path, so lifting a valid leaf into a slot where a different
@@ -152,7 +181,7 @@ class TestForgery(_Fixture):
         stolen = self.t.prove(D, b"k6")
         assert mine.occupant is not None
         forged = smt.Proof(stolen.siblings, mine.occupant)
-        self.assertFalse(smt.verify(self.root, D, b"k6", b"v6", forged))
+        self.assertFalse(smt.verify(self.root, D, b"k6", self.held(b"k6", b"v6"), forged))
 
     def test_an_unrelated_occupant_does_not_prove_absence(self):
         """The occupant has to sit where OUR key would have gone. Someone else's leaf from a
@@ -166,13 +195,19 @@ class TestForgery(_Fixture):
     def test_a_truncated_proof_does_not_verify(self):
         proof = self.t.prove(D, b"k5")
         self.assertFalse(
-            smt.verify(self.root, D, b"k5", b"v5", smt.Proof(proof.siblings[:-1], proof.occupant))
+            smt.verify(
+                self.root,
+                D,
+                b"k5",
+                self.held(b"k5", b"v5"),
+                smt.Proof(proof.siblings[:-1], proof.occupant),
+            )
         )
 
     def test_a_proof_against_the_wrong_root_does_not_verify(self):
         proof = self.t.prove(D, b"k5")
         self.put(b"k5", b"changed")
-        self.assertFalse(smt.verify(self.t.root(), D, b"k5", b"v5", proof))
+        self.assertFalse(smt.verify(self.t.root(), D, b"k5", self.held(b"k5", b"v5"), proof))
 
 
 class TestCanonicity(_Fixture):
@@ -187,8 +222,9 @@ class TestCanonicity(_Fixture):
         path = smt.path_of(D, name)
         t.invalidate(path)
         db.execute(
-            "INSERT OR REPLACE INTO live (store, name, head, value, path) VALUES (?,?,0,?,?)",
-            (D, name, value, path),
+            "INSERT OR REPLACE INTO live (store, name, head, value, path, cred)"
+            " VALUES (?,?,0,?,?,?)",
+            (D, name, value, path, self.cred(name)),
         )
 
     def test_insert_order_does_not_change_the_root(self):
@@ -251,7 +287,15 @@ class TestThroughTheStore(unittest.TestCase):
     def test_settlement_maintains_the_root(self):
         self.assertEqual(self.s.state_root(), smt.EMPTY)
         self._write(b"k", b"v")
-        self.assertTrue(smt.verify(self.s.state_root(), D, b"k", b"v", self.s.prove(D, b"k")))
+        self.assertTrue(
+            smt.verify(
+                self.s.state_root(),
+                D,
+                b"k",
+                (b"v", self.s.credential(D, b"k")),
+                self.s.prove(D, b"k"),
+            )
+        )
 
     def test_a_rebuilt_store_agrees_on_the_root(self):
         """The store's standing invariant -- incremental application equals replay -- extended to
@@ -299,3 +343,47 @@ class TestDomains(unittest.TestCase):
             smt.branch_hash(3, smt.bounds(path, 3)[0], *kids),
             smt.branch_hash(4, smt.bounds(path, 4)[0], *kids),
         )
+
+
+class TestTheCredentialIsInTheLeaf(_Fixture):
+    """`[H]` *"why not just put it in all leaves? It's an authenticated data store."*
+
+    The root commits to WHO WAS PERMITTED to write each value, not only to the value. Without this,
+    the sole thing authenticating a data row is that a quorum committed it — so a quorum at or above
+    threshold could assert arbitrary state and every proof would still verify."""
+
+    def test_the_same_value_under_a_different_credential_is_a_different_root(self):
+        """The property everything else here depends on. If the root ignored the credential, the
+        two stores below would be indistinguishable and a peer could swap one for the other."""
+        self.put(b"k", b"v", cred=b"signed-by-alice")
+        alice = self.t.root()
+        self.put(b"k", b"v", cred=b"signed-by-mallory")
+
+        self.assertNotEqual(self.t.root(), alice, "the root does not commit to the credential")
+
+    def test_a_proof_with_the_wrong_credential_does_not_verify(self):
+        """A peer serving a real value with a credential of its choosing. The value is genuine and
+        the fold still refuses it, which is the whole point: authorisation travels with the row."""
+        for i in range(50):
+            self.put(f"k{i}".encode(), f"v{i}".encode())
+        proof = self.t.prove(D, b"k7")
+
+        self.assertTrue(smt.verify(self.t.root(), D, b"k7", self.held(b"k7", b"v7"), proof))
+        self.assertFalse(
+            smt.verify(self.t.root(), D, b"k7", (b"v7", self.cred(b"k9")), proof),
+            "another key's valid credential vouched for this row",
+        )
+        self.assertFalse(smt.verify(self.t.root(), D, b"k7", (b"v7", b""), proof))
+
+    def test_a_neighbours_credential_is_not_disclosed_by_an_absence_proof(self):
+        """The occupant quotes a LEAF HASH, so proving our key absent tells the asker where someone
+        else's leaf sits and nothing about what authorised it."""
+        for i in range(200):
+            self.put(f"k{i}".encode(), f"v{i}".encode())
+        occupied = [
+            p for p in (self.t.prove(D, f"absent{i}".encode()) for i in range(200)) if p.occupant
+        ]
+        assert occupied, "no absence proof ended on a neighbour"
+        for proof in occupied:
+            assert proof.occupant is not None
+            self.assertNotIn(b"cred:", proof.occupant[1])

@@ -136,7 +136,7 @@ def evaluate(
         for g in step.guards:
             if not holds(layer, g):
                 return Verdict(Reason.GUARD, i), layer
-        layer.apply(m)
+        layer.apply(m, tx.raw)
     return OK, layer
 
 
@@ -151,9 +151,20 @@ def _relocates(reader: Reader, m: ops.Move, auth: Authoriser | None) -> bool:
 
     The credential is checked against LIVE state and CURRENT authority: a valid signature from an
     author authorised now, over a transaction that sets this key to the value it presently holds.
-    An old signature over a value nobody holds any more vouches for nothing."""
-    if reader.get(m.store, m.name) is None:
+    An old signature over a value nobody holds any more vouches for nothing.
+
+    BYTE IDENTITY FIRST, AND FOR EVERY STORE. This used to wave data rows through, which was safe
+    only while a data row's credential was empty and nothing committed to it. The root commits to
+    it now (`smt.leaf_hash`), so a move carrying a different credential would rewrite part of a leaf
+    and change the root — and relocation-invariance is what makes collection state-preserving.
+    Byte identity is strictly stronger than re-vouching, which is why it is the universal rule and
+    not the management one: two DIFFERENT valid credentials for the same value (the manager writing
+    that value twice) both vouch, and swapping one for the other still moves the root."""
+    held = reader.get(m.store, m.name)
+    if held is None:
         return False  # nothing to move; a move cannot create
+    if m.credential != held.cred:
+        return False  # a relocation carries the row's OWN credential or it is not a relocation
     if m.store != ops.STORE_MANAGEMENT:
         return True  # data rows derive their authority from management state, which is preserved
     return _vouches(reader, m, auth)

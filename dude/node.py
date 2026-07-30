@@ -622,8 +622,8 @@ class Node:
         f = codec.as_seq(codec.decode(env.env.body), 2)
         prefix, depth = codec.as_bytes(f[0]), codec.as_int(f[1])
         rows = [
-            [store, name, value, self.store.prove(store, name).encode()]
-            for store, name, value in self.store.rows_under(prefix, depth)
+            [store, name, value, cred, self.store.prove(store, name).encode()]
+            for store, name, value, cred in self.store.rows_under(prefix, depth)
         ]
         self._reply(env, Verb.ROWS, codec.encode(rows), now)
 
@@ -682,15 +682,16 @@ class Node:
         ck = self.store.checkpoint()
         if self.walking is None or ck is None:
             return
-        rows: list[tuple[int, bytes, bytes, smt.Proof]] = []
+        rows: list[tuple[int, bytes, bytes, bytes, smt.Proof]] = []
         for row in codec.as_seq(codec.decode(env.env.body)):
-            r = codec.as_seq(row, 4)
+            r = codec.as_seq(row, 5)
             rows.append(
                 (
                     codec.as_int(r[0]),
                     codec.as_bytes(r[1]),
                     codec.as_bytes(r[2]),
-                    smt.Proof.decode(codec.as_bytes(r[3])),
+                    codec.as_bytes(r[3]),  # the credential; the leaf commits to it
+                    smt.Proof.decode(codec.as_bytes(r[4])),
                 )
             )
         self.store.adopt_state(rows, ck.root)

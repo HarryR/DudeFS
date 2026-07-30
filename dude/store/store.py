@@ -75,7 +75,10 @@ CREATE TABLE IF NOT EXISTS live (
     value  BLOB NOT NULL,              -- ciphertext; held here so it outlives its log entry
     epoch  INTEGER NOT NULL DEFAULT 0, -- which keyepoch `value` is under (#conveyor)
     path   BLOB NOT NULL,              -- H(store||name): where this key sits in the state root
-    cred   BLOB NOT NULL DEFAULT x'',  -- the signed transaction that authorised `value` (#conveyor)
+    -- The signed transaction that authorised `value`, for EVERY row. NO DEFAULT: the state root
+    -- commits to it (`smt.leaf_hash`), so a row without one is not a row this system has, and an
+    -- INSERT that forgets it must fail rather than quietly produce an unauthenticated leaf.
+    cred   BLOB NOT NULL,
     PRIMARY KEY (store, name)
 );
 -- UNIQUE deliberately: `path` is a hash of the primary key, so a duplicate is a collision, and a
@@ -297,9 +300,9 @@ class Store:
         chain behind it is a traversal (`history`), and compaction may have collapsed it
         (#provenance)."""
         row = self.db.execute(
-            "SELECT head, value, epoch FROM live WHERE store=? AND name=?", (store, name)
+            "SELECT head, value, epoch, cred FROM live WHERE store=? AND name=?", (store, name)
         ).fetchone()
-        return Held(row[0], row[1], row[2]) if row else None
+        return Held(row[0], row[1], row[2], row[3]) if row else None
 
     def prefix(self, store: int, pre: bytes) -> Iterator[Row]:
         """Every live `(name, provenance, value)` in `store` whose name starts with `pre`, in name
@@ -542,10 +545,16 @@ class Store:
         already produced it in order — and because replay hands over the same shape without any
         evaluation having happened (#replay-does-not-readjudicate)."""
         seg = self.segment_of(idx)
-        # The credential a `Set` leaves behind is the transaction doing it: management rows only,
-        # because that store IS the authority and is the one place "who said so" must outlive the
-        # log. Recording it for every data row would double the live view for a chain that data
-        # rows already derive from management state.
+        # The credential a `Set` leaves behind is the transaction doing it, FOR EVERY STORE `[H]`.
+        # It was management-only while the leaf hashed the value alone, on the reasoning that data
+        # rows derive their authority from management state — true of the authority, and no use to
+        # a reader holding a row: the chain existed and nothing carried it. Now the leaf commits to
+        # it (`smt.leaf_hash`), so every row answers "who was permitted to write this" without a
+        # second lookup, and the log's own history is not the only thing that can say.
+        #
+        # Storage: a transaction writing 100 keys stores 100 copies. Deduplicating by `op_hash`
+        # with live rows referencing it is the natural fix and the same refcount shape as epochs;
+        # inline until the numbers say otherwise (#credential-in-every-leaf).
         cred = tx.raw
         self.db.execute(
             "INSERT INTO entry (idx, kind, op_hash, raw, author, ts, segment)"
@@ -564,20 +573,25 @@ class Store:
                 # BEFORE the accumulator arithmetic, and that placement is the whole correctness of
                 # it: the loop below subtracts the current element for every mutation and only a
                 # `Set` adds one back, so falling through here would have deleted the moved row
-                # from `A_state` while leaving it in the live view. Provenance moves; nothing else
-                # does — the value, its epoch and both commitments are untouched, and the
-                # credential travels with the row so the chain back to whoever authorised this
-                # value outlives the entry that set it.
+                # from `A_state` while leaving it in the live view. Provenance moves; NOTHING ELSE
+                # DOES — the value, its epoch, its credential and both commitments are untouched.
+                #
+                # `m.credential` is deliberately not written. Settlement has already refused any
+                # move whose credential is not byte-for-byte what the row holds, so writing it
+                # would be a no-op — and not writing it makes relocation-invariance STRUCTURAL:
+                # since the root commits to the credential, there is now no path through this
+                # function by which relocating a row can move the state root. A guard that could be
+                # bypassed is weaker than an operation that cannot express the mistake. The
+                # credential still travels on the wire, because that is what lets a validator check
+                # the move without holding the row.
                 self.db.execute(
-                    "UPDATE live SET head=?, cred=? WHERE store=? AND name=?",
-                    (idx, m.credential, m.store, m.name),
+                    "UPDATE live SET head=? WHERE store=? AND name=?", (idx, m.store, m.name)
                 )
                 continue
             cur = self.get(m.store, m.name)
             if cur:
                 acc = crypto.acc_sub(acc, element(m.store, m.name, cur[1]))
             path = smt.path_of(m.store, m.name)
-            keep = cred if m.store == ops.STORE_MANAGEMENT else b""
             # Both commitments move together, in this transaction, for the same reason the live
             # view does: two truths about one state is the failure the store exists to prevent.
             self.tree.invalidate(path)
@@ -585,7 +599,7 @@ class Store:
                 self.db.execute(
                     "INSERT OR REPLACE INTO live (store, name, head, value, path, epoch, cred)"
                     " VALUES (?,?,?,?,?,?,?)",
-                    (m.store, m.name, idx, m.value, path, m.epoch, keep),
+                    (m.store, m.name, idx, m.value, path, m.epoch, cred),
                 )
                 acc = crypto.acc_add(acc, element(m.store, m.name, m.value))
             else:
@@ -778,7 +792,7 @@ class Store:
 
     def _collect(self, seg: int, at: Index, marker: ops.Compaction | None = None) -> Index:
         """`collect`'s body, assuming an open transaction and no stragglers."""
-        before = self.accumulator()
+        before, before_root = self.accumulator(), self.state_root()
         if marker is None:
             marker = ops.Compaction(seg, at - 1, before, self.log_accumulator(), self.state_root())
         self.db.execute(
@@ -805,11 +819,20 @@ class Store:
         self.db.execute("DELETE FROM entry WHERE segment=?", (seg,))
         self.db.execute("DELETE FROM segment WHERE id=?", (seg,))
 
+        # A HARD INVARIANT `[H]`, and therefore not a `DudeError`: collection is defined as
+        # state-preserving, so either of these firing means our own fold is wrong, not that
+        # somebody sent us something bad. Nothing may catch it (core/errors.py).
+        #
+        # BOTH COMMITMENTS, because there are two and preserving one says nothing about the other.
+        # The accumulator is over `(store, name, value)` and cannot see a credential at all, so
+        # while the root commits to credentials, an accumulator check alone would sleep through a
+        # relocation that rewrote one. The two disagreeing is precisely the "two truths about one
+        # state" failure the store exists to prevent, and the root is the half a joiner checks
+        # against.
         if self.accumulator() != before:
-            # A HARD INVARIANT `[H]`, and therefore not a `DudeError`: collection is defined as
-            # state-preserving, so this firing means our own fold is wrong, not that somebody sent
-            # us something bad. Nothing may catch it (core/errors.py).
             raise InvariantError("collection changed the state accumulator")
+        if self.state_root() != before_root:
+            raise InvariantError("collection changed the state root")
         return at
 
     # -- THE CONVEYOR (#conveyor) ---------------------------------------------- #
@@ -857,21 +880,29 @@ class Store:
             self.tree.hash_under(smt.with_bit(prefix, depth, 1), depth + 1),
         )
 
-    def rows_under(self, prefix: bytes, depth: int) -> tuple[tuple[int, bytes, bytes], ...]:
-        """Every live `(store, name, value)` whose path falls under `prefix`'s first `depth` bits.
+    def rows_under(self, prefix: bytes, depth: int) -> tuple[tuple[int, bytes, bytes, bytes], ...]:
+        """Every live `(store, name, value, credential)` whose path falls under `prefix`'s first
+        `depth` bits.
+
+        THE CREDENTIAL IS NOT OPTIONAL HERE. The root commits to it, so a row served without one
+        cannot be folded to the root a quorum signed — the transfer would refuse every row it was
+        given. It is also the thing the receiver actually wants: a row arriving from a stranger is
+        worth having because it carries the signature that authorised it, not because the stranger
+        said so.
 
         A subtree is a contiguous range in path order, so this is an index scan, not a walk."""
         lo, hi = smt.bounds(prefix, depth)
         return tuple(
-            (int(s), n, val)
-            for s, n, val in self.db.execute(
-                "SELECT store, name, value FROM live WHERE path BETWEEN ? AND ? ORDER BY path",
+            (int(s), n, val, cred)
+            for s, n, val, cred in self.db.execute(
+                "SELECT store, name, value, cred FROM live"
+                " WHERE path BETWEEN ? AND ? ORDER BY path",
                 (lo, hi),
             )
         )
 
     def adopt_state(
-        self, rows: Iterable[tuple[int, bytes, bytes, smt.Proof]], root: crypto.Digest
+        self, rows: Iterable[tuple[int, bytes, bytes, bytes, smt.Proof]], root: crypto.Digest
     ) -> str | None:
         """Apply state this node never held, each row checked against a root the quorum signed.
 
@@ -885,17 +916,24 @@ class Store:
         transfer that is only checked at the end. That per-chunk property is what lets the walk be
         optimistic — pull, verify, discard the bad — rather than all-or-nothing.
 
+        AND EACH ROW ARRIVES WITH THE CREDENTIAL THAT AUTHORISED IT, which `smt.verify` folds into
+        the leaf. So a transferred row is not merely "committed by a quorum" — it carries the
+        signature of the client who was permitted to write it, and a peer cannot substitute one it
+        prefers without failing the fold. It is also simply required for the arithmetic: storing a
+        row without its credential would give this node a different root from the one it just
+        checked against, and every subsequent walk would disagree with the cluster for ever.
+
         It does NOT touch `A_log` or the head: history is not what is being transferred. Those come
         from the checkpoint the root belongs to, and from replaying forward afterwards."""
-        checked: list[tuple[int, bytes, bytes]] = []
-        for store, name, value, proof in rows:
-            if not smt.verify(root, store, name, value, proof):
+        checked: list[tuple[int, bytes, bytes, bytes]] = []
+        for store, name, value, cred, proof in rows:
+            if not smt.verify(root, store, name, (value, cred), proof):
                 return f"a row for store {store} does not verify against the signed root"
-            checked.append((store, name, value))
+            checked.append((store, name, value, cred))
         self.db.execute("BEGIN IMMEDIATE")
         try:
             acc = self.accumulator()
-            for store, name, value in checked:
+            for store, name, value, cred in checked:
                 if (cur := self.get(store, name)) is not None:
                     acc = crypto.acc_sub(acc, element(store, name, cur[1]))
                 path = smt.path_of(store, name)
@@ -903,7 +941,7 @@ class Store:
                 self.db.execute(
                     "INSERT OR REPLACE INTO live (store, name, head, value, path, epoch, cred)"
                     " VALUES (?,?,?,?,?,?,?)",
-                    (store, name, 0, value, path, ops.EPOCH_NONE, b""),
+                    (store, name, 0, value, path, ops.EPOCH_NONE, cred),
                 )
                 acc = crypto.acc_add(acc, element(store, name, value))
             self._set_meta("acc", acc)

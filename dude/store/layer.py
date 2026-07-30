@@ -32,9 +32,24 @@ class Held(NamedTuple):
 
     provenance: Index
     value: bytes
-    epoch: int = ops.EPOCH_NONE
+    epoch: int
     """Which keyepoch `value` is under. A reader needs it to pick a key, and the conveyor needs it
     to count (#conveyor)."""
+
+    cred: bytes
+    """The signed transaction that authorised `value`, and part of what the root commits to
+    (`smt.leaf_hash`).
+
+    ON THE READ SURFACE because settlement must compare a relocation against the credential the row
+    ALREADY holds, and settlement reads through a `Layer` — so asking the store directly would miss
+    a row written earlier in the same batch.
+
+    NO DEFAULT, and neither has `epoch` any more `[H]`. There is no live row without a credential:
+    the two write paths are `_commit`, which records the transaction doing the write, and
+    `adopt_state`, which takes the credential from the peer and checks it against the signed root.
+    An empty one is not a state the system has — so it must not be a value this type can be given
+    by omission. A default here would make an unauthenticated leaf constructible by forgetting an
+    argument, which is the shape of every bug this codebase keeps finding."""
 
 
 class Row(NamedTuple):
@@ -95,18 +110,19 @@ class Layer:
         """Merged view. A tombstone in this layer HIDES a base row — without that, a deleted key
         would reappear in an enumeration, which is how `Management.nodes()` would resurrect a node
         removed earlier in the same transaction."""
-        rows: dict[bytes, Held] = {
-            name: Held(prov, val, ep) for name, prov, val, ep in self._base.prefix(store, pre)
-        }
+        # `Row`, not `Held`, for the merge: enumeration does not carry credentials, and building a
+        # `Held` here would mean inventing an empty one for every base row — a value no live row
+        # has. The delta's `Held`s are narrowed to `Row` on the way in instead.
+        rows: dict[bytes, Row] = {r.name: r for r in self._base.prefix(store, pre)}
         for (st, name), held in self._delta.items():
             if st != store or not name.startswith(pre):
                 continue
             if held is None:
                 rows.pop(name, None)
             else:
-                rows[name] = held
+                rows[name] = Row(name, held.provenance, held.value, held.epoch)
         for name in sorted(rows):
-            yield Row(name, rows[name].provenance, rows[name].value, rows[name].epoch)
+            yield rows[name]
 
     def epoch_live(self, epoch: int) -> int:
         """The base count, corrected for what this layer has done to it.
@@ -125,18 +141,25 @@ class Layer:
 
     # -- writes ------------------------------------------------------------- #
 
-    def apply(self, m: ops.Mutation) -> None:
-        """Record one mutation. Nothing reaches the underlying store."""
+    def apply(self, m: ops.Mutation, cred: bytes) -> None:
+        """Record one mutation. Nothing reaches the underlying store.
+
+        `cred` is the credential a `Set` will leave behind — the transaction doing it. REQUIRED,
+        for the reason `Held.cred` has no default: the layer cannot know it and the caller settling
+        the transaction can, so an omitted one would silently record a row that could not exist.
+        Without it a key set and then relocated within one batch would be compared against an empty
+        credential and refused for a reason that is not true of it."""
         if isinstance(m, ops.Move):
             # Carries no value: it moves whatever is already there, so the layer copies the current
-            # row forward rather than inventing one. A move of a key that is absent records
-            # nothing — settlement refuses it separately, with a reason.
+            # row forward rather than inventing one — CREDENTIAL INCLUDED, since a relocation moves
+            # provenance and nothing else. A move of a key that is absent records nothing —
+            # settlement refuses it separately, with a reason.
             held = self.get(m.store, m.name)
             if held is not None:
-                self._delta[(m.store, m.name)] = Held(PENDING, held.value, held.epoch)
+                self._delta[(m.store, m.name)] = Held(PENDING, held.value, held.epoch, held.cred)
         else:
             self._delta[(m.store, m.name)] = (
-                Held(PENDING, m.value, m.epoch) if isinstance(m, ops.Set) else None
+                Held(PENDING, m.value, m.epoch, cred) if isinstance(m, ops.Set) else None
             )
         self._log.append(m)
 

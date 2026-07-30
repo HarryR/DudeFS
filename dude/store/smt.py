@@ -53,11 +53,23 @@ def path_of(store: int, name: bytes) -> bytes:
     return bytes(crypto.h_domain(_PATH, codec.encode([store, name])))
 
 
-def leaf_hash(path: bytes, vhash: crypto.Digest) -> crypto.Digest:
-    """Binds the leaf to its OWN path, so a leaf cannot be replayed at another position.
+def leaf_hash(path: bytes, vhash: crypto.Digest, chash: crypto.Digest) -> crypto.Digest:
+    """Binds the leaf to its OWN path, so a leaf cannot be replayed at another position — and to
+    the CREDENTIAL that authorised its value.
 
-    Both fields are fixed width, so plain concatenation is injective and needs no framing."""
-    return crypto.h_domain(_LEAF, path + vhash)
+    `[H]` *"why not just put it in all leaves? It's an authenticated data store."* Without the
+    credential the root commits to what every key holds and to nothing about who was permitted to
+    put it there, so the only thing authenticating a data row is the quorum's say-so. A quorum at
+    or above threshold could then commit arbitrary state and every check in this file would pass.
+    With it, a proof answers "this key holds this value, and here is the signature that put it
+    there" in one step, and a compromised quorum can still only carry writes some authorised client
+    actually signed: it may omit, reorder or replay, but it cannot invent a value for a key.
+
+    THE HASH OF THE CREDENTIAL, not the bytes, so a proof of a value stays small. A verifier that
+    also wants the authorisation is handed the credential and checks it against this digest.
+
+    All three fields are fixed width, so plain concatenation is injective and needs no framing."""
+    return crypto.h_domain(_LEAF, path + vhash + chash)
 
 
 def branch_hash(
@@ -123,11 +135,17 @@ class Proof:
 
     siblings: tuple[crypto.Digest, ...]
     occupant: tuple[bytes, crypto.Digest] | None = None
-    """`(path, value hash)` of whatever leaf sits at the end of the walk, if any.
+    """`(path, LEAF HASH)` of whatever leaf sits at the end of the walk, if any.
 
     For an inclusion proof that is the key itself. For an absence proof it is either `None` — the
     slot is empty — or a DIFFERENT key that happens to live where ours would have: both are proofs
-    that ours is not there, and the second is the common case in a populated tree."""
+    that ours is not there, and the second is the common case in a populated tree.
+
+    THE LEAF HASH RATHER THAN THE VALUE HASH, because a leaf is no longer determined by its value
+    alone. This field's job is to name the terminal the fold starts from, and that terminal is the
+    leaf hash; carrying its ingredients instead would mean carrying two digests to rebuild one, and
+    would tell the asker a neighbour's value hash for no reason. A presence claim recomputes this
+    from the value and credential it was given, so nothing here is believed."""
 
     def encode(self) -> bytes:
         occ = [self.occupant[0], self.occupant[1]] if self.occupant else []
@@ -158,38 +176,53 @@ def _fold(
     return node
 
 
-def _present(root: crypto.Digest, path: bytes, value: bytes, proof: Proof) -> bool:
+def _present(root: crypto.Digest, path: bytes, held: tuple[bytes, bytes], proof: Proof) -> bool:
     if proof.occupant is None or proof.occupant[0] != path:
         return False  # a presence claim needs OUR leaf, not a neighbour's
-    if proof.occupant[1] != crypto.h(value):
+    value, credential = held
+    # RECOMPUTED from what the caller says the key holds, so the quoted terminal is checked rather
+    # than used. A prover choosing this digest freely would prove any value it liked.
+    term = leaf_hash(path, crypto.h(value), crypto.h(credential))
+    if proof.occupant[1] != term:
         return False
-    return _fold(path, leaf_hash(path, proof.occupant[1]), proof.siblings) == root
+    return _fold(path, term, proof.siblings) == root
 
 
 def _absent(root: crypto.Digest, path: bytes, proof: Proof) -> bool:
     if proof.occupant is None:
         return _fold(path, EMPTY, proof.siblings) == root
-    other, vhash = proof.occupant
+    other, term = proof.occupant
     if other == path:
         return False  # that leaf IS ours; this proves presence, not absence
     if bounds(other, len(proof.siblings)) != bounds(path, len(proof.siblings)):
         # The occupant must sit where OUR key would have gone. A leaf from an unrelated part of the
         # tree proves nothing about ours, and the fold alone would not catch it.
         return False
-    return _fold(path, leaf_hash(other, vhash), proof.siblings) == root
+    return _fold(path, term, proof.siblings) == root
 
 
-def verify(root: crypto.Digest, store: int, name: bytes, value: bytes | None, proof: Proof) -> bool:
-    """Does `proof` show that `(store, name)` holds `value` — or, for `value=None`, holds nothing?
+def verify(
+    root: crypto.Digest,
+    store: int,
+    name: bytes,
+    held: tuple[bytes, bytes] | None,
+    proof: Proof,
+) -> bool:
+    """Does `proof` show that `(store, name)` holds this `(value, credential)` — or, for
+    `held=None`, holds nothing?
+
+    PRESENCE IS A PAIR, deliberately: the leaf commits to both, so there is no way to ask this
+    question about a value while declining to say who authorised it. A signature is not optional
+    context in an authenticated data store.
 
     A total function over closed types (#no-exceptions-for-control-flow): every malformed,
     mismatched or simply wrong proof is `False`, and nothing here raises."""
     if len(proof.siblings) > MAX_DEPTH:
         return False
     path = path_of(store, name)
-    if value is None:
+    if held is None:
         return _absent(root, path, proof)
-    return _present(root, path, value, proof)
+    return _present(root, path, held, proof)
 
 
 class Tree:
@@ -199,12 +232,17 @@ class Tree:
         self.db = db
 
     def _leaves(self, path: bytes, depth: int) -> list[tuple[bytes, crypto.Digest]]:
-        """The leaves under a prefix, at most two — which is all any decision here needs."""
+        """The leaves under a prefix, at most two — which is all any decision here needs.
+
+        Returns each as `(path, leaf hash)`, already hashed: every caller wants the terminal, and
+        building it in one place is what keeps `hash_under` and `prove` agreeing about what a leaf
+        is."""
         lo, hi = bounds(path, depth)
         return [
-            (r[0], crypto.h(r[1]))
+            (r[0], leaf_hash(r[0], crypto.h(r[1]), crypto.h(r[2])))
             for r in self.db.execute(
-                "SELECT path, value FROM live WHERE path>=? AND path<=? ORDER BY path LIMIT 2",
+                "SELECT path, value, cred FROM live"
+                " WHERE path>=? AND path<=? ORDER BY path LIMIT 2",
                 (lo, hi),
             )
         ]
@@ -226,7 +264,7 @@ class Tree:
         if len(found) == 1:
             # THE COMPRESSION, in one line: a lone leaf hashes as itself however deep it sits, so
             # the walk stops here instead of descending to 256.
-            return leaf_hash(*found[0])
+            return found[0][1]
         left, right = bounds(path, depth + 1)[0], bounds(_flip(path, depth), depth + 1)[0]
         if bit(path, depth) == 1:
             left, right = right, left

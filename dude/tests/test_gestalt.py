@@ -19,7 +19,7 @@ from ..net import Verb
 from ..net.envelope import Envelope, Frame, seal, unseal
 from ..net.transports import InProc, Switchboard, address_of, name_of
 from ..node import _DISPATCH, HANDLED, REPLIES, UNIMPLEMENTED, Node, _encode_slice, _slice_digest
-from ..store import Commitment, Entry, Store, attest, ops, smt
+from ..store import Commitment, Entry, Store, attest, ops, settle, smt
 from ..store.management import P_NODE, P_ROSTER, Management, Role
 from ..store.store import StoreError
 from ..tunables import DEFAULT
@@ -488,8 +488,8 @@ class TestTheStateWalk(unittest.TestCase):
 
     def _rows_with_proofs(self, prefix=b"", depth=0):
         return [
-            (store, name, value, self.source.store.prove(store, name))
-            for store, name, value in self.source.store.rows_under(prefix, depth)
+            (store, name, value, cred, self.source.store.prove(store, name))
+            for store, name, value, cred in self.source.store.rows_under(prefix, depth)
         ]
 
     def test_a_wiped_node_takes_the_whole_state_against_the_root(self):
@@ -513,14 +513,44 @@ class TestTheStateWalk(unittest.TestCase):
         wiped = Store()
         wiped.provision(self.c.mgr.public)
         rows = self._rows_with_proofs()
-        store, name, _value, proof = rows[0]
-        rows[0] = (store, name, b"not-what-was-committed", proof)
+        store, name, _value, cred, proof = rows[0]
+        rows[0] = (store, name, b"not-what-was-committed", cred, proof)
 
         why = wiped.adopt_state(rows, self.root)
 
         assert why is not None, "a value the root does not commit to was applied"
         self.assertIn("does not verify", why)
         self.assertEqual(wiped.get(store, name), None, "part of a poisoned chunk landed")
+
+    def test_a_row_whose_credential_was_substituted_is_refused(self):
+        """The transfer's half of `[H]`'s ruling. The VALUE here is genuine and really was
+        committed — only the credential differs, and the fold still refuses the row. So a peer
+        cannot hand a joiner real data under an authorisation of its own choosing."""
+        wiped = Store()
+        wiped.provision(self.c.mgr.public)
+        rows = self._rows_with_proofs()
+        store, name, value, _cred, proof = rows[0]
+        rows[0] = (store, name, value, b"authorised-by-whoever-is-serving-you", proof)
+
+        why = wiped.adopt_state(rows, self.root)
+
+        assert why is not None, "a row arrived with a credential the root does not commit to"
+        self.assertIn("does not verify", why)
+
+    def test_a_transferred_roster_row_still_traces_to_the_manager(self):
+        """THE PAYOFF, and the reason the credential is in the leaf rather than only in the log.
+        This node holds no entries at all — it replayed nothing — and can still answer "who was
+        permitted to write this" for a row a stranger handed it, WITHOUT asking the quorum that the
+        roster itself defines."""
+        wiped = Store()
+        wiped.provision(self.c.mgr.public)
+        self.assertIsNone(wiped.adopt_state(self._rows_with_proofs(), self.root))
+        self.assertEqual(wiped.head(), 0, "the premise is wrong: this node replayed history")
+
+        key = P_NODE + bytes(self.source.me.public)
+        who = settle.vouched(wiped, ops.STORE_MANAGEMENT, key, wiped.credential(M, key))
+
+        self.assertEqual(who, self.c.mgr.public, "the chain back to the manager did not survive")
 
     def test_a_subtree_that_already_agrees_is_never_transferred(self):
         """Cost degrades smoothly with absence: the walk descends only where the hashes differ, so a
@@ -705,8 +735,8 @@ class TestAFinishedWalkIsCorroborated(unittest.TestCase):
     def _walked(self) -> Store:
         joiner = self._bare()
         rows = [
-            (store, name, value, self.source.store.prove(store, name))
-            for store, name, value in self.source.store.rows_under(b"", 0)
+            (store, name, value, cred, self.source.store.prove(store, name))
+            for store, name, value, cred in self.source.store.rows_under(b"", 0)
         ]
         assert joiner.adopt_state(rows, self.ck.root) is None
         return joiner
@@ -724,8 +754,8 @@ class TestAFinishedWalkIsCorroborated(unittest.TestCase):
         genuine rows. The walk simply did not finish, and only the fold can say so."""
         joiner = self._bare()
         rows = [
-            (store, name, value, self.source.store.prove(store, name))
-            for store, name, value in self.source.store.rows_under(b"", 0)
+            (store, name, value, cred, self.source.store.prove(store, name))
+            for store, name, value, cred in self.source.store.rows_under(b"", 0)
         ][:3]
         self.assertIsNone(joiner.adopt_state(rows, self.ck.root))
 
@@ -1346,7 +1376,9 @@ class TestClusterCollection(unittest.TestCase):
         hot = crypto.h(b"hot")
         held = node.store.get(D, hot)
         assert held is not None
-        self.assertTrue(smt.verify(ck.root, D, hot, held.value, node.store.prove(D, hot)))
+        self.assertTrue(
+            smt.verify(ck.root, D, hot, (held.value, held.cred), node.store.prove(D, hot))
+        )
         self.assertTrue(
             smt.verify(ck.root, D, b"never-written", None, node.store.prove(D, b"never-written"))
         )
@@ -1554,14 +1586,22 @@ class TestTheAngelDuty(unittest.TestCase):
         k0 = crypto.h(b"k0")
         held = node.store.get(D, k0)
         assert held is not None
-        self.assertTrue(smt.verify(said.claim.root, D, k0, held.value, node.store.prove(D, k0)))
+        self.assertTrue(
+            smt.verify(said.claim.root, D, k0, (held.value, held.cred), node.store.prove(D, k0))
+        )
         self.assertTrue(
             smt.verify(
                 said.claim.root, D, b"nothing-here", None, node.store.prove(D, b"nothing-here")
             )
         )
         self.assertFalse(
-            smt.verify(said.claim.root, D, k0, b"not what it holds", node.store.prove(D, k0))
+            smt.verify(
+                said.claim.root,
+                D,
+                k0,
+                (b"not what it holds", held.cred),
+                node.store.prove(D, k0),
+            )
         )
 
     def test_the_floor_needs_more_than_one_answer(self):

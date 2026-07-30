@@ -161,7 +161,7 @@ class TestTheGuardSeesUncommittedWork(_Fixture):
         base = store.Store()
         lay = layer.Layer(base)
         self.assertEqual(lay.epoch_live(4), 0)
-        lay.apply(ops.Set(D, b"k", b"v", 4))
+        lay.apply(ops.Set(D, b"k", b"v", 4), b"cred")
         self.assertEqual(lay.epoch_live(4), 1, "the layer did not see its own write")
         self.assertFalse(layer.holds(lay, ops.Drained(4)))
 
@@ -170,14 +170,14 @@ class TestTheGuardSeesUncommittedWork(_Fixture):
         base.apply((tx(self.kp, muts=(ops.Set(D, b"k", b"v", 4),)),), auth=None)
         lay = layer.Layer(base)
         self.assertFalse(layer.holds(lay, ops.Drained(4)))
-        lay.apply(ops.Del(D, b"k"))
+        lay.apply(ops.Del(D, b"k"), b"cred")
         self.assertTrue(layer.holds(lay, ops.Drained(4)), "the layer did not see its own delete")
 
     def test_a_conveyance_in_the_same_layer_releases_it(self):
         base = store.Store()
         base.apply((tx(self.kp, muts=(ops.Set(D, b"k", b"old", 4),)),), auth=None)
         lay = layer.Layer(base)
-        lay.apply(ops.Set(D, b"k", b"new", 5))
+        lay.apply(ops.Set(D, b"k", b"new", 5), b"cred")
         self.assertTrue(layer.holds(lay, ops.Drained(4)))
         self.assertFalse(layer.holds(lay, ops.Drained(5)))
 

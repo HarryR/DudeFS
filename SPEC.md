@@ -325,6 +325,24 @@ Collection MUST be refused when any of these holds:
   from never-inserted, and no history may enter the root.
 - Every leaf MUST be bound to its own path, and every internal node to its depth **and** its prefix,
   so no hash can be quoted out of position.
+- **Every leaf MUST also be bound to the credential that authorised its value** — the signed
+  transaction that wrote it — hashed, so a proof of a value stays small. Without this the root
+  commits to what every key holds and to nothing about who was permitted to put it there, so a
+  quorum at or above threshold could assert arbitrary state and every proof would still verify. A
+  quorum can always omit, reorder or replay; it MUST NOT be able to invent a value for a key.
+- A credential MUST be kept for **every** live row, in every store, and MUST NOT be optional in any
+  type, schema or wire format that carries a row. There is no live row without one.
+- Presence MUST be asked as a pair — value **and** credential — so no interface can ask about a
+  value while declining to say who authorised it.
+- A relocation (#conveyor) MUST carry the credential the row already holds, byte for byte, in every
+  store. Re-vouching is NOT sufficient: two different valid credentials for one value both vouch,
+  and swapping one for the other moves the root. Where possible the write path MUST make a
+  relocation structurally incapable of altering a credential rather than checking that it did not.
+- Collection MUST preserve the root as well as `A_state`, and MUST verify both. `A_state` is over
+  `(store, name, value)` and cannot see a credential at all, so it alone would sleep through a
+  relocation that rewrote one.
+- A party that transfers state MUST serve each row's credential with it, and the receiver MUST store
+  it. A row stored without its credential yields a different root from the one just verified.
 - Empty subtrees MUST hash to a fixed constant per depth.
 - Domain separation MUST use BLAKE2b personalisation, never a tag concatenated onto the message.
 - The root and `A_state` MUST both be maintained; neither replaces the other.
@@ -633,6 +651,10 @@ obliges**, which is the defect this table exists to make visible rather than pla
 | the verifier chooses the descent depth | `NetTunables.walk_depth`, `Node._on_hashes` |
 | a subtree hash is rebuilt from the answer, not believed | `node._folds_to` |
 | a finished walk is corroborated against the signed fold | `Store.adopted_at`, `Node._walk_done` |
+| every leaf commits to the credential that authorised it | `smt.leaf_hash` |
+| a relocation cannot alter a credential | `settle._relocates`, `Store._commit` |
+| collection preserves the root as well as the fold | `Store._collect` |
+| a transferred row arrives with its credential | `Store.rows_under`, `Store.adopt_state` |
 | an adopted height is monotone and durable | `Store.adopted_height` |
 | `f+1` is decided by the quorum module | `quorum.corroboration` |
 | a reply is correlated to the peer we asked | `Mailbox.arrived` |

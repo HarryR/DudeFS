@@ -46,7 +46,10 @@ class TestSettlement(unittest.TestCase):
         r = self.s.apply((tx(self.kp, (), (ops.Set(0, self.K, b"v1"),)),))
         self.assertEqual(len(r.settled), 1)
         idx, _ = r.settled[0]
-        self.assertEqual(self.s.get(ops.STORE_DATA, self.K), (idx, b"v1", ops.EPOCH_NONE))
+        held = self.s.get(ops.STORE_DATA, self.K)
+        assert held is not None
+        self.assertEqual((held.provenance, held.value, held.epoch), (idx, b"v1", ops.EPOCH_NONE))
+        self.assertTrue(held.cred, "a settled row kept no record of what authorised it")
         self.assertEqual(self.s.head(), idx)
 
     def test_absent_is_not_empty_bytes(self):
@@ -816,11 +819,9 @@ class TestTransferAndSettlementRace(unittest.TestCase):
         self.assertIsNotNone(self.s.get(ops.STORE_DATA, b"j"))
 
 
-class TestRelocation(unittest.TestCase):
-    """`ops.Move` (#conveyor). Migration used to author a `Set` of the same value and settle it
-    locally with authority checking disabled. That put node-signed writes into the management
-    store, displaced the manager's signature over the roster, and left honest nodes holding
-    byte-different logs. Each of those is a test below."""
+class _Relocation(unittest.TestCase):
+    """A manager, a node, and one roster row for them to move. Shared by the two relocation suites
+    below so the fixture is written once and neither suite re-runs the other's tests."""
 
     def setUp(self):
         self.s = store.Store()
@@ -849,6 +850,13 @@ class TestRelocation(unittest.TestCase):
         )
         move = ops.Move(ops.STORE_MANAGEMENT, self.roster_key, cred)
         return self.s.apply((ops.writes(move).sign(author, ts),), auth=self.mgmt)
+
+
+class TestRelocation(_Relocation):
+    """`ops.Move` (#conveyor). Migration used to author a `Set` of the same value and settle it
+    locally with authority checking disabled. That put node-signed writes into the management
+    store, displaced the manager's signature over the roster, and left honest nodes holding
+    byte-different logs. Each of those is a test below."""
 
     def test_a_relocation_moves_provenance_and_nothing_else(self):
         before = self.s.get(ops.STORE_MANAGEMENT, self.roster_key)
@@ -916,3 +924,73 @@ class TestRelocation(unittest.TestCase):
         move = ops.Move(ops.STORE_MANAGEMENT, b"never/existed", b"")
         got = self.s.apply((ops.writes(move).sign(self.node, 2),), auth=self.mgmt)
         self.assertEqual([d.why for d in got.dropped], [settle.Reason.RELOCATION])
+
+
+class TestRelocationInADataStore(_Relocation):
+    """The rule used to stop at the management store. `_relocates` returned True for any data-store
+    move without looking at the credential at all — safe only while a data row's credential was
+    empty and the root committed to nothing about it.
+
+    Now the leaf hashes the credential, so a move that carried a different one would rewrite part
+    of a leaf and MOVE THE STATE ROOT. Relocation-invariance is what makes collection
+    state-preserving, so this is not a policy about data stores; it is arithmetic."""
+
+    def setUp(self):
+        super().setUp()
+        self.key = b"a-data-key"
+        self.s.apply(
+            (ops.writes(ops.Set(D, self.key, b"a value")).sign(self.mgr, 1),), auth=self.mgmt
+        )
+
+    def _move_data(self, credential=None, ts=3):
+        cred = self.s.credential(D, self.key) if credential is None else credential
+        move = ops.Move(D, self.key, cred)
+        return self.s.apply((ops.writes(move).sign(self.node, ts),), auth=self.mgmt)
+
+    def test_an_honest_data_relocation_is_state_invariant(self):
+        acc, root = self.s.accumulator(), self.s.state_root()
+        self.assertEqual(self._move_data().dropped, (), "an honest relocation was refused")
+        self.assertEqual(self.s.accumulator(), acc)
+        self.assertEqual(self.s.state_root(), root, "a relocation moved the state root")
+
+    def test_a_data_relocation_carrying_someone_elses_credential_is_refused(self):
+        """A validly-signed transaction, by an author who really may write this store, over this
+        key's real current value — and still refused, because it is not the credential this row
+        holds. Vouching is not enough: two different credentials for one value both vouch, and
+        swapping one for the other still moves the root."""
+        twin = ops.writes(ops.Set(D, self.key, b"a value")).sign(self.mgr, 9)
+        self.assertIsNotNone(
+            settle.vouched(self.s, D, self.key, twin.raw), "the premise is wrong: it does not vouch"
+        )
+
+        got = self._move_data(credential=twin.raw)
+
+        self.assertEqual([d.why for d in got.dropped], [settle.Reason.RELOCATION])
+
+    def test_a_data_relocation_without_a_credential_is_refused(self):
+        self.assertEqual(
+            [d.why for d in self._move_data(credential=b"").dropped], [settle.Reason.RELOCATION]
+        )
+
+    def test_a_data_row_keeps_the_transaction_that_authorised_it(self):
+        """The other half of `[H]`'s ruling: the chain exists for data rows too, and something
+        carries it. `settle.vouched` is the check a holder of the row can run on its own."""
+        who = settle.vouched(self.s, D, self.key, self.s.credential(D, self.key))
+        self.assertEqual(who, self.mgr.public)
+
+    def test_migration_preserves_the_root(self):
+        """The production path, not a hand-built move: `Store.migration` authors the relocations
+        that drain a segment, and collection is only state-preserving if they are."""
+        for i in range(4):
+            self.s.apply(
+                (ops.writes(ops.Set(D, f"k{i}".encode(), b"v")).sign(self.mgr, 2 + i),),
+                auth=self.mgmt,
+            )
+        root = self.s.state_root()
+        moved = self.s.migration(0, self.node, now=9, at_most=64)
+        assert moved is not None, "nothing to migrate; the test proves nothing"
+
+        got = self.s.apply((moved,), auth=self.mgmt)
+
+        self.assertEqual(got.dropped, (), "the migration this store authored was refused")
+        self.assertEqual(self.s.state_root(), root, "migration moved the state root")
