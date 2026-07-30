@@ -10,6 +10,7 @@ import unittest
 
 from ..core import crypto
 from ..mempool import (
+    CANNOT_APPLY,
     DUPLICATE,
     TOO_NEW,
     TOO_OLD,
@@ -92,34 +93,38 @@ class TestAdmission(unittest.TestCase):
         self.kp = crypto.Keypair.generate()
         self.t = Tunables(delta=1_000, w_admit=30_000)
         self.mp = Mempool(self.t)
+        self.store = Store()  # the door consults state, so it needs one
+
+    def _admit(self, tx, now=T0):
+        return self.mp.admit(tx, now, self.store)
 
     def test_clock_faults_are_named_not_merely_refused(self):
         """A client self-corrects only if the refusal says WHICH way its clock is wrong (§1.1)."""
-        self.assertEqual(self.mp.admit(write(self.kp, "a", b"v", T0 - 60_000), T0), TOO_OLD)
-        self.assertEqual(self.mp.admit(write(self.kp, "b", b"v", T0 + 60_000), T0), TOO_NEW)
-        self.assertIsNone(self.mp.admit(write(self.kp, "c", b"v", T0), T0))
+        self.assertEqual(self._admit(write(self.kp, "a", b"v", T0 - 60_000)), TOO_OLD)
+        self.assertEqual(self._admit(write(self.kp, "b", b"v", T0 + 60_000)), TOO_NEW)
+        self.assertIsNone(self._admit(write(self.kp, "c", b"v", T0)))
 
     def test_late_is_carried_forward_not_stranded(self):
         """§1.1's floor-not-window rule. A slow client's transaction lands in the CURRENT bucket,
         so it settles a few buckets later than its own clock suggests — never stranded in a bucket
         that has already gone."""
         late = write(self.kp, "late", b"v", T0 - 20_000)  # inside w_admit, 20 buckets back
-        self.assertIsNone(self.mp.admit(late, T0))
+        self.assertIsNone(self._admit(late))
         self.assertEqual(self.mp.buckets(), (self.t.bucket(T0),))
         self.assertNotIn(self.t.bucket(T0 - 20_000), self.mp.buckets())
 
     def test_early_client_waits_in_its_own_future_bucket(self):
         """The mirror case: a fast client's transaction lands where its `ts` says, ahead of now."""
         early = write(self.kp, "early", b"v", T0 + 20_000)
-        self.assertIsNone(self.mp.admit(early, T0))
+        self.assertIsNone(self._admit(early))
         self.assertEqual(self.mp.buckets(), (self.t.bucket(T0 + 20_000),))
 
     def test_unsigned_and_duplicate(self):
         tx = write(self.kp, "x", b"v", T0)
         forged = ops.SignedTransaction(tx.author, tx.ts, tx.txn, crypto.Signature(bytes(64)))
-        self.assertEqual(self.mp.admit(forged, T0), UNSIGNED)
-        self.assertIsNone(self.mp.admit(tx, T0))
-        self.assertEqual(self.mp.admit(tx, T0), DUPLICATE)
+        self.assertEqual(self._admit(forged), UNSIGNED)
+        self.assertIsNone(self._admit(tx))
+        self.assertEqual(self._admit(tx), DUPLICATE)
 
     def test_identity_is_the_store_s_own(self):
         """Dedup is the primary replay defence, and it only works because both sides agree on what
@@ -131,7 +136,7 @@ class TestAdmission(unittest.TestCase):
         """§1.2. A transaction admitted at the very edge of `w_admit` is endorsed a wave later, so
         re-applying the door would refuse a slice member that was legitimately admitted."""
         edge = write(self.kp, "edge", b"v", T0 - self.t.w_admit)
-        self.assertIsNone(self.mp.admit(edge, T0))
+        self.assertIsNone(self._admit(edge))
         later = T0 + self.t.w_valid_margin  # a couple of waves on
         self.assertGreater(later - edge.ts, self.t.w_admit)  # the door would now refuse it...
         self.assertTrue(self.mp.endorsable(edge, later))  # ...but endorsement does not
@@ -158,7 +163,7 @@ class TestProposal(unittest.TestCase):
     def _pool(self, txs) -> Mempool:
         mp = Mempool(self.t)
         for tx in txs:
-            assert mp.admit(tx, T0) is None
+            assert mp.admit(tx, T0, self.store, self.mgmt) is None
         return mp
 
     def test_the_intersection_needs_no_search(self):
@@ -191,15 +196,33 @@ class TestProposal(unittest.TestCase):
         second = self._pool(list(reversed(txs))).propose(b, self.store, self.mgmt)
         self.assertEqual([tx_id(t) for t in first], [tx_id(t) for t in second])
 
-    def test_proposal_is_screened_so_it_cannot_offer_the_unlandable(self):
-        """`settle.would_apply` is the same evaluator the store and the client use, so a batch never
-        contains a transaction that would be rejected on arrival."""
-        stranger = crypto.Keypair.generate()  # never granted anything
-        good = write(self.mgr, "ok", b"v", T0)
-        bad = write(stranger, "nope", b"v", T0)
-        mp = self._pool([good, bad])
+    def test_a_batch_offers_one_of_two_mutually_exclusive_transactions(self):
+        """What proposal screening still does once the DOOR screens against state.
+
+        `[H]` *"you can have mutually exclusive items in the mempool - but the logic is 'choose one
+        to be settled'."* Both of these are individually valid, so both are admitted; they exclude
+        each other only in sequence. `would_apply` walks the candidates IN ORDER over a layer that
+        absorbs each survivor, so the second one's guard is false by the time it is reached.
+
+        This is what `ops.conflicts` was written for and never called to do, done against real state
+        rather than by comparing two envelopes. A transaction that cannot apply against committed
+        state no longer reaches this point at all, which is why the previous version of this test —
+        an unauthorised write, screened out here — can no longer be written."""
+        self.store.apply((write(self.mgr, "k", b"first", T0),))
+        expect = ops.value_digest(b"first")
+        a, b = (
+            ops.Transaction()
+            .then(ops.Set(D, name("k"), w), ops.Holds(D, name("k"), expect))
+            .sign(self.mgr, T0)
+            for w in (b"a-wins", b"b-wins")
+        )
+        mp = self._pool([a, b])
+
         batch = mp.propose(self.t.bucket(T0), self.store, self.mgmt)
-        self.assertEqual([tx_id(t) for t in batch], [tx_id(good)])
+
+        self.assertEqual(len(batch), 1, "both sides of an exclusion were offered")
+        self.assertIn(tx_id(batch[0]), {tx_id(a), tx_id(b)})
+        self.assertEqual(len(mp), 2, "the loser is still held: selection is not rejection")
 
     def test_backward_clock_step_cannot_equivocate(self):
         """§8's realistic fault: NTP correction or VM resume moves the clock back tens of seconds. A
@@ -225,47 +248,94 @@ class TestProposal(unittest.TestCase):
 
 
 class TestReentry(unittest.TestCase):
+    """What comes back from settlement, and what does not.
+
+    `[H]` *"After the block is applied we then take all the kicked transactions and try to put those
+    which are still valid back into the mempool; those whose predicates don't apply to the current
+    state are not put back."* And: *"the mempool entry validity requirements must be consistently
+    applied"* — so re-entry asks the door's question, through the door's code.
+
+    This replaced a rule that kept every reject except a bad signature and evicted on age. That rule
+    was an implementer's decision recorded directly beneath the ruling above."""
+
     def setUp(self):
         self.kp = crypto.Keypair.generate()
         self.t = Tunables(delta=1_000, w_admit=30_000)  # evict_after derives from w_valid
         self.mp = Mempool(self.t)
+        self.store = Store()
 
-    def test_reject_reasons_are_not_equally_final(self):
-        """MEMPOOL.md §5. "Cannot be applied given settled state" reads as "drop it", but only a bad
-        signature is permanently dead — `guard` and `authority` both become satisfiable again, so
-        evicting on the verdict would discard transactions that are merely EARLY."""
-        guarded = write(self.kp, "g", b"v", T0)
-        unauthorised = write(self.kp, "a", b"v", T0)
-        forged = write(self.kp, "s", b"v", T0)
-        for tx in (guarded, unauthorised, forged):
-            self.assertIsNone(self.mp.admit(tx, T0))
+    def _admit(self, tx, now=T0):
+        return self.mp.admit(tx, now, self.store)
 
-        dropped = self.mp.reenter(
-            (
-                (guarded, settle.Verdict(settle.Reason.GUARD, 0)),
-                (unauthorised, settle.Verdict(settle.Reason.AUTHORITY, 0)),
-                (forged, settle.Verdict(settle.Reason.SIGNATURE)),
-            ),
-            T0,
+    def _reenter(self, tx, why, now=T0):
+        rejects = (settle.Reject(tx, settle.Verdict(why, 0)),)
+        return self.mp.reenter(rejects, now, self.store)
+
+    def _cas(self, key: str, expect: bytes, value: bytes) -> ops.SignedTransaction:
+        """A compare-and-swap: `holds(key, digest(expect))` guarding a write."""
+        return (
+            ops.Transaction()
+            .then(ops.Set(D, name(key), value), ops.Holds(D, name(key), ops.value_digest(expect)))
+            .sign(self.kp, T0)
         )
-        self.assertEqual([tx_id(t) for t in dropped], [tx_id(forged)])
-        self.assertEqual(len(self.mp), 2)
 
-    def test_a_kept_reject_lands_in_a_current_bucket(self):
-        """Re-entry carries forward like admission does, so a reject cannot be parked in a bucket
-        that will never be proposed again."""
+    def test_a_reject_that_is_still_valid_comes_back(self):
+        """The case that makes this re-evaluation and not ejection: a transaction can be rejected
+        AT ITS POSITION in a batch and be applicable once the batch is done."""
         tx = write(self.kp, "g", b"v", T0)
-        self.mp.admit(tx, T0)
+        self.assertIsNone(self._admit(tx))
+
+        ejected = self._reenter(tx, settle.Reason.GUARD)
+
+        self.assertEqual(ejected, ())
+        self.assertEqual(len(self.mp), 1)
+
+    def test_a_transaction_that_cannot_apply_is_refused_at_the_door(self):
+        """The ruling at the other door: the client is told NOW, not by timeout."""
+        self.store.apply((write(self.kp, "k", b"actual", T0),))
+        stale = self._cas("k", expect=b"stale", value=b"v")
+
+        self.assertEqual(self._admit(stale), CANNOT_APPLY)
+        self.assertEqual(len(self.mp), 0)
+
+    def test_a_stale_compare_and_swap_does_not_come_back(self):
+        """The ABA case the old rule left open. The loser of a CAS race was held for the horizon and
+        re-proposed if the value came back; now it is ejected and the client must re-read."""
+        self.store.apply((write(self.kp, "k", b"first", T0),))
+        loser = self._cas("k", expect=b"first", value=b"mine")
+        self.assertIsNone(self._admit(loser))  # valid when submitted
+        self.store.apply((write(self.kp, "k", b"someone-else", T0),))  # it loses the race
+
+        ejected = self._reenter(loser, settle.Reason.GUARD)
+
+        self.assertEqual([tx_id(t) for t in ejected], [tx_id(loser)])
+        self.assertEqual(len(self.mp), 0)
+
+    def test_a_transaction_already_in_the_log_never_comes_back(self):
+        """`Reason.SETTLED` ends it whatever the state says: `op_hash` is unique, so it cannot land
+        twice. It arrived by transfer while the bucket was settling."""
+        tx = write(self.kp, "t", b"v", T0)
+        self.assertIsNone(self._admit(tx))
+
+        ejected = self._reenter(tx, settle.Reason.SETTLED)
+
+        self.assertEqual([tx_id(t) for t in ejected], [tx_id(tx)])
+
+    def test_a_reject_lands_in_a_current_bucket(self):
+        """Re-entry carries forward as admission does, so a reject cannot be parked in a bucket that
+        will never be proposed again."""
+        tx = write(self.kp, "g", b"v", T0)
+        self._admit(tx)
         later = T0 + 10_000
-        self.mp.reenter(((tx, settle.Verdict(settle.Reason.GUARD, 0)),), later)
+        self._reenter(tx, settle.Reason.GUARD, now=later)
         self.assertEqual(self.mp.buckets(), (self.t.bucket(later),))
 
-    def test_eviction_is_by_age_not_by_verdict(self):
-        """Holding a transaction until its guards come true is correct; holding it forever is a
-        denial-of-service. Bitcoin's mempool expiry has the same shape."""
+    def test_eviction_is_the_backstop_for_what_was_never_chosen(self):
+        """A transaction can be valid and never selected. The horizon is `w_valid`, past which an
+        endorser refuses it, so holding it longer retains what can never land."""
         tx = write(self.kp, "g", b"v", T0)
-        self.mp.admit(tx, T0)
-        self.assertEqual(self.mp.evict(T0 + 30_000), ())  # still young
+        self._admit(tx)
+        self.assertEqual(self.mp.evict(T0 + 30_000), ())  # still endorsable
         gone = self.mp.evict(T0 + 90_000)
         self.assertEqual([tx_id(t) for t in gone], [tx_id(tx)])
         self.assertEqual(len(self.mp), 0)
@@ -274,19 +344,19 @@ class TestReentry(unittest.TestCase):
         """Otherwise a transaction bounced through settlement resets its own clock and lives for
         ever — the eviction horizon has to be immune to re-entry."""
         tx = write(self.kp, "g", b"v", T0)
-        self.mp.admit(tx, T0)
-        for t in range(10_000, 60_000, 10_000):
-            self.mp.reenter(((tx, settle.Verdict(settle.Reason.GUARD, 0)),), T0 + t)
+        self._admit(tx)
+        for t in range(10_000, 30_000, 10_000):
+            self._reenter(tx, settle.Reason.GUARD, now=T0 + t)
         self.assertEqual(len(self.mp), 1)
         self.assertEqual(len(self.mp.evict(T0 + 90_000)), 1)
 
     def test_retire_forgets_and_then_refuses_as_duplicate(self):
         tx = write(self.kp, "x", b"v", T0)
-        self.mp.admit(tx, T0)
+        self._admit(tx)
         self.mp.retire((tx,))
         self.assertEqual(len(self.mp), 0)
         self.assertEqual(self.mp.buckets(), ())
-        self.assertEqual(self.mp.admit(tx, T0), DUPLICATE)
+        self.assertEqual(self._admit(tx), DUPLICATE)
 
 
 if __name__ == "__main__":

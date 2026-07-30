@@ -181,7 +181,7 @@ class Node:
         gate ruling in one line — a node carries an op it did not author, and authorises the
         requester, never the author."""
         tx = ops.SignedTransaction.decode(env.env.body)
-        refusal = self.mempool.admit(tx, now)
+        refusal = self.mempool.admit(tx, now, self.store, self.mgmt)
         if refusal is not None:
             self._reply(env, Verb.REFUSED, refusal.value.encode(), now)
             return
@@ -194,8 +194,24 @@ class Node:
         if env.frm in seen:
             return  # one batch per node per bucket (§4.1); a second is equivocation, not an offer
         seen[env.frm] = ids
+        if self._stale(ids, bucket, now):
+            return  # we do not vouch for a slice we can see is past its validity bound
         self._flood(Verb.ENDORSE, env.env.body, now)
         self._count(bucket, _slice_digest(bucket, ids), self.me.public, now)
+
+    def _stale(self, ids: tuple[crypto.Digest, ...], bucket: int, now: Millis) -> bool:
+        """Does this slice contain a transaction we hold that is past `w_valid`?
+
+        `Mempool.endorsable` is that check, and it had NO CALLER. The bound whose stated purpose is
+        "to stop an unguarded write being replayable indefinitely" was enforced by nothing, and the
+        only limit on a transaction's life was an eviction horizon that also never ran. A malicious
+        proposer could sit on a transaction and offer it long after its author's window.
+
+        Only what we HOLD can be judged: a body we do not have cannot be checked, which is the gap
+        `ANNOUNCE`/`FETCH` closes and this cannot. Silence is the refusal, as with a wrong fold: we
+        simply do not endorse, so a quorum of honest nodes cannot form around it."""
+        held = {tx.op_hash: tx for tx in self._held(bucket)}
+        return any(not self.mempool.endorsable(held[i], now) for i in ids if i in held)
 
     def _on_endorse(self, env: SignedEnvelope, now: Millis) -> None:
         bucket, ids = _decode_slice(env.env.body)
@@ -212,7 +228,7 @@ class Node:
         txn = self.store.migration(seg, self.me, now)
         if txn is None:
             return False
-        if self.mempool.admit(txn, now) is not None:
+        if self.mempool.admit(txn, now, self.store, self.mgmt) is not None:
             return False
         self._flood(Verb.SUBMIT, txn.raw, now)
         return True
@@ -489,10 +505,15 @@ class Node:
     # -- the round ----------------------------------------------------------------------------- #
 
     def tick(self, now: Millis) -> None:
-        """Advance: send what is due, reap expiries, then propose for any closed bucket."""
+        """Advance: send what is due, reap expiries, then propose for any closed bucket.
+
+        `mempool.evict` is called HERE, and was called nowhere: the age backstop whose own docstring
+        named unbounded retention a denial-of-service never ran, so a transaction that was valid and
+        never chosen stayed for ever. Nothing else in the round looks at age."""
         if now - self.last_probe >= self.tunables.attest.probe_every:
             self.probe(now)
         self.catch_up(now)
+        self.mempool.evict(now)
         self.postman.tick(now)
         self._propose(now)
 
@@ -556,6 +577,8 @@ class Node:
                 if tx.op_hash == op
             ),
             now,
+            self.store,
+            self.mgmt,
         )
         _ = digest
 

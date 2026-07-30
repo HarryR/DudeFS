@@ -456,7 +456,7 @@ ruff format dude -q && ruff check dude && ty check dude/ \
 
 Or `make check`, which is the same thing with `ruff format --check` so it writes nothing.
 
-**272 tests: 271 green, 1 red on purpose.** Lint, format and typecheck are clean. The red is
+**277 tests: 276 green, 1 red on purpose.** Lint, format and typecheck are clean. The red is
 `test_a_pull_for_a_collected_range_is_not_answered_with_a_hole`: an honest `PULL` for a collected range
 is still answered with a run starting past what was asked for (`8 != 2`), because the server has no way
 to say *"that range is gone"*. It asserts what the open step owes and fails until that lands. **If you

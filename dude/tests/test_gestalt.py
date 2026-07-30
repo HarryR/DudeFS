@@ -17,7 +17,7 @@ from ..core.errors import DudeError, InvariantError
 from ..net import Verb
 from ..net.envelope import Envelope, Frame, seal, unseal
 from ..net.transports import InProc, Switchboard, address_of, name_of
-from ..node import _DISPATCH, HANDLED, REPLIES, UNIMPLEMENTED, Node
+from ..node import _DISPATCH, HANDLED, REPLIES, UNIMPLEMENTED, Node, _encode_slice, _slice_digest
 from ..store import Commitment, Entry, Store, attest, ops, smt
 from ..store.management import P_NODE, Management, Role
 from ..store.store import StoreError
@@ -205,6 +205,42 @@ class TestGestalt(unittest.TestCase):
         self.assertFalse(
             issubclass(InvariantError, DudeError), "our error became catchable as theirs"
         )
+
+
+class TestEndorsementHasABound(unittest.TestCase):
+    """`Mempool.endorsable` is the `w_valid` bound, and it had NO CALLER — so the rule whose stated
+    purpose is "to stop an unguarded write being replayable indefinitely" was enforced nowhere, and
+    the only thing limiting a transaction's life was an eviction horizon that also never ran."""
+
+    def setUp(self):
+        self.c = Cluster()
+        self.client = self.c.mgr
+        self.node, self.proposer = self.c.nodes[1], self.c.nodes[0]
+        self.tx = ops.writes(ops.Set(D, crypto.h(b"aged"), b"v")).sign(self.client, T0)
+        assert self.node.mempool.admit(self.tx, T0, self.node.store, self.node.mgmt) is None
+        self.bucket = self.node.tunables.mempool.bucket(T0)
+        self.body = _encode_slice(self.bucket, (self.tx.op_hash,))
+        self.digest = _slice_digest(self.bucket, (self.tx.op_hash,))
+
+    def _propose_at(self, when: int) -> None:
+        env = Envelope(self.node.me.public, Verb.PROPOSE, b"p" * 16, self.body)
+        self.node.receive(seal(env.sign(self.proposer.me, when)), when)
+
+    def test_a_slice_inside_the_bound_is_endorsed(self):
+        """The control: without this the test below would pass for any reason at all."""
+        self._propose_at(T0 + DELTA)
+        self.assertIn((self.bucket, self.digest), self.node.endorsements)
+
+    def test_a_slice_past_the_bound_is_not_endorsed(self):
+        """A malicious proposer sits on a transaction and offers it long after its author's window.
+        Silence is the refusal, as with a wrong fold: we do not endorse, so a quorum of honest nodes
+        cannot form around it."""
+        late = T0 + self.node.tunables.mempool.w_valid + 1
+        self.assertFalse(self.node.mempool.endorsable(self.tx, late))
+
+        self._propose_at(late)
+
+        self.assertNotIn((self.bucket, self.digest), self.node.endorsements)
 
 
 class TestVerbCoverage(unittest.TestCase):

@@ -462,6 +462,31 @@ it. Nothing in it may rest on the word of the cluster being joined.
 - Shunning MUST be a local read policy. It MUST NOT alter the roster or the quorum arithmetic, so a
   heavily shunned cluster stalls rather than proceeding on a thinned quorum.
 
+## The mempool {#mempool}
+
+- **One predicate decides mempool entry, and every door MUST apply it.** A client submitting and a
+  reject returning from settlement ask the same question; two policies that agree today is how they
+  stop agreeing later.
+- That predicate MUST include the admission window, the signature, **and whether the transaction
+  would apply against committed state**. A transaction that cannot apply now would not have landed
+  even if a batch chose it, so admitting it costs the client the only thing it wanted: an answer.
+- A refusal MUST name its reason, and the reason MUST distinguish a clock fault from an invalid
+  transaction — a client can only self-correct if it is told which.
+- A reject returning from settlement MUST be **re-evaluated**, not ejected on its verdict. A reject
+  can be valid *after* the batch that rejected it: a write guarded on `absent(k)` fails at its
+  position if `k` exists there and holds once a bucket-mate has deleted `k`.
+- A transaction already in the log MUST NOT re-enter, whatever the state says: the content address is
+  unique, so it can never land again.
+- Mutually exclusive transactions MAY both be held. Exclusion MUST be resolved by **selection**, not
+  by refusal at the door: the candidates are evaluated in order over a layer that absorbs each
+  survivor, so a batch carries at most one of them and the loser is still held.
+- An endorser MUST refuse a slice containing a transaction it holds that is past `w_valid`. Silence
+  is the refusal; a quorum of honest nodes then cannot form around it.
+- A transaction MUST NOT be retained past the point at which it can no longer be endorsed
+  (#timing).
+- The screening the proposer applies, the door applies, and settlement applies MUST be the same
+  evaluator. Three implementations that agree today is not agreement.
+
 ## Timing {#timing}
 
 - Every timing value MUST be expressed against a **declared quantity**. A literal timing figure MUST
@@ -531,6 +556,12 @@ obliges**, which is the defect this table exists to make visible rather than pla
 | a backoff ceiling does not exceed its deadline | `Tunables.__post_init__` |
 | one dial has one home | `tests/test_timing.py` |
 | tunables are consensus-agreed at a log position | **OWED** — they are per-node defaults today |
+| one predicate decides mempool entry, at every door | `Mempool.valid` (`admit`, `reenter`) |
+| entry consults committed state | `Mempool.valid` via `settle.would_apply` |
+| a reject is re-evaluated, not ejected on its verdict | `Mempool.reenter` |
+| exclusion is resolved by selection, not refusal | `Mempool.propose` via `settle.would_apply` |
+| an endorser refuses a slice past `w_valid` | `Node._stale` via `Mempool.endorsable` |
+| nothing is retained past its endorsable life | `Mempool.evict`, called from `Node.tick` |
 ## Keys
 
 ### Two secrets, never one {#two-secrets}

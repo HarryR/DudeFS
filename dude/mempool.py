@@ -122,12 +122,23 @@ class Refusal(Enum):
     TOO_NEW = "ts-too-new"
     DUPLICATE = "duplicate"
     UNSIGNED = "signature"
+    CANNOT_APPLY = "cannot-apply"
+    """Its guards do not hold, or its author is not authorised, against COMMITTED state.
+
+    Refused at the door rather than carried: a transaction that cannot apply now would not have
+    landed even if a batch chose it, so admitting it buys the client nothing and costs it the one
+    thing it wanted, an answer.
+
+    Distinct from `settle.Reason.GUARD`, which is the same condition as the evaluator reports it:
+    two enumerations, one for the door and one for settlement, never compared. See this enum's own
+    note about two spellings that matched by accident."""
 
 
 TOO_OLD = Refusal.TOO_OLD
 TOO_NEW = Refusal.TOO_NEW
 DUPLICATE = Refusal.DUPLICATE
 UNSIGNED = Refusal.UNSIGNED
+CANNOT_APPLY = Refusal.CANNOT_APPLY
 
 
 def tx_id(tx: ops.SignedTransaction) -> crypto.Digest:
@@ -164,8 +175,50 @@ class Mempool:
 
     # -- the door ----------------------------------------------------------------------------- #
 
-    def admit(self, tx: ops.SignedTransaction, now: Millis) -> Refusal | None:
-        """Judge a client's clock — the only place that happens (§1.1).
+    def valid(
+        self,
+        tx: ops.SignedTransaction,
+        now: Millis,
+        reader: Reader,
+        auth: settle.Authoriser | None = None,
+    ) -> Refusal | None:
+        """MAY THIS BE IN THE MEMPOOL? `None` means yes; anything else is the reason.
+
+        ONE PREDICATE, AT EVERY DOOR `[H]`: *"the mempool entry validity requirements must be
+        consistently applied."* A client submitting and a reject returning from settlement ask the
+        same question, so they run the same code. Two policies that agree today is how they stop
+        agreeing later.
+
+        IT CONSULTS STATE, and did not `[H]`: *"something that can't possibly be applied to the
+        current state would never be valid even if it were chosen by a batch."* The window and the
+        signature were checked and the predicates were not, so a transaction whose guards were
+        already false was admitted, carried, proposed, screened out at `propose`, and left only when
+        it aged out. The client learned nothing until it timed out.
+
+        `settle.would_apply` is the evaluator the store, the proposer and a client all use, so the
+        four agree by construction rather than by four implementations agreeing today.
+
+        NOT the duplicate check, which belongs to `admit`: "already held" is not a fact about the
+        transaction, and a reject returning is not a duplicate of itself."""
+        t = self.tunables
+        if now - tx.ts > t.w_admit:
+            return Refusal.TOO_OLD
+        if tx.ts - now > t.w_admit:
+            return Refusal.TOO_NEW
+        if not tx.verify():
+            return Refusal.UNSIGNED
+        if settle.would_apply(reader, (tx,), auth).rejects:
+            return Refusal.CANNOT_APPLY
+        return None
+
+    def admit(
+        self,
+        tx: ops.SignedTransaction,
+        now: Millis,
+        reader: Reader,
+        auth: settle.Authoriser | None = None,
+    ) -> Refusal | None:
+        """The door a CLIENT knocks on: `valid`, plus "do we hold it already", plus the insert.
 
         `None` means admitted; anything else is the reason. NOT a `Refusal.ADMITTED` member: an
         enumeration of refusals must not contain "was not refused", or iterating it yields a bogus
@@ -181,26 +234,28 @@ class Mempool:
         than its own clock suggests — bounded by `w_admit`. The bucket is a floor, not an exclusion
         window, so nothing that passes this gate can be stranded by arithmetic.
 
-        UNSETTLED (MEMPOOL.md §9.0). The alternative is to DROP rather than relocate, leaving the
-        client to monitor its transactions and re-issue on whatever logic its application wants.
-        That is arguably better: it stops a node quietly moving a transaction to a bucket other than
-        the one its author signed for. This method implements carry-forward; do not treat that as
-        decided."""
-        t = self.tunables
-        if now - tx.ts > t.w_admit:
-            return Refusal.TOO_OLD
-        if tx.ts - now > t.w_admit:
-            return Refusal.TOO_NEW
-        if not tx.verify():
-            return Refusal.UNSIGNED
+        UNSETTLED: the alternative is to DROP rather than relocate, leaving the client to monitor
+        its own transactions and re-issue on whatever logic its application wants. That is arguably
+        better, since it stops a node quietly moving a transaction to a bucket other than the one
+        its author signed for. This implements carry-forward; do not treat that as decided."""
         ident = tx_id(tx)
         if ident in self.settled or ident in self.arrived:
             return Refusal.DUPLICATE
-
-        landed = max(t.bucket(tx.ts), t.bucket(now))
-        self.pending.setdefault(landed, {})[ident] = tx
-        self.arrived[ident] = now
+        if (why := self.valid(tx, now, reader, auth)) is not None:
+            return why
+        self._hold(tx, now, arrived=now)
         return None
+
+    def _hold(self, tx: ops.SignedTransaction, now: Millis, arrived: Millis) -> None:
+        """Place a transaction in the bucket it will be proposed for, keeping its ARRIVAL time.
+
+        `arrived` is passed rather than read from `now` so the age horizon survives re-entry: a
+        transaction bounced through settlement would otherwise reset its own clock and live for
+        ever. A test caught that, not review."""
+        t = self.tunables
+        landed = max(t.bucket(tx.ts), t.bucket(now))
+        self.pending.setdefault(landed, {})[tx_id(tx)] = tx
+        self.arrived.setdefault(tx_id(tx), arrived)
 
     def endorsable(self, tx: ops.SignedTransaction, now: Millis) -> bool:
         """The check an ENDORSER applies to a transaction inside someone else's proposal (§1.2).
@@ -257,45 +312,62 @@ class Mempool:
 
     def reenter(
         self,
-        rejects: tuple[tuple[ops.SignedTransaction, settle.Verdict], ...],
+        rejects: tuple[settle.Reject, ...],
         now: Millis,
+        reader: Reader,
+        auth: settle.Authoriser | None = None,
     ) -> tuple[ops.SignedTransaction, ...]:
-        """Return rejects to the mempool, dropping what can never land. Returns what was dropped.
+        """RE-EVALUATE each reject, keep what may enter again. Returns what was ejected.
 
-        REJECT REASONS ARE NOT EQUALLY FINAL, and this is where MEMPOOL.md §5's distinction earns
-        its keep. "Cannot be applied given settled state" reads as "drop it", but only a bad
-        signature is permanently dead: an `authority` reject becomes valid when a grant is
-        re-issued, and a `guard` reject when the predicate becomes true again. Evicting on the
-        verdict alone would discard transactions that are merely EARLY.
+        `[H]` *"After the block is applied we then take all the kicked transactions and try to put
+        those which are still valid back into the mempool; those whose predicates don't apply to the
+        current state are not put back."*
 
-        So: keep and re-screen, and evict on age instead."""
-        dropped: list[ops.SignedTransaction] = []
+        Which is this, through the same predicate the door uses. It used to keep every reject except
+        a bad signature and evict on age alone, reasoning that an `authority` or `guard` reject is
+        merely EARLY and may become satisfiable. That reasoning was recorded as an implementer's
+        decision directly beneath the ruling above, and the code followed it: a guard-false
+        transaction was carried the whole horizon, and a stale compare-and-swap could be re-proposed
+        if its value came back.
+
+        RE-EVALUATION, NOT BLANKET EJECTION, and the difference is load-bearing: a reject can be
+        valid AFTER the batch that rejected it. A write guarded on `absent(k)` fails at its position
+        if `k` exists there, and holds once a bucket-mate has deleted `k`. Only the state decides.
+
+        `Reason.SETTLED` ends it whatever the state says: the transaction is in the log and
+        `op_hash` is unique, so it can never land again. A bad signature needs no special case,
+        because `valid` checks signatures."""
+        ejected: list[ops.SignedTransaction] = []
         for tx, verdict in rejects:
             ident = tx_id(tx)
             arrived = self.arrived.get(ident, now)
-            # `settle.Reason`, NOT this module's `Refusal.UNSIGNED`. They happen to share the string
-            # "signature", so the old comparison worked BY COINCIDENCE across two unrelated
-            # enumerations — exactly the class of bug typing these was meant to remove.
-            permanent = verdict.why is settle.Reason.SIGNATURE
-            if permanent or now - arrived > self.tunables.evict_after:
-                dropped.append(tx)
-                self.arrived.pop(ident, None)
-                self._unhold(ident)
-                continue
             # Carry forward means MOVE, not copy. Omitting the removal left a copy in the old bucket
             # every round, so a transaction that kept bouncing accumulated one entry per round and
             # would be offered in several buckets at once — caught by a test, not by review.
             self._unhold(ident)
-            landed = max(self.tunables.bucket(tx.ts), self.tunables.bucket(now))
-            self.pending.setdefault(landed, {})[ident] = tx
-            self.arrived.setdefault(ident, arrived)
+            # `settle.Reason`, NOT this module's `Refusal`. Two unrelated enumerations once shared
+            # the spelling "signature" and compared equal by accident, which is the class of bug
+            # typing these was meant to remove.
+            if (
+                verdict.why is settle.Reason.SETTLED
+                or self.valid(tx, now, reader, auth) is not None
+            ):
+                ejected.append(tx)
+                self.arrived.pop(ident, None)
+                continue
+            self._hold(tx, now, arrived=arrived)
         self._sweep_empty()
-        return tuple(dropped)
+        return tuple(ejected)
 
     def evict(self, now: Millis) -> tuple[ops.SignedTransaction, ...]:
-        """Age-based eviction (§5), the shape Bitcoin's mempool expiry has run for years. Holding a
-        transaction until its guards happen to come true is correct; holding it forever is a
-        denial-of-service."""
+        """The backstop for a transaction that was valid, was never chosen, and can no longer be
+        endorsed at all.
+
+        The horizon is `evict_after`, which EQUALS `w_valid` and is derived rather than set: past
+        that an endorser refuses the transaction, so holding it retains what can never land. It was
+        300 s against a 33 s endorsable lifetime — and nothing called this method, so the backstop
+        whose own docstring called unbounded retention a denial-of-service never ran. `Node.tick`
+        calls it now."""
         horizon = self.tunables.evict_after
         gone: list[ops.SignedTransaction] = []
         for held in self.pending.values():
