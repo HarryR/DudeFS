@@ -413,6 +413,142 @@ class TestClusterCollection(unittest.TestCase):
             floors.add(ck.height)
         self.assertEqual(len(floors), 1, "nodes disagree about the attested floor")
 
+    def test_a_replayed_collection_keeps_the_quorums_signatures(self):
+        """`replay` used to call `_collect` with NO marker, so it fabricated a local one -- no
+        signers, no sigs -- and wrote that to `checkpoint` meta as its floor, discarding the
+        ratification that arrived in the entry. The node then advertised the fabrication as
+        `ratified` in its own attestations, so an unverifiable floor SPREAD."""
+        now = self._churn(12)
+        now = self._drain(0, now)
+        source, joiner = self.c.nodes[0], self.c.nodes[1]
+        self.assertEqual(source.maybe_collect(now), 0)
+        self.c.pump(now)
+
+        fresh = Node(crypto.Keypair.generate(), Store())
+        fresh.store.replay(list(source.store.entries()))
+
+        ck = fresh.store.checkpoint()
+        assert ck is not None, "the replayed collection left no checkpoint at all"
+        self.assertNotEqual(ck.sigs, (), "the quorum's signatures were dropped on replay")
+        self.assertIsNone(
+            ck.attested(list(joiner.roster())), "a replayed floor nobody could verify"
+        )
+
+    def test_an_unratified_collection_in_a_run_is_refused(self):
+        """One peer must not be able to make us forget a segment. `replay` applied any `Compaction`
+        in a run with no signature check at all, which made bulk transfer a DATA-LOSS primitive --
+        and the loss is irreversible, unlike every other refusal on this path."""
+        now = self._churn(12)
+        now = self._drain(0, now)
+        source = self.c.nodes[0]
+        entries = list(source.store.entries())
+        self.assertEqual(source.maybe_collect(now), 0)
+        self.c.pump(now)
+        marker = next(e for e in source.store.entries() if isinstance(e.item, ops.Compaction))
+        real = marker.item
+        assert isinstance(real, ops.Compaction)
+
+        victim = Store()
+        self.assertIsNone(victim.replay(entries), "the honest prefix should apply")
+        held = victim.head()
+        stripped = ops.Compaction(  # the same claim, with the ratification taken off
+            real.segment, real.height, real.acc_state, real.acc_log, real.root
+        )
+
+        why = victim.replay([Entry(marker.idx, stripped)])
+
+        assert why is not None, "an unratified collection was applied"
+        self.assertIn("not ratified", why)
+        self.assertEqual(victim.head(), held, "state moved on a refused collection")
+        self.assertIn(0, victim.segments(), "the segment was forgotten anyway")
+
+    def test_a_far_behind_node_adopts_a_ratified_floor_from_gossip(self):
+        """The only way a node that has never collected gets an anchor at all.
+
+        `checkpoint` meta used to be written by exactly one code path -- a collection this node
+        performed itself -- so a node that missed everything had floor 0 for ever and nothing to
+        check any transfer against. The checkpoint it needed was arriving on every attestation it
+        heard and being dropped.
+
+        Note the floor landing ABOVE the head. That is not a defect to guard against: it is the
+        true, signed, locally-checkable statement *"the cluster has ratified state I do not
+        hold"* -- the bootstrap trigger, and refusing it would discard the fact that says so."""
+        now = self._churn(12)
+        now = self._drain(0, now)
+        source = self.c.nodes[0]
+        self.assertEqual(source.maybe_collect(now), 0)
+        self.c.pump(now)
+        ck = source.store.checkpoint()
+        assert ck is not None
+
+        joiner = Store()
+        joiner.apply(self.c._genesis(), auth=None)  # provisioned, so it knows the roster
+        self.assertEqual(joiner.floor(), 0, "a floor out of nowhere")
+
+        joiner.witness(source.attestation(now))  # the ordinary gossip path, nothing bespoke
+
+        self.assertEqual(joiner.floor(), ck.height, "the ratified floor was not adopted")
+        self.assertGreater(joiner.floor(), joiner.head(), "floor above head must be expressible")
+
+    def test_a_floor_nobody_signed_is_not_adopted(self):
+        """`attested_floor`'s licence to take a MAX is that a floor carries the quorum. A node that
+        could name any height and be believed would defeat #monotonicity outright."""
+        joiner = Store()
+        joiner.apply(self.c._genesis(), auth=None)
+        liar = crypto.Keypair.generate()
+        forged = ops.Compaction(0, 999_999, crypto.ACC_IDENTITY)  # a height nobody ratified
+
+        self.assertIsNotNone(joiner.adopt(forged), "an unsigned checkpoint was adopted")
+        self.assertEqual(joiner.floor(), 0)
+
+        # And by the route it would really arrive: inside a signed attestation. The attestation's
+        # own signature is good -- it is the FLOOR it carries that nobody ratified.
+        told = attest.Attestation(1, 2, crypto.ACC_IDENTITY, crypto.ACC_IDENTITY, ratified=forged)
+        joiner.witness(attest.SignedAttestation.make(liar, told))
+        self.assertEqual(joiner.floor(), 0, "a forged floor rode in on a valid signature")
+
+    def test_a_self_consistent_lie_is_refused_by_the_quorums_checkpoint(self):
+        """THE test for anchoring on the quorum rather than on the sender.
+
+        A transfer was verified against `expect` -- the SENDER'S OWN attestation -- so a roster
+        member could serve any history it liked provided it signed a statement matching it. Self
+        consistency is not authenticity, and a liar has no trouble being self-consistent: it simply
+        keeps its own store.
+
+        The contrast is the whole point. Same run, same signed commitment: accepted by a node with
+        no ratified floor, refused by a node holding the quorum's checkpoint."""
+        now = self._churn(12)
+        now = self._drain(0, now)
+        source = self.c.nodes[0]
+        self.assertEqual(source.maybe_collect(now), 0)
+        self.c.pump(now)
+        ck = source.store.checkpoint()
+        assert ck is not None
+
+        liar, rogue = crypto.Keypair.generate(), Store()
+        rogue.apply(self.c._genesis(), auth=None)
+        while rogue.head() < ck.height:  # a whole fabricated history, up to the ratified height
+            key = crypto.h(f"lie{rogue.head()}".encode())
+            rogue.apply((ops.writes(ops.Set(D, key, b"x")).sign(liar, T0),), auth=None)
+        self.assertEqual(rogue.head(), ck.height, "the lie must reach the ratified height")
+        told = Commitment(
+            rogue.head(), rogue.accumulator(), rogue.log_accumulator(), rogue.state_root()
+        )
+        run = list(rogue.entries(2))
+
+        gullible = Store()  # no collection, so no floor: it has only the sender's word
+        gullible.apply(self.c._genesis(), auth=None)
+        self.assertIsNone(gullible.replay(run, told), "the lie is not even self-consistent")
+
+        joiner = Store()
+        joiner.apply(self.c._genesis(), auth=None)
+        self.assertIsNone(joiner.adopt(ck))
+
+        why = joiner.replay(run, told)
+
+        assert why is not None, "a self-consistent lie was accepted at a ratified height"
+        self.assertEqual(joiner.head(), 1, "the lie was committed anyway")
+
     def test_the_floor_never_drops(self):
         """The retention is monotone at exactly one place, so a node cannot adopt an older
         checkpoint than the one it has already attested -- which would read as a regression and
@@ -693,7 +829,9 @@ class TestTheAngelDuty(unittest.TestCase):
         self.assertEqual(len({a.by for a in bundle}), 3, "one link did not reach the cluster")
         for one in bundle:
             self.assertTrue(one.verify(), "a relayed statement lost its own signature")
-        self.assertIsNotNone(attest.attested_floor(bundle, 3, now, WINDOW))
+        self.assertIsNotNone(
+            attest.attested_floor(bundle, 3, now, WINDOW, roster=list(relay.roster()))
+        )
 
     def test_a_starved_client_sees_that_it_is_starved(self):
         """The gain, stated as the failure it prevents. A relay that goes quiet cannot make a
@@ -706,7 +844,9 @@ class TestTheAngelDuty(unittest.TestCase):
         bundle = relay.gathered(now)
 
         much_later = now + WINDOW * 10
-        self.assertIsNone(attest.attested_floor(bundle, 3, much_later, WINDOW))
+        self.assertIsNone(
+            attest.attested_floor(bundle, 3, much_later, WINDOW, roster=list(relay.roster()))
+        )
         self.assertIsNone(attest.staleness(bundle, much_later, WINDOW))
         self.assertEqual(attest.staleness(bundle, now + 5_000, WINDOW), 5_000)
 

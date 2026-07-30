@@ -361,10 +361,19 @@ class Store:
 
         Signatures ARE verified: self-contained, always possible, and there is never an excuse.
 
-        `expect` is the sender's own signed commitment. When the run reaches the height it names,
-        every commitment must agree or the whole batch is ROLLED BACK — before it is committed, not
-        detected afterwards. Signatures alone are not enough here: they say an entry was authored,
-        never that the quorum settled it or that this is the log everyone else holds.
+        **A collection in the run is RATIFIED OR REFUSED.** This used to apply any `Compaction` a
+        peer put in a run, with no signature check anywhere — so bulk transfer was a data-loss
+        primitive: hand a catching-up node an unsigned marker and it forgot the segment, permanently
+        and on one peer's word. `Store.collect` was the only place that ever verified a marker
+        (#collection-is-ratified). The marker is also passed THROUGH to `_collect` now, so the
+        quorum's signatures survive into this node's own checkpoint instead of being replaced by a
+        locally fabricated one nobody signed.
+
+        `expect` is the sender's own signed commitment, and it is the WEAKER of the two anchors: it
+        says only that the sender is internally consistent, which a liar can arrange. The stronger
+        one is this node's ratified checkpoint, and both are checked wherever the run reaches their
+        height — every commitment must agree or the whole batch is ROLLED BACK, before it is
+        committed rather than detected afterwards.
 
         RETURNS THE REFUSAL, and raises nothing for it `[H]`. A run that does not reconcile is
         THEIR fault and a routine outcome — a bounded `PULL` races the sender's own progress, a
@@ -377,12 +386,22 @@ class Store:
             acc = self.accumulator()
             for e in items:
                 if isinstance(e.item, ops.Compaction):
+                    # The roster is read HERE, at the marker, not once before the run. A replay
+                    # starting from genesis begins with no roster at all, so hoisting this would
+                    # check nothing on exactly the path that most needs it — and the roster that
+                    # matters is the one the log had reached when the collection happened, which is
+                    # what reading it mid-replay gives.
+                    roster = list(self.roster())
                     # A collection replays as itself: drop the segment's entries and subtract its
                     # accumulator. There is no splice and no chain to repair, because a segment is
                     # collected WHOLE — which is the entire reason the segment model replaces the
                     # entry-level one.
+                    if roster and (why := e.item.attested(roster)) is not None:
+                        self.db.execute("ROLLBACK")
+                        seg = e.item.segment
+                        return f"collection of segment {seg} in the run is not ratified: {why}"
                     self._set_meta("acc", acc)
-                    self._collect(e.item.segment, at=e.idx)
+                    self._collect(e.item.segment, at=e.idx, marker=e.item)
                     acc = self.accumulator()
                     continue
                 if (why := _unverified(e)) is not None:
@@ -390,13 +409,10 @@ class Store:
                     return why
                 acc = self._commit(e.idx, e.item, e.item.txn.mutations, acc)
             self._set_meta("acc", acc)
-            if (
-                expect is not None
-                and self.head() == expect.head
-                and (why := self._disagrees(expect)) is not None
-            ):
-                self.db.execute("ROLLBACK")
-                return why
+            for anchor in self._anchors(expect):
+                if self.head() == anchor.head and (why := self._disagrees(anchor)) is not None:
+                    self.db.execute("ROLLBACK")
+                    return why
             self.db.execute("COMMIT")
         except Exception:
             # Still here, and still re-raising: a bug of OURS mid-replay must not be reported as a
@@ -404,6 +420,27 @@ class Store:
             self.db.execute("ROLLBACK")
             raise
         return None
+
+    def _anchors(self, expect: Commitment | None) -> tuple[Commitment, ...]:
+        """Every signed position this run can be checked against, strongest first.
+
+        THE RATIFIED CHECKPOINT IS THE STRONG ONE, and until now it was never used for this at all:
+        a transfer was checked only against `expect`, which is the SENDER'S OWN attestation — so a
+        roster member could serve any history it liked provided it signed a statement matching it.
+        Self-consistency is not authenticity. The checkpoint carries the quorum, so a run crossing
+        its height is checked against what everybody agreed rather than against one peer's story.
+
+        Both are returned rather than one: they answer at different heights, and a run reaching
+        neither is unverified — which is #4's missing anchor, not something this can invent."""
+        ck = self.checkpoint()
+        return tuple(
+            c
+            for c in (
+                Commitment(ck.height, ck.acc_state, ck.acc_log, ck.root) if ck else None,
+                expect,
+            )
+            if c is not None
+        )
 
     def _disagrees(self, expect: Commitment) -> str | None:
         """`None` if every commitment agrees, else which one did not — in words a log line can
@@ -750,6 +787,34 @@ class Store:
         ck = self.checkpoint()
         return ck.height if ck is not None else 0
 
+    def adopt(self, ck: ops.Compaction) -> str | None:
+        """Take a checkpoint somebody else holds, if the quorum signed it. `None` if adopted, else
+        why not.
+
+        THE ONLY WAY A WIPED NODE GETS AN ANCHOR. Before this, `checkpoint` meta was written by
+        exactly one code path — a collection this node performed itself — so a node that had never
+        collected had floor 0 for ever and nothing to check any transfer against. Meanwhile the
+        checkpoint it needed was already arriving on every attestation it heard (`Attestation
+        .ratified`) and being dropped on the floor.
+
+        MAX WINS, and that is safe only because the signatures are checked here `[H]`. A floor
+        carries the quorum, so it can be WITHHELD but not forged upward — which is what makes
+        "believe the highest" the correct rule rather than a credulous one (`attest.attested_floor`
+        reasons the same way about the same object). Verify first, then take the higher.
+
+        A floor ABOVE our own head is not an error and must not be refused: it is the true, signed,
+        locally-checkable statement *"the cluster has ratified state I do not hold"* — which is
+        precisely the bootstrap trigger, and refusing it would discard the one fact that says so."""
+        roster = list(self.roster())
+        if not roster:
+            return "no roster to check a checkpoint against"
+        if (why := ck.attested(roster)) is not None:
+            return why
+        if ck.height <= self.floor():
+            return None  # not better than what we hold; monotone by policy, and not a failure
+        self._set_meta("checkpoint", ck.raw)
+        return None
+
     def attestation(self, now: int) -> attest.Attestation:
         """Bump the counter and read one coherent snapshot to attest.
 
@@ -797,9 +862,15 @@ class Store:
         kept forever when it convicts.
 
         Unsigned bytes are dropped rather than stored: anyone can write an incriminating claim,
-        and only the key can make it evidence."""
+        and only the key can make it evidence.
+
+        ALSO WHERE A CHECKPOINT IS ADOPTED, because this is the one funnel every peer attestation
+        passes through, and a claim carries the quorum-signed floor it stands on. `adopt` verifies
+        those signatures itself, so hearing from a liar costs nothing."""
         if not signed.verify():
             return None
+        if signed.claim.ratified is not None:
+            self.adopt(signed.claim.ratified)
         held = self.sighting(signed.by)
         if held is not None:
             found = attest.contradiction(held, signed)

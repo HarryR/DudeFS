@@ -11,7 +11,7 @@ and carries no author, so attributing one to a key that did not sign it is not c
 from __future__ import annotations
 
 import enum
-from collections.abc import Container, Iterable
+from collections.abc import Container, Iterable, Sequence
 from dataclasses import dataclass
 
 from dude.core import codec, crypto
@@ -276,19 +276,32 @@ def fresh(
     return keep
 
 
-def attested_floor(
+def attested_floor(  # noqa: PLR0913 — the sixth is `roster`, and it is the one that must not be optional
     atts: Iterable[SignedAttestation],
     need: int,
     now: int,
     window: int,
+    *,
+    roster: Sequence[crypto.PublicKey],
     shunned: Container[crypto.PublicKey] = (),
 ) -> int | None:
-    """The height a client may rely on: the MAX floor over at least `need` FRESH responders.
+    """The height a client may rely on: the MAX floor over at least `need` FRESH responders,
+    counting only floors whose quorum signatures VERIFY.
 
     Max, not majority, because an arm can WITHHOLD a higher checkpoint and never forge one — the
     floor carries the quorum's signatures, so the highest honest answer wins and a lagging node
     cannot drag it down (#freshness-needs-many). `need` is `f+1`, which is why a lone responder
     does not answer this question at all.
+
+    **`roster` IS REQUIRED, and used to be absent entirely.** The sentence above is the whole
+    justification for taking a max, and it is only true of a checkpoint somebody CHECKED: this
+    function read `claim.floor` without verifying a single signature, so any node could name any
+    height and be believed — the one thing #monotonicity claims is impossible. A required parameter
+    rather than an optional one `[H]`, so the check cannot be forgotten by omission.
+
+    An unverifiable floor contributes ZERO rather than excluding its responder: whether a node
+    answered freshly and whether it holds a good checkpoint are two questions, and `need` is about
+    the first.
 
     A single-link client can still satisfy `need`: a relay holds no key but its own, so it can
     withhold or replay but never forge, and one link is enough to GATHER `f+1` signed statements
@@ -298,7 +311,15 @@ def attested_floor(
     keep = fresh(atts, now, window, shunned)
     if len(keep) < need:
         return None
-    return max(a.claim.floor for a in keep.values())
+    return max(_verified_floor(a, roster) for a in keep.values())
+
+
+def _verified_floor(a: SignedAttestation, roster: Sequence[crypto.PublicKey]) -> int:
+    """This statement's floor if its checkpoint carries a good quorum signature, else 0."""
+    ck = a.claim.ratified
+    if ck is None or ck.attested(list(roster)) is not None:
+        return 0
+    return ck.height
 
 
 def staleness(

@@ -387,9 +387,18 @@ class Node:
 
     def floor(self, need: int, now: Millis) -> int | None:
         """The height this node would rely on: the max over `need` distinct FRESH peers and itself,
-        ignoring anyone convicted. `None` if too few answered (#freshness-needs-many)."""
+        ignoring anyone convicted, and counting only floors whose quorum signatures verify.
+
+        The roster comes from our own log, which is the only roster we have any reason to trust —
+        and a checkpoint signed by a roster we no longer recognise is one we cannot check, which is
+        a bootstrap problem (§1) rather than something to paper over here."""
         return attest.attested_floor(
-            self.gathered(now), need, now, self.tunables.attest.fresh_within, self.shunned()
+            self.gathered(now),
+            need,
+            now,
+            self.tunables.attest.fresh_within,
+            roster=list(self.roster()),
+            shunned=self.shunned(),
         )
 
     def staleness(self, now: Millis) -> Millis | None:

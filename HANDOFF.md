@@ -8,7 +8,7 @@ ruff format dude -q && ruff check dude && ty check dude/ \
   && python3 -m unittest discover -s dude/tests -t . -q
 ```
 
-**245 tests: 244 green, 1 RED ON PURPOSE.** Lint, format and typecheck are clean. The red is
+**250 tests: 249 green, 1 RED ON PURPOSE.** Lint, format and typecheck are clean. The red is
 `test_a_pull_for_a_collected_range_is_not_answered_with_a_hole` — it asserts what §2 owes and fails
 until that lands. **The tree is not broken and it is not flaky** (six consecutive runs). Do not delete
 it to get a green gate; everything else must stay green.
@@ -18,10 +18,11 @@ decide that and sync from scratch (§2). `UNIMPLEMENTED` is down to `ANNOUNCE` /
 dissemination — a transaction currently spreads by re-flooding the whole `SUBMIT`, which works and
 does not scale).
 
-**But read §1 before believing any of that.** The plan's steps are built; several of them are not
-*wired*, and the pattern is uniform enough to state as a rule: **this codebase repeatedly builds a
-signature and then never consults it at the point where it decides something.** Four instances are
-open right now, all in node-to-node sync, which is the part the project cannot be wrong about.
+**The rule this codebase keeps proving**, and worth carrying into any review: **it builds a signature
+correctly and then never consults it at the point where something is decided.** Four instances of that
+were open in node-to-node sync and are now closed (PLAN.md, "The anchor wave"); each survived unit
+tests because both halves were right in isolation. Expect more of the same shape, and grep for the
+verification call rather than for the signing code.
 
 ---
 
@@ -35,44 +36,37 @@ to be wrong; the author's judgement was simply degrading. Start there rather tha
 
 ## Next work, in order
 
-### 1. The signatures that are built and never consulted — FATAL, fix first
+### 1. Bootstrap has a roster circularity — what the anchor wave left open
 
-`[H]` Harry: *"all the carefully built signing thrown away at verification time."*
+The four "signature never consulted" defects are fixed (PLAN.md, "The anchor wave"), and closing them
+surfaced one thing that is **not** a defect but is a genuine gap, found only by writing the tests:
 
-Four instances, all on the sync path, none of them needing new cryptography — the signatures already
-exist and already arrive. Each is a missing call at the point where something is decided.
+**A node with no state cannot verify a checkpoint, because verifying one needs the roster, and the
+roster is state.** `Store.adopt` refuses with *"no roster to check a checkpoint against"* — correctly,
+since believing an unverifiable floor is exactly the hole just closed. So today:
 
-- **A single peer can order you to delete a segment.** `replay`'s collection branch applies any
-  `ops.Compaction` in the run with **no ratification check at all** — no `attested(roster)`, nothing
-  ([store.py, `replay`](dude/store/store.py)). `Store.collect` is the only place in the codebase that
-  ever verifies a marker. So bulk transfer is a data-loss primitive: hand a catching-up node an
-  unsigned marker and it forgets the segment. Worst of the four, because the loss is irreversible.
-- **A transfer is verified against the sender's own claim.** `_on_entries` builds `expect` from
-  `self.store.sighting(env.frm)` ([node.py:455-460](dude/node.py#L455-L460)) — the sender's *own*
-  attestation. That is self-consistency, not authenticity: a roster member can serve any history it
-  likes so long as it signs a statement matching it. No quorum enters the check.
-- **`replay` fabricates an unsigned floor and stores it.** The collection branch calls `_collect`
-  with **no marker**, so `_collect` builds a local one with no signers and no sigs and writes that to
-  `checkpoint` meta as the node's floor — discarding the quorum signatures that arrived in `e.item`.
-  The node then advertises that fabrication as `ratified` in its own attestations, so the unverifiable
-  floor spreads.
-- **Nobody adopts a real checkpoint, and nobody verifies one where it is used.** Every attestation
-  already carries `ratified` — the entire quorum-signed checkpoint ([attest.py:75-80](dude/store/attest.py#L75-L80))
-  — and it travels on `FRONTIER`/`STANDING`. Nothing adopts it: `checkpoint` meta is only ever written
-  by a collection this node performed itself, so **a wiped joiner has floor 0 for ever** and has no
-  quorum anchor to check anything against. Meanwhile `attested_floor` takes `max(a.claim.floor)`
-  ([attest.py:301](dude/store/attest.py#L301)) without verifying a single signature — and its
-  justification for max-not-majority is, in its own docstring, that *"the floor carries the quorum's
-  signatures"*. Combined with the fabrication above, a floor is forgeable upward, which is the one
-  thing #monotonicity claims it is not.
+- a **provisioned** node — one that holds genesis, hence the roster — can adopt a ratified floor from
+  ordinary gossip and bootstrap from it. That works now and is tested.
+- a **wiped** node holds nothing, so it can verify nothing, and `[H]` *"re-join as if new"* has no
+  starting point. Not fatal today, because re-provisioning a wiped node is a manager action anyway —
+  but the join is supposed to be the recovery path, and this is why it cannot be yet.
 
-**The fix is one wave**, and it has a pleasing property: adopting checkpoints turns *"my floor is
-above my head"* into a true, signed, locally-checkable statement — which is exactly the bootstrap
-trigger §2 needs. Verify a marker's ratification in `replay`; pass the real marker to `_collect` so
-its signatures survive; adopt a peer's verified checkpoint monotonically (max wins, since a floor
-cannot be forged upward *once checked*); require the roster at `attested_floor` and ignore any floor
-whose signatures do not verify; and make the ratified checkpoint an anchor in `replay`, so a run
-crossing a ratified height is checked against the quorum rather than against the sender.
+**The break in the circle is already ruled and half-built: the credential travels with the row.** A
+management row carries the manager-signed transaction that authorised it, so a joiner that knows only
+the **manager key** out of band can verify roster rows against it, then verify the checkpoint's
+signatures against that roster, then verify state against the checkpoint's root. Manager key →
+roster → quorum → state, with no step taken on trust. That is what makes item 3 load-bearing rather
+than a refinement, and it wants stating in SPEC as the bootstrap chain.
+
+Two smaller things this wave leaves behind:
+
+- **`attested_floor` now requires `roster=`** and counts an unverifiable floor as zero. That is a
+  breaking signature change; every caller passes its own roster from its own log. A checkpoint signed
+  by a roster the caller no longer recognises is one it cannot check — which is this same circularity
+  seen from the client side.
+- **A far-behind node's floor can exceed its head**, deliberately. That is the bootstrap trigger and
+  it must stay expressible; do not "fix" it. Note `(floor, head]` completeness is vacuous while it
+  holds, which is correct — such a node owes no entries, it owes a bootstrap.
 
 ### 3. The credential in every leaf — RULED, not yet built
 

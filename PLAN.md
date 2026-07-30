@@ -389,6 +389,36 @@ and a reordering, because all three are "this entry is not at the position owed"
 case used to reach `entry.idx PRIMARY KEY` and raise `sqlite3.IntegrityError`, which is not a
 `DudeError` at all: trap 3 for the third time.
 
+## The anchor wave — four signatures that were never checked  ★
+
+`[H]` *"all the carefully built signing thrown away at verification time."* Found by review, not by
+tests, and every one of them passed unit tests because both halves were right in isolation. None needed
+new cryptography: the signatures already existed and already arrived on the wire.
+
+| what | was |
+|---|---|
+| a collection inside a transferred run | applied with **no ratification check at all** — one peer could make a catching-up node forget a segment, i.e. bulk transfer was a data-loss primitive. `Store.collect` was the only place that ever verified a marker |
+| the marker a replay applies | **fabricated locally**, with no signers and no sigs, and written to `checkpoint` meta as the node's floor. It then advertised that fabrication as `ratified`, so an unverifiable floor SPREAD |
+| what a transfer is checked against | the **sender's own attestation** — self-consistency, not authenticity. A roster member could serve any history it liked provided it signed a statement matching it |
+| a peer's ratified checkpoint | **never adopted**, though it rides on every attestation. `checkpoint` meta was written only by a collection the node performed itself, so a node that never collected had floor 0 for ever and no anchor for anything. And `attested_floor` read `claim.floor` **without verifying one signature**, while its own docstring gave "the floor carries the quorum's signatures" as the reason it may take a MAX |
+
+Now: `replay` verifies a marker against the roster **as of that point in the replay** (read at the
+marker, not hoisted — a replay from genesis starts with no roster, so hoisting checked nothing on the
+path that most needs it), passes the real marker through so the quorum's signatures survive, and takes
+the **ratified checkpoint as an anchor** alongside the sender's claim, which is demoted to the weaker
+of the two. `Store.adopt` takes a peer's checkpoint if the signatures verify, monotonically, max wins.
+`attested_floor` requires `roster=` and counts an unverifiable floor as zero.
+
+**The test that says it works** is `test_a_self_consistent_lie_is_refused_by_the_quorums_checkpoint`:
+the same fabricated run with the same signed commitment is *accepted* by a node with no ratified floor
+and *refused* by one holding the quorum's checkpoint.
+
+**And a floor may now exceed a head, deliberately** — the signed, locally-checkable statement "the
+cluster has ratified state I do not hold", which is the bootstrap trigger the open step needs. What it
+exposed: verifying a checkpoint needs the roster, and the roster is state, so a WIPED node can verify
+nothing. The break is the credential that travels with the row (manager key → roster → quorum →
+state); see HANDOFF.md §1.
+
 ## Not doing, and why
 
 | | |
@@ -408,7 +438,7 @@ ruff format dude -q && ruff check dude && ty check dude/ \
 
 Or `make check`, which is the same thing with `ruff format --check` so it writes nothing.
 
-**245 tests: 244 green, 1 red on purpose.** Lint, format and typecheck are clean. The red is
+**250 tests: 249 green, 1 red on purpose.** Lint, format and typecheck are clean. The red is
 `test_a_pull_for_a_collected_range_is_not_answered_with_a_hole`: an honest `PULL` for a collected range
 is still answered with a run starting past what was asked for (`8 != 2`), because the server has no way
 to say *"that range is gone"*. It asserts what the open step owes and fails until that lands. **If you
