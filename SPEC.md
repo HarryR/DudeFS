@@ -412,8 +412,17 @@ it. Nothing in it may rest on the word of the cluster being joined.
    NOT yet supported: a row vouched by a successor key MUST fail this check rather than pass it.
    A party that does not hold the state MUST additionally verify each row's presence under a signed
    root — see step 9, which is where a proof is needed at all.
-7. Roster membership MUST be verifiable as **complete**, so that a subset cannot be presented — a
-   smaller roster is a smaller quorum.
+7. Roster membership MUST be stated in **one manager-signed commitment**, and that commitment MUST
+   agree with the rows a node holds. Enumeration cannot detect its own incompleteness, and a subset is
+   a smaller roster, hence a smaller quorum — a party handed three rows of eleven would compute a
+   quorum of two from individually valid, individually vouched rows.
+   The commitment MUST carry a **monotone serial**, and a node MUST NOT accept a roster whose serial
+   is older than one it has already accepted. Otherwise a genuine-but-superseded roster — members
+   since removed, whose keys an adversary may still hold — verifies perfectly for ever. The same
+   withhold-never-forge argument as the floor: a higher serial cannot be forged without the manager.
+   A roster change and its commitment MUST land in one transaction (#roster-change-is-atomic): a row
+   set with no commitment is unverifiable rather than merely undocumented.
+   The high-water serial MUST be durable, or a restart reopens the window it closes.
 8. The checkpoint MUST then be verified against that roster (#collection-is-ratified).
 9. State MUST then be verified against the checkpoint's root (#state-root).
 
@@ -579,6 +588,8 @@ obliges**, which is the defect this table exists to make visible rather than pla
 | a checkpoint from another cluster is not adopted | `Store.adopt` |
 | roster membership traces to the anchor | `Store.unvouched_roster`, enforced in `Store.replay` |
 | one implementation of "does this credential vouch for this row" | `settle.vouched` |
+| membership is one manager-signed commitment, matching the rows | `Store.roster_incomplete` |
+| a roster serial never goes backwards | `Store.roster_incomplete`, `Store.roster_serial` |
 | roster completeness is verifiable | **OWED** — needs a manager-signed membership commitment |
 | a floor is corroborated by `f+1` fresh responders before use | **OWED** — `attested_floor` exists; nothing calls it on the bootstrap path |
 | a node that cannot obtain `(floor, head]` bootstraps instead | **OWED** — no decision point exists |

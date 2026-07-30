@@ -413,6 +413,7 @@ class Store:
             if (why := self._unacceptable(expect)) is not None:
                 self.db.execute("ROLLBACK")
                 return why
+            self._remember_roster_serial()
             self.db.execute("COMMIT")
         except Exception:
             # Still here, and still re-raising: a bug of OURS mid-replay must not be reported as a
@@ -438,10 +439,21 @@ class Store:
                 return why
         if self.anchor() is None:
             return None  # unprovisioned: it cannot answer, and `adopt` already refuses it a floor
-        for why in (self.wrong_cluster(), self.unvouched_roster()):
+        for why in (self.wrong_cluster(), self.unvouched_roster(), self.roster_incomplete()):
             if why is not None:
                 return f"refusing a log this node's anchor does not authorise: {why}"
         return None
+
+    def _remember_roster_serial(self) -> None:
+        """Advance the roster high-water mark, having accepted the run that carried it.
+
+        Separate from the check that reads it: a verifier that also recorded would decide and commit
+        in one act, and could not be run twice safely."""
+        from .management import Management  # noqa: PLC0415 -- reads through Store
+
+        commitment = Management(self).roster_commitment()
+        if commitment is not None and commitment[0] > self.roster_serial():
+            self._set_meta("roster_serial", commitment[0].to_bytes(8))
 
     def _anchors(self, expect: Commitment | None) -> tuple[Commitment, ...]:
         """Every signed position this run can be checked against, strongest first.
@@ -933,6 +945,49 @@ class Store:
             if author != held:
                 return f"roster row for {who.hex()[:8]} is vouched by {author.hex()[:8]}, not by us"
         return None
+
+    def roster_incomplete(self) -> str | None:
+        """`None` if the roster we hold is the whole roster the manager signed, else why not.
+
+        STEP 7 OF THE CHAIN (#bootstrap-anchor). Step 6 proves every member was authorised by the
+        anchor; it cannot prove NO MEMBER IS MISSING, and a subset is a smaller roster, hence a
+        smaller quorum — a party handed three of eleven rows would compute a quorum of two.
+
+        THREE THINGS, and each is a different attack:
+
+        * the commitment traces to the anchor, or a forged log states its own membership;
+        * it equals the rows we hold, or a subset passes while claiming to be the whole;
+        * its serial never goes backwards, or a genuine-but-superseded roster — members since
+          removed, whose keys an adversary may still hold — verifies perfectly for ever.
+
+        The high-water mark is node-local and durable, like the anchor and the checkpoint, and is
+        advanced by `replay` once the run it came in is accepted. A checker that moved it would
+        decide and record in one act, so the two are kept apart."""
+        from .management import P_ROSTER, Management  # noqa: PLC0415 -- reads through Store
+
+        held = self.anchor()
+        if held is None:
+            return "no anchor: this node was never provisioned with a manager key"
+        mgmt = Management(self)
+        commitment = mgmt.roster_commitment()
+        if commitment is None:
+            return "the log states no roster commitment, so a subset could not be detected"
+        author = settle.vouched(self, ops.STORE_MANAGEMENT, P_ROSTER, self.credential(0, P_ROSTER))
+        if author != held:
+            return f"the roster commitment is vouched by {author.hex()[:8] if author else 'nobody'}"
+        serial, members = commitment
+        if members != mgmt.node_set():
+            return (
+                f"the roster commitment names {len(members)} members, the log holds a different set"
+            )
+        if serial < self.roster_serial():
+            return f"roster serial {serial} is older than the {self.roster_serial()} already seen"
+        return None
+
+    def roster_serial(self) -> int:
+        """The highest roster revision this node has accepted. Monotone, and durable so it survives
+        the restart that would otherwise let an old roster back in."""
+        return int.from_bytes(self._get_meta("roster_serial", b""))
 
     def adopt(self, ck: ops.Compaction) -> str | None:
         """Take a checkpoint somebody else holds, if the quorum signed it. `None` if adopted, else

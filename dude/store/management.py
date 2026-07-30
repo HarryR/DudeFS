@@ -23,6 +23,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import Enum
 
@@ -96,6 +97,7 @@ P_NODE = b"node/"  # + identity          -> [addr, ...]
 P_GRANT = b"grant/"  # + identity        -> [role, [store...], [kind...]]
 P_POP = b"pop/"  # + identity            -> possession proof, from issuance (#possession-proof)
 P_WRAP = b"wrap/"  # + epoch + identity  -> sealed master (#wrapped-masters)
+P_ROSTER = b"roster"  # one key      -> [serial, [member, ...]] (#bootstrap-anchor step 7)
 
 
 def _wrap_key(epoch: int, who: crypto.PublicKey) -> bytes:
@@ -145,6 +147,32 @@ class Management:
         """Where `who` can be reached. A node may be multi-homed; `dude.net` chooses among them."""
         rec = self.nodes().get(who)
         return rec.addresses if rec else ()
+
+    def roster_commitment(self) -> tuple[int, tuple[crypto.PublicKey, ...]] | None:
+        """The manager's signed statement of WHO THE MEMBERS ARE, and which revision it is.
+
+        STEP 7 OF THE CHAIN (#bootstrap-anchor). Enumerating `node/` rows tells a holder of state
+        who the members are; it cannot tell a party HANDED some rows that it received all of
+        them, and a subset is a smaller roster, which is a smaller quorum. One value the manager
+        signed closes that: a subset of a list is not that list.
+
+        THE SERIAL MAKES A STALE ROSTER DETECTABLE, by the argument the floor rests on: an adversary
+        can withhold a newer commitment but cannot forge a higher serial without the manager's key,
+        so believing the highest one you can verify is correct rather than credulous. Without it a
+        genuine-but-superseded roster — members since removed, whose keys an adversary may still
+        hold — verifies perfectly."""
+        raw = self.store.get(self.store_id, P_ROSTER)
+        if raw is None:
+            return None
+        f = codec.as_seq(codec.decode(raw[1]), 2)
+        members = tuple(crypto.PublicKey(codec.as_bytes(m)) for m in codec.as_seq(f[1]))
+        return codec.as_int(f[0]), members
+
+    def set_roster(self, members: Iterable[crypto.PublicKey], serial: int) -> ops.Transaction:
+        """Emit the commitment for a membership set. SORTED, because the value is compared byte for
+        byte against an enumeration and two orderings of one set must not be two commitments."""
+        record = codec.encode([serial, sorted(bytes(m) for m in members)])
+        return ops.writes(ops.Set(self.store_id, P_ROSTER, record))
 
     def grant_of(self, who: crypto.PublicKey) -> Grant | None:
         raw = self.store.get(self.store_id, P_GRANT + who)

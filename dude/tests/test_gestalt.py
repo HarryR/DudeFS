@@ -19,7 +19,7 @@ from ..net.envelope import Envelope, Frame, seal, unseal
 from ..net.transports import InProc, Switchboard, address_of, name_of
 from ..node import _DISPATCH, HANDLED, REPLIES, UNIMPLEMENTED, Node, _encode_slice, _slice_digest
 from ..store import Commitment, Entry, Store, attest, ops, smt
-from ..store.management import P_NODE, Management, Role
+from ..store.management import P_NODE, P_ROSTER, Management, Role
 from ..store.store import StoreError
 from ..tunables import DEFAULT
 
@@ -73,6 +73,10 @@ class Cluster:
                 kp.public, Role.NODE, frozenset({D}), frozenset(), kp.prove_possession()
             )
             tx = tx + mgmt.add_node(kp.public, (address_of(kp.public).encode(),))
+        # STEP 7: membership is stated ONCE, in the same transaction that creates the rows. A
+        # `node/` row set with no commitment cannot be checked for completeness, so a verifier
+        # refuses the log -- `#roster-change-is-atomic` is why both land together or neither does.
+        tx = tx + mgmt.set_roster([kp.public for kp in self.keys], serial=1)
         return (tx.sign(self.mgr, T0),)
 
     def provisioned(self) -> Store:
@@ -377,6 +381,88 @@ class TestTheRosterTracesToTheAnchor(unittest.TestCase):
 
         self.assertEqual(node.store.stragglers(0), (), "the roster rows never moved")
         self.assertIsNone(node.store.unvouched_roster(), "a relocated row lost its credential")
+
+
+class TestTheRosterIsComplete(unittest.TestCase):
+    """Step 7 of #bootstrap-anchor: no member is missing, and no old roster comes back.
+
+    Step 6 proves every member was authorised by the anchor. It cannot prove that none is MISSING —
+    and a subset is a smaller roster, which is a smaller quorum, so a party handed three of eleven
+    rows would compute a quorum of two and believe it."""
+
+    def setUp(self):
+        self.c = Cluster()
+        self.client = self.c.mgr
+
+    def test_an_honest_roster_is_complete(self):
+        node = self.c.nodes[0]
+        commitment = Management(node.store).roster_commitment()
+        assert commitment is not None
+        serial, members = commitment
+        self.assertEqual(serial, 1)
+        self.assertEqual(members, node.store.roster())
+        self.assertIsNone(node.store.roster_incomplete())
+
+    def test_a_subset_of_the_roster_is_refused(self):
+        """THE ATTACK. Hand a party fewer rows than the manager signed and it computes a smaller
+        quorum — two of three here — from perfectly valid, individually vouched rows."""
+        node = self.c.nodes[0]
+        dropped = node.store.roster()[0]
+        node.store.db.execute(
+            "DELETE FROM live WHERE store=? AND name=?", (M, P_NODE + bytes(dropped))
+        )
+        self.assertEqual(len(node.store.roster()), 2, "the row did not come out")
+
+        why = node.store.roster_incomplete()
+
+        assert why is not None, "a subset of the roster passed as the whole"
+        self.assertIn("different set", why)
+
+    def test_a_log_that_states_no_membership_is_refused(self):
+        """Enumeration cannot detect its own incompleteness, so a log with rows and no commitment is
+        unverifiable rather than merely undocumented."""
+        node = self.c.nodes[0]
+        node.store.db.execute("DELETE FROM live WHERE store=? AND name=?", (M, P_ROSTER))
+
+        why = node.store.roster_incomplete()
+
+        assert why is not None
+        self.assertIn("no roster commitment", why)
+
+    def test_an_older_roster_cannot_come_back(self):
+        """The rollback rule. A genuine-but-superseded roster — members since removed, whose keys an
+        adversary may still hold — verifies perfectly against the anchor, so only the serial refuses
+        it. The high-water mark is durable so a restart does not reopen the window."""
+        node = self.c.nodes[0]
+        self.assertIsNone(node.store.roster_incomplete())
+        node.store._set_meta("roster_serial", (5).to_bytes(8))  # we have seen revision 5
+
+        why = node.store.roster_incomplete()
+
+        assert why is not None, "a roster older than one already accepted was accepted again"
+        self.assertIn("older than", why)
+
+    def test_a_commitment_the_anchor_did_not_sign_is_refused(self):
+        """Otherwise a forged log states its own membership, which is the step-6 attack moved one
+        level up: the members would each be vouched, by a manager who vouched for himself."""
+        node = self.c.nodes[0]
+        node.store.db.execute("UPDATE live SET cred=x'' WHERE store=? AND name=?", (M, P_ROSTER))
+
+        why = node.store.roster_incomplete()
+
+        assert why is not None
+        self.assertIn("vouched by nobody", why)
+
+    def test_a_replayed_log_carries_its_membership_or_is_refused(self):
+        """The chain end to end on the path that matters: a provisioned but empty node replaying a
+        whole log accepts it only if the membership is stated and vouched."""
+        joiner = Store()
+        joiner.provision(self.c.mgr.public)
+
+        self.assertIsNone(joiner.replay(list(self.c.nodes[0].store.entries())))
+
+        self.assertEqual(joiner.roster(), self.c.nodes[0].store.roster())
+        self.assertEqual(joiner.roster_serial(), 1, "the high-water mark did not advance")
 
 
 class TestCompactionRunsByItself(unittest.TestCase):

@@ -61,6 +61,7 @@ WIRED = {
     "adopt": "a checkpoint whose quorum signatures do not verify",
     "wrong_cluster": "a log our provisioned manager key does not authorise",
     "unvouched_roster": "a roster row that does not trace to the anchor",
+    "roster_incomplete": "a roster that is a subset, unstated, or older than one already seen",
     "vouched": "a credential that does not vouch for the value a row currently holds",
 }
 """Checks that must have a live consumer in production code.
