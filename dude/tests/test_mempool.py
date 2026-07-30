@@ -227,7 +227,7 @@ class TestProposal(unittest.TestCase):
 class TestReentry(unittest.TestCase):
     def setUp(self):
         self.kp = crypto.Keypair.generate()
-        self.t = Tunables(delta=1_000, w_admit=30_000, evict_after=60_000)
+        self.t = Tunables(delta=1_000, w_admit=30_000)  # evict_after derives from w_valid
         self.mp = Mempool(self.t)
 
     def test_reject_reasons_are_not_equally_final(self):

@@ -34,15 +34,27 @@ class NetTunables:
     """Dials that belong to the framing layer itself rather than to a link or a message."""
 
     window: Millis = 5_000
-    """The conversation window (`SignedEnvelope.fresh`). A PARTICIPATION gate, not a DoS filter:
-    a node outside it cannot hold a conversation at all, and because both ends check, it
-    self-partitions (MEMPOOL.md §1.3). Measures "are we in sync right now", so it is tight — a
-    transaction's admission window measures content age instead, and is looser."""
+    """The conversation window (`SignedEnvelope.fresh`). A PARTICIPATION gate, not a DoS filter: a
+    node outside it cannot hold a conversation at all, and because both ends check, it
+    self-partitions. Measures "are we in sync right now", so it is tight — a transaction's admission
+    window measures content age instead, and is looser.
+
+    FLOOR: `timing.CONVERSATION_FLOOR` (550 ms) — skew plus one trip, below which two honest nodes
+    cannot converse."""
 
     ttl: Millis = 10_000
     """Default deadline for a posted message: how long the mailbox keeps trying. NEVER transmitted —
     the envelope carries no TTL, because a second expiry with no consumer on the wire is exactly the
-    declared-but-unwired shape."""
+    declared-but-unwired shape.
+
+    The retry schedule MUST fit inside this: see `PlanTunables.max_attempts`."""
+
+    pull_max: int = 256
+    """Entries per `ENTRIES` reply — a bound on message size, never on how far behind a joiner is.
+
+    Here rather than as a constant in `node.py`, because this file's ruling is that a dial deep in
+    code lingers. A SIZE bound, so nothing in `timing` derives it: the requester asks again from
+    where it got to, which costs round trips and never correctness."""
 
 
 @dataclass(frozen=True, slots=True)

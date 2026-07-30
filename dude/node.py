@@ -45,9 +45,6 @@ from .store import Commitment, Entry, Store, StoreError, attest, ops, settle
 from .store.management import Management
 from .tunables import DEFAULT, Tunables
 
-_PULL_MAX = 256
-"""Entries per `ENTRIES` reply. A bound on message size, not on how far a joiner may be behind."""
-
 type Millis = int
 
 
@@ -436,7 +433,7 @@ class Node:
         frm = codec.as_int(codec.as_seq(codec.decode(env.env.body), 1)[0])
         run = []
         for e in self.store.entries(max(frm, 1)):
-            if len(run) >= _PULL_MAX:
+            if len(run) >= self.tunables.net.pull_max:
                 break
             kind = (
                 ops.KIND_COMPACTION if isinstance(e.item, ops.Compaction) else ops.KIND_TRANSACTION

@@ -462,6 +462,35 @@ it. Nothing in it may rest on the word of the cluster being joined.
 - Shunning MUST be a local read policy. It MUST NOT alter the roster or the quorum arithmetic, so a
   heavily shunned cluster stalls rather than proceeding on a thinned quorum.
 
+## Timing {#timing}
+
+- Every timing value MUST be expressed against a **declared quantity**. A literal timing figure MUST
+  NOT appear anywhere outside a tunable group's field default.
+- The declared quantities are exactly: `RTT_MAX` and `CLOCK_SKEW` (measurements of a deployment),
+  `CLIENT_CLOCK_TOLERANCE` (a policy, whose cost is the replay window), and the protocol counts
+  `HOPS_TO_QUORUM` and `WAVES_TO_SETTLE`. Adding to this set MUST be a decision, not a default.
+- Each dial MUST sit at or above the floor derived from those quantities. A dial MAY exceed its
+  floor — that is a margin — and MUST NOT sit below it.
+- The bucket width MUST be at least dissemination to a quorum, `HOPS_TO_QUORUM·RTT_MAX + CLOCK_SKEW`.
+- The conversation window MUST be at least `CLOCK_SKEW + RTT_MAX`.
+- The admission window MUST be at least `CLIENT_CLOCK_TOLERANCE + 2·RTT_MAX`, and it is the **replay
+  bound**: a captured transaction stays admittable for that long, so generosity here is paid for in
+  replay window rather than in latency.
+- The endorsement margin MUST be at least `WAVES_TO_SETTLE·delta + CLOCK_SKEW`, so a transaction
+  admitted at the edge of the window survives the round it was admitted for.
+- **Nothing MUST be retained past the point it can settle.** The eviction horizon MUST EQUAL
+  `w_valid`, and MUST be derived rather than set, because a transaction is unendorsable once
+  `|now − ts| > w_valid` and any surplus is a window in which a stale compare-and-swap can be
+  re-proposed.
+- A retry schedule MUST fit inside the deadline it is spent against, and a backoff ceiling MUST NOT
+  exceed that deadline.
+- The freshness window MUST exceed the probe interval that feeds it, with room for a missed probe.
+- **A dial MUST have exactly one home**: the group belonging to the object that decides with it. The
+  same dial declared in two groups can disagree, and the copy that loses is whichever the caller did
+  not read.
+- Dials MUST be reachable from the one composed surface. A timing constant in module scope MUST NOT
+  exist.
+
 ## Enforcement
 
 Covers Compaction, Accumulators, Replication and Trust. **A row with no enforcer is a requirement nothing
@@ -494,6 +523,11 @@ obliges**, which is the defect this table exists to make visible rather than pla
 | a floor is corroborated by `f+1` fresh responders before use | **OWED** — `attested_floor` exists; nothing calls it on the bootstrap path |
 | a node that cannot obtain `(floor, head]` bootstraps instead | **OWED** — no decision point exists |
 | a server says what it no longer holds | **OWED** — `_on_pull` answers with what it has |
+| every dial sits at or above its derived floor | `tests/test_timing.py` |
+| nothing is retained past the point it can settle | `MempoolTunables.evict_after` (a property) |
+| the retry schedule fits its deadline | `timing.retry_total` + `tests/test_timing.py` |
+| one dial has one home | `tests/test_timing.py` |
+| tunables are consensus-agreed at a log position | **OWED** — they are per-node defaults today |
 ## Keys
 
 ### Two secrets, never one {#two-secrets}

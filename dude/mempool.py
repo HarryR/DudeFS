@@ -34,29 +34,48 @@ class Tunables:
 
     delta: Millis = 1_000
     """Bucket width. `bucket = ts / delta`, so boundaries are COMPUTED, never negotiated — there
-    is no protocol for agreeing where a bucket starts (MEMPOOL.md §1).
+    is no protocol for agreeing where a bucket starts.
+
+    FLOOR: `timing.BUCKET_FLOOR` (850 ms at the declared quantities) — a bucket narrower than
+    dissemination closes before its transactions could have reached the nodes that must propose
+    them. 1 s is the next round value above it.
 
     Changing this re-buckets everything: a change must land on a boundary aligned to both the old
     and the new value or bucket ids are ambiguous across it. Raising is safe; lowering can strand
     in-flight proposals."""
 
     w_admit: Millis = 30_000
-    """The door (§1.1). A transaction is refused if its `ts` is further than this from the receiving
-    node's now. Floored by worst-case delivery: below that, an honest client with a correct clock is
-    refused for being slow rather than wrong."""
+    """The door. A transaction is refused if its `ts` is further than this from the receiving node's
+    now, in either direction.
 
-    w_valid_margin: Millis = 3_000
-    """`w_valid = w_admit + this`, the whole of the difference (§1.2). A transaction admitted at
-    the very edge of `w_admit` is endorsed a wave or two later, so endorsement needs that much more
-    room. It is a pipeline margin, NOT a second tier of trust."""
+    FLOOR: `timing.ADMISSION_FLOOR` (25.6 s) — the client's tolerated clock error plus a round trip.
+    This is also the REPLAY bound: a captured transaction stays admittable for roughly this long, so
+    generosity above the floor is paid for in replay window rather than in latency."""
 
-    evict_after: Millis = 300_000
-    """Re-entry horizon (§5). A reject whose verdict may become satisfiable later is kept and
-    re-screened; this bounds how long, because holding forever is a denial-of-service."""
+    w_valid_margin: Millis = 3_250
+    """`w_valid = w_admit + this`, the whole of the difference. A transaction admitted at the very
+    edge of `w_admit` is endorsed a wave or two later, so endorsement needs that much more room. It
+    is a pipeline margin, NOT a second tier of trust.
+
+    FLOOR: `timing.endorse_margin(delta)` = 3·delta + skew = 3_250. It was 3_000 — **below its own
+    floor**, so a transaction admitted at the edge of the window could be refused by endorsers while
+    still inside the round it was admitted for. Found by deriving it."""
 
     @property
     def w_valid(self) -> Millis:
         return self.w_admit + self.w_valid_margin
+
+    @property
+    def evict_after(self) -> Millis:
+        """How long a transaction may be held. EQUAL to `w_valid`, and derived rather than set.
+
+        A transaction cannot be endorsed once `|now - ts| > w_valid`, so holding one past that is
+        not generosity — it is retaining what can never settle. It was 300 s against a 33 s
+        endorsable lifetime: 9x dead weight, and that surplus was exactly the window in which a
+        stale compare-and-swap could be re-proposed if its value happened to come back.
+
+        A property, not a field, so the two cannot drift apart again."""
+        return self.w_valid
 
     def bucket(self, ts: Millis) -> Bucket:
         return ts // self.delta

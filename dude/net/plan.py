@@ -17,7 +17,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
 
-from ..core import crypto
+from ..core import crypto, timing
 from .link import Estimator, Link, Peer
 
 type Millis = int
@@ -81,13 +81,35 @@ type Decision = Send | Wait | GiveUp
 class PlanTunables:
     """Destined for the one consolidated tunables surface (LINKS.md §5) — no literal below."""
 
-    backoff_base: Millis = 100
-    backoff_cap: Millis = 30_000
-    stagger_cap: Millis = 250
+    backoff_base: Millis = timing.RTT_MAX // 3
+    """First retry delay, 100 ms. A third of `RTT_MAX`, so the first retry is cheap on a fast link
+    and the schedule reaches a full round trip by its third attempt."""
+
+    backoff_cap: Millis = 5_000
+    """Ceiling on one delay. MUST NOT exceed the deadline it is spent against (`net.ttl`), or the
+    cap can never be applied — it was 30 s against a 10 s TTL, a dial with no reachable effect."""
+
+    stagger_cap: Millis = timing.RTT_MAX
+    """R7's Connection Attempt Delay, as a CAP rather than the value.
+
+    RFC 8305 specifies a flat 250 ms because a browser has no RTT history for a freshly resolved
+    address. We have history, per link, so the real delay is `min(cap, best_link.rto())` — waiting
+    the full cap before trying a second address when the first is a unix socket with a 20 ms RTO
+    would throw away most of what the estimator is for. One `RTT_MAX`: closer and the second dial is
+    duplicate load, further and it is a serial retry wearing a parallel name."""
+
     max_parallel: int = 2
-    max_attempts: int = 8
+    """How many links one message may be in flight on at once. Two is the Happy Eyeballs shape;
+    every attempt beyond the first also costs a budget token, so this is an upper bound rather than
+    a target."""
+    max_attempts: int = 6
     """A backstop, not the real limit — the deadline and the budget are. It exists so a pathological
-    peer cannot be attempted thousands of times inside one long TTL."""
+    peer cannot be attempted thousands of times inside one long TTL.
+
+    CHECKED against the deadline: `timing.retry_total(base, cap, attempts)` MUST fit inside
+    `net.ttl`. It was 8, which spends 25.5 s against a 10 s TTL, so the last three attempts were
+    unreachable — the schedule and the deadline had been chosen independently and disagreed. Six
+    spends 6.3 s."""
 
 
 @dataclass(frozen=True, slots=True)

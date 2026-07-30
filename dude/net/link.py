@@ -68,18 +68,10 @@ class LinkTunables:
     breaker_threshold: int = 5
     breaker_cooldown: Millis = 5_000
 
-    stagger_cap: Millis = 250
-    """R7's Connection Attempt Delay, as a CAP rather than the value.
-
-    RFC 8305 specifies a flat 250 ms because a browser has no RTT history for a freshly resolved
-    address. We do have history, per link, so the real delay is `min(cap, best_link.rto())` —
-    waiting 250 ms before trying a second address when the first is a unix socket with a 20 ms RTO
-    would throw away most of what the estimator is for."""
-
-    max_parallel: int = 2
-    """How many links one message may be in flight on at once. Two is the Happy Eyeballs shape;
-    every attempt beyond the first also costs a budget token, so this is an upper bound and not a
-    target."""
+    # `stagger_cap` and `max_parallel` are NOT here: they live in `PlanTunables`, which is what
+    # reads them. They were declared in both groups with no consumer for this copy, so the two could
+    # disagree — and did, by 50 ms, the moment one of them was derived from `RTT_MAX`. The dial
+    # belongs to the object that decides with it.
 
     budget_max_tokens: int = 10_000
     budget_token_ratio: int = 100
