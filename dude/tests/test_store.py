@@ -879,7 +879,7 @@ class TestRelocation(_Relocation):
     def test_a_node_cannot_smuggle_a_write_through_a_relocation(self):
         """THE fix. A `Move` carries no value, so there is no field in which to put a different
         one -- the dangerous thing is inexpressible rather than merely refused."""
-        self.assertFalse(hasattr(ops.Move(0, b"k"), "value"))
+        self.assertFalse(hasattr(ops.Move(0, b"k", b"cred"), "value"))
 
     def test_a_relocation_without_a_credential_is_refused(self):
         """Management rows must keep their authority. Dropping the credential is exactly what the

@@ -122,16 +122,20 @@ class Move:
 
     store: int
     name: bytes
-    credential: bytes = b""
-    """The manager-signed transaction that authorised the value being moved, carried forward.
+    credential: bytes
+    """The signed transaction that authorised the value being moved, carried forward.
 
     THE AUTHORITY TRAVELS WITH THE ROW. Collection eventually forgets the entry that first set a
     roster row, so without this a joiner could only take the roster on the quorum's word — and the
     roster is what defines the quorum. Carrying the credential keeps the chain back to the manager
     key intact across any amount of compaction.
 
-    Required for #management-is-cleartext rows and empty elsewhere: the management store IS the
-    authority, so it is the one place where "who said so" has to outlive the log."""
+    REQUIRED IN EVERY STORE, and byte-for-byte what the row already holds. It was management-only,
+    on the reasoning that data rows derive their authority from management state — true of the
+    authority and no use to someone holding the row. The state root commits to it now
+    (`smt.leaf_hash`), so a move carrying anything else would move the root and relocation would
+    stop being state-preserving. No default: an empty one is refused by settlement for every row
+    there is, so being able to omit it would only ever produce a transaction nobody will settle."""
 
     def encode(self) -> list:
         return [_MOVE, self.store, self.name, self.credential]
