@@ -405,11 +405,18 @@ class TestTieBreak(unittest.TestCase):
     """Two candidate slices of equal maximum size (#slice-tie-break).
 
     A: {1, 2, 3}, B: {1, 2, 4}, C: {1, 2, 3, 4}. Quorum = 2. Candidate intersections: AB={1,2}
-    (size 2), AC={1,2,3} (size 3), BC={1,2,4} (size 3). Two maximal candidates -- all nodes
-    MUST converge on ONE by a deterministic keyed sort, and the KEY MUST include the bucket so
-    an adversary cannot pre-mine transactions to guarantee winning in every future round."""
+    (size 2), AC={1,2,3} (size 3), BC={1,2,4} (size 3). Two maximal candidates -- honest nodes
+    that can back the winning slice MUST converge on ONE by a deterministic keyed sort, and
+    the KEY MUST include the bucket so an adversary cannot pre-mine transactions to guarantee
+    winning in every future round.
 
-    def test_all_nodes_converge_on_the_same_maximal_candidate(self):
+    LIVENESS IS QUORUM-SCOPED, NOT UNIVERSAL. `_compute_slice` restricts to slices ⊆ local
+    (a node MUST NOT sign what it does not hold), so whichever candidate wins the tie-break,
+    exactly one of {A, B} cannot back it and does not ratify. That is not a bug: it is what
+    `⊆ local` guarantees. Two ratifiers is a quorum; the one non-ratifier will re-enter its
+    unwitnessed tx to the next bucket."""
+
+    def test_ratifiers_converge_on_the_same_maximal_candidate(self):
         _keys, nodes = _setup(3)
         h1, h2, h3, h4 = (crypto.h(b"1"), crypto.h(b"2"), crypto.h(b"3"), crypto.h(b"4"))
         node_ids = list(nodes)
@@ -421,21 +428,23 @@ class TestTieBreak(unittest.TestCase):
 
         blocks = [r.ratified() for r in nodes.values()]
         rats: list[Block] = [b for b in blocks if b is not None]
-        self.assertEqual(len(rats), 3, "not all nodes ratified")
+        # Liveness: at least the quorum (2) of nodes that CAN back the winning slice ratifies.
+        self.assertGreaterEqual(len(rats), 2, f"fewer than a quorum ratified: {len(rats)}")
+        # Safety: everyone who ratified ratified the same slice.
         distinct_slices = {b.hashes for b in rats}
         self.assertEqual(len(distinct_slices), 1, f"nodes disagreed: {distinct_slices}")
         (chosen,) = distinct_slices
         self.assertEqual(len(chosen), 3, "the chosen slice should be one of the maximal candidates")
-        # It must be one of the two candidates.
         self.assertIn(chosen, {tuple(sorted({h1, h2, h3})), tuple(sorted({h1, h2, h4}))})
 
     def test_the_tie_break_key_depends_on_the_bucket(self):
         """Same holdings, different bucket -> the tie-break rolls the dice again.
 
-        Constructing two buckets whose keyed sorts pick different candidates. With only two
-        candidates, half of all buckets pick one and half pick the other on average, so any
-        modest range of buckets contains at least one of each. We probe up to 32 buckets and
-        assert the winner is not always the same."""
+        With only two candidates, half of all buckets pick one and half pick the other on
+        average, so any modest range of buckets contains at least one of each. We probe up to
+        32 buckets and assert the ratified winner is not always the same. Which node ratifies
+        depends on which candidate wins the bucket -- so we take the winner from ANY ratifier,
+        not specifically node 0, whose slice may not have won this bucket."""
         h1, h2, h3, h4 = (crypto.h(b"1"), crypto.h(b"2"), crypto.h(b"3"), crypto.h(b"4"))
 
         seen: set[tuple[crypto.Digest, ...]] = set()
@@ -446,10 +455,12 @@ class TestTieBreak(unittest.TestCase):
             nodes[node_ids[1]].add_local(frozenset({h1, h2, h4}))
             nodes[node_ids[2]].add_local(frozenset({h1, h2, h3, h4}))
             _run(nodes)
-            ratified = nodes[node_ids[0]].ratified()
-            self.assertIsNotNone(ratified, f"bucket {bucket} did not ratify")
-            assert ratified is not None
-            seen.add(ratified.hashes)
+            rats = [b for r in nodes.values() if (b := r.ratified()) is not None]
+            self.assertGreaterEqual(len(rats), 2, f"bucket {bucket}: fewer than a quorum ratified")
+            distinct = {b.hashes for b in rats}
+            self.assertEqual(len(distinct), 1, f"bucket {bucket}: ratifiers disagreed: {distinct}")
+            (winner,) = distinct
+            seen.add(winner)
             if len(seen) >= 2:
                 return
         self.fail(f"tie-break winner was constant across 32 buckets: {seen}")
