@@ -87,21 +87,23 @@ class Cluster:
         return s
 
     def pump(self, now: int, rounds: int = 10) -> int:
-        """Advance every node, then deliver everything in flight, `rounds` times, ADVANCING TIME
-        by δ per iteration. Returns the final `now`.
+        """Advance every node `rounds` times, ADVANCING TIME by δ per outer round, and
+        QUIESCING dissemination at each `now` before advancing. Returns the final `now`.
 
-        `now` is a FLOOR, not an authoritative time -- if the cluster's own clock is already past
-        it, we continue from there. Round's `close_by` needs actual time to pass for finalize to
-        trigger, and old tests wrote fixed `pump(T0); pump(T0 + DELTA)` sequences that assumed
-        time-standing-still-within-a-pump. Treating `now` as a floor lets those patterns keep
-        working while giving Round the room it needs."""
+        `now` is a FLOOR, not an authoritative time -- if the cluster's own clock is already
+        past it, we continue from there.
+
+        Quiescing inside each outer round is the important half: in production a SUBMIT
+        re-flood chains A -> B -> C in less than δ (the SPEC bucket-width floor). A naive
+        one-hop-per-iteration pump lets each hop consume a full δ, so a 2-hop chain can cross
+        a bucket boundary on the far end -- the tx lands in a different bucket on C than on
+        A, and neither node's Round opens with a quorum of holders. `_quiesce` lets every
+        hop that fits inside one moment happen inside one moment."""
         now = max(now, self._clock)
         for _ in range(rounds):
             for node in self.nodes:
                 node.tick(now)
-            for node in self.nodes:
-                for frame in self.board.drain(name_of(node.me.public)):
-                    node.receive(frame, now)
+            self._quiesce(now, away=set())
             now += DELTA
         self._clock = now
         return now
@@ -115,15 +117,29 @@ class Cluster:
             for i, node in enumerate(self.nodes):
                 if i not in away:
                     node.tick(now)
+            self._quiesce(now, away)
+            now += DELTA
+        self._clock = now
+        return now
+
+    def _quiesce(self, now: int, away: set[int]) -> None:
+        """Deliver until no more frames are in flight, at `now` fixed. Dissemination chains
+        (SUBMIT re-flood, HELD/SIG relays) happen inside one bucket in production; the harness
+        preserves that shape here."""
+        for _ in range(len(self.nodes) + 1):
+            for i, node in enumerate(self.nodes):
+                if i not in away:
+                    node.postman.tick(now)
+            delivered = 0
             for i, node in enumerate(self.nodes):
                 frames = self.board.drain(name_of(node.me.public))
                 if i in away:
                     continue
                 for frame in frames:
                     node.receive(frame, now)
-            now += DELTA
-        self._clock = now
-        return now
+                    delivered += 1
+            if delivered == 0:
+                return
 
     def submit(self, client: crypto.Keypair, tx: ops.SignedTransaction, to: int, now: int) -> None:
         """A client hands a transaction to ONE node — the whole point of the protocol being that it
