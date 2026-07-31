@@ -552,6 +552,179 @@ via the same one door as any other submission.
 
 ---
 
+## Tentative — under construction
+
+This section is a first pass at L5 (settlement) and L6 (sync, no-compaction path). It is here
+to be argued with, not to be built against yet. Requirements below use MUST/MUST NOT the same
+way the settled sections do, but no enforcement row exists until the shape survives review. The
+compaction path (compactor role, log truncation, fast sync, light-client sync via SMT proofs) is
+explicitly deferred — that discussion belongs after this line is rock-solid.
+
+## L5 — Settlement (tentative) {#settlement-layer}
+
+Settlement is the layer between "the quorum agreed on which slice" (L4) and "the log has advanced,
+every node's state matches, the head is committed". Round produces a RATIFIED slice; settlement
+turns that into a SETTLED block.
+
+### Ratified is not settled {#ratified-is-not-settled}
+
+- A slice is RATIFIED when Round's meta-agreement has produced a quorum of signatures over the
+  slice's identity (#slice-meta-agreement). Ratification says only that the quorum picked this
+  slice.
+- A block is SETTLED when a quorum of signatures over the slice's identity **AND the resulting
+  post-apply state anchors** has converged. Only SETTLED blocks advance the head.
+- The two are distinct events with distinct signatures. A slice can be RATIFIED and never SETTLE
+  (see #settlement-may-hang).
+
+### Deterministic application, transaction by transaction {#deterministic-application-per-tx}
+
+- On ratification, every honest node applies the slice's transactions to its own Store in the
+  slice's canonical order. Application uses the one evaluator (#one-evaluator).
+- A transaction MUST be atomic: all its steps land or none do (#tx-atomic). A step whose guard
+  fails causes the whole transaction to fall through — not a partial write.
+- A transaction that falls through in one honest node's application MUST fall through in every
+  honest node's application: same starting state, same slice, same evaluator, same order.
+
+### Non-applying transactions re-enter the current mempool {#fall-through-through-the-door}
+
+- A transaction from a ratified slice that could not apply MUST be handed to the currently
+  collecting mempool as an ordinary admission attempt (#rejects-through-same-door). The mempool
+  decides whether the tx is now inadmissible (its author lost authority, its predicate quotes
+  state that has moved) or still admissible for a future bucket.
+- There is no separate re-entry path, no reject flag, no "settlement queue". If the current
+  predicate admits it, it collects again; if not, it is dropped.
+
+### Settlement signs the post-apply anchors {#settlement-signs-post-anchors}
+
+- After applying, a node MUST compute the resulting `state_root`, `A_state`, `A_log`, and `head`
+  index, and sign a message binding those to the slice's identity: `sig over (slice_hash, height,
+  state_root, A_state, A_log)`.
+- The sign happens **after** the durable transaction (#atomic-write) that applied the slice. A
+  node MUST NOT sign anchors it has not committed.
+- A node that could not apply the slice — because it did not hold every body, or its Store
+  refused a transaction the honest evaluator accepted, or its own state was too far behind — MUST
+  NOT sign. Silence is the refusal.
+
+### Settlement converges by quorum agreement on the anchors {#settlement-quorum-on-anchors}
+
+- Nodes exchange settlement signatures. A block is SETTLED when a quorum of settlement signatures
+  over the same anchors converges — same evaluator on the same inputs producing the same outcome
+  is what makes convergence possible without a coordinator.
+- The settlement signature set MUST be distinct by construction (bitmap indexed by roster
+  position), for the same reason ratification counts distinct signers (#ratification-counts).
+- Two nodes producing different anchors from the same slice is a divergence, not a signature
+  disagreement about a value judgement. It reveals that one implementation is wrong — the
+  evaluator, the accumulator update, the SMT insert, one of them. Divergence at this step is a
+  bug of ours.
+
+### Settlement does not reach through the mempool {#settlement-does-not-cross-mempool}
+
+- Settlement MUST NOT hold a reference to the currently-collecting mempool, inspect it, or bypass
+  its admission predicate. Fall-through re-entry (#fall-through-through-the-door) is the sole
+  crossing, and it is a call through the same one door every other submission uses.
+- The mempool MUST NOT know that a caller was Settlement rather than a client or a peer. If it
+  did, its predicate would grow a special case, and the "one door, one predicate" invariant
+  (#one-admission-predicate) would be a lie by construction.
+- Bodies for the ratified slice MUST come from the FROZEN mempool the Round was seeded with, not
+  from the currently-collecting one. A body admitted after the bucket boundary belongs to the
+  next bucket; using it to satisfy a lookup for the previous bucket would let a slice's contents
+  drift under settlement's feet.
+
+### Settlement may hang; not solved here {#settlement-may-hang}
+
+- A slice MAY be RATIFIED and never SETTLE: fewer than a quorum can produce matching post-apply
+  signatures (partial holdings on the ⊆-local edge cases, one node down at the wrong moment, a
+  transient partition during the exchange). The block stays in the RATIFIED-but-not-SETTLED state
+  indefinitely and the head does not advance.
+- This is a known gap in the tentative spec. A resolution mechanism is planned but deliberately
+  not written here — get the settle-when-it-does-settle path rock-solid first, then close the
+  hang case surgically.
+
+### The block is the SETTLED thing {#block-shape-settled}
+
+- A SETTLED block's identity is `(bucket, height, slice_hash, prev_block_hash, state_root,
+  A_state, A_log, settle_sigs)`. The `settle_sigs` are a quorum-bounded distinct-signer bitmap
+  over `(slice_hash, height, anchors)`.
+- Ratify signatures are **not persisted**. They are Round's transient consensus infrastructure —
+  the record of *how the quorum came to agree on this slice*, not the record *that they did*.
+  What proves the block to a replayer is the settle_sigs alone: a quorum agreed on the outcome,
+  and `slice_hash` inside that payload pins which slice they were agreeing about.
+- Individual transactions are not settled one at a time. The block is the unit.
+
+## L6 — Sync (tentative, no-compaction only) {#sync-layer-no-compaction}
+
+The path a joining or lagging node walks to become current, in the world where nothing has been
+compacted and every node still holds every block from genesis. Fast sync, light-client sync via
+SMT proofs, and any compaction-aware sync path are deferred (see #compaction-deferred).
+
+### A joiner starts from the anchor alone {#joiner-starts-from-anchor}
+
+- A joining node arrives holding the manager pubkey (out-of-band anchor) and seed addresses for
+  peers. Nothing else — not the current roster, not the current head, not any block.
+- Every fact about the cluster the joiner comes to believe MUST be reached from the anchor by
+  verified replay. The roster it eventually uses to check the current tip is derived from the log
+  it has walked, not fetched separately and trusted.
+
+### No trusted frontier {#no-trusted-frontier}
+
+- A joiner MUST NOT trust a "current head" statement from any peer: it does not yet hold the
+  roster that would verify the settlement signatures on that head.
+- A lagging node with a stale roster MUST NOT trust a claimed head signed by a roster it cannot
+  yet verify. It walks forward to the point where it CAN verify, then verifies.
+- Therefore sync is block-by-block from where the joiner is (genesis for a fresh joiner, its last
+  SETTLED height for a lagger) to the true head — not a fetch of the head followed by a walk back
+  to fill in.
+
+### Sync is log replay {#sync-is-log-replay}
+
+- The sync verb (name pending; not `FRONTIER`) MUST be: "give me the next SETTLED block after
+  height X". A block-by-block pull, in order, from the joiner's current height.
+- The joiner MUST replay each block through the one evaluator, verify both signature sets against
+  the roster in effect at that block's height (#roster-at-ratification), update its own Store,
+  and only then advance to X+1.
+- Nothing about the walk uses the SMT for correctness. The SMT belongs to a different question
+  (light-client proofs — see #smt-for-light-clients).
+
+### The roster walks forward with the log {#roster-walks-forward}
+
+- The roster the joiner uses to verify block N+1's signatures is the roster its Store holds
+  after applying blocks 0..N. Roster changes are log-state (#authority-is-log-state), so this
+  falls out of #roster-at-ratification without any special mechanism.
+- A joiner that hits a roster change block MUST apply the change atomically with the block
+  (#roster-change-is-atomic), so the next block is checked against the post-change roster.
+
+### The SMT is not part of sync {#smt-for-light-clients}
+
+- The compressed sparse Merkle tree (#state-root) exists so a light client can be shown a
+  membership or non-membership proof for a single key without holding any log. It is not a
+  primitive of full-node sync.
+- Full-node sync recomputes the SMT locally by folding the log; a joiner never trusts an
+  SMT root from a peer as a sync shortcut. That shortcut is exactly the fast-sync path, and
+  fast sync is deferred.
+
+### Test shape {#sync-test-shape}
+
+- A three-node cluster runs long enough to produce many SETTLED blocks including at least one
+  roster change (adding an authorised writer, granting a new node's role).
+- A fourth node is instantiated holding only the manager pubkey and seed addresses. It syncs
+  block-by-block through the sync verb, verifies each, catches up to the current SETTLED head,
+  then participates in the next Round as a quorum-eligible node.
+- Divergence at any step (a block whose signatures fail, whose replay produces different
+  anchors, whose slice contains a transaction the joiner cannot resolve) MUST fail loudly, not
+  proceed with a warning.
+
+### Compaction is deferred {#compaction-deferred}
+
+- The compactor role (a distinct key with its own authorisation to propose truncation),
+  entry discard below a ratified checkpoint (SPEC L1's OWED row), and any sync path shaped for
+  a compacted log are deliberately out of scope for the tentative L6.
+- The no-compaction path MUST work correctly and be exhaustively tested before compaction is
+  introduced. Once it does, compaction becomes a surgical addition — a compactor-signed
+  checkpoint that renders older blocks discardable, and a fast-sync path that adopts state at a
+  ratified checkpoint rather than replaying from genesis.
+
+---
+
 ## Trust (cross-cutting)
 
 Applies at L1–L4 alike and at everything above.
