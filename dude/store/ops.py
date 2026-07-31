@@ -125,7 +125,6 @@ def _mutation_from(v: codec.Bencodable) -> Mutation:
 
 _ABSENT = b"a"
 _HOLDS = b"h"
-_DRAINED = b"d"
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,24 +154,7 @@ class Holds:
         return [_HOLDS, self.store, self.name, self.digest]
 
 
-@dataclass(frozen=True, slots=True)
-class Drained:
-    """No live value anywhere is encrypted under `epoch` — so its key may die (#conveyor).
-
-    A PREDICATE rather than a special case in settlement, which buys three things at once: every
-    node evaluates it identically at the same log position, replay reproduces it, and the retirement
-    entry says in the log what it was conditional on. Retirement is then an ordinary transaction.
-
-    It is the one predicate that is not about a single key, because it is the one question whose
-    answer must range over all of them."""
-
-    epoch: int
-
-    def encode(self) -> list:
-        return [_DRAINED, self.epoch]
-
-
-type Predicate = Absent | Holds | Drained
+type Predicate = Absent | Holds
 
 
 def _predicate_from(v: codec.Bencodable) -> Predicate:
@@ -181,8 +163,6 @@ def _predicate_from(v: codec.Bencodable) -> Predicate:
     if tag == _ABSENT:
         p = codec.as_seq(v, 3)
         return Absent(codec.as_int(p[1]), codec.as_bytes(p[2]))
-    if tag == _DRAINED:
-        return Drained(codec.as_int(codec.as_seq(v, 2)[1]))
     if tag == _HOLDS:
         p = codec.as_seq(v, 4)
         return Holds(
@@ -273,15 +253,10 @@ class Transaction:
         return tuple(seen)
 
     def reads(self) -> tuple[tuple[int, bytes], ...]:
-        """Every `(store, key)` a guard depends on.
-
-        `Drained` contributes none: it depends on every key at once, so naming its dependencies is
-        not something this can express. It is evaluated at settlement like any other guard, which
-        is where a whole-state question has a single well-defined answer."""
+        """Every `(store, key)` a guard depends on."""
         seen: dict[tuple[int, bytes], None] = {}
         for g in self.guards:
-            if not isinstance(g, Drained):
-                seen.setdefault((g.store, g.name), None)
+            seen.setdefault((g.store, g.name), None)
         return tuple(seen)
 
     def stores(self) -> frozenset[int]:
@@ -373,16 +348,9 @@ def _satisfied_by(pred: Absent | Holds, post: crypto.Digest | None) -> bool:
 
 def falsifies(a: SignedTransaction, b: SignedTransaction) -> bool:
     """Would `a`'s effects invalidate any of `b`'s predicates? Compared per `(store, key)`, so a
-    name in one store never falsifies a predicate about the same name in another.
-
-    `Drained` is skipped: it is not about a key, so there is no effect to compare it against. That
-    costs nothing, because a guard is evaluated again at settlement — two transactions that would
-    invalidate each other simply both enter the bucket, and the second one's guard fails there. The
-    backstop is the same one that makes guards meaningful in the first place."""
+    name in one store never falsifies a predicate about the same name in another."""
     eff = a.effects()
     for p in b.txn.guards:
-        if isinstance(p, Drained):
-            continue
         key = (p.store, p.name)
         if key in eff and not _satisfied_by(p, eff[key]):
             return True

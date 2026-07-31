@@ -65,9 +65,6 @@ CREATE TABLE IF NOT EXISTS live (
 -- UNIQUE deliberately: `path` is a hash of the primary key, so a duplicate is a collision, and a
 -- collision must be an error rather than two keys silently sharing one leaf (#state-root).
 CREATE UNIQUE INDEX IF NOT EXISTS live_by_path ON live(path);
--- The conveyor's whole question -- "is this epoch drained yet" -- is one indexed count.
-CREATE INDEX IF NOT EXISTS live_by_epoch ON live(epoch);
-
 -- Internal nodes of the state root. A MEMO OF A PURE FUNCTION and nothing more: every row is
 -- recomputable from `live` alone, so truncating this table costs time and cannot cost correctness.
 CREATE TABLE IF NOT EXISTS smt_memo (
@@ -516,30 +513,6 @@ class Store:
             "SELECT cred FROM live WHERE store=? AND name=?", (store, name)
         ).fetchone()
         return row[0] if row else b""
-
-    # -- THE CONVEYOR (#conveyor) ---------------------------------------------- #
-
-    def epoch_live(self, epoch: int) -> int:
-        """How many live values are still encrypted under `epoch`.
-
-        A pure function of live state, so every node computes the same number at the same log
-        position and nobody has to be trusted about it. Zero is the ONLY condition under which that
-        epoch's key may die — retire one value too early and that value is unreadable by everyone,
-        forever, which is the failure this whole system exists to prevent."""
-        row = self.db.execute("SELECT COUNT(*) FROM live WHERE epoch=?", (epoch,)).fetchone()
-        return row[0] or 0
-
-    def epochs(self) -> dict[int, int]:
-        """Live values per epoch, `EPOCH_NONE` excluded — the conveyor's backlog, by age.
-
-        Sorted, since a caller wants the oldest first: that is the epoch closest to dying."""
-        return {
-            r[0]: r[1]
-            for r in self.db.execute(
-                "SELECT epoch, COUNT(*) FROM live WHERE epoch<>? GROUP BY epoch ORDER BY epoch",
-                (ops.EPOCH_NONE,),
-            )
-        }
 
     # -- THE STATE ROOT (#state-root) ------------------------------------------ #
 

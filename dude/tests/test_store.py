@@ -314,8 +314,7 @@ class TestCrossStorePredicates(unittest.TestCase):
         )
         back = ops.SignedTransaction.decode(t.raw)
         self.assertEqual(back, t)
-        keyed = [p for p in back.txn.guards if not isinstance(p, ops.Drained)]
-        self.assertEqual([p.store for p in keyed], [7, 9])
+        self.assertEqual([p.store for p in back.txn.guards], [7, 9])
         self.assertTrue(back.verify())
 
 

@@ -324,36 +324,6 @@ class Management:
             *(ops.Set(self.store_id, _wrap_key(epoch, who), wraps[who]) for who in sorted(wraps))
         )
 
-    def wraps_of(self, epoch: int) -> tuple[bytes, ...]:
-        """Every wrap key for one epoch. A prefix scan, which is what the fixed-width epoch in
-        `_wrap_key` was for."""
-        pre = P_WRAP + epoch.to_bytes(8, "big")
-        return tuple(name for name, _prov, _v, _ep in self.store.prefix(self.store_id, pre))
-
-    def retire(self, epoch: int) -> ops.Transaction:
-        """Kill a keyepoch: delete every wrapped copy of its master (#conveyor).
-
-        GUARDED BY `Drained`, which is the whole safety of it. Retire an epoch that still has one
-        live value under it and that value is unreadable by everyone, forever — so the condition is
-        carried in the transaction, evaluated by every node at settlement, and reproduced on replay.
-        A retirement that should not have happened does not settle anywhere.
-
-        What this can and cannot do is worth being exact about. Deleting the wraps makes the master
-        unobtainable FROM THE RECORD, and #state-root now proves that absence to anyone holding the
-        root. Whether a holder that once had it in memory forgot it is not provable by anyone — that
-        is the accepted TEE trade-off, not a gap this closes."""
-        if epoch == ops.EPOCH_NONE:
-            # Not a routine refusal, a caller bug: `EPOCH_NONE` is "no key to retire", so this
-            # would delete whatever happened to be filed under a zero epoch.
-            raise ValueError("EPOCH_NONE is not a keyepoch and cannot be retired")
-        guard = ops.Drained(epoch)
-        return ops.Transaction(
-            tuple(
-                ops.Step((guard,), ops.Del(self.store_id, name))
-                for name in sorted(self.wraps_of(epoch))
-            )
-        )
-
     # -- historical node sets ------------------------------------------------- #
 
     def node_set_at(self, _idx: Index) -> tuple[crypto.PublicKey, ...]:

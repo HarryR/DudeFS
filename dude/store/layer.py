@@ -72,8 +72,6 @@ class Reader(Protocol):
 
     def prefix(self, store: int, pre: bytes) -> Iterator[Row]: ...
 
-    def epoch_live(self, epoch: int) -> int: ...
-
 
 class Layer:
     """A read-through, writable delta over any `Reader`. Writes land in this layer; reads fall
@@ -123,21 +121,6 @@ class Layer:
         for name in sorted(rows):
             yield rows[name]
 
-    def epoch_live(self, epoch: int) -> int:
-        """The base count, corrected for what this layer has done to it.
-
-        A layer that only delegated would let a transaction retire an epoch it is itself writing
-        under, in the same batch — the count has to see uncommitted work for the same reason a
-        guard does."""
-        n = self._base.epoch_live(epoch)
-        for (st, name), held in self._delta.items():
-            was = self._base.get(st, name)
-            if was is not None and was.epoch == epoch:
-                n -= 1
-            if held is not None and held.epoch == epoch:
-                n += 1
-        return n
-
     # -- writes ------------------------------------------------------------- #
 
     def apply(self, m: ops.Mutation, cred: bytes) -> None:
@@ -169,8 +152,6 @@ def holds(reader: Reader, pred: ops.Predicate) -> bool:
     `absent` is a presence test; `holds` compares the digest the author QUOTED against the stored
     ciphertext (11.4d), never a value the node derived. Taking a `Reader` rather than a `Store` is
     what lets a guard see mutations from earlier steps of its own transaction."""
-    if isinstance(pred, ops.Drained):
-        return reader.epoch_live(pred.epoch) == 0
     cur = reader.get(pred.store, pred.name)
     if isinstance(pred, ops.Absent):
         return cur is None
