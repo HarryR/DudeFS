@@ -725,9 +725,18 @@ SMT proofs, and any compaction-aware sync path are deferred (see #compaction-def
 
 ---
 
-## Trust (cross-cutting)
+## Trust (cross-cutting) — currently OWED
 
-Applies at L1–L4 alike and at everything above.
+The requirements in this section describe the attestation duty that was ripped in
+2026-08-01 as "a mitigation nothing consults" (CLAUDE.md trap #7): the machinery ran on
+every tick, produced convictions, and no production path acted on them. The principles
+survive — a node that signs a lower height after a higher one is convictable, `f+1` fresh
+distinct answers are the currency floor, self-contradiction is terminal — but the code that
+observes and enforces them is not here. The natural first consumer is L5 settlement
+(#settlement-signs-post-anchors is exactly a signed-monotone claim about state), and until
+then the trust section is a specification of what MUST hold once the machinery returns
+rather than of what the code currently checks. The enforcement rows for this section have
+been struck from the table.
 
 ### Storage nodes are untrusted {#nodes-are-untrusted}
 
@@ -811,6 +820,14 @@ Applies at L3 and L4.
 ---
 
 ## Keys (the primitives; who does what is L5)
+
+The **encoding-half** of this section stays wired: `Set.epoch` is on the wire, `live.epoch`
+is stored, values carry their keyepoch cleartext next to the ciphertext. The **retirement-
+half** — `Management.retire`, the `Drained` predicate, `Store.epoch_live`, the refcount over
+live values — was ripped in 2026-08-01 as a mitigation nothing consults, together with the
+attestation duty. The whole subsystem returns when the client encryption layer lands (Harry:
+"the actual thing up and running properly first before adding new operations"). The
+enforcement row for #wrapped-masters retention is OWED; #value-carries-epoch stays wired.
 
 ### Two secrets, never one {#two-secrets}
 
@@ -963,7 +980,7 @@ visible rather than plausible.
 | every live row carries a credential | `live.cred NOT NULL` schema, `Held.cred` no default |
 | the leaf commits to the credential | `smt.leaf_hash(path, vhash, chash)` |
 | management is a cleartext prefixed keyspace | `management.py`, keys typed as `P_NODE + …` |
-| entries below the last ratified checkpoint may be discarded | **OWED** (L5 pivot in progress) |
+| entries below the last ratified checkpoint may be discarded | **OWED** — compaction ripped 2026-08-01 (rip 2/3); no-compaction path holds every entry from genesis, and the compactor role (SPEC L5+) has not been designed |
 | a settled index is preserved on replay | `Store.replay` applies at recorded indices |
 
 ### L2 ops
@@ -987,9 +1004,9 @@ visible rather than plausible.
 | admission consults currently-settled state | `Mempool.valid` via `settle.would_apply` |
 | duplicates never enter | `Store._settled_hashes` and `Mempool.valid` |
 | one evaluator across admission, slice construction, settlement | `settle.evaluate` called from `Store.apply` and `Mempool.valid` |
-| a mempool is not retained past its window's close | **OWED** — the current `Mempool` is a long-lived pool with `evict`/`reenter`, not per-window |
-| `Mempool.evict` and `Mempool.reenter` do not exist as separate operations | **OWED** — both exist today; both should collapse into the lifecycle |
-| rejects re-enter through the same door | **OWED** — the current `Mempool.reenter` is a distinct path, not the same admission call |
+| a mempool is not retained past its window's close | `dude.coordinator.Coordinator` swaps the whole `Mempool` at each bucket boundary — the frozen one goes with the Round, a fresh one starts admitting |
+| rejects re-enter through the same door | `Coordinator._settle` calls `self.mempool.admit(tx, ...)` for surviving-but-not-included transactions — the same one door any submission uses |
+| `Mempool.evict` / `Mempool.reenter` / `Mempool.propose` / `Mempool.retire` do not exist | **OWED** — the methods still exist on the class but no production path calls them post-round-pivot; a small cleanup commit will strike them |
 
 ### L4 consensus
 
@@ -1011,11 +1028,11 @@ visible rather than plausible.
 | the slice is the largest intersection over a quorum | `dude.round._compute_slice` (enumerates C(n, q) subsets) |
 | ties are broken by keyed sort | `dude.round._compute_slice` — `min(candidates, key=lambda c: _slice_id(bucket, c))` |
 | a meta-agreement round chooses one slice | `Round._try_ratify` — quorum of matching `Sig` messages over the same `slice_hash` |
-| exclusion is by selection during slice construction | Currently `Mempool.propose` via `settle.would_apply`. Moves onto the ratified `Block` when Round is wired (Phase 6). |
-| endorsers refuse a slice containing a past-`w_valid` transaction | Currently `Mempool.endorsable`. Moves into Round's `_finalize` when the mempool feeds Round (Phase 7). |
+| exclusion is by selection during slice construction | Naturally satisfied by Round's #slice-is-intersection: a mutually-exclusive tx cannot appear in the largest set held by a quorum unless every quorum member holds it, which for a slice-mate that would invalidate it is precisely what settlement's evaluator refuses at apply time. The falsified loser returns via #fall-through-through-the-door. |
+| endorsers refuse a slice containing a past-`w_valid` transaction | **OWED** — Round's `Sig` verification currently checks only slice_hash membership, not per-tx staleness. The endorser-refusal-of-stale rule was on `Mempool.endorsable`, which is one of the retired mempool methods (see the L3 row above). Rewire into `Round._on_sig` when the retired methods are struck. |
 | an equivocating peer's contradiction is preserved as evidence past GONE | `Round._on_sig` (detects equivocation before dropping on `GONE`); `Round.equivocations()` for the observability layer |
-| the running Node uses `Round` for consensus | `dude.coordinator.Coordinator` — `Node.tick` calls `Coordinator.tick`, which opens Rounds at bucket boundaries, drives them, hands ratified Blocks to `Store.apply`, and pushes surviving hashes back to the current Mempool through the same admission door. `Node._propose`/`_on_propose`/`_count`/`_settle` are gone. |
-| **block-shaped ratification via `Coordinator._settle`** | `dude.round.Block` is the ratified shape; `Coordinator._settle` looks up bodies from the frozen Mempool and passes them as an ordered tuple to `Store.apply`. Block metadata (bucket, signers, sigs) is not yet persisted -- the log records transactions per-entry, not blocks-as-entries. That is a Phase 7 concern with `store.py`. |
+| the running Node uses `Round` for consensus | `dude.coordinator.Coordinator` — `Node.tick` calls `Coordinator.tick`, which opens Rounds at bucket boundaries, drives them, hands ratified Blocks to `Store.apply`, and pushes surviving hashes back to the current Mempool through the same admission door. |
+| **block-shaped ratification via `Coordinator._settle`** | `dude.round.Block` is the ratified shape; `Coordinator._settle` looks up bodies from the frozen Mempool and passes them as an ordered tuple to `Store.apply`. Block metadata (bucket, signers, sigs) is not yet persisted — the log records transactions per-entry, not blocks-as-entries. Moves into L5 settlement (SPECv2 #block-shape-settled). |
 
 ### Transport
 
@@ -1036,15 +1053,13 @@ visible rather than plausible.
 
 ### Trust / attestation
 
-| requirement | enforced by |
-|---|---|
-| monotone counter bumped and committed before signing | `Store.attestation` (one transaction) |
-| gaps in the counter are free, reuse is fatal | `Store.attestation` bumps unconditionally |
-| self-contradiction is the only fault | `attest.contradiction` |
-| clock skew is not convictable | `attest.contradiction` ignores `at` |
-| shun is local read policy, not roster mutation | `Node.shunned` |
-| the counter is separate from the height | `Attestation.seq` and `Attestation.head` are distinct fields |
-| a relayed verdict is recomputed, not believed | `Witness.judge` |
+Every row here was OWED as of 2026-08-01, and the whole table was struck rather than
+carried at debt. The Trust section preamble names why: the machinery ran with no consumer
+in production, so the mitigation was doing nothing that could be missed. When L5 settlement
+lands its post-apply signature exchange, the first four rows return there naturally (a
+node signing a lower height after a higher one is exactly the shape settlement collects).
+The remaining rows return alongside — self-contradiction, shun-as-local-policy, relayed-
+verdict-recomputed — once the observability layer that reads them is on the map.
 
 ---
 
@@ -1074,6 +1089,32 @@ Tags kept here rather than deleted, so stale citations resolve to an explanation
 - `#conveyor` — retired at L0–L4. The primitives are in Keys (#wrapped-masters,
   #value-carries-epoch). The DUTY (which layer re-encrypts, when) is L5+ and will get a fresh
   anchor when it settles. Do not cite `#conveyor` from new code.
+
+The following are OWED rather than retired — the requirement stands, but the machinery that
+enforced it was struck 2026-08-01 as "a mitigation nothing consults" and will return with
+whichever layer becomes its first real consumer. Cite them freely; expect no enforcement
+until the return commit names them again.
+
+- `#cross-attestation`, `#freshness-needs-many`, `#freshness-is-gathered`, `#monotonicity`,
+  `#peers-keep-evidence` — the attestation duty. Returns with L5 settlement (post-apply
+  signatures ARE monotone claims about state, checked by the same shape as attestation).
+- `#the-lemma`, `#nodes-are-untrusted` — the trust axioms these principles state stay
+  settled; nothing changed about the threat model. The rows are here because the machinery
+  that made them checkable is gone.
+- `#wrapped-masters` retention rule (refcount over live values, retire-when-zero) — the
+  DUTY was ripped with the conveyor. Returns with client encryption. `#value-carries-epoch`
+  is NOT here — the wire format survives.
+
+Two wire-verb sets went with these rips and have no anchor to retire (verbs are enum
+members, not SPEC tags); noted here for grepability:
+
+- `COLLECT` / `RATIFY` — compaction consensus (rip 2/3, 2026-08-01).
+- `FRONTIER` / `STANDING` / `PULL` / `ENTRIES` — attestation probes and log transfer (rip
+  3/3c, 2026-08-01). PULL/ENTRIES return in a different shape when L6 sync lands.
+- `ANNOUNCE` / `FETCH` / `SUBTREE` / `HASHES` / `LEAVES` / `ROWS` — gossip-by-hash and the
+  SMT state walk (rips 1/3 and 3/3a). Neither is expected to return in the same form —
+  gossip-by-hash rides Round's `HELD` now, and light-client state queries will be direct
+  rather than an interactive walk.
 
 ---
 
