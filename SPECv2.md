@@ -1006,7 +1006,7 @@ visible rather than plausible.
 | one evaluator across admission, slice construction, settlement | `settle.evaluate` called from `Store.apply` and `Mempool.valid` |
 | a mempool is not retained past its window's close | `dude.coordinator.Coordinator` swaps the whole `Mempool` at each bucket boundary — the frozen one goes with the Round, a fresh one starts admitting |
 | rejects re-enter through the same door | `Coordinator._settle` calls `self.mempool.admit(tx, ...)` for surviving-but-not-included transactions — the same one door any submission uses |
-| `Mempool.evict` / `Mempool.reenter` / `Mempool.propose` / `Mempool.retire` do not exist | **OWED** — the methods still exist on the class but no production path calls them post-round-pivot; a small cleanup commit will strike them |
+| `Mempool.evict` / `Mempool.reenter` / `Mempool.propose` / `Mempool.retire` do not exist | Struck 2026-08-01 — Mempool is now a container with one door (`admit`) and one introspection helper (`buckets`), and the Coordinator owns everything else |
 
 ### L4 consensus
 

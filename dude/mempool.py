@@ -155,23 +155,18 @@ def tx_id(tx: ops.SignedTransaction) -> crypto.Digest:
 
 @dataclass(slots=True)
 class Mempool:
-    """Candidate transactions, bucketed by `ts / delta`.
+    """Currently-collecting mempool: one bucket window's worth of candidate transactions,
+    keyed by content address.
 
-    Holds no lock, no socket and no store handle: a caller drives it, and `dude.net` will carry what
-    it produces. `settled` ids are remembered so a re-offered transaction is refused as a duplicate
-    without consulting storage."""
+    THIS CLASS IS A CONTAINER WITH ONE DOOR AND NOTHING ELSE. Lifecycle -- window close,
+    freeze-with-Round, fall-through re-entry after settlement, body lookup at apply time --
+    lives in `dude.coordinator`. This class does not know Round exists, does not know
+    Settlement exists, does not know its own window has closed. The Coordinator constructs a
+    fresh instance at every bucket boundary; the frozen predecessor goes with the Round it
+    seeded and dies when that Round retires (SPECv2 #settlement-does-not-cross-mempool)."""
 
     tunables: Tunables = field(default_factory=Tunables)
     pending: dict[Bucket, dict[crypto.Digest, ops.SignedTransaction]] = field(default_factory=dict)
-    arrived: dict[crypto.Digest, Millis] = field(default_factory=dict)
-    settled: set[crypto.Digest] = field(default_factory=set)
-    highest_proposed: Bucket = -1
-    """Monotone, and MUST be persisted by the caller (§8).
-
-    A backward clock step — NTP correction, VM resume, leap second — would otherwise re-enter a
-    bucket already proposed for and emit a SECOND batch for it, which is exactly the equivocation
-    §4.1 convicts on, with no malice involved. Tens of seconds is the realistic magnitude, so this
-    is a small durability obligation guarding against self-conviction."""
 
     # -- the door ----------------------------------------------------------------------------- #
 
@@ -220,203 +215,27 @@ class Mempool:
     ) -> Refusal | None:
         """The door a CLIENT knocks on: `valid`, plus "do we hold it already", plus the insert.
 
-        `None` means admitted; anything else is the reason. NOT a `Refusal.ADMITTED` member: an
-        enumeration of refusals must not contain "was not refused", or iterating it yields a bogus
-        entry that every exhaustive match and every metric has to special-case. It also stops
-        falsiness doing implicit work — the stringly-typed trick this enum replaced — and matches
-        `Policy.before_send`, so the codebase has one spelling of "no objection" rather than two.
-
-        A refusal is the *desired* outcome for a broken client: it is told, immediately, by every
-        node it talks to.
+        `None` means admitted; anything else is the reason.
 
         LATE IS NOT STRANDED. A transaction whose derived bucket has already passed is carried
-        forward to the current one, so a client running behind settles a few buckets further ahead
-        than its own clock suggests — bounded by `w_admit`. The bucket is a floor, not an exclusion
-        window, so nothing that passes this gate can be stranded by arithmetic.
-
-        UNSETTLED: the alternative is to DROP rather than relocate, leaving the client to monitor
-        its own transactions and re-issue on whatever logic its application wants. That is arguably
-        better, since it stops a node quietly moving a transaction to a bucket other than the one
-        its author signed for. This implements carry-forward; do not treat that as decided."""
+        forward to the current one, so a client running behind settles a few buckets further
+        ahead than its own clock suggests -- bounded by `w_admit`. The bucket is a floor, not
+        an exclusion window."""
         ident = tx_id(tx)
-        if ident in self.settled or ident in self.arrived:
+        if any(ident in held for held in self.pending.values()):
             return Refusal.DUPLICATE
         if (why := self.valid(tx, now, reader, auth)) is not None:
             return why
-        self._hold(tx, now, arrived=now)
-        return None
-
-    def _hold(self, tx: ops.SignedTransaction, now: Millis, arrived: Millis) -> None:
-        """Place a transaction in the bucket it will be proposed for, keeping its ARRIVAL time.
-
-        `arrived` is passed rather than read from `now` so the age horizon survives re-entry: a
-        transaction bounced through settlement would otherwise reset its own clock and live for
-        ever. A test caught that, not review."""
         t = self.tunables
         landed = max(t.bucket(tx.ts), t.bucket(now))
-        self.pending.setdefault(landed, {})[tx_id(tx)] = tx
-        self.arrived.setdefault(tx_id(tx), arrived)
-
-    def endorsable(self, tx: ops.SignedTransaction, now: Millis) -> bool:
-        """The check an ENDORSER applies to a transaction inside someone else's proposal (§1.2).
-
-        `w_valid`, never `w_admit`. Re-applying the door would require all `q` endorsers' windows to
-        agree on every member, so any skew would kill otherwise-valid slices; admission is the
-        admitting node's business. This wider bound exists only to stop an unguarded write being
-        replayable indefinitely."""
-        return abs(now - tx.ts) <= self.tunables.w_valid
-
-    # -- proposing ---------------------------------------------------------------------------- #
-
-    def propose(
-        self, bucket: Bucket, reader: Reader, auth: settle.Authoriser | None = None
-    ) -> tuple[ops.SignedTransaction, ...]:
-        """The batch this node offers for `bucket`: its eligible transactions, screened.
-
-        DETERMINISTIC ORDER, so the largest intersection needs no search. Two
-        nodes applying this rule to the same eligible set produce identical batches, and to
-        *different* eligible sets produce batches differing only by the transactions each actually
-        holds — one is a subset of the other rather than diverging. The intersection, obtained by
-        construction. It also retires the ECMH-powerset idea: naming a subset is 32 bytes and free,
-        but *inverting* a name costs 2^n, and nothing needs inverting because whoever names a subset
-        can enumerate it.
-
-        Screened through `settle.would_apply` so a batch is not offered containing transactions that
-        cannot land — the same evaluator the store and the client use, so all three agree."""
-        candidates = tuple(tx for _, tx in sorted(self.pending.get(bucket, {}).items(), key=_order))
-        survivors, _ = settle.would_apply(reader, candidates, auth)
-        return survivors
-
-    def may_propose(self, bucket: Bucket) -> bool:
-        """One batch per node per bucket (§4.1), and never backwards.
-
-        This is what makes equivocation impossible rather than merely punishable: honest signers
-        refuse a second batch for a bucket, so with quorum intersection `2q - n > f` two conflicting
-        batches can never both be confirmed. No trusted counter is needed — precisely the
-        distinction for which TrInc is shelved as a non-fit."""
-        return bucket > self.highest_proposed
-
-    def mark_proposed(self, bucket: Bucket) -> None:
-        self.highest_proposed = max(self.highest_proposed, bucket)
-
-    # -- after settlement --------------------------------------------------------------------- #
-
-    def retire(self, txs: tuple[ops.SignedTransaction, ...]) -> None:
-        """Forget transactions that made it into the log."""
-        for tx in txs:
-            ident = tx_id(tx)
-            self.settled.add(ident)
-            self.arrived.pop(ident, None)
-            self._unhold(ident)
-        self._sweep_empty()
-
-    def reenter(
-        self,
-        rejects: tuple[settle.Reject, ...],
-        now: Millis,
-        reader: Reader,
-        auth: settle.Authoriser | None = None,
-    ) -> tuple[ops.SignedTransaction, ...]:
-        """RE-EVALUATE each reject, keep what may enter again. Returns what was ejected.
-
-        `[H]` *"After the block is applied we then take all the kicked transactions and try to put
-        those which are still valid back into the mempool; those whose predicates don't apply to the
-        current state are not put back."*
-
-        Which is this, through the same predicate the door uses. It used to keep every reject except
-        a bad signature and evict on age alone, reasoning that an `authority` or `guard` reject is
-        merely EARLY and may become satisfiable. That reasoning was recorded as an implementer's
-        decision directly beneath the ruling above, and the code followed it: a guard-false
-        transaction was carried the whole horizon, and a stale compare-and-swap could be re-proposed
-        if its value came back.
-
-        RE-EVALUATION, NOT BLANKET EJECTION, and the difference is load-bearing: a reject can be
-        valid AFTER the batch that rejected it. A write guarded on `absent(k)` fails at its position
-        if `k` exists there, and holds once a bucket-mate has deleted `k`. Only the state decides.
-
-        `Reason.SETTLED` ends it whatever the state says: the transaction is in the log and
-        `op_hash` is unique, so it can never land again. A bad signature needs no special case,
-        because `valid` checks signatures."""
-        ejected: list[ops.SignedTransaction] = []
-        for tx, verdict in rejects:
-            ident = tx_id(tx)
-            arrived = self.arrived.get(ident, now)
-            # Carry forward means MOVE, not copy. Omitting the removal left a copy in the old bucket
-            # every round, so a transaction that kept bouncing accumulated one entry per round and
-            # would be offered in several buckets at once — caught by a test, not by review.
-            self._unhold(ident)
-            # `settle.Reason`, NOT this module's `Refusal`. Two unrelated enumerations once shared
-            # the spelling "signature" and compared equal by accident, which is the class of bug
-            # typing these was meant to remove.
-            if (
-                verdict.why is settle.Reason.SETTLED
-                or self.valid(tx, now, reader, auth) is not None
-            ):
-                ejected.append(tx)
-                self.arrived.pop(ident, None)
-                continue
-            self._hold(tx, now, arrived=arrived)
-        self._sweep_empty()
-        return tuple(ejected)
-
-    def evict(self, now: Millis) -> tuple[ops.SignedTransaction, ...]:
-        """The backstop for a transaction that was valid, was never chosen, and can no longer be
-        endorsed at all.
-
-        The horizon is `evict_after`, which EQUALS `w_valid` and is derived rather than set: past
-        that an endorser refuses the transaction, so holding it retains what can never land. It was
-        300 s against a 33 s endorsable lifetime — and nothing called this method, so the backstop
-        whose own docstring called unbounded retention a denial-of-service never ran. `Node.tick`
-        calls it now."""
-        horizon = self.tunables.evict_after
-        gone: list[ops.SignedTransaction] = []
-        for held in self.pending.values():
-            for ident, tx in tuple(held.items()):
-                if now - self.arrived.get(ident, now) > horizon:
-                    gone.append(tx)
-                    del held[ident]
-                    self.arrived.pop(ident, None)
-        self._sweep_empty()
-        return tuple(gone)
+        self.pending.setdefault(landed, {})[ident] = tx
+        return None
 
     # -- introspection ------------------------------------------------------------------------ #
 
-    def accumulator(self, bucket: Bucket) -> crypto.Accumulator:
-        """ECMH over the bucket's transaction ids: 32 bytes naming this exact set.
-
-        Equal accumulators mean identical sets in O(1), which is the short-circuit that makes gossip
-        cheap. It deliberately does NOT support recovering the difference — that needs a sketch
-        (PinSketch/IBLT), and they are declined here: Erlay pays 3.15s -> 5.75s relay latency
-        for its bandwidth saving, and here wave latency IS finality latency."""
-        acc = crypto.ACC_IDENTITY
-        for ident in self.pending.get(bucket, {}):
-            acc = crypto.acc_add(acc, crypto.acc_element(ident))
-        return acc
-
     def buckets(self) -> tuple[Bucket, ...]:
-        """Sorted — never mapping order, which Go randomises (portability, not style)."""
+        """Sorted -- never mapping order, which Go randomises (portability, not style)."""
         return tuple(sorted(b for b, held in self.pending.items() if held))
 
     def __len__(self) -> int:
         return sum(len(held) for held in self.pending.values())
-
-    def _unhold(self, ident: crypto.Digest) -> None:
-        """Remove from every bucket. A transaction is held in exactly one, but sweeping all of them
-        makes that an invariant this class maintains rather than one a caller must respect."""
-        for held in self.pending.values():
-            held.pop(ident, None)
-
-    def _sweep_empty(self) -> None:
-        for b in [b for b, held in self.pending.items() if not held]:
-            del self.pending[b]
-
-
-def _order(item: tuple[crypto.Digest, ops.SignedTransaction]) -> tuple[int, bytes]:
-    """`(ts, id)` — the deterministic total order proposals are cut from.
-
-    OPEN: ordering by `ts` means a client can gain priority by BACKDATING within
-    `w_admit`, which is the only clock fault that is profitable rather than merely costly. With no
-    fee auction the prize is winning CAS races on a contended key. The alternative is ordering by id
-    alone, which removes the advantage and any `ts` fairness with it."""
-    ident, tx = item
-    return tx.ts, bytes(ident)
