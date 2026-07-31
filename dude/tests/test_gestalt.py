@@ -155,15 +155,12 @@ class TestVerbCoverage(unittest.TestCase):
         self.assertFalse(HANDLED & REPLIES)
 
     def test_the_unimplemented_set_is_exactly_the_known_todo(self):
-        """`ANNOUNCE`/`FETCH` are the flood-announce-pull-bodies dissemination (#mempool). Today
-        a transaction spreads by re-flooding the whole `SUBMIT`, which works and does not scale.
-
-        `PROPOSE`/`ENDORSE` were the placeholder round's verbs. `Node` no longer dispatches them
-        -- Round's own `HELD`/`SIG` do the job now (SPECv2 #round-lifecycle). They stay in the
-        enum's retired range so a stale peer sending one is unimplemented-and-ignored rather than
-        crashing on an unknown verb; the enum entries should be moved to a retired section in a
-        follow-up cleanup."""
-        self.assertEqual(UNIMPLEMENTED, {Verb.ANNOUNCE, Verb.FETCH, Verb.PROPOSE, Verb.ENDORSE})
+        """`PROPOSE`/`ENDORSE` were the placeholder round's verbs. `Node` no longer dispatches
+        them -- Round's own `HELD`/`SIG` do the job now (SPECv2 #round-lifecycle). They stay in
+        the enum's retired range so a stale peer sending one is unimplemented-and-ignored rather
+        than crashing on an unknown verb; the enum entries should be moved to a retired section
+        in a follow-up cleanup."""
+        self.assertEqual(UNIMPLEMENTED, {Verb.PROPOSE, Verb.ENDORSE})
 
     def test_every_handled_verb_has_a_handler(self):
         """Derived, not listed: `_DISPATCH` is built from `HANDLED`, so a verb claimed as handled
@@ -173,7 +170,7 @@ class TestVerbCoverage(unittest.TestCase):
     def test_an_unimplemented_verb_is_ignored_not_fatal(self):
         """A peer sending a verb we have not built must cost its message and nothing more."""
         node, other = self.c.nodes[0], self.c.nodes[1]
-        env = Envelope(node.me.public, Verb.FETCH, b"z" * 16).sign(other.me, T0)
+        env = Envelope(node.me.public, Verb.PROPOSE, b"z" * 16).sign(other.me, T0)
         node.receive(seal(env), T0)  # must not raise
 
         key = crypto.h(b"after-unimplemented")

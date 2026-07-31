@@ -186,13 +186,13 @@ class TestMaybeReply(unittest.TestCase):
         self.box = Mailbox()
 
     def test_a_reply_retires_what_was_waiting_for_it(self):
-        env = request(self.me, self.peer.public, Verb.FETCH, T0)
+        env = request(self.me, self.peer.public, Verb.PING, T0)
         self.box.post(env, T0, TTL, await_reply=True)
         (t,) = self.box.due(T0)
         self.box.sent(t.mid, A1, t.envelope.ts, T0)
         self.assertEqual(len(self.box), 1)  # sent, still waiting
 
-        reply = env.answer(Verb.BODIES, b"data").sign(self.peer, T0 + 5)
+        reply = env.answer(Verb.PONG, b"data").sign(self.peer, T0 + 5)
         got = self.box.arrived(reply, T0 + 5)
         assert got is not None
         self.assertEqual(got.mid, env.env.mid)
@@ -201,7 +201,7 @@ class TestMaybeReply(unittest.TestCase):
     def test_it_died_before_replying_is_an_ordinary_expiry(self):
         """The case that made "maybe reply" look hard. It is one event, and it costs no extra code
         because it shares its clock with the send deadline."""
-        env = request(self.me, self.peer.public, Verb.FETCH, T0)
+        env = request(self.me, self.peer.public, Verb.PING, T0)
         self.box.post(env, T0, TTL, await_reply=True)
         (t,) = self.box.due(T0)
         self.box.sent(t.mid, A1, t.envelope.ts, T0)  # bytes left; receipt not implied
@@ -212,7 +212,7 @@ class TestMaybeReply(unittest.TestCase):
     def test_unanswered_and_undelivered_are_distinguished(self):
         """Both are "timeout", and conflating them in a log loses the difference between a peer that
         cannot be reached and a peer that will not answer."""
-        reachable = request(self.me, self.peer.public, Verb.FETCH, T0)
+        reachable = request(self.me, self.peer.public, Verb.PING, T0)
         self.box.post(reachable, T0, TTL, await_reply=True)
         (t,) = self.box.due(T0)
         self.box.sent(t.mid, A1, t.envelope.ts, T0)
@@ -227,29 +227,27 @@ class TestMaybeReply(unittest.TestCase):
     def test_an_unsolicited_message_is_not_a_reply(self):
         """`arrived` correlates and nothing more. A message that answers nothing we are waiting for
         is handled as unsolicited rather than silently dropped or silently matched."""
-        self.assertIsNone(
-            self.box.arrived(request(self.peer, self.me.public, Verb.ANNOUNCE, T0), T0)
-        )
+        self.assertIsNone(self.box.arrived(request(self.peer, self.me.public, Verb.PING, T0), T0))
 
     def test_a_reply_to_something_we_stopped_waiting_for_is_not_matched(self):
         """A late reply arriving after the deadline must not resurrect a retired entry."""
-        env = request(self.me, self.peer.public, Verb.FETCH, T0)
+        env = request(self.me, self.peer.public, Verb.PING, T0)
         self.box.post(env, T0, TTL, await_reply=True)
         (t,) = self.box.due(T0)
         self.box.sent(t.mid, A1, t.envelope.ts, T0)
         self.box.expired(T0 + TTL)
 
-        late = env.answer(Verb.BODIES, b"data").sign(self.peer, T0 + TTL + 1)
+        late = env.answer(Verb.PONG, b"data").sign(self.peer, T0 + TTL + 1)
         self.assertIsNone(self.box.arrived(late, T0 + TTL + 1))
 
     def test_a_single_attempt_is_attributable_with_no_echo(self):
         """Karn is satisfied by construction when only one transmission is outstanding, so the
         common path yields samples even from a peer that never sets `reply_ts`."""
-        env = request(self.me, self.peer.public, Verb.FETCH, T0)
+        env = request(self.me, self.peer.public, Verb.PING, T0)
         self.box.post(env, T0, TTL, await_reply=True)
         (t,) = self.box.due(T0)
         self.box.sent(t.mid, A1, t.envelope.ts, T0)
-        reply = env.answer(Verb.BODIES).sign(self.peer, T0 + 40)
+        reply = env.answer(Verb.PONG).sign(self.peer, T0 + 40)
         got = self.box.arrived(reply, T0 + 40)
         assert got is not None  # narrowing: `arrived` returns None for the unsolicited
         self.assertEqual((got.address, got.rtt), (A1, 40))
@@ -257,7 +255,7 @@ class TestMaybeReply(unittest.TestCase):
     def test_reply_ts_recovers_a_sample_that_karn_would_discard(self):
         """The point of the field. Two attempts on two links: without an echo the reply is
         unattributable, and with one it names the transmission AND therefore the link."""
-        env = request(self.me, self.peer.public, Verb.FETCH, T0)
+        env = request(self.me, self.peer.public, Verb.PING, T0)
         self.box.post(env, T0, TTL, await_reply=True)
         (first,) = self.box.due(T0)
         self.box.sent(first.mid, A1, T0, T0)
@@ -265,7 +263,7 @@ class TestMaybeReply(unittest.TestCase):
         (second,) = self.box.due(T0 + 100)
         self.box.sent(second.mid, A2, T0 + 500, T0 + 500)  # the SECOND link
 
-        reply = env.answer(Verb.BODIES).sign(self.peer, T0 + 600)
+        reply = env.answer(Verb.PONG).sign(self.peer, T0 + 600)
         echoed = SignedEnvelope(
             reply.frm,
             reply.ts,
@@ -288,7 +286,7 @@ class TestMaybeReply(unittest.TestCase):
         it names exactly ONE attempt; two transmissions inside the same millisecond are as ambiguous
         as no echo at all. Both fields come back None together, because a wrong sample charges one
         link for another's latency and R3's estimator has no way to notice."""
-        env = request(self.me, self.peer.public, Verb.FETCH, T0)
+        env = request(self.me, self.peer.public, Verb.PING, T0)
         self.box.post(env, T0, TTL, await_reply=True)
         for offset in (0, 100):
             (t,) = self.box.due(T0 + offset)
@@ -299,7 +297,7 @@ class TestMaybeReply(unittest.TestCase):
             Attempt(A1, T0, T0),
             Attempt(A2, T0 + 100, T0),  # SAME stamp, different link
         )
-        got = self.box.arrived(env.answer(Verb.BODIES).sign(self.peer, T0 + 9), T0 + 9)
+        got = self.box.arrived(env.answer(Verb.PONG).sign(self.peer, T0 + 9), T0 + 9)
         assert got is not None  # narrowing: `arrived` returns None for the unsolicited
         self.assertEqual((got.address, got.rtt), (None, None))
         self.assertIsNotNone(got.mid)  # still a reply: liveness counts even when measurement cannot

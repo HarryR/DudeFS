@@ -127,8 +127,8 @@ class TestCorrelation(unittest.TestCase):
         self.b = crypto.Keypair.generate()
 
     def test_a_reply_must_echo_the_id_it_answers(self):
-        q1 = request(self.a, self.b.public, Verb.FETCH, T0)
-        q2 = request(self.a, self.b.public, Verb.FETCH, T0)
+        q1 = request(self.a, self.b.public, Verb.PING, T0)
+        q2 = request(self.a, self.b.public, Verb.PING, T0)
         self.assertNotEqual(q1.env.mid, q2.env.mid)
 
         answer_to_q1 = q1.answer(Verb.BODIES, b"payload").sign(self.b, T0)

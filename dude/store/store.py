@@ -448,25 +448,6 @@ class Store:
         #    subtract the prior element twice, which is exactly the bug the set-then-del identity
         #    test caught.
         for m in mutations:
-            if isinstance(m, ops.Move):
-                # BEFORE the accumulator arithmetic, and that placement is the whole correctness of
-                # it: the loop below subtracts the current element for every mutation and only a
-                # `Set` adds one back, so falling through here would have deleted the moved row
-                # from `A_state` while leaving it in the live view. Provenance moves; NOTHING ELSE
-                # DOES — the value, its epoch, its credential and both commitments are untouched.
-                #
-                # `m.credential` is deliberately not written. Settlement has already refused any
-                # move whose credential is not byte-for-byte what the row holds, so writing it
-                # would be a no-op — and not writing it makes relocation-invariance STRUCTURAL:
-                # since the root commits to the credential, there is now no path through this
-                # function by which relocating a row can move the state root. A guard that could be
-                # bypassed is weaker than an operation that cannot express the mistake. The
-                # credential still travels on the wire, because that is what lets a validator check
-                # the move without holding the row.
-                self.db.execute(
-                    "UPDATE live SET head=? WHERE store=? AND name=?", (idx, m.store, m.name)
-                )
-                continue
             cur = self.get(m.store, m.name)
             if cur:
                 acc = crypto.acc_sub(acc, element(m.store, m.name, cur[1]))

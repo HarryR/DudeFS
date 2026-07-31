@@ -51,8 +51,6 @@ WIRED = {
     "_violations": "a roster whose failure-domain placement cannot survive its own bound",
     "admit": "a transaction outside the admission window, or already settled",
     "holds": "a transaction whose guards do not hold against committed state",
-    "_vouches": "a relocation of a management row nobody currently authorised",
-    "_relocates": "a Move that is not true of live state",
     "_disagrees": "a transferred run that does not reproduce a signed commitment",
     "_unverified": "a replayed entry whose signature does not verify",
     "_uncontiguous": "a run that would land somewhere other than the position owed",

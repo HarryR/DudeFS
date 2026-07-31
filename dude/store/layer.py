@@ -143,23 +143,12 @@ class Layer:
     def apply(self, m: ops.Mutation, cred: bytes) -> None:
         """Record one mutation. Nothing reaches the underlying store.
 
-        `cred` is the credential a `Set` will leave behind — the transaction doing it. REQUIRED,
+        `cred` is the credential a `Set` will leave behind -- the transaction doing it. REQUIRED,
         for the reason `Held.cred` has no default: the layer cannot know it and the caller settling
-        the transaction can, so an omitted one would silently record a row that could not exist.
-        Without it a key set and then relocated within one batch would be compared against an empty
-        credential and refused for a reason that is not true of it."""
-        if isinstance(m, ops.Move):
-            # Carries no value: it moves whatever is already there, so the layer copies the current
-            # row forward rather than inventing one — CREDENTIAL INCLUDED, since a relocation moves
-            # provenance and nothing else. A move of a key that is absent records nothing —
-            # settlement refuses it separately, with a reason.
-            held = self.get(m.store, m.name)
-            if held is not None:
-                self._delta[(m.store, m.name)] = Held(PENDING, held.value, held.epoch, held.cred)
-        else:
-            self._delta[(m.store, m.name)] = (
-                Held(PENDING, m.value, m.epoch, cred) if isinstance(m, ops.Set) else None
-            )
+        the transaction can, so an omitted one would silently record a row that could not exist."""
+        self._delta[(m.store, m.name)] = (
+            Held(PENDING, m.value, m.epoch, cred) if isinstance(m, ops.Set) else None
+        )
         self._log.append(m)
 
     @property

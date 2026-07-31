@@ -68,11 +68,11 @@ class Verb(IntEnum):
     # -- mempool dissemination (#mempool) -------------------------------------------------- #
     SUBMIT = 10
     """A client offers a transaction. The only verb a client needs to write."""
-    ANNOUNCE = 11
-    """"I hold these transaction ids for this bucket", plus the bucket accumulator."""
-    FETCH = 12
-    """"Send me these bodies." The pull half of pull-not-push."""
     BODIES = 13
+    """The reply to a SUBMIT that was accepted -- carries the op_hash of the settled tx.
+    Naming is legacy from the gossip-by-hash design (which had ANNOUNCE/FETCH/BODIES); the verb
+    survived because it is the only channel that currently returns a digest to an authoring
+    client."""
 
     # -- slice agreement (#buckets) -------------------------------------------------------- #
     PROPOSE = 20

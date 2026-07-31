@@ -73,10 +73,6 @@ class Reason(Enum):
     """May become satisfiable — a grant can be re-issued."""
     GUARD = "guard"
     """May become satisfiable — a predicate can become true again."""
-    RELOCATION = "relocation"
-    """A `Move` that does not match live state, or whose credential does not vouch for it.
-
-    May become satisfiable: the value may move again, or a correct credential may be supplied."""
     SETTLED = "settled"
     """Permanently dead, and NOT a failure: this transaction is already in the log.
 
@@ -125,49 +121,13 @@ def evaluate(
         return Verdict(Reason.SIGNATURE), layer
     for i, step in enumerate(tx.steps):
         m = step.mutation
-        if isinstance(m, ops.Move):
-            # NO AUTHORITY CHECK, deliberately: a relocation asserts nothing, so there is nothing
-            # to be authorised for. What it must be instead is TRUE, which `_relocates` decides
-            # from live state and the credential rather than from who signed the envelope.
-            if not _relocates(layer, m, auth):
-                return Verdict(Reason.RELOCATION, i), layer
-        elif auth is not None and not auth.may_write(layer, tx.author, m.store):
+        if auth is not None and not auth.may_write(layer, tx.author, m.store):
             return Verdict(Reason.AUTHORITY, i), layer
         for g in step.guards:
             if not holds(layer, g):
                 return Verdict(Reason.GUARD, i), layer
         layer.apply(m, tx.raw)
     return OK, layer
-
-
-def _relocates(reader: Reader, m: ops.Move, auth: Authoriser | None) -> bool:
-    """Is this move honest — and, in the management store, still vouched for?
-
-    Two questions, and the second is the one #management-is-cleartext rows exist to survive.
-    Collection eventually forgets the entry that first set a roster row, so a joiner replaying a
-    compacted log would have only the quorum's word for the roster — and the roster is what defines
-    the quorum. The credential carries the manager's signature forward with the row, so the chain
-    back to the manager key survives any amount of compaction.
-
-    The credential is checked against LIVE state and CURRENT authority: a valid signature from an
-    author authorised now, over a transaction that sets this key to the value it presently holds.
-    An old signature over a value nobody holds any more vouches for nothing.
-
-    BYTE IDENTITY FIRST, AND FOR EVERY STORE. This used to wave data rows through, which was safe
-    only while a data row's credential was empty and nothing committed to it. The root commits to
-    it now (`smt.leaf_hash`), so a move carrying a different credential would rewrite part of a leaf
-    and change the root — and relocation-invariance is what makes collection state-preserving.
-    Byte identity is strictly stronger than re-vouching, which is why it is the universal rule and
-    not the management one: two DIFFERENT valid credentials for the same value (the manager writing
-    that value twice) both vouch, and swapping one for the other still moves the root."""
-    held = reader.get(m.store, m.name)
-    if held is None:
-        return False  # nothing to move; a move cannot create
-    if m.credential != held.cred:
-        return False  # a relocation carries the row's OWN credential or it is not a relocation
-    if m.store != ops.STORE_MANAGEMENT:
-        return True  # data rows derive their authority from management state, which is preserved
-    return _vouches(reader, m, auth)
 
 
 def vouched(reader: Reader, store: int, name: bytes, credential: bytes) -> crypto.PublicKey | None:
@@ -203,13 +163,6 @@ def vouched(reader: Reader, store: int, name: bytes, credential: bytes) -> crypt
         ):
             return cred.author
     return None
-
-
-def _vouches(reader: Reader, m: ops.Move, auth: Authoriser | None) -> bool:
-    who = vouched(reader, m.store, m.name, m.credential)
-    if who is None:
-        return False
-    return auth is None or auth.may_write(reader, who, m.store)
 
 
 class Reject(NamedTuple):

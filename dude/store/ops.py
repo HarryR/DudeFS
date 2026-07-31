@@ -63,7 +63,6 @@ EPOCH_NONE = 0
 Epochs are minted from 1, so a zero here is a statement rather than a missing field."""
 
 _SET = b"s"
-_MOVE = b"m"
 _DEL = b"d"
 
 
@@ -103,43 +102,7 @@ class Del:
         return [_DEL, self.store, self.name]
 
 
-@dataclass(frozen=True, slots=True)
-class Move:
-    """Rewrite `name` at the head with THE VALUE IT ALREADY HOLDS (#conveyor).
-
-    IT CARRIES NO VALUE, and that is the entire point. A relocation asserting nothing new cannot be
-    made to assert something new — where `Set(store, name, same_value)` is indistinguishable from
-    `Set(store, name, anything)` and therefore needs write authority its author cannot have, since
-    the manager is cold. A `Move` needs no authority because it changes nothing, and that is
-    checkable by anyone from live state alone rather than taken on trust.
-
-    This exists because the alternative was measured and was worse: migration used to author a
-    `Set` and settle it locally with authority checking disabled, which put node-signed writes into
-    the management store, displaced the manager's signature over the roster, and left three honest
-    nodes holding byte-different logs at identical indices."""
-
-    store: int
-    name: bytes
-    credential: bytes
-    """The signed transaction that authorised the value being moved, carried forward.
-
-    THE AUTHORITY TRAVELS WITH THE ROW. Collection eventually forgets the entry that first set a
-    roster row, so without this a joiner could only take the roster on the quorum's word — and the
-    roster is what defines the quorum. Carrying the credential keeps the chain back to the manager
-    key intact across any amount of compaction.
-
-    REQUIRED IN EVERY STORE, and byte-for-byte what the row already holds. It was management-only,
-    on the reasoning that data rows derive their authority from management state — true of the
-    authority and no use to someone holding the row. The state root commits to it now
-    (`smt.leaf_hash`), so a move carrying anything else would move the root and relocation would
-    stop being state-preserving. No default: an empty one is refused by settlement for every row
-    there is, so being able to omit it would only ever produce a transaction nobody will settle."""
-
-    def encode(self) -> list:
-        return [_MOVE, self.store, self.name, self.credential]
-
-
-type Mutation = Set | Del | Move
+type Mutation = Set | Del
 
 
 def _mutation_from(v: codec.Bencodable) -> Mutation:
@@ -150,9 +113,6 @@ def _mutation_from(v: codec.Bencodable) -> Mutation:
         return Set(
             codec.as_int(p[1]), codec.as_bytes(p[2]), codec.as_bytes(p[3]), codec.as_int(p[4])
         )
-    if tag == _MOVE:
-        p = codec.as_seq(v, 4)
-        return Move(codec.as_int(p[1]), codec.as_bytes(p[2]), codec.as_bytes(p[3]))
     if tag == _DEL:
         p = codec.as_seq(v, 3)
         return Del(codec.as_int(p[1]), codec.as_bytes(p[2]))
@@ -334,10 +294,6 @@ class Transaction:
         because the log is ordered (#last-write-wins)."""
         out: dict[tuple[int, bytes], crypto.Digest | None] = {}
         for m in self.mutations:
-            if isinstance(m, Move):
-                # A relocation leaves the value exactly as it was, so it can falsify nobody's
-                # predicate and has no post-state of its own to report.
-                continue
             out[(m.store, m.name)] = value_digest(m.value) if isinstance(m, Set) else None
         return out
 
