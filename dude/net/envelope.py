@@ -77,6 +77,14 @@ class Verb(IntEnum):
     # -- slice agreement (#buckets) -------------------------------------------------------- #
     PROPOSE = 20
     ENDORSE = 21
+    HELD = 22
+    """"I hold these transaction hashes for this bucket" -- Round's advertisement (SPECv2
+    #gossip-by-hash). The Round protocol's own vocabulary, distinct from `SUBMIT`'s "here is a
+    body for you to admit"."""
+    SIG = 23
+    """A signature over the slice this node believes this bucket ratifies -- Round's second
+    message (SPECv2 #slice-meta-agreement). A quorum of matching `SIG`s is what turns a
+    candidate slice into a ratified block."""
 
     # -- collection (#collection-is-driven-by-any-node) ----------------------------------------- #
     COLLECT = 40

@@ -6,25 +6,19 @@
 #
 # WHAT IT OWNS, and nothing else:
 #
-#   store     the log                          (dude.store)
-#   mempool   candidate transactions            (dude.mempool)
-#   postman   the wire, and the only clock      (dude.net.postman)
+#   store        the log                                      (dude.store)
+#   coordinator  the consensus driver + the current mempool   (dude.coordinator)
+#   postman      the wire, and the only clock                 (dude.net.postman)
 #
 # It contributes exactly one thing of its own: a `handle` mapping an inbound verb to an action, and
 # a `tick` that advances the round. Anything more belongs in one of the parts.
 #
-# THE ROUND IS INCOMPLETE, NOT UNDECIDED — and the difference matters. #buckets specifies the
-# mechanism (bucketing, observations, the `>= k` rule, the three-wave cadence); what is open is the
-# **correctness argument** under partition and skew — a modelling task, not a missing design.
-#
-# What is implemented here: bucket arithmetic, one batch per node per bucket (#buckets),
-# endorsement counted by `dude.quorum` against a slice DIGEST, settlement through the one evaluator,
-# rejects returned by `Mempool.reenter`.
-#
-# What is specified and NOT yet implemented: the `>= k` observation rule (#buckets) — this floods
-# `PROPOSE` and counts endorsements instead of deriving the batch from who observed what — and the
-# three-wave cadence, which is collapsed into one pass here. Both are known gaps against a written
-# spec, and neither is waiting on a decision.
+# THE CONSENSUS ROUND LIVES IN `dude.round` and is DRIVEN by `dude.coordinator`. `Node.tick` calls
+# `Coordinator.tick`; inbound `HELD`/`SIG` envelopes are handed to `Coordinator.on_round_msg`;
+# client SUBMITs are handed to `Coordinator.submit`. The placeholder "everyone proposes their own
+# batch, count endorsements, first-to-quorum wins" round that used to live here (methods `_propose`,
+# `_count`, `_settle`, verbs `PROPOSE`/`ENDORSE`) has been deleted -- SPECv2 #round-lifecycle is
+# now the settled shape.
 
 from __future__ import annotations
 
@@ -32,6 +26,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from . import quorum
+from .coordinator import Coordinator
 from .core import codec, crypto
 from .core.errors import DudeError
 from .mempool import Mempool
@@ -40,8 +35,9 @@ from .net.address import Endpoint
 from .net.envelope import Envelope, Frame, MessageId, SignedEnvelope, new_message_id
 from .net.link import Peer, Transport
 from .net.postman import Postman
+from .net.round_adapter import RoundAdapter
 from .net.transports import address_of
-from .store import Commitment, Entry, Store, StoreError, attest, ops, settle, smt
+from .store import Commitment, Entry, Store, StoreError, attest, ops, smt
 from .store.management import Management
 from .store.witness import Witness
 from .tunables import DEFAULT, Tunables
@@ -59,8 +55,8 @@ like a verb somebody forgot."""
 HANDLED = frozenset(
     {
         Verb.SUBMIT,
-        Verb.PROPOSE,
-        Verb.ENDORSE,
+        Verb.HELD,
+        Verb.SIG,
         Verb.PING,
         Verb.COLLECT,
         Verb.RATIFY,
@@ -74,7 +70,11 @@ HANDLED = frozenset(
         Verb.ROWS,
     }
 )
-"""Verbs this node acts on."""
+"""Verbs this node acts on.
+
+`HELD` and `SIG` are the Round protocol's own vocabulary (SPECv2 #round-lifecycle); handled by
+delegating to `Coordinator.on_round_msg`. `PROPOSE` and `ENDORSE` were the placeholder round's
+verbs; deleted as part of the Round pivot (Phase 6)."""
 
 SOLICITED = frozenset({Verb.ENTRIES, Verb.HASHES, Verb.ROWS})
 """Verbs that are only ever an ANSWER to something this node asked for.
@@ -97,20 +97,13 @@ class Node:
     store: Store
     tunables: Tunables = DEFAULT
     postman: Postman = field(init=False)
-    mempool: Mempool = field(init=False)
-    proposals: dict[int, dict[crypto.PublicKey, tuple[crypto.Digest, ...]]] = field(
-        default_factory=dict
-    )
-    """Per bucket, what each node proposed. Keyed by proposer because §4.1 allows exactly one batch
-    per node per bucket — a second is not a competing offer, it is equivocation."""
+    adapter: RoundAdapter = field(init=False)
+    coordinator: Coordinator = field(init=False)
+    """Owns the current Mempool, the in-flight Rounds, and drives them on tick. See
+    `dude.coordinator`. Node's role in consensus is now just: hand SUBMIT bodies to
+    `coordinator.submit`, hand HELD/SIG envelopes to `coordinator.on_round_msg`, and call
+    `coordinator.tick(now)` from `tick`."""
 
-    endorsements: dict[tuple[int, crypto.Digest], set[crypto.PublicKey]] = field(
-        default_factory=dict
-    )
-    """`(bucket, slice digest) -> who endorsed`. A SET, so a node endorsing twice counts once —
-    otherwise one peer could manufacture a quorum by repeating itself."""
-
-    settled_buckets: set[int] = field(default_factory=set)
     collecting: dict[int, ops.Compaction] = field(default_factory=dict)
     collected: set[int] = field(default_factory=set)
     last_probe: Millis = 0
@@ -131,7 +124,15 @@ class Node:
 
     def __post_init__(self) -> None:
         self.postman = Postman(self.me, window=self.tunables.net.window)
-        self.mempool = Mempool(self.tunables.mempool)
+        self.adapter = RoundAdapter(self.me, self.postman, self.tunables.net.ttl)
+        self.coordinator = Coordinator(self.me, self.store, self.adapter, self.tunables)
+
+    @property
+    def mempool(self) -> Mempool:
+        """The currently-collecting Mempool. Kept as a `Node` property so tests and diagnostics
+        that reach for `node.mempool` still work; the authoritative owner is `self.coordinator`,
+        which swaps this instance at every bucket boundary."""
+        return self.coordinator.mempool
 
     # -- membership ---------------------------------------------------------------------------- #
 
@@ -207,41 +208,26 @@ class Node:
         gate ruling in one line — a node carries an op it did not author, and authorises the
         requester, never the author."""
         tx = ops.SignedTransaction.decode(env.env.body)
-        refusal = self.mempool.admit(tx, now, self.store, self.mgmt)
+        refusal = self.coordinator.submit(tx, now)
         if refusal is not None:
             self._reply(env, Verb.REFUSED, refusal.value.encode(), now)
             return
         self._reply(env, Verb.BODIES, tx.op_hash, now)
+        # Re-flood the body so peers admit it too. Until gossip-by-hash + FETCH lands (SPECv2
+        # #gossip-by-hash), this is what makes every node's mempool converge on the same set --
+        # which is the input a Round's largest-intersection-over-quorum then acts on.
         self._flood(Verb.SUBMIT, env.env.body, now, skip=env.frm)
 
-    def _on_propose(self, env: SignedEnvelope, now: Millis) -> None:
-        bucket, ids = _decode_slice(env.env.body)
-        seen = self.proposals.setdefault(bucket, {})
-        if env.frm in seen:
-            return  # one batch per node per bucket (§4.1); a second is equivocation, not an offer
-        seen[env.frm] = ids
-        if self._stale(ids, bucket, now):
-            return  # we do not vouch for a slice we can see is past its validity bound
-        self._flood(Verb.ENDORSE, env.env.body, now)
-        self._count(bucket, _slice_digest(bucket, ids), self.me.public, now)
+    def _on_held(self, env: SignedEnvelope, now: Millis) -> None:
+        """A peer's HELD advertisement -- what transactions they claim to hold for some bucket.
+        Round's own protocol vocabulary (SPECv2 #round-lifecycle); Coordinator routes by bucket
+        to the right Round instance."""
+        self.coordinator.on_round_msg(env, now)
 
-    def _stale(self, ids: tuple[crypto.Digest, ...], bucket: int, now: Millis) -> bool:
-        """Does this slice contain a transaction we hold that is past `w_valid`?
-
-        `Mempool.endorsable` is that check, and it had NO CALLER. The bound whose stated purpose is
-        "to stop an unguarded write being replayable indefinitely" was enforced by nothing, and the
-        only limit on a transaction's life was an eviction horizon that also never ran. A malicious
-        proposer could sit on a transaction and offer it long after its author's window.
-
-        Only what we HOLD can be judged: a body we do not have cannot be checked, which is the gap
-        `ANNOUNCE`/`FETCH` closes and this cannot. Silence is the refusal, as with a wrong fold: we
-        simply do not endorse, so a quorum of honest nodes cannot form around it."""
-        held = {tx.op_hash: tx for tx in self._held(bucket)}
-        return any(not self.mempool.endorsable(held[i], now) for i in ids if i in held)
-
-    def _on_endorse(self, env: SignedEnvelope, now: Millis) -> None:
-        bucket, ids = _decode_slice(env.env.body)
-        self._count(bucket, _slice_digest(bucket, ids), env.frm, now)
+    def _on_sig(self, env: SignedEnvelope, now: Millis) -> None:
+        """A peer's signature over a slice they believe this bucket ratifies. Same handling as
+        HELD -- routed to the Round for its bucket via the Coordinator."""
+        self.coordinator.on_round_msg(env, now)
 
     # -- collection (#collection-is-driven-by-any-node) ----------------------------------------- #
 
@@ -828,11 +814,13 @@ class Node:
     # -- the round ----------------------------------------------------------------------------- #
 
     def tick(self, now: Millis) -> None:
-        """Advance: send what is due, reap expiries, then propose for any closed bucket.
+        """Advance: gossip, catch up if we can, bootstrap if we cannot, drive the consensus
+        round, drive housekeeping, drive the wire.
 
-        `mempool.evict` is called HERE, and was called nowhere: the age backstop whose own docstring
-        named unbounded retention a denial-of-service never ran, so a transaction that was valid and
-        never chosen stayed for ever. Nothing else in the round looks at age."""
+        Round advancement now lives in `Coordinator.tick` -- it drives the current Mempool's
+        eviction (via bucket-swap), opens Rounds at boundaries, ticks them, flushes their
+        outboxes, and settles any that ratified. What used to be `Node._propose`/`_count`/
+        `_settle` (the placeholder round mechanism) is gone."""
         if now - self.last_probe >= self.tunables.attest.probe_every:
             self.probe(now)
         self.catch_up(now)
@@ -842,78 +830,9 @@ class Node:
         # walk was real and nothing ever performed one — the node that needed it sat asking for
         # entries no one holds, for ever, and the failure looked exactly like a quiet network.
         self.bootstrap(now)
-        self.mempool.evict(now)
+        self.coordinator.tick(now)
         self.housekeep(now)
         self.postman.tick(now)
-        self._propose(now)
-
-    def _propose(self, now: Millis) -> None:
-        """Offer this node's batch for the bucket that has just closed.
-
-        PLACEHOLDER, see the module header — what is settled here is the bucket arithmetic, the
-        one-batch-per-node rule and the screening; what is NOT settled is how nodes converge on one
-        slice when their proposals differ — superseded by the rotating-leader ruling, under
-        which the leader's proposal IS the slice and the question does not arise."""
-        t = self.tunables.mempool
-        bucket = t.bucket(now) - 1  # the bucket that just closed
-        if bucket in self.settled_buckets or not self.mempool.may_propose(bucket):
-            return
-        batch = self.mempool.propose(bucket, self.store, self.mgmt)
-        if not batch:
-            return
-        self.mempool.mark_proposed(bucket)
-        ids = tuple(tx.op_hash for tx in batch)
-        self.proposals.setdefault(bucket, {})[self.me.public] = ids
-        body = _encode_slice(bucket, ids)
-        self._flood(Verb.PROPOSE, body, now)
-        self._count(bucket, _slice_digest(bucket, ids), self.me.public, now)
-
-    def _count(
-        self, bucket: int, digest: crypto.Digest, who: crypto.PublicKey, now: Millis
-    ) -> None:
-        """Record an endorsement and settle if it reaches a quorum.
-
-        `dude.quorum` is asked, never reimplemented — the gate decides what consensus is and nothing
-        here may depend on how it decides (#quorum-gate)."""
-        if bucket in self.settled_buckets:
-            return
-        agreeing = self.endorsements.setdefault((bucket, digest), set())
-        agreeing.add(who)
-        n = len(self.roster()) or 1
-        if not quorum.satisfied(n, len(agreeing)):
-            return
-        self._settle(bucket, digest, now)
-
-    def _settle(self, bucket: int, digest: crypto.Digest, now: Millis) -> None:
-        """Apply the agreed slice, then return the rejects to the mempool.
-
-        The whole of the mempool loop (#mempool), reusing the pieces rather than restating them:
-        `Store.apply` drives `settle.evaluate`, and `Mempool.reenter` applies the finality
-        distinction to whatever did not land."""
-        ids = {i for prop in self.proposals.get(bucket, {}).values() for i in prop}
-        held = {tx.op_hash: tx for tx in self._held(bucket)}
-        batch = tuple(held[i] for i in sorted(ids) if i in held)
-        if not batch:
-            return
-        applied = self.store.apply(batch, auth=self.mgmt)
-        self.settled_buckets.add(bucket)
-        landed = {op for op, _ in applied.settled}
-        self.mempool.retire(tuple(tx for tx in batch if tx.op_hash in landed))
-        self.mempool.reenter(
-            tuple(
-                settle.Reject(tx, settle.Verdict(why))
-                for tx in batch
-                for op, why in applied.dropped
-                if tx.op_hash == op
-            ),
-            now,
-            self.store,
-            self.mgmt,
-        )
-        _ = digest
-
-    def _held(self, bucket: int) -> tuple[ops.SignedTransaction, ...]:
-        return tuple(self.mempool.pending.get(bucket, {}).values())
 
     # -- outbound ------------------------------------------------------------------------------ #
 
@@ -991,24 +910,6 @@ def _uncontiguous(run: list[Entry], frm: int) -> str | None:
             return f"run is not contiguous from {frm}: expected {want}, got {e.idx}"
         want += 1
     return None
-
-
-def _encode_slice(bucket: int, ids: tuple[crypto.Digest, ...]) -> bytes:
-    return codec.encode([bucket, sorted(ids)])
-
-
-def _decode_slice(raw: bytes) -> tuple[int, tuple[crypto.Digest, ...]]:
-    f = codec.as_seq(codec.decode(raw), 2)
-    return codec.as_int(f[0]), tuple(crypto.Digest(codec.as_bytes(x)) for x in codec.as_seq(f[1]))
-
-
-def _slice_digest(bucket: int, ids: tuple[crypto.Digest, ...]) -> crypto.Digest:
-    """What endorsement is counted against: the CONTENTS, not a proposer.
-
-    Two nodes that independently assemble the same slice therefore endorse the same thing, which is
-    what lets agreement happen with nobody in charge — and the open question was only what happens
-    when they assemble DIFFERENT slices, which a rotating leader removes entirely."""
-    return crypto.h(_encode_slice(bucket, ids))
 
 
 def _mid() -> MessageId:

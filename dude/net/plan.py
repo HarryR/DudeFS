@@ -143,6 +143,11 @@ class Plan:
             return Wait(min(deadline, now + self.backoff(attempts)), Stalled.NO_USABLE_LINK)
 
         usable = peer.usable(now)
+        if not usable:
+            # `deliverable` said yes but `usable` returned empty. That can happen when a policy's
+            # `before_send` reads state that other policies mutate between the two calls (e.g., a
+            # per-check budget). Treat the same as "not deliverable" and wait.
+            return Wait(min(deadline, now + self.backoff(attempts)), Stalled.NO_USABLE_LINK)
         picked = [usable[0]]  # the first attempt is always free; the budget bounds PARALLELISM only
         for link in usable[1:]:
             if len(picked) >= self.t.max_parallel or not peer.budget.spend():

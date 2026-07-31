@@ -375,7 +375,7 @@ class Round:
         local = self._local
         if local is None:  # unreachable given tick's guard, but the narrower makes ty happy
             return
-        slice_hashes = _compute_slice(self._all_holdings(), self._quorum, self._bucket)
+        slice_hashes = _compute_slice(self._all_holdings(), self._quorum, self._bucket, local)
         slice_hash = _slice_id(self._bucket, slice_hashes)
         body = _slice_body(self._bucket, slice_hash)
         my_sig = Sig(self._bucket, slice_hash, self._me.sign(body))
@@ -434,13 +434,22 @@ def _compute_slice(
     holdings: dict[NodeId, frozenset[crypto.Digest]],
     quorum_size: int,
     bucket: Bucket,
+    local: frozenset[crypto.Digest],
 ) -> frozenset[crypto.Digest]:
-    """The largest set held (as a set) by at least `quorum_size` peers (#slice-is-intersection),
-    with ties broken by a bucket-keyed deterministic sort (#slice-tie-break).
+    """The largest set held (as a set) by at least `quorum_size` peers AND by us
+    (#slice-is-intersection), with ties broken by a bucket-keyed deterministic sort
+    (#slice-tie-break).
 
     Enumerates quorum-sized subsets of the observed peers and picks the largest intersection.
     For N ~ 11 and quorum ~ 8, C(11,8) = 165 subsets -- fast. For much larger rosters this is
     not the algorithm to use, but 11 is the ceiling this design targets (#no-token-economics).
+
+    RESTRICTED TO ⊆ `local`. A node MUST NOT sign a slice containing transactions it does not
+    hold: it cannot check them, cannot produce their bodies for settlement, and (worst) is
+    attesting to something it hasn't verified. Filtering candidates to those subsets of `local`
+    means every slice this node signs is fully backed by evidence it holds. If the quorum-held
+    intersection over some subset of peers contains a tx we lack, we simply don't include that tx
+    in our own view -- other nodes that DO hold it may reach quorum without us, which is correct.
 
     Ties: several distinct maximal intersections. The block MUST be chosen by a deterministic
     randomised sort keyed by the bucket, so (a) every honest node picks the same one and (b) an
@@ -459,6 +468,7 @@ def _compute_slice(
             inter = inter & holdings[p]
             if not inter:
                 break
+        inter = inter & local  # restrict to what we can back
         if len(inter) < max_size:
             continue
         if len(inter) > max_size:
@@ -466,6 +476,8 @@ def _compute_slice(
             candidates = {inter}
         else:
             candidates.add(inter)
+    if not candidates:
+        return frozenset()
     if len(candidates) == 1:
         return next(iter(candidates))
     return min(candidates, key=lambda c: _slice_id(bucket, c))

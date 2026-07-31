@@ -476,6 +476,17 @@ via the same one door as any other submission.
   what makes the block ratified. A slice that satisfies #slice-is-intersection but never carries
   a quorum signature is not a block.
 
+### Evidence outlives ratification {#evidence-outlives-ratification}
+
+- A peer whose signatures over two different slices for the same bucket both verify HAS
+  equivocated (#cross-attestation), and this is proof against their key. The evidence MUST be
+  detected and preserved for the observability layer to act on, **regardless of whether the
+  receiving node has already ratified**.
+- A byzantine peer's contradiction is evidence that outlives any one round; discarding it because
+  the local recipient has moved past it throws away the record. Round MUST verify the peer's
+  signature and check for equivocation BEFORE any state-based short-circuit — a `GONE` state
+  short-circuits state updates, not evidence extraction.
+
 ### Ratification counts distinct signers {#ratification-counts}
 
 - A block is ratified when signatures from a quorum of the roster verify over its identity.
@@ -819,17 +830,19 @@ visible rather than plausible.
 | deterministic application inside one transaction | `Store.apply` (BEGIN IMMEDIATE / COMMIT) |
 | routine outcomes are returned, not raised | return types of `Store.apply`, `Store.replay`, `Mempool.admit` |
 | invariants terminate the process | `InvariantError` outside the `DudeError` tree |
-| Round has exactly three states (collect / finalize / gone) | **OWED** — the current code has no Round object at all; the round is inlined into `Node` |
-| Round is sans-I/O and testable in isolation | **OWED** — same reason |
-| exclusion is by selection during slice construction | `Mempool.propose` via `settle.would_apply` (needs to move into Round) |
-| endorsers refuse a slice containing a past-`w_valid` transaction | `Mempool.endorsable` (needs to move into Round) |
-| pipelining: one collect window at a time, many finalize windows | **OWED** — the current code carries one bucket at a time |
-| gossip advertises by hash, not body | **OWED** — the current code re-floods `SUBMIT` bodies |
-| no designated leader | **structural** — nothing in the current code promotes one node's proposal; this row exists so a future contribution proposing one is refused at review |
-| the slice is the largest intersection over a quorum | **OWED** — the current code takes the first proposal a quorum endorses |
-| ties are broken by keyed sort | **OWED** — no candidate set is currently computed, so no tie-break is either |
-| a meta-agreement round chooses one slice | **OWED** — the current code has one round, not two |
-| **block-shaped ratification and replay-at-block-position** | **OWED** — the current code ratifies and replays per transaction, not per block |
+| Round has exactly three states (collect / finalize / gone) | `dude.round.Round`, `dude.round.State` |
+| Round is sans-I/O and testable in isolation | `dude.round` (no imports of `net`, `store`, or the clock; `dude.tests.test_round` exercises it directly) |
+| pipelining: one collect window at a time, many finalize windows | `dude.round.Round` is per-bucket by construction; `dude.tests.test_round.TestPipelining` + `TestRandomisedBuckets` |
+| gossip advertises by hash, not body | `dude.round.Held` (frozenset of digests); `dude.net.round_adapter.encode` for the wire encoding |
+| no designated leader | **structural** — `dude.round.Round` has no leader field or leader-selection logic; enforced by CI review |
+| the slice is the largest intersection over a quorum | `dude.round._compute_slice` (enumerates C(n, q) subsets) |
+| ties are broken by keyed sort | `dude.round._compute_slice` — `min(candidates, key=lambda c: _slice_id(bucket, c))` |
+| a meta-agreement round chooses one slice | `Round._try_ratify` — quorum of matching `Sig` messages over the same `slice_hash` |
+| exclusion is by selection during slice construction | Currently `Mempool.propose` via `settle.would_apply`. Moves onto the ratified `Block` when Round is wired (Phase 6). |
+| endorsers refuse a slice containing a past-`w_valid` transaction | Currently `Mempool.endorsable`. Moves into Round's `_finalize` when the mempool feeds Round (Phase 7). |
+| an equivocating peer's contradiction is preserved as evidence past GONE | `Round._on_sig` (detects equivocation before dropping on `GONE`); `Round.equivocations()` for the observability layer |
+| the running Node uses `Round` for consensus | `dude.coordinator.Coordinator` — `Node.tick` calls `Coordinator.tick`, which opens Rounds at bucket boundaries, drives them, hands ratified Blocks to `Store.apply`, and pushes surviving hashes back to the current Mempool through the same admission door. `Node._propose`/`_on_propose`/`_count`/`_settle` are gone. |
+| **block-shaped ratification via `Coordinator._settle`** | `dude.round.Block` is the ratified shape; `Coordinator._settle` looks up bodies from the frozen Mempool and passes them as an ordered tuple to `Store.apply`. Block metadata (bucket, signers, sigs) is not yet persisted -- the log records transactions per-entry, not blocks-as-entries. That is a Phase 7 concern with `store.py`. |
 
 ### Transport
 

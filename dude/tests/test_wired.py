@@ -131,16 +131,15 @@ def _production_calls() -> set[str]:
 
 DRIVEN = {
     # the duty                what performs it, each round
-    "mempool.evict": "ages out what can no longer be endorsed",
-    "mempool.admit": "screens what a client offers",
-    "mempool.reenter": "re-evaluates what settlement kicked",
-    "mempool.propose": "offers this node's batch for a closed bucket",
-    "mempool.retire": "forgets what landed in the log",
+    "mempool.admit": "screens what a client offers (also called from Coordinator on reject re-entry)",
+    "coordinator.tick": "advances the consensus round: swap mempool on bucket boundary, drive open Rounds, settle those that ratified",
+    "coordinator.submit": "hands a client's tx to the currently-live mempool",
+    "coordinator.on_round_msg": "routes HELD/SIG envelopes to the right Round by bucket",
     "probe": "asks peers where they are, so a rollback is seen",
     "catch_up": "asks the longest peer for what we are missing",
     "bootstrap": "takes state against a signed root when the log can no longer reach us",
     "postman.tick": "sends what is due and reaps what expired",
-    "store.apply": "settles the agreed slice",
+    "store.apply": "settles the agreed block",
 }
 """Duties that MUST be performed by the round. Keyed by the dotted call as production writes it.
 
@@ -222,8 +221,10 @@ class TestEveryDutyIsDriven(unittest.TestCase):
         self.assertEqual(set(DRIVEN) & set(UNDRIVEN), set())
 
     def test_a_duty_is_not_confused_with_a_check(self):
-        """`retire` is both `Mempool.retire`, which the round calls, and `Management.retire`, which
-        nothing calls. Keying on the bare attribute reported the second as driven."""
+        """`tick` is both `Coordinator.tick`, which the round calls, and `postman.tick`, which is
+        also driven -- but a name-collision detector that matched on the bare `tick` would report
+        both as satisfied by whichever it found first. Keying on the fully-qualified
+        `<object>.<method>` pattern is what makes them distinguishable."""
         called = _production_calls()
-        self.assertIn("mempool.retire", called)
-        self.assertNotIn("mgmt.retire", called)
+        self.assertIn("coordinator.tick", called)
+        self.assertIn("postman.tick", called)
