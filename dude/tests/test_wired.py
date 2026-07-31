@@ -42,12 +42,10 @@ _PROD = sorted(p for p in _DUDE.rglob("*.py") if "tests" not in p.parts)
 WIRED = {
     # the check                what it refuses, in one line
     "addressed_to": "a frame tagged for somebody else",
-    "attested": "a checkpoint the quorum did not ratify, or too few of it did",
-    "satisfied": "a decision taken on fewer signatures than the rule requires",
     "verify_possession": "a grant to a key nobody proved they hold",
     "accept": "an envelope for someone else, out of window, or unsigned",
     "contradiction": "believing a peer that has contradicted itself",
-    "attested_floor": "a floor asserted by fewer than f+1 fresh responders",
+    "attested_head": "a head asserted by fewer than f+1 fresh responders",
     "fresh": "a statement too old to say anything about now",
     "may_write": "a write into a store the author holds no grant for",
     "_violations": "a roster whose failure-domain placement cannot survive its own bound",
@@ -58,7 +56,6 @@ WIRED = {
     "_disagrees": "a transferred run that does not reproduce a signed commitment",
     "_unverified": "a replayed entry whose signature does not verify",
     "_uncontiguous": "a run that would land somewhere other than the position owed",
-    "adopt": "a checkpoint whose quorum signatures do not verify",
     "wrong_cluster": "a log our provisioned manager key does not authorise",
     "unvouched_roster": "a roster row that does not trace to the anchor",
     "roster_incomplete": "a roster that is a subset, unstated, or older than one already seen",

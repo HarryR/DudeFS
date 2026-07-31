@@ -32,10 +32,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .. import quorum
 from ..core import codec, crypto
 from ..core.errors import DudeError
-from . import smt
 
 
 class OpError(DudeError):
@@ -168,12 +166,6 @@ def _mutation_from(v: codec.Bencodable) -> Mutation:
 _ABSENT = b"a"
 _HOLDS = b"h"
 _DRAINED = b"d"
-
-# Entry kinds, as stored in the log (#collection-is-a-log-entry: a compaction is an entry like any
-# other).
-KIND_TRANSACTION = 0
-KIND_COMPACTION = 1
-_KIND_COMPACTION = b"compact"
 
 
 @dataclass(frozen=True, slots=True)
@@ -441,178 +433,8 @@ def falsifies(a: SignedTransaction, b: SignedTransaction) -> bool:
     return False
 
 
-# --------------------------------------------------------------------------- #
-# Compaction — the other kind of log entry (#collection-is-a-log-entry)                         #
-# --------------------------------------------------------------------------- #
-
-
-type LogEntry = SignedTransaction | Compaction
-"""What a log entry may be. Closed by construction: a transaction, or a collection."""
-
-
-@dataclass(frozen=True, slots=True)
-class Compaction:
-    """A consensus-agreed log entry that COLLECTS ONE SEGMENT, whole.
-
-    It declares a single segment id and nothing else. That is the whole change from the entry-level
-    design it replaces, and it is why so much machinery disappeared: there is no scattered drop set,
-    no chain to splice, and no per-entry accumulator arithmetic, because a segment IS a run by
-    construction and its accumulator is one value to subtract.
-
-    Collecting is refused while the segment holds live values (see `Store.collect`). Those
-    stragglers
-    migrate forward first, which is what keeps `A_state` invariant across a collection — and
-    there is
-    always at least one class of them, since genesis grants and roster rows live for the lifetime of
-    the log."""
-
-    segment: int
-    height: int = 0
-    """The log position this collection attests. A snapshot has no memory of how many entries
-    produced it, so height cannot be derived and must be carried."""
-
-    acc_state: crypto.Accumulator = crypto.ACC_IDENTITY
-    """The fold AFTER collecting. Collection is state-preserving, so this equals the fold before —
-    which is exactly what makes it checkable by anyone still holding the segment."""
-
-    acc_log: crypto.Accumulator = crypto.ACC_IDENTITY
-    """The LOG fold at `height` (#accumulators).
-
-    Here because a joiner cannot compute it. `acc_state` and `root` describe live state, which a
-    joiner receives; `acc_log` is a fold over every entry ever, minus what has been collected, and a
-    node that never held the collected entries has no way to reconstruct it. It must be ADOPTED, and
-    until it was carried here there was nothing signed to adopt — so a bootstrapped node would have
-    diverged from every peer permanently, on the one commitment C2 signs and checks.
-
-    Taken at `height`, before this marker is written, for the same reason it is not taken after: the
-    marker's own hash covers this field, so committing to a value that included the marker would be
-    circular.
-
-    With this the checkpoint carries `(height, acc_state, acc_log, root)` — which is exactly
-    `store.Commitment`, the tuple a transfer is already verified against. Adoption and verification
-    become the same object."""
-
-    root: crypto.Digest = smt.EMPTY
-    """The state root at this height (#state-root). Collection preserves state, so this too is
-    unchanged by collecting — and it is what makes the checkpoint useful to a CLIENT rather than
-    only to the cluster: `acc_state` proves two nodes agree and proves nothing about any one key,
-    while a quorum-signed root turns a single key's proof into something worth having."""
-
-    signers: crypto.SignerBitmap = crypto.NO_SIGNERS
-    sigs: tuple[crypto.Signature, ...] = ()
-    """The quorum's ratification. Not decoration: collection deletes the joiner's only other
-    verification path, so a collection nobody signed is a collection nobody can check.
-    `attested` reports the plain complaint — "no signature" — rather than failing later and
-    obscurely."""
-
-    def attest_bytes(self) -> bytes:
-        """What the quorum signs: the claim, without the signatures over it."""
-        return codec.encode(
-            [
-                KIND_COMPACTION,
-                self.segment,
-                self.height,
-                self.acc_state,
-                self.acc_log,
-                self.root,
-            ]
-        )
-
-    @classmethod
-    def from_attest_bytes(cls, raw: bytes) -> Compaction:
-        """The inverse of `attest_bytes`, for a claim received from a peer.
-
-        `decode` cannot serve: it reads the six-field ENTRY, and a claim is the four-field thing
-        the quorum signs — the signatures are what the claim is being circulated to collect. The
-        pair has to exist because the claim travels: without it every COLLECT on the wire decodes
-        to nothing and is dropped in silence, which is how this was found."""
-        p = codec.as_seq(codec.decode(raw), 6)
-        if codec.as_int(p[0]) != KIND_COMPACTION:
-            raise OpError("not a collection claim")
-        return cls(
-            codec.as_int(p[1]),
-            codec.as_int(p[2]),
-            crypto.Accumulator(codec.as_bytes(p[3])),
-            crypto.Accumulator(codec.as_bytes(p[4])),
-            crypto.Digest(codec.as_bytes(p[5])),
-        )
-
-    def attested(self, roster: list[crypto.PublicKey]) -> str | None:
-        """`None` if the ratification holds, else why not — in words a log line can carry.
-
-        IT COUNTS THE SIGNATURES, and it did not `[H]`. It verified that the claimed signers really
-        signed and that the bitmap was the right width, and then returned success — so "ratified"
-        meant *"at least one roster member signed"*. `quorum.satisfied` was consulted only where a
-        marker is PRODUCED (`Node._try_collect`), which is the half that a Byzantine node does not
-        run. One member could therefore mint a floor, and order a segment collected, and every
-        consumer downstream — `Store.collect`, `Store.adopt`, `replay`'s anchor — inherited it. The
-        mitigation existed, was tested, and mitigated nothing.
-
-        The threshold is DERIVED from the roster rather than passed in, so no caller can forget it
-        and no two callers can disagree about it: it is the same `quorum.DEFAULT` rule the producing
-        side counts with, which is the property that makes the two ends comparable at all."""
-        if not self.sigs:
-            return "no signature"
-        if len(self.signers) != crypto.bitmap_size(len(roster)):
-            return "signer bitmap does not match the roster"
-        # Distinct by construction: a bitmap names each member at most once, so "three signatures
-        # from one member" is not expressible rather than merely rejected.
-        signed = crypto.bitmap_indices(self.signers, len(roster))
-        if not quorum.satisfied(len(roster), len(signed)):
-            need = quorum.size(len(roster))
-            return f"{len(signed)} of {len(roster)} signed; a quorum is {need}"
-        if not crypto.Ed25519ListMultiSig.verify(
-            self.signers, list(self.sigs), self.attest_bytes(), roster
-        ):
-            return "a signature does not match its named signer"
-        return None
-
-    def encode(self) -> bytes:
-        return codec.encode(
-            [
-                KIND_COMPACTION,
-                self.segment,
-                self.height,
-                self.acc_state,
-                self.acc_log,
-                self.root,
-                self.signers,
-                list(self.sigs),
-            ]
-        )
-
-    @property
-    def raw(self) -> bytes:
-        return self.encode()
-
-    @property
-    def op_hash(self) -> crypto.Digest:
-        """Over the CLAIM, not the ratification.
-
-        The log commits to what was AGREED; the signature set is an artefact of which shares
-        happened to arrive first, and it differs between nodes that all collected the same segment
-        for the same reason. Hashing the whole entry made `A_log` diverge across honest nodes —
-        same state, same head, different history — which is the same defect that per-node migration
-        had and the same assertion caught both.
-
-        It also gives the dedup substrate the right meaning: two collections of one segment are the
-        same claim and therefore the same entry, whoever assembled the signatures."""
-        return crypto.h(self.attest_bytes())
-
-    @classmethod
-    def decode(cls, raw: bytes) -> Compaction:
-        p = codec.as_seq(codec.decode(raw), 8)
-        if codec.as_int(p[0]) != KIND_COMPACTION:
-            raise OpError("not a compaction entry")
-        return cls(
-            codec.as_int(p[1]),
-            codec.as_int(p[2]),
-            crypto.Accumulator(codec.as_bytes(p[3])),
-            crypto.Accumulator(codec.as_bytes(p[4])),
-            crypto.Digest(codec.as_bytes(p[5])),
-            crypto.SignerBitmap(codec.as_bytes(p[6])),
-            tuple(crypto.Signature(codec.as_bytes(s)) for s in codec.as_seq(p[7])),
-        )
+type LogEntry = SignedTransaction
+"""What a log entry may be. Compaction was struck (rip 2/3); a log entry is a transaction."""
 
 
 def conflicts(a: SignedTransaction, b: SignedTransaction) -> bool:

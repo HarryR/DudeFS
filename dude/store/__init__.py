@@ -10,7 +10,6 @@ from . import management, ops, settle
 from .layer import PENDING, Layer, Reader, holds
 from .ops import (
     Absent,
-    Compaction,
     Del,
     Holds,
     Set,
@@ -29,7 +28,6 @@ __all__ = [
     "Absent",
     "Applied",
     "Commitment",
-    "Compaction",
     "Del",
     "Entry",
     "Holds",

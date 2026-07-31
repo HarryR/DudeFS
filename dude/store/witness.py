@@ -51,15 +51,9 @@ class Witness:
         kept forever when it convicts.
 
         Unsigned bytes are dropped rather than stored: anyone can write an incriminating claim,
-        and only the key can make it evidence.
-
-        ALSO WHERE A CHECKPOINT IS ADOPTED, because this is the one funnel every peer attestation
-        passes through, and a claim carries the quorum-signed floor it stands on. `adopt` verifies
-        those signatures itself, so hearing from a liar costs nothing."""
+        and only the key can make it evidence."""
         if not signed.verify():
             return None
-        if signed.claim.ratified is not None:
-            self.store.adopt(signed.claim.ratified)
         held = self.sighting(signed.by)
         if held is not None:
             found = attest.contradiction(held, signed)

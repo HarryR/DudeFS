@@ -86,12 +86,6 @@ class Verb(IntEnum):
     message (SPECv2 #slice-meta-agreement). A quorum of matching `SIG`s is what turns a
     candidate slice into a ratified block."""
 
-    # -- collection (#collection-is-driven-by-any-node) ----------------------------------------- #
-    COLLECT = 40
-    """"Segment S is collectable, and the fold after collecting is X." Any node may say it."""
-    RATIFY = 41
-    """A signature over that claim, from a node that recomputed the fold and agrees."""
-
     # -- log transfer (#replication) -------------------------------------------------------- #
     FRONTIER = 30
     """"Where are you now?" Carries nothing: the question has no parameters."""

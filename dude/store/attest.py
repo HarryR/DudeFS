@@ -11,12 +11,12 @@ and carries no author, so attributing one to a key that did not sign it is not c
 from __future__ import annotations
 
 import enum
-from collections.abc import Container, Iterable, Sequence
+from collections.abc import Container, Iterable
 from dataclasses import dataclass
 
 from dude.core import codec, crypto
 from dude.core.errors import DudeError
-from dude.store import ops, smt
+from dude.store import smt
 
 _KIND_ATTESTATION = 2
 """Domain tag. Distinct from the entry kinds in `ops` because an attestation is NOT a log entry:
@@ -68,24 +68,9 @@ class Attestation:
     """The state root at this node's own head (#state-root).
 
     Signed, so a client can check a single key against a node's CURRENT state rather than only
-    against the last checkpoint — and if the node lies about it, the statement is convictable like
-    any other. The floor below is what a quorum vouches for; this is what one node stakes its
-    identity on."""
-
-    ratified: ops.Compaction | None = None
-    """The highest quorum-ratified checkpoint the node holds — the actual floor.
-
-    `None` before the first collection, when there is no floor at all and only `head` carries
-    information. Carried whole rather than as a bare height, because the signatures are the entire
-    reason a floor cannot be forged upward."""
-
-    @property
-    def floor(self) -> int:
-        """The attested height a client may rely on. Zero until the first checkpoint exists."""
-        return self.ratified.height if self.ratified is not None else 0
+    the last one. If the node lies about it, the statement is convictable like any other."""
 
     def encode(self) -> bytes:
-        ck = self.ratified.encode() if self.ratified is not None else b""
         return codec.encode(
             [
                 _KIND_ATTESTATION,
@@ -95,16 +80,14 @@ class Attestation:
                 self.acc_log,
                 self.at,
                 self.root,
-                ck,
             ]
         )
 
     @classmethod
     def decode(cls, raw: bytes) -> Attestation:
-        p = codec.as_seq(codec.decode(raw), 8)
+        p = codec.as_seq(codec.decode(raw), 7)
         if codec.as_int(p[0]) != _KIND_ATTESTATION:
             raise AttestError("not an attestation")
-        ck = codec.as_bytes(p[7])
         return cls(
             codec.as_int(p[1]),
             codec.as_int(p[2]),
@@ -112,7 +95,6 @@ class Attestation:
             crypto.Accumulator(codec.as_bytes(p[4])),
             codec.as_int(p[5]),
             crypto.Digest(codec.as_bytes(p[6])),
-            ops.Compaction.decode(ck) if ck else None,
         )
 
 
@@ -203,7 +185,7 @@ def contradiction(a: SignedAttestation, b: SignedAttestation) -> Evidence | None
         if earlier.claim.encode() == later.claim.encode():
             return None  # the same statement served twice is not a second statement
         return Evidence(Fault.EQUIVOCATION, earlier, later)
-    if later.claim.head < earlier.claim.head or later.claim.floor < earlier.claim.floor:
+    if later.claim.head < earlier.claim.head:
         return Evidence(Fault.REGRESSION, earlier, later)
     return None
 
@@ -276,50 +258,33 @@ def fresh(
     return keep
 
 
-def attested_floor(  # noqa: PLR0913 — the sixth is `roster`, and it is the one that must not be optional
+def attested_head(
     atts: Iterable[SignedAttestation],
     need: int,
     now: int,
     window: int,
     *,
-    roster: Sequence[crypto.PublicKey],
     shunned: Container[crypto.PublicKey] = (),
 ) -> int | None:
-    """The height a client may rely on: the MAX floor over at least `need` FRESH responders,
-    counting only floors whose quorum signatures VERIFY.
+    """The highest head that at least `need` fresh distinct responders vouch for, or None.
 
-    Max, not majority, because an arm can WITHHOLD a higher checkpoint and never forge one — the
-    floor carries the quorum's signatures, so the highest honest answer wins and a lagging node
-    cannot drag it down (#freshness-needs-many). `need` is `f+1`, which is why a lone responder
-    does not answer this question at all.
-
-    **`roster` IS REQUIRED, and used to be absent entirely.** The sentence above is the whole
-    justification for taking a max, and it is only true of a checkpoint somebody CHECKED: this
-    function read `claim.floor` without verifying a single signature, so any node could name any
-    height and be believed — the one thing #monotonicity claims is impossible. A required parameter
-    rather than an optional one `[H]`, so the check cannot be forgotten by omission.
-
-    An unverifiable floor contributes ZERO rather than excluding its responder: whether a node
-    answered freshly and whether it holds a good checkpoint are two questions, and `need` is about
-    the first.
+    The head is signed by the responder, so a peer can WITHHOLD a higher head but not forge one
+    upward -- the highest honest answer wins and a lagging peer cannot drag it down
+    (#freshness-needs-many). `need` is `f+1`, which is why a lone responder does not answer this
+    question at all.
 
     A single-link client can still satisfy `need`: a relay holds no key but its own, so it can
     withhold or replay but never forge, and one link is enough to GATHER `f+1` signed statements
     the client checks for itself. That is what returned cold single-link clients to scope.
 
-    `None` when too few distinct keys answered inside the window."""
+    HEAD IS A HINT, not a currency floor. Without a compaction / settlement anchor, a claimed
+    head is just each responder's private opinion of its own progress -- useful for detecting
+    a lagging local view, not usable as a checkpoint. The joiner path in tentative L6 walks the
+    log forward from genesis regardless (SPECv2 #no-trusted-frontier)."""
     keep = fresh(atts, now, window, shunned)
     if len(keep) < need:
         return None
-    return max(_verified_floor(a, roster) for a in keep.values())
-
-
-def _verified_floor(a: SignedAttestation, roster: Sequence[crypto.PublicKey]) -> int:
-    """This statement's floor if its checkpoint carries a good quorum signature, else 0."""
-    ck = a.claim.ratified
-    if ck is None or ck.attested(list(roster)) is not None:
-        return 0
-    return ck.height
+    return max(a.claim.head for a in keep.values())
 
 
 def staleness(

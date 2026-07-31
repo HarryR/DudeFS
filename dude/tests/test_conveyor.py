@@ -183,24 +183,18 @@ class TestTheGuardSeesUncommittedWork(_Fixture):
 
 
 class TestTheBeltMoves(_Fixture):
-    """The belt picture, asserted: conveying at the front is what lets things fall off the back.
-    One write does both jobs -- it drains the old epoch AND vacates the old segment."""
+    """Conveying drains the old epoch. Segment vacation was the compaction-era half; it went
+    with rip 2/3."""
 
-    def setUp(self):
-        super().setUp()
-        self.s.SEGMENT_WIDTH = 4
-
-    def test_conveying_drains_the_epoch_and_vacates_the_segment(self):
+    def test_conveying_drains_the_epoch(self):
         for i in range(6):
             self.write(f"k{i}".encode(), b"v", 1)
         self.assertEqual(self.s.epoch_live(1), 6)
-        self.assertNotEqual(self.s.stragglers(0), (), "nothing to convey; the test proves nothing")
 
         for i in range(6):
             self.write(f"k{i}".encode(), b"conveyed", 2)
 
         self.assertEqual(self.s.epoch_live(1), 0, "the epoch did not drain")
-        self.assertEqual(self.s.stragglers(0), (), "the segment did not empty")
 
     def test_the_oldest_epoch_is_the_one_closest_to_dying(self):
         """`epochs()` is the conveyor's work queue, oldest first -- which is the order that

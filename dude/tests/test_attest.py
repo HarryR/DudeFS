@@ -2,7 +2,7 @@
 
 The asymmetry worth remembering while reading these: a missed rollback costs a stale read, and a
 false conviction permanently kills a paid-for node. Several tests below exist only to pin the
-NON-faults — the honest crash, the partition, the node that merely made progress.
+NON-faults -- the honest crash, the partition, the node that merely made progress.
 """
 
 import itertools
@@ -20,47 +20,9 @@ NOW = 1_700_000_000_000
 WINDOW = 120_000
 
 
-def _claim(
-    seq: int,
-    head: int,
-    ck: ops.Compaction | None = None,
-    acc: bytes = b"s",
-    at: int = NOW,
-) -> attest.Attestation:
-    """A claim with each quantity settable on its own, so a test can move exactly one.
-
-    THE CHECKPOINT IS PASSED IN, never a bare height. Whether it is ratified is the whole difference
-    between a floor anyone may rely on and a number a node asserted, so the call site says which one
-    it means: `_unratified` for the questions where signatures are irrelevant (a regression is a
-    regression), `_ratified` for anything a reader would act on."""
-    return attest.Attestation(
-        seq, head, crypto.acc_element(acc), crypto.acc_element(b"log"), at=at, ratified=ck
-    )
-
-
-def _unratified(height: int) -> ops.Compaction:
-    """A checkpoint nobody signed. Fine for `contradiction`, which asks only whether one statement
-    regressed against another; worth zero to `attested_floor`, which is the point."""
-    return ops.Compaction(0, height, crypto.ACC_IDENTITY)
-
-
-def _ratified(height: int, keys: list[crypto.Keypair], roster: list[crypto.PublicKey]):
-    """A checkpoint the quorum signed, as `Store.collect` would have produced it.
-
-    The floors in these tests used to be bare `Compaction(0, height)` with no signatures at all, and
-    `attested_floor` believed them — which is exactly the defect being closed: the justification for
-    taking a MAX is that a floor carries the quorum, so an unsigned one may not contribute."""
-    claim = ops.Compaction(0, height, crypto.ACC_IDENTITY)
-    shares = {
-        roster.index(kp.public): crypto.Ed25519ListMultiSig.sign_share(
-            kp._seed, claim.attest_bytes()
-        )
-        for kp in keys
-    }
-    bitmap, sigs = crypto.Ed25519ListMultiSig.combine(shares, len(roster))
-    return ops.Compaction(
-        0, height, claim.acc_state, claim.acc_log, claim.root, bitmap, tuple(sigs)
-    )
+def _claim(seq: int, head: int, acc: bytes = b"s", at: int = NOW) -> attest.Attestation:
+    """A claim with each quantity settable on its own, so a test can move exactly one."""
+    return attest.Attestation(seq, head, crypto.acc_element(acc), crypto.acc_element(b"log"), at=at)
 
 
 class TestEncoding(unittest.TestCase):
@@ -71,14 +33,8 @@ class TestEncoding(unittest.TestCase):
         self.kp = crypto.Keypair.generate()
 
     def test_a_claim_round_trips(self):
-        c = _claim(7, 4242, _unratified(4000))
+        c = _claim(7, 4242)
         self.assertEqual(attest.Attestation.decode(c.encode()), c)
-
-    def test_a_claim_with_no_checkpoint_round_trips(self):
-        """The young-cluster case: no collection has happened, so there is no floor to carry."""
-        c = _claim(1, 3)
-        self.assertIsNone(c.ratified)
-        self.assertEqual(attest.Attestation.decode(c.encode()).floor, 0)
 
     def test_a_signed_attestation_round_trips_and_verifies(self):
         s = attest.SignedAttestation.make(self.kp, _claim(7, 4242))
@@ -93,11 +49,9 @@ class TestEncoding(unittest.TestCase):
         forged = attest.SignedAttestation(s.by, _claim(7, 999_999), s.sig)
         self.assertFalse(forged.verify())
 
-    def test_an_entry_is_not_an_attestation(self):
-        """An attestation is a statement ABOUT a log, not an entry IN one. Neither decodes as the
-        other, so a domain confusion is refused rather than half-read."""
+    def test_an_attestation_refuses_garbage(self):
         with self.assertRaises(DudeError):
-            attest.Attestation.decode(ops.Compaction(1, 2, crypto.ACC_IDENTITY).encode())
+            attest.Attestation.decode(b"not-bencode")
 
 
 class TestContradiction(unittest.TestCase):
@@ -120,15 +74,6 @@ class TestContradiction(unittest.TestCase):
         self.assertEqual(ev.fault, attest.Fault.REGRESSION)
         self.assertEqual(ev.culprit, self.kp.public)
         self.assertEqual((ev.earlier.claim.head, ev.later.claim.head), (100, 90))
-
-    def test_a_dropped_floor_convicts_even_when_the_head_climbs(self):
-        """A restored node can replay traffic and pass its old head while having LOST the
-        checkpoint it once attested. The head alone would miss it; the floor does not."""
-        a = self._sign(_claim(1, 100, _unratified(90)))
-        b = self._sign(_claim(2, 120, _unratified(50)))
-        ev = attest.contradiction(a, b)
-        assert ev is not None
-        self.assertEqual(ev.fault, attest.Fault.REGRESSION)
 
     def test_equivocation_convicts(self):
         a, b = self._sign(_claim(4, 100)), self._sign(_claim(4, 101))
@@ -204,12 +149,6 @@ class TestTheInterlock(unittest.TestCase):
         self.assertEqual(a.acc_state, self.s.accumulator())
         self.assertEqual(a.acc_log, self.s.log_accumulator())
 
-    def test_there_is_no_floor_before_the_first_checkpoint(self):
-        """A young cluster attests zero and only the hint carries information. Freshness starts at
-        the first collection, not at genesis."""
-        self.assertIsNone(self.s.checkpoint())
-        self.assertEqual(self.s.attestation(NOW).floor, 0)
-
     def test_an_honest_node_never_convicts_itself(self):
         """The property the whole design hangs on, stated directly: every consecutive pair of a
         healthy node's own attestations must be clean."""
@@ -218,30 +157,25 @@ class TestTheInterlock(unittest.TestCase):
             self.assertIsNone(attest.contradiction(a, b), "an honest node convicted itself")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestFreshness(unittest.TestCase):
     """#freshness-is-gathered. What is being tested is a BOUND becoming visible, not currency
-    becoming provable — a client that is being starved must be able to SEE that it is."""
+    becoming provable -- a client that is being starved must be able to SEE that it is.
+
+    Without compaction (rip 2/3), a node's `head` is the only currency signal it can offer; the
+    max-across-f+1-fresh-answers shape stays, but it now reports the highest signed head rather
+    than the highest ratified floor."""
 
     def setUp(self):
         self.keys = [crypto.Keypair.generate() for _ in range(4)]
-        self.roster = [kp.public for kp in self.keys]
 
-    def _bundle(self, at: int = NOW, floor: int = 100, n: int = 3):
-        ck = _ratified(floor, self.keys, self.roster)
-        return [
-            attest.SignedAttestation.make(kp, _claim(1, floor + 10, ck, at=at))
-            for kp in self.keys[:n]
-        ]
+    def _bundle(self, at: int = NOW, head: int = 100, n: int = 3):
+        return [attest.SignedAttestation.make(kp, _claim(1, head, at=at)) for kp in self.keys[:n]]
 
-    def _floor(self, atts, need: int, now: int = NOW, window: int = WINDOW):
-        return attest.attested_floor(atts, need, now, window, roster=self.roster)
+    def _head(self, atts, need: int, now: int = NOW, window: int = WINDOW):
+        return attest.attested_head(atts, need, now, window)
 
     def test_a_fresh_bundle_answers_the_question(self):
-        got = self._floor(self._bundle(), 3)
+        got = self._head(self._bundle(), 3)
         self.assertEqual(got, 100)
         self.assertEqual(attest.staleness(self._bundle(), NOW, WINDOW), 0)
 
@@ -249,35 +183,33 @@ class TestFreshness(unittest.TestCase):
         """The only lie an adversary without f+1 keys can tell. It cannot manufacture recent
         statements, so a starved client sees old timestamps rather than believing it is current."""
         old = self._bundle(at=NOW - WINDOW * 3)
-        self.assertIsNone(self._floor(old, 3))
+        self.assertIsNone(self._head(old, 3))
         self.assertIsNone(attest.staleness(old, NOW, WINDOW))
 
     def test_staleness_is_a_number_not_an_unknown(self):
         """The client's actual gain: it can say how far behind it is at worst."""
         lagged = self._bundle(at=NOW - 45_000)
         self.assertEqual(attest.staleness(lagged, NOW, WINDOW), 45_000)
-        self.assertEqual(self._floor(lagged, 3), 100)
+        self.assertEqual(self._head(lagged, 3), 100)
 
     def test_a_future_timestamp_is_discarded(self):
         """A statement dated tomorrow would still read as recent when replayed tomorrow, so it is
         refused now -- the same window logic the envelope applies to a conversation."""
         ahead = self._bundle(at=NOW + WINDOW * 2)
-        self.assertIsNone(self._floor(ahead, 3))
+        self.assertIsNone(self._head(ahead, 3))
 
     def test_one_stale_arm_does_not_stop_the_others(self):
         """A node with a bad clock DEGRADES its own contribution and nothing else. It is dropped
         from the count, never convicted."""
         mixed = [*self._bundle(n=2), *self._bundle(at=NOW - WINDOW * 5, n=1)]
-        self.assertIsNone(self._floor(mixed, 3), "the stale arm still counted")
-        self.assertEqual(self._floor(mixed, 2), 100)
+        self.assertIsNone(self._head(mixed, 3), "the stale arm still counted")
+        self.assertEqual(self._head(mixed, 2), 100)
 
-    def test_a_lagging_arm_cannot_drag_the_floor_down(self):
+    def test_a_lagging_arm_cannot_drag_the_head_down(self):
         """Max, not majority: withholding is the only lie available, so the highest honest answer
         wins (#freshness-needs-many)."""
-        behind = attest.SignedAttestation.make(
-            self.keys[3], _claim(1, 20, _ratified(10, self.keys, self.roster))
-        )
-        self.assertEqual(self._floor([*self._bundle(), behind], 4), 100)
+        behind = attest.SignedAttestation.make(self.keys[3], _claim(1, 20))
+        self.assertEqual(self._head([*self._bundle(), behind], 4), 100)
 
     def test_a_clock_stepping_backwards_convicts_nobody(self):
         """An NTP correction is a road bump. `contradiction` never looks at time, because
@@ -292,3 +224,7 @@ class TestFreshness(unittest.TestCase):
         the last probe round, and the floor becomes permanently unanswerable."""
         t = attest.AttestTunables()
         self.assertGreater(t.fresh_within, t.probe_every)
+
+
+if __name__ == "__main__":
+    unittest.main()

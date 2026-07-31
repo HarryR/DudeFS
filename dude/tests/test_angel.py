@@ -177,11 +177,13 @@ class TestTheAngelDuty(unittest.TestCase):
         question at all, and the max is taken over f+1."""
         now = self._write(3)
         node = self.c.nodes[0]
-        self.assertIsNone(node.floor(need=4, now=now), "four distinct answers do not exist here")
+        self.assertIsNone(
+            node.head_vouched_by(need=4, now=now), "four distinct answers do not exist here"
+        )
         for n in self.c.nodes:
             n.probe(now)
         self.c.pump(now)
-        self.assertIsNotNone(node.floor(need=3, now=now))
+        self.assertIsNotNone(node.head_vouched_by(need=3, now=now))
 
     def test_one_link_is_enough_to_gather_the_whole_cluster(self):
         """THE SINGLE-LINK CLIENT, back in scope without a priest (#freshness-is-gathered).
@@ -199,9 +201,7 @@ class TestTheAngelDuty(unittest.TestCase):
         self.assertEqual(len({a.by for a in bundle}), 3, "one link did not reach the cluster")
         for one in bundle:
             self.assertTrue(one.verify(), "a relayed statement lost its own signature")
-        self.assertIsNotNone(
-            attest.attested_floor(bundle, 3, now, WINDOW, roster=list(relay.roster()))
-        )
+        self.assertIsNotNone(attest.attested_head(bundle, 3, now, WINDOW))
 
     def test_a_starved_client_sees_that_it_is_starved(self):
         """The gain, stated as the failure it prevents. A relay that goes quiet cannot make a
@@ -214,9 +214,7 @@ class TestTheAngelDuty(unittest.TestCase):
         bundle = relay.gathered(now)
 
         much_later = now + WINDOW * 10
-        self.assertIsNone(
-            attest.attested_floor(bundle, 3, much_later, WINDOW, roster=list(relay.roster()))
-        )
+        self.assertIsNone(attest.attested_head(bundle, 3, much_later, WINDOW))
         self.assertIsNone(attest.staleness(bundle, much_later, WINDOW))
         self.assertEqual(attest.staleness(bundle, now + 5_000, WINDOW), 5_000)
 
@@ -243,7 +241,7 @@ class TestTheAngelDuty(unittest.TestCase):
         for n in self.c.nodes:
             n.probe(now)
         self.c.pump(now)
-        self.assertIsNotNone(node.floor(need=3, now=now))
+        self.assertIsNotNone(node.head_vouched_by(need=3, now=now))
 
         node.witness.heard(
             attest.SignedAttestation.make(
@@ -252,7 +250,9 @@ class TestTheAngelDuty(unittest.TestCase):
             )
         )
         self.assertIn(victim.me.public, node.shunned())
-        self.assertIsNone(node.floor(need=3, now=now), "a convicted node still counted toward f+1")
+        self.assertIsNone(
+            node.head_vouched_by(need=3, now=now), "a convicted node still counted toward f+1"
+        )
 
     def test_the_roster_is_untouched_by_shunning(self):
         """A local read policy. Shunning must not thin the quorum — a heavily-shunned cluster

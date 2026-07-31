@@ -38,30 +38,10 @@ from .management import P_NODE, P_ROSTER, Management, Role
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS entry (
     idx      INTEGER PRIMARY KEY,      -- the settled index; assigned by settlement, never authored
-    kind     INTEGER NOT NULL,         -- 0 = transaction, 1 = collection
     op_hash  BLOB NOT NULL UNIQUE,     -- h(raw): content address (#content-address)
     raw      BLOB NOT NULL,            -- the bytes exactly as received
-    author   BLOB,                     -- transactions only; a compaction has no single author
-    ts       INTEGER,                  -- transactions only. The author's own clock (#buckets)
-    segment  INTEGER NOT NULL          -- the SETTLEMENT bucket, not the author's clock. See below.
-);
-CREATE INDEX IF NOT EXISTS entry_by_segment ON entry(segment, idx);
-
--- Segments are PHYSICAL SLICES of the one logical log, and they are the unit of collection.
---
--- Not stores, and not ACL domains: conflating those breaks predicates and grants -- a store id
--- is stable and named by a grant, while a segment is ephemeral and named by nobody.
---
--- The id is the SETTLEMENT bucket. Deriving it from the author's `ts` would be wrong: the mempool
--- carries late transactions forward, so an author-stamped entry could land in a segment that has
--- already been collected — recreating exactly the scattering segments exist to prevent.
---
--- A segment is collected WHOLE. That is the entire mechanism: no scattered drop set, no chain
--- repair, no run-length problem, because a segment IS a run by construction.
-CREATE TABLE IF NOT EXISTS segment (
-    id     INTEGER PRIMARY KEY,
-    acc    BLOB NOT NULL,              -- ECMH over this segment; collection subtracts it whole
-    sealed INTEGER NOT NULL DEFAULT 0  -- no further entries may be assigned to it
+    author   BLOB NOT NULL,            -- the transaction's author key
+    ts       INTEGER NOT NULL          -- the author's own clock (#buckets)
 );
 
 -- The live view: the store proper. An absent key is simply no row (#predicates's `absent`, which is
@@ -143,15 +123,6 @@ class Applied:
     dropped: tuple[Dropped, ...]
 
 
-def _write_set(mutations: tuple[ops.Mutation, ...]) -> tuple[tuple[int, bytes], ...]:
-    """The distinct `(store, key)` pairs a mutation sequence touches, in first-touch order — one
-    entry per key, however many times the sequence writes it."""
-    seen: dict[tuple[int, bytes], None] = {}
-    for m in mutations:
-        seen.setdefault((m.store, m.name), None)
-    return tuple(seen)
-
-
 def log_element(idx: int, op_hash: crypto.Digest) -> crypto.Accumulator:
     """The accumulated element for one LOG entry: `HashToPoint(bencode(["log", idx, op_hash]))`.
 
@@ -226,63 +197,21 @@ class Store:
     def _log_add(self, idx: Index, op_hash: crypto.Digest) -> None:
         self._set_meta("acc_log", crypto.acc_add(self.log_accumulator(), log_element(idx, op_hash)))
 
-    def _log_sub(self, idx: Index, op_hash: crypto.Digest) -> None:
-        self._set_meta("acc_log", crypto.acc_sub(self.log_accumulator(), log_element(idx, op_hash)))
-
     # -- LOG ----------------------------------------------------------------- #
 
     def head(self) -> Index:
-        """The highest settled index, or the adopted height if state was taken without the log.
-
-        `MAX(idx)` ALONE IS WRONG AFTER A BOOTSTRAP. A node that took state against a checkpoint's
-        root holds no entries at all, so the log's maximum is zero while the state it holds is the
-        state at the checkpoint's height. Reporting zero would say it is behind the frontier for
-        ever, and it would bootstrap again on every round — the walk would succeed and change
-        nothing.
-
-        The adopted height is durable and monotone, and it is only ever set once the walk has been
-        CORROBORATED against the same checkpoint's fold (`Store.adopted_at`)."""
+        """The highest settled index. Zero on an empty log."""
         row = self.db.execute("SELECT MAX(idx) FROM entry").fetchone()
-        return max(row[0] or 0, self.adopted_height())
-
-    def adopted_height(self) -> Index:
-        """The height this node's state was taken AT, if it was taken rather than replayed."""
-        return int.from_bytes(self._get_meta("adopted_height", b""))
-
-    def adopted_at(self, ck: ops.Compaction) -> str | None:
-        """Declare this node to be at `ck`, having verified it holds exactly what `ck` commits to.
-
-        THE CORROBORATION IS THE WHOLE POINT, and it is cheap: the fold is O(1) and already signed,
-        so "the walk's queue emptied" becomes "the state I hold is the state that was committed".
-        Without it, a walk that lost replies — or was steered into asking for nothing — finishes
-        looking exactly like one that succeeded.
-
-        `A_log` is ADOPTED here rather than computed, because a joiner cannot compute it: it is a
-        fold over every entry ever, minus what has been collected, and this node held none of them.
-        That is why the ratified marker carries it (#accumulators)."""
-        if self.accumulator() != ck.acc_state:
-            return "the state walked does not match the fold the quorum signed"
-        if self.state_root() != ck.root:
-            return "the state walked does not match the root the quorum signed"
-        if ck.height <= self.adopted_height():
-            return None  # already at or past it; adoption is monotone, never a step back
-        self._set_meta("adopted_height", ck.height.to_bytes(8))
-        self._set_meta("acc_log", ck.acc_log)
-        return None
+        return row[0] or 0
 
     def entries(self, frm: Index = 1, to: Index | None = None) -> Iterator[Entry]:
         """Replay range, inclusive. The only way anyone derives state
         (#replay-does-not-readjudicate)."""
         hi = self.head() if to is None else to
-        for idx, kind, raw in self.db.execute(
-            "SELECT idx, kind, raw FROM entry WHERE idx BETWEEN ? AND ? ORDER BY idx", (frm, hi)
+        for idx, raw in self.db.execute(
+            "SELECT idx, raw FROM entry WHERE idx BETWEEN ? AND ? ORDER BY idx", (frm, hi)
         ):
-            yield Entry(
-                idx,
-                ops.SignedTransaction.decode(raw)
-                if kind == ops.KIND_TRANSACTION
-                else ops.Compaction.decode(raw),
-            )
+            yield Entry(idx, ops.SignedTransaction.decode(raw))
 
     # -- STORE --------------------------------------------------------------- #
 
@@ -414,25 +343,6 @@ class Store:
         try:
             acc = self.accumulator()
             for e in items:
-                if isinstance(e.item, ops.Compaction):
-                    # The roster is read HERE, at the marker, not once before the run. A replay
-                    # starting from genesis begins with no roster at all, so hoisting this would
-                    # check nothing on exactly the path that most needs it — and the roster that
-                    # matters is the one the log had reached when the collection happened, which is
-                    # what reading it mid-replay gives.
-                    roster = list(self.roster())
-                    # A collection replays as itself: drop the segment's entries and subtract its
-                    # accumulator. There is no splice and no chain to repair, because a segment is
-                    # collected WHOLE — which is the entire reason the segment model replaces the
-                    # entry-level one.
-                    if roster and (why := e.item.attested(roster)) is not None:
-                        self.db.execute("ROLLBACK")
-                        seg = e.item.segment
-                        return f"collection of segment {seg} in the run is not ratified: {why}"
-                    self._set_meta("acc", acc)
-                    self._collect(e.item.segment, at=e.idx, marker=e.item)
-                    acc = self.accumulator()
-                    continue
                 if (why := _unverified(e)) is not None:
                     self.db.execute("ROLLBACK")
                     return why
@@ -459,14 +369,17 @@ class Store:
         the case that matters — a log introducing its own manager and its own roster checks out
         against itself, and only the anchor can say no.
 
-        Two kinds of question, in order. Does this agree with something SIGNED (the ratified
-        checkpoint, then the sender's own claim), and is this the log our anchor authorises (its
-        manager grant, then every roster row's credential)."""
-        for at in self._anchors(expect):
-            if self.head() == at.head and (why := self._disagrees(at)) is not None:
-                return why
+        Two kinds of question, in order. Does this agree with the sender's own signed claim (if
+        the run reached its height), and is this the log our anchor authorises (its manager grant,
+        then every roster row's credential)."""
+        if (
+            expect is not None
+            and self.head() == expect.head
+            and (why := self._disagrees(expect)) is not None
+        ):
+            return why
         if self.anchor() is None:
-            return None  # unprovisioned: it cannot answer, and `adopt` already refuses it a floor
+            return None  # unprovisioned: it cannot answer
         for why in (self.wrong_cluster(), self.unvouched_roster(), self.roster_incomplete()):
             if why is not None:
                 return f"refusing a log this node's anchor does not authorise: {why}"
@@ -481,27 +394,6 @@ class Store:
         commitment = Management(self).roster_commitment()
         if commitment is not None and commitment[0] > self.roster_serial():
             self._set_meta("roster_serial", commitment[0].to_bytes(8))
-
-    def _anchors(self, expect: Commitment | None) -> tuple[Commitment, ...]:
-        """Every signed position this run can be checked against, strongest first.
-
-        THE RATIFIED CHECKPOINT IS THE STRONG ONE, and until now it was never used for this at all:
-        a transfer was checked only against `expect`, which is the SENDER'S OWN attestation — so a
-        roster member could serve any history it liked provided it signed a statement matching it.
-        Self-consistency is not authenticity. The checkpoint carries the quorum, so a run crossing
-        its height is checked against what everybody agreed rather than against one peer's story.
-
-        Both are returned rather than one: they answer at different heights, and a run reaching
-        neither is unverified — which is #4's missing anchor, not something this can invent."""
-        ck = self.checkpoint()
-        return tuple(
-            c
-            for c in (
-                Commitment(ck.height, ck.acc_state, ck.acc_log, ck.root) if ck else None,
-                expect,
-            )
-            if c is not None
-        )
 
     def _disagrees(self, expect: Commitment) -> str | None:
         """`None` if every commitment agrees, else which one did not — in words a log line can
@@ -534,7 +426,6 @@ class Store:
         Takes the mutation sequence rather than re-deriving it from `tx`, because the evaluator has
         already produced it in order — and because replay hands over the same shape without any
         evaluation having happened (#replay-does-not-readjudicate)."""
-        seg = self.segment_of(idx)
         # The credential a `Set` leaves behind is the transaction doing it, FOR EVERY STORE `[H]`.
         # It was management-only while the leaf hashed the value alone, on the reasoning that data
         # rows derive their authority from management state — true of the authority, and no use to
@@ -547,12 +438,10 @@ class Store:
         # inline until the numbers say otherwise (#credential-in-every-leaf).
         cred = tx.raw
         self.db.execute(
-            "INSERT INTO entry (idx, kind, op_hash, raw, author, ts, segment)"
-            " VALUES (?,?,?,?,?,?,?)",
-            (idx, ops.KIND_TRANSACTION, tx.op_hash, tx.raw, tx.author, tx.ts, seg),
+            "INSERT INTO entry (idx, op_hash, raw, author, ts) VALUES (?,?,?,?,?)",
+            (idx, tx.op_hash, tx.raw, tx.author, tx.ts),
         )
         self._log_add(idx, tx.op_hash)
-        self._segment_add(seg, idx, tx.op_hash)
         # Effects, in order — the last write to a key wins (#last-write-wins).
         #    The accumulator is maintained HERE and only here: each step removes whatever the key
         #    currently holds and adds what it will hold. Doing any of it in the loop above would
@@ -631,47 +520,12 @@ class Store:
 
     # -- COMPACTION (#collection-is-a-log-entry, 11.2a-i, 11.4b) ------------------------------ #
 
-    # -- segments ------------------------------------------------------------- #
-
-    SEGMENT_WIDTH = 1024
-    """Entries per segment. A COUNT, not a duration, because the settlement bucket is what must not
-    move — see the `segment` table comment. It must exceed the mempool's dedup window, since
-    `entry.op_hash UNIQUE` is the dedup substrate and collection forgets hashes: collect a segment
-    narrower than that window and a transaction still inside it becomes replayable."""
-
-    def segment_of(self, idx: Index) -> int:
-        """Which segment an index belongs to. Pure arithmetic — computed, never negotiated."""
-        return idx // self.SEGMENT_WIDTH
-
-    def _segment_add(self, seg: int, idx: Index, op_hash: crypto.Digest) -> None:
-        row = self.db.execute("SELECT acc FROM segment WHERE id=?", (seg,)).fetchone()
-        acc = crypto.Accumulator(row[0]) if row else crypto.ACC_IDENTITY
-        acc = crypto.acc_add(acc, log_element(idx, op_hash))
-        self.db.execute(
-            "INSERT OR REPLACE INTO segment (id, acc, sealed) VALUES (?,?,0)", (seg, acc)
-        )
-
-    def segments(self) -> tuple[int, ...]:
-        """Sorted — never mapping or rowid order, which is a portability rule, not a style one."""
-        return tuple(r[0] for r in self.db.execute("SELECT id FROM segment ORDER BY id"))
-
-    def segment_live(self, seg: int) -> int:
-        """How many of this segment's entries still provide a LIVE value.
-
-        This is the collection trigger: a segment is worth collecting when it is mostly dead, which
-        is the classic generational rule and the explicit signal entry-level compaction
-        never had."""
-        q = "SELECT COUNT(*) FROM live WHERE head IN (SELECT idx FROM entry WHERE segment=?)"
-        return int(self.db.execute(q, (seg,)).fetchone()[0])
-
     def roster(self) -> tuple[crypto.PublicKey, ...]:
-        """Who may ratify a collection. Read from the management prefix rather than configured, so
-        the set that signs is the set the log itself says exists.
+        """The set of authorised nodes. Read from the management prefix rather than configured,
+        so the set that signs is the set the log itself says exists.
 
         `management` reads through `layer.Reader`, NOT through `Store`, so importing it here is a
-        plain one-way edge and there is no cycle to avoid. Five call sites deferred this import
-        behind a `# noqa` on the claim that there was one; deferring an import hides a dependency
-        from the block a reader consults and reduces nothing."""
+        plain one-way edge and there is no cycle to avoid."""
 
         return Management(self).node_set()
 
@@ -681,161 +535,6 @@ class Store:
             "SELECT cred FROM live WHERE store=? AND name=?", (store, name)
         ).fetchone()
         return row[0] if row else b""
-
-    def stragglers(self, seg: int) -> tuple[tuple[int, bytes], ...]:
-        """The `(store, name)` pairs this segment still holds live.
-
-        These are what stops a segment collecting, and there is ALWAYS at least one class of them:
-        genesis grants and roster rows are live for the lifetime of the log, so segment 0 would be
-        permanently uncollectable without migration."""
-        q = (
-            "SELECT store, name FROM live WHERE head IN (SELECT idx FROM entry WHERE segment=?)"
-            " ORDER BY store, name"
-        )
-        return tuple((int(s), n) for s, n in self.db.execute(q, (seg,)).fetchall())
-
-    def migration(
-        self, seg: int, author: crypto.Keypair, now: int, at_most: int
-    ) -> ops.SignedTransaction | None:
-        """AUTHOR the transaction that moves this segment's stragglers forward. Settles nothing.
-
-        Two things this deliberately does NOT do, both of which it used to.
-
-        It does not `Set` the same value back: that is indistinguishable from setting a different
-        one, so it needed write authority the author does not have, and migration acquired it by
-        applying with authority checking off — which put node-signed writes into the management
-        store and displaced the manager's signature over the roster. `ops.Move` asserts nothing and
-        so needs nothing (#conveyor).
-
-        CLAMPED, and the clamp is required rather than defaulted. A segment may hold up to
-        `SEGMENT_WIDTH` live rows, and a management row carries a signed transaction as its
-        credential, so relocating every straggler at once builds a transaction no frame can carry.
-        Taking `at_most` per call makes draining a segment converge over rounds rather than fail in
-        one.
-
-        It does not APPLY. Migration entries are log entries like any other and must be agreed by
-        the quorum, or every node authors its own and three honest nodes end up holding
-        byte-different logs at identical indices — `A_state` agreeing throughout, which is exactly
-        why it went unnoticed."""
-        moves = [
-            ops.Move(st, name, self.credential(st, name))
-            for st, name in self.stragglers(seg)[:at_most]
-            if self.get(st, name) is not None  # raced with a writer; it has already moved on
-        ]
-        if not moves:
-            return None
-        return ops.writes(*moves).sign(author, now)
-
-    def collect(
-        self,
-        seg: int,
-        attest: ops.Compaction | None = None,
-        now: int | None = None,
-        dedup_window: int = 0,
-    ) -> Index:
-        """Collect a segment WHOLE. Returns the index of the collection entry.
-
-        Refuses while the segment still holds live values: those stragglers must be migrated forward
-        first, which is what keeps `A_state` invariant across a collection. The refusal is the point
-        — a segment that silently collected live data would lose committed state, which is the one
-        failure this system exists to prevent."""
-        # The dedup floor. `entry.op_hash UNIQUE` is what makes a settled transaction unrepeatable,
-        # and collection FORGETS those hashes -- so collecting a segment while the mempool would
-        # still admit one of its transactions makes that transaction replayable.
-        #
-        # Expressed as an AGE, not as a segment width. The plan said "width > w_admit + w_valid",
-        # but a width is a COUNT of entries and the window is a DURATION: comparing them needs an
-        # assumed arrival rate, which nobody has. The newest entry's own timestamp answers it
-        # directly and needs no rate at all.
-        if dedup_window and now is not None:
-            row = self.db.execute(
-                "SELECT MAX(ts) FROM entry WHERE segment=? AND ts IS NOT NULL", (seg,)
-            ).fetchone()
-            newest = row[0] if row and row[0] is not None else None
-            if newest is not None and now - newest < dedup_window:
-                raise StoreError(
-                    f"segment {seg} is younger than the dedup window "
-                    f"({now - newest}ms < {dedup_window}ms); collecting it would make its "
-                    f"transactions replayable"
-                )
-        current = self.segment_of(self.head() + 1)
-        if seg >= current:
-            # Migration writes at the HEAD, so draining a segment into ITSELF is a no-op — the
-            # straggler simply reappears at a later index in the same segment. A segment is only
-            # drainable once the log has moved past it. Found by writing the test.
-            raise StoreError(f"segment {seg} is still current (head is in segment {current})")
-        roster = self.roster()
-        marker = attest or ops.Compaction(
-            seg, self.head(), self.accumulator(), self.log_accumulator(), self.state_root()
-        )
-        if roster:
-            # Enforced here, not left to a caller: collection deletes the joiner's only other way
-            # to check this log, so an unratified collection is one nobody can ever verify. The
-            # complaint is plain -- "no signature" -- because a vague failure at this boundary is
-            # how an unverifiable log gets shipped.
-            why = marker.attested(list(roster))
-            if why is not None:
-                raise StoreError(f"collection of segment {seg} is not ratified: {why}")
-        if marker.segment != seg:
-            raise StoreError("attestation names a different segment")
-        left = self.stragglers(seg)
-        if left:
-            raise StoreError(
-                f"segment {seg} still holds {len(left)} live value(s); migrate them forward first"
-            )
-        self.db.execute("BEGIN IMMEDIATE")
-        try:
-            idx = self._collect(seg, at=self.head() + 1, marker=marker)
-            self.db.execute("COMMIT")
-        except Exception:
-            self.db.execute("ROLLBACK")
-            raise
-        return idx
-
-    def _collect(self, seg: int, at: Index, marker: ops.Compaction | None = None) -> Index:
-        """`collect`'s body, assuming an open transaction and no stragglers."""
-        before, before_root = self.accumulator(), self.state_root()
-        if marker is None:
-            marker = ops.Compaction(seg, at - 1, before, self.log_accumulator(), self.state_root())
-        self.db.execute(
-            "INSERT INTO entry (idx, kind, op_hash, raw, author, ts, segment)"
-            " VALUES (?,?,?,?,NULL,NULL,?)",
-            (at, ops.KIND_COMPACTION, marker.op_hash, marker.raw, self.segment_of(at)),
-        )
-        self._log_add(at, marker.op_hash)
-        self._segment_add(self.segment_of(at), at, marker.op_hash)
-
-        # The checkpoint is RETAINED here rather than derived from the log later, because this
-        # marker is itself an entry and a later collection will delete it -- and a node that
-        # forgot its own floor would attest zero and look like it had regressed. Monotone by
-        # policy at exactly one place: a node never adopts a checkpoint older than its floor.
-        if marker.height > self.floor():
-            self._set_meta("checkpoint", marker.raw)
-
-        row = self.db.execute("SELECT acc FROM segment WHERE id=?", (seg,)).fetchone()
-        if row is not None:
-            # ONE subtraction, not a per-entry fold. This is what a segment buys.
-            self._set_meta(
-                "acc_log", crypto.acc_sub(self.log_accumulator(), crypto.Accumulator(row[0]))
-            )
-        self.db.execute("DELETE FROM entry WHERE segment=?", (seg,))
-        self.db.execute("DELETE FROM segment WHERE id=?", (seg,))
-
-        # A HARD INVARIANT `[H]`, and therefore not a `DudeError`: collection is defined as
-        # state-preserving, so either of these firing means our own fold is wrong, not that
-        # somebody sent us something bad. Nothing may catch it (core/errors.py).
-        #
-        # BOTH COMMITMENTS, because there are two and preserving one says nothing about the other.
-        # The accumulator is over `(store, name, value)` and cannot see a credential at all, so
-        # while the root commits to credentials, an accumulator check alone would sleep through a
-        # relocation that rewrote one. The two disagreeing is precisely the "two truths about one
-        # state" failure the store exists to prevent, and the root is the half a joiner checks
-        # against.
-        if self.accumulator() != before:
-            raise InvariantError("collection changed the state accumulator")
-        if self.state_root() != before_root:
-            raise InvariantError("collection changed the state root")
-        return at
 
     # -- THE CONVEYOR (#conveyor) ---------------------------------------------- #
 
@@ -877,58 +576,6 @@ class Store:
         return self.tree.prove(store, name)
 
     # -- ATTESTATION (#monotonicity) ------------------------------------------ #
-
-    def checkpoint(self) -> ops.Compaction | None:
-        """The highest quorum-ratified checkpoint this node holds, or None before the first."""
-        raw = self._get_meta("checkpoint", b"")
-        return ops.Compaction.decode(raw) if raw else None
-
-    def floor(self) -> Index:
-        """That checkpoint's height. Zero until one exists — a young cluster has no floor."""
-        ck = self.checkpoint()
-        return ck.height if ck is not None else 0
-
-    def horizon(self) -> int:
-        """The lowest segment this log still retains. Zero until anything is collected.
-
-        THE FRONTIER, NOT A SET, and that is the whole of why nothing here grows without bound.
-        Collection is oldest-first (`Node.maybe_collect`), so the retained log is a contiguous
-        suffix and one ratified marker describes where it starts: the marker names the segment it
-        collected, so the next one up is the frontier. A per-collection ledger would explain the
-        same holes and would be the only structure in the system that grows for ever — the log is
-        bounded by collection, sightings and convictions by the roster, and that would be bounded
-        by nothing.
-
-        Distinct from `floor`, the HEIGHT that checkpoint attests, being the head at the moment of
-        collecting. A client relies on the floor; the horizon is what explains an absence."""
-        ck = self.checkpoint()
-        return ck.segment + 1 if ck is not None else 0
-
-    def retained_from(self) -> Index:
-        """The lowest index this log is obliged to hold. Below it, absence is authorised.
-
-        THE COMPLETENESS RULE in one expression: an index at or above this MUST be present, and one
-        below it is accounted for by the ratified collection that removed it. It replaces the
-        `(floor, head]` phrasing, which used the wrong quantity: the floor is the head at collection
-        time, while the frontier says which indices were forgotten.
-
-        Floored at 1 because indices start there: with nothing collected the horizon is segment 0
-        and the arithmetic would name index 0, which no log holds — so a completeness check would
-        report a gap that cannot exist."""
-        return self.frontier(self.checkpoint())
-
-    def frontier(self, ck: ops.Compaction | None) -> Index:
-        """The lowest index a log holding THIS checkpoint is obliged to retain.
-
-        Split out from `retained_from` so a node can ask the question about SOMEBODY ELSE'S marker.
-        A node that was absent while the cluster collected holds no newer checkpoint, so its own
-        answer is stale by exactly the amount that matters — it would believe the log could still
-        reach it while every `PULL` was refused. `Node.bootstrap` asks this about the marker f+1
-        fresh peers vouch for instead.
-
-        One expression, two callers, deliberately: the frontier arithmetic being written twice is
-        how the two answers would come to disagree."""
-        return max(1, ((ck.segment + 1) if ck is not None else 0) * self.SEGMENT_WIDTH)
 
     def anchor(self) -> crypto.PublicKey | None:
         """The manager public key this node was provisioned with, or None if it was not.
@@ -1073,40 +720,6 @@ class Store:
         the restart that would otherwise let an old roster back in."""
         return int.from_bytes(self._get_meta("roster_serial", b""))
 
-    def adopt(self, ck: ops.Compaction) -> str | None:
-        """Take a checkpoint somebody else holds, if the quorum signed it. `None` if adopted, else
-        why not.
-
-        THE ONLY WAY A WIPED NODE GETS AN ANCHOR. Before this, `checkpoint` meta was written by
-        exactly one code path — a collection this node performed itself — so a node that had never
-        collected had floor 0 for ever and nothing to check any transfer against. Meanwhile the
-        checkpoint it needed was already arriving on every attestation it heard (`Attestation
-        .ratified`) and being dropped on the floor.
-
-        MAX WINS, and that is safe only because the signatures are checked here `[H]`. A floor
-        carries the quorum, so it can be WITHHELD but not forged upward — which is what makes
-        "believe the highest" the correct rule rather than a credulous one (`attest.attested_floor`
-        reasons the same way about the same object). Verify first, then take the higher.
-
-        A floor ABOVE our own head is not an error and must not be refused: it is the true, signed,
-        locally-checkable statement *"the cluster has ratified state I do not hold"* — which is
-        precisely the bootstrap trigger, and refusing it would discard the one fact that says so."""
-        if (why := self.wrong_cluster()) is not None:
-            # The chain has an ORDER (#bootstrap-anchor): a checkpoint is verified against the
-            # roster, and the roster is worth something only if the log holding it is the one our
-            # anchor authorises. Adopting first and verifying later would take a floor — and so a
-            # monotone height — from a cluster we were never provisioned into.
-            return why
-        roster = list(self.roster())
-        if not roster:
-            return "no roster to check a checkpoint against"
-        if (why := ck.attested(roster)) is not None:
-            return why
-        if ck.height <= self.floor():
-            return None  # not better than what we hold; monotone by policy, and not a failure
-        self._set_meta("checkpoint", ck.raw)
-        return None
-
     def attestation(self, now: int) -> attest.Attestation:
         """Bump the counter and read one coherent snapshot to attest.
 
@@ -1135,7 +748,6 @@ class Store:
                 self.log_accumulator(),
                 now,
                 self.state_root(),
-                self.checkpoint(),
             )
             self.db.execute("COMMIT")
         except Exception:

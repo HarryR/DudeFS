@@ -167,7 +167,7 @@ class TestTransferIsNotTrusted(unittest.TestCase):
             ops.Set(ops.STORE_MANAGEMENT, who, codec.encode([[b"attacker:1234"], []]))
         ).sign(author, T0)
         idx = self.victim.store.head() + 1 if at is None else at
-        return codec.encode([[idx, ops.KIND_TRANSACTION, tx.raw]])
+        return codec.encode([[idx, tx.raw]])
 
     def test_an_unsolicited_transfer_is_dropped(self):
         """THE regression. A stranger holding no grant and no roster seat used to add itself to a
@@ -207,7 +207,7 @@ class TestTransferIsNotTrusted(unittest.TestCase):
         at = self.victim.store.head() + 1
         one = ops.writes(ops.Set(D, crypto.h(b"one"), b"v")).sign(self.client, T0)
         two = ops.writes(ops.Set(D, crypto.h(b"two"), b"v")).sign(self.client, T0)
-        run = [[at, ops.KIND_TRANSACTION, one.raw], [at, ops.KIND_TRANSACTION, two.raw]]
+        run = [[at, one.raw], [at, two.raw]]
         env = Envelope(self.victim.me.public, Verb.ENTRIES, b"z" * 16, codec.encode(run)).sign(
             peer, T0
         )
@@ -252,12 +252,7 @@ class TestTransferIsNotTrusted(unittest.TestCase):
         )
         self.victim.witness.heard(attest.SignedAttestation.make(peer.me, lie))
 
-        run = []
-        for e in peer.store.entries(before + 1):
-            kind = (
-                ops.KIND_COMPACTION if isinstance(e.item, ops.Compaction) else ops.KIND_TRANSACTION
-            )
-            run.append([e.idx, kind, e.item.raw])
+        run = [[e.idx, e.item.raw] for e in peer.store.entries(before + 1)]
         env = Envelope(self.victim.me.public, Verb.ENTRIES, b"z" * 16, codec.encode(run)).sign(
             peer.me, now
         )
@@ -289,11 +284,7 @@ def _first_awake(c: Cluster, deaf) -> int:
 
 def _run_from(peer: Node, frm: int) -> list:
     """The rows an `ENTRIES` reply carries, built exactly as `_on_pull` builds them."""
-    run = []
-    for e in peer.store.entries(frm):
-        kind = ops.KIND_COMPACTION if isinstance(e.item, ops.Compaction) else ops.KIND_TRANSACTION
-        run.append([e.idx, kind, e.item.raw])
-    return run
+    return [[e.idx, e.item.raw] for e in peer.store.entries(frm)]
 
 
 if __name__ == "__main__":

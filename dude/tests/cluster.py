@@ -136,15 +136,7 @@ class Cluster:
 
 
 def gaps_in_the_retained_log(store: Store) -> tuple[int, ...]:
-    """Indices missing from `[retained_from, head]` — the part of the log that must be COMPLETE.
-
-    "No holes" is the wrong invariant: collection deletes whole segments, so a compacted log is
-    *supposed* to have gaps. What separates a legitimate gap from a lost entry is the HORIZON, the
-    frontier of collection named by the one ratified marker the node retains. Below it absence is
-    accounted for; at or above it every index is owed.
-
-    This used the floor, which is the wrong quantity: the floor is the head at the moment of
-    collecting, so it sits far ABOVE the indices that were actually forgotten. Collection being
-    oldest-first is what makes a single frontier sufficient."""
+    """Indices missing from `[1, head]` -- in the no-compaction world the log is complete from
+    genesis to head, so any gap is a lost entry rather than a legitimate absence."""
     have = {e.idx for e in store.entries()}
-    return tuple(i for i in range(store.retained_from(), store.head() + 1) if i not in have)
+    return tuple(i for i in range(1, store.head() + 1) if i not in have)
