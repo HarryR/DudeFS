@@ -17,7 +17,7 @@
 # mechanism (bucketing, observations, the `>= k` rule, the three-wave cadence); what is open is the
 # **correctness argument** under partition and skew — a modelling task, not a missing design.
 #
-# What is implemented here: bucket arithmetic, one batch per node per bucket (MEMPOOL.md §4.1),
+# What is implemented here: bucket arithmetic, one batch per node per bucket (#buckets),
 # endorsement counted by `dude.quorum` against a slice DIGEST, settlement through the one evaluator,
 # rejects returned by `Mempool.reenter`.
 #
@@ -873,8 +873,8 @@ class Node:
     def _settle(self, bucket: int, digest: crypto.Digest, now: Millis) -> None:
         """Apply the agreed slice, then return the rejects to the mempool.
 
-        The whole of MEMPOOL.md §0's loop, and it reuses the pieces rather than restating them:
-        `Store.apply` drives `settle.evaluate`, and `Mempool.reenter` applies §5's finality
+        The whole of the mempool loop (#mempool), reusing the pieces rather than restating them:
+        `Store.apply` drives `settle.evaluate`, and `Mempool.reenter` applies the finality
         distinction to whatever did not land."""
         ids = {i for prop in self.proposals.get(bucket, {}).values() for i in prop}
         held = {tx.op_hash: tx for tx in self._held(bucket)}
@@ -906,7 +906,7 @@ class Node:
     def _flood(
         self, verb: Verb, body: bytes, now: Millis, skip: crypto.PublicKey | None = None
     ) -> None:
-        """Send to every peer. Flood announcements, pull bodies (MEMPOOL.md §3.2) — at this size the
+        """Send to every peer. Flood announcements, pull bodies (#mempool) — at this size the
         announcement term is small and reconciliation would buy bandwidth at the cost of latency,
         which is the wrong trade when wave latency IS finality latency."""
         for who in self.postman.peers:

@@ -1,13 +1,10 @@
 # DudeFS — Python proof of concept
 
-> Implementation of the design in [DESIGN.md](DESIGN.md) (rev 6) and companions
-> ([PROTOCOL.md](PROTOCOL.md), [ARCHITECTURE.md](ARCHITECTURE.md),
-> [CRYPTO.md](CRYPTO.md), [CLIENT.md](CLIENT.md), [MANAGER.md](MANAGER.md),
-> [RESILIENCE.md](RESILIENCE.md), [FORMAL.md](FORMAL.md),
-> [COMPARISON.md](COMPARISON.md)), following the plan in
-> [IMPLEMENTATION.md](IMPLEMENTATION.md). **If code and documents disagree, the
-> documents win** — deviations are raised in [NOTES.md](NOTES.md), never silently
-> coded around.
+> Implementation of the design in **[SPEC.md](SPEC.md)**, which is the only design
+> document: requirements and nothing else, each with an anchor the code cites. **If
+> code and spec disagree, the spec wins** — a deviation is raised as a requirement or
+> an issue, never silently coded around. SPEC's enforcement table maps every rule to
+> what enforces it, or marks it OWED. How to work here: **[CLAUDE.md](CLAUDE.md)**.
 
 DudeFS is a **distributed, authenticated, encrypted coordination store** — a
 durable, provenance-carrying `etcd` for a small trust group. State is never
@@ -26,7 +23,7 @@ visibility (finality waits on the skew window δ), or availability-over-durabili
 ## Status: M0–M7 (the daemon/client/CLI stack, encrypted) — 223 tests green
 
 Zero-knowledge is **genuinely on**: the `xcs1` AEAD suite (XChaCha20-Poly1305-IETF
-with an SIV-derived, misuse-resistant nonce — [CRYPTO.md](CRYPTO.md) §2) encrypts
+with an SIV-derived, misuse-resistant nonce — CRYPTO.md §2) encrypts
 every payload; group keys are distributed with `sbx1` libsodium sealed boxes. One
 32-byte master per keyepoch is wrapped; the working keys (data key, slot secret)
 derive from it by domain-separated keyed-BLAKE2. Crypto runs on **libsodium via
@@ -41,12 +38,12 @@ PyNaCl** — the single runtime dependency.
 | **M4** | gossip / anti-entropy (summary/delta fixpoint) + relay; consensus hardening | ✅ |
 | **M5** | control plane: capability certs, epoch bridge + possession barrier, RERECEIPT, public roster slot | ✅ |
 | **M6** | **log-compaction** (rev 6, DESIGN §12): conveyor cut, resurrection masks, attempts sidecar; void rule + node GC | ✅ |
-| **M7** | the real system: node daemon, client daemon + JSON-RPC worker API ([CLIENT.md](CLIENT.md)), the `dude` CLI ([MANAGER.md](MANAGER.md)), and the crypto swap to PyNaCl (`xcs1`/`sbx1`) | WP1–3 ✅ · WP4 demo pending |
+| **M7** | the real system: node daemon, client daemon + JSON-RPC worker API (CLIENT.md), the `dude` CLI (MANAGER.md), and the crypto swap to PyNaCl (`xcs1`/`sbx1`) | WP1–3 ✅ · WP4 demo pending |
 
 All five evidence kinds (FORK, DOUBLE_VOTE, FLOOR_PERJURY, SEQ_REUSE, LOST_COMMIT)
 are sound **and** complete; the adversarial review findings through #22 are closed
 (horizon + epoch persisted across restart, gap-free issuance, client read-side
-quorum sync). See [NOTES.md](NOTES.md) for the rationale record.
+quorum sync). The rationale record is the git history.
 
 The kernel is **pure and synchronous** — no I/O, no clocks, no randomness; time is
 injected as `now_ms`, and the L4 quorum client is a sans-I/O state machine (events
@@ -117,4 +114,4 @@ make clean        # remove .venv + caches   (distclean also removes .uv)
 ```
 
 Code style: [PYTHON-CODESTYLE.md](PYTHON-CODESTYLE.md) — strict typing, enums over
-constants, typed error hierarchy, docstrings citing doc sections.
+constants, typed error hierarchy, docstrings citing SPEC anchors.

@@ -1,7 +1,7 @@
-# dude.net.postman — the one impure object. See ../../LINKS.md.
+# dude.net.postman — the one impure object. See SPEC.md (#peer-not-path).
 #
 # WHY THIS EXISTS [H]: `Link`, `Peer` and `Mailbox` are each deliberately ignorant of the others'
-# domain (LINKS.md §1), so something has to compose them — and it cannot be one of them. A mailbox
+# domain (#peer-not-path), so something composes them — and it cannot be one of them. A mailbox
 # that drove peers would have to know about links and addresses, which is the exact separation the
 # split was drawn to get. So the composer is a fourth object rather than a promotion of a third.
 #
@@ -89,7 +89,7 @@ class Postman:
                 for link in links:
                     # RESTAMPED AND RE-SIGNED PER ATTEMPT. Not tidiness: a distinct `ts` per attempt
                     # is what lets a reply's `reply_ts` name one of them, which is what keeps a
-                    # staggered message measurable rather than a blind spot (LINKS.md §3.4a).
+                    # staggered message measurable rather than a blind spot (#rtt-attribution).
                     stamped = t.envelope.env.sign(self.me, now)
                     if link.send(seal(stamped), now) is None:
                         self.mailbox.sent(t.mid, link.address, now, now, again_at=again_at)
@@ -103,7 +103,7 @@ class Postman:
         The envelope is never `None` — the old signature said it might be, which was unreachable
         since a frame that will not unseal or verify RAISES rather than returning.
 
-        Refuses by raising: strict in what we accept, and loudly (LINKS.md anti-rule).
+        Refuses by raising: strict in what we accept, and loudly (#be-strict).
 
         THE SCREEN TAG IS CHECKED HERE, and it was checked nowhere `[H]`. `crypto.screen_tag` states
         the intended flow — *"the sender keys on the target's identity; the receiver keys on its OWN
@@ -150,7 +150,7 @@ class Postman:
     def _reap(self, now: Millis) -> tuple[Expired, ...]:
         """Expire deadlines, charging a link ONLY when it was the sole attempt.
 
-        LINKS.md §3.3's discipline. `Expired.address` is populated only when one attempt was made,
+        #breaker's discipline. `Expired.address` is populated only when one attempt was made,
         so the judgement is made where the attempt record lives and applied here."""
         done = self.mailbox.expired(now)
         for e in done:

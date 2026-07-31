@@ -1,4 +1,4 @@
-# dude.net.transports.inproc — a carrier with no I/O at all. See ../../../LINKS.md.
+# dude.net.transports.inproc — a carrier with no I/O at all. See SPEC.md (#transport-adds-no-trust).
 #
 # Delivery by direct call into a shared switchboard. It exists so a whole cluster runs in one
 # process with no sockets, no ports and no sleeping — which is what makes an end-to-end run a

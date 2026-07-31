@@ -382,7 +382,7 @@ def screen_tag(node_identity: PublicKey, sealed: bytes) -> ScreenTag:
 
 
 # --------------------------------------------------------------------------- #
-# Proof-of-possession (NOTES 58): the manager signs pubkeys only and never       #
+# Proof-of-possession (#possession-proof): the manager signs pubkeys only and     #
 # certifies an unheld key — the subject proves it holds the sk by signing a      #
 # domain-separated self-attestation over its own pubkey. Non-interactive (no     #
 # challenge round trip); replay-safe because the pop is bound to THAT pubkey and #

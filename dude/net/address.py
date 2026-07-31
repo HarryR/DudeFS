@@ -1,4 +1,4 @@
-# dude.net.address — where a peer can be reached. See ../../TRANSPORT.md.
+# dude.net.address — where a peer can be reached. See SPEC.md (#peer-not-path).
 #
 # The management store records addresses as opaque `bytes` and this module is the ONLY thing that
 # parses them (#transport-adds-no-trust: transport adds no trust, and carrier vocabulary must not
@@ -138,7 +138,7 @@ class Endpoint:
         """Accepts a bare address too, so a roster written before options existed still reads.
 
         The one place liberality is right: it is not accepting a MALFORMED record, it is accepting a
-        shorter well-defined one. LINKS.md's anti-rule forbids guessing at broken input, not
+        shorter well-defined one. #be-strict forbids guessing at broken input, not
         supporting two explicit shapes."""
         try:
             decoded = codec.decode(raw)

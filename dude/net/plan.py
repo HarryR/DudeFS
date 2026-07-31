@@ -1,4 +1,4 @@
-# dude.net.plan — retry, stagger and give-up policy. Pure. See ../../LINKS.md.
+# dude.net.plan — retry, stagger and give-up policy. Pure. See SPEC.md (#retry-budget).
 #
 # THE INVARIANT THIS FILE EXISTS TO KEEP [H]: **no object both holds state and decides policy.**
 #
@@ -79,7 +79,7 @@ type Decision = Send | Wait | GiveUp
 
 @dataclass(frozen=True, slots=True)
 class PlanTunables:
-    """Destined for the one consolidated tunables surface (LINKS.md §5) — no literal below."""
+    """Destined for the one consolidated tunables surface (#timing) — no literal below."""
 
     backoff_base: Millis = 100
     """First retry delay, and the FLOOR of every delay: `backoff` never returns less. A third of a

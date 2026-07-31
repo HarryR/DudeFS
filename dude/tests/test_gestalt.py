@@ -1014,7 +1014,7 @@ class TestVerbCoverage(unittest.TestCase):
 
     def test_the_unimplemented_set_is_exactly_mempool_dissemination(self):
         """One cluster left, and it is known work rather than an open question: `ANNOUNCE` /
-        `FETCH` are MEMPOOL.md §3's flood-announce-pull-bodies dissemination. Today a transaction
+        `FETCH` are the flood-announce-pull-bodies dissemination (#mempool). Today a transaction
         spreads by re-flooding the whole `SUBMIT`, which works and does not scale."""
         self.assertEqual(UNIMPLEMENTED, {Verb.ANNOUNCE, Verb.FETCH})
 

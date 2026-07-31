@@ -325,7 +325,7 @@ Collection MUST be refused when any of these holds:
   from never-inserted, and no history may enter the root.
 - Every leaf MUST be bound to its own path, and every internal node to its depth **and** its prefix,
   so no hash can be quoted out of position.
-- **Every leaf MUST also be bound to the credential that authorised its value** — the signed
+- **Every leaf MUST also be bound to the credential that authorised its value** {#credential-in-every-leaf} — the signed
   transaction that wrote it — hashed, so a proof of a value stays small. Without this the root
   commits to what every key holds and to nothing about who was permitted to put it there, so a
   quorum at or above threshold could assert arbitrary state and every proof would still verify. A
@@ -805,6 +805,58 @@ essential: keyed on identity alone it would be a constant, i.e. a permanent per-
 `[H]` Sealing after signing means an observer sees no identity. Signing a ciphertext would leave the
 sender's key in the clear and leak the social graph.
 
+### A peer is an identity, not a path {#peer-not-path}
+
+- A peer MUST be an identity with several addresses, and the identity is the unit of reachability.
+- A reply MUST be correlated by message id **and by the peer that was asked**, never by the link it
+  arrived on: send on A, receive on B is ordinary traffic. The dedup key is `(frm, mid)` and never
+  `mid` alone, because `mid` is chosen by the sender — so any identity that learns an outstanding id
+  could otherwise have its answer taken as solicited.
+- **A request whose answer is only ever solicited MUST be registered as awaiting a reply.** An
+  unregistered request is answered correctly and its answer discarded at the door, which is silent.
+
+### An RTT sample must be attributable {#rtt-attribution}
+
+- A sample MUST come only from a message transmitted **exactly once, on exactly one link**. Karn &
+  Partridge; multi-homing makes it strictly worse than TCP's case, since a reply arriving on B after
+  attempts on A and B says nothing about either.
+- Each attempt MUST therefore be restamped and re-signed, and a reply MUST echo the stamp it answers,
+  or a staggered message is a measurement blind spot rather than a measurement.
+- Where attribution fails, the reply MUST be reported as unattributable rather than guessed at: a
+  wrong sample charges one link for another's latency and the estimator cannot notice. Liveness still
+  counts; only the measurement is withheld.
+- A timeout MUST be built from variance, not from the average — `SRTT + max(G, 4·RTTVAR)`. Variance is
+  the load-bearing term; "twice the average" behaves badly on any link with occasional long tails.
+
+### Only the breaker declares a link down {#breaker}
+
+- A timeout is a suspicion; a failure is a decision. **Nothing outside the breaker may declare a link
+  down** — a single expiry adjusts state and MUST NOT produce a verdict.
+- An expiry MUST be charged to a link only when exactly one attempt was made, for the same reason a
+  sample must be attributable: otherwise a healthy link accumulates another's failures until the
+  breaker opens on the wrong one.
+
+### Retries are budgeted as a fraction of traffic {#retry-budget}
+
+- Backoff MUST carry jitter. The randomisation is the point, not the growth: a fixed delay
+  re-synchronises every client that failed together, so a recovering peer meets a thundering herd.
+- Retries MUST be budgeted as a **fraction of traffic**, not per request. Per-request limits multiply
+  — three layers retrying three times is twenty-seven attempts, each layer within its own limit.
+- The budget MUST sit **per peer**: per link would fight multi-homing, and global would let one dead
+  peer starve retries to healthy ones.
+- Multi-homed attempts MUST be staggered rather than failed over serially, or worst-case latency is
+  the sum of every address's timeout.
+- Staggered attempts MUST spend from the same budget, so parallel dialling collapses back to serial
+  exactly when the peer is unhealthy, with no separate health check deciding it.
+
+### Be strict in what you accept {#be-strict}
+
+- Malformed input MUST be refused loudly, never repaired by guessing. The Robustness Principle is the
+  mechanism by which two implementations drift apart while both appear to work.
+- Delivery is at-least-once by design, so duplicate suppression is the **receiver's** job. Execution
+  idempotence comes from the content address (#content-address); a response cache buys only answer
+  stability and is per-verb policy, which most verbs decline.
+
 ## Errors
 
 ### Routine outcomes are returned, not raised {#no-exceptions-for-control-flow}
@@ -822,3 +874,15 @@ Closed enums reserve **ordinal 0 as `INVALID`**, so a Go port's zero value lands
 
 None yet. When a rule is retired, its tag stays here with the reason, so a stale citation resolves to
 an explanation rather than to nothing.
+
+## Retired documents
+
+`HANDOFF.md`, `PLAN.md`, `FRAMING.md`, `ACCUMULATOR.md`, `THREAT-MODEL.md`, `LINKS.md` and
+`MEMPOOL.md` were retired into this file. Each was a work-in-progress discussion document, and each
+had accumulated reasoning that had been superseded without being removed — which is worse than no
+reasoning, because a stale justification reads as authority. `LINKS.md` still asserted that three of
+its own rules were violated by code that had since implemented them.
+
+What survived is here as requirements. The history is in git; the working practices are in
+`CLAUDE.md`; the open work is in GitHub issues. A citation to a section number in any of those files
+is stale by construction — cite an anchor.

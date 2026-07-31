@@ -1,10 +1,10 @@
-# dude.mempool — candidate transactions, and the slice proposed from them. See ../MEMPOOL.md.
+# dude.mempool — candidate transactions, and the slice proposed from them. See SPEC.md (#mempool).
 #
 # SANS-I/O AND CLOCK-FREE EXCEPT WHERE STATED. `now` is a parameter, never read from the system
 # here, so a test drives a decade of buckets in microseconds and a replay is bit-identical. Nothing
 # in this module opens a socket or touches storage.
 #
-# THE INVARIANT THE WHOLE DESIGN RESTS ON (MEMPOOL.md §8): **the clock may choose, it may not
+# THE INVARIANT THE WHOLE DESIGN RESTS ON (#timing): **the clock may choose, it may not
 # judge.** It is consulted in exactly two places — `admit` (the door) and `propose` (what to offer).
 # It appears nowhere in verifying a proposal, and settlement is by log index. So a node whose clock
 # is skewed proposes badly and accepts correctly, which is why it follows a quorum result rather
@@ -26,7 +26,7 @@ type Millis = int
 
 @dataclass(frozen=True, slots=True)
 class Tunables:
-    """Timing, as MEMPOOL.md §7.5 rules it: values that belong in the management store so they are
+    """Timing, as #timing rules it: values that belong in the management store so they are
     consensus-agreed at a log position, rather than in a per-node file that can silently drift.
 
     The defaults are a well-connected deployment. A mixnet carrying the durability measures is a
@@ -273,7 +273,7 @@ class Mempool:
     ) -> tuple[ops.SignedTransaction, ...]:
         """The batch this node offers for `bucket`: its eligible transactions, screened.
 
-        DETERMINISTIC ORDER, so the largest intersection needs no search (MEMPOOL.md §3.1). Two
+        DETERMINISTIC ORDER, so the largest intersection needs no search. Two
         nodes applying this rule to the same eligible set produce identical batches, and to
         *different* eligible sets produce batches differing only by the transactions each actually
         holds — one is a subset of the other rather than diverging. The intersection, obtained by
@@ -386,7 +386,7 @@ class Mempool:
 
         Equal accumulators mean identical sets in O(1), which is the short-circuit that makes gossip
         cheap. It deliberately does NOT support recovering the difference — that needs a sketch
-        (PinSketch/IBLT), and MEMPOOL.md §3.2 declines them: Erlay pays 3.15s -> 5.75s relay latency
+        (PinSketch/IBLT), and they are declined here: Erlay pays 3.15s -> 5.75s relay latency
         for its bandwidth saving, and here wave latency IS finality latency."""
         acc = crypto.ACC_IDENTITY
         for ident in self.pending.get(bucket, {}):
@@ -414,7 +414,7 @@ class Mempool:
 def _order(item: tuple[crypto.Digest, ops.SignedTransaction]) -> tuple[int, bytes]:
     """`(ts, id)` — the deterministic total order proposals are cut from.
 
-    OPEN (MEMPOOL.md §9.1): ordering by `ts` means a client can gain priority by BACKDATING within
+    OPEN: ordering by `ts` means a client can gain priority by BACKDATING within
     `w_admit`, which is the only clock fault that is profitable rather than merely costly. With no
     fee auction the prize is winning CAS races on a contended key. The alternative is ordering by id
     alone, which removes the advantage and any `ts` fairness with it."""

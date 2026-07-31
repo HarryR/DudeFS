@@ -316,7 +316,7 @@ class TestMaybeReply(unittest.TestCase):
 
 
 class TestOnlyThePeerWeAskedMayAnswer(unittest.TestCase):
-    """LINKS.md's rule, which the code did not follow: *"the dedup key is `(frm, mid)`, never `mid`
+    """#peer-not-path, which the code did not follow: *"the dedup key is `(frm, mid)`, never `mid`
     alone... `mid` is chosen by the sender."*
 
     Correlation popped on the id alone, so any identity that learned an outstanding id had its

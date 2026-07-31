@@ -1,4 +1,4 @@
-# dude.net.mailbox — what to send, where to try next, and when to give up. See ../../TRANSPORT.md.
+# dude.net.mailbox — what to send, where to try next, when to give up. SPEC.md (#peer-not-path).
 #
 # SANS-I/O, like the mempool and for the same two reasons [H]:
 #
@@ -78,9 +78,9 @@ class Attempt:
 class Reply:
     """A correlated reply, and what may be believed about it.
 
-    `address is None` and `rtt is None` together mean UNATTRIBUTABLE (LINKS.md §3.3): the reply is
-    real and proves liveness, but no link may be charged or credited for it. Both are `None` or
-    neither — a link without a time, or a time without a link, would be meaningless."""
+    `address is None` and `rtt is None` together mean UNATTRIBUTABLE (#rtt-attribution): the
+    reply is real and proves liveness, but no link may be charged or credited for it. Both are
+    `None` or neither — a link without a time, or a time without a link, would be meaningless."""
 
     mid: MessageId
     address: Address | None
@@ -246,7 +246,7 @@ class Mailbox:
         """An inbound envelope. If it answers something outstanding, retire that entry and report
         what may be believed about it; otherwise `None`, and the caller treats it as unsolicited.
 
-        ATTRIBUTION, in the order the rules apply (LINKS.md R2, §3.3):
+        ATTRIBUTION, in the order the rules apply (#rtt-attribution):
 
         1. **One attempt outstanding** — unambiguous by construction. Karn is satisfied with no
            echo at all, so a peer that never sets `reply_ts` still yields samples on that path.
@@ -261,7 +261,8 @@ class Mailbox:
         on B is ordinary traffic. `SignedEnvelope.accept` has already established that it is
         addressed to us, fresh, correctly signed, and echoes the right id.
 
-        AND BY THE PEER WE ASKED `[H]`, which it was not. LINKS.md states the rule and the reason —
+        AND BY THE PEER WE ASKED `[H]`, which it was not. SPEC states the rule and the reason
+        (#peer-not-path) —
         *"the dedup key is `(frm, mid)`, never `mid` alone... `mid` is chosen by the sender"* — and
         `arrived` popped on the id alone, so ANY identity that learned an outstanding id could have
         its answer taken as solicited. Frames are sealed, so an id is not observable; but the peer

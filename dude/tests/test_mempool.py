@@ -1,4 +1,4 @@
-# Tests for dude.mempool and dude.quorum. See ../../MEMPOOL.md.
+# Tests for dude.mempool and dude.quorum. See SPEC.md (#mempool).
 #
 # Every test drives `now` explicitly. Nothing here sleeps or reads a system clock, which is the
 # point of the mempool taking `now` as a parameter: a decade of buckets costs microseconds, and a
@@ -73,7 +73,7 @@ class TestQuorum(unittest.TestCase):
 
 class TestBuckets(unittest.TestCase):
     def test_boundaries_are_computed_not_negotiated(self):
-        """MEMPOOL.md §1: two nodes derive the same bucket for the same transaction with ZERO
+        """#buckets: two nodes derive the same bucket for the same transaction with ZERO
         communication, because the bucket is arithmetic on the transaction's own timestamp."""
         a, b = Tunables(delta=1_000), Tunables(delta=1_000)
         for ts in (T0, T0 + 1, T0 + 999, T0 + 1_000, T0 + 5_500):
@@ -167,7 +167,7 @@ class TestProposal(unittest.TestCase):
         return mp
 
     def test_the_intersection_needs_no_search(self):
-        """MEMPOOL.md §3.1, the finding that retires the ECMH powerset.
+        """The finding that retires the ECMH powerset.
 
         Two nodes cutting from the same deterministic order produce batches that differ ONLY by the
         transactions each actually holds — one is a subsequence of the other, not a divergent

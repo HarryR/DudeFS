@@ -1,4 +1,4 @@
-# dude.net.envelope — point-to-point message framing. See TRANSPORT.md, SPEC.md (#sign-then-seal).
+# dude.net.envelope — point-to-point message framing. See SPEC.md (#sign-then-seal).
 #
 # THREE LAYERS, and keeping them apart is the whole design [H]:
 #
@@ -19,7 +19,7 @@
 # crypto is already paid for. It is a PARTICIPATION gate: a node whose clock is outside the window
 # literally cannot hold a conversation, and because both ends check, it self-partitions
 # symmetrically. The door closes on defect. No accommodation exists for a broken clock, by decision
-# (MEMPOOL.md §1.3).
+# -- see #timing.
 #
 # SIGN-THEN-SEAL, never the reverse: sealing after signing means an observer sees no identity at
 # all. Signing a ciphertext would leave the sender's key in the clear and leak the social graph.
@@ -65,7 +65,7 @@ class Verb(IntEnum):
     PING = 1
     PONG = 2
 
-    # -- mempool dissemination (MEMPOOL.md §3) -------------------------------------------------- #
+    # -- mempool dissemination (#mempool) -------------------------------------------------- #
     SUBMIT = 10
     """A client offers a transaction. The only verb a client needs to write."""
     ANNOUNCE = 11
@@ -74,7 +74,7 @@ class Verb(IntEnum):
     """"Send me these bodies." The pull half of pull-not-push."""
     BODIES = 13
 
-    # -- slice agreement (MEMPOOL.md §4) -------------------------------------------------------- #
+    # -- slice agreement (#buckets) -------------------------------------------------------- #
     PROPOSE = 20
     ENDORSE = 21
 
@@ -113,7 +113,7 @@ class Verb(IntEnum):
     # -- diagnostics ---------------------------------------------------------------------------- #
     REFUSED = 90
     """A refusal, carrying a reason. Never silence: a client can only correct a clock fault if it is
-    told which way it is wrong (MEMPOOL.md §1.1)."""
+    told which way it is wrong (#mempool)."""
 
 
 type MessageId = bytes
@@ -158,7 +158,8 @@ class Envelope:
     reply_ts: int = 0
     """The `ts` of the ATTEMPT this answers — TCP's Timestamps option (RFC 7323) in one field.
 
-    Without it, Karn's rule (LINKS.md R2) discards the RTT sample from anything sent more than once,
+    Without it, Karn's rule (#rtt-attribution) discards the RTT sample from anything sent more than
+    once,
     which under multi-homing is most traffic: a reply arriving after attempts on two links tells you
     nothing about either. Echoing the attempt's `ts` matches the reply to exactly ONE transmission,
     and since each attempt went out on a known link, that recovers **both** the sample and the link.

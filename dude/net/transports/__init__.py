@@ -1,4 +1,4 @@
-# dude.net.transports — carriers. See ../../../LINKS.md, ../../../TRANSPORT.md.
+# dude.net.transports — carriers. See SPEC.md (#transport-adds-no-trust).
 #
 # A package rather than a module, because a transport is the one thing here that genuinely
 # multiplies: in-process, unix, tcp, and whatever a deployment adds. Each is small, each satisfies

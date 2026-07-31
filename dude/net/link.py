@@ -1,4 +1,4 @@
-# dude.net.link — one path to one peer, and the policies layered over it. See ../../LINKS.md.
+# dude.net.link — one path to one peer, and the policies layered over it. See SPEC.md (#breaker).
 #
 # SKETCH. Not wired into `Mailbox` yet — this is the shape, to see how it smells.
 #
@@ -12,7 +12,7 @@
 #   before_send()  veto — the only one that can refuse
 #   on_sent()      the bytes left (which implies nothing about receipt)
 #   on_failed()    the transport raised
-#   on_reply(rtt)  a reply came back; `rtt` is None when it is UNATTRIBUTABLE (LINKS.md §3.3)
+#   on_reply(rtt)  a reply came back; `rtt` is None when it is UNATTRIBUTABLE (#rtt-attribution)
 #
 # `rtt=None` is the load-bearing case, not an edge case. Under multi-homing most replies cannot be
 # attributed to a transmission at all (R2, Karn), and a policy that treats "no sample" as "sample of
@@ -50,7 +50,7 @@ class Transport(Protocol):
 
 
 # --------------------------------------------------------------------------------------------- #
-# Tunables. ONE surface per LINKS.md §5 [H] — these belong in the consolidated management-store    #
+# Tunables. ONE surface per #timing [H] — these belong in the consolidated management-store    #
 # type, and live here only until that lands. No literal in this module appears anywhere but here.  #
 # --------------------------------------------------------------------------------------------- #
 
@@ -299,7 +299,7 @@ class Link:
         return None
 
     def reply(self, now: Millis, rtt: Millis | None) -> None:
-        """A reply arrived on this link. `rtt=None` when unattributable (LINKS.md §3.3) — pass it
+        """A reply arrived on this link. `rtt=None` when unattributable (#rtt-attribution) — pass it
         anyway: liveness still counts even when measurement does not."""
         for p in self.policies:
             p.on_reply(now, rtt)
@@ -401,7 +401,7 @@ class Peer:
 
         A removed address stops being selectable at once. An attempt already in flight on it is
         not cancelled — it cannot be, the bytes have gone — so a late reply for a departed link is
-        simply unattributable, a case the caller already handles (LINKS.md §3.3)."""
+        simply unattributable, a case the caller already handles (#rtt-attribution)."""
         by_address = {e.address: e for e in wanted_eps}
         wanted = set(by_address)
         added = tuple(sorted((a for a in wanted if a not in self.links), key=lambda a: a.sort_key))

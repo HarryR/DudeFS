@@ -79,7 +79,7 @@ OWED = {
         "RULING PENDING: wire the exclusion rule into batch selection, or strike it. Sound either "
         "way -- settlement re-evaluates every guard, which is the backstop `falsifies` names -- so "
         "the cost today is a wasted slot and a GUARD refusal where an exclusion was meant, never "
-        "wrong state. Do not leave this entry here indefinitely (HANDOFF.md §4)."
+        "wrong state. Do not leave this entry here indefinitely."
     ),
 }
 """Checks with no consumer YET, each with the reason and who will consume it.
