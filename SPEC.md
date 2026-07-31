@@ -658,7 +658,7 @@ obliges**, which is the defect this table exists to make visible rather than pla
 | a statement outside the window is discarded | `attest.fresh` |
 | the attestation counter is committed before signing | `Store.attestation` |
 | conviction is self-contradiction only | `attest.contradiction` |
-| a relayed verdict is recomputed | `Store.judge` |
+| a relayed verdict is recomputed | `Witness.judge` |
 | shunning does not alter quorum arithmetic | `Node.shunned` |
 | every inbound frame is checked against the screen tag | `Postman.deliver` |
 | received state is verified against a signed root, row by row | `Store.adopt_state` via `smt.verify` |

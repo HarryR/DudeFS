@@ -460,7 +460,7 @@ class TestFreshnessIsThePrecondition(unittest.TestCase):
         size that matters it decides the answer: with one peer, self plus peer reaches two."""
         now = self._collected()
         alone = Node(crypto.Keypair.generate(), self.c.provisioned())
-        alone.store.witness(self.c.nodes[0].attestation(now))
+        alone.witness.heard(self.c.nodes[0].attestation(now))
 
         self.assertEqual(len(alone.gathered(now)), 2)
         self.assertEqual(len(alone.gathered(now, me=False)), 1, "it counted itself as a responder")

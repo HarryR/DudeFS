@@ -16,6 +16,7 @@ from ..node import (
     Node,
 )
 from ..store import Commitment, Entry, Store, attest, ops, smt
+from ..store.witness import Witness
 from ..tunables import DEFAULT
 from .cluster import DELTA, T0, Cluster, D, gaps_in_the_retained_log
 
@@ -281,7 +282,7 @@ class TestClusterCollection(unittest.TestCase):
 
         joiner = Node(crypto.Keypair.generate(), self.c.provisioned())
         joiner.connect(source.me.public, InProc(name_of(joiner.me.public), self.c.board))
-        joiner.store.witness(source.attestation(now))  # carries the ratified marker
+        joiner.witness.heard(source.attestation(now))  # carries the ratified marker
 
         self.assertGreater(joiner.store.retained_from(), joiner.store.head() + 1)
         self.assertTrue(joiner.behind_the_horizon(), "it thinks it can still catch up")
@@ -315,7 +316,7 @@ class TestClusterCollection(unittest.TestCase):
         joiner = self.c.provisioned()
         self.assertEqual(joiner.floor(), 0, "a floor out of nowhere")
 
-        joiner.witness(source.attestation(now))  # the ordinary gossip path, nothing bespoke
+        Witness(joiner).heard(source.attestation(now))  # the ordinary gossip path
 
         self.assertEqual(joiner.floor(), ck.height, "the ratified floor was not adopted")
         self.assertGreater(joiner.floor(), joiner.head(), "floor above head must be expressible")
@@ -333,7 +334,7 @@ class TestClusterCollection(unittest.TestCase):
         # And by the route it would really arrive: inside a signed attestation. The attestation's
         # own signature is good -- it is the FLOOR it carries that nobody ratified.
         told = attest.Attestation(1, 2, crypto.ACC_IDENTITY, crypto.ACC_IDENTITY, ratified=forged)
-        joiner.witness(attest.SignedAttestation.make(liar, told))
+        Witness(joiner).heard(attest.SignedAttestation.make(liar, told))
         self.assertEqual(joiner.floor(), 0, "a forged floor rode in on a valid signature")
 
     def test_a_floor_one_node_signed_is_not_adopted(self):

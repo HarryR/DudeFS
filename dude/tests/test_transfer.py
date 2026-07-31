@@ -87,7 +87,7 @@ class TestCatchUp(unittest.TestCase):
         for frame in self.c.board.drain(name_of(asleep.me.public)):
             asleep.receive(frame, now)
 
-        ahead = [s for s in asleep.store.sightings() if s.claim.head > asleep.store.head()]
+        ahead = [s for s in asleep.witness.sightings() if s.claim.head > asleep.store.head()]
         self.assertNotEqual(ahead, [], "the gossip did not reveal the gap")
 
     def test_a_pull_is_bounded(self):
@@ -250,7 +250,7 @@ class TestTransferIsNotTrusted(unittest.TestCase):
             at=real.at,
             root=real.root,
         )
-        self.victim.store.witness(attest.SignedAttestation.make(peer.me, lie))
+        self.victim.witness.heard(attest.SignedAttestation.make(peer.me, lie))
 
         run = []
         for e in peer.store.entries(before + 1):

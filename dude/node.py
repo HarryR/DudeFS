@@ -43,6 +43,7 @@ from .net.postman import Postman
 from .net.transports import address_of
 from .store import Commitment, Entry, Store, StoreError, attest, ops, settle, smt
 from .store.management import Management
+from .store.witness import Witness
 from .tunables import DEFAULT, Tunables
 
 type Millis = int
@@ -138,6 +139,14 @@ class Node:
     def mgmt(self) -> Management:
         return Management(self.store)
 
+    @property
+    def witness(self) -> Witness:
+        """What peers have said about themselves, and what that has proved.
+
+        Constructed per use like `mgmt`, and for the same reason: it holds nothing of its own, so
+        there is no cached view to go stale."""
+        return Witness(self.store)
+
     def connect(self, peer: crypto.PublicKey, transport: Transport) -> None:
         """Add a peer reachable in-process. A real deployment reads endpoints from the management
         store instead; this is the same `Peer` either way."""
@@ -146,7 +155,10 @@ class Node:
         self.postman.peers[peer] = p
 
     def roster(self) -> tuple[crypto.PublicKey, ...]:
-        return self.mgmt.node_set()
+        """THE STORE'S ANSWER, not a second one. This used to be `self.mgmt.node_set()` — the same
+        expression `Store.roster` already evaluates, so two implementations of "who is the roster"
+        sat on either side of the boundary because neither layer was sure it was allowed to ask."""
+        return self.store.roster()
 
     # -- inbound ------------------------------------------------------------------------------- #
 
@@ -429,8 +441,10 @@ class Node:
     def _on_frontier(self, env: SignedEnvelope, now: Millis) -> None:
         """Answer "where are you now" with everything needed to judge us and the cluster at once:
         our own signed position, and the latest we have heard of everyone else."""
-        held = self.store.convictions()
-        reply = attest.Frontier(self.attestation(now), self.store.sightings(), tuple(held.values()))
+        held = self.witness.convictions()
+        reply = attest.Frontier(
+            self.attestation(now), self.witness.sightings(), tuple(held.values())
+        )
         self._reply(env, Verb.STANDING, reply.encode(), now)
 
     def _on_standing(self, env: SignedEnvelope, _now: Millis) -> None:
@@ -445,10 +459,10 @@ class Node:
         for one in (said.own, *said.sightings):
             if one.by == self.me.public:
                 continue  # our own statements come from our own store, never from a relay
-            self.store.witness(one)
+            self.witness.heard(one)
         for claimed in said.convictions:
             if claimed.culprit != self.me.public:
-                self.store.judge(claimed)
+                self.witness.judge(claimed)
 
     def shunned(self) -> frozenset[crypto.PublicKey]:
         """Keys proven to have contradicted themselves.
@@ -457,7 +471,7 @@ class Node:
         arithmetic, so a heavily-shunned cluster stalls rather than proceeding on a thinned
         quorum. Ejection is a manager action on the evidence; there is no rehabilitation here,
         because recovery is re-join as a new identity."""
-        return frozenset(self.store.convictions())
+        return frozenset(self.witness.convictions())
 
     def gathered(self, now: Millis, me: bool = True) -> list[attest.SignedAttestation]:
         """Every statement this node can vouch for by holding: its own, plus every peer's, each
@@ -468,7 +482,7 @@ class Node:
         that matters — a bootstrapping node with one peer would reach `f+1` on its own statement
         plus that one peer, so a single responder would decide."""
         mine = [self.attestation(now)] if me else []
-        return [*mine, *self.store.sightings()]
+        return [*mine, *self.witness.sightings()]
 
     def floor(self, need: int, now: Millis, include_self: bool = True) -> int | None:
         """The height this node would rely on: the max over `need` distinct FRESH peers and itself,
@@ -493,7 +507,7 @@ class Node:
         fresh by construction and would report zero forever. The question worth answering is about
         the view of the cluster, not about itself."""
         return attest.staleness(
-            self.store.sightings(), now, self.tunables.attest.fresh_within, self.shunned()
+            self.witness.sightings(), now, self.tunables.attest.fresh_within, self.shunned()
         )
 
     # -- log transfer (#collect-whole-segment) -------------------------------------------------- #
@@ -507,7 +521,7 @@ class Node:
         mine = self.store.head()
         if self.behind_the_horizon():
             return  # a PULL cannot be served; see `behind_the_horizon`
-        ahead = [s for s in self.store.sightings() if s.claim.head > mine]
+        ahead = [s for s in self.witness.sightings() if s.claim.head > mine]
         if not ahead:
             return
         best = max(ahead, key=lambda s: s.claim.head)
@@ -593,7 +607,7 @@ class Node:
             return  # nothing owed, or a run that would not land where it says it does
         # Checked against what the sender SIGNED, and rolled back if it disagrees. `replay` verifies
         # signatures, which says an entry was authored and never that the quorum settled it.
-        said = self.store.sighting(env.frm)
+        said = self.witness.sighting(env.frm)
         expect = (
             Commitment(said.claim.head, said.claim.acc_state, said.claim.acc_log, said.claim.root)
             if said is not None
@@ -803,7 +817,7 @@ class Node:
             # frontier that decides this is the one f+1 fresh peers vouch for, which is the same
             # reason freshness is the precondition for everything else here.
             return False
-        peer = next((s.by for s in self.store.sightings() if s.by in self.roster()), None)
+        peer = next((s.by for s in self.witness.sightings() if s.by in self.roster()), None)
         if peer is None:
             return False
         top = bytes(crypto.DIGEST_SIZE)

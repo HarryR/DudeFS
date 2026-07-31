@@ -42,7 +42,7 @@ class TestTheAngelDuty(unittest.TestCase):
         self.c.pump(now)
 
         for i, node in enumerate(self.c.nodes):
-            heard = {s.by for s in node.store.sightings()}
+            heard = {s.by for s in node.witness.sightings()}
             peers = {n.me.public for n in self.c.nodes} - {node.me.public}
             self.assertEqual(heard, peers, f"node {i} is keeping nothing about its peers")
 
@@ -65,7 +65,7 @@ class TestTheAngelDuty(unittest.TestCase):
         signed = attest.SignedAttestation.make(victim.me, rolled_back)
 
         watcher = self.c.nodes[1]
-        found = watcher.store.witness(signed)
+        found = watcher.witness.heard(signed)
         assert found is not None, "the peer did not notice a regression it had the evidence for"
         self.assertEqual(found.fault, attest.Fault.REGRESSION)
         self.assertEqual(found.culprit, victim.me.public)
@@ -82,7 +82,7 @@ class TestTheAngelDuty(unittest.TestCase):
         for node in self.c.nodes:
             node.probe(now)
         self.c.pump(now)
-        self.assertIsNotNone(b.store.sighting(a.me.public), "B never heard A directly")
+        self.assertIsNotNone(b.witness.sighting(a.me.public), "B never heard A directly")
 
         forged = attest.SignedAttestation.make(
             a.me,
@@ -93,7 +93,7 @@ class TestTheAngelDuty(unittest.TestCase):
                 crypto.acc_element(b"x"),
             ),
         )
-        b.store.witness(forged)
+        b.witness.heard(forged)
         # C asks, B answers. Evidence is PULLED like every other body in this system, so it
         # travels on the next probe round rather than being pushed at anyone.
         for node in self.c.nodes:
@@ -137,9 +137,9 @@ class TestTheAngelDuty(unittest.TestCase):
         counter skips and nothing is provable — a gap is free where reuse is fatal."""
         now = self._write(2)
         node, watcher = self.c.nodes[0], self.c.nodes[1]
-        watcher.store.witness(node.attestation(now))
+        watcher.witness.heard(node.attestation(now))
         node.store.attestation(now)  # built, never signed: the process died here
-        self.assertIsNone(watcher.store.witness(node.attestation(now)))
+        self.assertIsNone(watcher.witness.heard(node.attestation(now)))
         self.assertEqual(watcher.shunned(), frozenset())
 
     def test_a_single_node_can_be_held_to_its_own_root(self):
@@ -245,7 +245,7 @@ class TestTheAngelDuty(unittest.TestCase):
         self.c.pump(now)
         self.assertIsNotNone(node.floor(need=3, now=now))
 
-        node.store.witness(
+        node.witness.heard(
             attest.SignedAttestation.make(
                 victim.me,
                 attest.Attestation(999, 0, crypto.acc_element(b"x"), crypto.acc_element(b"x")),
@@ -260,7 +260,7 @@ class TestTheAngelDuty(unittest.TestCase):
         self._write(2)
         node, victim = self.c.nodes[0], self.c.nodes[1]
         before = node.roster()
-        node.store.witness(
+        node.witness.heard(
             attest.SignedAttestation.make(
                 victim.me,
                 attest.Attestation(999, 0, crypto.acc_element(b"x"), crypto.acc_element(b"x")),
