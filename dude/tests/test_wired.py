@@ -63,11 +63,6 @@ WIRED = {
     "unvouched_roster": "a roster row that does not trace to the anchor",
     "roster_incomplete": "a roster that is a subset, unstated, or older than one already seen",
     "vouched": "a credential that does not vouch for the value a row currently holds",
-    "smt.verify": "a state row that does not fold to the root the quorum signed",
-    "_folds_to": "a subtree hash the signed root does not commit to",
-    "corroborated": "acting on a checkpoint fewer than f+1 fresh responders vouch for",
-    "adopted_at": "calling a walk finished when it does not hold what was committed",
-    "corroboration": "open-coding f+1 outside the module that owns quorum arithmetic",
 }
 """Checks that must have a live consumer in production code.
 
@@ -131,13 +126,12 @@ def _production_calls() -> set[str]:
 
 DRIVEN = {
     # the duty                what performs it, each round
-    "mempool.admit": "screens what a client offers (also called from Coordinator on reject re-entry)",
-    "coordinator.tick": "advances the consensus round: swap mempool on bucket boundary, drive open Rounds, settle those that ratified",
+    "mempool.admit": "screens what a client offers (also from Coordinator on reject re-entry)",
+    "coordinator.tick": "swap mempool on bucket boundary, drive open Rounds, settle any ratified",
     "coordinator.submit": "hands a client's tx to the currently-live mempool",
     "coordinator.on_round_msg": "routes HELD/SIG envelopes to the right Round by bucket",
     "probe": "asks peers where they are, so a rollback is seen",
     "catch_up": "asks the longest peer for what we are missing",
-    "bootstrap": "takes state against a signed root when the log can no longer reach us",
     "postman.tick": "sends what is due and reaps what expired",
     "store.apply": "settles the agreed block",
 }

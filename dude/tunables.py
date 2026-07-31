@@ -130,13 +130,6 @@ class NetTunables:
     deliverability, and clamps every wait to it, so `plan.max_attempts` is a backstop and not the
     binding constraint."""
 
-    walk_depth: int = 12
-    """How deep a state walk descends before asking for rows instead of hashes.
-
-    A SIZE choice, not a timing one: deeper means more round trips and smaller replies, shallower
-    means fewer and larger. At depth 12 a subtree is one in 4096 of the keyspace, so a reply is a
-    few hundred rows at 10^6 keys. The joiner picks it, not the server — see `Verb.ROWS`."""
-
     pull_max: int = 256
     """Entries per `ENTRIES` reply — a bound on message size, never on how far behind a joiner is.
 

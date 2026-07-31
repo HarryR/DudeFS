@@ -37,7 +37,7 @@ from .net.link import Peer, Transport
 from .net.postman import Postman
 from .net.round_adapter import RoundAdapter
 from .net.transports import address_of
-from .store import Commitment, Entry, Store, StoreError, attest, ops, smt
+from .store import Commitment, Entry, Store, StoreError, attest, ops
 from .store.management import Management
 from .store.witness import Witness
 from .tunables import DEFAULT, Tunables
@@ -64,10 +64,6 @@ HANDLED = frozenset(
         Verb.STANDING,
         Verb.PULL,
         Verb.ENTRIES,
-        Verb.SUBTREE,
-        Verb.HASHES,
-        Verb.LEAVES,
-        Verb.ROWS,
     }
 )
 """Verbs this node acts on.
@@ -76,7 +72,7 @@ HANDLED = frozenset(
 delegating to `Coordinator.on_round_msg`. `PROPOSE` and `ENDORSE` were the placeholder round's
 verbs; deleted as part of the Round pivot (Phase 6)."""
 
-SOLICITED = frozenset({Verb.ENTRIES, Verb.HASHES, Verb.ROWS})
+SOLICITED = frozenset({Verb.ENTRIES})
 """Verbs that are only ever an ANSWER to something this node asked for.
 
 An unsolicited one is dropped before dispatch. Without that, anyone at all could hand a node a run
@@ -110,14 +106,6 @@ class Node:
     """When this node last asked its peers where they were (#cross-attestation)."""
     last_housekept: int = -1
     """The last bucket in which this node did compaction housekeeping. See `housekeep`."""
-    walking: dict[tuple[bytes, int], crypto.Digest] | None = None
-    """Prefixes still outstanding in a state walk, each with THE HASH WE EXPECT for it.
-
-    Keyed by the question rather than stacked, because replies are asynchronous: a stack pairs an
-    answer with whatever was asked last, which is wrong as soon as two are in flight. The expected
-    hash is what makes an answer checkable — it is seeded from the checkpoint's signed root and
-    every verified reply yields its children's, so the whole descent folds to something the quorum
-    signed. `None` when not bootstrapping."""
     shares: dict[bytes, dict[crypto.PublicKey, crypto.Signature]] = field(default_factory=dict)
     """Shares keyed by CLAIM BYTES, not by segment: two nodes disagreeing about the fold produce
     two different claims, and neither may borrow the other's signatures."""
@@ -605,212 +593,6 @@ class Node:
         # step's missing decision, not something this handler can answer.
         self.store.replay(run, expect)
 
-    # -- state transfer (#bootstrap-anchor step 9) ---------------------------------------------- #
-
-    def _on_subtree(self, env: SignedEnvelope, now: Millis) -> None:
-        """Answer with the two child hashes under a prefix. The comparison step of the walk."""
-        f = codec.as_seq(codec.decode(env.env.body), 2)
-        prefix, depth = codec.as_bytes(f[0]), codec.as_int(f[1])
-        left, right = self.store.subtree(prefix, depth)
-        # Echoed, so the answer names its own question: a reply that does not say what it answers
-        # can only be paired by arrival order, which is not an order.
-        self._reply(env, Verb.HASHES, codec.encode([prefix, depth, left, right]), now)
-
-    def _on_leaves(self, env: SignedEnvelope, now: Millis) -> None:
-        """Answer with the rows under a prefix, EACH WITH ITS PROOF.
-
-        The proof is what lets the asker check a row the moment it arrives, against a root a quorum
-        signed, rather than trusting a transfer until some later reconciliation. Serving a row
-        without one would make the reply unverifiable in isolation, which is the property the whole
-        walk is built on."""
-        f = codec.as_seq(codec.decode(env.env.body), 2)
-        prefix, depth = codec.as_bytes(f[0]), codec.as_int(f[1])
-        rows = [
-            [store, name, value, cred, self.store.prove(store, name).encode()]
-            for store, name, value, cred in self.store.rows_under(prefix, depth)
-        ]
-        # Echoed, for the same reason `HASHES` echoes: an answer that does not say what it answers
-        # can only be paired by arrival order, and replies are asynchronous.
-        self._reply(env, Verb.ROWS, codec.encode([prefix, depth, rows]), now)
-
-    def _on_hashes(self, env: SignedEnvelope, now: Millis) -> None:
-        """A peer's child hashes, CHECKED AGAINST THE SIGNED ROOT before they are acted on.
-
-        The answer echoes its own question, so it pairs with what we asked rather than with whatever
-        was asked most recently — replies are asynchronous and a stack got that wrong.
-
-        AND IT IS VERIFIABLE, which the first version of this was not. A node's hash is
-        `branch_hash(depth, lo, left, right)`, so knowing what we expect for a prefix lets us
-        RECOMPUTE it from the answer. We expect the checkpoint's root at the top, and each verified
-        reply gives us its children's expected hashes, so the descent folds to something a quorum
-        signed at every step. Without that a peer could echo our own hashes back, we would descend
-        nowhere, and the walk would finish holding nothing — the failure being indistinguishable
-        from success.
-
-        The compression case is part of the rule, not an exception to it: a subtree holding one leaf
-        hashes AS that leaf however deep it sits, so exactly one empty child means the parent equals
-        the other child rather than the branch of the two.
-
-        THE DEPTH IS OURS TO CHOOSE, which is why there are two verbs: the server never decides how
-        much we take at once."""
-        if (walk := self.walking) is None:
-            return  # we are not bootstrapping; an unsolicited answer decides nothing
-        f = codec.as_seq(codec.decode(env.env.body), 4)
-        prefix, depth = codec.as_bytes(f[0]), codec.as_int(f[1])
-        left = crypto.Digest(codec.as_bytes(f[2]))
-        right = crypto.Digest(codec.as_bytes(f[3]))
-        expect = walk.get((prefix, depth))
-        if expect is None or not _folds_to(expect, prefix, depth, left, right):
-            return  # not something we asked, or not what the root commits to
-        # Removed only once the answer is ACCEPTED. Popping first let a bad answer delete the
-        # question, which is the steering attack by a quieter route: we would never ask it again.
-        del walk[(prefix, depth)]
-        for bit, remote in enumerate((left, right)):
-            child = smt.with_bit(prefix, depth, bit)
-            if self.store.tree.hash_under(child, depth + 1) == remote:
-                continue  # this whole subtree already agrees: never transferred
-            if remote == smt.EMPTY:
-                continue  # they hold nothing here; deletion is the log's business, not the walk's
-            # TRACKED EITHER WAY. A `LEAVES` question used to be asked and not recorded, so the
-            # queue could empty while rows were still in flight — the walk declared itself finished,
-            # failed to corroborate, and threw away the transfer that was about to complete it.
-            # Outstanding means outstanding, whichever verb is carrying it.
-            walk[(child, depth + 1)] = remote
-            verb = Verb.LEAVES if depth + 1 >= self.tunables.net.walk_depth else Verb.SUBTREE
-            self._ask(env.frm, verb, child, depth + 1, now)
-        if (ck := self.store.checkpoint()) is not None:
-            self._walk_done(ck)
-
-    def _on_rows(self, env: SignedEnvelope, _now: Millis) -> None:
-        """Rows with proofs. Verified against the ratified root, or dropped.
-
-        A CHUNK IS REFUSED WHERE IT ARRIVES. `Store.adopt_state` folds each row's own siblings to
-        the root, so a bad chunk costs one reply rather than poisoning a transfer checked only at
-        the end — which is what lets the walk be optimistic at all."""
-        ck = self.store.checkpoint()
-        if (walk := self.walking) is None or ck is None:
-            return
-        f = codec.as_seq(codec.decode(env.env.body), 3)
-        prefix, depth = codec.as_bytes(f[0]), codec.as_int(f[1])
-        if (prefix, depth) not in walk:
-            return  # not something we asked for
-        # Retired whether or not the rows survive verification: the question HAS been answered, and
-        # leaving it outstanding would strand the walk on a peer that answered badly once.
-        del walk[(prefix, depth)]
-        rows: list[tuple[int, bytes, bytes, bytes, smt.Proof]] = []
-        for row in codec.as_seq(f[2]):
-            r = codec.as_seq(row, 5)
-            rows.append(
-                (
-                    codec.as_int(r[0]),
-                    codec.as_bytes(r[1]),
-                    codec.as_bytes(r[2]),
-                    codec.as_bytes(r[3]),  # the credential; the leaf commits to it
-                    smt.Proof.decode(codec.as_bytes(r[4])),
-                )
-            )
-        self.store.adopt_state(rows, ck.root)
-        self._walk_done(ck)
-
-    def _walk_done(self, ck: ops.Compaction) -> None:
-        """Finish the walk if nothing is outstanding — but only if the state agrees with `ck`.
-
-        THE QUEUE EMPTYING IS NOT SUCCESS. A walk that lost replies, or was steered into asking for
-        nothing, empties its queue exactly like one that worked. The checkpoint's fold is O(1) and
-        already signed, so corroborating against it is what makes the difference observable.
-
-        A walk that does not corroborate STARTS AGAIN rather than failing: sync is a convergence
-        loop, and the honest response to "I do not hold what was committed" is to go and get the
-        rest. It starts again BY ENDING, so `bootstrap` opens the next one from the round — this
-        used to reseed `walking` with the top of the tree and never ask the question, which left a
-        permanently outstanding entry that nothing would answer and no new walk could replace, since
-        `bootstrap` refuses to start one while a walk is live. The retry belongs to whatever decided
-        a walk was needed, and that decision is re-made every tick from the same condition."""
-        if self.walking is None or self.walking:
-            return
-        self.store.adopted_at(ck)
-        self.walking = None
-
-    def _ask(
-        self, peer: crypto.PublicKey, verb: Verb, prefix: bytes, depth: int, now: Millis
-    ) -> None:
-        """Post one walk question. The body is `[prefix, depth]` for both verbs."""
-        env = Envelope(peer, verb, _mid(), codec.encode([prefix, depth])).sign(self.me, now)
-        # See `catch_up`: `HASHES` and `ROWS` are both `SOLICITED`, so a walk that does not register
-        # its question discards the answer and finishes holding nothing.
-        self.postman.mailbox.post(env, now, self.tunables.net.ttl, await_reply=True)
-
-    def corroborated(self, now: Millis) -> ops.Compaction | None:
-        """The highest ratified checkpoint that `f+1` FRESH responders vouch for, or None.
-
-        THE PRECONDITION FOR EVERYTHING ELSE `[H]`: *"we were supposed to first verify f+1 nodes'
-        attestations before doing anything else."* Every other check in this system establishes
-        AUTHENTICITY — that a thing was signed by who it claims, and traces to our anchor. None of
-        them establishes CURRENCY: a malicious node can serve a perfectly authentic, perfectly stale
-        world, correctly signed throughout, and only the count of fresh independent statements
-        distinguishes that from the truth (#freshness-needs-many, #the-lemma).
-
-        MAX BY HEIGHT, NOT BY SIGNATURE COUNT, and not by majority. A floor carries the quorum's
-        signatures, so a responder can WITHHOLD a higher checkpoint and cannot forge one: the
-        highest one that verifies wins and a lagging or lying responder cannot drag it down.
-
-        The count is a THRESHOLD rather than a score. `Compaction.op_hash` covers the claim and not
-        the signature set precisely because that set "is an artefact of which shares happened to
-        arrive first, and it differs between nodes that all collected the same segment for the same
-        reason" — so eleven signatures are not more true than eight, and preferring the
-        better-signed one would systematically prefer the OLDER one, since shares accumulate with
-        time. `attested` counts to the threshold; height decides which.
-
-        `f+1` is also, as you put it, learning a subset of the roster: `f+1` identities of which at
-        least one is honest. That is why it comes before adopting anything — including before the
-        state walk, which would otherwise verify beautifully against a root nobody current vouches
-        for."""
-        n = len(self.roster())
-        if not n:
-            return None
-        floor = self.floor(quorum.corroboration(n), now, include_self=False)
-        if floor is None:
-            return None  # too few fresh answers: denied, not deceived
-        best = max(
-            (s.claim.ratified for s in self.gathered(now, me=False) if s.claim.floor == floor),
-            key=lambda ck: ck.height if ck else -1,
-            default=None,
-        )
-        return best if best is not None and self.store.adopt(best) is None else None
-
-    def bootstrap(self, now: Millis) -> bool:
-        """Start a state walk against the ratified root, for a node the log cannot reach.
-
-        `behind_the_horizon` says catching up is impossible; this is the thing to do instead. It
-        begins at the top of the tree and descends only where the hashes disagree, so a slightly
-        stale node transfers almost nothing and a wiped one transfers everything — the same code,
-        with cost degrading smoothly, which is what `[H]` "re-join as if new" asked for.
-
-        Returns whether a walk was started. Nothing here applies state: `_on_rows` does that, and
-        only against a root the quorum signed."""
-        if self.walking is not None:
-            return False
-        if (ck := self.corroborated(now)) is None:
-            return False  # nothing f+1 fresh responders vouch for: there is nothing to walk toward
-        if self.store.frontier(ck) <= self.store.head() + 1:
-            # What we are missing is still retained somewhere, so `catch_up` can reach us and a
-            # walk would move the whole state to save a PULL.
-            #
-            # AGAINST THE CORROBORATED MARKER, NOT `behind_the_horizon`. That reads our OWN
-            # checkpoint, and a node that was absent while the cluster collected has no newer
-            # checkpoint to read — its horizon is stale by exactly the amount that matters, so it
-            # would answer "I can still catch up" for ever while every PULL was refused. The
-            # frontier that decides this is the one f+1 fresh peers vouch for, which is the same
-            # reason freshness is the precondition for everything else here.
-            return False
-        peer = next((s.by for s in self.witness.sightings() if s.by in self.roster()), None)
-        if peer is None:
-            return False
-        top = bytes(crypto.DIGEST_SIZE)
-        self.walking = {(top, 0): ck.root}  # the root is what every answer must fold back to
-        self._ask(peer, Verb.SUBTREE, top, 0, now)
-        return True
-
     # -- the round ----------------------------------------------------------------------------- #
 
     def tick(self, now: Millis) -> None:
@@ -824,12 +606,6 @@ class Node:
         if now - self.last_probe >= self.tunables.attest.probe_every:
             self.probe(now)
         self.catch_up(now)
-        # AND THE ALTERNATIVE WHEN CATCHING UP CANNOT WORK. `bootstrap` decides for itself whether
-        # it is needed, so this is unconditional here: the round drives it, and a node that can
-        # still be reached by the log starts no walk. Without this line every check in the state
-        # walk was real and nothing ever performed one — the node that needed it sat asking for
-        # entries no one holds, for ever, and the failure looked exactly like a quiet network.
-        self.bootstrap(now)
         self.coordinator.tick(now)
         self.housekeep(now)
         self.postman.tick(now)
@@ -856,42 +632,6 @@ class Node:
         self.postman.mailbox.post(
             to.answer(verb, body).sign(self.me, now), now, self.tunables.net.ttl, await_reply=False
         )
-
-
-# --------------------------------------------------------------------------------------------- #
-# Slice encoding — the only wire shape this module owns.                                        #
-# --------------------------------------------------------------------------------------------- #
-
-
-def _folds_to(
-    expect: crypto.Digest, prefix: bytes, depth: int, left: crypto.Digest, right: crypto.Digest
-) -> bool:
-    """Do these two children reconstruct the hash we were expecting for this node?
-
-    The whole of what makes a `HASHES` answer trustworthy: an internal node is
-    `branch_hash(depth, lo, left, right)`, so an answer that does not rebuild what the root commits
-    to is refused rather than acted on.
-
-    Compression is part of the rule, and BOTH reconstructions must be accepted. A subtree holding
-    exactly one leaf hashes AS that leaf however deep it sits — but a subtree with one empty child
-    and SEVERAL leaves on the other side is an ordinary branch over `EMPTY` and that side. The two
-    are indistinguishable from the hashes alone: the asker cannot know how many leaves sit under a
-    digest, which is the entire point of a digest.
-
-    Taking only the compressed reading stalled every walk that met the second shape, which in a
-    sparse tree is most interior nodes. The walk did not fail — it simply kept that question
-    outstanding for ever, so the queue never emptied, the node never adopted, and it looked exactly
-    like a peer that had gone quiet.
-
-    Accepting both grants a peer nothing. Either way it must produce children that rebuild a hash
-    the root already commits to, and claiming compression to hide a subtree only withholds rows —
-    which any peer can do by not answering, and which the fold at the end of the walk catches."""
-    lo, _ = smt.bounds(prefix, depth)
-    if left == smt.EMPTY and right == smt.EMPTY:
-        return expect == smt.EMPTY
-    if expect == smt.branch_hash(depth, lo, left, right):
-        return True
-    return (left == smt.EMPTY and expect == right) or (right == smt.EMPTY and expect == left)
 
 
 def _uncontiguous(run: list[Entry], frm: int) -> str | None:

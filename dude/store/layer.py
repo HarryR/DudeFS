@@ -45,10 +45,9 @@ class Held(NamedTuple):
     a row written earlier in the same batch.
 
     NO DEFAULT, and neither has `epoch` any more `[H]`. There is no live row without a credential:
-    the two write paths are `_commit`, which records the transaction doing the write, and
-    `adopt_state`, which takes the credential from the peer and checks it against the signed root.
-    An empty one is not a state the system has — so it must not be a value this type can be given
-    by omission. A default here would make an unauthenticated leaf constructible by forgetting an
+    the one write path is `_commit`, which records the transaction doing the write. An empty one
+    is not a state the system has -- so it must not be a value this type can be given by
+    omission. A default here would make an unauthenticated leaf constructible by forgetting an
     argument, which is the shape of every bug this codebase keeps finding."""
 
 
