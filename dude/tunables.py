@@ -44,7 +44,6 @@ from .core.errors import InvariantError
 from .mempool import Tunables as MempoolTunables
 from .net.link import LinkTunables
 from .net.plan import PlanTunables
-from .store.attest import AttestTunables
 
 type Millis = int
 
@@ -147,7 +146,6 @@ class Tunables:
     link: LinkTunables = field(default_factory=LinkTunables)
     plan: PlanTunables = field(default_factory=PlanTunables)
     mempool: MempoolTunables = field(default_factory=MempoolTunables)
-    attest: AttestTunables = field(default_factory=AttestTunables)
 
     def __post_init__(self) -> None:
         """Refuse a configuration whose dials contradict their own derivation.
@@ -175,11 +173,6 @@ class Tunables:
             raise InvariantError(
                 f"plan.backoff_cap ({self.plan.backoff_cap}ms) exceeds the deadline it is spent "
                 f"against, net.ttl ({self.net.ttl}ms), so it can never bind before the deadline"
-            )
-        if self.attest.fresh_within <= self.attest.probe_every:
-            raise InvariantError(
-                f"attest.fresh_within ({self.attest.fresh_within}ms) does not exceed "
-                f"probe_every ({self.attest.probe_every}ms), so every gathered bundle is stale"
             )
 
 

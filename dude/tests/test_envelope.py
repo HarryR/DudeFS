@@ -62,7 +62,7 @@ class TestSignedFields(unittest.TestCase):
         self.a = crypto.Keypair.generate()
         self.b = crypto.Keypair.generate()
         self.c = crypto.Keypair.generate()
-        self.env = request(self.a, self.b.public, Verb.FRONTIER, T0)
+        self.env = request(self.a, self.b.public, Verb.PING, T0)
 
     def test_recipient_is_signed_so_a_frame_cannot_be_redirected(self):
         """Without `to` under the signature, a valid envelope could be lifted and re-delivered to
@@ -70,7 +70,7 @@ class TestSignedFields(unittest.TestCase):
         redirected = SignedEnvelope(
             self.env.frm,
             self.env.ts,
-            Envelope(self.c.public, Verb.FRONTIER, self.env.env.mid),
+            Envelope(self.c.public, Verb.PING, self.env.env.mid),
             self.env.sig,
         )
         self.assertFalse(redirected.verify())
@@ -81,7 +81,7 @@ class TestSignedFields(unittest.TestCase):
         swapped = SignedEnvelope(
             self.env.frm,
             self.env.ts,
-            Envelope(self.env.env.to, Verb.PULL, self.env.env.mid),
+            Envelope(self.env.env.to, Verb.SUBMIT, self.env.env.mid),
             self.env.sig,
         )
         self.assertFalse(swapped.verify())

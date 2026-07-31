@@ -86,16 +86,6 @@ class Verb(IntEnum):
     message (SPECv2 #slice-meta-agreement). A quorum of matching `SIG`s is what turns a
     candidate slice into a ratified block."""
 
-    # -- log transfer (#replication) -------------------------------------------------------- #
-    FRONTIER = 30
-    """"Where are you now?" Carries nothing: the question has no parameters."""
-    STANDING = 33
-    """The answer — own attestation, plus the latest heard of every peer (#cross-attestation).
-    A reply that DOES need a handler, unlike those in `REPLIES`: the sightings it carries are the
-    evidence channel, so dropping it on the floor would discard the whole point of asking."""
-    PULL = 31
-    ENTRIES = 32
-
     # -- diagnostics ---------------------------------------------------------------------------- #
     REFUSED = 90
     """A refusal, carrying a reason. Never silence: a client can only correct a clock fault if it is

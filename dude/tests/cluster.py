@@ -15,8 +15,6 @@ from ..store import Store, ops
 from ..store.management import Management, Role
 from ..tunables import DEFAULT
 
-WINDOW = DEFAULT.attest.fresh_within
-
 D = ops.STORE_DATA
 M = ops.STORE_MANAGEMENT
 T0 = 1_700_000_000_000

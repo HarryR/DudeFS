@@ -26,7 +26,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from .coordinator import Coordinator
-from .core import codec, crypto
+from .core import crypto
 from .core.errors import DudeError
 from .mempool import Mempool
 from .net import Verb
@@ -36,9 +36,8 @@ from .net.link import Peer, Transport
 from .net.postman import Postman
 from .net.round_adapter import RoundAdapter
 from .net.transports import address_of
-from .store import Commitment, Entry, Store, attest, ops
+from .store import Store, ops
 from .store.management import Management
-from .store.witness import Witness
 from .tunables import DEFAULT, Tunables
 
 type Millis = int
@@ -57,10 +56,6 @@ HANDLED = frozenset(
         Verb.HELD,
         Verb.SIG,
         Verb.PING,
-        Verb.FRONTIER,
-        Verb.STANDING,
-        Verb.PULL,
-        Verb.ENTRIES,
     }
 )
 """Verbs this node acts on.
@@ -69,7 +64,7 @@ HANDLED = frozenset(
 delegating to `Coordinator.on_round_msg`. `PROPOSE` and `ENDORSE` were the placeholder round's
 verbs; deleted as part of the Round pivot (Phase 6)."""
 
-SOLICITED = frozenset({Verb.ENTRIES})
+SOLICITED: frozenset[Verb] = frozenset()
 """Verbs that are only ever an ANSWER to something this node asked for.
 
 An unsolicited one is dropped before dispatch. Without that, anyone at all could hand a node a run
@@ -97,9 +92,6 @@ class Node:
     `coordinator.submit`, hand HELD/SIG envelopes to `coordinator.on_round_msg`, and call
     `coordinator.tick(now)` from `tick`."""
 
-    last_probe: Millis = 0
-    """When this node last asked its peers where they were (#cross-attestation)."""
-
     def __post_init__(self) -> None:
         self.postman = Postman(self.me, window=self.tunables.net.window)
         self.adapter = RoundAdapter(self.me, self.postman, self.tunables.net.ttl)
@@ -117,14 +109,6 @@ class Node:
     @property
     def mgmt(self) -> Management:
         return Management(self.store)
-
-    @property
-    def witness(self) -> Witness:
-        """What peers have said about themselves, and what that has proved.
-
-        Constructed per use like `mgmt`, and for the same reason: it holds nothing of its own, so
-        there is no cached view to go stale."""
-        return Witness(self.store)
 
     def connect(self, peer: crypto.PublicKey, transport: Transport) -> None:
         """Add a peer reachable in-process. A real deployment reads endpoints from the management
@@ -207,171 +191,14 @@ class Node:
         HELD -- routed to the Round for its bucket via the Coordinator."""
         self.coordinator.on_round_msg(env, now)
 
-    # -- attestation (#monotonicity, #cross-attestation) ---------------------------------------- #
-
-    def attestation(self, now: Millis) -> attest.SignedAttestation:
-        """Sign one committed snapshot of this node's own store.
-
-        Signed here and unsigned in `Store.attestation`, which is the whole division: the store
-        holds the durable state and no key, the node holds the key and no state.
-
-        The store bumps and commits the counter; this only signs what it returns. That ordering is
-        the whole safety of it — see `Store.attestation`."""
-        return attest.SignedAttestation.make(self.me, self.store.attestation(now))
-
-    def probe(self, now: Millis) -> None:
-        """Ask every peer where it is. Cheap, and the only thing that makes a rollback VISIBLE
-        rather than merely provable-in-principle."""
-        self.last_probe = now
-        self._flood(Verb.FRONTIER, b"", now)
-
-    def _on_frontier(self, env: SignedEnvelope, now: Millis) -> None:
-        """Answer "where are you now" with everything needed to judge us and the cluster at once:
-        our own signed position, and the latest we have heard of everyone else."""
-        held = self.witness.convictions()
-        reply = attest.Frontier(
-            self.attestation(now), self.witness.sightings(), tuple(held.values())
-        )
-        self._reply(env, Verb.STANDING, reply.encode(), now)
-
-    def _on_standing(self, env: SignedEnvelope, _now: Millis) -> None:
-        """Take a peer's position and everything it has heard.
-
-        The relayed sightings are witnessed too, which is what makes evidence TRANSITIVE: a node
-        that never spoke to the culprit directly can still hold the pair that convicts it."""
-        try:
-            said = attest.Frontier.decode(env.env.body)
-        except DudeError:
-            return  # malformed bytes from a peer are routine, not exceptional
-        for one in (said.own, *said.sightings):
-            if one.by == self.me.public:
-                continue  # our own statements come from our own store, never from a relay
-            self.witness.heard(one)
-        for claimed in said.convictions:
-            if claimed.culprit != self.me.public:
-                self.witness.judge(claimed)
-
-    def shunned(self) -> frozenset[crypto.PublicKey]:
-        """Keys proven to have contradicted themselves.
-
-        A LOCAL READ POLICY (#cross-attestation): it does not touch the roster or the quorum
-        arithmetic, so a heavily-shunned cluster stalls rather than proceeding on a thinned
-        quorum. Ejection is a manager action on the evidence; there is no rehabilitation here,
-        because recovery is re-join as a new identity."""
-        return frozenset(self.witness.convictions())
-
-    def gathered(self, now: Millis, me: bool = True) -> list[attest.SignedAttestation]:
-        """Every statement this node can vouch for by holding: its own, plus every peer's, each
-        still carrying the signature of whoever made it (#freshness-is-gathered).
-
-        `me=False` DROPS OUR OWN, and the currency question needs that: asking "is my view current"
-        and counting our own attestation toward the answer is asking ourselves. Worse at the size
-        that matters — a bootstrapping node with one peer would reach `f+1` on its own statement
-        plus that one peer, so a single responder would decide."""
-        mine = [self.attestation(now)] if me else []
-        return [*mine, *self.witness.sightings()]
-
-    def head_vouched_by(self, need: int, now: Millis, include_self: bool = True) -> int | None:
-        """The highest head at least `need` distinct FRESH responders vouch for, ignoring
-        anyone convicted. Renamed from `floor` when compaction went (rip 2/3): without a
-        ratified checkpoint there is no "floor" concept, just a signed head each peer stakes
-        its identity on."""
-        return attest.attested_head(
-            self.gathered(now, me=include_self),
-            need,
-            now,
-            self.tunables.attest.fresh_within,
-            shunned=self.shunned(),
-        )
-
-    def staleness(self, now: Millis) -> Millis | None:
-        """How long since this node last heard from ANYONE — `None` if nobody is inside the window.
-
-        Peers only: a node's own statement is stamped with the clock it is asking about, so it is
-        fresh by construction and would report zero forever. The question worth answering is about
-        the view of the cluster, not about itself."""
-        return attest.staleness(
-            self.witness.sightings(), now, self.tunables.attest.fresh_within, self.shunned()
-        )
-
-    # -- log transfer ---------------------------------------------------------------------------- #
-
-    def catch_up(self, now: Millis) -> None:
-        """Ask the peer that claims the longest log for what we are missing.
-
-        Driven by what the gossip already told us: a sighting carries that peer's head, so being
-        behind is something a node NOTICES rather than something it has to be told. One peer, not
-        all of them -- the reply is bulk, and asking everyone would multiply it by the roster.
-
-        NO-COMPACTION SHAPE. In this world the log is retained forever, so the join / lag case is
-        always resolvable by pulling from `head + 1`. The `behind_the_horizon` refusal that used
-        to gate this went with compaction (rip 2/3). L6 will reshape this into "next SETTLED
-        block after X" once settlement lands (SPECv2 #sync-is-log-replay)."""
-        mine = self.store.head()
-        ahead = [s for s in self.witness.sightings() if s.claim.head > mine]
-        if not ahead:
-            return
-        best = max(ahead, key=lambda s: s.claim.head)
-        env = Envelope(best.by, Verb.PULL, _mid(), codec.encode([mine + 1])).sign(self.me, now)
-        # AWAITING A REPLY, and that is not bookkeeping: `ENTRIES` is in `SOLICITED`, so an answer
-        # this node did not register as expected is dropped at the door.
-        self.postman.mailbox.post(env, now, self.tunables.net.ttl, await_reply=True)
-
-    def _on_pull(self, env: SignedEnvelope, now: Millis) -> None:
-        """Serve a run of settled entries from `frm`.
-
-        BOUNDED, because a joiner asking from 1 would otherwise pull the whole log into one
-        message. The requester asks again from where it got to, so the bound costs round trips
-        and never correctness."""
-        frm = codec.as_int(codec.as_seq(codec.decode(env.env.body), 1)[0])
-        run = []
-        for e in self.store.entries(max(frm, 1)):
-            if len(run) >= self.tunables.net.pull_max:
-                break
-            run.append([e.idx, e.item.raw])
-        self._reply(env, Verb.ENTRIES, codec.encode(run), now)
-
-    def _on_entries(self, env: SignedEnvelope, _now: Millis) -> None:
-        """Replay what we were sent, at the indices it was settled at.
-
-        Only what is strictly ahead of our head: `replay` preserves positions, so re-applying an
-        entry we already hold would collide rather than be idempotent. Signatures are verified
-        inside `replay` -- a bulk transfer is exactly where trusting the sender would be cheapest
-        and worst.
-
-        THE SHAPE IS CHECKED, NOT ONLY THE CONTENT. `_uncontiguous` is one predicate for three
-        failures: a gap, a repeat and a reordering are each "this index is not the one owed"."""
-        if env.frm not in self.roster():
-            return  # bulk state from outside the roster is not a thing that happens
-        want = self.store.head() + 1
-        run: list[Entry] = []
-        for row in codec.as_seq(codec.decode(env.env.body)):
-            f = codec.as_seq(row, 2)
-            idx, raw = codec.as_int(f[0]), codec.as_bytes(f[1])
-            if idx < want:
-                continue
-            run.append(Entry(idx, ops.SignedTransaction.decode(raw)))
-        if not run or _uncontiguous(run, want) is not None:
-            return  # nothing owed, or a run that would not land where it says it does
-        said = self.witness.sighting(env.frm)
-        expect = (
-            Commitment(said.claim.head, said.claim.acc_state, said.claim.acc_log, said.claim.root)
-            if said is not None
-            else None
-        )
-        self.store.replay(run, expect)
-
     # -- the round ----------------------------------------------------------------------------- #
 
     def tick(self, now: Millis) -> None:
-        """Advance: gossip, catch up, drive the consensus round, drive the wire.
+        """Advance the consensus round and the wire.
 
         Round advancement lives in `Coordinator.tick` -- it drives the current Mempool's
         eviction (via bucket-swap), opens Rounds at boundaries, ticks them, flushes their
         outboxes, and settles any that ratified."""
-        if now - self.last_probe >= self.tunables.attest.probe_every:
-            self.probe(now)
-        self.catch_up(now)
         self.coordinator.tick(now)
         self.postman.tick(now)
 
@@ -397,24 +224,6 @@ class Node:
         self.postman.mailbox.post(
             to.answer(verb, body).sign(self.me, now), now, self.tunables.net.ttl, await_reply=False
         )
-
-
-def _uncontiguous(run: list[Entry], frm: int) -> str | None:
-    """`None` if `run` is exactly the indices `frm, frm+1, …`, else which index broke it.
-
-    ONE predicate for three failures, because they are the same failure: an entry at the wrong
-    position. A gap loses entries nothing authorised forgetting — only a quorum-ratified checkpoint
-    can license an absence, and a `PULL` reply is not one. A repeat is two entries claiming one
-    position. A reordering is both at once.
-
-    Returned rather than raised: a peer sending a malformed run is THEIR fault and routine
-    (core/errors.py)."""
-    want = frm
-    for e in run:
-        if e.idx != want:
-            return f"run is not contiguous from {frm}: expected {want}, got {e.idx}"
-        want += 1
-    return None
 
 
 def _mid() -> MessageId:

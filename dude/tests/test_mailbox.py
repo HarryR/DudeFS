@@ -328,13 +328,13 @@ class TestOnlyThePeerWeAskedMayAnswer(unittest.TestCase):
         self.box = Mailbox()
 
     def _question(self):
-        env = request(self.me, self.asked.public, Verb.PULL, T0)
+        env = request(self.me, self.asked.public, Verb.PING, T0)
         self.box.post(env, T0, ttl=10_000, await_reply=True)
         return env
 
     def test_the_peer_we_asked_is_answered(self):
         env = self._question()
-        reply = env.answer(Verb.ENTRIES).sign(self.asked, T0 + 5)
+        reply = env.answer(Verb.PONG).sign(self.asked, T0 + 5)
 
         self.assertIsNotNone(self.box.arrived(reply, T0 + 5), "the peer we asked was not credited")
 
@@ -342,7 +342,7 @@ class TestOnlyThePeerWeAskedMayAnswer(unittest.TestCase):
         """The stranger's envelope is perfectly valid — signed, addressed to us, in window, echoing
         a live id. Only the destination we recorded says it is not an answer to our question."""
         env = self._question()
-        theirs = env.answer(Verb.ENTRIES).sign(self.other, T0 + 5)
+        theirs = env.answer(Verb.PONG).sign(self.other, T0 + 5)
 
         self.assertIsNone(
             self.box.arrived(theirs, T0 + 5), "a stranger's answer was taken as solicited"

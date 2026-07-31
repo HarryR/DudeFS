@@ -31,7 +31,7 @@ from typing import NamedTuple
 
 from ..core import codec, crypto
 from ..core.errors import DudeError, InvariantError
-from . import attest, ops, settle, smt
+from . import ops, settle, smt
 from .layer import Held, Index, Row, _prefix_upper, holds
 from .management import P_NODE, P_ROSTER, Management, Role
 
@@ -673,38 +673,3 @@ class Store:
         """The highest roster revision this node has accepted. Monotone, and durable so it survives
         the restart that would otherwise let an old roster back in."""
         return int.from_bytes(self._get_meta("roster_serial", b""))
-
-    def attestation(self, now: int) -> attest.Attestation:
-        """Bump the counter and read one coherent snapshot to attest.
-
-        THE INTERLOCK, and the highest-risk line in the design: the counter is bumped and
-        COMMITTED here, and the caller signs only what this returns. Signing over uncommitted
-        state is therefore not expressible rather than merely discouraged.
-
-        It matters because the consequence is asymmetric (#cross-attestation): peers keep the
-        evidence and conviction is terminal, so a node that signed a height it had not yet made
-        durable would destroy itself on an honest crash. A crash here SKIPS a counter value
-        instead, and a gap means nothing to anyone.
-
-        One transaction for the same reason: five separate reads could interleave with a
-        settlement and attest a head whose accumulator belongs to a different moment.
-
-        `now` is passed IN. The store keeps no clock — a timestamp is the node's assertion about
-        its own clock (#freshness-is-gathered), and nothing here can check it."""
-        self.db.execute("BEGIN IMMEDIATE")
-        try:
-            seq = int.from_bytes(self._get_meta("attest_seq", b"")) + 1
-            self._set_meta("attest_seq", seq.to_bytes(8))
-            claim = attest.Attestation(
-                seq,
-                self.head(),
-                self.accumulator(),
-                self.log_accumulator(),
-                now,
-                self.state_root(),
-            )
-            self.db.execute("COMMIT")
-        except Exception:
-            self.db.execute("ROLLBACK")
-            raise
-        return claim

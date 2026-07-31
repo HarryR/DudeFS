@@ -33,7 +33,6 @@ from dataclasses import replace
 from ..core.errors import DudeError, InvariantError
 from ..mempool import Tunables as MempoolTunables
 from ..net.plan import PlanTunables
-from ..store.attest import AttestTunables
 from ..tunables import DEFAULT, NetTunables, TimingTunables, Tunables
 
 
@@ -98,10 +97,6 @@ class TestAnIncoherentDeploymentCannotBeBuilt(unittest.TestCase):
         with self.assertRaises(InvariantError) as cm:
             Tunables(plan=PlanTunables(backoff_cap=30_000))
         self.assertIn("never bind", str(cm.exception))
-
-    def test_a_freshness_window_inside_the_probe_interval_is_refused(self):
-        with self.assertRaises(InvariantError):
-            Tunables(attest=AttestTunables(probe_every=200_000))
 
     def test_raising_a_declared_quantity_moves_every_floor(self):
         """The point of declaring them: a mixnet deployment with a 5 s round trip does not get to
