@@ -10,9 +10,8 @@ from __future__ import annotations
 
 import unittest
 
-from dude.core import codec, crypto
-from dude.round import Block, Recipient
-from dude.settle_round import (
+from dude.consensus.round import Block, Recipient
+from dude.consensus.settle_round import (
     Anchors,
     SettleError,
     SettleRound,
@@ -20,6 +19,7 @@ from dude.settle_round import (
     SettleState,
     _slice_id_of,
 )
+from dude.core import codec, crypto
 
 T0 = 1_700_000_000_000
 DELTA = 1_000

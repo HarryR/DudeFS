@@ -30,8 +30,8 @@ from __future__ import annotations
 import unittest
 from dataclasses import replace
 
+from ..consensus.mempool import Tunables as MempoolTunables
 from ..core.errors import DudeError, InvariantError
-from ..mempool import Tunables as MempoolTunables
 from ..net.plan import PlanTunables
 from ..tunables import DEFAULT, NetTunables, TimingTunables, Tunables
 

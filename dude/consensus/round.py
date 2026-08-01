@@ -25,9 +25,9 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from itertools import combinations
 
+from ..core import codec, crypto
+from ..core.errors import DudeError
 from . import quorum
-from .core import codec, crypto
-from .core.errors import DudeError
 
 type NodeId = crypto.PublicKey
 type Bucket = int

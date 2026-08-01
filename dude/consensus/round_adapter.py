@@ -21,9 +21,9 @@ from __future__ import annotations
 
 from ..core import codec, crypto
 from ..core.errors import DudeError
-from ..round import Bucket, Held, Recipient, Round, RoundMsg, Sig, Target
-from .envelope import Envelope, MessageId, SignedEnvelope, Verb, new_message_id
-from .postman import Postman
+from ..net.envelope import Envelope, MessageId, SignedEnvelope, Verb, new_message_id
+from ..net.postman import Postman
+from .round import Bucket, Held, Recipient, Round, RoundMsg, Sig, Target
 
 type Millis = int
 

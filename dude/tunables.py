@@ -40,8 +40,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from .consensus.mempool import Tunables as MempoolTunables
 from .core.errors import InvariantError
-from .mempool import Tunables as MempoolTunables
 from .net.link import LinkTunables
 from .net.plan import PlanTunables
 

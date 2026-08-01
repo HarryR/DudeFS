@@ -9,20 +9,20 @@ from __future__ import annotations
 
 import unittest
 
-from ..core import codec, crypto
-from ..net import Verb
-from ..net.address import Address, Endpoint, Scheme
-from ..net.envelope import Envelope
-from ..net.link import Peer
-from ..net.postman import Postman
-from ..net.round_adapter import (
+from ..consensus.round import Held, Round, Sig, _slice_body
+from ..consensus.round_adapter import (
     RoundAdapter,
     RoundAdapterError,
     bucket_of,
     decode,
     encode,
 )
-from ..round import Held, Round, Sig, _slice_body
+from ..core import codec, crypto
+from ..net import Verb
+from ..net.address import Address, Endpoint, Scheme
+from ..net.envelope import Envelope
+from ..net.link import Peer
+from ..net.postman import Postman
 
 T0 = 1_700_000_000_000
 DELTA = 1_000

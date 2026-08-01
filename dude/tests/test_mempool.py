@@ -8,8 +8,7 @@ from __future__ import annotations
 
 import unittest
 
-from ..core import crypto
-from ..mempool import (
+from ..consensus.mempool import (
     DUPLICATE,
     TOO_NEW,
     TOO_OLD,
@@ -18,7 +17,8 @@ from ..mempool import (
     Tunables,
     tx_id,
 )
-from ..quorum import MAJORITY, MAJORITY_PLUS, TWO_THIRDS, QuorumError, satisfied, size
+from ..consensus.quorum import MAJORITY, MAJORITY_PLUS, TWO_THIRDS, QuorumError, satisfied, size
+from ..core import crypto
 from ..store import Store, ops
 
 D = ops.STORE_DATA

@@ -9,8 +9,8 @@ from __future__ import annotations
 
 import unittest
 
+from dude.consensus.settle_round import SettleState
 from dude.core import crypto
-from dude.settle_round import SettleState
 from dude.store import ops
 
 from .cluster import DELTA, T0, Cluster, D

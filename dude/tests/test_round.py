@@ -16,9 +16,9 @@ from __future__ import annotations
 import random
 import unittest
 
-from .. import quorum
+from ..consensus import quorum
+from ..consensus.round import Block, Recipient, Round, RoundMsg, Sig, State, _slice_body, _slice_id
 from ..core import crypto
-from ..round import Block, Recipient, Round, RoundMsg, Sig, State, _slice_body, _slice_id
 
 T0 = 1_700_000_000_000
 DELTA = 1_000

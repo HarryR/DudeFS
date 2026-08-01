@@ -25,17 +25,17 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from .coordinator import Coordinator
+from .consensus.coordinator import Coordinator
+from .consensus.mempool import Mempool
+from .consensus.round_adapter import RoundAdapter
+from .consensus.settle_adapter import SettleAdapter
 from .core import crypto
 from .core.errors import DudeError
-from .mempool import Mempool
 from .net import Verb
 from .net.address import Endpoint
 from .net.envelope import Envelope, Frame, MessageId, SignedEnvelope, new_message_id
 from .net.link import Peer, Transport
 from .net.postman import Postman
-from .net.round_adapter import RoundAdapter
-from .net.settle_adapter import SettleAdapter
 from .net.transports import address_of
 from .store import Store, ops
 from .store.management import Management

@@ -19,10 +19,10 @@ from __future__ import annotations
 
 from ..core import codec, crypto
 from ..core.errors import DudeError
-from ..round import NodeId, Recipient, Target
-from ..settle_round import Anchors, SettleMsg, SettleRound, SettleSig
-from .envelope import Envelope, SignedEnvelope, Verb, new_message_id
-from .postman import Postman
+from ..net.envelope import Envelope, SignedEnvelope, Verb, new_message_id
+from ..net.postman import Postman
+from .round import NodeId, Recipient, Target
+from .settle_round import Anchors, SettleMsg, SettleRound, SettleSig
 
 type Millis = int
 
