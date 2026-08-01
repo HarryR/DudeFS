@@ -86,6 +86,12 @@ class Verb(IntEnum):
     message (SPECv2 #slice-meta-agreement). A quorum of matching `SIG`s is what turns a
     candidate slice into a ratified block."""
 
+    # -- settlement (#ratified-is-not-settled, #settlement-signs-post-anchors) ------------------ #
+    SETTLE_SIG = 24
+    """A signature over `(slice_hash, height, state_root, A_state, A_log)` -- SettleRound's
+    single message. A quorum of matching `SETTLE_SIG`s turns a ratified block into a SETTLED
+    block, at which point the Coordinator commits the slice to the durable Store."""
+
     # -- diagnostics ---------------------------------------------------------------------------- #
     REFUSED = 90
     """A refusal, carrying a reason. Never silence: a client can only correct a clock fault if it is
