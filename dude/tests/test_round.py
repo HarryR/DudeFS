@@ -16,7 +16,7 @@ from __future__ import annotations
 import random
 import unittest
 
-from ..consensus import quorum
+from .. import quorum
 from ..consensus.round import Block, Recipient, Round, RoundMsg, Sig, State, _slice_body, _slice_id
 from ..core import crypto
 

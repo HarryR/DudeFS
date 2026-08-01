@@ -5,7 +5,7 @@ import functools
 import random
 import unittest
 
-from dude.consensus import quorum
+from dude import quorum
 from dude.core import codec, crypto
 from dude.store import management, ops, settle, store
 

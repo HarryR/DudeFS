@@ -31,9 +31,9 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import Enum, auto
 
+from .. import quorum
 from ..core import codec, crypto
 from ..core.errors import DudeError
-from . import quorum
 from .round import Block, NodeId, Recipient, Target
 
 type Height = int

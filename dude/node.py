@@ -25,10 +25,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from .consensus.coordinator import Coordinator
-from .consensus.mempool import Mempool
-from .consensus.round_adapter import RoundAdapter
-from .consensus.settle_adapter import SettleAdapter
+from .consensus import Coordinator, Mempool, RoundAdapter, SettleAdapter
 from .core import crypto
 from .core.errors import DudeError
 from .net import Verb

@@ -27,9 +27,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import Enum
 
-from ..consensus import (
-    quorum as quorum,  # noqa: PLC0414 — submodule direct, avoids consensus/__init__ cycle
-)
+from .. import quorum
 from ..core import codec, crypto
 from ..core.errors import DudeError
 from . import ops

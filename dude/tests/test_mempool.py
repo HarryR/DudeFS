@@ -17,8 +17,8 @@ from ..consensus.mempool import (
     Tunables,
     tx_id,
 )
-from ..consensus.quorum import MAJORITY, MAJORITY_PLUS, TWO_THIRDS, QuorumError, satisfied, size
 from ..core import crypto
+from ..quorum import MAJORITY, MAJORITY_PLUS, TWO_THIRDS, QuorumError, satisfied, size
 from ..store import Store, ops
 
 D = ops.STORE_DATA

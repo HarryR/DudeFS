@@ -8,7 +8,6 @@
 # decomposition that splits them across packages.
 #
 # WHAT LIVES HERE:
-#   quorum         quorum arithmetic (SPECv2 #quorum-gate)
 #   mempool        admission door (SPECv2 L3 -- one door, one predicate)
 #   round          per-bucket slice-selection state machine (SPECv2 #round-lifecycle)
 #   round_adapter  Round's wire encoding (HELD, SIG)
@@ -17,7 +16,13 @@
 #   coordinator    the driver -- swaps mempools at bucket boundaries, drives rounds, promotes
 #                  ratified blocks to settlement, commits on SETTLED
 #
+# QUORUM LIVES AT dude.quorum, NOT HERE. It is pure arithmetic and is consumed by both
+# consensus and by `store.management` (for failure-domain checks on the roster). Keeping it
+# outside the consensus package removes the cycle that would otherwise exist between store
+# and consensus during package loading. Cite via `from dude import quorum`.
+#
 # WHAT IT DEPENDS ON:
+#   dude.quorum    the quorum rule (shared with dude.store.management)
 #   dude.core      crypto primitives, codec
 #   dude.store     Store (the committed log + state), settle.evaluate, Layer, ops
 #   dude.net       envelope, postman, transports (the adapters use these)
@@ -25,37 +30,38 @@
 #
 # WHAT DEPENDS ON IT:
 #   dude.node      composes Coordinator + Postman + adapters into a running node
-#   dude.store.management  imports `quorum` for failure-domain arithmetic (only this leaf)
-#
-# WHY __init__.py IS DELIBERATELY SPARSE. `store.management` imports `quorum` from here, and
-# store loads before consensus (Coordinator etc. depend on Store, not vice versa). Any eager
-# import that transitively touches store would cycle: consensus/__init__ triggers store which
-# triggers management which triggers consensus/__init__ which is still loading. `quorum` is a
-# leaf module (only depends on `core.errors`); exposing it here is safe. Everything else --
-# Coordinator, Round, Mempool, adapters -- must be imported by its submodule path,
-# `from dude.consensus.coordinator import Coordinator`, so that only the machinery a caller
-# actually uses gets loaded (and store has finished initialising by then).
 
-from . import quorum
-from .quorum import (
-    MAJORITY,
-    MAJORITY_PLUS,
-    TWO_THIRDS,
-    QuorumError,
-    Rule,
-    corroboration,
-    satisfied,
-    size,
-)
+from .coordinator import Coordinator
+from .mempool import CANNOT_APPLY, DUPLICATE, TOO_NEW, TOO_OLD, UNSIGNED, Mempool, Refusal
+from .mempool import Tunables as MempoolTunables
+from .round import Block, Bucket, Round, RoundError, RoundMsg
+from .round_adapter import RoundAdapter, RoundAdapterError
+from .settle_adapter import SettleAdapter, SettleAdapterError
+from .settle_round import Anchors, SettledBlock, SettleError, SettleRound, SettleSig, SettleState
 
 __all__ = [
-    "MAJORITY",
-    "MAJORITY_PLUS",
-    "TWO_THIRDS",
-    "QuorumError",
-    "Rule",
-    "corroboration",
-    "quorum",
-    "satisfied",
-    "size",
+    "CANNOT_APPLY",
+    "DUPLICATE",
+    "TOO_NEW",
+    "TOO_OLD",
+    "UNSIGNED",
+    "Anchors",
+    "Block",
+    "Bucket",
+    "Coordinator",
+    "Mempool",
+    "MempoolTunables",
+    "Refusal",
+    "Round",
+    "RoundAdapter",
+    "RoundAdapterError",
+    "RoundError",
+    "RoundMsg",
+    "SettleAdapter",
+    "SettleAdapterError",
+    "SettleError",
+    "SettleRound",
+    "SettleSig",
+    "SettleState",
+    "SettledBlock",
 ]
