@@ -7,7 +7,7 @@
 # it is why this layer can be built and tested while the layers above are still open questions.
 
 from . import management, ops, settle
-from .layer import PENDING, Layer, Reader, holds
+from .layer import PENDING, Layer, LayerError, Reader, View, holds
 from .ops import (
     Absent,
     Del,
@@ -33,6 +33,7 @@ __all__ = [
     "Holds",
     "Index",
     "Layer",
+    "LayerError",
     "Reader",
     "Set",
     "SignedTransaction",
@@ -41,6 +42,7 @@ __all__ = [
     "StoreError",
     "Transaction",
     "Verdict",
+    "View",
     "conflicts",
     "element",
     "evaluate",

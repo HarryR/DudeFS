@@ -524,10 +524,37 @@ class Store:
         checkpoint is cut."""
         return self.tree.root()
 
+    def hash_under(self, prefix: bytes, depth: int) -> crypto.Digest:
+        """SMT subtree hash under `prefix` at `depth`. Exposed on Store so a `Layer(base=store)`
+        can compose its own projected root by delegating unchanged subtrees to the base
+        (SPECv2 #view-protocol)."""
+        return self.tree.hash_under(prefix, depth)
+
     def prove(self, store: int, name: bytes) -> smt.Proof:
         """Presence or absence, by the same walk. Absence is the valuable half — it is what makes
         a revocation checkable rather than asserted (#absence-is-revocation)."""
         return self.tree.prove(store, name)
+
+    @property
+    def is_frozen(self) -> bool:
+        """Always True in the current single-threaded Coordinator (SPECv2 #store-serial-settle):
+        the discipline is that Store.apply is not called while any Layer over Store is OPEN, so
+        from a Layer's perspective the Store is de facto frozen for the Layer's lifetime. When
+        `Store.freeze()` becomes real machinery (snapshot work), this becomes a version-handle
+        check rather than a constant."""
+        return True
+
+    def _rows_in_path_range(
+        self, lo: bytes, hi: bytes
+    ) -> Iterator[tuple[int, bytes, bytes, bytes]]:
+        """Every live `(store, name, value, credential)` whose SMT path falls inside `[lo, hi]`.
+        The fast path a `Layer` uses to compute effective leaves during a projected root walk;
+        one indexed range scan against `live_by_path`."""
+        for st, name, value, cred in self.db.execute(
+            "SELECT store, name, value, cred FROM live WHERE path BETWEEN ? AND ? ORDER BY path",
+            (lo, hi),
+        ):
+            yield int(st), name, value, cred
 
     # -- ATTESTATION (#monotonicity) ------------------------------------------ #
 

@@ -116,7 +116,7 @@ def evaluate(
     the whole of "rollback" — nothing was written anywhere.
 
     Signature first: self-contained, always checkable, so there is never an excuse to defer it."""
-    layer = Layer(reader)
+    layer = Layer.speculative(reader)
     if not tx.verify():
         return Verdict(Reason.SIGNATURE), layer
     for i, step in enumerate(tx.steps):
@@ -189,7 +189,7 @@ def would_apply(
     Ordered, and later transactions see earlier survivors — because each is evaluated over a layer
     that has absorbed them. This is what a mempool runs to decide what is worth carrying, and what
     a client runs to find out whether its own transaction will land."""
-    base = Layer(reader)
+    base = Layer.speculative(reader)
     keep: list[ops.SignedTransaction] = []
     drop: list[Reject] = []
     for tx in batch:
