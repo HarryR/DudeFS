@@ -560,6 +560,67 @@ way the settled sections do, but no enforcement row exists until the shape survi
 compaction path (compactor role, log truncation, fast sync, light-client sync via SMT proofs) is
 explicitly deferred — that discussion belongs after this line is rock-solid.
 
+## The View abstraction (tentative) {#view-abstraction}
+
+`Store` and `Layer` are the same abstraction: a read surface over live state that can compute
+the three roots, be frozen, and be a base for another view stacked on top. Their difference is
+storage backend (SQLite vs in-memory dict) and lifecycle (persistent vs transient), not
+capability. Over several iterations the two collapse to one type — call it `View` — and
+snapshot support falls out of the same abstraction: a snapshot is a frozen View that
+serialises to bytes and reconstitutes on the receiver.
+
+The staged L5 preview (apply-locally, sign-anchors, exchange-sigs, commit-on-SETTLED) is what
+motivates building this now. It needs a way to compute post-apply anchors WITHOUT committing
+to durable Store, and the natural shape is a stackable overlay whose base is guaranteed not to
+change while the overlay is alive.
+
+### The View protocol {#view-protocol}
+
+- A View MUST expose: `get(store, name)`, `prefix(store, pre)`, `accumulator()`,
+  `state_root()`, `hash_under(prefix, depth)`, `prove(store, name)`, `is_frozen`.
+- The persistent Store implements View. Layer implements View. Whether a caller sees the
+  concrete type or the protocol is API convenience; the operations are the same.
+- Extending Store's read surface is what "unification" means in practice — every Store method
+  that produces state-view information moves onto the View protocol; Store keeps only the
+  log-side (append, replay, entries, provisioning) and the durability backing for its View.
+
+### A Layer's base must be frozen {#frozen-base-for-layer}
+
+- `Layer(base=X)` MUST refuse construction if `not X.is_frozen`. Enforced at the constructor,
+  so the invariant is not something a caller must remember.
+- A Layer has two states: OPEN (accepts `apply(mutation, credential)` calls that update its
+  delta) and FROZEN (refuses `apply`, may serve as another Layer's base). The transition
+  OPEN → FROZEN is via `freeze()` and is one-way.
+- `is_frozen` MUST be durable: once True, MUST NOT return to False. There is no thaw.
+- The invariant this enforces: nothing beneath an open Layer can change while the Layer is
+  alive. Every subtree hash a Layer memoises against its base is valid for the Layer's
+  lifetime — no invalidation cascade, no coherence protocol between stacked overlays.
+
+### Store does not mutate during settlement {#store-serial-settle}
+
+- The Coordinator MUST NOT call `Store.apply` while any Layer over that Store is OPEN.
+- For a single-threaded Coordinator that settles blocks in bucket order (#pipelining), the
+  invariant reduces to a lifecycle discipline: create the Layer, evaluate the slice, sign
+  anchors, exchange sigs, commit on SETTLED. The Layer's lifetime does not span another
+  `Store.apply`.
+- Once the persistent Store gains a real `Store.freeze()` (needed for snapshots, deferred),
+  the discipline promotes to a version-handle: an open Layer over Store pins a version, and
+  `Store.apply` refuses if any handle is outstanding. The single-threaded coordinator does not
+  need this yet; the design leaves room for it.
+
+### The pipelining shape falls out {#pipelining-via-frozen-layers}
+
+- Round(N) ratifies. Coordinator creates `layer_N = Layer(base=store)` OPEN, evaluates slice
+  into it, signs `(slice_hash_N, height, layer_N.state_root, layer_N.accumulator, ...)`.
+- Round(N+1) ratifies before N SETTLES. Coordinator calls `layer_N.freeze()`, creates
+  `layer_N_plus_1 = Layer(base=layer_N)` OPEN, evaluates slice N+1 into it, signs anchors
+  computed from the stack.
+- When N SETTLES: `store.apply(slice_N)` commits. `layer_N` becomes semantically equivalent
+  to base (delta folded down); `layer_N_plus_1` continues to read correctly through it.
+- If N never SETTLES (indefinite hang, deferred per #settlement-may-hang), `layer_N` stays
+  frozen and `layer_N_plus_1` continues to function as an overlay; nothing commits down
+  until the hang resolves.
+
 ## L5 — Settlement (tentative) {#settlement-layer}
 
 Settlement is the layer between "the quorum agreed on which slice" (L4) and "the log has advanced,
@@ -596,14 +657,18 @@ turns that into a SETTLED block.
 
 ### Settlement signs the post-apply anchors {#settlement-signs-post-anchors}
 
-- After applying, a node MUST compute the resulting `state_root`, `A_state`, `A_log`, and `head`
-  index, and sign a message binding those to the slice's identity: `sig over (slice_hash, height,
-  state_root, A_state, A_log)`.
-- The sign happens **after** the durable transaction (#atomic-write) that applied the slice. A
-  node MUST NOT sign anchors it has not committed.
-- A node that could not apply the slice — because it did not hold every body, or its Store
-  refused a transaction the honest evaluator accepted, or its own state was too far behind — MUST
-  NOT sign. Silence is the refusal.
+- After evaluating the slice into a Layer over Store (#view-abstraction, #frozen-base-for-layer),
+  a node MUST compute the resulting `state_root`, `A_state`, `A_log`, and `head` index from the
+  Layer, and sign a message binding those to the slice's identity: `sig over (slice_hash,
+  height, state_root, A_state, A_log)`.
+- The sign happens BEFORE the durable Store commit, against the OPEN Layer's projected roots.
+  Once a quorum of matching sigs converges (SETTLED), the Coordinator commits the Layer's delta
+  to Store in one durable transaction (#atomic-write). Signing over Layer-projected roots is
+  safe because the Layer's base is frozen (#frozen-base-for-layer) and the Layer's own delta is
+  what the sig commits to.
+- A node that could not evaluate the slice — because it did not hold every body, or its
+  evaluator refused a transaction the honest ones accepted, or its own state was too far
+  behind — MUST NOT sign. Silence is the refusal.
 
 ### Settlement converges by quorum agreement on the anchors {#settlement-quorum-on-anchors}
 
