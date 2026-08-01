@@ -677,10 +677,68 @@ turns that into a SETTLED block.
   is what makes convergence possible without a coordinator.
 - The settlement signature set MUST be distinct by construction (bitmap indexed by roster
   position), for the same reason ratification counts distinct signers (#ratification-counts).
-- Two nodes producing different anchors from the same slice is a divergence, not a signature
-  disagreement about a value judgement. It reveals that one implementation is wrong — the
-  evaluator, the accumulator update, the SMT insert, one of them. Divergence at this step is a
-  bug of ours.
+- Divergent anchors are handled per #settlement-peer-divergence-is-evidence and
+  #settlement-self-divergence-is-invariant — the WHO computed the disagreeing value distinguishes
+  a routine drop from a self-terminating fault.
+
+### A peer's divergent anchors are evidence, not an alarm {#settlement-peer-divergence-is-evidence}
+
+- A peer's SettleSig whose anchors differ from our own locally-computed anchors MUST be dropped
+  from quorum counting. It MAY be preserved as evidence (same shape as
+  #evidence-outlives-ratification) for the observability layer to act on.
+- It MUST NOT raise `InvariantError` and MUST NOT terminate the process. A peer sending
+  divergent anchors is operationally indistinguishable from a bug in that peer, malice by that
+  peer, or a bug in us — no local decision distinguishes them, and treating any peer input as
+  fatal-to-us hands every byzantine node a one-byte cluster-shutdown button.
+- If our own anchors are the outlier (honest peers reach quorum among themselves without us),
+  we simply do not SETTLE this block. Recovery is L6 sync (deferred) — the settlement path
+  does not attempt self-repair.
+
+### Our own state disagreeing with our own signed anchors is `InvariantError` {#settlement-self-divergence-is-invariant}
+
+- After committing to Store on SETTLED, the Coordinator MUST safety-check that
+  `store.head`, `store.state_root`, `store.accumulator`, `store.log_accumulator` equal what we
+  previously signed in the anchors. A mismatch means our evaluator produced different mutations
+  between the preview (Layer projection) and the commit (Store.apply) — non-determinism between
+  two runs of the same evaluator over the same base state.
+- This MUST raise `InvariantError`. It is our own postcondition being violated, not a claim
+  about a peer. Per #failure-domains, `InvariantError` is not a `DudeError` and MUST NOT be
+  catchable at any crash-only boundary.
+
+### The Coordinator filters already-settled txs before preview {#already-settled-filtering}
+
+- Round ratifies over mempool hashes and does not consult log state. A ratified slice MAY name
+  a transaction that has already landed in the log via an earlier bucket's settlement (the tx
+  reached one node's mempool late, was carried forward, appeared in a later Round's holdings).
+- The Coordinator MUST filter such txs OUT of the preview batch before computing anchors,
+  because `Store.apply` at commit will drop them as duplicates (op_hash UNIQUE, per
+  #content-address) and the projected height would then exceed what actually commits. Signing
+  anchors nobody can reproduce is exactly the self-divergence
+  #settlement-self-divergence-is-invariant catches — filter first, sign anchors the commit will
+  match.
+
+### Fall-through re-admission re-broadcasts the body {#fall-through-re-broadcasts}
+
+- A tx re-admitted into the current mempool via #fall-through-through-the-door MUST also be
+  re-broadcast to peers (via SUBMIT or its equivalent).
+- Local-only re-admit isolates the tx: only this node holds it going forward, and Round's slice
+  cannot include a tx a quorum does not hold. Without re-broadcast, a tx that survived one
+  bucket's ratification-and-drop cycle on this node stays trapped here forever, cycling through
+  every subsequent bucket as ours-alone.
+- The re-broadcast rides the ordinary SUBMIT re-flood path — no separate wire vocabulary; the
+  mempool cannot distinguish re-admitted-fall-through from client-submitted, per
+  #settlement-does-not-cross-mempool.
+
+### Every ratified bucket runs settlement, even empty {#empty-bucket-still-settles}
+
+- A bucket that ratifies an empty slice (no txs collected, or every tx dropped in preview) MUST
+  still open a SettleRound and exchange sigs. The settlement quorum's agreement is what makes
+  the head advance-preserving invariant checkable — an empty settle_sigs bitmap signed over
+  `(slice_hash=∅, height=head, anchors=current)` proves the quorum saw the same state at that
+  bucket boundary, which is a floor #freshness-is-gathered (once trust re-lands) can lean on.
+- Empty settlements MUST NOT be optimised out. Cost is one message round per bucket regardless
+  of workload; that is the shape the design targets (#durability-over-latency) and skipping it
+  breaks the "every bucket has a signed post-anchor commitment" property.
 
 ### Settlement does not reach through the mempool {#settlement-does-not-cross-mempool}
 
@@ -701,9 +759,15 @@ turns that into a SETTLED block.
   signatures (partial holdings on the ⊆-local edge cases, one node down at the wrong moment, a
   transient partition during the exchange). The block stays in the RATIFIED-but-not-SETTLED state
   indefinitely and the head does not advance.
-- This is a known gap in the tentative spec. A resolution mechanism is planned but deliberately
-  not written here — get the settle-when-it-does-settle path rock-solid first, then close the
-  hang case surgically.
+- A related failure mode observed while building Stage 3: once a node falls out of the
+  settlement quorum for even one block (its own SettleRound stays COLLECTING while peers reach
+  SETTLED among themselves), its Store diverges from the cluster's -- and no subsequent bucket's
+  settlement will help it recover. Peers refuse the diverged tx as a duplicate against their
+  log; the re-broadcast (#fall-through-re-broadcasts) keeps the tx local. That node is stuck
+  until L6 sync (#sync-is-log-replay) hands it the blocks it missed.
+- Both failure modes are known gaps in the tentative spec. A resolution mechanism is planned
+  but deliberately not written here -- get the settle-when-it-does-settle path rock-solid
+  first, then close the hang case surgically. L6 sync is the recovery half.
 
 ### The block is the SETTLED thing {#block-shape-settled}
 
