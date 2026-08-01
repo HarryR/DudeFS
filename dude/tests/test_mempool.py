@@ -15,7 +15,6 @@ from ..consensus.mempool import (
     UNSIGNED,
     Mempool,
     Tunables,
-    tx_id,
 )
 from ..core import crypto
 from ..quorum import MAJORITY, MAJORITY_PLUS, TWO_THIRDS, QuorumError, satisfied, size
@@ -123,12 +122,6 @@ class TestAdmission(unittest.TestCase):
         self.assertEqual(self._admit(forged), UNSIGNED)
         self.assertIsNone(self._admit(tx))
         self.assertEqual(self._admit(tx), DUPLICATE)
-
-    def test_identity_is_the_store_s_own(self):
-        """Dedup is the primary replay defence, and it only works because both sides agree on what
-        "the same transaction" is (§1.2). A mempool-local id would break that silently."""
-        tx = write(self.kp, "x", b"v", T0)
-        self.assertEqual(tx_id(tx), tx.op_hash)
 
 
 if __name__ == "__main__":

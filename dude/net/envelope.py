@@ -183,11 +183,11 @@ class Envelope:
         stretch to cover retries — and why each attempt carries a DISTINCT `ts`, which is exactly
         what lets a reply's `reply_ts` name one of them. It also replaces the old `at()`, which
         existed only because `ts` used to sit on the unsigned half."""
-        return SignedEnvelope(kp.public, ts, self, kp.sign(_body(kp.public, ts, self)))
+        return SignedEnvelope(kp.public, ts, self, kp.sign(_body_bytes(kp.public, ts, self)))
 
 
-def _body(frm: crypto.PublicKey, ts: int, env: Envelope) -> bytes:
-    """The canonical bytes a sender signs. Mirrors `ops._body(author, ts, steps)` deliberately.
+def _body_bytes(frm: crypto.PublicKey, ts: int, env: Envelope) -> bytes:
+    """The canonical bytes a sender signs. Mirrors `ops._body_bytes(author, ts, steps)`.
 
     NESTED, so the two levels are visible on the wire as well as in the types: the header is this
     hop's claim, the inner list is the envelope the author decided.
@@ -195,7 +195,10 @@ def _body(frm: crypto.PublicKey, ts: int, env: Envelope) -> bytes:
     Everything here is signed, and that is load-bearing. `to` under the signature stops a valid
     envelope being lifted and re-delivered to a different recipient, who would otherwise see a
     correctly-signed message never addressed to them; the same argument covers `verb` and
-    `reply_to` — anything an unsigned copy would let an attacker change for free."""
+    `reply_to` — anything an unsigned copy would let an attacker change for free.
+
+    Shared between `Envelope.sign` (before the SignedEnvelope exists) and `SignedEnvelope._body`
+    (after) so the shape lives in one place."""
     return codec.encode([frm, ts, env.encode()])
 
 
@@ -213,11 +216,17 @@ class SignedEnvelope:
     sig: crypto.Signature
 
     @property
+    def _body(self) -> bytes:
+        """The canonical bytes THIS signature covers -- what `verify` checks and what `raw` wraps
+        with the sig for the wire form."""
+        return _body_bytes(self.frm, self.ts, self.env)
+
+    @property
     def raw(self) -> bytes:
-        return codec.encode([_body(self.frm, self.ts, self.env), self.sig])
+        return codec.encode([self._body, self.sig])
 
     def verify(self) -> bool:
-        return self.frm.verify(_body(self.frm, self.ts, self.env), self.sig)
+        return self.frm.verify(self._body, self.sig)
 
     def fresh(self, now: int, window: int) -> bool:
         """Is this envelope inside the conversation window?

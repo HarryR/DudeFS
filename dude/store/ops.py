@@ -235,7 +235,9 @@ class Transaction:
     def sign(self, kp: crypto.Keypair, ts: int) -> SignedTransaction:
         """Bind an identity and a clock, and sign. `ts` is the author's own clock (#buckets) — the
         bucket follows from it, so it is signed content."""
-        return SignedTransaction(kp.public, ts, self, kp.sign(_body(kp.public, ts, self.steps)))
+        return SignedTransaction(
+            kp.public, ts, self, kp.sign(_body_bytes(kp.public, ts, self.steps))
+        )
 
     @property
     def mutations(self) -> tuple[Mutation, ...]:
@@ -278,9 +280,12 @@ def writes(*mutations: Mutation) -> Transaction:
     return Transaction(tuple(Step((), m) for m in mutations))
 
 
-def _body(author: crypto.PublicKey, ts: int, steps: tuple[Step, ...]) -> bytes:
+def _body_bytes(author: crypto.PublicKey, ts: int, steps: tuple[Step, ...]) -> bytes:
     """The canonical bytes an author signs. Position is absent by construction: a settled index does
-    not exist yet, and reaching for one is #position-is-not-authored's bug."""
+    not exist yet, and reaching for one is #position-is-not-authored's bug.
+
+    Shared between `Transaction.sign` (before the SignedTransaction exists) and
+    `SignedTransaction._body` (after) so the shape lives in one place."""
     return codec.encode([author, ts, [st.encode() for st in steps]])
 
 
@@ -302,16 +307,24 @@ class SignedTransaction:
         return self.txn.steps
 
     @property
+    def _body(self) -> bytes:
+        """The canonical bytes THIS signature covers -- what `verify` checks and what `raw` wraps
+        with the sig for the wire form."""
+        return _body_bytes(self.author, self.ts, self.steps)
+
+    @property
     def raw(self) -> bytes:
-        return codec.encode([_body(self.author, self.ts, self.steps), self.sig])
+        return codec.encode([self._body, self.sig])
 
     @property
     def op_hash(self) -> crypto.Digest:
-        """Content address — over the bytes as received (#content-address)."""
+        """Content address — over the bytes as received (#content-address). This is also the
+        mempool's dedup key: identity IS shared with the store's log, so a transaction cannot be a
+        duplicate in one and a fresh entry in the other."""
         return crypto.h(self.raw)
 
     def verify(self) -> bool:
-        return self.author.verify(_body(self.author, self.ts, self.steps), self.sig)
+        return self.author.verify(self._body, self.sig)
 
     @classmethod
     def decode(cls, raw: bytes) -> SignedTransaction:

@@ -209,7 +209,7 @@ class Coordinator:
             now=now,
             close_by=self._close_by(now),
         )
-        r.add_local(_all_hashes(frozen))
+        r.add_local(frozen.all_hashes())
         self.rounds[bucket] = (frozen, r)
         self.adapter.flush(r, now)
 
@@ -305,7 +305,7 @@ class Coordinator:
         # re-broadcast each so peers hold them too -- otherwise a tx that only this node
         # carried after ratifying an empty slice would stay isolated for every future bucket.
         applied_hashes = {tx.op_hash for tx in s.applied}
-        for op_hash, tx in _all_bodies(s.frozen).items():
+        for op_hash, tx in s.frozen.all_bodies().items():
             if op_hash in applied_hashes:
                 continue
             refusal = self.mempool.admit(tx, now, self.store, self.mgmt)
@@ -313,23 +313,6 @@ class Coordinator:
                 self.reflood(tx, now)
 
         self.settling = None
-
-
-# ------------------------------------------------------------------------------------------- #
-# Helpers                                                                                     #
-# ------------------------------------------------------------------------------------------- #
-
-
-def _all_hashes(m: Mempool) -> frozenset[crypto.Digest]:
-    """Every op_hash currently in the mempool, across whatever internal bucket keys it holds
-    them under. Round takes a single set."""
-    return frozenset(op_hash for txs in m.pending.values() for op_hash in txs)
-
-
-def _all_bodies(m: Mempool) -> dict[crypto.Digest, SignedTransaction]:
-    """Every tx currently in the mempool, keyed by op_hash. Used to re-admit fall-throughs
-    (non-slice and slice-dropped) via the one door on SETTLED."""
-    return {tx.op_hash: tx for _b, txs in m.pending.items() for tx in txs.values()}
 
 
 def _expect_anchors(signed: Anchors, store: Store) -> None:

@@ -141,18 +141,6 @@ UNSIGNED = Refusal.UNSIGNED
 CANNOT_APPLY = Refusal.CANNOT_APPLY
 
 
-def tx_id(tx: ops.SignedTransaction) -> crypto.Digest:
-    """A transaction's identity — `op_hash`, THE STORE'S OWN content address, deliberately not a
-    second scheme of this module's invention.
-
-    That sharing is load-bearing. Dedup on this id, not the clock, is the primary replay defence
-    (§1.2), and it only works if the mempool and the log agree on what "the same transaction" means.
-    A mempool-local identity would let a transaction be a duplicate here and a fresh entry there.
-    `w_valid` then exists only to keep the replayable window inside the horizon over which that
-    dedup still answers, since compaction eventually collects the entry."""
-    return tx.op_hash
-
-
 @dataclass(slots=True)
 class Mempool:
     """Currently-collecting mempool: one bucket window's worth of candidate transactions,
@@ -221,14 +209,13 @@ class Mempool:
         forward to the current one, so a client running behind settles a few buckets further
         ahead than its own clock suggests -- bounded by `w_admit`. The bucket is a floor, not
         an exclusion window."""
-        ident = tx_id(tx)
-        if any(ident in held for held in self.pending.values()):
+        if any(tx.op_hash in held for held in self.pending.values()):
             return Refusal.DUPLICATE
         if (why := self.valid(tx, now, reader, auth)) is not None:
             return why
         t = self.tunables
         landed = max(t.bucket(tx.ts), t.bucket(now))
-        self.pending.setdefault(landed, {})[ident] = tx
+        self.pending.setdefault(landed, {})[tx.op_hash] = tx
         return None
 
     # -- introspection ------------------------------------------------------------------------ #
@@ -236,6 +223,18 @@ class Mempool:
     def buckets(self) -> tuple[Bucket, ...]:
         """Sorted -- never mapping order, which Go randomises (portability, not style)."""
         return tuple(sorted(b for b, held in self.pending.items() if held))
+
+    def all_hashes(self) -> frozenset[crypto.Digest]:
+        """Every op_hash currently held, flattened across buckets. Round takes a single set;
+        keeping the flatten here means callers don't need to know how holdings are laid out
+        internally -- change the layout, this method changes, nothing else does."""
+        return frozenset(op_hash for txs in self.pending.values() for op_hash in txs)
+
+    def all_bodies(self) -> dict[crypto.Digest, ops.SignedTransaction]:
+        """Every tx currently held, keyed by op_hash. Used to re-admit fall-throughs on SETTLED
+        via the one door (#fall-through-through-the-door). Same internal-layout guarantee as
+        `all_hashes`."""
+        return {tx.op_hash: tx for txs in self.pending.values() for tx in txs.values()}
 
     def __len__(self) -> int:
         return sum(len(held) for held in self.pending.values())
