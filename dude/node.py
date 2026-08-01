@@ -35,6 +35,7 @@ from .net.envelope import Envelope, Frame, MessageId, SignedEnvelope, new_messag
 from .net.link import Peer, Transport
 from .net.postman import Postman
 from .net.round_adapter import RoundAdapter
+from .net.settle_adapter import SettleAdapter
 from .net.transports import address_of
 from .store import Store, ops
 from .store.management import Management
@@ -55,6 +56,7 @@ HANDLED = frozenset(
         Verb.SUBMIT,
         Verb.HELD,
         Verb.SIG,
+        Verb.SETTLE_SIG,
         Verb.PING,
     }
 )
@@ -86,16 +88,25 @@ class Node:
     tunables: Tunables = DEFAULT
     postman: Postman = field(init=False)
     adapter: RoundAdapter = field(init=False)
+    settle_adapter: SettleAdapter = field(init=False)
     coordinator: Coordinator = field(init=False)
     """Owns the current Mempool, the in-flight Rounds, and drives them on tick. See
-    `dude.coordinator`. Node's role in consensus is now just: hand SUBMIT bodies to
-    `coordinator.submit`, hand HELD/SIG envelopes to `coordinator.on_round_msg`, and call
-    `coordinator.tick(now)` from `tick`."""
+    `dude.coordinator`. Node's role in consensus is: hand SUBMIT bodies to
+    `coordinator.submit`, HELD/SIG envelopes to `coordinator.on_round_msg`, SETTLE_SIG
+    envelopes to `coordinator.on_settle_msg`, and call `coordinator.tick(now)` from `tick`."""
 
     def __post_init__(self) -> None:
         self.postman = Postman(self.me, window=self.tunables.net.window)
         self.adapter = RoundAdapter(self.me, self.postman, self.tunables.net.ttl)
-        self.coordinator = Coordinator(self.me, self.store, self.adapter, self.tunables)
+        self.settle_adapter = SettleAdapter(self.me, self.postman, self.tunables.net.ttl)
+        self.coordinator = Coordinator(
+            self.me,
+            self.store,
+            self.adapter,
+            self.settle_adapter,
+            self.tunables,
+            reflood=lambda tx, now: self._flood(Verb.SUBMIT, tx.raw, now),
+        )
 
     @property
     def mempool(self) -> Mempool:
@@ -190,6 +201,12 @@ class Node:
         """A peer's signature over a slice they believe this bucket ratifies. Same handling as
         HELD -- routed to the Round for its bucket via the Coordinator."""
         self.coordinator.on_round_msg(env, now)
+
+    def _on_settle_sig(self, env: SignedEnvelope, now: Millis) -> None:
+        """A peer's signature over the post-apply anchors of a ratified block -- SettleRound's
+        one message (SPECv2 #settlement-signs-post-anchors). Routed to the currently-settling
+        block via the Coordinator, dropped if it does not match."""
+        self.coordinator.on_settle_msg(env, now)
 
     # -- the round ----------------------------------------------------------------------------- #
 

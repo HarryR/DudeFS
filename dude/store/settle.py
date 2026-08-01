@@ -189,13 +189,30 @@ def would_apply(
     Ordered, and later transactions see earlier survivors — because each is evaluated over a layer
     that has absorbed them. This is what a mempool runs to decide what is worth carrying, and what
     a client runs to find out whether its own transaction will land."""
-    base = Layer.speculative(reader)
+    return apply_to(Layer.speculative(reader), batch, auth)
+
+
+def apply_to(
+    target: Layer,
+    batch: tuple[ops.SignedTransaction, ...],
+    auth: Authoriser | None = None,
+) -> Screened:
+    """Evaluate a batch INTO `target`, absorbing survivors as we go. Like `would_apply` but
+    writes the effects into an existing Layer whose projected roots the caller will read.
+
+    The L5 settlement preview uses this: Coordinator constructs an OPEN Layer over Store, walks
+    the ratified slice through this function, then reads `target.accumulator()` and
+    `target.state_root()` to build the anchors it signs (SPECv2 #settlement-signs-post-anchors).
+
+    `target` MUST be OPEN -- absorption requires it. If the caller passes a FROZEN Layer, the
+    absorb call inside will raise `LayerError`. That is the right shape: signing anchors
+    against a frozen preview would sign anchors nobody could reproduce."""
     keep: list[ops.SignedTransaction] = []
     drop: list[Reject] = []
     for tx in batch:
-        verdict, layer = evaluate(base, tx, auth)
+        verdict, layer = evaluate(target, tx, auth)
         if verdict:
-            base.absorb(layer)
+            target.absorb(layer)
             keep.append(tx)
         else:
             drop.append(Reject(tx, verdict))

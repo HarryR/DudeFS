@@ -159,13 +159,8 @@ class TestVerbCoverage(unittest.TestCase):
         them -- Round's own `HELD`/`SIG` do the job now (SPECv2 #round-lifecycle). They stay in
         the enum's retired range so a stale peer sending one is unimplemented-and-ignored rather
         than crashing on an unknown verb; the enum entries should be moved to a retired section
-        in a follow-up cleanup.
-
-        `SETTLE_SIG` is L5 Stage 2's new verb -- defined in the wire vocabulary, encoded and
-        decoded by `dude.net.settle_adapter`, but not yet wired into `Node` (Stage 3 hooks
-        SettleRound into the Coordinator). Until Stage 3 lands, an incoming `SETTLE_SIG` is
-        unimplemented-and-ignored."""
-        self.assertEqual(UNIMPLEMENTED, {Verb.PROPOSE, Verb.ENDORSE, Verb.SETTLE_SIG})
+        in a follow-up cleanup."""
+        self.assertEqual(UNIMPLEMENTED, {Verb.PROPOSE, Verb.ENDORSE})
 
     def test_every_handled_verb_has_a_handler(self):
         """Derived, not listed: `_DISPATCH` is built from `HANDLED`, so a verb claimed as handled
