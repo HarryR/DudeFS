@@ -17,8 +17,9 @@ import random
 import unittest
 
 from .. import quorum
-from ..consensus.round import Block, Recipient, Round, RoundMsg, Sig, State, _slice_body, _slice_id
+from ..consensus.round import Block, Round, RoundMsg, Sig, State, _slice_hash
 from ..core import crypto
+from ..net.postman import Recipient
 
 T0 = 1_700_000_000_000
 DELTA = 1_000
@@ -31,7 +32,7 @@ def _wire(nodes: dict[crypto.PublicKey, Round], now: int) -> None:
     """Drain every Round's outbox and deliver to targets.
 
     A message addressed to `Recipient.ALL` goes to every OTHER node (never back to sender).
-    A message addressed to a specific NodeId goes only to that node. Nothing here retries,
+    A message addressed to a specific PublicKey goes only to that node. Nothing here retries,
     reorders, or drops -- those are what the pipelining / partition scenarios will construct."""
     for src_id, src in nodes.items():
         for target, msg in src.outbox():
@@ -299,12 +300,7 @@ class TestByzantineEquivocation(unittest.TestCase):
         # Craft a bogus Sig from node 2 for a slice that isn't the real one, then inject it into
         # node 0 BEFORE the real round produces the honest Sig.
         bogus_slice = frozenset({crypto.h(b"nope")})
-        bogus_hash = _slice_id(1, bogus_slice)
-        bogus_sig = Sig(
-            bucket=1,
-            slice_hash=bogus_hash,
-            sig=keys[2].sign(_slice_body(1, bogus_hash)),
-        )
+        bogus_sig = Sig.sign(keys[2], 1, _slice_hash(1, bogus_slice))
         fabric.inject(bogus_sig, from_=keys[2].public, to=keys[0].public, now=T0 + DELTA)
 
         # Now let the round complete normally.
@@ -602,8 +598,7 @@ class TestPropertySafetyUnderByzantine(unittest.TestCase):
                 # differs from anything real.
                 byz, victim = rng.sample(keys, 2)
                 bogus_hashes = frozenset(rng.sample(_UNIVERSE, rng.randint(1, 5)))
-                bogus_hash = _slice_id(1, bogus_hashes)
-                bogus_sig = Sig(1, bogus_hash, byz.sign(_slice_body(1, bogus_hash)))
+                bogus_sig = Sig.sign(byz, 1, _slice_hash(1, bogus_hashes))
                 fabric.inject(bogus_sig, from_=byz.public, to=victim.public, now=T0 + DELTA)
 
                 _run_fabric(nodes, fabric, rounds=30, start=T0 + 2 * DELTA)

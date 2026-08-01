@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 from .consensus import Coordinator, Mempool, RoundAdapter, SettleAdapter
 from .core import crypto
 from .core.errors import DudeError
+from .core.units import Millis
 from .net import Verb
 from .net.address import Endpoint
 from .net.envelope import Envelope, Frame, MessageId, SignedEnvelope, new_message_id
@@ -37,9 +38,6 @@ from .net.transports import address_of
 from .store import Store, ops
 from .store.management import Management
 from .tunables import DEFAULT, Tunables
-
-type Millis = int
-
 
 REPLIES = frozenset({Verb.PONG, Verb.BODIES, Verb.REFUSED})
 """Verbs that ANSWER something we sent. They need no handler: `Postman.deliver` has already

@@ -28,10 +28,9 @@ from itertools import combinations
 from .. import quorum
 from ..core import codec, crypto
 from ..core.errors import DudeError
-
-type NodeId = crypto.PublicKey
-type Bucket = int
-type Millis = int
+from ..core.units import Millis
+from ..net.postman import Recipient, Target
+from .mempool import Bucket
 
 _SLICE_DOMAIN = b"dude.round.slice"
 
@@ -41,18 +40,6 @@ class RoundError(DudeError):
     clock that went backwards. Not for peer misbehaviour -- that is a silent drop with an `#XXX:`
     comment. Not for genuine invariant violation -- that is `InvariantError`, and Round has none
     at the moment because there is nothing here whose arithmetic could go wrong internally."""
-
-
-class Recipient(Enum):
-    """Where an outbound message goes. A `NodeId` is a directed send; `ALL` is broadcast.
-
-    An enum-plus-union rather than `NodeId | None` because `None` is exactly the "did you forget
-    a case" trap the codebase's closed enums exist to prevent (#no-exceptions-for-control-flow)."""
-
-    ALL = auto()
-
-
-type Target = NodeId | Recipient
 
 
 # --------------------------------------------------------------------------------------------- #
@@ -79,16 +66,36 @@ class Held:
 
 @dataclass(frozen=True, slots=True)
 class Sig:
-    """My signature over the slice I believe this bucket ratifies.
+    """My signature over the slice I believe this bucket ratifies. Constructed via
+    `Sig.sign(kp, bucket, slice_hash)`; verified via `msg.verify(pk)`.
 
     `slice_hash` is `H(bucket, sorted_tuple_of_hashes)` -- exactly what would appear as the
     slice's identity on the wire. A peer holding the same set of `Held` messages computes the
     same `slice_hash` (#slice-is-intersection, #slice-tie-break). Once a quorum of `Sig` messages
-    arrive for the same `slice_hash`, the Round is ratified (#slice-meta-agreement)."""
+    arrive for the same `slice_hash`, the Round is ratified (#slice-meta-agreement).
+
+    Bucket-bound, so a signature over one bucket's slice cannot be replayed against another
+    bucket."""
 
     bucket: Bucket
     slice_hash: crypto.Digest
     sig: crypto.Signature
+
+    @classmethod
+    def sign(cls, kp: crypto.Keypair, bucket: Bucket, slice_hash: crypto.Digest) -> Sig:
+        """Build a Sig over `(bucket, slice_hash)` signed by `kp`."""
+        return cls(bucket, slice_hash, kp.sign(_sig_payload(bucket, slice_hash)))
+
+    def verify(self, pk: crypto.PublicKey) -> bool:
+        """True if this Sig's signature is a valid signature by `pk` over what it claims to
+        cover. The caller decides what to do with a False -- Round drops, tests assert."""
+        return pk.verify(_sig_payload(self.bucket, self.slice_hash), self.sig)
+
+
+def _sig_payload(bucket: Bucket, slice_hash: crypto.Digest) -> bytes:
+    """The bytes a Sig's signature covers. Shared between `sign` (before the message exists) and
+    `verify` (after) so the shape lives in exactly one place."""
+    return codec.encode([_SLICE_DOMAIN, bucket, slice_hash])
 
 
 type RoundMsg = Held | Sig
@@ -112,6 +119,21 @@ class Block:
     sigs: tuple[crypto.Signature, ...]
     """The quorum's ratification, per #ratification-counts. The bitmap indexes the roster; each
     named signer's signature is over `slice_hash`."""
+
+    @property
+    def slice_hash(self) -> crypto.Digest:
+        """`H(bucket, sorted(hashes))` -- the canonical identity two nodes computing the same
+        slice agree on. Bucket-bound so identical slices in different buckets have different ids.
+        Used by SettleRound to bind post-apply anchors to this specific block."""
+        return _slice_hash(self.bucket, self.hashes)
+
+
+def _slice_hash(
+    bucket: Bucket, hashes: tuple[crypto.Digest, ...] | frozenset[crypto.Digest]
+) -> crypto.Digest:
+    """The slice-identity computation, shared between `Block.slice_hash` (post-ratification)
+    and `Round._finalize` (pre-Block, working with the not-yet-Block set)."""
+    return crypto.h(codec.encode([bucket, sorted(hashes)]))
 
 
 # --------------------------------------------------------------------------------------------- #
@@ -147,7 +169,7 @@ class Round:
         self,
         bucket: Bucket,
         me: crypto.Keypair,
-        roster: tuple[NodeId, ...],
+        roster: tuple[crypto.PublicKey, ...],
         now: Millis,
         close_by: Millis,
     ) -> None:
@@ -178,10 +200,10 @@ class Round:
         self._now = now
         self._close_by = close_by
         self._local: frozenset[crypto.Digest] | None = None
-        self._peer_holds: dict[NodeId, frozenset[crypto.Digest]] = {}
-        self._peer_sigs: dict[NodeId, Sig] = {}
+        self._peer_holds: dict[crypto.PublicKey, frozenset[crypto.Digest]] = {}
+        self._peer_sigs: dict[crypto.PublicKey, Sig] = {}
         self._my_sig: Sig | None = None
-        self._equivocations: list[tuple[NodeId, Sig, Sig]] = []
+        self._equivocations: list[tuple[crypto.PublicKey, Sig, Sig]] = []
         self._ratified: Block | None = None
         self._surviving: tuple[crypto.Digest, ...] = ()
         self._outbox: list[tuple[Target, RoundMsg]] = []
@@ -209,7 +231,7 @@ class Round:
         # will compute; convergence is by shared observation, not by delegation.
         self._outbox.append((Recipient.ALL, Held(self._bucket, hashes)))
 
-    def receive(self, msg: RoundMsg, from_: NodeId, now: Millis) -> None:
+    def receive(self, msg: RoundMsg, from_: crypto.PublicKey, now: Millis) -> None:
         """A message arrived from a peer. VERIFY, THEN INCORPORATE OR DROP.
 
         A bad-signature `Sig` MUST be verified and dropped. Nothing about a message with an
@@ -253,7 +275,7 @@ class Round:
         else:
             self._on_sig(msg, from_)
 
-    def _on_held(self, msg: Held, from_: NodeId) -> None:
+    def _on_held(self, msg: Held, from_: crypto.PublicKey) -> None:
         if self._state is State.GONE:
             # XXX: dropped -- Round has ratified. A Held is evidence for slice computation and
             # that computation is now settled; further Helds do not affect anything.
@@ -264,9 +286,8 @@ class Round:
         # stable snapshot at close_by, not on whoever they happened to hear from before quorum.
         self._peer_holds[from_] = msg.hashes
 
-    def _on_sig(self, msg: Sig, from_: NodeId) -> None:
-        body = _slice_body(msg.bucket, msg.slice_hash)
-        if not from_.verify(body, msg.sig):
+    def _on_sig(self, msg: Sig, from_: crypto.PublicKey) -> None:
+        if not msg.verify(from_):
             # XXX: dropped -- bad signature. Not evidence: anyone could craft a bad Sig with any
             # `from_` field on the wire, so this proves nothing about `from_`.
             return
@@ -339,7 +360,7 @@ class Round:
             raise RoundError("surviving() called before ratified()")
         return self._surviving
 
-    def equivocations(self) -> Iterable[tuple[NodeId, Sig, Sig]]:
+    def equivocations(self) -> Iterable[tuple[crypto.PublicKey, Sig, Sig]]:
         """Pairs of `Sig` messages from one peer that name different slices for this bucket.
 
         Round does not itself act on these -- shunning and eviction from the roster are separate
@@ -355,14 +376,63 @@ class Round:
 
     # -- internals ---------------------------------------------------------------------------- #
 
-    def _all_holdings(self) -> dict[NodeId, frozenset[crypto.Digest]]:
+    def _all_holdings(self) -> dict[crypto.PublicKey, frozenset[crypto.Digest]]:
         """Every set of holdings observed for this bucket: this node's plus every peer's.
 
         Includes the local set only after `add_local` has been called."""
-        got: dict[NodeId, frozenset[crypto.Digest]] = dict(self._peer_holds)
+        got: dict[crypto.PublicKey, frozenset[crypto.Digest]] = dict(self._peer_holds)
         if self._local is not None:
             got[self._me.public] = self._local
         return got
+
+    def _compute_slice(self, local: frozenset[crypto.Digest]) -> frozenset[crypto.Digest]:
+        """The largest set held (as a set) by at least `self._quorum` peers AND by us
+        (#slice-is-intersection), with ties broken by a bucket-keyed deterministic sort
+        (#slice-tie-break).
+
+        Enumerates quorum-sized subsets of the observed peers and picks the largest intersection.
+        For N ~ 11 and quorum ~ 8, C(11,8) = 165 subsets -- fast. For much larger rosters this is
+        not the algorithm to use, but 11 is the ceiling this design targets (#no-token-economics).
+
+        RESTRICTED TO ⊆ `local`. A node MUST NOT sign a slice containing transactions it does not
+        hold: it cannot check them, cannot produce their bodies for settlement, and (worst) is
+        attesting to something it hasn't verified. Filtering candidates to those subsets of `local`
+        means every slice this node signs is fully backed by evidence it holds. If the quorum-held
+        intersection over some subset of peers contains a tx we lack, we simply don't include that
+        tx in our own view -- other nodes that DO hold it may reach quorum without us, which is
+        correct.
+
+        Ties: several distinct maximal intersections. The block MUST be chosen by a deterministic
+        randomised sort keyed by the bucket, so (a) every honest node picks the same one and (b) an
+        adversary cannot pre-mine transactions to guarantee winning in every future round -- the
+        sort's ordering changes with `bucket`. `H(bucket, sorted(candidate))` is the sort key; the
+        smallest such digest wins."""
+        holdings = self._all_holdings()
+        if len(holdings) < self._quorum:
+            return frozenset()
+        peers = sorted(holdings)
+        candidates: set[frozenset[crypto.Digest]] = set()
+        max_size = 0
+        for combo in combinations(peers, self._quorum):
+            it = iter(combo)
+            inter = holdings[next(it)]
+            for p in it:
+                inter = inter & holdings[p]
+                if not inter:
+                    break
+            inter = inter & local  # restrict to what we can back
+            if len(inter) < max_size:
+                continue
+            if len(inter) > max_size:
+                max_size = len(inter)
+                candidates = {inter}
+            else:
+                candidates.add(inter)
+        if not candidates:
+            return frozenset()
+        if len(candidates) == 1:
+            return next(iter(candidates))
+        return min(candidates, key=lambda c: _slice_hash(self._bucket, c))
 
     def _finalize(self) -> None:
         """Called by `tick` when `close_by` has passed. Compute the slice from whatever holdings
@@ -375,10 +445,8 @@ class Round:
         local = self._local
         if local is None:  # unreachable given tick's guard, but the narrower makes ty happy
             return
-        slice_hashes = _compute_slice(self._all_holdings(), self._quorum, self._bucket, local)
-        slice_hash = _slice_id(self._bucket, slice_hashes)
-        body = _slice_body(self._bucket, slice_hash)
-        my_sig = Sig(self._bucket, slice_hash, self._me.sign(body))
+        slice_hashes = self._compute_slice(local)
+        my_sig = Sig.sign(self._me, self._bucket, _slice_hash(self._bucket, slice_hashes))
         self._my_sig = my_sig
         self._peer_sigs[self._me.public] = my_sig  # my own vote counts toward my own ratification
         self._surviving = tuple(sorted(h for h in local if h not in slice_hashes))
@@ -411,73 +479,3 @@ class Round:
             sigs=tuple(sigs),
         )
         self._state = State.GONE
-
-
-# --------------------------------------------------------------------------------------------- #
-# Slice computation and identity                                                                #
-# --------------------------------------------------------------------------------------------- #
-
-
-def _slice_body(bucket: Bucket, slice_hash: crypto.Digest) -> bytes:
-    """The bytes a peer signs to endorse a slice. Bucket-bound, so a signature over one bucket's
-    slice cannot be replayed against another bucket."""
-    return codec.encode([_SLICE_DOMAIN, bucket, slice_hash])
-
-
-def _slice_id(bucket: Bucket, hashes: frozenset[crypto.Digest]) -> crypto.Digest:
-    """`H(bucket, sorted(hashes))` -- a canonical identity two nodes computing the same slice
-    agree on. Bucket-bound so identical slices in different buckets have different ids."""
-    return crypto.h(codec.encode([bucket, sorted(hashes)]))
-
-
-def _compute_slice(
-    holdings: dict[NodeId, frozenset[crypto.Digest]],
-    quorum_size: int,
-    bucket: Bucket,
-    local: frozenset[crypto.Digest],
-) -> frozenset[crypto.Digest]:
-    """The largest set held (as a set) by at least `quorum_size` peers AND by us
-    (#slice-is-intersection), with ties broken by a bucket-keyed deterministic sort
-    (#slice-tie-break).
-
-    Enumerates quorum-sized subsets of the observed peers and picks the largest intersection.
-    For N ~ 11 and quorum ~ 8, C(11,8) = 165 subsets -- fast. For much larger rosters this is
-    not the algorithm to use, but 11 is the ceiling this design targets (#no-token-economics).
-
-    RESTRICTED TO ⊆ `local`. A node MUST NOT sign a slice containing transactions it does not
-    hold: it cannot check them, cannot produce their bodies for settlement, and (worst) is
-    attesting to something it hasn't verified. Filtering candidates to those subsets of `local`
-    means every slice this node signs is fully backed by evidence it holds. If the quorum-held
-    intersection over some subset of peers contains a tx we lack, we simply don't include that tx
-    in our own view -- other nodes that DO hold it may reach quorum without us, which is correct.
-
-    Ties: several distinct maximal intersections. The block MUST be chosen by a deterministic
-    randomised sort keyed by the bucket, so (a) every honest node picks the same one and (b) an
-    adversary cannot pre-mine transactions to guarantee winning in every future round -- the
-    sort's ordering changes with `bucket`. `H(bucket, sorted(candidate))` is the sort key; the
-    smallest such digest wins."""
-    if len(holdings) < quorum_size:
-        return frozenset()
-    peers = sorted(holdings)
-    candidates: set[frozenset[crypto.Digest]] = set()
-    max_size = 0
-    for combo in combinations(peers, quorum_size):
-        it = iter(combo)
-        inter = holdings[next(it)]
-        for p in it:
-            inter = inter & holdings[p]
-            if not inter:
-                break
-        inter = inter & local  # restrict to what we can back
-        if len(inter) < max_size:
-            continue
-        if len(inter) > max_size:
-            max_size = len(inter)
-            candidates = {inter}
-        else:
-            candidates.add(inter)
-    if not candidates:
-        return frozenset()
-    if len(candidates) == 1:
-        return next(iter(candidates))
-    return min(candidates, key=lambda c: _slice_id(bucket, c))

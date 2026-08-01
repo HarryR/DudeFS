@@ -19,13 +19,30 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum, auto
 from typing import NamedTuple
 
 from ..core import crypto
+from ..core.units import Millis
 from .envelope import EnvelopeError, Frame, SignedEnvelope, seal, unseal
 from .link import Link, Peer
-from .mailbox import Expired, Mailbox, Millis, Reply, Transmit
+from .mailbox import Expired, Mailbox, Reply, Transmit
 from .plan import Decision, GiveUp, Plan, Send, Wait
+
+
+class Recipient(Enum):
+    """Where an outbound message goes. A `crypto.PublicKey` is a directed send; `ALL` is broadcast.
+
+    An enum-plus-union rather than `PublicKey | None` because `None` is exactly the "did you forget
+    a case" trap the codebase's closed enums exist to prevent (#no-exceptions-for-control-flow).
+
+    Lives here because expansion (`ALL` -> every known peer) is `Postman.recipients` -- Postman
+    owns the peer set and is the only object that can turn `ALL` into a concrete address list."""
+
+    ALL = auto()
+
+
+type Target = crypto.PublicKey | Recipient
 
 
 class Received(NamedTuple):
@@ -146,6 +163,15 @@ class Postman:
         link = peer.links.get(reply.address)
         if link is not None:
             link.reply(now, reply.rtt)
+
+    def recipients(self, target: Target) -> list[crypto.PublicKey]:
+        """Expand a `Target` into concrete peer keys, excluding ourselves. `Recipient.ALL` fans
+        out to every known peer; a specific key resolves to itself (empty if it happens to be
+        our own key). The one place `ALL` is turned into a concrete address list, because peers
+        live here."""
+        if target is Recipient.ALL:
+            return [p for p in self.peers if p != self.me.public]
+        return [target] if target != self.me.public else []
 
     def _reap(self, now: Millis) -> tuple[Expired, ...]:
         """Expire deadlines, charging a link ONLY when it was the sole attempt.

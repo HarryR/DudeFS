@@ -18,9 +18,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 from ..core import crypto
+from ..core.units import Millis
 from .link import Estimator, Link, Peer
-
-type Millis = int
 
 
 class Stalled(Enum):

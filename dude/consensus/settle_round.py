@@ -34,10 +34,10 @@ from enum import Enum, auto
 from .. import quorum
 from ..core import codec, crypto
 from ..core.errors import DudeError
-from .round import Block, NodeId, Recipient, Target
-
-type Height = int
-type Millis = int
+from ..core.units import Millis
+from ..net.postman import Recipient, Target
+from ..store.layer import Index
+from .round import Block
 
 _ANCHORS_DOMAIN = b"dude.settle_round.anchors"
 
@@ -54,15 +54,16 @@ class Anchors:
     """The post-apply commitments a SettleRound signs and quorum-agrees on
     (SPECv2 #settlement-signs-post-anchors).
 
-    `height` is the log position this block will occupy once SETTLED. Assigned by the
-    Coordinator in block order (#pipelining), not derivable from the block itself -- so it lives
-    here rather than on `Block`.
+    `height` is the log `Index` this block will occupy once SETTLED. Assigned by the Coordinator
+    in block order (#pipelining), not derivable from the block itself -- so it lives here rather
+    than on `Block`. Same underlying type as `store.head` and `Entry.idx`; the two-name-per-type
+    trap the audit is for (`Height` was a synonym for `Index` -- deleted).
 
     All four fields are what a replayer or a light client checks against. Equal `Anchors` between
     two nodes at the same slice means byte-identical post-apply state; anything else is a
     divergence."""
 
-    height: Height
+    height: Index
     state_root: crypto.Digest
     acc_state: crypto.Accumulator
     acc_log: crypto.Accumulator
@@ -71,18 +72,43 @@ class Anchors:
 @dataclass(frozen=True, slots=True)
 class SettleSig:
     """A peer's signed statement that they computed these `anchors` after applying the block
-    with `slice_hash`. The signature covers `_payload(slice_hash, anchors)`.
+    with `slice_hash`. Constructed via `SettleSig.sign(kp, slice_hash, anchors)`; verified via
+    `msg.verify(pk)`.
 
-    `slice_hash` is `dude.round._slice_id(bucket, hashes)`, exactly as Round computes it, so
-    the sig binds this signature to the ratified block and cannot be replayed against any
-    other slice or bucket."""
+    `slice_hash` is `block.slice_hash`, exactly as Round computes it, so the sig binds this
+    signature to the ratified block and cannot be replayed against any other slice or bucket.
+    Domain-tagged so a SettleSig cannot be replayed as a Round Sig or vice versa; slice-bound so
+    it cannot be replayed across blocks; anchors-bound so a peer changing its mind about the
+    outcome is detectable rather than silent."""
 
     slice_hash: crypto.Digest
     anchors: Anchors
     sig: crypto.Signature
 
+    @classmethod
+    def sign(cls, kp: crypto.Keypair, slice_hash: crypto.Digest, anchors: Anchors) -> SettleSig:
+        """Build a SettleSig for `(slice_hash, anchors)` signed by `kp`."""
+        return cls(slice_hash, anchors, kp.sign(_settle_payload(slice_hash, anchors)))
 
-type SettleMsg = SettleSig
+    def verify(self, pk: crypto.PublicKey) -> bool:
+        """True if this SettleSig's signature is a valid signature by `pk` over what it claims to
+        cover. The caller decides what to do with a False -- SettleRound drops, tests assert."""
+        return pk.verify(_settle_payload(self.slice_hash, self.anchors), self.sig)
+
+
+def _settle_payload(slice_hash: crypto.Digest, anchors: Anchors) -> bytes:
+    """The bytes a SettleSig's signature covers. Shared between `sign` (before the message
+    exists) and `verify` (after) so the shape lives in exactly one place."""
+    return codec.encode(
+        [
+            _ANCHORS_DOMAIN,
+            slice_hash,
+            anchors.height,
+            anchors.state_root,
+            anchors.acc_state,
+            anchors.acc_log,
+        ]
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,7 +152,7 @@ class SettleRound:
         self,
         block: Block,
         me: crypto.Keypair,
-        roster: tuple[NodeId, ...],
+        roster: tuple[crypto.PublicKey, ...],
         anchors: Anchors,
         now: Millis,  # noqa: ARG002 -- reserved for hang-detection when #settlement-may-hang lands
     ):
@@ -137,24 +163,24 @@ class SettleRound:
         self._roster = roster
         self._quorum = quorum.size(len(roster))
         self._anchors = anchors
-        self._slice_hash = _slice_id_of(block)
+        self._slice_hash = block.slice_hash
         # Pre-verified sigs, keyed by signer. Only sigs whose anchors match ours land here.
-        self._sigs: dict[NodeId, crypto.Signature] = {}
+        self._sigs: dict[crypto.PublicKey, crypto.Signature] = {}
         # Peer sigs whose anchors did NOT match. Kept for observability, never counted.
-        self._divergences: list[tuple[NodeId, Anchors]] = []
-        self._outbox: list[tuple[Target, SettleMsg]] = []
+        self._divergences: list[tuple[crypto.PublicKey, Anchors]] = []
+        self._outbox: list[tuple[Target, SettleSig]] = []
         self._state = SettleState.COLLECTING
         self._settled: SettledBlock | None = None
 
         # Sign our own anchors immediately and broadcast.
-        my_sig = me.sign(_payload(self._slice_hash, anchors))
-        self._sigs[me.public] = my_sig
-        self._outbox.append((Recipient.ALL, SettleSig(self._slice_hash, anchors, my_sig)))
+        my_msg = SettleSig.sign(me, self._slice_hash, anchors)
+        self._sigs[me.public] = my_msg.sig
+        self._outbox.append((Recipient.ALL, my_msg))
         self._try_settle()
 
     # -- inbound ----------------------------------------------------------------------------- #
 
-    def receive(self, msg: SettleSig, from_: NodeId, now: Millis) -> None:  # noqa: ARG002 -- `now` reserved
+    def receive(self, msg: SettleSig, from_: crypto.PublicKey, now: Millis) -> None:  # noqa: ARG002 -- `now` reserved
         """Consume one peer's SettleSig for this block.
 
         Verifies the signature, checks the slice binding, and either counts the sig toward the
@@ -174,8 +200,7 @@ class SettleRound:
             return  # our own sig already counted
         if msg.slice_hash != self._slice_hash:
             return  # wrong block
-        payload = _payload(msg.slice_hash, msg.anchors)
-        if not from_.verify(payload, msg.sig):
+        if not msg.verify(from_):
             return  # invalid signature; drop
         if msg.anchors != self._anchors:
             # Divergence: peer computed different anchors from the same slice. Their bug, their
@@ -192,7 +217,7 @@ class SettleRound:
 
     # -- outbound ---------------------------------------------------------------------------- #
 
-    def outbox(self) -> Iterable[tuple[Target, SettleMsg]]:
+    def outbox(self) -> Iterable[tuple[Target, SettleSig]]:
         """Drain queued outbound messages. Called by the Coordinator after each tick / receive."""
         drained = tuple(self._outbox)
         self._outbox.clear()
@@ -210,7 +235,7 @@ class SettleRound:
         """The settled block once a quorum has converged, else None."""
         return self._settled
 
-    def divergences(self) -> tuple[tuple[NodeId, Anchors], ...]:
+    def divergences(self) -> tuple[tuple[crypto.PublicKey, Anchors], ...]:
         """Peer SettleSigs whose anchors disagreed with ours. Evidence for the observability
         layer to act on; empty tuple in the honest case (SPECv2 #settlement-quorum-on-anchors)."""
         return tuple(self._divergences)
@@ -237,31 +262,3 @@ class SettleRound:
             settle_sigs=tuple(sigs),
         )
         self._state = SettleState.SETTLED
-
-
-# ------------------------------------------------------------------------------------------- #
-# Signature payload and slice-hash derivation                                                 #
-# ------------------------------------------------------------------------------------------- #
-
-
-def _payload(slice_hash: crypto.Digest, anchors: Anchors) -> bytes:
-    """The bytes a peer signs to endorse post-apply anchors for a slice. Domain-tagged so a
-    SettleSig cannot be replayed as a Round Sig or vice versa; slice-bound so it cannot be
-    replayed across blocks; anchors-bound so a peer changing its mind about the outcome is
-    detectable rather than silent."""
-    return codec.encode(
-        [
-            _ANCHORS_DOMAIN,
-            slice_hash,
-            anchors.height,
-            anchors.state_root,
-            anchors.acc_state,
-            anchors.acc_log,
-        ]
-    )
-
-
-def _slice_id_of(block: Block) -> crypto.Digest:
-    """The block's slice_hash, computed as `dude.round._slice_id(bucket, hashes)` would -- same
-    domain, same shape, so SettleSig binds to exactly the identity Round's Sig ratified."""
-    return crypto.h(codec.encode([block.bucket, list(block.hashes)]))

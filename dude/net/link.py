@@ -28,10 +28,9 @@ from typing import NamedTuple, Protocol
 
 from ..core import crypto
 from ..core.errors import DudeError
+from ..core.units import Millis
 from .address import Address, Endpoint
 from .envelope import Frame
-
-type Millis = int
 
 
 class LinkError(DudeError):

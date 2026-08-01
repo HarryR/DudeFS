@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import unittest
 
-from ..consensus.round import Held, Round, Sig, _slice_body
+from ..consensus.round import Held, Round, Sig
 from ..consensus.round_adapter import (
     RoundAdapter,
     RoundAdapterError,
@@ -42,9 +42,7 @@ class TestEncodeDecodeRoundtrip(unittest.TestCase):
 
     def test_sig_roundtrips(self):
         kp = crypto.Keypair.generate()
-        slice_hash = crypto.h(b"a-slice")
-        body_bytes = _slice_body(3, slice_hash)
-        original = Sig(bucket=3, slice_hash=slice_hash, sig=kp.sign(body_bytes))
+        original = Sig.sign(kp, 3, crypto.h(b"a-slice"))
         verb, body = encode(original)
         self.assertIs(verb, Verb.SIG)
         got = decode(verb, body)
@@ -69,8 +67,7 @@ class TestBucketOf(unittest.TestCase):
 
     def test_reads_the_bucket_from_a_sig_body(self):
         kp = crypto.Keypair.generate()
-        h = crypto.h(b"s")
-        _, body = encode(Sig(bucket=99, slice_hash=h, sig=kp.sign(_slice_body(99, h))))
+        _, body = encode(Sig.sign(kp, 99, crypto.h(b"s")))
         self.assertEqual(bucket_of(body), 99)
 
     def test_malformed_body_raises(self):

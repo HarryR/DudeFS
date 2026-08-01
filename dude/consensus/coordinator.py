@@ -42,19 +42,18 @@ from dataclasses import dataclass, field
 
 from ..core import crypto
 from ..core.errors import InvariantError
+from ..core.units import Millis
 from ..net.envelope import SignedEnvelope
 from ..store import Layer, Store, settle
 from ..store.management import Management
 from ..store.ops import SignedTransaction
 from ..store.store import log_element
 from ..tunables import Tunables
-from .mempool import Mempool, Refusal
-from .round import Block, Bucket, Round
+from .mempool import Bucket, Mempool, Refusal
+from .round import Block, Round
 from .round_adapter import RoundAdapter, RoundAdapterError, bucket_of
 from .settle_adapter import SettleAdapter, SettleAdapterError, slice_hash_of
-from .settle_round import Anchors, SettleRound, _slice_id_of
-
-type Millis = int
+from .settle_round import Anchors, SettleRound
 
 
 @dataclass(slots=True)
@@ -157,7 +156,7 @@ class Coordinator:
             sh = slice_hash_of(env.env.body)
         except SettleAdapterError:
             return
-        if self.settling is None or _slice_id_of(self.settling.block) != sh:
+        if self.settling is None or self.settling.block.slice_hash != sh:
             return  # not for the block we are settling
         try:
             self.settle_adapter.deliver(env, self.settling.settle_round, now)

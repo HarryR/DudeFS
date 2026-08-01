@@ -7,8 +7,8 @@
 # incoming message belongs to -- that mapping is slice_hash -> SettleRound and it belongs to the
 # `Coordinator` (Stage 3). Three functions:
 #
-#     encode(msg)          SettleMsg   -> (Verb, body_bytes)
-#     decode(verb, body)   (Verb, bytes) -> SettleMsg
+#     encode(msg)          SettleSig     -> (Verb, body_bytes)
+#     decode(verb, body)   (Verb, bytes) -> SettleSig
 #     slice_hash_of(body)  body_bytes  -> Digest  (peek without full decode, so the Coordinator
 #                                                  can dispatch to the right SettleRound instance)
 #
@@ -19,12 +19,10 @@ from __future__ import annotations
 
 from ..core import codec, crypto
 from ..core.errors import DudeError
+from ..core.units import Millis
 from ..net.envelope import Envelope, SignedEnvelope, Verb, new_message_id
 from ..net.postman import Postman
-from .round import NodeId, Recipient, Target
-from .settle_round import Anchors, SettleMsg, SettleRound, SettleSig
-
-type Millis = int
+from .settle_round import Anchors, SettleRound, SettleSig
 
 
 class SettleAdapterError(DudeError):
@@ -40,7 +38,7 @@ class SettleAdapterError(DudeError):
 # --------------------------------------------------------------------------------------------- #
 
 
-def encode(msg: SettleMsg) -> tuple[Verb, bytes]:
+def encode(msg: SettleSig) -> tuple[Verb, bytes]:
     """A SettleRound message to its wire form: `(verb, body_bytes)`.
 
     Body layout: `[slice_hash, height, state_root, acc_state, acc_log, sig]`. slice_hash comes
@@ -51,7 +49,7 @@ def encode(msg: SettleMsg) -> tuple[Verb, bytes]:
     )
 
 
-def decode(verb: Verb, body: bytes) -> SettleMsg:
+def decode(verb: Verb, body: bytes) -> SettleSig:
     """The inverse of `encode`. Raises `SettleAdapterError` on malformed body; the caller is
     expected to be inside the crash-only boundary that catches `DudeError`."""
     if verb is not Verb.SETTLE_SIG:
@@ -107,7 +105,7 @@ class SettleAdapter:
         Preserved as `Target` in case a future scenario adds directed sends."""
         for target, msg in round_.outbox():
             verb, body = encode(msg)
-            for peer in _resolve(target, self.postman, self.me.public):
+            for peer in self.postman.recipients(target):
                 env = Envelope(peer, verb, new_message_id(), body).sign(self.me, now)
                 # No answer awaited: convergence is by observation, not by request/reply.
                 self.postman.mailbox.post(env, now, self.ttl, await_reply=False)
@@ -120,13 +118,6 @@ class SettleAdapter:
         binding, and updates state. Foreign-slice and bad-sig drops happen inside SettleRound;
         this method just decodes and hands over."""
         round_.receive(decode(env.env.verb, env.env.body), from_=env.frm, now=now)
-
-
-def _resolve(target: Target, postman: Postman, me: crypto.PublicKey) -> list[NodeId]:
-    """Expand a `Target` into concrete peer keys via the Postman's known peer set."""
-    if target is Recipient.ALL:
-        return [p for p in postman.peers if p != me]
-    return [target] if target != me else []
 
 
 __all__ = ["SettleAdapter", "SettleAdapterError", "decode", "encode", "slice_hash_of"]

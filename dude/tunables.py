@@ -42,10 +42,9 @@ from dataclasses import dataclass, field
 
 from .consensus.mempool import Tunables as MempoolTunables
 from .core.errors import InvariantError
+from .core.units import Millis
 from .net.link import LinkTunables
 from .net.plan import PlanTunables
-
-type Millis = int
 
 
 @dataclass(frozen=True, slots=True)

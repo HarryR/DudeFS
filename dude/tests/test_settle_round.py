@@ -10,16 +10,16 @@ from __future__ import annotations
 
 import unittest
 
-from dude.consensus.round import Block, Recipient
+from dude.consensus.round import Block
 from dude.consensus.settle_round import (
     Anchors,
     SettleError,
     SettleRound,
     SettleSig,
     SettleState,
-    _slice_id_of,
 )
-from dude.core import codec, crypto
+from dude.core import crypto
+from dude.net.postman import Recipient
 
 T0 = 1_700_000_000_000
 DELTA = 1_000
@@ -226,7 +226,7 @@ class TestBadInputIsSilentlyDropped(unittest.TestCase):
 
         # A SettleSig claiming to be from keys[1] with a bogus signature
         forged = SettleSig(
-            slice_hash=_slice_id_of(block),
+            slice_hash=block.slice_hash,
             anchors=anchors,
             sig=crypto.Signature(bytes(64)),
         )
@@ -245,9 +245,7 @@ class TestBadInputIsSilentlyDropped(unittest.TestCase):
         r0 = SettleRound(our_block, keys[0], roster, _anchors(), T0)
 
         # Genuine sig, but over the OTHER block's slice_hash
-        other_slice = _slice_id_of(other_block)
-        sig = keys[1].sign(_payload_for_test(other_slice, _anchors()))
-        wrong = SettleSig(slice_hash=other_slice, anchors=_anchors(), sig=sig)
+        wrong = SettleSig.sign(keys[1], other_block.slice_hash, _anchors())
         r0.receive(wrong, from_=keys[1].public, now=T0)
 
         # Not counted
@@ -263,9 +261,7 @@ class TestBadInputIsSilentlyDropped(unittest.TestCase):
         r0 = SettleRound(block, keys[0], roster, anchors, T0)
 
         # A perfectly valid signature -- but from a key that is not in the roster.
-        slice_hash = _slice_id_of(block)
-        sig = stranger.sign(_payload_for_test(slice_hash, anchors))
-        msg = SettleSig(slice_hash=slice_hash, anchors=anchors, sig=sig)
+        msg = SettleSig.sign(stranger, block.slice_hash, anchors)
         r0.receive(msg, from_=stranger.public, now=T0)
 
         self.assertEqual(r0.state(), SettleState.COLLECTING)
@@ -299,36 +295,13 @@ class TestLateArrivalIsTolerated(unittest.TestCase):
         # Fabricate another matching sig from a "new" peer -- won't be counted anyway (outside
         # the roster in this setup), but the point is state is stable.
         outsider = crypto.Keypair.generate()
-        slice_hash = _slice_id_of(_block())
-        sig = outsider.sign(_payload_for_test(slice_hash, _anchors()))
         r0.receive(
-            SettleSig(slice_hash=slice_hash, anchors=_anchors(), sig=sig),
+            SettleSig.sign(outsider, _block().slice_hash, _anchors()),
             from_=outsider.public,
             now=T0,
         )
         self.assertEqual(r0.state(), SettleState.SETTLED)
         self.assertEqual(r0.settled(), first)
-
-
-# --------------------------------------------------------------------------------------------- #
-# helpers                                                                                       #
-# --------------------------------------------------------------------------------------------- #
-
-
-def _payload_for_test(slice_hash: crypto.Digest, anchors: Anchors) -> bytes:
-    """Reimplementation of the module-private payload helper, so tests can build sigs for
-    verifying peer-input hygiene. If _payload changes, this test-facing helper does too --
-    that is intentional (the wire shape is under test)."""
-    return codec.encode(
-        [
-            b"dude.settle_round.anchors",
-            slice_hash,
-            anchors.height,
-            anchors.state_root,
-            anchors.acc_state,
-            anchors.acc_log,
-        ]
-    )
 
 
 if __name__ == "__main__":

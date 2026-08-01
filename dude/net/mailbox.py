@@ -32,10 +32,9 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 from ..core import crypto
+from ..core.units import Millis
 from .address import Address
 from .envelope import MessageId, SignedEnvelope
-
-type Millis = int
 
 
 class Expiry(Enum):

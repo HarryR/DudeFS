@@ -21,11 +21,11 @@ from __future__ import annotations
 
 from ..core import codec, crypto
 from ..core.errors import DudeError
+from ..core.units import Millis
 from ..net.envelope import Envelope, MessageId, SignedEnvelope, Verb, new_message_id
 from ..net.postman import Postman
-from .round import Bucket, Held, Recipient, Round, RoundMsg, Sig, Target
-
-type Millis = int
+from .mempool import Bucket
+from .round import Held, Round, RoundMsg, Sig
 
 
 class RoundAdapterError(DudeError):
@@ -106,7 +106,7 @@ class RoundAdapter:
         directed sends (e.g., a "please retransmit" request to one peer)."""
         for target, msg in round_.outbox():
             verb, body = encode(msg)
-            for peer in _resolve(target, self.postman, self.me.public):
+            for peer in self.postman.recipients(target):
                 env = Envelope(peer, verb, new_message_id(), body).sign(self.me, now)
                 # No answer is awaited: `HELD` and `SIG` are not correlated by mid. Convergence
                 # is by observation over the collect window, not by request/reply.
@@ -120,13 +120,6 @@ class RoundAdapter:
         state. Foreign-bucket and bad-sig drops happen inside Round; this method just decodes and
         hands over."""
         round_.receive(decode(env.env.verb, env.env.body), from_=env.frm, now=now)
-
-
-def _resolve(target: Target, postman: Postman, me: crypto.PublicKey) -> list[crypto.PublicKey]:
-    """Expand a `Target` into concrete peer keys via the Postman's known peer set."""
-    if target is Recipient.ALL:
-        return [p for p in postman.peers if p != me]
-    return [target] if target != me else []
 
 
 __all__ = ["MessageId", "RoundAdapter", "RoundAdapterError", "bucket_of", "decode", "encode"]
