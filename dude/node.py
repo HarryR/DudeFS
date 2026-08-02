@@ -37,7 +37,14 @@ from .net.postman import Postman
 from .net.transports import address_of
 from .store import Store, ops
 from .store.management import Management
-from .sync.adapter import SyncAdapter
+from .sync.adapter import (
+    GetBlock,
+    Refused,
+    SyncAdapter,
+    SyncAdapterError,
+    SyncMsg,
+    SyncRefusal,
+)
 from .sync.follower import Follower, serve_getblock, serve_height
 from .tunables import DEFAULT, Tunables
 
@@ -234,28 +241,47 @@ class Node:
         self.coordinator.on_settle_msg(env, now)
 
     def _on_height(self, env: SignedEnvelope, now: Millis) -> None:
-        """A peer is asking for our current head. Answer with `HEIGHT_REPLY (block_num, tip_hash)`
+        """A peer is asking for our current head. Answer with `HeightReply(block_num, tip_hash)`
         via the stateless `serve_height` helper (SPECv2 #height-poll-is-the-trigger)."""
-        verb, body = serve_height(self.store)
-        self._reply(env, verb, body, now)
+        self.sync_adapter.reply(env, serve_height(self.store), now)
 
     def _on_height_reply(self, env: SignedEnvelope, now: Millis) -> None:
-        """A peer's answer to our own HEIGHT poll. Route to the Follower, which updates its
-        `_heads` map and may fire fork detection or start a pull on the next tick."""
-        self.follower.receive(env.env.verb, env.env.body, env.frm, now)
+        """A peer's answer to our own HEIGHT poll. Decode, route to the Follower, which updates
+        its `_heads` map and may fire fork detection or start a pull on the next tick."""
+        try:
+            msg = SyncMsg.decode(env.env.verb, env.env.body)
+        except SyncAdapterError:
+            return  # XXX: dropped -- malformed HEIGHT_REPLY body from this peer.
+        self.follower.receive(msg, env.frm, now)
 
     def _on_getblock(self, env: SignedEnvelope, now: Millis) -> None:
         """A peer is asking for a SETTLED block. Answer via `serve_getblock` -- returns either
-        `SETTLED_BLOCK` (block + bodies) or `REFUSED` with a `SyncRefusal` reason. Stateless;
-        reads from `store.settled_at` + `store.bodies_of_block`."""
-        verb, body = serve_getblock(self.store, env.env.body)
-        self._reply(env, verb, body, now)
+        `SettledBlockReply` (block + bodies) or `Refused` with a `SyncRefusal` reason. A
+        malformed `GetBlock` body earns `Refused(UNKNOWN)` -- the requester's next-peer path
+        is uniform regardless of failure mode."""
+        try:
+            req = SyncMsg.decode(env.env.verb, env.env.body)
+        except SyncAdapterError:
+            self.sync_adapter.reply(env, Refused(reason=SyncRefusal.UNKNOWN), now)
+            return
+        # verb-routed here, decode returns GetBlock; guard for the type checker.
+        if not isinstance(req, GetBlock):
+            return
+        self.sync_adapter.reply(env, serve_getblock(self.store, req), now)
 
     def _on_settled_block(self, env: SignedEnvelope, now: Millis) -> None:
-        """A peer's answer to our GETBLOCK. Route to the Follower, which runs the full verify
-        pipeline (chain link + settle_sigs + body-sig + preview-anchors-match) and commits on
-        success -- or drops the peer on any failure (#sync-is-log-replay)."""
-        self.follower.receive(env.env.verb, env.env.body, env.frm, now)
+        """A peer's answer to our GETBLOCK. Decode, route to the Follower, which runs the full
+        verify pipeline (chain link + settle_sigs + body-sig + preview-anchors-match) and
+        commits on success -- or drops the peer on any failure (#sync-is-log-replay). A decode
+        failure means the peer served garbage; drop as a pull source via `on_bad_reply`."""
+        try:
+            msg = SyncMsg.decode(env.env.verb, env.env.body)
+        except (SyncAdapterError, DudeError):
+            # SettleError (from SettledBlockWithBodies.decode) is a DudeError; either shape of
+            # decode failure means the pulling peer served garbage.
+            self.follower.on_bad_reply(env.frm)
+            return
+        self.follower.receive(msg, env.frm, now)
 
     # -- the round ----------------------------------------------------------------------------- #
 
@@ -271,14 +297,14 @@ class Node:
         self.postman.tick(now)
 
     def _flush_follower(self, now: Millis) -> None:
-        """Post the Follower's outbox to the mailbox. Follower emits `(peer, verb, body)` tuples
-        for outbound HEIGHT / GETBLOCK requests; the sync-adapter wraps them in signed envelopes
-        and posts with `await_reply=True` so the mailbox correlates the answer (HEIGHT_REPLY,
-        SETTLED_BLOCK, REFUSED)."""
-        for peer, verb, body in self.follower.outbox():
+        """Post the Follower's outbox to the mailbox. Follower emits `(peer, SyncMsg)` pairs for
+        outbound `HeightAsk` / `GetBlock` requests; the sync-adapter wraps them in signed
+        envelopes and posts with `await_reply=True` so the mailbox correlates the answer
+        (`HeightReply`, `SettledBlockReply`, `Refused`)."""
+        for peer, msg in self.follower.outbox():
             if peer not in self.postman.peers:
                 continue  # peer not reachable; drop rather than raise
-            self.sync_adapter.send(peer, verb, body, now, await_reply=True)
+            self.sync_adapter.send(peer, msg, now, await_reply=True)
 
     # -- outbound ------------------------------------------------------------------------------ #
 
@@ -291,7 +317,7 @@ class Node:
         for who in self.postman.peers:
             if who in (self.me.public, skip):
                 continue
-            env = Envelope(who, verb, _mid(), body).sign(self.me, now)
+            env = Envelope(who, verb, new_message_id(), body).sign(self.me, now)
             # An announcement, so no answer is awaited: `BODIES` and `REFUSED` are `REPLIES`, which
             # `deliver` retires without needing a registered question.
             self.postman.mailbox.post(env, now, self.tunables.net.ttl, await_reply=False)
@@ -302,10 +328,6 @@ class Node:
         self.postman.mailbox.post(
             to.answer(verb, body).sign(self.me, now), now, self.tunables.net.ttl, await_reply=False
         )
-
-
-def _mid() -> MessageId:
-    return new_message_id()
 
 
 _DISPATCH: dict[Verb, Callable[[Node, SignedEnvelope, Millis], None]] = {

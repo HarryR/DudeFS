@@ -20,15 +20,18 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from abc import ABC, abstractmethod
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from enum import Enum, auto
 from itertools import combinations
+from typing import ClassVar
 
 from .. import quorum
 from ..core import codec, crypto
 from ..core.errors import DudeError
 from ..core.units import Millis
+from ..net.envelope import Verb
 from ..net.postman import Recipient, Target
 from .mempool import Bucket
 
@@ -45,13 +48,80 @@ class RoundError(DudeError):
 # --------------------------------------------------------------------------------------------- #
 # Protocol messages                                                                             #
 #                                                                                                #
-# Round OWNS these. They are the abstract shape the state machine operates on. The wire encoding #
-# (verbs, envelopes, framing) is `RoundAdapter`'s concern and does not appear here.              #
+# Round OWNS these. They are the abstract shape the state machine operates on. Each subclass    #
+# also carries its own wire encoding (`encode()` + classmethod `_decode(body)`); dispatch by     #
+# verb is on the `RoundMsg` base via `RoundMsg.decode(verb, body)`. `RoundAdapter` is a thin    #
+# Postman binding around those methods (see round_adapter.py).                                   #
 # --------------------------------------------------------------------------------------------- #
 
 
+class RoundAdapterError(DudeError):
+    """A wire message that names a Round verb but is not one -- malformed body, wrong shape.
+
+    Not for a `Sig` whose signature does not verify (that is Round's own concern, checked in
+    `Round.receive`), and not for a foreign-bucket message (Round drops those silently). This is
+    for messages that could not have come from an honest peer using the same protocol at all."""
+
+
+class RoundMsg(ABC):
+    """Base of Round's protocol vocabulary. Every subclass:
+
+      * is a frozen dataclass whose leading field is `bucket: Bucket`;
+      * declares `verb: ClassVar[Verb]` -- its wire tag;
+      * implements `_encode(self) -> bytes` -- its body-only wire form;
+      * implements classmethod `_decode(cls, body) -> Self` -- the body inverse;
+      * appears in `_ROUND_MSG_CLASSES` so `_DECODERS` sees it.
+
+    Instantiating `RoundMsg` directly is not meaningful -- `_encode` is abstract, so ABC guards
+    that at construction time. Use `msg.encode()` for the wire form (bundles verb + body),
+    `RoundMsg.decode(verb, body)` for inbound wire frames, and `RoundMsg.bucket_of(body)` for
+    the "peek without full decode" the Coordinator needs to route to the right Round instance.
+    """
+
+    verb: ClassVar[Verb]
+    """Wire tag for this message type. Each concrete subclass MUST assign a distinct `Verb`."""
+
+    bucket: Bucket
+    """Every Round message names its bucket in its FIRST wire field so `bucket_of` can read
+    it without fully decoding. Enforced by convention (every subclass's `_encode` places bucket
+    first) plus `bucket_of` reading only field zero."""
+
+    @abstractmethod
+    def _encode(self) -> bytes:
+        """The BODY bytes for this message. Subclass owns the layout; `encode()` wraps in the
+        verb. Deterministic and byte-canonical -- two nodes with identical `msg` values MUST
+        produce identical output."""
+
+    def encode(self) -> tuple[Verb, bytes]:
+        """The wire form of this message: `(verb, body_bytes)`. Composed from the class's
+        `verb` attribute and `_encode()`."""
+        return self.verb, self._encode()
+
+    @classmethod
+    def decode(cls, verb: Verb, body: bytes) -> RoundMsg:
+        """The inverse of `encode`: given a wire verb + body, dispatch to the matching
+        subclass's decoder. Raises `RoundAdapterError` on unknown verb or malformed body; the
+        caller sits inside a crash-only boundary that catches `DudeError`."""
+        try:
+            handler = _DECODERS[verb]
+        except KeyError as e:
+            raise RoundAdapterError(f"not a Round verb: {verb.name}") from e
+        return handler(body)
+
+    @classmethod
+    def bucket_of(cls, body: bytes) -> Bucket:
+        """The bucket named in a Round-verb body, extracted without fully decoding. The `HELD`
+        and `SIG` shapes both start with an int bucket. Used by the Coordinator to route the
+        message to the right Round instance before doing full validation."""
+        try:
+            p = codec.as_seq(codec.decode(body))
+            return codec.as_int(p[0])
+        except DudeError as e:
+            raise RoundAdapterError(f"cannot read bucket from body: {e}") from e
+
+
 @dataclass(frozen=True, slots=True)
-class Held:
+class Held(RoundMsg):
     """Advertisement: I hold these transaction hashes in my bucket for `bucket`.
 
     Encoding is per-hash for now; a future optimisation MAY compress via ECMH or set-reconciliation
@@ -60,12 +130,26 @@ class Held:
     A node MAY re-advertise the same or a superset (holdings only grow within a round -- there is
     no `unheld`). Peers accumulate; the latest advertisement wins per (peer, bucket)."""
 
+    verb: ClassVar[Verb] = Verb.HELD
+
     bucket: Bucket
     hashes: frozenset[crypto.Digest]
 
+    def _encode(self) -> bytes:
+        return codec.encode([self.bucket, sorted(self.hashes)])
+
+    @classmethod
+    def _decode(cls, body: bytes) -> Held:
+        try:
+            p = codec.as_seq(codec.decode(body), 2)
+            hashes = frozenset(crypto.Digest(codec.as_bytes(h)) for h in codec.as_seq(p[1]))
+            return cls(bucket=codec.as_int(p[0]), hashes=hashes)
+        except DudeError as e:
+            raise RoundAdapterError(f"malformed HELD body: {e}") from e
+
 
 @dataclass(frozen=True, slots=True)
-class Sig:
+class Sig(RoundMsg):
     """My signature over the slice I believe this bucket ratifies. Constructed via
     `Sig.sign(kp, bucket, slice_hash)`; verified via `msg.verify(pk)`.
 
@@ -76,6 +160,8 @@ class Sig:
 
     Bucket-bound, so a signature over one bucket's slice cannot be replayed against another
     bucket."""
+
+    verb: ClassVar[Verb] = Verb.SIG
 
     bucket: Bucket
     slice_hash: crypto.Digest
@@ -91,6 +177,21 @@ class Sig:
         cover. The caller decides what to do with a False -- Round drops, tests assert."""
         return pk.verify(_sig_payload(self.bucket, self.slice_hash), self.sig)
 
+    def _encode(self) -> bytes:
+        return codec.encode([self.bucket, self.slice_hash, self.sig])
+
+    @classmethod
+    def _decode(cls, body: bytes) -> Sig:
+        try:
+            p = codec.as_seq(codec.decode(body), 3)
+            return cls(
+                bucket=codec.as_int(p[0]),
+                slice_hash=crypto.Digest(codec.as_bytes(p[1])),
+                sig=crypto.Signature(codec.as_bytes(p[2])),
+            )
+        except DudeError as e:
+            raise RoundAdapterError(f"malformed SIG body: {e}") from e
+
 
 def _sig_payload(bucket: Bucket, slice_hash: crypto.Digest) -> bytes:
     """The bytes a Sig's signature covers. Shared between `sign` (before the message exists) and
@@ -98,7 +199,15 @@ def _sig_payload(bucket: Bucket, slice_hash: crypto.Digest) -> bytes:
     return codec.encode([_SLICE_DOMAIN, bucket, slice_hash])
 
 
-type RoundMsg = Held | Sig
+_ROUND_MSG_CLASSES: tuple[type[RoundMsg], ...] = (Held, Sig)
+"""The closed set of Round message subclasses. `_DECODERS` is derived from this; adding a new
+verb requires exactly two edits: define the subclass, add it here."""
+
+
+_DECODERS: dict[Verb, Callable[[bytes], RoundMsg]] = {
+    c.verb: c._decode  # noqa: SLF001 -- same-module dispatch table
+    for c in _ROUND_MSG_CLASSES
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -272,7 +381,7 @@ class Round:
             return
         if isinstance(msg, Held):
             self._on_held(msg, from_)
-        else:
+        elif isinstance(msg, Sig):
             self._on_sig(msg, from_)
 
     def _on_held(self, msg: Held, from_: crypto.PublicKey) -> None:
@@ -465,17 +574,14 @@ class Round:
         agreeing = {peer: sig for peer, sig in self._peer_sigs.items() if sig.slice_hash == want}
         if len(agreeing) < self._quorum:
             return
-        # Ratified. Build the Block: the roster-ordered bitmap + parallel signatures.
-        bits = bytearray(crypto.bitmap_size(len(self._roster)))
-        sigs: list[crypto.Signature] = []
-        for i, member in enumerate(self._roster):
-            if member in agreeing:
-                bits[i // 8] |= 1 << (7 - i % 8)
-                sigs.append(agreeing[member].sig)
+        # Ratified. Build the Block: the roster-ordered bitmap + parallel signatures, via
+        # the same `combine` primitive `Ed25519ListMultiSig.verify` will read on the other side.
+        shares = {i: agreeing[m].sig for i, m in enumerate(self._roster) if m in agreeing}
+        signers, sigs = crypto.Ed25519ListMultiSig.combine(shares, len(self._roster))
         self._ratified = Block(
             bucket=self._bucket,
             hashes=tuple(sorted(self._pending_slice_hashes)),
-            signers=crypto.SignerBitmap(bytes(bits)),
+            signers=signers,
             sigs=tuple(sigs),
         )
         self._state = State.GONE

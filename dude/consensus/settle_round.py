@@ -30,15 +30,26 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import Enum, auto
+from typing import ClassVar
 
 from .. import quorum
 from ..core import codec, crypto
 from ..core.errors import DudeError
 from ..core.units import Millis
+from ..net.envelope import Verb
 from ..net.postman import Recipient, Target
 from ..store.layer import Index
 from ..store.ops import SignedTransaction
 from .round import Block
+
+
+class SettleAdapterError(DudeError):
+    """A wire message that names SETTLE_SIG but is not one -- malformed body, wrong shape.
+
+    Not for a `SettleSig` whose signature does not verify (that is SettleRound's own concern),
+    and not for a foreign-slice sig (SettleRound drops those silently). For messages that could
+    not have come from an honest peer using the same protocol at all."""
+
 
 _ANCHORS_DOMAIN = b"dude.settle_round.anchors"
 
@@ -96,6 +107,11 @@ class SettleSig:
     it cannot be replayed across blocks; anchors-bound so a peer changing its mind about the
     outcome is detectable rather than silent."""
 
+    verb: ClassVar[Verb] = Verb.SETTLE_SIG
+    """Wire tag for this message type. Same shape as `SyncMsg.verb`, `RoundMsg.verb`; there is
+    only one SettleRound message so no dispatch table is needed, but the attribute is present
+    so `msg.verb` is a legal query regardless of protocol."""
+
     slice_hash: crypto.Digest
     anchors: Anchors
     sig: crypto.Signature
@@ -109,6 +125,61 @@ class SettleSig:
         """True if this SettleSig's signature is a valid signature by `pk` over what it claims to
         cover. The caller decides what to do with a False -- SettleRound drops, tests assert."""
         return pk.verify(_settle_payload(self.slice_hash, self.anchors), self.sig)
+
+    def _encode(self) -> bytes:
+        """The BODY bytes for this message. slice_hash comes first so `SettleSig.slice_hash_of`
+        reads only that field to route the message without a full decode."""
+        a = self.anchors
+        return codec.encode(
+            [
+                self.slice_hash,
+                a.block_num,
+                a.height,
+                a.prev_block,
+                a.state_root,
+                a.acc_state,
+                a.acc_log,
+                self.sig,
+            ]
+        )
+
+    def encode(self) -> tuple[Verb, bytes]:
+        """The wire form of this message: `(verb, body_bytes)`."""
+        return self.verb, self._encode()
+
+    @classmethod
+    def decode(cls, verb: Verb, body: bytes) -> SettleSig:
+        """The inverse of `encode`. Raises `SettleAdapterError` on the wrong verb or a malformed
+        body; the caller sits inside a crash-only boundary that catches `DudeError`."""
+        if verb is not cls.verb:
+            raise SettleAdapterError(f"not a SettleRound verb: {verb.name}")
+        try:
+            p = codec.as_seq(codec.decode(body), 8)
+            return cls(
+                slice_hash=crypto.Digest(codec.as_bytes(p[0])),
+                anchors=Anchors(
+                    block_num=codec.as_int(p[1]),
+                    height=codec.as_int(p[2]),
+                    prev_block=crypto.Digest(codec.as_bytes(p[3])),
+                    state_root=crypto.Digest(codec.as_bytes(p[4])),
+                    acc_state=crypto.Accumulator(codec.as_bytes(p[5])),
+                    acc_log=crypto.Accumulator(codec.as_bytes(p[6])),
+                ),
+                sig=crypto.Signature(codec.as_bytes(p[7])),
+            )
+        except DudeError as e:
+            raise SettleAdapterError(f"malformed SETTLE_SIG body: {e}") from e
+
+    @classmethod
+    def slice_hash_of(cls, body: bytes) -> crypto.Digest:
+        """The slice_hash named in a SETTLE_SIG body, extracted without fully decoding. Used by
+        the Coordinator to route the message to the right SettleRound instance before full
+        validation."""
+        try:
+            p = codec.as_seq(codec.decode(body))
+            return crypto.Digest(codec.as_bytes(p[0]))
+        except DudeError as e:
+            raise SettleAdapterError(f"cannot read slice_hash from body: {e}") from e
 
 
 def _settle_payload(slice_hash: crypto.Digest, anchors: Anchors) -> bytes:
@@ -407,16 +478,12 @@ class SettleRound:
         # `SettledBlock.sign_by_manager` instead. Sig list is parallel to set bits, same as
         # Round's Block (SPECv2 #ratification-counts).
         n = len(self._roster) + 1  # +1 for the manager override slot
-        bits = bytearray(crypto.bitmap_size(n))
-        sigs: list[crypto.Signature] = []
-        for i, member in enumerate(self._roster):
-            if member in self._sigs:
-                bits[i // 8] |= 1 << (7 - i % 8)
-                sigs.append(self._sigs[member])
+        shares = {i: self._sigs[m] for i, m in enumerate(self._roster) if m in self._sigs}
+        signers, sigs = crypto.Ed25519ListMultiSig.combine(shares, n)
         self._settled = SettledBlock(
             block=self._block,
             anchors=self._anchors,
-            signers=crypto.SignerBitmap(bytes(bits)),
+            signers=signers,
             settle_sigs=tuple(sigs),
         )
         self._state = SettleState.SETTLED

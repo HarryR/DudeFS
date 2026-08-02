@@ -2,16 +2,17 @@
 #
 # WHAT ONE FOLLOWER DOES. Given a Store, a Management view, and a set of peers, drive the
 # node's head to the cluster's current head by:
-#   * periodically polling peers with HEIGHT to learn where they are;
-#   * when any peer reports higher, pulling `GETBLOCK(my_head + 1)` from that peer;
-#   * on `SETTLED_BLOCK`, verifying (chain link + settle_sigs + body-block correspondence +
+#   * periodically polling peers with `HeightAsk` to learn where they are;
+#   * when any peer reports higher, pulling `GetBlock(my_head + 1)` from that peer;
+#   * on `SettledBlockReply`, verifying (chain link + settle_sigs + body-block correspondence +
 #     body sigs + preview-anchors-match) and committing atomically;
 #   * repeating until `caught_up()` -- `f+1` fresh distinct peer replies at `(my_block_num,
 #     my_tip_hash)`.
 #
 # SANS-I/O DISCIPLINE. Same shape as Round and SettleRound: `tick(now)`, `receive(msg, from_,
 # now)`, `outbox()`. Postman is the impure edge (via `SyncAdapter`). Nothing here reads a
-# clock, opens a socket, or spawns anything.
+# clock, opens a socket, or spawns anything. Messages in and out are `SyncMsg` values, not
+# raw `(verb, body)` pairs; decode failures are the wire's problem, not the state machine's.
 #
 # WHAT IT DOES NOT DO. Serve inbound HEIGHT / GETBLOCK -- those are stateless functions
 # (`serve_height`, `serve_getblock`) called by Node's handlers. Produce SETTLED blocks -- that
@@ -32,14 +33,12 @@ from ..consensus.settle_round import (
     Anchors,
     SettledBlock,
     SettledBlockWithBodies,
-    SettleError,
     _settle_payload,
     genesis_stamp,
 )
 from ..core import crypto
 from ..core.errors import DudeError, InvariantError
 from ..core.units import Millis
-from ..net.envelope import Verb
 from ..store import Layer, Store, settle
 from ..store.layer import Index
 from ..store.management import Management
@@ -47,17 +46,13 @@ from ..store.ops import SignedTransaction
 from ..store.store import log_element
 from ..tunables import SyncTunables
 from .adapter import (
-    SyncAdapterError,
+    GetBlock,
+    HeightAsk,
+    HeightReply,
+    Refused,
+    SettledBlockReply,
+    SyncMsg,
     SyncRefusal,
-    decode_getblock,
-    decode_height_reply,
-    decode_refusal,
-    decode_settled_block,
-    encode_getblock,
-    encode_height,
-    encode_height_reply,
-    encode_refusal,
-    encode_settled_block,
 )
 
 
@@ -80,7 +75,7 @@ class HeightReport:
 
 @dataclass(frozen=True, slots=True)
 class PullInFlight:
-    """A GETBLOCK request awaiting its SETTLED_BLOCK / REFUSED reply. `sent_at` is when we
+    """A GetBlock request awaiting its SettledBlockReply / Refused reply. `sent_at` is when we
     posted the request, for `pull_timeout` accounting."""
 
     peer: crypto.PublicKey
@@ -88,13 +83,13 @@ class PullInFlight:
     sent_at: Millis
 
 
-type OutboxItem = tuple[crypto.PublicKey, Verb, bytes]
+type OutboxItem = tuple[crypto.PublicKey, SyncMsg]
 
 
 @dataclass(slots=True)
 class Follower:
     """One node's sync driver. Constructed once by Node; ticks alongside Coordinator; consumes
-    and produces bytes at its `receive`/`outbox` boundary; touches Store only through
+    and produces `SyncMsg` values at its `receive`/`outbox` boundary; touches Store only through
     `commit_block`.
 
     NOT thread-safe. Neither is Coordinator; both live inside a single-threaded Node."""
@@ -109,7 +104,7 @@ class Follower:
     _bad_sources: set[crypto.PublicKey] = field(default_factory=set)
     """Peers dropped from the pull-source pool: they served a bad block, refused when they
     said they had the height, or reported a divergent tip. Still polled (in case telemetry
-    cares) but not asked to serve GETBLOCK. In-memory only -- persistence is a post-L6 arc
+    cares) but not asked to serve GetBlock. In-memory only -- persistence is a post-L6 arc
     (SPECv2 #sync-safety-vs-full-bft)."""
     _outbox: list[OutboxItem] = field(default_factory=list)
 
@@ -124,8 +119,8 @@ class Follower:
 
     # -- inputs ----------------------------------------------------------------------------- #
 
-    def receive(self, verb: Verb, body: bytes, from_: crypto.PublicKey, now: Millis) -> None:
-        """One inbound sync message from a peer. Verify, then update state or drop.
+    def receive(self, msg: SyncMsg, from_: crypto.PublicKey, now: Millis) -> None:
+        """One inbound sync message from a peer -- typed `SyncMsg`, dispatched on runtime type.
 
         Every drop site carries an `#XXX:` comment naming what was dropped and why, so the
         rejection is visible in code rather than implicit in a bare return."""
@@ -133,14 +128,21 @@ class Follower:
             # XXX: dropped -- our own key. Shouldn't happen (Postman routes by destination), but
             # a defensive check keeps a self-inflicted feedback loop impossible.
             return
-        if verb is Verb.HEIGHT_REPLY:
-            self._on_height_reply(body, from_, now)
-        elif verb is Verb.SETTLED_BLOCK:
-            self._on_settled_block(body, from_, now)
-        elif verb is Verb.REFUSED:
-            self._on_refused(body, from_, now)
-        # XXX: dropped -- Verb.HEIGHT and Verb.GETBLOCK are the answering side's concern; the
+        if isinstance(msg, HeightReply):
+            self._on_height_reply(msg, from_, now)
+        elif isinstance(msg, SettledBlockReply):
+            self._on_settled_block(msg, from_, now)
+        elif isinstance(msg, Refused):
+            self._on_refused(msg, from_, now)
+        # XXX: dropped -- `HeightAsk` and `GetBlock` are the answering side's concern; the
         # Follower is the ASKING side. Node's dispatcher routes those to `serve_*` helpers.
+
+    def on_bad_reply(self, from_: crypto.PublicKey) -> None:
+        """The wire got a reply from `from_` that didn't decode. Drop as a pull source and
+        clear any in-flight pull to this peer. Called by Node when `decode` fails on
+        SETTLED_BLOCK -- a peer serving garbage is not a decoder concern, it's a source
+        concern."""
+        self._drop_source(from_)
 
     def tick(self, now: Millis) -> None:
         """Advance time. Poll peers whose deadline has passed; time out an in-flight pull that
@@ -148,13 +150,13 @@ class Follower:
         # 1. Poll due peers.
         for peer, deadline in list(self._poll_at.items()):
             if now >= deadline:
-                self._enqueue(peer, *encode_height())
+                self._enqueue(peer, HeightAsk())
                 self._poll_at[peer] = now + self.tunables.poll_interval
         # 2. Pull timeout: if we've been waiting too long, give up on this peer for this pull.
         p = self._pulling
         if p is not None and now - p.sent_at > self.tunables.pull_timeout:
             # XXX: dropped -- peer did not answer in time. This peer stays polled (its
-            # HEIGHT_REPLY is still evidence toward caught_up) but is a `_bad_sources` for now;
+            # HeightReply is still evidence toward caught_up) but is a `_bad_sources` for now;
             # a future refinement could track "unhelpful for this block_num" instead of a
             # blanket drop.
             self._bad_sources.add(p.peer)
@@ -164,7 +166,7 @@ class Follower:
             source = self._pick_pull_source()
             if source is not None:
                 target_num = (self.store.head_block_num() or 0) + 1
-                self._enqueue(source, *encode_getblock(target_num))
+                self._enqueue(source, GetBlock(n=target_num))
                 self._pulling = PullInFlight(source, target_num, now)
 
     # -- outputs ---------------------------------------------------------------------------- #
@@ -200,39 +202,28 @@ class Follower:
 
     # -- inbound dispatch ------------------------------------------------------------------- #
 
-    def _on_height_reply(self, body: bytes, from_: crypto.PublicKey, now: Millis) -> None:
-        try:
-            block_num, tip_hash = decode_height_reply(body)
-        except SyncAdapterError:
-            # XXX: dropped -- malformed HEIGHT_REPLY body. Peer is speaking a different protocol
-            # or the wire mangled it; either way, don't count this reply.
-            return
+    def _on_height_reply(self, msg: HeightReply, from_: crypto.PublicKey, now: Millis) -> None:
         # Fork detection: same block_num as ours but different tip means we're on different
         # chains (#poll-detects-divergent-tips). Drop as a sync source, keep the report for
         # observability.
         my_num = self.store.head_block_num() or 0
         my_tip = self.store.head_block_hash()
-        if my_tip is not None and block_num == my_num and tip_hash != my_tip:
+        if my_tip is not None and msg.block_num == my_num and msg.tip_hash != my_tip:
             self._bad_sources.add(from_)
-        self._heads[from_] = HeightReport(block_num, tip_hash, now)
+        self._heads[from_] = HeightReport(msg.block_num, msg.tip_hash, now)
 
-    def _on_settled_block(  # noqa: C901, PLR0911 -- verification pipeline is intentionally linear
+    def _on_settled_block(  # noqa: PLR0911 -- verification pipeline is intentionally linear
         self,
-        body: bytes,
+        msg: SettledBlockReply,
         from_: crypto.PublicKey,
         now: Millis,  # noqa: ARG002 -- reserved for pull-latency telemetry
     ) -> None:
         p = self._pulling
         if p is None or from_ != p.peer:
-            # XXX: dropped -- unsolicited SETTLED_BLOCK, or from a peer we didn't ask. Only
-            # the currently-pulled peer's reply counts.
+            # XXX: dropped -- unsolicited SettledBlockReply, or from a peer we didn't ask.
+            # Only the currently-pulled peer's reply counts.
             return
-        # Decode (bad bytes => drop peer, clear pull).
-        try:
-            sbwb = decode_settled_block(body)
-        except (SettleError, SyncAdapterError):
-            self._drop_source(from_)
-            return
+        sbwb = msg.payload
         sb = sbwb.block
         # -- Verify block_num matches what we asked for --
         if sb.anchors.block_num != p.block_num:
@@ -290,20 +281,13 @@ class Follower:
 
     def _on_refused(
         self,
-        body: bytes,
+        msg: Refused,  # noqa: ARG002 -- reason kept for future per-reason handling
         from_: crypto.PublicKey,
         now: Millis,  # noqa: ARG002 -- reserved for refusal-latency telemetry
     ) -> None:
         p = self._pulling
         if p is None or from_ != p.peer:
             # XXX: dropped -- refusal to something we didn't ask, or from a peer we didn't ask.
-            return
-        try:
-            decode_refusal(body)
-        except SyncAdapterError:
-            # XXX: dropped -- malformed REFUSED body. Treat as an unhelpful reply; clear the
-            # pull and try another peer next tick.
-            self._pulling = None
             return
         # For now, any refusal clears the pull and marks the peer as unhelpful. A future
         # refinement could keep the peer as a source but skip THIS block_num against them
@@ -315,8 +299,8 @@ class Follower:
 
     # -- internals -------------------------------------------------------------------------- #
 
-    def _enqueue(self, peer: crypto.PublicKey, verb: Verb, body: bytes) -> None:
-        self._outbox.append((peer, verb, body))
+    def _enqueue(self, peer: crypto.PublicKey, msg: SyncMsg) -> None:
+        self._outbox.append((peer, msg))
 
     def _drop_source(self, peer: crypto.PublicKey) -> None:
         """Move a peer to `_bad_sources` and clear any in-flight pull to that peer."""
@@ -391,36 +375,29 @@ class Follower:
 
 
 # --------------------------------------------------------------------------------------------- #
-# Answering side: pure functions for HEIGHT / GETBLOCK requests.                                #
+# Answering side: pure functions for HeightAsk / GetBlock requests.                             #
 #                                                                                                #
 # Node's dispatcher calls these; they touch the Store but hold no state, so they don't belong    #
 # on Follower. Placed here so all sync logic sits under `dude.sync`.                             #
 # --------------------------------------------------------------------------------------------- #
 
 
-def serve_height(store: Store) -> tuple[Verb, bytes]:
-    """Answer an inbound HEIGHT request. Returns HEIGHT_REPLY with our head block_num and its
+def serve_height(store: Store) -> HeightReply:
+    """Answer an inbound `HeightAsk`. Returns a `HeightReply` with our head block_num and its
     identity hash. On a store with no SETTLED blocks yet, replies `(0, zero-digest)` -- the
     requester interprets this as 'peer holds nothing beyond what I have'."""
     block_num = store.head_block_num() or 0
     tip_hash = store.head_block_hash() or crypto.Digest(bytes(32))
-    return encode_height_reply(block_num, tip_hash)
+    return HeightReply(block_num=block_num, tip_hash=tip_hash)
 
 
-def serve_getblock(store: Store, body: bytes) -> tuple[Verb, bytes]:
-    """Answer an inbound GETBLOCK request. Returns SETTLED_BLOCK with the wire form of
-    `SettledBlockWithBodies` if we hold this block, else REFUSED with a reason.
-
-    `body` is the raw GETBLOCK request body. Malformed body → REFUSED(UNKNOWN); block not
-    held → REFUSED(NOT_YET_SETTLED); held → SETTLED_BLOCK."""
-    try:
-        n = decode_getblock(body)
-    except SyncAdapterError:
-        return encode_refusal(SyncRefusal.UNKNOWN)
-    block_bytes = store.settled_at(n)
+def serve_getblock(store: Store, req: GetBlock) -> SyncMsg:
+    """Answer an inbound `GetBlock`. Returns `SettledBlockReply` (block + bodies) if we hold
+    this block, else `Refused` with a reason (NOT_YET_SETTLED for absent blocks)."""
+    block_bytes = store.settled_at(req.n)
     if block_bytes is None:
-        return encode_refusal(SyncRefusal.NOT_YET_SETTLED)
-    # Decode our own persisted block, re-wrap with bodies, re-encode as the wire form.
+        return Refused(reason=SyncRefusal.NOT_YET_SETTLED)
+    # Decode our own persisted block, re-wrap with bodies, return typed.
     sb = SettledBlock.decode(block_bytes)
-    bodies = store.bodies_of_block(n)
-    return encode_settled_block(SettledBlockWithBodies(block=sb, bodies=bodies))
+    bodies = store.bodies_of_block(req.n)
+    return SettledBlockReply(payload=SettledBlockWithBodies(block=sb, bodies=bodies))

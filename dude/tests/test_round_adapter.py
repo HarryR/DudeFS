@@ -1,22 +1,16 @@
-# Tests for dude.net.round_adapter -- the wire binding for Round's abstract protocol.
+# Tests for Round's protocol messages + Postman binding.
 #
-# THE ADAPTER IS STATELESS. The three functions (encode, decode, bucket_of) are pure translations
-# between Round's `Held`/`Sig` and the wire's `HELD`/`SIG` verbs; the `RoundAdapter` class adds a
-# Postman + keypair so callers can flush a Round's outbox as envelopes. Bucket-to-Round dispatch
-# is NOT this module's job -- that is the Coordinator's, in Phase 6.
+# `Held`/`Sig` each own their own `encode()`/`_decode()`; dispatch is via `RoundMsg.decode(verb,
+# body)` and `RoundMsg.bucket_of(body)`. The `RoundAdapter` class adds a Postman + keypair so
+# callers can flush a Round's outbox as envelopes. Bucket-to-Round dispatch is NOT this
+# module's job -- that is the Coordinator's.
 
 from __future__ import annotations
 
 import unittest
 
-from ..consensus.round import Held, Round, Sig
-from ..consensus.round_adapter import (
-    RoundAdapter,
-    RoundAdapterError,
-    bucket_of,
-    decode,
-    encode,
-)
+from ..consensus.round import Held, Round, RoundAdapterError, RoundMsg, Sig
+from ..consensus.round_adapter import RoundAdapter
 from ..core import codec, crypto
 from ..net import Verb
 from ..net.address import Address, Endpoint, Scheme
@@ -35,44 +29,41 @@ class TestEncodeDecodeRoundtrip(unittest.TestCase):
     def test_held_roundtrips(self):
         hashes = frozenset({crypto.h(b"a"), crypto.h(b"b"), crypto.h(b"c")})
         original = Held(bucket=7, hashes=hashes)
-        verb, body = encode(original)
+        verb, body = original.encode()
         self.assertIs(verb, Verb.HELD)
-        got = decode(verb, body)
-        self.assertEqual(got, original)
+        self.assertEqual(RoundMsg.decode(verb, body), original)
 
     def test_sig_roundtrips(self):
         kp = crypto.Keypair.generate()
         original = Sig.sign(kp, 3, crypto.h(b"a-slice"))
-        verb, body = encode(original)
+        verb, body = original.encode()
         self.assertIs(verb, Verb.SIG)
-        got = decode(verb, body)
-        self.assertEqual(got, original)
+        self.assertEqual(RoundMsg.decode(verb, body), original)
 
     def test_empty_held_roundtrips(self):
         """An empty bucket produces a `Held` with an empty hash set. Must not become a decode
         failure."""
         original = Held(bucket=1, hashes=frozenset())
-        verb, body = encode(original)
-        got = decode(verb, body)
-        self.assertEqual(got, original)
+        verb, body = original.encode()
+        self.assertEqual(RoundMsg.decode(verb, body), original)
 
 
 class TestBucketOf(unittest.TestCase):
-    """The coordinator needs to route by bucket before doing full validation. `bucket_of` reads
-    just the leading field."""
+    """The coordinator needs to route by bucket before doing full validation.
+    `RoundMsg.bucket_of` reads just the leading field."""
 
     def test_reads_the_bucket_from_a_held_body(self):
-        _, body = encode(Held(bucket=42, hashes=frozenset({crypto.h(b"x")})))
-        self.assertEqual(bucket_of(body), 42)
+        _, body = Held(bucket=42, hashes=frozenset({crypto.h(b"x")})).encode()
+        self.assertEqual(RoundMsg.bucket_of(body), 42)
 
     def test_reads_the_bucket_from_a_sig_body(self):
         kp = crypto.Keypair.generate()
-        _, body = encode(Sig.sign(kp, 99, crypto.h(b"s")))
-        self.assertEqual(bucket_of(body), 99)
+        _, body = Sig.sign(kp, 99, crypto.h(b"s")).encode()
+        self.assertEqual(RoundMsg.bucket_of(body), 99)
 
     def test_malformed_body_raises(self):
         with self.assertRaises(RoundAdapterError):
-            bucket_of(b"not bencode")
+            RoundMsg.bucket_of(b"not bencode")
 
 
 class TestDecodeFailures(unittest.TestCase):
@@ -81,20 +72,29 @@ class TestDecodeFailures(unittest.TestCase):
 
     def test_malformed_held_body_raises(self):
         with self.assertRaises(RoundAdapterError):
-            decode(Verb.HELD, b"garbage")
+            RoundMsg.decode(Verb.HELD, b"garbage")
 
     def test_malformed_sig_body_raises(self):
         with self.assertRaises(RoundAdapterError):
-            decode(Verb.SIG, b"garbage")
+            RoundMsg.decode(Verb.SIG, b"garbage")
 
     def test_wrong_field_count_raises(self):
         # Held expects [bucket, [hashes]]; give it three fields.
         with self.assertRaises(RoundAdapterError):
-            decode(Verb.HELD, codec.encode([1, [], b"extra"]))
+            RoundMsg.decode(Verb.HELD, codec.encode([1, [], b"extra"]))
 
     def test_non_round_verb_raises(self):
         with self.assertRaises(RoundAdapterError):
-            decode(Verb.PING, b"")
+            RoundMsg.decode(Verb.PING, b"")
+
+
+class TestRoundMsgIsAbstract(unittest.TestCase):
+    """`RoundMsg` itself is abstract -- instantiating it fails. Concrete subclasses
+    (`Held`, `Sig`) implement `encode` and are constructible."""
+
+    def test_roundmsg_cannot_be_instantiated_directly(self):
+        with self.assertRaises(TypeError):
+            RoundMsg()
 
 
 class TestFlushToMailbox(unittest.TestCase):
@@ -167,7 +167,7 @@ class TestDeliverToRound(unittest.TestCase):
         r.add_local(frozenset({crypto.h(b"local")}))
 
         peer_hashes = frozenset({crypto.h(b"peer-a"), crypto.h(b"peer-b")})
-        verb, body = encode(Held(bucket=1, hashes=peer_hashes))
+        verb, body = Held(bucket=1, hashes=peer_hashes).encode()
         env = Envelope(me.public, verb, b"m" * 16, body).sign(peer, T0)
 
         # Adapter needs a Postman to construct, but `deliver` does not use it.

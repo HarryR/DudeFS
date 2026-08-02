@@ -51,10 +51,10 @@ from ..store.ops import SignedTransaction
 from ..store.store import log_element
 from ..tunables import Tunables
 from .mempool import Bucket, Mempool, Refusal
-from .round import Block, Round
-from .round_adapter import RoundAdapter, RoundAdapterError, bucket_of
-from .settle_adapter import SettleAdapter, SettleAdapterError, slice_hash_of
-from .settle_round import Anchors, SettleRound, genesis_stamp
+from .round import Block, Round, RoundAdapterError, RoundMsg
+from .round_adapter import RoundAdapter
+from .settle_adapter import SettleAdapter
+from .settle_round import Anchors, SettleAdapterError, SettleRound, SettleSig, genesis_stamp
 
 
 @dataclass(slots=True)
@@ -140,7 +140,7 @@ class Coordinator:
         """A HELD or SIG envelope from a peer. Route to the Round for its bucket, dropping
         anything for a bucket this node is not currently running."""
         try:
-            bucket = bucket_of(env.env.body)
+            bucket = RoundMsg.bucket_of(env.env.body)
         except RoundAdapterError:
             return  # malformed body, dropped
         entry = self.rounds.get(bucket)
@@ -158,7 +158,7 @@ class Coordinator:
         have not ratified yet), the sig is dropped -- gossip will catch us up naturally when
         we ratify our own view of that bucket."""
         try:
-            sh = slice_hash_of(env.env.body)
+            sh = SettleSig.slice_hash_of(env.env.body)
         except SettleAdapterError:
             return
         if self.settling is None or self.settling.block.slice_hash != sh:

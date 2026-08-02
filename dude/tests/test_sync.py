@@ -17,14 +17,15 @@ import unittest
 
 from dude.consensus.settle_round import Anchors, SettledBlock, SettledBlockWithBodies
 from dude.core import crypto
-from dude.net.envelope import Verb
 from dude.store import Store, ops
 from dude.store.management import Management
 from dude.sync.adapter import (
+    GetBlock,
+    HeightAsk,
+    HeightReply,
+    Refused,
+    SettledBlockReply,
     SyncRefusal,
-    encode_height_reply,
-    encode_refusal,
-    encode_settled_block,
 )
 from dude.sync.follower import Follower, serve_getblock, serve_height
 from dude.tunables import DEFAULT
@@ -57,18 +58,16 @@ def _pump(
     now: int,
 ) -> None:
     """One pump: tick the follower, then translate every outbox message into a reply from
-    `producer` (if the message is a HEIGHT/GETBLOCK addressed at `producer_key`) and deliver
+    `producer` (if the message is a HeightAsk/GetBlock addressed at `producer_key`) and deliver
     it back. Mirrors what Node's dispatcher will do end-to-end, but in-process."""
     follower.tick(now)
-    for peer, verb, body in follower.outbox():
+    for peer, msg in follower.outbox():
         if peer != producer_key:
             continue  # message directed at a peer that isn't our producer stub
-        if verb is Verb.HEIGHT:
-            reply_verb, reply_body = serve_height(producer)
-            follower.receive(reply_verb, reply_body, producer_key, now)
-        elif verb is Verb.GETBLOCK:
-            reply_verb, reply_body = serve_getblock(producer, body)
-            follower.receive(reply_verb, reply_body, producer_key, now)
+        if isinstance(msg, HeightAsk):
+            follower.receive(serve_height(producer), producer_key, now)
+        elif isinstance(msg, GetBlock):
+            follower.receive(serve_getblock(producer, msg), producer_key, now)
 
 
 def _catch_up(
@@ -222,27 +221,26 @@ class TestByzantinePeerIsHandled(unittest.TestCase):
         self.byz = crypto.Keypair.generate()  # not on the cluster; just a fake pubkey
 
     def test_lied_higher_height_wasted_one_getblock_then_dropped(self):
-        """Byzantine peer says head=999, we ask GETBLOCK(2), they refuse (they have no such
+        """Byzantine peer says head=999, we ask GetBlock(2), they refuse (they have no such
         block) -- follower drops them as a source and does not corrupt state."""
         self.follower.add_peer(self.byz.public, now=T0)
         self.follower.tick(T0)
-        # First outbox drain: a HEIGHT to byz. Serve a lying reply.
+        # First outbox drain: a HeightAsk to byz. Serve a lying reply.
         drained = self.follower.outbox()
         self.assertEqual(len(drained), 1)
-        _peer, _verb, _body = drained[0]
         self.follower.receive(
-            *encode_height_reply(999, crypto.h(b"pretend")),
+            HeightReply(block_num=999, tip_hash=crypto.h(b"pretend")),
             self.byz.public,
             T0,
         )
-        # Next tick: follower sees byz is above us, sends GETBLOCK(2) to byz.
+        # Next tick: follower sees byz is above us, sends GetBlock(2) to byz.
         now = T0 + POLL
         self.follower.tick(now)
         drained = self.follower.outbox()
-        self.assertTrue(any(v is Verb.GETBLOCK for _, v, _ in drained))
-        # Byz has no such block -- respond with REFUSED.
+        self.assertTrue(any(isinstance(m, GetBlock) for _, m in drained))
+        # Byz has no such block -- respond with Refused.
         self.follower.receive(
-            *encode_refusal(SyncRefusal.NOT_YET_SETTLED),
+            Refused(reason=SyncRefusal.NOT_YET_SETTLED),
             self.byz.public,
             now,
         )
@@ -257,19 +255,19 @@ class TestByzantinePeerIsHandled(unittest.TestCase):
         Store."""
         self.follower.add_peer(self.byz.public, now=T0)
         self.follower.tick(T0)
-        self.follower.outbox()  # drain the HEIGHT
+        self.follower.outbox()  # drain the HeightAsk
         # Say we're one block ahead of us
         self.follower.receive(
-            *encode_height_reply(2, crypto.h(b"bogus-tip")),
+            HeightReply(block_num=2, tip_hash=crypto.h(b"bogus-tip")),
             self.byz.public,
             T0,
         )
-        # Follower asks for GETBLOCK(2). Craft a garbage block: real shape but a sig that
+        # Follower asks for GetBlock(2). Craft a garbage block: real shape but a sig that
         # verifies against nobody. We can build one from the honest producer's block 2 with
         # the settle_sigs replaced.
         now = T0 + POLL
         self.follower.tick(now)
-        self.follower.outbox()  # drain the GETBLOCK
+        self.follower.outbox()  # drain the GetBlock
         real_bytes = self.honest.store.settled_at(2)
         assert real_bytes is not None
         real_sb = SettledBlock.decode(real_bytes)
@@ -281,8 +279,11 @@ class TestByzantinePeerIsHandled(unittest.TestCase):
             settle_sigs=tuple(crypto.Signature(bytes(64)) for _ in real_sb.settle_sigs),
         )
         bad_bodies = self.honest.store.bodies_of_block(2)
-        _v, body = encode_settled_block(SettledBlockWithBodies(block=bad_sb, bodies=bad_bodies))
-        self.follower.receive(Verb.SETTLED_BLOCK, body, self.byz.public, now)
+        self.follower.receive(
+            SettledBlockReply(payload=SettledBlockWithBodies(block=bad_sb, bodies=bad_bodies)),
+            self.byz.public,
+            now,
+        )
         self.assertIn(self.byz.public, self.follower._bad_sources)
         self.assertEqual(self.joiner_store.head_block_num(), 1)
 
@@ -292,7 +293,7 @@ class TestByzantinePeerIsHandled(unittest.TestCase):
         self.follower.tick(T0)
         self.follower.outbox()
         self.follower.receive(
-            *encode_height_reply(2, crypto.h(b"any")),
+            HeightReply(block_num=2, tip_hash=crypto.h(b"any")),
             self.byz.public,
             T0,
         )
@@ -319,8 +320,11 @@ class TestByzantinePeerIsHandled(unittest.TestCase):
             settle_sigs=real_sb.settle_sigs,
         )
         bad_bodies = self.honest.store.bodies_of_block(2)
-        _v, body = encode_settled_block(SettledBlockWithBodies(block=bad_sb, bodies=bad_bodies))
-        self.follower.receive(Verb.SETTLED_BLOCK, body, self.byz.public, now)
+        self.follower.receive(
+            SettledBlockReply(payload=SettledBlockWithBodies(block=bad_sb, bodies=bad_bodies)),
+            self.byz.public,
+            now,
+        )
         self.assertIn(self.byz.public, self.follower._bad_sources)
         self.assertEqual(self.joiner_store.head_block_num(), 1)
 
@@ -356,7 +360,7 @@ class TestByzantinePeerIsHandled(unittest.TestCase):
 
         # Byz reports target_num as its head.
         follower.receive(
-            *encode_height_reply(target_num, crypto.h(b"any")),
+            HeightReply(block_num=target_num, tip_hash=crypto.h(b"any")),
             self.byz.public,
             T0,
         )
@@ -380,18 +384,21 @@ class TestByzantinePeerIsHandled(unittest.TestCase):
                 auth=Management(fresh_joiner),
             )
 
-        # Follower ticks: sees byz above (target_num > our target_num - 1), issues GETBLOCK.
+        # Follower ticks: sees byz above (target_num > our target_num - 1), issues GetBlock.
         follower.tick(T0 + POLL)
         outbox = follower.outbox()
-        assert any(v is Verb.GETBLOCK for _, v, _ in outbox), f"expected GETBLOCK, got {outbox}"
+        assert any(isinstance(m, GetBlock) for _, m in outbox), f"expected GetBlock, got {outbox}"
         # Craft the bad block: real block target_num but with the last body omitted.
         real_bytes = self.honest.store.settled_at(target_num)
         assert real_bytes is not None
         real_sb = SettledBlock.decode(real_bytes)
         real_bodies = self.honest.store.bodies_of_block(target_num)
         truncated = real_bodies[:-1]
-        _v, body = encode_settled_block(SettledBlockWithBodies(block=real_sb, bodies=truncated))
-        follower.receive(Verb.SETTLED_BLOCK, body, self.byz.public, T0 + POLL)
+        follower.receive(
+            SettledBlockReply(payload=SettledBlockWithBodies(block=real_sb, bodies=truncated)),
+            self.byz.public,
+            T0 + POLL,
+        )
         # Byz dropped, joiner head still at target_num - 1.
         self.assertIn(self.byz.public, follower._bad_sources)
         self.assertEqual(fresh_joiner.head_block_num(), target_num - 1)
@@ -420,9 +427,9 @@ class TestForkDetectionAtPollTime(unittest.TestCase):
         my_num = joiner_store.head_block_num()
         assert my_num is not None
         byz = crypto.Keypair.generate()
-        # Deliver a HEIGHT_REPLY with mismatched tip -- follower can decide directly.
+        # Deliver a HeightReply with mismatched tip -- follower can decide directly.
         follower.receive(
-            *encode_height_reply(my_num, crypto.h(b"different-chain")),
+            HeightReply(block_num=my_num, tip_hash=crypto.h(b"different-chain")),
             byz.public,
             T0,
         )
@@ -460,7 +467,7 @@ class TestCaughtUpRequiresFreshWitnesses(unittest.TestCase):
         # f+1 for n=3 (two-thirds) is 1 tolerance + 1 = 2. Deliver two matching reports.
         for node in c.nodes[:2]:
             follower.receive(
-                *encode_height_reply(my_num, my_tip),
+                HeightReply(block_num=my_num, tip_hash=my_tip),
                 node.me.public,
                 T0,
             )
@@ -479,7 +486,7 @@ class TestCaughtUpRequiresFreshWitnesses(unittest.TestCase):
         # past freshness_window by receiving a THIRD (stale-counter) report far in the future.
         for node in c.nodes[:2]:
             follower.receive(
-                *encode_height_reply(my_num, my_tip),
+                HeightReply(block_num=my_num, tip_hash=my_tip),
                 node.me.public,
                 T0,
             )
@@ -488,7 +495,7 @@ class TestCaughtUpRequiresFreshWitnesses(unittest.TestCase):
         far_future = T0 + DEFAULT.sync.freshness_window * 2 + 1
         stranger = crypto.Keypair.generate()
         follower.receive(
-            *encode_height_reply(my_num, my_tip),
+            HeightReply(block_num=my_num, tip_hash=my_tip),
             stranger.public,
             far_future,
         )
@@ -512,17 +519,17 @@ class TestPullTimeout(unittest.TestCase):
         follower = _make_follower(joiner_store)
         silent = crypto.Keypair.generate()
         follower.add_peer(silent.public, now=T0)
-        # Silent peer answers HEIGHT (says they're ahead of us) but never replies to GETBLOCK.
+        # Silent peer answers HeightAsk (says they're ahead of us) but never replies to GetBlock.
         follower.tick(T0)
-        follower.outbox()  # drain HEIGHT
+        follower.outbox()  # drain HeightAsk
         follower.receive(
-            *encode_height_reply(2, crypto.h(b"any")),
+            HeightReply(block_num=2, tip_hash=crypto.h(b"any")),
             silent.public,
             T0,
         )
         # Tick advances past pull_timeout without a reply.
         follower.tick(T0 + POLL)
-        # A GETBLOCK went out; drain it.
+        # A GetBlock went out; drain it.
         follower.outbox()
         # Now advance beyond pull_timeout.
         follower.tick(T0 + POLL + PULL_TIMEOUT + 1)
