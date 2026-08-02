@@ -13,10 +13,12 @@ import unittest
 from dude.consensus.round import Block
 from dude.consensus.settle_round import (
     Anchors,
+    SettledBlock,
     SettleError,
     SettleRound,
     SettleSig,
     SettleState,
+    genesis_stamp,
 )
 from dude.core import crypto
 from dude.net.postman import Recipient
@@ -48,12 +50,14 @@ def _block(bucket: int = 1, hashes: tuple[bytes, ...] = ()) -> Block:
     )
 
 
-def _anchors(height: int = 1, root_seed: bytes = b"root") -> Anchors:
+def _anchors(block_num: int = 1, height: int = 0, root_seed: bytes = b"root") -> Anchors:
     """A deterministic set of anchor values for tests. `root_seed` lets a test construct two
     distinct anchors -- one honest, one divergent -- without leaking hash internals into
     assertions."""
     return Anchors(
+        block_num=block_num,
         height=height,
+        prev_block=crypto.h(b"prev:" + root_seed),
         state_root=crypto.h(b"state:" + root_seed),
         acc_state=crypto.acc_element(b"acc:" + root_seed),
         acc_log=crypto.acc_element(b"log:" + root_seed),
@@ -302,6 +306,138 @@ class TestLateArrivalIsTolerated(unittest.TestCase):
         )
         self.assertEqual(r0.state(), SettleState.SETTLED)
         self.assertEqual(r0.settled(), first)
+
+
+# --------------------------------------------------------------------------------------------- #
+# Block-shape and chain link (#block-shape-settled, #genesis-stamp-anchors-the-chain)           #
+# --------------------------------------------------------------------------------------------- #
+
+
+class TestSettledBlockEncoding(unittest.TestCase):
+    """The wire form ratified by #block-shape-settled. `encode` is what persists to disk and
+    what a joiner receives on `SETTLED_BLOCK`; `decode` is its inverse; `block_hash` is the
+    input to the next block's chain link."""
+
+    def _sb(self, block_num: int = 1, height: int = 0) -> SettledBlock:
+        """A settled block with real signatures over `_anchors(block_num, height)`."""
+        keys = [crypto.Keypair.generate() for _ in range(3)]
+        roster = tuple(k.public for k in keys)
+        block = _block()
+        anchors = _anchors(block_num=block_num, height=height)
+        r0 = SettleRound(block, keys[0], roster, anchors, T0)
+        r1 = SettleRound(block, keys[1], roster, anchors, T0)
+        # Deliver r1's sig to r0 to reach the 2-of-3 quorum.
+        for target, msg in r1.outbox():
+            if target is Recipient.ALL or target == keys[0].public:
+                r0.receive(msg, from_=keys[1].public, now=T0)
+        settled = r0.settled()
+        assert settled is not None
+        return settled
+
+    def test_encode_then_decode_is_the_same_settled_block(self):
+        """Round-trip. Anything the wire mangles is a decode divergence -- both sides self-
+        consistent in isolation, silently disagreeing on what was transmitted (CLAUDE.md trap 1)."""
+        sb = self._sb()
+        got = SettledBlock.decode(sb.encode())
+        self.assertEqual(got.block.bucket, sb.block.bucket)
+        self.assertEqual(got.block.hashes, sb.block.hashes)
+        self.assertEqual(got.anchors, sb.anchors)
+        self.assertEqual(bytes(got.signers), bytes(sb.signers))
+        self.assertEqual(got.settle_sigs, sb.settle_sigs)
+
+    def test_block_hash_is_stable_and_sig_independent(self):
+        """The chain link -- a successor's `Anchors.prev_block` -- MUST be deterministic AND
+        sig-independent (see `SettledBlock.block_hash`). Two nodes with the same slice + same
+        anchors compute the same hash regardless of which quorum-subset of sigs they hold."""
+        sb = self._sb()
+        # Deterministic: two calls give the same digest.
+        self.assertEqual(sb.block_hash, sb.block_hash)
+        # Sig-independent: strip a settle_sig, hash still matches.
+        stripped = SettledBlock(
+            block=sb.block,
+            anchors=sb.anchors,
+            signers=crypto.SignerBitmap(b""),
+            settle_sigs=(),
+        )
+        self.assertEqual(sb.block_hash, stripped.block_hash)
+        # NOT equal to H(encode()): the wire bytes include sigs, the chain hash does not.
+        self.assertNotEqual(sb.block_hash, crypto.h(sb.encode()))
+
+    def test_encode_omits_ratify_sigs(self):
+        """#block-shape-settled: ratify sigs are Round's transient consensus infrastructure and
+        MUST NOT be persisted. The decoded block's ratify credentials are empty."""
+        sb = self._sb()
+        got = SettledBlock.decode(sb.encode())
+        self.assertEqual(bytes(got.block.signers), b"")
+        self.assertEqual(got.block.sigs, ())
+
+    def test_malformed_bytes_raise_settle_error(self):
+        """Bad bytes are a routine peer-input outcome; SettleError is a DudeError that the
+        crash-only boundary catches -- not InvariantError, which would terminate."""
+        with self.assertRaises(SettleError):
+            SettledBlock.decode(b"not bencode at all")
+
+
+class TestChainLinkIsSigned(unittest.TestCase):
+    """`prev_block` is inside the anchors payload, so the settlement signature covers it. A peer
+    lying about which chain a block belongs to invalidates its own signature."""
+
+    def test_different_prev_block_makes_incompatible_sigs(self):
+        """Two nodes with the same slice + same state anchors but different `prev_block` produce
+        DIFFERENT SettleSigs, and neither counts toward the other's quorum. This is what stops a
+        forked history claiming to be the same chain."""
+        keys = [crypto.Keypair.generate() for _ in range(3)]
+        roster = tuple(k.public for k in keys)
+        block = _block()
+        a_chain_x = _anchors(root_seed=b"same-state")
+        a_chain_y = Anchors(
+            block_num=a_chain_x.block_num,
+            height=a_chain_x.height,
+            prev_block=crypto.h(b"different-parent"),
+            state_root=a_chain_x.state_root,
+            acc_state=a_chain_x.acc_state,
+            acc_log=a_chain_x.acc_log,
+        )
+        r_x = SettleRound(block, keys[0], roster, a_chain_x, T0)
+        r_y = SettleRound(block, keys[1], roster, a_chain_y, T0)
+        # Deliver each side's sig to the other. Both see divergent anchors and drop.
+        for target, msg in r_y.outbox():
+            if target is Recipient.ALL or target == keys[0].public:
+                r_x.receive(msg, from_=keys[1].public, now=T0)
+        for target, msg in r_x.outbox():
+            if target is Recipient.ALL or target == keys[1].public:
+                r_y.receive(msg, from_=keys[0].public, now=T0)
+        # Neither settles -- they think they're on different chains.
+        self.assertEqual(r_x.state(), SettleState.COLLECTING)
+        self.assertEqual(r_y.state(), SettleState.COLLECTING)
+        # And each recorded the other as a divergence (evidence).
+        self.assertEqual(len(list(r_x.divergences())), 1)
+        self.assertEqual(len(list(r_y.divergences())), 1)
+
+
+class TestGenesisStamp(unittest.TestCase):
+    """The first block's `prev_block` is the genesis stamp -- computable from the manager pubkey
+    alone (#genesis-stamp-anchors-the-chain), so a fresh joiner can chain-verify block 1 without
+    fetching any earlier state."""
+
+    def test_genesis_is_deterministic(self):
+        """Same manager pubkey => same stamp, byte for byte."""
+        m = crypto.Keypair.generate().public
+        self.assertEqual(genesis_stamp(m), genesis_stamp(m))
+
+    def test_different_managers_get_different_stamps(self):
+        """Two clusters started from different manager keys have byte-different genesis stamps,
+        so a block from cluster A cannot chain-verify against cluster B's history even if the
+        first bucket numbers coincidentally match."""
+        m_a = crypto.Keypair.generate().public
+        m_b = crypto.Keypair.generate().public
+        self.assertNotEqual(genesis_stamp(m_a), genesis_stamp(m_b))
+
+    def test_genesis_is_a_digest(self):
+        """32 bytes, the ordinary digest width -- so it fits `Anchors.prev_block` without any
+        special-case encoding at height 1 vs later heights."""
+        stamp = genesis_stamp(crypto.Keypair.generate().public)
+        self.assertEqual(len(stamp), 32)
 
 
 if __name__ == "__main__":

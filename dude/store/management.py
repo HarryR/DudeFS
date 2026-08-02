@@ -26,12 +26,16 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import Enum
+from typing import TYPE_CHECKING
 
 from .. import quorum
 from ..core import codec, crypto
 from ..core.errors import DudeError
 from . import ops
 from .layer import Index, Reader
+
+if TYPE_CHECKING:
+    from .store import Store
 
 # A transport locator, opaque here on purpose: the management store records WHERE a node can be
 # reached as a string, and `dude.net` owns what the string means. Keeping the parse out of the store
@@ -112,7 +116,7 @@ class Management:
     Self-contained by design: a caller that holds this needs no other knowledge of how membership,
     authorisation or key distribution are encoded."""
 
-    def __init__(self, store: Reader, store_id: int = ops.STORE_MANAGEMENT):
+    def __init__(self, store: Store, store_id: int = ops.STORE_MANAGEMENT):
         self.store = store
         self.store_id = store_id
 
@@ -137,10 +141,13 @@ class Management:
             out[who] = NodeRecord(who, addrs, doms)
         return out
 
-    def node_set(self) -> tuple[crypto.PublicKey, ...]:
+    def roster(self) -> tuple[crypto.PublicKey, ...]:
         """The roster as a sorted tuple — sorted because a signer bitmap indexes into it, and two
         implementations must agree on the order. Never rely on mapping iteration order for this:
-        Go randomises it, so an unsorted roster would produce different bitmaps per language."""
+        Go randomises it, so an unsorted roster would produce different bitmaps per language.
+
+        THIS IS THE ONE ROSTER SOURCE. `Store.roster()` used to delegate here; deleted. Anyone
+        needing the roster asks Management (which is what owns authority questions in general)."""
         return tuple(sorted(self.nodes()))
 
     def addresses_of(self, who: crypto.PublicKey) -> tuple[Address, ...]:
@@ -174,8 +181,11 @@ class Management:
         record = codec.encode([serial, sorted(bytes(m) for m in members)])
         return ops.writes(ops.Set(self.store_id, P_ROSTER, record))
 
-    def grant_of(self, who: crypto.PublicKey) -> Grant | None:
-        raw = self.store.get(self.store_id, P_GRANT + who)
+    def _read_grant(self, reader: Reader, who: crypto.PublicKey) -> Grant | None:
+        """The primitive grant lookup. Reads from `reader` (typically `self.store`, but the
+        transaction's own layer during evaluation) so a grant made by an earlier step is
+        visible to a later step's check."""
+        raw = reader.get(self.store_id, P_GRANT + who)
         if raw is None:
             return None
         f = codec.as_seq(codec.decode(raw[1]), 3)
@@ -190,18 +200,27 @@ class Management:
             frozenset(codec.as_int(x) for x in codec.as_seq(f[2])),
         )
 
-    def may_write(self, reader: Reader, who: crypto.PublicKey, store_id: int) -> bool:
-        """#coarse-acl's coarse check, and the ONLY authority question a node can answer blind: the
-        store id is cleartext in every operation (#coarse-acl), so this needs no key and no path.
+    def grant_of(self, who: crypto.PublicKey) -> Grant | None:
+        """The default-reader convenience: look up a grant against `self.store`. Same shape as
+        `_read_grant(self.store, who)`."""
+        return self._read_grant(self.store, who)
 
-        Takes the `reader` per call so it satisfies `settle.Authoriser`: during evaluation that is
-        the transaction's own layer, which is how a grant made by an earlier STEP is visible to a
-        later step's check (authorise -> use -> revoke, in one atomic transaction)."""
-        g = (
-            Management(reader, self.store_id).grant_of(who)
-            if reader is not self.store
-            else self.grant_of(who)
-        )
+    def may_write(self, reader: Reader, who: crypto.PublicKey, store_id: int) -> bool:
+        """`#coarse-acl`'s check: may `who` write `store_id`? The one authority question a node
+        can answer blind, because the store id is cleartext in every operation.
+
+        THE ANCHOR IS ALWAYS AUTHORISED. The manager pubkey (`store.anchor()`, provisioned
+        out-of-band) is the axiom the whole authority chain hangs from -- their grants are
+        what create the rest of the roster's authority in the first place. Checking their
+        authority against a log they themselves authorise would be circular; treating them as
+        always-may-write is what makes bootstrap a manager-signed block rather than a special-
+        cased evaluator bypass (`auth=None`, deleted).
+
+        Takes `reader` per call so a grant made by an earlier step in a transaction is visible
+        to a later step's check (authorise -> use -> revoke, in one atomic transaction)."""
+        if who == self.store.anchor():
+            return True
+        g = self._read_grant(reader, who)
         if g is None:
             return False
         return g.role is Role.MANAGER or store_id in g.stores
@@ -213,6 +232,45 @@ class Management:
         if g is None:
             return False
         return g.role is Role.MANAGER or kind in g.kinds
+
+    def authorization(
+        self,
+        bitmap: crypto.SignerBitmap,
+        sigs: tuple[crypto.Signature, ...],
+        payload: bytes,
+    ) -> bool:
+        """Verify a block-shape multisig against the current roster + anchor
+        (SPECv2 #manager-sig-overrides-quorum).
+
+        BITMAP LAYOUT: `len(roster) + 1` positions. Indices `0..N-1` are roster members;
+        index `N` is the manager slot, verified against `self.store.anchor()`. Delegates to
+        `Ed25519ListMultiSig.verify` with `[*roster, anchor]` as the effective signer set --
+        the roster-append composition is encapsulated here so no caller needs to know about
+        the manager slot's position.
+
+        TRUE if EITHER:
+          - the manager slot signed (anchor override) -- authorizes alone; OR
+          - a quorum of roster slots signed (ordinary consensus path).
+
+        FALSE if the multisig itself failed to verify (bad sig, wrong signer, bitmap/sig
+        length mismatch) OR if only sub-quorum roster slots signed with no manager override.
+
+        Raises `ManagementError` if the store is not provisioned (no anchor to verify the
+        override slot against) -- a Management being asked to authorize with no manager
+        anchor is a misconfiguration, not a routine failure."""
+        anchor = self.store.anchor()
+        if anchor is None:
+            raise ManagementError("cannot authorize: store has no manager anchor")
+        roster = self.roster()
+        n = len(roster) + 1  # +1 for the manager override slot
+        if not crypto.Ed25519ListMultiSig.verify(bitmap, list(sigs), payload, [*roster, anchor]):
+            return False
+        set_indices = crypto.bitmap_indices(bitmap, n)
+        manager_slot = n - 1
+        if manager_slot in set_indices:
+            return True  # manager override -- authorizes alone
+        roster_signer_count = sum(1 for i in set_indices if i < manager_slot)
+        return roster_signer_count >= quorum.DEFAULT.size(len(roster))
 
     def possession_proof(self, who: crypto.PublicKey) -> crypto.Signature | None:
         raw = self.store.get(self.store_id, P_POP + who)
@@ -326,7 +384,7 @@ class Management:
 
     # -- historical node sets ------------------------------------------------- #
 
-    def node_set_at(self, _idx: Index) -> tuple[crypto.PublicKey, ...]:
+    def roster_at(self, _idx: Index) -> tuple[crypto.PublicKey, ...]:
         """NOT IMPLEMENTED, deliberately, and the reason is worth reading.
 
         #replay-does-not-readjudicate says an endorsement is valid for the node set in force

@@ -88,9 +88,24 @@ class Verb(IntEnum):
 
     # -- settlement (#ratified-is-not-settled, #settlement-signs-post-anchors) ------------------ #
     SETTLE_SIG = 24
-    """A signature over `(slice_hash, height, state_root, A_state, A_log)` -- SettleRound's
-    single message. A quorum of matching `SETTLE_SIG`s turns a ratified block into a SETTLED
-    block, at which point the Coordinator commits the slice to the durable Store."""
+    """A signature over `(slice_hash, block_num, height, prev_block, state_root, A_state, A_log)`
+    -- SettleRound's single message. A quorum of matching `SETTLE_SIG`s turns a ratified block
+    into a SETTLED block, at which point the Coordinator commits the slice to the durable Store."""
+
+    # -- sync (#sync-is-log-replay, #height-poll-is-the-trigger) ------------------------------- #
+    HEIGHT = 30
+    """"What is your current SETTLED head?" -- solicited height poll. The Follower's periodic
+    trigger for "am I behind?". No body."""
+    HEIGHT_REPLY = 31
+    """`(block_num, tip_hash)` -- the reply to HEIGHT. `tip_hash` is `SettledBlock.block_hash`
+    at the responder's current head, enabling fork detection at poll time
+    (#poll-detects-divergent-tips)."""
+    GETBLOCK = 32
+    """`GETBLOCK n` -- fetch the SETTLED block at `block_num == n`. Body is a single integer.
+    A joiner walks `my_head+1, my_head+2, ...` (#sync-is-log-replay)."""
+    SETTLED_BLOCK = 33
+    """The reply to GETBLOCK. Body is `SettledBlock.encode()`. Peers serve from `store.settled_at`
+    (persisted at commit time, #block-shape-settled)."""
 
     # -- diagnostics ---------------------------------------------------------------------------- #
     REFUSED = 90
@@ -228,6 +243,15 @@ class SignedEnvelope:
     def verify(self) -> bool:
         return self.frm.verify(self._body, self.sig)
 
+    def seal(self) -> Frame:
+        """Sign-then-seal (the envelope is already signed) and tag for the recipient.
+
+        Note what is NOT here: no epoch, no version, no sender hint, no length prefix beyond
+        the codec's. Every one of those would be an unauthenticated field outside the sealed
+        box, and an unauthenticated field on the wire is either ignorable or forgeable."""
+        sealed = self.env.to.seal(self.raw)
+        return Frame(crypto.screen_tag(self.env.to, sealed), sealed)
+
     def fresh(self, now: int, window: int) -> bool:
         """Is this envelope inside the conversation window?
 
@@ -323,24 +347,14 @@ class Frame:
         anything would be trusting an unauthenticated field."""
         return crypto.screen_tag(me, self.sealed) == self.tag
 
+    def unseal(self, kp: crypto.Keypair) -> SignedEnvelope:
+        """Open the frame and decode the envelope inside. Verification is `accept`'s job.
 
-def seal(env: SignedEnvelope) -> Frame:
-    """Sign-then-seal (the envelope arrives already signed) and tag for the recipient.
-
-    Note what is NOT here: no epoch, no version, no sender hint, no length prefix beyond the
-    codec's. Every one of those would be an unauthenticated field outside the sealed box, and an
-    unauthenticated field on the wire is either ignorable or forgeable."""
-    sealed = env.env.to.seal(env.raw)
-    return Frame(crypto.screen_tag(env.env.to, sealed), sealed)
-
-
-def unseal(frame: Frame, kp: crypto.Keypair) -> SignedEnvelope:
-    """Open a frame and decode the envelope inside. Verification is `accept`'s job.
-
-    Raises `EnvelopeError` for a box that will not open — a frame not meant for us and a tampered
-    one are indistinguishable by design in an anonymous sealed box, so they are one error."""
-    try:
-        raw = kp.open_sealed_raw(frame.sealed)
-    except crypto.SealedBoxError as e:
-        raise EnvelopeError("frame would not unseal (not ours, or tampered)") from e
-    return SignedEnvelope.decode(raw)
+        Raises `EnvelopeError` for a box that will not open — a frame not meant for us and a
+        tampered one are indistinguishable by design in an anonymous sealed box, so they are
+        one error."""
+        try:
+            raw = kp.open_sealed_raw(self.sealed)
+        except crypto.SealedBoxError as e:
+            raise EnvelopeError("frame would not unseal (not ours, or tampered)") from e
+        return SignedEnvelope.decode(raw)

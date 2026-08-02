@@ -10,7 +10,7 @@ import sqlite3
 import unittest
 
 from dude.core import crypto
-from dude.store import ops, smt, store
+from dude.store import management, ops, smt, store
 from dude.tests.test_store import tx
 
 D = ops.STORE_DATA
@@ -280,9 +280,11 @@ class TestThroughTheStore(unittest.TestCase):
     def setUp(self):
         self.s = store.Store()
         self.kp = crypto.Keypair.generate()
+        self.s.provision(self.kp.public)
+        self.mgmt = management.Management(self.s)
 
     def _write(self, name: bytes, value: bytes) -> None:
-        self.s.apply((tx(self.kp, muts=(ops.Set(D, name, value),)),), auth=None)
+        self.s.apply((tx(self.kp, muts=(ops.Set(D, name, value),)),), auth=self.mgmt)
 
     def test_settlement_maintains_the_root(self):
         self.assertEqual(self.s.state_root(), smt.EMPTY)

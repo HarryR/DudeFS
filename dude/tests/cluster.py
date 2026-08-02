@@ -6,9 +6,10 @@
 
 from __future__ import annotations
 
+from ..consensus.bootstrap import bootstrap
 from ..core import crypto
 from ..net import Verb
-from ..net.envelope import Envelope, seal
+from ..net.envelope import Envelope
 from ..net.transports import InProc, Switchboard, address_of, name_of
 from ..node import Node
 from ..store import Store, ops
@@ -31,16 +32,21 @@ class Cluster:
         self.keys = [crypto.Keypair.generate() for _ in range(size)]
         self.nodes: list[Node] = []
 
-        # One genesis log, replayed into each node's store, so every node starts from the SAME
-        # roster and the same manager grant — membership is log state, not configuration.
+        # Every node starts with the SAME block 1 -- a manager-signed genesis block that
+        # establishes the initial roster (#manager-sig-overrides-quorum). Every node's store
+        # therefore agrees byte-for-byte on the chain from block 1 onward, and a fresh joiner
+        # arriving later can pull block 1 from any peer and chain-verify it against the
+        # manager pubkey alone.
         genesis = self._genesis()
         for kp in self.keys:
             store = Store()
-            # PROVISIONED with the manager key before anything else: it is the axiom the rest of the
-            # chain hangs from, and `adopt` refuses a checkpoint from a log it does not authorise.
+            # PROVISIONED with the manager key before anything else: it is the axiom the rest of
+            # the chain hangs from, and `adopt` refuses a checkpoint from a log it does not
+            # authorise.
             store.provision(self.mgr.public)
-            # The manager's own grant has to precede the authority that checks it.
-            store.apply(genesis, auth=None)
+            # Manager signs block 1 containing the roster grants (bootstrap runs once per node
+            # at init; every node produces byte-equal block 1 because the inputs are identical).
+            bootstrap(store, self.mgr, genesis)
             node = Node(kp, store)
             self.board.bind(name_of(kp.public))
             self.nodes.append(node)
@@ -76,14 +82,14 @@ class Cluster:
         return (tx.sign(self.mgr, T0),)
 
     def provisioned(self) -> Store:
-        """A store as a JOINER really arrives: provisioned with the manager key, holding genesis.
+        """A store as a JOINER really arrives: provisioned with the manager key, holding block 1.
 
-        The anchor is the axiom of the bootstrap chain, so a store without one verifies nothing and
-        `Store.adopt` refuses it a floor. Tests that hand-built a bare `Store()` relied on that
-        check not existing."""
+        The anchor is the axiom of the bootstrap chain, so a store without one verifies nothing
+        and `Store.adopt` refuses it a floor. Tests that hand-built a bare `Store()` relied on
+        that check not existing."""
         s = Store()
         s.provision(self.mgr.public)
-        s.apply(self._genesis(), auth=None)
+        bootstrap(s, self.mgr, self._genesis())
         return s
 
     def pump(self, now: int, rounds: int = 10) -> int:
@@ -146,7 +152,7 @@ class Cluster:
         needs a link to one node, not to all of them."""
         node = self.nodes[to]
         env = Envelope(node.me.public, Verb.SUBMIT, b"c" * 16, tx.raw).sign(client, now)
-        node.receive(seal(env), now)
+        node.receive(env.seal(), now)
 
 
 def gaps_in_the_retained_log(store: Store) -> tuple[int, ...]:

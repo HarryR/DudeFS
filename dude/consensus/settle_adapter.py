@@ -41,11 +41,21 @@ class SettleAdapterError(DudeError):
 def encode(msg: SettleSig) -> tuple[Verb, bytes]:
     """A SettleRound message to its wire form: `(verb, body_bytes)`.
 
-    Body layout: `[slice_hash, height, state_root, acc_state, acc_log, sig]`. slice_hash comes
-    first because `slice_hash_of` reads only that field to route the message."""
+    Body layout: `[slice_hash, block_num, height, prev_block, state_root, acc_state, acc_log,
+    sig]`. slice_hash comes first because `slice_hash_of` reads only that field to route the
+    message."""
     a = msg.anchors
     return Verb.SETTLE_SIG, codec.encode(
-        [msg.slice_hash, a.height, a.state_root, a.acc_state, a.acc_log, msg.sig]
+        [
+            msg.slice_hash,
+            a.block_num,
+            a.height,
+            a.prev_block,
+            a.state_root,
+            a.acc_state,
+            a.acc_log,
+            msg.sig,
+        ]
     )
 
 
@@ -55,16 +65,18 @@ def decode(verb: Verb, body: bytes) -> SettleSig:
     if verb is not Verb.SETTLE_SIG:
         raise SettleAdapterError(f"not a SettleRound verb: {verb.name}")
     try:
-        p = codec.as_seq(codec.decode(body), 6)
+        p = codec.as_seq(codec.decode(body), 8)
         return SettleSig(
             slice_hash=crypto.Digest(codec.as_bytes(p[0])),
             anchors=Anchors(
-                height=codec.as_int(p[1]),
-                state_root=crypto.Digest(codec.as_bytes(p[2])),
-                acc_state=crypto.Accumulator(codec.as_bytes(p[3])),
-                acc_log=crypto.Accumulator(codec.as_bytes(p[4])),
+                block_num=codec.as_int(p[1]),
+                height=codec.as_int(p[2]),
+                prev_block=crypto.Digest(codec.as_bytes(p[3])),
+                state_root=crypto.Digest(codec.as_bytes(p[4])),
+                acc_state=crypto.Accumulator(codec.as_bytes(p[5])),
+                acc_log=crypto.Accumulator(codec.as_bytes(p[6])),
             ),
-            sig=crypto.Signature(codec.as_bytes(p[5])),
+            sig=crypto.Signature(codec.as_bytes(p[7])),
         )
     except DudeError as e:
         raise SettleAdapterError(f"malformed SETTLE_SIG body: {e}") from e

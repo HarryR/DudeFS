@@ -18,8 +18,6 @@ from .envelope import (
     Verb,
     new_message_id,
     request,
-    seal,
-    unseal,
 )
 from .mailbox import Attempt, Expired, Expiry, Mailbox, Reply, Transmit
 from .postman import Postman
@@ -45,6 +43,4 @@ __all__ = [
     "new_message_id",
     "parse_all",
     "request",
-    "seal",
-    "unseal",
 ]

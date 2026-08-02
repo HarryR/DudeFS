@@ -163,7 +163,7 @@ class Mempool:
         tx: ops.SignedTransaction,
         now: Millis,
         reader: Reader,
-        auth: settle.Authoriser | None = None,
+        auth: settle.Authoriser,
     ) -> Refusal | None:
         """MAY THIS BE IN THE MEMPOOL? `None` means yes; anything else is the reason.
 
@@ -199,7 +199,7 @@ class Mempool:
         tx: ops.SignedTransaction,
         now: Millis,
         reader: Reader,
-        auth: settle.Authoriser | None = None,
+        auth: settle.Authoriser,
     ) -> Refusal | None:
         """The door a CLIENT knocks on: `valid`, plus "do we hold it already", plus the insert.
 

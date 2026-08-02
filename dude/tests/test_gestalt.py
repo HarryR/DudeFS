@@ -15,7 +15,7 @@ import unittest
 from ..core import codec, crypto
 from ..core.errors import DudeError, InvariantError
 from ..net import Verb
-from ..net.envelope import Envelope, Frame, seal
+from ..net.envelope import Envelope, Frame
 from ..net.transports import name_of
 from ..node import (
     _DISPATCH,
@@ -120,7 +120,7 @@ class TestGestalt(unittest.TestCase):
         stranger = crypto.Keypair.generate()
         for body in (b"\xff\x00not-bencode", codec.encode([1, 2, 3])):  # bad tag, then bad arity
             env = Envelope(node.me.public, Verb.SUBMIT, b"c" * 16, body).sign(stranger, T0)
-            node.receive(seal(env), T0)  # must not raise
+            node.receive(env.seal(), T0)  # must not raise
 
         key = crypto.h(b"after-garbage-body")
         tx = ops.writes(ops.Set(D, key, b"still-alive")).sign(self.client, T0)
@@ -171,7 +171,7 @@ class TestVerbCoverage(unittest.TestCase):
         """A peer sending a verb we have not built must cost its message and nothing more."""
         node, other = self.c.nodes[0], self.c.nodes[1]
         env = Envelope(node.me.public, Verb.PROPOSE, b"z" * 16).sign(other.me, T0)
-        node.receive(seal(env), T0)  # must not raise
+        node.receive(env.seal(), T0)  # must not raise
 
         key = crypto.h(b"after-unimplemented")
         tx = ops.writes(ops.Set(D, key, b"fine")).sign(self.client, T0)

@@ -37,6 +37,7 @@ from ..core.errors import DudeError
 from ..core.units import Millis
 from ..net.postman import Recipient, Target
 from ..store.layer import Index
+from ..store.ops import SignedTransaction
 from .round import Block
 
 _ANCHORS_DOMAIN = b"dude.settle_round.anchors"
@@ -54,16 +55,30 @@ class Anchors:
     """The post-apply commitments a SettleRound signs and quorum-agrees on
     (SPECv2 #settlement-signs-post-anchors).
 
-    `height` is the log `Index` this block will occupy once SETTLED. Assigned by the Coordinator
-    in block order (#pipelining), not derivable from the block itself -- so it lives here rather
-    than on `Block`. Same underlying type as `store.head` and `Entry.idx`; the two-name-per-type
-    trap the audit is for (`Height` was a synonym for `Index` -- deleted).
+    `block_num` is the MONOTONE block counter: increments by one per SETTLED block regardless of
+    whether the block committed any transactions. This is what a `GETBLOCK n` request names and
+    what the chain is indexed by. Empty ratifications (#empty-bucket-still-settles) still get a
+    distinct block_num, so chain-continuity holds even across empties.
 
-    All four fields are what a replayer or a light client checks against. Equal `Anchors` between
+    `height` is the log `Index` of the last transaction this block committed. Same underlying
+    type as `store.head` and `Entry.idx`. Distinct from `block_num`: an empty block has
+    `height == prev_block.height` (no txs committed), but `block_num == prev.block_num + 1`.
+    Both are signed so a joiner can verify chain position (block_num) and log alignment
+    (height) independently.
+
+    `prev_block` is `H(prev_settled_block.encode())` -- the chain link (#block-shape-settled,
+    #genesis-stamp-anchors-the-chain). At `block_num == 1`, this is the genesis stamp
+    `H("dude.genesis:" || manager_pubkey)`, computable by anyone holding the manager pubkey. The
+    settlement signature covers `prev_block`, so a peer cannot lie about which chain their block
+    belongs to without invalidating the sig.
+
+    All six fields are what a replayer or a light client checks against. Equal `Anchors` between
     two nodes at the same slice means byte-identical post-apply state; anything else is a
     divergence."""
 
+    block_num: Index
     height: Index
+    prev_block: crypto.Digest
     state_root: crypto.Digest
     acc_state: crypto.Accumulator
     acc_log: crypto.Accumulator
@@ -103,7 +118,9 @@ def _settle_payload(slice_hash: crypto.Digest, anchors: Anchors) -> bytes:
         [
             _ANCHORS_DOMAIN,
             slice_hash,
+            anchors.block_num,
             anchors.height,
+            anchors.prev_block,
             anchors.state_root,
             anchors.acc_state,
             anchors.acc_log,
@@ -119,12 +136,149 @@ class SettledBlock:
     Persists as the record of "the cluster applied this slice at this height and agreed on these
     roots." A replayer receiving this block verifies the settle_sigs against the roster at
     `height` (#roster-at-ratification) and, on a fresh apply of the same slice, reproduces the
-    same anchors -- else divergence."""
+    same anchors -- else divergence.
+
+    RATIFY SIGS ARE NOT ENCODED. Per #block-shape-settled, "what proves the block to a replayer
+    is the settle_sigs alone: a quorum agreed on the outcome, and `slice_hash` inside that
+    payload pins which slice they were agreeing about." Round's `signers`/`sigs` on the wrapped
+    `Block` are transient consensus infrastructure -- the record of HOW the quorum agreed on the
+    slice, not the record THAT they did. `encode()` therefore omits them; `decode()` returns a
+    SettledBlock whose wrapped Block has empty ratify credentials."""
 
     block: Block
     anchors: Anchors
     signers: crypto.SignerBitmap
     settle_sigs: tuple[crypto.Signature, ...]
+
+    @property
+    def block_hash(self) -> crypto.Digest:
+        """Chain identity -- `H(identity_bytes)`, over the block's slice + anchors + block_num.
+        A successor's `Anchors.prev_block` names THIS.
+
+        SIG-INDEPENDENT. The signer bitmap and `settle_sigs` are a QUORUM PROOF, variable per
+        node: any quorum-sized subset of matching sigs is a valid proof, and which subset a node
+        holds at the moment `_try_settle` fires depends on message-arrival timing. Two nodes with
+        the same slice + same anchors MUST compute the same `block_hash` regardless of which
+        subset of sigs they persist -- else `prev_block` diverges per node and the chain forks.
+        (Discovered while implementing L5 close-out: nodes' `encode()` bytes differed because of
+        this exact race, breaking chain agreement.)"""
+        return crypto.h(self._identity_bytes())
+
+    def _identity_bytes(self) -> bytes:
+        """The chain-identity portion of the block: slice + anchors, no sigs. Hashed for
+        `block_hash`; embedded verbatim in `encode` so a joiner receives both identity and
+        proof without re-hashing to know which was signed."""
+        return codec.encode(
+            [
+                self.block.bucket,
+                sorted(self.block.hashes),
+                self.anchors.block_num,
+                self.anchors.height,
+                self.anchors.prev_block,
+                self.anchors.state_root,
+                self.anchors.acc_state,
+                self.anchors.acc_log,
+            ]
+        )
+
+    def encode(self) -> bytes:
+        """Wire form (#block-shape-settled). What a peer sends on `SETTLED_BLOCK`, what a
+        producer persists on SETTLED. Layout: `[identity_bytes, signers, settle_sigs]` -- the
+        identity portion comes first because chain-verify hashes only it (`block_hash`), and a
+        joiner can peek without re-decoding the sig section."""
+        return codec.encode(
+            [
+                self._identity_bytes(),
+                self.signers,
+                list(self.settle_sigs),
+            ]
+        )
+
+    @classmethod
+    def decode(cls, raw: bytes) -> SettledBlock:
+        """The inverse of `encode`. Raises `SettleError` on malformed bytes."""
+        try:
+            outer = codec.as_seq(codec.decode(raw), 3)
+            identity = codec.as_seq(codec.decode(codec.as_bytes(outer[0])), 8)
+            bucket = codec.as_int(identity[0])
+            hashes = tuple(crypto.Digest(codec.as_bytes(h)) for h in codec.as_seq(identity[1]))
+            anchors = Anchors(
+                block_num=codec.as_int(identity[2]),
+                height=codec.as_int(identity[3]),
+                prev_block=crypto.Digest(codec.as_bytes(identity[4])),
+                state_root=crypto.Digest(codec.as_bytes(identity[5])),
+                acc_state=crypto.Accumulator(codec.as_bytes(identity[6])),
+                acc_log=crypto.Accumulator(codec.as_bytes(identity[7])),
+            )
+            signers = crypto.SignerBitmap(codec.as_bytes(outer[1]))
+            settle_sigs = tuple(crypto.Signature(codec.as_bytes(s)) for s in codec.as_seq(outer[2]))
+        except DudeError as e:
+            raise SettleError(f"malformed SettledBlock: {e}") from e
+        # Ratify sigs are not on the wire -- reconstruct a Block with empty ratify credentials.
+        # A replayer needs `bucket` and `hashes` for `slice_hash` and for applying the slice;
+        # the ratify sigs were Round's transient consensus record and never persist.
+        block = Block(
+            bucket=bucket,
+            hashes=hashes,
+            signers=crypto.SignerBitmap(b""),
+            sigs=(),
+        )
+        return cls(block=block, anchors=anchors, signers=signers, settle_sigs=settle_sigs)
+
+
+@dataclass(frozen=True, slots=True)
+class SettledBlockWithBodies:
+    """A SettledBlock plus the tx bodies needed to replay it -- the wire form a joiner receives
+    on `SETTLED_BLOCK` and what a replayer needs to actually apply the block.
+
+    TWO-TYPE SPLIT (#block-shape-settled): `SettledBlock` alone is identity + proof (persists,
+    chains, verifies). `SettledBlockWithBodies` is identity + proof + payload (transmits,
+    replays). Kept as separate types so the CHAIN concern (block_hash, prev_block linking) never
+    accidentally depends on the PAYLOAD concern (which txs make it up) -- their shapes differ,
+    their durability differs (proof persists in the block table; bodies come from the entry
+    table), and conflating them was the source of the sig-inclusion race Stage 1 caught.
+
+    `bodies` correspond to the APPLIED set on the producer -- the subset of `block.hashes` that
+    actually made it through the evaluator (some may have fallen through per
+    #fall-through-through-the-door). A joiner verifies bodies re-apply cleanly against its own
+    state at that height, produces matching anchors, and only then commits."""
+
+    block: SettledBlock
+    bodies: tuple[SignedTransaction, ...]
+
+    def encode(self) -> bytes:
+        """Wire form: `[SettledBlock.encode(), [tx.raw, ...]]`. The block-bytes come first so a
+        peer serving `SETTLED_BLOCK` can pass `store.settled_at(n)` through verbatim without
+        re-serialising the identity/proof portion."""
+        return codec.encode(
+            [
+                self.block.encode(),
+                [tx.raw for tx in self.bodies],
+            ]
+        )
+
+    @classmethod
+    def decode(cls, raw: bytes) -> SettledBlockWithBodies:
+        """The inverse of `encode`. Raises `SettleError` on malformed bytes."""
+        try:
+            p = codec.as_seq(codec.decode(raw), 2)
+            block = SettledBlock.decode(codec.as_bytes(p[0]))
+            bodies = tuple(SignedTransaction.decode(codec.as_bytes(b)) for b in codec.as_seq(p[1]))
+        except DudeError as e:
+            raise SettleError(f"malformed SettledBlockWithBodies: {e}") from e
+        return cls(block=block, bodies=bodies)
+
+
+_GENESIS_DOMAIN = b"dude.genesis:"
+
+
+def genesis_stamp(manager: crypto.PublicKey) -> crypto.Digest:
+    """The `prev_block` value for the SettledBlock at height 1 (#genesis-stamp-anchors-the-chain).
+    A joiner starting from the out-of-band manager pubkey computes this locally; every node
+    producing block 1 computes the same thing from its own `store.anchor()`. Two clusters started
+    from different manager keys have byte-different genesis stamps by construction, so a block
+    from cluster A cannot chain-verify against cluster B's history."""
+    return crypto.h(_GENESIS_DOMAIN + bytes(manager))
 
 
 class SettleState(Enum):
@@ -247,9 +401,13 @@ class SettleRound:
             return
         if len(self._sigs) < self._quorum:
             return
-        # Ratified. Build the SettledBlock with a roster-ordered bitmap of signers and their
-        # parallel signatures -- the same shape as Round's Block (SPECv2 #ratification-counts).
-        bits = bytearray(crypto.bitmap_size(len(self._roster)))
+        # Ratified. Build the SettledBlock with a bitmap of signers plus a reserved manager slot
+        # at position `len(roster)` (#manager-sig-overrides-quorum). The manager bit stays 0 in
+        # the ordinary quorum path -- bootstrap and emergency-intervention blocks set it via
+        # `SettledBlock.sign_by_manager` instead. Sig list is parallel to set bits, same as
+        # Round's Block (SPECv2 #ratification-counts).
+        n = len(self._roster) + 1  # +1 for the manager override slot
+        bits = bytearray(crypto.bitmap_size(n))
         sigs: list[crypto.Signature] = []
         for i, member in enumerate(self._roster):
             if member in self._sigs:

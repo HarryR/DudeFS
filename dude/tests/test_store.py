@@ -34,15 +34,24 @@ def _at(st, m):
     return ops.Set(st, m.name, m.value, m.epoch) if isinstance(m, ops.Set) else ops.Del(st, m.name)
 
 
+def provisioned(kp: crypto.Keypair) -> tuple[store.Store, management.Management]:
+    """A fresh Store provisioned with `kp` as the manager anchor, plus its Management. Tests
+    that authored transactions under the pre-`auth=None`-removal shape use this so the
+    anchor-is-always-authorised rule handles their writes without invoking a bypass."""
+    s = store.Store()
+    s.provision(kp.public)
+    return s, management.Management(s)
+
+
 class TestSettlement(unittest.TestCase):
     def setUp(self):
-        self.s = store.Store()
         self.kp = crypto.Keypair.generate()
+        self.s, self.mgmt = provisioned(self.kp)
         self.K = crypto.NameToken(crypto.h(b"K"))
         self.J = crypto.NameToken(crypto.h(b"J"))
 
     def test_set_get_and_provenance(self):
-        r = self.s.apply((tx(self.kp, (), (ops.Set(0, self.K, b"v1"),)),))
+        r = self.s.apply((tx(self.kp, (), (ops.Set(0, self.K, b"v1"),)),), auth=self.mgmt)
         self.assertEqual(len(r.settled), 1)
         idx, _ = r.settled[0]
         held = self.s.get(ops.STORE_DATA, self.K)
@@ -52,20 +61,20 @@ class TestSettlement(unittest.TestCase):
         self.assertEqual(self.s.head(), idx)
 
     def test_absent_is_not_empty_bytes(self):
-        self.s.apply((tx(self.kp, (), (ops.Set(0, self.K, b""),)),))
+        self.s.apply((tx(self.kp, (), (ops.Set(0, self.K, b""),)),), auth=self.mgmt)
         # holds empty bytes -> present. #one-write-vocabulary: these are different facts.
         self.assertTrue(self.s.holds(ops.Holds(D, self.K, ops.value_digest(b""))))
         self.assertFalse(self.s.holds(ops.Absent(D, self.K)))
 
     def test_del_makes_absent(self):
-        self.s.apply((tx(self.kp, (), (ops.Set(0, self.K, b"v"),)),))
-        self.s.apply((tx(self.kp, (), (ops.Del(0, self.K),)),))
+        self.s.apply((tx(self.kp, (), (ops.Set(0, self.K, b"v"),)),), auth=self.mgmt)
+        self.s.apply((tx(self.kp, (), (ops.Del(0, self.K),)),), auth=self.mgmt)
         self.assertIsNone(self.s.get(ops.STORE_DATA, self.K))
         self.assertTrue(self.s.holds(ops.Absent(D, self.K)))
 
     def test_failed_predicate_is_dropped_not_stored(self):
         bad = tx(self.kp, (ops.Holds(D, self.K, crypto.h(b"nope")),), (ops.Set(0, self.K, b"x"),))
-        r = self.s.apply((bad,))
+        r = self.s.apply((bad,), auth=self.mgmt)
         self.assertEqual(r.settled, ())
         self.assertEqual(r.dropped, ((bad.op_hash, settle.Reason.GUARD),))
         self.assertEqual(self.s.head(), 0)  # nothing entered the log (#predicates)
@@ -74,15 +83,15 @@ class TestSettlement(unittest.TestCase):
     def test_bad_signature_is_dropped(self):
         good = tx(self.kp, (), (ops.Set(0, self.K, b"v"),))
         forged = ops.SignedTransaction(good.author, good.ts + 5, good.txn, good.sig)
-        r = self.s.apply((forged,))
+        r = self.s.apply((forged,), auth=self.mgmt)
         self.assertEqual(r.dropped, ((forged.op_hash, settle.Reason.SIGNATURE),))
 
     def test_cas_race_first_wins_second_drops(self):
-        self.s.apply((tx(self.kp, (), (ops.Set(0, self.K, b"old"),)),))
+        self.s.apply((tx(self.kp, (), (ops.Set(0, self.K, b"old"),)),), auth=self.mgmt)
         d = ops.value_digest(b"old")
         a = tx(self.kp, (ops.Holds(D, self.K, d),), (ops.Set(0, self.K, b"A"),))
         b = tx(self.kp, (ops.Holds(D, self.K, d),), (ops.Set(0, self.K, b"B"),))
-        r = self.s.apply((a, b))  # already ordered by the layer above
+        r = self.s.apply((a, b), auth=self.mgmt)  # already ordered by the layer above
         self.assertEqual(len(r.settled), 1)
         self.assertEqual(len(r.dropped), 1)
         cur = self.s.get(ops.STORE_DATA, self.K)
@@ -93,7 +102,7 @@ class TestSettlement(unittest.TestCase):
         """#settlement: no predicates, so nothing is invalidated — both apply, last wins."""
         a = tx(self.kp, (), (ops.Set(0, self.K, b"A"),))
         b = tx(self.kp, (), (ops.Set(0, self.K, b"B"),))
-        r = self.s.apply((a, b))
+        r = self.s.apply((a, b), auth=self.mgmt)
         self.assertEqual(len(r.settled), 2)
         cur = self.s.get(ops.STORE_DATA, self.K)
         assert cur is not None
@@ -101,7 +110,9 @@ class TestSettlement(unittest.TestCase):
 
     def test_atomicity_within_a_transaction(self):
         """Last write wins inside one transaction (#last-write-wins)."""
-        r = self.s.apply((tx(self.kp, (), (ops.Set(0, self.K, b"1"), ops.Set(0, self.K, b"2"))),))
+        r = self.s.apply(
+            (tx(self.kp, (), (ops.Set(0, self.K, b"1"), ops.Set(0, self.K, b"2"))),), auth=self.mgmt
+        )
         self.assertEqual(len(r.settled), 1)
         cur = self.s.get(ops.STORE_DATA, self.K)
         assert cur is not None
@@ -110,17 +121,17 @@ class TestSettlement(unittest.TestCase):
 
 class TestAccumulator(unittest.TestCase):
     def setUp(self):
-        self.s = store.Store()
         self.kp = crypto.Keypair.generate()
+        self.s, self.mgmt = provisioned(self.kp)
 
     def test_empty_state_is_identity(self):
         self.assertEqual(self.s.accumulator(), crypto.ACC_IDENTITY)
 
     def test_set_then_del_returns_to_identity(self):
         k = crypto.NameToken(crypto.h(b"K"))
-        self.s.apply((tx(self.kp, (), (ops.Set(0, k, b"v"),)),))
+        self.s.apply((tx(self.kp, (), (ops.Set(0, k, b"v"),)),), auth=self.mgmt)
         self.assertNotEqual(self.s.accumulator(), crypto.ACC_IDENTITY)
-        self.s.apply((tx(self.kp, (), (ops.Del(0, k),)),))
+        self.s.apply((tx(self.kp, (), (ops.Del(0, k),)),), auth=self.mgmt)
         self.assertEqual(
             self.s.accumulator(),
             crypto.ACC_IDENTITY,
@@ -132,17 +143,18 @@ class TestAccumulator(unittest.TestCase):
         order they got there (#accumulators)."""
         names = [crypto.NameToken(crypto.h(bytes([i]))) for i in range(6)]
         vals = [b"v%d" % i for i in range(6)]
-        a, b = store.Store(), store.Store()
+        a, b = provisioned(self.kp)[0], provisioned(self.kp)[0]
         for st, order in ((a, range(6)), (b, reversed(range(6)))):
+            m = management.Management(st)
             for i in order:
-                st.apply((tx(self.kp, (), (ops.Set(0, names[i], vals[i]),)),))
+                st.apply((tx(self.kp, (), (ops.Set(0, names[i], vals[i]),)),), auth=m)
         self.assertEqual(a.accumulator(), b.accumulator())
 
     def test_accumulator_matches_recomputation_from_live(self):
         """The maintained value must equal one folded from scratch over the live rows."""
         for i in range(12):
             n = crypto.NameToken(crypto.h(bytes([i % 5])))
-            self.s.apply((tx(self.kp, (), (ops.Set(0, n, b"v%d" % i),)),))
+            self.s.apply((tx(self.kp, (), (ops.Set(0, n, b"v%d" % i),)),), auth=self.mgmt)
         rows = self.s.db.execute("SELECT store, name, value FROM live").fetchall()
         want = functools.reduce(
             crypto.acc_add,
@@ -158,11 +170,13 @@ class TestReplayEquivalence(unittest.TestCase):
 
     def _randomised(self, seed):
         rng = random.Random(seed)
-        s = store.Store()
-        kps = [crypto.Keypair.from_seed(crypto.Seed(bytes([i] * 32))) for i in range(1, 4)]
+        # One anchor keypair drives all writes -- the test cares about state convergence
+        # under random writes, not about multi-author authority. Cheaper than granting
+        # authority to N keys and equally valid for the invariant being tested.
+        kp = crypto.Keypair.from_seed(crypto.Seed(bytes([1] * 32)))
+        s, mgmt = provisioned(kp)
         names = [crypto.NameToken(crypto.h(bytes([i]))) for i in range(5)]
         for _ in range(120):
-            kp = rng.choice(kps)
             n = rng.choice(names)
             preds, muts = (), ()
             roll = rng.random()
@@ -180,7 +194,7 @@ class TestReplayEquivalence(unittest.TestCase):
                 muts = (ops.Set(0, n, b"a"), ops.Set(0, m, b"b"))
             else:
                 muts = (ops.Set(0, n, bytes([rng.randrange(256)])),)
-            s.apply((tx(kp, preds, muts, ts=rng.randrange(1, 10**6)),))
+            s.apply((tx(kp, preds, muts, ts=rng.randrange(1, 10**6)),), auth=mgmt)
         return s
 
     def test_rebuild_matches_incremental(self):
@@ -217,13 +231,18 @@ class TestStoreIsolation(unittest.TestCase):
     management value — an ACL bypass by name collision. A regression test, not a nicety."""
 
     def setUp(self):
-        self.s = store.Store()
         self.kp = crypto.Keypair.generate()
+        self.s, self.mgmt = provisioned(self.kp)
         self.name = crypto.NameToken(crypto.h(b"config/thing"))  # ONE token, used in two stores
 
     def test_same_name_in_two_stores_does_not_collide(self):
-        self.s.apply((tx(self.kp, (), (ops.Set(0, self.name, b"mgmt"),), st=ops.STORE_MANAGEMENT),))
-        self.s.apply((tx(self.kp, (), (ops.Set(0, self.name, b"data"),), st=ops.STORE_DATA),))
+        self.s.apply(
+            (tx(self.kp, (), (ops.Set(0, self.name, b"mgmt"),), st=ops.STORE_MANAGEMENT),),
+            auth=self.mgmt,
+        )
+        self.s.apply(
+            (tx(self.kp, (), (ops.Set(0, self.name, b"data"),), st=ops.STORE_DATA),), auth=self.mgmt
+        )
         mgmt = self.s.get(ops.STORE_MANAGEMENT, self.name)
         data = self.s.get(ops.STORE_DATA, self.name)
         assert mgmt is not None and data is not None
@@ -232,7 +251,10 @@ class TestStoreIsolation(unittest.TestCase):
         self.assertEqual(self.s.db.execute("SELECT COUNT(*) FROM live").fetchone()[0], 2)
 
     def test_predicates_are_scoped_to_their_store(self):
-        self.s.apply((tx(self.kp, (), (ops.Set(0, self.name, b"mgmt"),), st=ops.STORE_MANAGEMENT),))
+        self.s.apply(
+            (tx(self.kp, (), (ops.Set(0, self.name, b"mgmt"),), st=ops.STORE_MANAGEMENT),),
+            auth=self.mgmt,
+        )
         # absent in the DATA store even though present in management
         self.assertTrue(self.s.holds(ops.Absent(D, self.name)))
         self.assertFalse(self.s.holds(ops.Absent(ops.STORE_MANAGEMENT, self.name)))
@@ -245,7 +267,8 @@ class TestStoreIsolation(unittest.TestCase):
                     (ops.Set(0, self.name, b"d"),),
                     st=ops.STORE_DATA,
                 ),
-            )
+            ),
+            auth=self.mgmt,
         )
         self.assertEqual(len(r.settled), 1)
         mgmt = self.s.get(ops.STORE_MANAGEMENT, self.name)
@@ -254,9 +277,16 @@ class TestStoreIsolation(unittest.TestCase):
 
     def test_accumulator_distinguishes_the_stores(self):
         """Two states differing only in WHICH store holds a value must not fingerprint alike."""
-        a, b = store.Store(), store.Store()
-        a.apply((tx(self.kp, (), (ops.Set(0, self.name, b"v"),), st=ops.STORE_MANAGEMENT),))
-        b.apply((tx(self.kp, (), (ops.Set(0, self.name, b"v"),), st=ops.STORE_DATA),))
+        a, ma = provisioned(self.kp)
+        b, mb = provisioned(self.kp)
+        a.apply(
+            (tx(self.kp, (), (ops.Set(0, self.name, b"v"),), st=ops.STORE_MANAGEMENT),),
+            auth=ma,
+        )
+        b.apply(
+            (tx(self.kp, (), (ops.Set(0, self.name, b"v"),), st=ops.STORE_DATA),),
+            auth=mb,
+        )
         self.assertNotEqual(a.accumulator(), b.accumulator())
 
 
@@ -266,13 +296,16 @@ class TestCrossStorePredicates(unittest.TestCase):
     writes (#coarse-acl)."""
 
     def setUp(self):
-        self.s = store.Store()
         self.kp = crypto.Keypair.generate()
+        self.s, self.mgmt = provisioned(self.kp)
         self.flag = crypto.NameToken(crypto.h(b"mgmt/flag"))
         self.K = crypto.NameToken(crypto.h(b"data/K"))
 
     def test_data_write_gated_on_management_state(self):
-        self.s.apply((tx(self.kp, (), (ops.Set(0, self.flag, b"on"),), st=ops.STORE_MANAGEMENT),))
+        self.s.apply(
+            (tx(self.kp, (), (ops.Set(0, self.flag, b"on"),), st=ops.STORE_MANAGEMENT),),
+            auth=self.mgmt,
+        )
         # settles: the management predicate holds
         good = tx(
             self.kp,
@@ -280,7 +313,7 @@ class TestCrossStorePredicates(unittest.TestCase):
             (ops.Set(0, self.K, b"v"),),
             st=D,
         )
-        self.assertEqual(len(self.s.apply((good,)).settled), 1)
+        self.assertEqual(len(self.s.apply((good,), auth=self.mgmt).settled), 1)
         # drops: same shape, wrong expectation about the OTHER store
         bad = tx(
             self.kp,
@@ -288,7 +321,7 @@ class TestCrossStorePredicates(unittest.TestCase):
             (ops.Set(0, self.K, b"w"),),
             st=D,
         )
-        r = self.s.apply((bad,))
+        r = self.s.apply((bad,), auth=self.mgmt)
         self.assertEqual(r.dropped, ((bad.op_hash, settle.Reason.GUARD),))
 
     def test_conflict_is_per_store_pair(self):
@@ -328,6 +361,7 @@ class TestFailureDomains(unittest.TestCase):
     def setUp(self):
         self.mgr = crypto.Keypair.generate()
         self.store = store.Store()
+        self.store.provision(self.mgr.public)
         self.mgmt = management.Management(self.store)
         self.store.apply(
             (
@@ -338,7 +372,8 @@ class TestFailureDomains(unittest.TestCase):
                     frozenset(),
                     self.mgr.prove_possession(),
                 ).sign(self.mgr, 1),
-            )
+            ),
+            auth=self.mgmt,
         )
 
     def _add(self, n, domains):
@@ -483,15 +518,19 @@ class TestTransferAndSettlementRace(unittest.TestCase):
     def setUp(self):
         self.s = store.Store()
         self.kp = crypto.Keypair.generate()
+        # Provision the test key as the anchor so its writes pass authority via the anchor-
+        # is-always-authorised rule -- the shape that replaced `auth=None` (Path (a)).
+        self.s.provision(self.kp.public)
+        self.mgmt = management.Management(self.s)
 
     def test_a_transaction_already_in_the_log_is_dropped_not_raised(self):
         """`entry.op_hash UNIQUE` is what makes a settled transaction unrepeatable, and it used to
         enforce that by throwing out of a frame handler — a routine race reported as corruption."""
         t = tx(self.kp, muts=(ops.Set(ops.STORE_DATA, b"k", b"v"),))
-        first = self.s.apply((t,), auth=None)
+        first = self.s.apply((t,), auth=self.mgmt)
         self.assertEqual(len(first.settled), 1)
 
-        again = self.s.apply((t,), auth=None)  # must not raise
+        again = self.s.apply((t,), auth=self.mgmt)  # must not raise
         self.assertEqual(again.settled, ())
         self.assertEqual([d.why for d in again.dropped], [settle.Reason.SETTLED])
         self.assertEqual(self.s.head(), 1, "the duplicate took a log position")
@@ -499,10 +538,10 @@ class TestTransferAndSettlementRace(unittest.TestCase):
     def test_the_survivors_of_a_mixed_batch_still_land(self):
         """One duplicate must not take the batch down with it."""
         old = tx(self.kp, muts=(ops.Set(ops.STORE_DATA, b"k", b"v"),))
-        self.s.apply((old,), auth=None)
+        self.s.apply((old,), auth=self.mgmt)
         fresh = tx(self.kp, muts=(ops.Set(ops.STORE_DATA, b"j", b"w"),), ts=2)
 
-        got = self.s.apply((old, fresh), auth=None)
+        got = self.s.apply((old, fresh), auth=self.mgmt)
         self.assertEqual(len(got.settled), 1)
         self.assertEqual([d.why for d in got.dropped], [settle.Reason.SETTLED])
         self.assertIsNotNone(self.s.get(ops.STORE_DATA, b"j"))

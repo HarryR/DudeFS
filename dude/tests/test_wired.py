@@ -122,7 +122,7 @@ DRIVEN = {
     "coordinator.submit": "hands a client's tx to the currently-live mempool",
     "coordinator.on_round_msg": "routes HELD/SIG envelopes to the right Round by bucket",
     "postman.tick": "sends what is due and reaps what expired",
-    "store.apply": "settles the agreed block",
+    "store.commit_block": "atomically applies the agreed block's txs + persists its bytes",
 }
 """Duties that MUST be performed by the round. Keyed by the dotted call as production writes it.
 

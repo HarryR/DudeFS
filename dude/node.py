@@ -37,6 +37,8 @@ from .net.postman import Postman
 from .net.transports import address_of
 from .store import Store, ops
 from .store.management import Management
+from .sync.adapter import SyncAdapter
+from .sync.follower import Follower, serve_getblock, serve_height
 from .tunables import DEFAULT, Tunables
 
 REPLIES = frozenset({Verb.PONG, Verb.BODIES, Verb.REFUSED})
@@ -52,6 +54,10 @@ HANDLED = frozenset(
         Verb.HELD,
         Verb.SIG,
         Verb.SETTLE_SIG,
+        Verb.HEIGHT,
+        Verb.HEIGHT_REPLY,
+        Verb.GETBLOCK,
+        Verb.SETTLED_BLOCK,
         Verb.PING,
     }
 )
@@ -59,7 +65,12 @@ HANDLED = frozenset(
 
 `HELD` and `SIG` are the Round protocol's own vocabulary (SPECv2 #round-lifecycle); handled by
 delegating to `Coordinator.on_round_msg`. `PROPOSE` and `ENDORSE` were the placeholder round's
-verbs; deleted as part of the Round pivot (Phase 6)."""
+verbs; deleted as part of the Round pivot (Phase 6).
+
+`HEIGHT`/`GETBLOCK` are inbound sync REQUESTS -- Node answers via `serve_*` (stateless). The
+answers themselves (`HEIGHT_REPLY`/`SETTLED_BLOCK`) are correlated by Postman as replies but
+ALSO carry state the Follower needs -- so they land in `HANDLED` too, and their handlers route
+to `Follower.receive`. Different from `BODIES`/`PONG` where correlation IS the useful work."""
 
 SOLICITED: frozenset[Verb] = frozenset()
 """Verbs that are only ever an ANSWER to something this node asked for.
@@ -84,16 +95,23 @@ class Node:
     postman: Postman = field(init=False)
     adapter: RoundAdapter = field(init=False)
     settle_adapter: SettleAdapter = field(init=False)
+    sync_adapter: SyncAdapter = field(init=False)
     coordinator: Coordinator = field(init=False)
     """Owns the current Mempool, the in-flight Rounds, and drives them on tick. See
     `dude.coordinator`. Node's role in consensus is: hand SUBMIT bodies to
     `coordinator.submit`, HELD/SIG envelopes to `coordinator.on_round_msg`, SETTLE_SIG
     envelopes to `coordinator.on_settle_msg`, and call `coordinator.tick(now)` from `tick`."""
+    follower: Follower = field(init=False)
+    """Owns the L6 catch-up state machine (`dude.sync`). Consumes SETTLED blocks pulled from
+    peers; commits via `store.commit_block`, same durable path Coordinator uses. Coordinator
+    and Follower share the Store as their only meeting point (#sync-in-its-own-module) --
+    Coordinator PRODUCES blocks, Follower CONSUMES them, they never talk to each other."""
 
     def __post_init__(self) -> None:
         self.postman = Postman(self.me, window=self.tunables.net.window)
         self.adapter = RoundAdapter(self.me, self.postman, self.tunables.net.ttl)
         self.settle_adapter = SettleAdapter(self.me, self.postman, self.tunables.net.ttl)
+        self.sync_adapter = SyncAdapter(self.me, self.postman, self.tunables.net.ttl)
         self.coordinator = Coordinator(
             self.me,
             self.store,
@@ -101,6 +119,12 @@ class Node:
             self.settle_adapter,
             self.tunables,
             reflood=lambda tx, now: self._flood(Verb.SUBMIT, tx.raw, now),
+        )
+        self.follower = Follower(
+            me=self.me,
+            store=self.store,
+            mgmt=Management(self.store),
+            tunables=self.tunables.sync,
         )
 
     @property
@@ -118,16 +142,22 @@ class Node:
 
     def connect(self, peer: crypto.PublicKey, transport: Transport) -> None:
         """Add a peer reachable in-process. A real deployment reads endpoints from the management
-        store instead; this is the same `Peer` either way."""
+        store instead; this is the same `Peer` either way.
+
+        The follower also learns about the peer here so its next `tick` polls them for HEIGHT.
+        Initial poll deadline is 0, i.e. "poll on the very next tick" -- callers usually
+        `connect` at cluster construction time when the clock is not yet advanced, so any
+        reasonable `tick(now)` will fire the first poll immediately."""
         p = Peer(peer, lambda _e: transport, self.tunables.link)
         p.reconfigure((Endpoint(address_of(peer)),))
         self.postman.peers[peer] = p
+        self.follower.add_peer(peer, now=0)
 
     def roster(self) -> tuple[crypto.PublicKey, ...]:
-        """THE STORE'S ANSWER, not a second one. This used to be `self.mgmt.node_set()` — the same
-        expression `Store.roster` already evaluates, so two implementations of "who is the roster"
-        sat on either side of the boundary because neither layer was sure it was allowed to ask."""
-        return self.store.roster()
+        """MANAGEMENT'S ANSWER, and nowhere else. `Management` owns everything about who is
+        authorised; the roster is one such question. `Store.roster` used to shadow this call;
+        deleted -- Store does not touch the roster. `store.mgmt.roster()` is the one path."""
+        return self.store.mgmt.roster()
 
     # -- inbound ------------------------------------------------------------------------------- #
 
@@ -203,16 +233,52 @@ class Node:
         block via the Coordinator, dropped if it does not match."""
         self.coordinator.on_settle_msg(env, now)
 
+    def _on_height(self, env: SignedEnvelope, now: Millis) -> None:
+        """A peer is asking for our current head. Answer with `HEIGHT_REPLY (block_num, tip_hash)`
+        via the stateless `serve_height` helper (SPECv2 #height-poll-is-the-trigger)."""
+        verb, body = serve_height(self.store)
+        self._reply(env, verb, body, now)
+
+    def _on_height_reply(self, env: SignedEnvelope, now: Millis) -> None:
+        """A peer's answer to our own HEIGHT poll. Route to the Follower, which updates its
+        `_heads` map and may fire fork detection or start a pull on the next tick."""
+        self.follower.receive(env.env.verb, env.env.body, env.frm, now)
+
+    def _on_getblock(self, env: SignedEnvelope, now: Millis) -> None:
+        """A peer is asking for a SETTLED block. Answer via `serve_getblock` -- returns either
+        `SETTLED_BLOCK` (block + bodies) or `REFUSED` with a `SyncRefusal` reason. Stateless;
+        reads from `store.settled_at` + `store.bodies_of_block`."""
+        verb, body = serve_getblock(self.store, env.env.body)
+        self._reply(env, verb, body, now)
+
+    def _on_settled_block(self, env: SignedEnvelope, now: Millis) -> None:
+        """A peer's answer to our GETBLOCK. Route to the Follower, which runs the full verify
+        pipeline (chain link + settle_sigs + body-sig + preview-anchors-match) and commits on
+        success -- or drops the peer on any failure (#sync-is-log-replay)."""
+        self.follower.receive(env.env.verb, env.env.body, env.frm, now)
+
     # -- the round ----------------------------------------------------------------------------- #
 
     def tick(self, now: Millis) -> None:
-        """Advance the consensus round and the wire.
+        """Advance the consensus round, the sync loop, and the wire.
 
-        Round advancement lives in `Coordinator.tick` -- it drives the current Mempool's
-        eviction (via bucket-swap), opens Rounds at boundaries, ticks them, flushes their
-        outboxes, and settles any that ratified."""
+        Coordinator drives Round + SettleRound + commit. Follower drives sync polls, pull
+        timeouts, and pull initiation; its outbox contains the HEIGHT / GETBLOCK envelopes to
+        post via the mailbox."""
         self.coordinator.tick(now)
+        self.follower.tick(now)
+        self._flush_follower(now)
         self.postman.tick(now)
+
+    def _flush_follower(self, now: Millis) -> None:
+        """Post the Follower's outbox to the mailbox. Follower emits `(peer, verb, body)` tuples
+        for outbound HEIGHT / GETBLOCK requests; the sync-adapter wraps them in signed envelopes
+        and posts with `await_reply=True` so the mailbox correlates the answer (HEIGHT_REPLY,
+        SETTLED_BLOCK, REFUSED)."""
+        for peer, verb, body in self.follower.outbox():
+            if peer not in self.postman.peers:
+                continue  # peer not reachable; drop rather than raise
+            self.sync_adapter.send(peer, verb, body, now, await_reply=True)
 
     # -- outbound ------------------------------------------------------------------------------ #
 

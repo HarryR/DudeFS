@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import unittest
 
-from dude.consensus.settle_round import SettleState
+from dude.consensus.settle_round import SettledBlock, SettleState, genesis_stamp
 from dude.core import crypto
 from dude.store import ops
 
@@ -149,6 +149,89 @@ class TestSettleStateEnum(unittest.TestCase):
     def test_state_names(self):
         self.assertEqual(SettleState.COLLECTING.name, "COLLECTING")
         self.assertEqual(SettleState.SETTLED.name, "SETTLED")
+
+
+class TestBlocksChainAndPersist(unittest.TestCase):
+    """The end-to-end shape of Stage 1: after settlement, every node has a `block` row per
+    ratified bucket, chained via `prev_block` back to the genesis stamp derived from the
+    manager pubkey (#genesis-stamp-anchors-the-chain, #block-shape-settled)."""
+
+    def setUp(self):
+        self.c = Cluster()
+        self.client = self.c.mgr
+
+    def test_first_block_prev_is_the_genesis_stamp(self):
+        """Block 1's `prev_block` = H('dude.genesis:' || manager_pubkey). A joiner holding
+        only the manager pubkey computes the same stamp locally."""
+        tx = ops.writes(ops.Set(D, crypto.h(b"first"), b"v")).sign(self.client, T0)
+        self.c.submit(self.client, tx, to=0, now=T0)
+        self.c.pump(T0)
+        self.c.pump(T0 + DELTA)
+        self.c.pump(T0 + 2 * DELTA)
+
+        for i, node in enumerate(self.c.nodes):
+            raw = node.store.settled_at(1)
+            assert raw is not None, f"node {i} has no block_num=1 row"
+            sb = SettledBlock.decode(raw)
+            self.assertEqual(sb.anchors.block_num, 1)
+            self.assertEqual(
+                sb.anchors.prev_block,
+                genesis_stamp(self.c.mgr.public),
+                f"node {i} block 1 does not chain to genesis",
+            )
+
+    def test_subsequent_blocks_chain_via_prev_block_hash(self):
+        """Block N+1's `prev_block` = H(block N's bytes). Walk two ratified blocks and check
+        the link is byte-exact. If two nodes agreed on the same block N bytes, they compute
+        the same prev_block for block N+1 -- so the chain converges."""
+        tx1 = ops.writes(ops.Set(D, crypto.h(b"one"), b"v")).sign(self.client, T0)
+        self.c.submit(self.client, tx1, to=0, now=T0)
+        self.c.pump(T0)
+        self.c.pump(T0 + DELTA)
+        # Second tx in a new bucket, so a second non-empty block ratifies.
+        tx2 = ops.writes(ops.Set(D, crypto.h(b"two"), b"v")).sign(self.client, T0 + 2 * DELTA)
+        self.c.submit(self.client, tx2, to=1, now=T0 + 2 * DELTA)
+        self.c.pump(T0 + 2 * DELTA)
+        self.c.pump(T0 + 3 * DELTA)
+        self.c.pump(T0 + 4 * DELTA)
+
+        for i, node in enumerate(self.c.nodes):
+            raw1 = node.store.settled_at(1)
+            raw2 = node.store.settled_at(2)
+            assert raw1 is not None, f"node {i} has no block 1"
+            assert raw2 is not None, f"node {i} has no block 2"
+            sb1 = SettledBlock.decode(raw1)
+            sb2 = SettledBlock.decode(raw2)
+            self.assertEqual(
+                sb2.anchors.prev_block,
+                sb1.block_hash,
+                f"node {i} block 2 does not chain to block 1",
+            )
+
+    def test_every_node_agrees_on_the_chain_hash(self):
+        """The load-bearing property for chain-verify in sync: given the same slice + same
+        anchors, every node's `block_hash` MUST agree, so successors compute the same
+        `prev_block` link. The full `encode()` bytes MAY differ per node (which subset of
+        settle_sigs a node held at SETTLE-moment is timing-dependent), but the sig-independent
+        chain identity MUST NOT.
+
+        Discovered while writing this test at Stage 1: nodes' `encode()` bytes DO differ
+        because of the sig-subset race, which is why `block_hash` was moved to hash only the
+        identity portion of the block."""
+        tx = ops.writes(ops.Set(D, crypto.h(b"pin"), b"v")).sign(self.client, T0)
+        self.c.submit(self.client, tx, to=0, now=T0)
+        self.c.pump(T0)
+        self.c.pump(T0 + DELTA)
+        self.c.pump(T0 + 2 * DELTA)
+
+        hashes = set()
+        for node in self.c.nodes:
+            raw = node.store.settled_at(1)
+            assert raw is not None
+            hashes.add(SettledBlock.decode(raw).block_hash)
+        self.assertEqual(
+            len(hashes), 1, "nodes disagree on block 1 chain-hash (identity, not raw bytes)"
+        )
 
 
 if __name__ == "__main__":

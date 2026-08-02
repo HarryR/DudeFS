@@ -45,6 +45,7 @@ from ..core.errors import InvariantError
 from ..core.units import Millis
 from ..net.envelope import SignedEnvelope
 from ..store import Layer, Store, settle
+from ..store.layer import Index
 from ..store.management import Management
 from ..store.ops import SignedTransaction
 from ..store.store import log_element
@@ -53,7 +54,7 @@ from .mempool import Bucket, Mempool, Refusal
 from .round import Block, Round
 from .round_adapter import RoundAdapter, RoundAdapterError, bucket_of
 from .settle_adapter import SettleAdapter, SettleAdapterError, slice_hash_of
-from .settle_round import Anchors, SettleRound
+from .settle_round import Anchors, SettleRound, genesis_stamp
 
 
 @dataclass(slots=True)
@@ -73,6 +74,10 @@ class _Settling:
     """The anchors we signed. Compared to the SETTLED block's anchors -- a mismatch here would
     mean our own evaluator produced different mutations between preview and commit, which is
     non-determinism and MUST NOT be catchable as a routine error."""
+    first_height: Index
+    """`store.head() + 1` at settle-start -- the log-idx the first tx of this block will land
+    at. Written into the block table so a joiner replaying via `bodies_of_block` fetches the
+    correct entry range without inferring the base offset from prior blocks."""
     settle_round: SettleRound
 
 
@@ -201,11 +206,22 @@ class Coordinator:
             self._start_settling(now)
 
     def _open_round(self, bucket: Bucket, frozen: Mempool, now: Millis) -> None:
-        """Instantiate a Round for `bucket`, seed it with what the frozen Mempool held."""
+        """Instantiate a Round for `bucket`, seed it with what the frozen Mempool held.
+
+        SKIPS QUIETLY if we are not in the roster. A follower-only node (a fresh joiner, a
+        node granted read-only membership, a node whose stake in the roster has been removed
+        pending re-onboarding) still ticks the coordinator every cycle but MUST NOT try to
+        open a Round it cannot participate in -- Round refuses `me not in roster` at
+        construction, and the exception would tear down the node's tick. Correct behaviour is
+        to sit out consensus and let the Follower catch us up; if a subsequent block grants
+        us into the roster, the next bucket boundary opens a Round normally."""
+        roster = self.mgmt.roster()
+        if self.me.public not in roster:
+            return
         r = Round(
             bucket=bucket,
             me=self.me,
-            roster=self.mgmt.node_set(),
+            roster=roster,
             now=now,
             close_by=self._close_by(now),
         )
@@ -256,22 +272,37 @@ class Coordinator:
         # Freeze the layer -- projected anchors are stable now.
         layer.freeze()
 
-        # Compute anchors. Height = store.head after this block commits. A_log projected by
-        # adding log_element for each applied tx at its future settled index.
+        # Compute anchors. `height` = store.head after this block commits (log-idx of last tx).
+        # `block_num` = monotone per-block counter, prior + 1 (or 1 for the first ever block).
+        # A_log projected by adding log_element for each applied tx at its future settled index.
         base_head = self.store.head()
         height = base_head + len(applied)
+        prev_block_num = self.store.head_block_num() or 0
+        block_num = prev_block_num + 1
         acc_log = self.store.log_accumulator()
         for i, tx in enumerate(applied):
             acc_log = crypto.acc_add(acc_log, log_element(base_head + i + 1, tx.op_hash))
+        # Chain link. `prev_block` is `H(prev_settled_block.encode())` -- the previous SETTLED
+        # block's hash -- or the genesis stamp for block 1 (#genesis-stamp-anchors-the-chain).
+        # `head_block_hash` returns None on the first settlement of an empty store; that is the
+        # only case genesis applies.
+        prev = self.store.head_block_hash()
+        if prev is None:
+            manager = self.store.anchor()
+            if manager is None:
+                raise InvariantError("store has no manager anchor; cannot compute genesis stamp")
+            prev = genesis_stamp(manager)
         anchors = Anchors(
+            block_num=block_num,
             height=height,
+            prev_block=prev,
             state_root=layer.state_root(),
             acc_state=layer.accumulator(),
             acc_log=acc_log,
         )
 
         # Construct SettleRound. It signs its own anchors and queues its own SettleSig.
-        sr = SettleRound(block, self.me, self.mgmt.node_set(), anchors, now)
+        sr = SettleRound(block, self.me, self.mgmt.roster(), anchors, now)
         self.settling = _Settling(
             bucket=bucket,
             block=block,
@@ -280,21 +311,39 @@ class Coordinator:
             applied=applied,
             dropped=dropped_from_slice,
             anchors=anchors,
+            first_height=base_head + 1,
             settle_round=sr,
         )
         # Emit our own SettleSig immediately so peers can start counting toward quorum.
         self.settle_adapter.flush(sr, now)
 
     def _on_settled(self, now: Millis) -> None:
-        """A quorum has agreed on our anchors. Commit the applied slice txs to Store, safety-
-        check that Store's post-apply anchors match what we signed, re-admit fall-through txs,
-        clear the settling slot."""
+        """A quorum has agreed on our anchors. Commit the applied slice txs to Store atomically
+        with the SETTLED block bytes, safety-check that Store's post-apply anchors match what we
+        signed, re-admit fall-through txs, clear the settling slot."""
         s = self.settling
         if s is None:
             raise InvariantError("_on_settled called with no settling slot")
 
-        if s.applied:
-            self.store.apply(s.applied, auth=self.mgmt)
+        # The SettledBlock is what the quorum agreed on. Its bytes go in the same SQL
+        # transaction as the tx applies (#atomic-write): a crash between the two would leave
+        # entries with no block record and sync could not serve them.
+        settled = s.settle_round.settled()
+        if settled is None:
+            raise InvariantError("_on_settled fired but SettleRound has no SettledBlock")
+        block_bytes = settled.encode()
+        # block_hash is SIG-INDEPENDENT (chain identity, not wire-bytes hash) -- see
+        # SettledBlock.block_hash. Two nodes with the same slice + anchors compute the same
+        # hash regardless of which sig subset they hold.
+        block_hash = settled.block_hash
+        self.store.commit_block(
+            s.anchors.block_num,
+            first_height=s.first_height,
+            block_bytes=block_bytes,
+            block_hash=block_hash,
+            batch=s.applied,
+            auth=self.mgmt,
+        )
 
         # Safety-check: Store's post-apply anchors must match what we signed. If they do not,
         # our evaluator is non-deterministic between preview and commit -- a bug of ours.

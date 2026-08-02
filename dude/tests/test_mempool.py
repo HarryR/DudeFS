@@ -19,6 +19,7 @@ from ..consensus.mempool import (
 from ..core import crypto
 from ..quorum import MAJORITY, MAJORITY_PLUS, TWO_THIRDS, QuorumError, satisfied, size
 from ..store import Store, ops
+from ..store.management import Management
 
 D = ops.STORE_DATA
 M = ops.STORE_MANAGEMENT
@@ -91,9 +92,11 @@ class TestAdmission(unittest.TestCase):
         self.t = Tunables(delta=1_000, w_admit=30_000)
         self.mp = Mempool(self.t)
         self.store = Store()  # the door consults state, so it needs one
+        self.store.provision(self.kp.public)  # kp is the anchor => may_write returns True
+        self.mgmt = Management(self.store)
 
     def _admit(self, tx, now=T0):
-        return self.mp.admit(tx, now, self.store)
+        return self.mp.admit(tx, now, self.store, self.mgmt)
 
     def test_clock_faults_are_named_not_merely_refused(self):
         """A client self-corrects only if the refusal says WHICH way its clock is wrong (§1.1)."""

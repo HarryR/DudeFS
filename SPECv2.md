@@ -771,14 +771,94 @@ turns that into a SETTLED block.
 
 ### The block is the SETTLED thing {#block-shape-settled}
 
-- A SETTLED block's identity is `(bucket, height, slice_hash, prev_block_hash, state_root,
-  A_state, A_log, settle_sigs)`. The `settle_sigs` are a quorum-bounded distinct-signer bitmap
-  over `(slice_hash, height, anchors)`.
-- Ratify signatures are **not persisted**. They are Round's transient consensus infrastructure —
-  the record of *how the quorum came to agree on this slice*, not the record *that they did*.
-  What proves the block to a replayer is the settle_sigs alone: a quorum agreed on the outcome,
-  and `slice_hash` inside that payload pins which slice they were agreeing about.
+- A SETTLED block has two distinct notions of "what belongs to it": its **identity** (fields
+  every node computes deterministically) and its **quorum proof** (a set of settlement signatures
+  that VARIES per node). Both are transmitted and persisted; only identity participates in the
+  chain hash.
+  - **Identity** = `(bucket, block_num, height, slice, prev_block_hash, state_root, A_state,
+    A_log)`. Deterministic. Two nodes with the same slice + same anchors compute byte-identical
+    identity bytes and therefore the same `block_hash = H(identity_bytes)`. This is what a
+    successor's `prev_block_hash` names.
+  - **Quorum proof** = `(signer_bitmap, settle_sigs)` — a distinct-signer subset over the
+    `(slice_hash, anchors)` payload, of size `len(roster) + 1` (positions `0..N-1` for roster
+    members, position `N` reserved for the manager override — see
+    #manager-sig-overrides-quorum). NOT part of `block_hash`. Which sigs a given node holds at
+    SETTLE-moment depends on message-arrival timing (once `_try_settle` sees quorum, later
+    matching sigs are dropped), so different nodes commit different sig subsets for the same
+    block — every one a valid proof.
+- **Why the split is load-bearing.** If `block_hash` covered the sig set, timing-race would
+  fork the chain: each node would compute a different `prev_block` for the successor, and no two
+  would agree. The design tolerates variable proofs; the chain requires deterministic identity.
+  Discovered at Stage 1 of L5-close-out; the SPEC previously conflated the two.
+- **Wire form** carries both, so a joiner receives identity (for chain-verify) and proof (for
+  quorum-verify against roster-at-height) in one payload. Layout: `[identity_bytes,
+  signer_bitmap, settle_sigs]` — identity first so a joiner can peek without decoding the sig
+  section.
+- Ratify signatures (Round's `signers`/`sigs`) are **not persisted**. They are transient
+  consensus infrastructure — the record of *how the quorum came to agree on this slice*, not the
+  record *that they did*. What proves the block to a replayer is the settle_sigs alone.
 - Individual transactions are not settled one at a time. The block is the unit.
+
+### Empty blocks still increment block_num {#block-num-is-monotone}
+
+- `block_num` is a MONOTONE per-block counter, incrementing by one per SETTLED block regardless
+  of whether the block committed any transactions. `height` (log Index of last committed tx) is
+  NOT monotone across empty blocks — two consecutive empty ratifications share the same height.
+- `block_num` is what `GETBLOCK n` names and what the chain is indexed by. Chain-continuity
+  requires empty blocks be numbered distinctly so a successor's `prev_block_hash` walks back to
+  a well-defined predecessor even when the log height didn't advance.
+- Both `block_num` and `height` are signed as part of anchors — a joiner verifies chain position
+  (block_num) and log alignment (height) independently.
+
+### Manager signature overrides quorum {#manager-sig-overrides-quorum}
+
+- A SETTLED block MAY be authorized by either a quorum of roster-member settle_sigs (the
+  ordinary path) OR by a single manager signature over the settle payload (the override path).
+  Either alone is sufficient. Both use the same `settle_sigs` list on the wire; they differ
+  only in which bitmap slot carries the sig.
+- **Bitmap layout**: `len(roster) + 1` slots. Positions `0..N-1` are roster members (as
+  before); position `N` is reserved for the manager. Bitmap serialization uses the existing
+  `crypto.SignerBitmap` mechanism with the +1 size; sig list is parallel to set bits.
+- **Verification**: for each set bit, verify the corresponding sig against roster[i] (for
+  i < N) or against `store.anchor()` (for i == N). Block is authorized iff EITHER the
+  manager bit N is set with a valid sig, OR the count of set roster bits with valid sigs
+  is ≥ `quorum.size(len(roster))`.
+- **Why the manager is a distinct slot and NOT a roster member**: roster is the operational
+  quorum of nodes; manager is a policy override that sits above. Putting the manager in the
+  roster would change quorum arithmetic silently every time the roster grew or shrank.
+  Reserving position N as a wildcard keeps the two concepts orthogonal.
+- **The two primary uses**:
+  - **Bootstrap**: block 1 is manager-signed. The manager pre-computes the anchors after
+    applying the initial-roster grants, signs those anchors, distributes the block bytes.
+    Every node (including fresh joiners arriving later) can verify block 1 with the manager
+    pubkey alone -- no roster needed pre-block-1. See `dude.consensus.bootstrap`.
+  - **Emergency intervention**: post-bootstrap, the manager can sign a block to unstick a
+    hung cluster (settlement-may-hang tail case) or replace a compromised roster. Uses the
+    same slot; the follower's verification path is uniform.
+- **Security implication**: manager key compromise = ability to sign fraudulent blocks
+  unilaterally. This IS the trust model already (manager is the anchor of all authority);
+  this rule makes the implication concrete and elevates the importance of manager key
+  rotation to the level of roster rotation. Not a new threat, just made wire-visible.
+- **Hybrid blocks**: a block with both a quorum of roster sigs AND the manager sig is
+  permitted but not produced by any current path -- either sig set alone authorizes, and
+  a producer would not add the redundancy. Follower accepts hybrids on verification via
+  the same either-or rule.
+
+### The chain roots at the anchor identity {#genesis-stamp-anchors-the-chain}
+
+- `prev_block_hash` at `block_num == 1` (the first SETTLED block) MUST be
+  `H("dude.genesis:" || manager_pubkey.bytes)`. A joiner starting from the out-of-band anchor
+  (#joiner-starts-from-anchor) computes the same genesis stamp locally with no network round-trip
+  and no trust in any peer's word about "where the chain starts".
+- Two clusters started from different manager keys have byte-different genesis stamps by
+  construction, so a block from cluster A cannot chain-verify against cluster B's history even
+  if block_num happens to align.
+- Height is a label; the chain is what enforces order. A joiner verifies `block_N.prev_block_hash
+  == block_{N-1}.block_hash` before accepting block N, so a peer serving blocks out of chain
+  would fail the check regardless of what block_num it stamped them with.
+- `bucket` is NOT the chain. A `bucket → block_num` map is one-to-one for SETTLED blocks, but
+  the chain identity is `prev_block_hash`, walked backward one link at a time to the genesis
+  stamp.
 
 ## L6 — Sync (tentative, no-compaction only) {#sync-layer-no-compaction}
 
@@ -806,13 +886,123 @@ SMT proofs, and any compaction-aware sync path are deferred (see #compaction-def
 
 ### Sync is log replay {#sync-is-log-replay}
 
-- The sync verb (name pending; not `FRONTIER`) MUST be: "give me the next SETTLED block after
-  height X". A block-by-block pull, in order, from the joiner's current height.
-- The joiner MUST replay each block through the one evaluator, verify both signature sets against
-  the roster in effect at that block's height (#roster-at-ratification), update its own Store,
-  and only then advance to X+1.
+- The sync verb is `GETBLOCK n` → `SETTLED_BLOCK` (the bytes-form ratified by
+  #block-shape-settled). A block-by-block pull, in order, from the joiner's current height:
+  request `n = my_head + 1`, verify, apply, increment, repeat.
+- The joiner MUST, for each pulled block:
+  (a) verify the chain link — `block.prev_block_hash == prev_block.block_hash` (the sig-
+      independent identity hash, #block-shape-settled) against the block already in its Store;
+      against the genesis stamp (#genesis-stamp-anchors-the-chain) for `n = 1`;
+  (b) verify the settle_sigs against the roster in effect at that block's height
+      (#roster-at-ratification), using `f+1` / quorum arithmetic from that roster's size;
+  (c) apply the block through the one evaluator (#deterministic-application-per-tx), which
+      re-checks per-transaction authority against the pre-apply state (see
+      #per-tx-authority-verified-at-replay). A tx whose author was not authorised at that
+      state MUST fall through — as it would have done on the producer side.
+- Only after all three succeed does the joiner advance to `n+1`. Any failure drops the peer as
+  a sync source; the pull is retried from another peer or the walk stalls until one becomes
+  available.
 - Nothing about the walk uses the SMT for correctness. The SMT belongs to a different question
   (light-client proofs — see #smt-for-light-clients).
+- A single request is `GETBLOCK n` for one height. "Latest", "earliest", and "next after N"
+  reduce to the same primitive at different N — one request shape keeps the decode narrow.
+  Batching, streaming, or range queries MAY be added later; they MUST NOT change the correctness
+  argument (each block is verified before the next is accepted).
+
+### Per-tx authority is verified during replay, not trusted from the block {#per-tx-authority-verified-at-replay}
+
+- A SETTLED block records that a quorum agreed on these anchors. It does NOT record who was
+  authorised to write which key at that height — the authority table is store-state, not block
+  content.
+- The joiner MUST re-derive per-tx authority during replay by running the one evaluator against
+  the store state produced by applying blocks `0..N-1`. The evaluator's authority check
+  (author holds the grant / role / possession-proof required for the target key) is the same
+  code path as production. A block that "was ratified" but contains a tx that fails authority
+  under honest replay MUST be rejected — not because the block is inauthentic (its sigs verify)
+  but because it names an outcome the honest evaluator cannot reproduce.
+- This is the safety half of "clients authorised at the time" — the block-level check
+  (settle_sigs against roster-at-height) proves the QUORUM was authorised; the tx-level check
+  proves each individual OP's author was authorised. Both live in the same replay step; the
+  evaluator has always done tx-authority, so this rule is code-existing, just spec-explicit.
+
+### Routine height polling is the trigger {#height-poll-is-the-trigger}
+
+- Every node MUST periodically ask each known peer `HEIGHT` → `HEIGHT_REPLY (n, tip_hash)`, where
+  `n` is the peer's current SETTLED head as an integer and `tip_hash = H(SettledBlock.bytes)` at
+  height `n`. The poll is solicited (request/reply through the ordinary mailbox correlation),
+  not gossiped: no separate broadcast mechanism to design or debug.
+- The reply body carries no additional signature — the envelope's own signature
+  (#signed-envelopes) already binds this reply to the peer that sent it and to this specific
+  request via mailbox correlation. What channel auth cannot prove is that the integer + hash
+  reflect the peer's actual current state; only concordant honest witnesses can floor that.
+- **Starting a pull requires ONE peer above; declaring caught-up requires `f+1` fresh peers at or
+  below AGREEING on `(n, tip_hash)`.** A single peer reporting a higher head is a hint — try
+  `GETBLOCK(head+1)` against them; the pull's own verification (#sync-is-log-replay) catches a
+  lie. But believing "I am caught up" MUST rest on `f+1` distinct peer replies within a freshness
+  window (per #freshness-needs-many), all reporting the same `(n, tip_hash)`. Concordance on the
+  tuple, not just the integer, is what makes the claim mean "same chain, same tip" rather than
+  "coincidentally same number".
+- `f+1` is computed from the roster the joiner currently holds, via the same `quorum.size(n)`
+  used everywhere else in the design (#quorum-gate). A fresh joiner who has not yet applied a
+  block has no roster and therefore cannot claim caught-up on its very first poll — it pulls,
+  applies, and gains a roster from the log, then the ordinary `f+1` rule takes effect.
+- A crashed-and-rebooted node, a temporarily-unavailable node, and a fresh joiner all use the
+  same trigger. There is no separate "join" flow, no "catch-up" flow, no "recovery" flow —
+  they are the same failure ("my head is below the cluster's") observed at different starting
+  points and solved by the same pull.
+
+### A same-height mismatched tip is a divergence signal {#poll-detects-divergent-tips}
+
+- If a peer's `HEIGHT_REPLY` names the same `n` as the joiner's own head but a DIFFERENT
+  `tip_hash`, the joiner and peer are on different chains at that height — a fork, or one of
+  them has been corrupted.
+- The joiner MUST drop that peer as a sync source (a peer on the wrong chain can serve no useful
+  block) and log the divergence loudly enough for observability to catch. It MUST NOT try to
+  reconcile automatically: a real fork is a human problem, and silent auto-resolution would risk
+  adopting the wrong side.
+- Fork detection at poll time — before any block pull — is the payoff of carrying `tip_hash`
+  in `HEIGHT_REPLY` rather than just `n`. Without it, divergence surfaces only when a
+  chain-link check fails during a pull, which is later and with less signal about which peer
+  drifted.
+- A same-height matched tip is the affirmative signal: the joiner and peer agree on the chain
+  up to `n`. This is what f+1 concordance rests on.
+
+### Height is a hint, never a floor {#height-is-a-hint}
+
+- `HEIGHT_REPLY` is UNSIGNED and MUST NOT be trusted for any signed statement. It drives the
+  "am I behind?" decision and nothing else. A peer that lies about its height wastes our pull
+  request — we ask for `GETBLOCK(N)`, they refuse (or reply with a block that fails chain
+  verification), we drop them from the poll set.
+- Correctness rests entirely on the block payload's own verification (chain link + settle_sigs
+  against roster-at-height). The height poll is a scheduling hint; the block-pull is the truth.
+
+### GETBLOCK refuses with a reason when the block is absent {#getblock-refuses-with-reason}
+
+- A peer receiving `GETBLOCK(n)` for a height it does not hold (has not settled yet, or has
+  compacted it away in a future world) MUST respond with `REFUSED` naming the reason:
+  `NOT_YET_SETTLED` (n > my head), `COMPACTED_AWAY` (post-#compaction-deferred), or
+  `UNKNOWN` (n is well below my head but I don't have it — pathological).
+- Silence is not the answer. The requester's timeout would fire, waste a full RTT, and re-attempt
+  against the same peer or a different one with no more information. Explicit refusal lets the
+  requester immediately try the next-highest reporter and lets telemetry attribute the miss.
+- The REFUSED reason MUST be a closed enum member so branches on it exhaustive-match, per
+  #no-exceptions-for-control-flow.
+
+### Sync lives in its own module {#sync-in-its-own-module}
+
+- The follower — the piece that polls heights, decides when to pull, drives the block-by-block
+  walk, and hands blocks to the Store — lives in a NEW top-level module (`dude/sync.py` or
+  similar). Not inside Coordinator; not inside Node.
+- Rationale: Coordinator PRODUCES SETTLED blocks (drives Round + SettleRound, commits on
+  quorum). The follower CONSUMES SETTLED blocks (pulls, verifies, commits). They share the Store
+  as the meeting point and nothing else. A node uses both; each has its own tick.
+- The follower MUST be sans-I/O in the same discipline as Round and SettleRound: `tick(now)`,
+  `receive(env, now)`, `outbox()`. Postman is the impure edge. This keeps the follower testable
+  by direct wiring, in the same shape as the consensus tests.
+- Coordinator and Follower MUST NOT hold references to each other or exchange messages
+  in-process. The only cross-talk is via Store: when the follower commits a block, the
+  Coordinator's next tick sees the new head. Same discipline as Settlement-does-not-cross-Mempool
+  (#settlement-does-not-cross-mempool) applied to the L4/L6 boundary.
 
 ### The roster walks forward with the log {#roster-walks-forward}
 
@@ -841,6 +1031,22 @@ SMT proofs, and any compaction-aware sync path are deferred (see #compaction-def
 - Divergence at any step (a block whose signatures fail, whose replay produces different
   anchors, whose slice contains a transaction the joiner cannot resolve) MUST fail loudly, not
   proceed with a warning.
+
+### Sync safety vs full BFT {#sync-safety-vs-full-bft}
+
+- L6 delivers **safe sync**: a joiner catches up to a head it can independently verify, using
+  `f+1` fresh witnesses (#height-poll-is-the-trigger) + per-block chain-and-sigs + per-tx
+  authority (#per-tx-authority-verified-at-replay). Under the standard threat model (fewer
+  than `f+1` colluding nodes), a joiner cannot be lied into a false head or a false block.
+- L6 does NOT deliver **full BFT observability**: cross-author attestation retention,
+  monotonicity conviction across time, shun-as-local-read-policy against convicted keys, and
+  manager-driven ejection on evidence. Those are the SPECv2 Trust section rows (currently
+  OWED, deferred alongside settlement-first-consumer note). They are needed to actively
+  detect-and-eject adversaries; they are NOT needed to keep sync itself safe against them.
+- The line is honest debt: an active adversary at `< f+1` cannot break sync but MAY cost
+  wasted round-trips (a lying peer refused, dropped, retried against another). Ejection would
+  make the cost `O(1)` instead of `O(retries)`. L6 tolerates the cost; ejection is a
+  post-L6 arc.
 
 ### Compaction is deferred {#compaction-deferred}
 

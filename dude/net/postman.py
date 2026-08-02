@@ -24,7 +24,7 @@ from typing import NamedTuple
 
 from ..core import crypto
 from ..core.units import Millis
-from .envelope import EnvelopeError, Frame, SignedEnvelope, seal, unseal
+from .envelope import EnvelopeError, Frame, SignedEnvelope
 from .link import Link, Peer
 from .mailbox import Expired, Mailbox, Reply, Transmit
 from .plan import Decision, GiveUp, Plan, Send, Wait
@@ -108,7 +108,7 @@ class Postman:
                     # is what lets a reply's `reply_ts` name one of them, which is what keeps a
                     # staggered message measurable rather than a blind spot (#rtt-attribution).
                     stamped = t.envelope.env.sign(self.me, now)
-                    if link.send(seal(stamped), now) is None:
+                    if link.send(stamped.seal(), now) is None:
                         self.mailbox.sent(t.mid, link.address, now, now, again_at=again_at)
                         return
                 self.mailbox.failed(t.mid, self.plan.retry_at(t.attempt, now))
@@ -141,7 +141,7 @@ class Postman:
         one grants an attacker no capability it lacked."""
         if not frame.addressed_to(self.me.public):
             raise EnvelopeError("frame is not addressed to us (screen tag does not match)")
-        env = unseal(frame, self.me)
+        env = frame.unseal(self.me)
         env.accept(self.me.public, now, self.window)
         reply = self.mailbox.arrived(env, now)
         if reply is not None:

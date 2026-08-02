@@ -8,7 +8,7 @@ from __future__ import annotations
 import unittest
 
 from ..core import codec, crypto
-from ..net import Envelope, EnvelopeError, Frame, SignedEnvelope, Verb, request, seal, unseal
+from ..net import Envelope, EnvelopeError, Frame, SignedEnvelope, Verb, request
 from ..net.postman import Postman
 from ..store import ops
 
@@ -191,10 +191,10 @@ class TestSealing(unittest.TestCase):
         self.b = crypto.Keypair.generate()
         self.eve = crypto.Keypair.generate()
         self.env = request(self.a, self.b.public, Verb.PROPOSE, T0, b"slice")
-        self.frame = seal(self.env)
+        self.frame = self.env.seal()
 
     def test_roundtrip(self):
-        self.assertEqual(unseal(self.frame, self.b), self.env)
+        self.assertEqual(self.frame.unseal(self.b), self.env)
         self.assertEqual(Frame.decode(self.frame.raw), self.frame)
 
     def test_sign_then_seal_hides_the_sender(self):
@@ -207,13 +207,13 @@ class TestSealing(unittest.TestCase):
 
     def test_a_stranger_cannot_open_it(self):
         with self.assertRaises(EnvelopeError):
-            unseal(self.frame, self.eve)
+            self.frame.unseal(self.eve)
 
     def test_the_screen_tag_covers_the_sealed_bytes(self):
         """The reason the tag is not keyed on identity alone: it would then be a constant, i.e. a
         permanent per-node fingerprint linking every frame ever sent to that node. Two frames to the
         same recipient must carry different tags."""
-        other = seal(request(self.a, self.b.public, Verb.PROPOSE, T0, b"different"))
+        other = request(self.a, self.b.public, Verb.PROPOSE, T0, b"different").seal()
         self.assertNotEqual(self.frame.tag, other.tag)
         self.assertTrue(self.frame.addressed_to(self.b.public))
         self.assertTrue(other.addressed_to(self.b.public))
@@ -232,7 +232,7 @@ class TestSealing(unittest.TestCase):
         secrecy: the sealed blob is genuinely ours and only the tag says otherwise. Under the old
         code it was accepted."""
         openable = Frame(crypto.screen_tag(self.eve.public, self.frame.sealed), self.frame.sealed)
-        self.assertEqual(unseal(openable, self.b), self.env, "the box really is ours")
+        self.assertEqual(openable.unseal(self.b), self.env, "the box really is ours")
 
         post = Postman(self.b)
         with self.assertRaises(EnvelopeError) as cm:
@@ -250,7 +250,7 @@ class TestSealing(unittest.TestCase):
         )
         self.assertTrue(tampered.addressed_to(self.b.public))  # the hint says yes...
         with self.assertRaises(EnvelopeError):  # ...and the real check says no
-            unseal(tampered, self.b)
+            tampered.unseal(self.b)
 
 
 class TestTwoEnumerations(unittest.TestCase):

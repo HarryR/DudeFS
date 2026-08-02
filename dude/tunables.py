@@ -137,6 +137,32 @@ class NetTunables:
 
 
 @dataclass(frozen=True, slots=True)
+class SyncTunables:
+    """Dials for L6 sync -- the Follower's height-poll cadence and pull-timeout.
+
+    FLOORS: `poll_interval` >= `timing.conversation_floor` (a poll IS a conversation and cannot
+    be faster than the window that carries it). `pull_timeout` >= `timing.dissemination`
+    (fetching a block from one peer needs at least one hop). `freshness_window` >= `poll_interval`
+    (a HeightReport must survive at least one poll cycle to count toward f+1, or an honest peer
+    that answered once would evaporate before the next poll)."""
+
+    poll_interval: Millis = 1_000
+    """How often to send HEIGHT to each peer. One bucket-ish so a joiner notices progress
+    within one settlement cycle but the wire is not spammed."""
+
+    pull_timeout: Millis = 3_000
+    """How long to wait for a SETTLED_BLOCK reply before dropping the peer as source for this
+    block and trying another. Blocks are variable size; the timeout is a floor for the smallest
+    honest response, not a bound on the largest."""
+
+    freshness_window: Millis = 5_000
+    """How old a HEIGHT_REPLY may be and still count toward `caught_up()`. Beyond this, the
+    peer is assumed to have moved on (or gone away) and its report is stale. Wide enough that
+    ordinary poll-and-reply variance doesn't cause an honest peer to flicker in-and-out of
+    the fresh set."""
+
+
+@dataclass(frozen=True, slots=True)
 class Tunables:
     """The one surface. Pass this down; do not reach for a group's defaults directly."""
 
@@ -145,6 +171,7 @@ class Tunables:
     link: LinkTunables = field(default_factory=LinkTunables)
     plan: PlanTunables = field(default_factory=PlanTunables)
     mempool: MempoolTunables = field(default_factory=MempoolTunables)
+    sync: SyncTunables = field(default_factory=SyncTunables)
 
     def __post_init__(self) -> None:
         """Refuse a configuration whose dials contradict their own derivation.
@@ -165,6 +192,9 @@ class Tunables:
                 self.mempool.w_valid_margin,
                 t.endorse_margin(self.mempool.delta),
             ),
+            ("sync.poll_interval", self.sync.poll_interval, t.conversation_floor),
+            ("sync.pull_timeout", self.sync.pull_timeout, t.dissemination),
+            ("sync.freshness_window", self.sync.freshness_window, self.sync.poll_interval),
         ):
             if value < floor:
                 raise InvariantError(f"{what} is {value}ms, below its derived floor of {floor}ms")

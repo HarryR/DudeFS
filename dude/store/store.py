@@ -76,6 +76,30 @@ CREATE TABLE IF NOT EXISTS smt_memo (
 
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v BLOB NOT NULL);
 
+-- Settled blocks (SPECv2 #block-shape-settled), one row per SETTLED bucket.
+--   `block_num`    -- MONOTONE per-block counter (increments per SETTLED block, whether empty
+--                     or not). Primary key. `GETBLOCK n` names this. Chain-continuity holds
+--                     even across empty ratifications (#empty-bucket-still-settles).
+--   `first_height` -- log Index of the FIRST tx this block committed. For an empty block,
+--                     `first_height == height + 1` (an empty range). Written so
+--                     `bodies_of_block(n)` can fetch bodies from the entry table by range
+--                     without inferring the base offset from prior blocks.
+--   `height`       -- log Index of the LAST tx committed by this block. Non-unique across
+--                     empty blocks. Kept for lookup by log-position.
+--   `bytes`        -- `SettledBlock.encode()` (identity + quorum proof).
+--   `hash`         -- `SettledBlock.block_hash` (sig-independent identity) for the chain link
+--                     a successor's `prev_block` names.
+-- Persisted so peers can serve `GETBLOCK n` to joiners (#sync-is-log-replay). Bodies live in
+-- the entry table (already-persisted) and are fetched by range at serve-time -- no duplication.
+-- Ratify sigs are NOT here; identity excludes them (see SettledBlock.encode docstring).
+CREATE TABLE IF NOT EXISTS block (
+    block_num    INTEGER PRIMARY KEY,
+    first_height INTEGER NOT NULL,
+    height       INTEGER NOT NULL,
+    bytes        BLOB NOT NULL,
+    hash         BLOB NOT NULL UNIQUE
+);
+
 """
 
 
@@ -254,9 +278,7 @@ class Store:
 
     # -- SETTLEMENT ---------------------------------------------------------- #
 
-    def apply(
-        self, batch: tuple[ops.SignedTransaction, ...], auth: settle.Authoriser | None = None
-    ) -> Applied:
+    def apply(self, batch: tuple[ops.SignedTransaction, ...], auth: settle.Authoriser) -> Applied:
         """Settle an **already-ordered** batch: evaluate each transaction, commit the survivors
         (#settlement).
 
@@ -265,38 +287,126 @@ class Store:
         SQL transaction that makes a crash mid-settlement leave the store at the previous batch
         boundary rather than half-applied.
 
-        Ordering is NOT decided here either: that is the discriminator's job one layer up (2.13)."""
-        settled: list[tuple[Index, crypto.Digest]] = []
-        dropped: list[Dropped] = []
-        already = self._settled_hashes(tuple(tx.op_hash for tx in batch))
+        Ordering is NOT decided here either: that is the discriminator's job one layer up (2.13).
+
+        `commit_block` is the same shape plus a block-bytes persist in the same transaction --
+        that is the entry point production settlement uses, so a crash cannot leave txs
+        committed with no matching block record."""
         self.db.execute("BEGIN IMMEDIATE")
         try:
-            acc = self.accumulator()
-            idx = self.head()
-            for tx in batch:
-                if tx.op_hash in already:
-                    # Already in the log — it arrived by TRANSFER while this bucket was settling.
-                    # A duplicate is a routine outcome and is reported rather than raised: the
-                    # alternative was `entry.op_hash UNIQUE` throwing out of a frame handler, i.e.
-                    # a race reported as corruption (#no-exceptions-for-control-flow).
-                    dropped.append(Dropped(tx.op_hash, settle.Reason.SETTLED))
-                    continue
-                verdict, layer = settle.evaluate(self, tx, auth)
-                # Walrus on `why` rather than `if not verdict`, because a verdict is exactly "no
-                # reason or a reason" — testing the reason IS testing success, and it narrows the
-                # type so the reason needs no `or "rejected"` fallback for a case that cannot occur.
-                if (why := verdict.why) is not None:
-                    dropped.append(Dropped(tx.op_hash, why))
-                    continue
-                idx += 1
-                acc = self._commit(idx, tx, layer.mutations, acc)
-                settled.append((idx, tx.op_hash))
-            self._set_meta("acc", acc)
+            applied = self._apply_within(batch, auth)
             self.db.execute("COMMIT")
         except Exception:
             self.db.execute("ROLLBACK")
             raise
+        return applied
+
+    def commit_block(  # noqa: PLR0913
+        self,
+        block_num: Index,
+        *,
+        first_height: Index,
+        block_bytes: bytes,
+        block_hash: crypto.Digest,
+        batch: tuple[ops.SignedTransaction, ...],
+        auth: settle.Authoriser,
+    ) -> Applied:
+        """Apply the batch and persist the SETTLED block bytes atomically (#atomic-write).
+
+        `block_num` is the monotone per-block counter (from `Anchors.block_num`); it uniquely
+        indexes this block in the chain. `first_height` is the log-idx the FIRST tx would land
+        at (whether or not there is one) -- for a joiner replaying, this pins the entry-table
+        range this block covers, so `bodies_of_block(n)` can return exactly the applied bodies
+        without needing to walk the prior chain. `block_bytes` is opaque here -- store persists
+        them; the consensus layer knows their shape (SettledBlock.encode). `block_hash` is the
+        sig-independent chain identity (SettledBlock.block_hash), stored alongside so a
+        successor's chain-link check needs one lookup, not a hash.
+
+        ONE SQL TRANSACTION. A crash between "txs applied" and "block persisted" would leave the
+        store in a state where entries exist but no block record names them -- opaque to sync,
+        because a joiner asks `GETBLOCK n` and gets nothing while the head has advanced. Folding
+        them in one commit means such a state is impossible by construction."""
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            applied = self._apply_within(batch, auth)
+            # `height` is the log-idx of the last tx (or prior head for an empty block, per
+            # #empty-bucket-still-settles). `block_num` is monotone regardless.
+            height = self.head()
+            self.db.execute(
+                "INSERT INTO block (block_num, first_height, height, bytes, hash)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (block_num, first_height, height, block_bytes, block_hash),
+            )
+            self.db.execute("COMMIT")
+        except Exception:
+            self.db.execute("ROLLBACK")
+            raise
+        return applied
+
+    def _apply_within(
+        self, batch: tuple[ops.SignedTransaction, ...], auth: settle.Authoriser
+    ) -> Applied:
+        """The transactional body shared by `apply` and `commit_block`. The caller MUST have
+        opened `BEGIN IMMEDIATE` and MUST issue `COMMIT`/`ROLLBACK` around this call."""
+        settled: list[tuple[Index, crypto.Digest]] = []
+        dropped: list[Dropped] = []
+        already = self._settled_hashes(tuple(tx.op_hash for tx in batch))
+        acc = self.accumulator()
+        idx = self.head()
+        for tx in batch:
+            if tx.op_hash in already:
+                # Already in the log — it arrived by TRANSFER while this bucket was settling.
+                # A duplicate is a routine outcome and is reported rather than raised: the
+                # alternative was `entry.op_hash UNIQUE` throwing out of a frame handler, i.e.
+                # a race reported as corruption (#no-exceptions-for-control-flow).
+                dropped.append(Dropped(tx.op_hash, settle.Reason.SETTLED))
+                continue
+            verdict, layer = settle.evaluate(self, tx, auth)
+            # Walrus on `why` rather than `if not verdict`, because a verdict is exactly "no
+            # reason or a reason" — testing the reason IS testing success, and it narrows the
+            # type so the reason needs no `or "rejected"` fallback for a case that cannot occur.
+            if (why := verdict.why) is not None:
+                dropped.append(Dropped(tx.op_hash, why))
+                continue
+            idx += 1
+            acc = self._commit(idx, tx, layer.mutations, acc)
+            settled.append((idx, tx.op_hash))
+        self._set_meta("acc", acc)
         return Applied(tuple(settled), tuple(dropped))
+
+    def settled_at(self, block_num: Index) -> bytes | None:
+        """The encoded SETTLED block bytes at `block_num`, or None if not held. Used by peers
+        serving `GETBLOCK n` to joiners (#sync-is-log-replay)."""
+        row = self.db.execute("SELECT bytes FROM block WHERE block_num=?", (block_num,)).fetchone()
+        return bytes(row[0]) if row else None
+
+    def bodies_of_block(self, block_num: Index) -> tuple[ops.SignedTransaction, ...]:
+        """The tx bodies this block committed, in log-idx order. Empty for empty blocks and
+        for unknown blocks. Peers building a `SettledBlockWithBodies` reply to `GETBLOCK n`
+        call `settled_at(n)` first to distinguish "unknown" from "empty"; if the block exists,
+        this returns exactly the bodies that applied when the block committed."""
+        row = self.db.execute(
+            "SELECT first_height, height FROM block WHERE block_num=?", (block_num,)
+        ).fetchone()
+        if row is None:
+            return ()
+        first_height, height = row
+        if first_height > height:
+            return ()  # empty block: range is [N+1, N], nothing to fetch
+        return tuple(e.item for e in self.entries(first_height, height))
+
+    def head_block_hash(self) -> crypto.Digest | None:
+        """`H(SettledBlock.encode())` at the current head, or None if no block is settled yet.
+        Successor's `Anchors.prev_block` names this (#genesis-stamp-anchors-the-chain -- when
+        None, the genesis stamp takes its place)."""
+        row = self.db.execute("SELECT hash FROM block ORDER BY block_num DESC LIMIT 1").fetchone()
+        return crypto.Digest(bytes(row[0])) if row else None
+
+    def head_block_num(self) -> Index | None:
+        """The monotone block counter at the current head, or None if no block is settled yet.
+        Successor's `Anchors.block_num` is this + 1."""
+        row = self.db.execute("SELECT MAX(block_num) FROM block").fetchone()
+        return row[0] if row and row[0] is not None else None
 
     def replay(self, items: Iterable[Entry], expect: Commitment | None = None) -> str | None:
         """Apply already-settled entries **at their recorded indices**, without re-adjudicating.
@@ -388,7 +498,7 @@ class Store:
         Separate from the check that reads it: a verifier that also recorded would decide and commit
         in one act, and could not be run twice safely."""
 
-        commitment = Management(self).roster_commitment()
+        commitment = self.mgmt.roster_commitment()
         if commitment is not None and commitment[0] > self.roster_serial():
             self._set_meta("roster_serial", commitment[0].to_bytes(8))
 
@@ -498,14 +608,14 @@ class Store:
 
     # -- COMPACTION (#collection-is-a-log-entry, 11.2a-i, 11.4b) ------------------------------ #
 
-    def roster(self) -> tuple[crypto.PublicKey, ...]:
-        """The set of authorised nodes. Read from the management prefix rather than configured,
-        so the set that signs is the set the log itself says exists.
-
-        `management` reads through `layer.Reader`, NOT through `Store`, so importing it here is a
-        plain one-way edge and there is no cycle to avoid."""
-
-        return Management(self).node_set()
+    @property
+    def mgmt(self) -> Management:
+        """A Management view over this store. Constructed on demand; Management holds no state
+        beyond `store` and `store_id`, so re-constructing is cheap and there is nothing to
+        invalidate. Callers that need the roster or an authority check reach for this rather
+        than wrapping `Management(store)` themselves -- one meeting point for everything
+        authority-related. `Store.roster()` is deleted; `store.mgmt.roster()` is the answer."""
+        return Management(self)
 
     def credential(self, store: int, name: bytes) -> bytes:
         """The signed transaction that authorised this row's value, or empty if none is kept."""
@@ -617,7 +727,7 @@ class Store:
         held = self.anchor()
         if held is None:
             return "no anchor: this node was never provisioned with a manager key"
-        grant = Management(self).grant_of(held)
+        grant = self.mgmt.grant_of(held)
         if grant is None:
             return "the log holds no grant for the manager we were provisioned with"
         if grant.role is not Role.MANAGER:
@@ -648,7 +758,7 @@ class Store:
         held = self.anchor()
         if held is None:
             return "no anchor: this node was never provisioned with a manager key"
-        for who in Management(self).node_set():
+        for who in self.mgmt.roster():
             name = P_NODE + who
             author = settle.vouched(self, ops.STORE_MANAGEMENT, name, self.credential(0, name))
             if author is None:
@@ -680,15 +790,14 @@ class Store:
         held = self.anchor()
         if held is None:
             return "no anchor: this node was never provisioned with a manager key"
-        mgmt = Management(self)
-        commitment = mgmt.roster_commitment()
+        commitment = self.mgmt.roster_commitment()
         if commitment is None:
             return "the log states no roster commitment, so a subset could not be detected"
         author = settle.vouched(self, ops.STORE_MANAGEMENT, P_ROSTER, self.credential(0, P_ROSTER))
         if author != held:
             return f"the roster commitment is vouched by {author.hex()[:8] if author else 'nobody'}"
         serial, members = commitment
-        if members != mgmt.node_set():
+        if members != self.mgmt.roster():
             return (
                 f"the roster commitment names {len(members)} members, the log holds a different set"
             )

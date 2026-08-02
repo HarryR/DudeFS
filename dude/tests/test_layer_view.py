@@ -17,6 +17,7 @@ from collections.abc import Sequence
 
 from ..core import crypto
 from ..store import Layer, LayerError, Store, ops
+from ..store.management import Management
 
 D = ops.STORE_DATA
 
@@ -27,11 +28,16 @@ def _writes(kp: crypto.Keypair, muts: Sequence[ops.Mutation], ts: int = 1) -> op
 
 
 def _seed_store(kp: crypto.Keypair, count: int) -> Store:
-    """A Store with `count` seed rows, so overlays land against a non-trivial base."""
+    """A Store with `count` seed rows, so overlays land against a non-trivial base.
+
+    Provisioned with `kp` as the manager anchor so `Management.may_write`'s anchor-is-always-
+    authorised rule accepts the seed writes -- one setup shape for both auth and content."""
     s = Store()
+    s.provision(kp.public)
     if count:
         s.apply(
-            (_writes(kp, [ops.Set(D, crypto.h(f"seed{i}".encode()), b"v") for i in range(count)]),)
+            (_writes(kp, [ops.Set(D, crypto.h(f"seed{i}".encode()), b"v") for i in range(count)]),),
+            auth=Management(s),
         )
     return s
 
@@ -91,7 +97,7 @@ class TestAccumulatorProjection(unittest.TestCase):
     def _committed(self, seed: int, muts: Sequence[ops.Mutation]) -> crypto.Accumulator:
         """The reference: seed the Store, apply the mutations, read A_state."""
         s = _seed_store(self.kp, seed)
-        s.apply((_writes(self.kp, muts, ts=2),))
+        s.apply((_writes(self.kp, muts, ts=2),), auth=Management(s))
         return s.accumulator()
 
     def _projected(self, seed: int, muts: Sequence[ops.Mutation]) -> crypto.Accumulator:
@@ -162,7 +168,7 @@ class TestStateRootProjection(unittest.TestCase):
 
     def _committed(self, seed: int, muts: Sequence[ops.Mutation]) -> crypto.Digest:
         s = _seed_store(self.kp, seed)
-        s.apply((_writes(self.kp, muts, ts=2),))
+        s.apply((_writes(self.kp, muts, ts=2),), auth=Management(s))
         return s.state_root()
 
     def _projected(self, seed: int, muts: Sequence[ops.Mutation]) -> crypto.Digest:
@@ -249,7 +255,7 @@ class TestFrozenLayerAsBase(unittest.TestCase):
         # Reference: commit A and B as one flat transaction
         ref = _seed_store(self.kp, 2)
         ref_tx = _writes(self.kp, muts_a + muts_b, ts=2)
-        ref.apply((ref_tx,))
+        ref.apply((ref_tx,), auth=Management(ref))
 
         # Overlay: same transaction, split across two stacked Layers, same tx.raw as credential
         inner = Layer(s)

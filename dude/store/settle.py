@@ -106,22 +106,25 @@ class Verdict:
 OK = Verdict()
 
 
-def evaluate(
-    reader: Reader, tx: ops.SignedTransaction, auth: Authoriser | None = None
-) -> tuple[Verdict, Layer]:
+def evaluate(reader: Reader, tx: ops.SignedTransaction, auth: Authoriser) -> tuple[Verdict, Layer]:
     """Walk `tx`'s step log against a fresh layer over `reader`.
 
     Returns the verdict and the layer. On success the layer holds the resulting mutations in order,
     ready to be committed by whoever owns persistence; on failure it is simply discarded, which is
     the whole of "rollback" — nothing was written anywhere.
 
-    Signature first: self-contained, always checkable, so there is never an excuse to defer it."""
+    Signature first: self-contained, always checkable, so there is never an excuse to defer it.
+
+    `auth` is REQUIRED. The old `Authoriser | None` shape let callers silently skip authority
+    by passing None; the new shape forces callers to be explicit. Manager-authored ops flow
+    through `Management.may_write`'s anchor-is-always-authorised rule, so no bypass is needed
+    for bootstrap or manager-authorized blocks."""
     layer = Layer.speculative(reader)
     if not tx.verify():
         return Verdict(Reason.SIGNATURE), layer
     for i, step in enumerate(tx.steps):
         m = step.mutation
-        if auth is not None and not auth.may_write(layer, tx.author, m.store):
+        if not auth.may_write(layer, tx.author, m.store):
             return Verdict(Reason.AUTHORITY, i), layer
         for g in step.guards:
             if not holds(layer, g):
@@ -182,7 +185,7 @@ class Screened(NamedTuple):
 
 
 def would_apply(
-    reader: Reader, batch: tuple[ops.SignedTransaction, ...], auth: Authoriser | None = None
+    reader: Reader, batch: tuple[ops.SignedTransaction, ...], auth: Authoriser
 ) -> Screened:
     """Screen a whole batch without touching anything.
 
@@ -195,7 +198,7 @@ def would_apply(
 def apply_to(
     target: Layer,
     batch: tuple[ops.SignedTransaction, ...],
-    auth: Authoriser | None = None,
+    auth: Authoriser,
 ) -> Screened:
     """Evaluate a batch INTO `target`, absorbing survivors as we go. Like `would_apply` but
     writes the effects into an existing Layer whose projected roots the caller will read.
