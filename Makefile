@@ -17,7 +17,7 @@
 # a project whose thesis is integrity, the build inputs should not be the least verified part of it.
 RUFF_VERSION     := 0.16.0
 TY_VERSION       := 0.0.61
-PYNACL_VERSION   := 1.5.0
+PYNACL_VERSION   := 1.6.2
 COVERAGE_VERSION := 7.6.1
 
 # What the tooling runs over. `dudefs/` and `tests/` are the previous package, kept only until the
