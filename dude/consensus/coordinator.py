@@ -1,9 +1,10 @@
 # dude.coordinator -- the per-node lifecycle for Rounds, SettleRounds, Mempools, and commit.
 #
-# WHAT IT OWNS. The currently-collecting Mempool. Rounds in flight (bucket -> frozen mempool +
-# Round). A queue of ratified blocks awaiting settlement, in bucket order. At most one live
-# SettleRound at a time, plus the OPEN Layer previewing its slice. Also owns the bucket-boundary
-# swap and the RATIFIED -> SETTLED -> COMMIT sequencing.
+# WHAT IT OWNS. The currently-collecting Mempool. Rounds in flight (bucket -> Round; the Round
+# carries its own bodies so no Mempool sidecar is retained). A queue of ratified blocks awaiting
+# settlement, in bucket order. At most one live SettleRound at a time, plus the OPEN Layer
+# previewing its slice. Also owns the bucket-boundary swap, the RATIFIED -> SETTLED -> COMMIT
+# sequencing, and the ABANDONED-round fall-through re-admission (#endorser-refuses-stale).
 #
 # WHAT IT DOES NOT OWN. The Round protocol (`dude.round`), the SettleRound protocol
 # (`dude.settle_round`), the wire encodings (`dude.net.round_adapter`,
@@ -63,13 +64,15 @@ class _Settling:
 
     bucket: Bucket
     block: Block
-    frozen: Mempool
     layer: Layer
     applied: tuple[SignedTransaction, ...]
     """Slice txs the preview accepted, in the order they will be committed."""
     dropped: tuple[SignedTransaction, ...]
     """Slice txs the preview rejected (guard/authority failure against the pre-apply state).
-    These re-enter the current mempool on SETTLED, alongside non-slice txs."""
+    These re-enter the current mempool on SETTLED, alongside `surviving`."""
+    surviving: tuple[SignedTransaction, ...]
+    """Non-slice txs (held by Round but not included in the ratified slice). Re-enter the
+    current mempool on SETTLED via #fall-through-through-the-door, alongside `dropped`."""
     anchors: Anchors
     """The anchors we signed. Compared to the SETTLED block's anchors -- a mismatch here would
     mean our own evaluator produced different mutations between preview and commit, which is
@@ -106,10 +109,17 @@ class Coordinator:
     because tests may not need it; production always passes one."""
 
     mempool: Mempool = field(init=False)
-    rounds: dict[Bucket, tuple[Mempool, Round]] = field(init=False, default_factory=dict)
-    pending: list[tuple[Bucket, Block, Mempool]] = field(init=False, default_factory=list)
-    """Ratified blocks waiting to be settled, in bucket order. Enqueued on Round ratification;
-    dequeued when `settling` opens up."""
+    rounds: dict[Bucket, Round] = field(init=False, default_factory=dict)
+    """Open Rounds by bucket. No Mempool held alongside -- Round now carries its own bodies
+    (`Round.add_local` takes SignedTransactions, not just hashes), so the L5 preview and
+    fall-through paths read directly off the Round without a frozen-Mempool sidecar."""
+    pending: list[
+        tuple[Bucket, Block, tuple[SignedTransaction, ...], tuple[SignedTransaction, ...]]
+    ] = field(init=False, default_factory=list)
+    """Ratified blocks waiting to be settled, in bucket order. Tuple: `(bucket, block,
+    slice_bodies, surviving)` -- everything the settling + fall-through paths need, sourced
+    from the Round on ratification. Enqueued on Round ratification; dequeued when `settling`
+    opens up."""
     settling: _Settling | None = field(init=False, default=None)
     current_bucket: Bucket = field(init=False, default=-1)
     """The bucket the currently-collecting mempool is for. `-1` means "no bucket yet"."""
@@ -130,6 +140,14 @@ class Coordinator:
         ahead -- enough for HELD to disseminate before finalize triggers on the next tick."""
         return now + self.tunables.mempool.delta
 
+    def _abandon_by(self, close_by: Millis) -> Millis:
+        """Deadline for the Round opening now: if still in FINALIZE at this point, abandon and
+        push everything back through the mempool door (#endorser-refuses-stale). Derived as
+        `close_by + w_valid_margin` so no honest node is still trying to sign a slice whose
+        txs have aged past `w_valid` -- the mempool's own admission floor refuses those, so
+        the round-level check reduces to a cadence timeout with no per-tx dance."""
+        return close_by + self.tunables.mempool.w_valid_margin
+
     # -- inbound ----------------------------------------------------------------------------- #
 
     def submit(self, tx: SignedTransaction, now: Millis) -> Refusal | None:
@@ -143,10 +161,9 @@ class Coordinator:
             bucket = RoundMsg.bucket_of(env.env.body)
         except RoundAdapterError:
             return  # malformed body, dropped
-        entry = self.rounds.get(bucket)
-        if entry is None:
+        r = self.rounds.get(bucket)
+        if r is None:
             return  # unknown bucket: already settled or not opened yet -- routine
-        _frozen, r = entry
         try:
             self.adapter.deliver(env, r, now)
         except RoundAdapterError:
@@ -184,14 +201,16 @@ class Coordinator:
             self._open_round(self.current_bucket, frozen, now)
             self.current_bucket += 1
 
-        # Drive open Rounds; move ratified ones to `pending`.
+        # Drive open Rounds; move ratified ones to `pending`, drop abandoned ones after
+        # re-admitting their held txs (#endorser-refuses-stale + #fall-through-through-the-door).
         for bucket in list(self.rounds):
-            _frozen, r = self.rounds[bucket]
+            r = self.rounds[bucket]
             r.tick(now)
             self.adapter.flush(r, now)
-            block = r.ratified()
-            if block is not None:
-                self._on_ratified(bucket, block, _frozen)
+            if r.ratified() is not None:
+                self._on_ratified(bucket, r)
+            elif r.abandoned():
+                self._on_abandoned(bucket, r, now)
 
         # Drive the current SettleRound; commit on SETTLED.
         if self.settling is not None:
@@ -206,7 +225,12 @@ class Coordinator:
             self._start_settling(now)
 
     def _open_round(self, bucket: Bucket, frozen: Mempool, now: Millis) -> None:
-        """Instantiate a Round for `bucket`, seed it with what the frozen Mempool held.
+        """Instantiate a Round for `bucket`, seed it with the transactions the frozen Mempool
+        held.
+
+        Bodies flow into Round via `add_local(all_bodies)`, not just hashes -- Round carries
+        the SignedTransactions itself so possession is structural and the slice we sign is by
+        construction backed by txs we can produce for settlement.
 
         SKIPS QUIETLY if we are not in the roster. A follower-only node (a fresh joiner, a
         node granted read-only membership, a node whose stake in the roster has been removed
@@ -218,42 +242,49 @@ class Coordinator:
         roster = self.mgmt.roster()
         if self.me.public not in roster:
             return
+        close_by = self._close_by(now)
         r = Round(
             bucket=bucket,
             me=self.me,
             roster=roster,
             now=now,
-            close_by=self._close_by(now),
+            close_by=close_by,
+            abandon_by=self._abandon_by(close_by),
         )
-        r.add_local(frozen.all_hashes())
-        self.rounds[bucket] = (frozen, r)
+        r.add_local(frozen.all_bodies().values())
+        self.rounds[bucket] = r
         self.adapter.flush(r, now)
 
-    def _on_ratified(self, bucket: Bucket, block: Block, frozen: Mempool) -> None:
+    def _on_ratified(self, bucket: Bucket, r: Round) -> None:
         """A Round has ratified. Enqueue in `pending` for settlement; retire the Round entry.
 
-        Enqueue in bucket order so `_start_settling` always picks the smallest -- monotone-
-        height per SPECv2 #pipelining."""
-        self.pending.append((bucket, block, frozen))
+        Bodies for slice + surviving come straight from the Round -- no Mempool sidecar. Enqueue
+        in bucket order so `_start_settling` always picks the smallest -- monotone-height per
+        SPECv2 #pipelining."""
+        block = r.ratified()
+        if block is None:  # unreachable: caller only calls after checking ratified()
+            raise InvariantError("_on_ratified called with unratified Round")
+        self.pending.append((bucket, block, r.slice_bodies(), r.surviving()))
         self.pending.sort(key=lambda entry: entry[0])
+        del self.rounds[bucket]
+
+    def _on_abandoned(self, bucket: Bucket, r: Round, now: Millis) -> None:
+        """A Round has abandoned (`abandon_by` passed without ratification). No block enters
+        `pending` -- nothing settles for this bucket. Every tx the Round held goes back through
+        the current-mempool door: some re-enter and go to a later bucket; anything past
+        `w_valid` on our clock is refused there for free (#endorser-refuses-stale +
+        #fall-through-through-the-door). Re-broadcast the re-admitted ones so peers hold them
+        too, same reasoning as the SETTLED fall-through path."""
+        for tx in r.surviving():
+            refusal = self.mempool.admit(tx, now, self.store, self.mgmt)
+            if refusal is None and self.reflood is not None:
+                self.reflood(tx, now)
         del self.rounds[bucket]
 
     def _start_settling(self, now: Millis) -> None:
         """Promote pending[0] to `settling`: build the Layer preview, compute anchors, construct
         the SettleRound, emit our own SettleSig."""
-        bucket, block, frozen = self.pending.pop(0)
-
-        # Look up bodies for the ratified slice.
-        bodies_by_hash = {
-            tx.op_hash: tx for _b, txs in frozen.pending.items() for tx in txs.values()
-        }
-        missing = [h for h in block.hashes if h not in bodies_by_hash]
-        if missing:
-            raise InvariantError(
-                f"bucket {bucket} ratified {len(missing)} tx(s) this node does not hold locally; "
-                f"gossip-by-hash + FETCH not yet implemented"
-            )
-        slice_txs = tuple(bodies_by_hash[h] for h in block.hashes)
+        bucket, block, slice_txs, surviving = self.pending.pop(0)
 
         # Filter already-settled txs. Round does not check log state -- it ratifies over
         # mempool hashes -- so a slice may contain a tx that has already landed in the log
@@ -306,10 +337,10 @@ class Coordinator:
         self.settling = _Settling(
             bucket=bucket,
             block=block,
-            frozen=frozen,
             layer=layer,
             applied=applied,
             dropped=dropped_from_slice,
+            surviving=surviving,
             anchors=anchors,
             first_height=base_head + 1,
             settle_round=sr,
@@ -350,13 +381,12 @@ class Coordinator:
         # InvariantError, per #failure-domains, so no `except DudeError` can swallow it.
         _expect_anchors(s.anchors, self.store)
 
-        # Re-admit non-slice and slice-dropped txs through the one admission door, and
-        # re-broadcast each so peers hold them too -- otherwise a tx that only this node
-        # carried after ratifying an empty slice would stay isolated for every future bucket.
-        applied_hashes = {tx.op_hash for tx in s.applied}
-        for op_hash, tx in s.frozen.all_bodies().items():
-            if op_hash in applied_hashes:
-                continue
+        # Re-admit surviving + slice-dropped txs through the one admission door, and re-broadcast
+        # each so peers hold them too -- otherwise a tx that only this node carried after
+        # ratifying an empty slice would stay isolated for every future bucket. Sources: Round's
+        # `surviving()` (bodies held-but-not-included) + the settle preview's own `dropped`
+        # (slice txs whose guards falsified against the pre-apply state).
+        for tx in (*s.surviving, *s.dropped):
             refusal = self.mempool.admit(tx, now, self.store, self.mgmt)
             if refusal is None and self.reflood is not None:
                 self.reflood(tx, now)

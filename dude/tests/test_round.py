@@ -10,6 +10,10 @@
 # Signatures are REAL. `crypto.Keypair.generate()` is fast enough that faking signatures buys
 # nothing and loses the property that ratification actually verifies. A malicious node in a test
 # is an actual peer with an actual key that signs something it should not.
+#
+# BODIES ARE REAL, TOO. Round.add_local takes SignedTransactions -- not just hashes -- so the
+# possession invariant ("sign only what we hold") is structural rather than a passing convention.
+# `_stubs("a", "b", ...)` builds deterministic real txs whose op_hash is a function of the name.
 
 from __future__ import annotations
 
@@ -20,12 +24,40 @@ from .. import quorum
 from ..consensus.round import Block, Round, RoundMsg, Sig, State, _slice_hash
 from ..core import crypto
 from ..net.postman import Recipient
+from ..store import ops
+from ..store.ops import SignedTransaction
 
 T0 = 1_700_000_000_000
 DELTA = 1_000
 CLOSE_BY = T0 + 5 * DELTA
 """Collection window for tests: five ticks. Enough for a Held to reach every peer and be
 re-observed by the sender before any node tries to finalize."""
+
+ABANDON_BY = T0 + 1_000 * DELTA
+"""Abandonment deadline for the scenario suite: far enough past every test's `_run` horizon
+that no test's Round ever times out incidentally. Abandonment behaviour lives in its own
+scenario (TestAbandonmentOnTimeout) which sets a shorter value on purpose."""
+
+_STUB_KP = crypto.Keypair.generate()
+"""One key for all stub transactions. Tests don't reason about tx authorship -- they reason
+about slice convergence -- so a single shared key keeps stub construction cheap."""
+
+
+def _stub_tx(name: str) -> SignedTransaction:
+    """A real SignedTransaction whose op_hash is a deterministic function of `name`. Distinct
+    names produce distinct hashes; same name always produces the same tx (structural sharing
+    across test methods). Used everywhere a test wants a body without caring about its
+    payload."""
+    return ops.writes(ops.Set(0, crypto.h(name.encode()), b"v")).sign(_STUB_KP, T0)
+
+
+def _stubs(*names: str) -> tuple[SignedTransaction, ...]:
+    return tuple(_stub_tx(n) for n in names)
+
+
+def _hashes(txs: tuple[SignedTransaction, ...]) -> tuple[crypto.Digest, ...]:
+    """Sorted op_hashes for a group of stub txs -- the canonical slice-hash order Round uses."""
+    return tuple(sorted(tx.op_hash for tx in txs))
 
 
 def _wire(nodes: dict[crypto.PublicKey, Round], now: int) -> None:
@@ -44,13 +76,16 @@ def _wire(nodes: dict[crypto.PublicKey, Round], now: int) -> None:
 
 
 def _setup(
-    n: int, bucket: int = 1, close_by: int = CLOSE_BY
+    n: int, bucket: int = 1, close_by: int = CLOSE_BY, abandon_by: int = ABANDON_BY
 ) -> tuple[list[crypto.Keypair], dict[crypto.PublicKey, Round]]:
     """N nodes, one Round instance each, all for the same bucket."""
     keys = [crypto.Keypair.generate() for _ in range(n)]
     roster = tuple(k.public for k in keys)
     rounds = {
-        k.public: Round(bucket=bucket, me=k, roster=roster, now=T0, close_by=close_by) for k in keys
+        k.public: Round(
+            bucket=bucket, me=k, roster=roster, now=T0, close_by=close_by, abandon_by=abandon_by
+        )
+        for k in keys
     }
     return keys, rounds
 
@@ -77,7 +112,7 @@ class TestAllNodesAgree(unittest.TestCase):
 
     def test_the_ratified_block_is_that_set(self):
         _keys, nodes = _setup(3)
-        shared = frozenset({crypto.h(b"a"), crypto.h(b"b"), crypto.h(b"c")})
+        shared = _stubs("a", "b", "c")
         for r in nodes.values():
             r.add_local(shared)
 
@@ -89,16 +124,15 @@ class TestAllNodesAgree(unittest.TestCase):
 
         # narrow: every entry non-None per the loop above
         rats: list[Block] = [b for b in blocks if b is not None]
-        expected_hashes = tuple(sorted(shared))
         self.assertEqual(
-            {b.hashes for b in rats}, {expected_hashes}, "nodes ratified different sets"
+            {b.hashes for b in rats}, {_hashes(shared)}, "nodes ratified different sets"
         )
         for r in nodes.values():
-            self.assertEqual(list(r.surviving()), [], "unexpected surviving hashes")
+            self.assertEqual(list(r.surviving()), [], "unexpected surviving txs")
 
     def test_every_node_ends_in_state_gone(self):
         _keys, nodes = _setup(3)
-        shared = frozenset({crypto.h(b"a"), crypto.h(b"b")})
+        shared = _stubs("a", "b")
         for r in nodes.values():
             r.add_local(shared)
 
@@ -114,25 +148,27 @@ class TestDisagreementAtTheEdge(unittest.TestCase):
 
     def test_the_extra_is_not_in_the_slice_and_is_returned_as_surviving(self):
         _keys, nodes = _setup(3)
-        shared = {crypto.h(b"a"), crypto.h(b"b"), crypto.h(b"c")}
-        extra = crypto.h(b"only-c")
+        shared = _stubs("a", "b", "c")
+        extra = _stub_tx("only-c")
 
         node_ids = list(nodes)
         for nid in node_ids[:2]:
-            nodes[nid].add_local(frozenset(shared))
-        nodes[node_ids[2]].add_local(frozenset(shared | {extra}))
+            nodes[nid].add_local(shared)
+        nodes[node_ids[2]].add_local((*shared, extra))
 
         _run(nodes)
 
         blocks = [r.ratified() for r in nodes.values()]
         rats: list[Block] = [b for b in blocks if b is not None]
         self.assertEqual(len(rats), 3, "not all nodes ratified")
-        self.assertEqual(
-            {b.hashes for b in rats}, {tuple(sorted(shared))}, "ratified different sets"
-        )
+        self.assertEqual({b.hashes for b in rats}, {_hashes(shared)}, "ratified different sets")
         for i, nid in enumerate(node_ids):
-            expected = [extra] if i == 2 else []
-            self.assertEqual(list(nodes[nid].surviving()), expected, f"node {i} wrong surviving")
+            expected = (extra.op_hash,) if i == 2 else ()
+            self.assertEqual(
+                tuple(tx.op_hash for tx in nodes[nid].surviving()),
+                expected,
+                f"node {i} wrong surviving",
+            )
 
 
 class Fabric:
@@ -221,7 +257,7 @@ class TestEmptyBucket(unittest.TestCase):
     def test_ratified_block_is_empty(self):
         _keys, nodes = _setup(3)
         for r in nodes.values():
-            r.add_local(frozenset())
+            r.add_local(())
 
         _run(nodes)
 
@@ -239,7 +275,7 @@ class TestDelayedMessages(unittest.TestCase):
         # Push close_by out far enough that the delayed Helds still arrive before it.
         close_by = T0 + 20 * DELTA
         _keys, nodes = _setup(3, close_by=close_by)
-        shared = frozenset({crypto.h(b"a"), crypto.h(b"b")})
+        shared = _stubs("a", "b")
         for r in nodes.values():
             r.add_local(shared)
 
@@ -249,7 +285,7 @@ class TestDelayedMessages(unittest.TestCase):
         blocks = [r.ratified() for r in nodes.values()]
         rats: list[Block] = [b for b in blocks if b is not None]
         self.assertEqual(len(rats), 3, "delayed delivery prevented ratification")
-        self.assertEqual({b.hashes for b in rats}, {tuple(sorted(shared))}, "diverged")
+        self.assertEqual({b.hashes for b in rats}, {_hashes(shared)}, "diverged")
 
 
 class TestPartitionedMinority(unittest.TestCase):
@@ -258,7 +294,7 @@ class TestPartitionedMinority(unittest.TestCase):
 
     def test_quorum_ratifies_without_partitioned_node(self):
         keys, nodes = _setup(3)
-        shared = frozenset({crypto.h(b"a"), crypto.h(b"b")})
+        shared = _stubs("a", "b")
         for r in nodes.values():
             r.add_local(shared)
 
@@ -275,7 +311,7 @@ class TestPartitionedMinority(unittest.TestCase):
 
         self.assertTrue(all(b is not None for b in connected), "connected quorum did not ratify")
         conn: list[Block] = [b for b in connected if b is not None]
-        self.assertEqual({b.hashes for b in conn}, {tuple(sorted(shared))})
+        self.assertEqual({b.hashes for b in conn}, {_hashes(shared)})
         # Isolated: either did not ratify at all, or ratified an empty slice on its own evidence
         # alone (which would not reach quorum, so it stays in FINALIZE).
         self.assertIsNone(isolated, "isolated node ratified without a quorum")
@@ -287,7 +323,7 @@ class TestByzantineEquivocation(unittest.TestCase):
 
     def test_equivocation_is_detected_and_ratification_survives(self):
         keys, nodes = _setup(3)
-        shared = frozenset({crypto.h(b"a"), crypto.h(b"b")})
+        shared = _stubs("a", "b")
         for r in nodes.values():
             r.add_local(shared)
 
@@ -298,7 +334,8 @@ class TestByzantineEquivocation(unittest.TestCase):
         fabric.tick(T0)
 
         # Craft a bogus Sig from node 2 for a slice that isn't the real one, then inject it into
-        # node 0 BEFORE the real round produces the honest Sig.
+        # node 0 BEFORE the real round produces the honest Sig. The bogus slice is a raw hash
+        # (no body needed -- Sig only carries the slice_hash, not the tx set).
         bogus_slice = frozenset({crypto.h(b"nope")})
         bogus_sig = Sig.sign(keys[2], 1, _slice_hash(1, bogus_slice))
         fabric.inject(bogus_sig, from_=keys[2].public, to=keys[0].public, now=T0 + DELTA)
@@ -312,8 +349,8 @@ class TestByzantineEquivocation(unittest.TestCase):
         self.assertIsNotNone(r0, "node 0 did not ratify")
         self.assertIsNotNone(r1, "node 1 did not ratify")
         assert r0 is not None and r1 is not None
-        self.assertEqual(r0.hashes, tuple(sorted(shared)), "node 0 ratified the wrong slice")
-        self.assertEqual(r1.hashes, tuple(sorted(shared)))
+        self.assertEqual(r0.hashes, _hashes(shared), "node 0 ratified the wrong slice")
+        self.assertEqual(r1.hashes, _hashes(shared))
 
         # Node 0 saw the equivocation from node 2.
         eqs = list(nodes[keys[0].public].equivocations())
@@ -331,10 +368,10 @@ class TestPipelining(unittest.TestCase):
     def test_two_buckets_ratify_independently(self):
         keys = [crypto.Keypair.generate() for _ in range(3)]
         roster = tuple(k.public for k in keys)
-        rounds_b1 = {k.public: Round(1, k, roster, T0, CLOSE_BY) for k in keys}
-        rounds_b2 = {k.public: Round(2, k, roster, T0, CLOSE_BY) for k in keys}
-        set_b1 = frozenset({crypto.h(b"b1-a"), crypto.h(b"b1-b")})
-        set_b2 = frozenset({crypto.h(b"b2-x"), crypto.h(b"b2-y"), crypto.h(b"b2-z")})
+        rounds_b1 = {k.public: Round(1, k, roster, T0, CLOSE_BY, ABANDON_BY) for k in keys}
+        rounds_b2 = {k.public: Round(2, k, roster, T0, CLOSE_BY, ABANDON_BY) for k in keys}
+        set_b1 = _stubs("b1-a", "b1-b")
+        set_b2 = _stubs("b2-x", "b2-y", "b2-z")
         for r in rounds_b1.values():
             r.add_local(set_b1)
         for r in rounds_b2.values():
@@ -346,13 +383,13 @@ class TestPipelining(unittest.TestCase):
         rats_b1 = [r.ratified() for r in rounds_b1.values()]
         rats_b1_ok: list[Block] = [b for b in rats_b1 if b is not None]
         self.assertEqual(len(rats_b1_ok), 3, "bucket 1 did not all ratify")
-        self.assertEqual({b.hashes for b in rats_b1_ok}, {tuple(sorted(set_b1))})
+        self.assertEqual({b.hashes for b in rats_b1_ok}, {_hashes(set_b1)})
 
         # Bucket 2: all ratify with set_b2, independently
         rats_b2 = [r.ratified() for r in rounds_b2.values()]
         rats_b2_ok: list[Block] = [b for b in rats_b2 if b is not None]
         self.assertEqual(len(rats_b2_ok), 3, "bucket 2 did not all ratify")
-        self.assertEqual({b.hashes for b in rats_b2_ok}, {tuple(sorted(set_b2))})
+        self.assertEqual({b.hashes for b in rats_b2_ok}, {_hashes(set_b2)})
 
 
 class TestRandomisedBuckets(unittest.TestCase):
@@ -365,17 +402,17 @@ class TestRandomisedBuckets(unittest.TestCase):
         keys = [crypto.Keypair.generate() for _ in range(3)]
         roster = tuple(k.public for k in keys)
 
-        # Distinct set of hashes per bucket, so we can assert bucket B ratified set B.
+        # Distinct set of stub txs per bucket, so we can assert bucket B ratified set B.
         buckets = list(range(1, 11))
         rng.shuffle(buckets)
-        contents = {
-            b: frozenset({crypto.h(f"b{b}-{i}".encode()) for i in range(3)}) for b in buckets
-        }
+        contents = {b: _stubs(*(f"b{b}-{i}" for i in range(3))) for b in buckets}
 
         # Construct Rounds in the shuffled order; add_local in the shuffled order.
         rounds_by_bucket: dict[int, dict[crypto.PublicKey, Round]] = {}
         for b in buckets:
-            rounds_by_bucket[b] = {k.public: Round(b, k, roster, T0, CLOSE_BY) for k in keys}
+            rounds_by_bucket[b] = {
+                k.public: Round(b, k, roster, T0, CLOSE_BY, ABANDON_BY) for k in keys
+            }
             for r in rounds_by_bucket[b].values():
                 r.add_local(contents[b])
 
@@ -392,7 +429,7 @@ class TestRandomisedBuckets(unittest.TestCase):
             self.assertEqual(len(rats_ok), 3, f"bucket {b} did not all ratify")
             self.assertEqual(
                 {x.hashes for x in rats_ok},
-                {tuple(sorted(contents[b]))},
+                {_hashes(contents[b])},
                 f"bucket {b} ratified the wrong set",
             )
 
@@ -414,11 +451,11 @@ class TestTieBreak(unittest.TestCase):
 
     def test_ratifiers_converge_on_the_same_maximal_candidate(self):
         _keys, nodes = _setup(3)
-        h1, h2, h3, h4 = (crypto.h(b"1"), crypto.h(b"2"), crypto.h(b"3"), crypto.h(b"4"))
+        t1, t2, t3, t4 = _stubs("1", "2", "3", "4")
         node_ids = list(nodes)
-        nodes[node_ids[0]].add_local(frozenset({h1, h2, h3}))
-        nodes[node_ids[1]].add_local(frozenset({h1, h2, h4}))
-        nodes[node_ids[2]].add_local(frozenset({h1, h2, h3, h4}))
+        nodes[node_ids[0]].add_local((t1, t2, t3))
+        nodes[node_ids[1]].add_local((t1, t2, t4))
+        nodes[node_ids[2]].add_local((t1, t2, t3, t4))
 
         _run(nodes)
 
@@ -431,7 +468,7 @@ class TestTieBreak(unittest.TestCase):
         self.assertEqual(len(distinct_slices), 1, f"nodes disagreed: {distinct_slices}")
         (chosen,) = distinct_slices
         self.assertEqual(len(chosen), 3, "the chosen slice should be one of the maximal candidates")
-        self.assertIn(chosen, {tuple(sorted({h1, h2, h3})), tuple(sorted({h1, h2, h4}))})
+        self.assertIn(chosen, {_hashes((t1, t2, t3)), _hashes((t1, t2, t4))})
 
     def test_the_tie_break_key_depends_on_the_bucket(self):
         """Same holdings, different bucket -> the tie-break rolls the dice again.
@@ -441,15 +478,15 @@ class TestTieBreak(unittest.TestCase):
         32 buckets and assert the ratified winner is not always the same. Which node ratifies
         depends on which candidate wins the bucket -- so we take the winner from ANY ratifier,
         not specifically node 0, whose slice may not have won this bucket."""
-        h1, h2, h3, h4 = (crypto.h(b"1"), crypto.h(b"2"), crypto.h(b"3"), crypto.h(b"4"))
+        t1, t2, t3, t4 = _stubs("1", "2", "3", "4")
 
         seen: set[tuple[crypto.Digest, ...]] = set()
         for bucket in range(1, 33):
             _keys, nodes = _setup(3, bucket=bucket)
             node_ids = list(nodes)
-            nodes[node_ids[0]].add_local(frozenset({h1, h2, h3}))
-            nodes[node_ids[1]].add_local(frozenset({h1, h2, h4}))
-            nodes[node_ids[2]].add_local(frozenset({h1, h2, h3, h4}))
+            nodes[node_ids[0]].add_local((t1, t2, t3))
+            nodes[node_ids[1]].add_local((t1, t2, t4))
+            nodes[node_ids[2]].add_local((t1, t2, t3, t4))
             _run(nodes)
             rats = [b for r in nodes.values() if (b := r.ratified()) is not None]
             self.assertGreaterEqual(len(rats), 2, f"bucket {bucket}: fewer than a quorum ratified")
@@ -462,13 +499,107 @@ class TestTieBreak(unittest.TestCase):
         self.fail(f"tie-break winner was constant across 32 buckets: {seen}")
 
 
+class TestAbandonmentOnTimeout(unittest.TestCase):
+    """A Round that cannot form quorum (partitioned minority alone, silent peers, whatever)
+    MUST abandon at `abandon_by` rather than hang forever. On abandonment, every held tx
+    surfaces via `surviving()` so the current mempool re-admits it -- anything past `w_valid`
+    is refused there, so this is the enforcer of #endorser-refuses-stale.
+
+    See SPECv2 #round-lifecycle and the ABANDONED state docstring for the full reasoning."""
+
+    def test_isolated_node_abandons_after_deadline(self):
+        """A node that gets no peer messages transitions to FINALIZE at close_by (signs
+        its own slice, waits for a quorum that never arrives), then transitions to ABANDONED
+        at abandon_by."""
+        close_by = T0 + 3 * DELTA
+        abandon_by = T0 + 8 * DELTA
+        keys, nodes = _setup(3, close_by=close_by, abandon_by=abandon_by)
+        # Nobody wires anything -- each Round runs in isolation.
+        held = _stubs("x", "y")
+        for r in nodes.values():
+            r.add_local(held)
+
+        # Tick past close_by: every isolated Round finalizes on its own evidence.
+        for r in nodes.values():
+            r.tick(close_by)
+        for r in nodes.values():
+            self.assertEqual(r.state(), State.FINALIZE, "did not enter FINALIZE at close_by")
+
+        # Tick past abandon_by: no peer sigs ever arrived, so every Round gives up.
+        for r in nodes.values():
+            r.tick(abandon_by)
+        for i, k in enumerate(keys):
+            r = nodes[k.public]
+            self.assertTrue(r.abandoned(), f"node {i} did not abandon")
+            self.assertIsNone(r.ratified(), f"node {i} ratified spontaneously")
+
+    def test_abandoned_round_surfaces_full_local_via_surviving(self):
+        """On abandonment, `surviving()` returns every body the Round held -- not just the
+        non-slice fraction. Nothing settled, so everything re-enters the door."""
+        close_by = T0 + 3 * DELTA
+        abandon_by = T0 + 8 * DELTA
+        _keys, nodes = _setup(3, close_by=close_by, abandon_by=abandon_by)
+        held = _stubs("x", "y", "z")
+        for r in nodes.values():
+            r.add_local(held)
+
+        # Force finalize + abandon on one isolated node.
+        r = next(iter(nodes.values()))
+        r.tick(close_by)
+        r.tick(abandon_by)
+
+        self.assertTrue(r.abandoned())
+        surviving = r.surviving()
+        # All three bodies, sorted by op_hash.
+        self.assertEqual(
+            tuple(tx.op_hash for tx in surviving),
+            tuple(sorted(tx.op_hash for tx in held)),
+        )
+
+    def test_abandon_is_terminal_no_re_ratification(self):
+        """Once ABANDONED, further peer Sigs arriving late MUST NOT flip the state back to
+        GONE. Abandonment is one-way."""
+        close_by = T0 + 3 * DELTA
+        abandon_by = T0 + 8 * DELTA
+        keys, nodes = _setup(3, close_by=close_by, abandon_by=abandon_by)
+        held = _stubs("x")
+        for r in nodes.values():
+            r.add_local(held)
+
+        # Node 0 finalizes + abandons in isolation.
+        r0 = nodes[keys[0].public]
+        r0.tick(close_by)
+        r0.tick(abandon_by)
+        self.assertTrue(r0.abandoned())
+
+        # Node 1 signs the same slice (in the parallel universe where it would have quorumed).
+        # Deliver its Sig to node 0 after abandonment.
+        r1 = nodes[keys[1].public]
+        r1.tick(close_by)
+        # Pull node 1's Sig from its outbox.
+        outbox = r1.outbox()
+        sig_msgs = [msg for _target, msg in outbox if isinstance(msg, Sig)]
+        self.assertEqual(len(sig_msgs), 1, "node 1 did not emit a Sig at finalize")
+        r0.receive(sig_msgs[0], from_=keys[1].public, now=abandon_by)
+        # Also deliver node 0's own Sig (would-be second sig for its own quorum tally).
+        r2 = nodes[keys[2].public]
+        r2.tick(close_by)
+        r2_out = r2.outbox()
+        r2_sig = next(msg for _target, msg in r2_out if isinstance(msg, Sig))
+        r0.receive(r2_sig, from_=keys[2].public, now=abandon_by)
+
+        # Node 0 stays abandoned; late Sigs are dropped by the state guard.
+        self.assertTrue(r0.abandoned())
+        self.assertIsNone(r0.ratified())
+
+
 # --------------------------------------------------------------------------------------------- #
 # Phase 4: property tests. The scenario suite pins specific shapes; this catches the space in   #
 # between by running many seeded random topologies through the same invariants.                 #
 # --------------------------------------------------------------------------------------------- #
 
-_UNIVERSE = tuple(crypto.h(f"tx{i}".encode()) for i in range(16))
-"""A small pool of hash values so random subsets overlap enough to make intersections interesting.
+_UNIVERSE = _stubs(*(f"tx{i}" for i in range(16)))
+"""A small pool of stub txs so random subsets overlap enough to make intersections interesting.
 Sixteen is chosen so C(16, k) is small enough that any per-node subset is enumerable, and large
 enough that at n=7, quorum=5 we get non-trivial edge cases."""
 
@@ -478,14 +609,14 @@ def _random_setup(
 ) -> tuple[
     list[crypto.Keypair],
     dict[crypto.PublicKey, Round],
-    dict[crypto.PublicKey, frozenset[crypto.Digest]],
+    dict[crypto.PublicKey, tuple[SignedTransaction, ...]],
 ]:
     """N nodes, per-node random holdings drawn from `_UNIVERSE`."""
     keys, nodes = _setup(n, bucket=bucket)
-    holdings: dict[crypto.PublicKey, frozenset[crypto.Digest]] = {}
+    holdings: dict[crypto.PublicKey, tuple[SignedTransaction, ...]] = {}
     for k in keys:
         size = rng.randint(0, len(_UNIVERSE))
-        holdings[k.public] = frozenset(rng.sample(_UNIVERSE, size))
+        holdings[k.public] = tuple(rng.sample(_UNIVERSE, size))
         nodes[k.public].add_local(holdings[k.public])
     return keys, nodes, holdings
 
@@ -529,10 +660,10 @@ class TestPropertyConvergence(unittest.TestCase):
                 close_by = T0 + 30 * DELTA
                 keys = [crypto.Keypair.generate() for _ in range(n)]
                 roster = tuple(k.public for k in keys)
-                nodes = {k.public: Round(1, k, roster, T0, close_by) for k in keys}
+                nodes = {k.public: Round(1, k, roster, T0, close_by, ABANDON_BY) for k in keys}
                 for k in keys:
                     size = rng.randint(0, len(_UNIVERSE))
-                    nodes[k.public].add_local(frozenset(rng.sample(_UNIVERSE, size)))
+                    nodes[k.public].add_local(rng.sample(_UNIVERSE, size))
 
                 fabric = Fabric(nodes, delay_ticks=rng.randint(0, 3))
                 _run_fabric(nodes, fabric, rounds=60)
@@ -597,7 +728,9 @@ class TestPropertySafetyUnderByzantine(unittest.TestCase):
                 # Byzantine node picks a random victim and sends a bogus Sig for a slice that
                 # differs from anything real.
                 byz, victim = rng.sample(keys, 2)
-                bogus_hashes = frozenset(rng.sample(_UNIVERSE, rng.randint(1, 5)))
+                bogus_hashes = frozenset(
+                    tx.op_hash for tx in rng.sample(_UNIVERSE, rng.randint(1, 5))
+                )
                 bogus_sig = Sig.sign(byz, 1, _slice_hash(1, bogus_hashes))
                 fabric.inject(bogus_sig, from_=byz.public, to=victim.public, now=T0 + DELTA)
 

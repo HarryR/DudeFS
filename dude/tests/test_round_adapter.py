@@ -17,6 +17,7 @@ from ..net.address import Address, Endpoint, Scheme
 from ..net.envelope import Envelope
 from ..net.link import Peer
 from ..net.postman import Postman
+from .test_round import _stubs
 
 T0 = 1_700_000_000_000
 DELTA = 1_000
@@ -125,8 +126,9 @@ class TestFlushToMailbox(unittest.TestCase):
             roster=self.roster,
             now=T0,
             close_by=T0 + 5 * DELTA,
+            abandon_by=T0 + 1_000 * DELTA,
         )
-        r.add_local(frozenset({crypto.h(b"tx1")}))
+        r.add_local(_stubs("tx1"))
 
         adapter = RoundAdapter(self.me, self.postman, ttl=10_000)
         adapter.flush(r, now=T0)
@@ -144,8 +146,15 @@ class TestFlushToMailbox(unittest.TestCase):
     def test_second_flush_is_empty_if_nothing_new(self):
         """A Round's outbox drains on read. A flush after that -- with no intervening tick or
         receive -- posts nothing."""
-        r = Round(bucket=1, me=self.me, roster=self.roster, now=T0, close_by=T0 + 5 * DELTA)
-        r.add_local(frozenset({crypto.h(b"tx1")}))
+        r = Round(
+            bucket=1,
+            me=self.me,
+            roster=self.roster,
+            now=T0,
+            close_by=T0 + 5 * DELTA,
+            abandon_by=T0 + 1_000 * DELTA,
+        )
+        r.add_local(_stubs("tx1"))
         adapter = RoundAdapter(self.me, self.postman, ttl=10_000)
 
         adapter.flush(r, now=T0)
@@ -163,8 +172,15 @@ class TestDeliverToRound(unittest.TestCase):
         roster = tuple(k.public for k in keys)
         me, peer = keys[0], keys[1]
 
-        r = Round(bucket=1, me=me, roster=roster, now=T0, close_by=T0 + 5 * DELTA)
-        r.add_local(frozenset({crypto.h(b"local")}))
+        r = Round(
+            bucket=1,
+            me=me,
+            roster=roster,
+            now=T0,
+            close_by=T0 + 5 * DELTA,
+            abandon_by=T0 + 1_000 * DELTA,
+        )
+        r.add_local(_stubs("local"))
 
         peer_hashes = frozenset({crypto.h(b"peer-a"), crypto.h(b"peer-b")})
         verb, body = Held(bucket=1, hashes=peer_hashes).encode()

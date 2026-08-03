@@ -385,7 +385,7 @@ via the same one door as any other submission.
 
 ### A Round is a closed mempool being finalized {#round-lifecycle}
 
-- A Round has three states and no others:
+- A Round has four states and no others:
 
   ```
   collect       admit transactions with timestamps inside W's window (this IS the mempool
@@ -394,13 +394,22 @@ via the same one door as any other submission.
                 a quorum, tie-broken by keyed sort, meta-agreed) and hand the block to
                 settlement; hand any surviving-but-not-included transactions back to the
                 current collecting mempool
-  gone          discard
+  gone          ratified — discard
+  abandoned     `abandon_by` passed without ratification; hand every held tx back to the
+                current collecting mempool (#endorser-refuses-stale) — discard
   ```
 
-- A Round MUST NOT persist past `gone`. Its ratified block lives in the log; nothing else about
-  the Round survives.
+- A Round MUST NOT persist past `gone` or `abandoned`. A ratified block lives in the log;
+  nothing else about the Round survives.
+- `abandoned` is one-way and terminal. It exists so a Round that cannot form quorum (partitioned
+  minority, silent peers, stale-slice refusal) does not hang indefinitely; the `abandon_by`
+  deadline is set by cadence (see #endorser-refuses-stale for the derivation).
 - Multiple Rounds in `finalize` MAY coexist (pipelining). Exactly one Round is in `collect` at
   any moment — that is L3's mempool.
+- The Round MUST carry its held transactions (bodies, not just hashes) from the moment `collect`
+  hands off to `finalize`. Signing implies possession — a node that cannot produce the bodies
+  for a slice cannot back that slice at settlement — so the possession invariant is structural
+  at the Round's input, not a passing convention.
 
 ### Rounds pipeline {#pipelining}
 
@@ -419,12 +428,26 @@ via the same one door as any other submission.
 
 ### Endorsers refuse a stale slice {#endorser-refuses-stale}
 
-- In the meta-agreement round, a node MUST refuse to sign a slice that contains a transaction it
-  holds and considers past `w_valid`. Silence is the refusal; a quorum of honest nodes then
-  cannot form around it.
-- The eviction horizon MUST EQUAL `w_valid`, derived rather than set: a transaction is
-  unendorsable once `|now − ts| > w_valid`, and any surplus is a window in which a stale
-  compare-and-swap can be re-proposed.
+Freshness is enforced at three points that compose, not by a per-tx staleness check inside the
+Round:
+
+1. **Admission.** A transaction is refused at the mempool door if `|now − ts| > w_valid`
+   (#one-admission-predicate). Nothing stale enters.
+2. **Possession.** A Round MUST sign only slices whose bodies it holds (#slice-is-intersection
+   restricts the candidate space to `⊆ local`). Combined with (1), every signed slice contains
+   only txs the node itself admitted while fresh.
+3. **Cadence.** A Round MUST abandon (transition to `abandoned`) if `abandon_by` passes without
+   ratification. `abandon_by` MUST be `close_by + w_valid_margin` so an aged-out slice never
+   gets signed by an honest node: if quorum was going to form within cadence, admission-time
+   freshness would still hold; past cadence, the Round gives up rather than continue trying.
+   Held transactions surface via the abandoned Round's `surviving` and re-enter the current
+   mempool through the one door, where anything past `w_valid` is refused for free.
+
+Silence is the refusal at every point. A stuck Round abandons rather than hangs, and the
+abandonment shape turns a potentially permanent hang into a retry on the next bucket. The
+eviction horizon MUST EQUAL `w_valid`, derived rather than set: a transaction is unendorsable
+once `|now − ts| > w_valid`, and any surplus is a window in which a stale compare-and-swap can
+be re-proposed.
 
 ### Blocks are the unit of consensus {#block-is-unit}
 
@@ -552,15 +575,7 @@ via the same one door as any other submission.
 
 ---
 
-## Tentative — under construction
-
-This section is a first pass at L5 (settlement) and L6 (sync, no-compaction path). It is here
-to be argued with, not to be built against yet. Requirements below use MUST/MUST NOT the same
-way the settled sections do, but no enforcement row exists until the shape survives review. The
-compaction path (compactor role, log truncation, fast sync, light-client sync via SMT proofs) is
-explicitly deferred — that discussion belongs after this line is rock-solid.
-
-## The View abstraction (tentative) {#view-abstraction}
+## The View abstraction {#view-abstraction}
 
 `Store` and `Layer` are the same abstraction: a read surface over live state that can compute
 the three roots, be frozen, and be a base for another view stacked on top. Their difference is
@@ -621,7 +636,7 @@ change while the overlay is alive.
   frozen and `layer_N_plus_1` continues to function as an overlay; nothing commits down
   until the hang resolves.
 
-## L5 — Settlement (tentative) {#settlement-layer}
+## L5 — Settlement {#settlement-layer}
 
 Settlement is the layer between "the quorum agreed on which slice" (L4) and "the log has advanced,
 every node's state matches, the head is committed". Round produces a RATIFIED slice; settlement
@@ -860,7 +875,7 @@ turns that into a SETTLED block.
   the chain identity is `prev_block_hash`, walked backward one link at a time to the genesis
   stamp.
 
-## L6 — Sync (tentative, no-compaction only) {#sync-layer-no-compaction}
+## L6 — Sync (no-compaction only) {#sync-layer-no-compaction}
 
 The path a joining or lagging node walks to become current, in the world where nothing has been
 compacted and every node still holds every block from genesis. Fast sync, light-client sync via
@@ -1288,7 +1303,7 @@ rather than an environment it has to arrange.
 
 ---
 
-## Enforcement (L0–L4)
+## Enforcement
 
 **A row with no enforcer is a requirement nothing obliges** — the defect this table exists to make
 visible rather than plausible.
@@ -1364,10 +1379,51 @@ visible rather than plausible.
 | ties are broken by keyed sort | `dude.round._compute_slice` — `min(candidates, key=lambda c: _slice_id(bucket, c))` |
 | a meta-agreement round chooses one slice | `Round._try_ratify` — quorum of matching `Sig` messages over the same `slice_hash` |
 | exclusion is by selection during slice construction | Naturally satisfied by Round's #slice-is-intersection: a mutually-exclusive tx cannot appear in the largest set held by a quorum unless every quorum member holds it, which for a slice-mate that would invalidate it is precisely what settlement's evaluator refuses at apply time. The falsified loser returns via #fall-through-through-the-door. |
-| endorsers refuse a slice containing a past-`w_valid` transaction | **OWED** — Round's `Sig` verification currently checks only slice_hash membership, not per-tx staleness. The endorser-refusal-of-stale rule was on `Mempool.endorsable`, which is one of the retired mempool methods (see the L3 row above). Rewire into `Round._on_sig` when the retired methods are struck. |
+| endorsers refuse a slice containing a past-`w_valid` transaction | Combined enforcement (#endorser-refuses-stale): (1) `Mempool.admit` rejects past-`w_valid` at the door; (2) `Round._compute_slice` restricts to `_local_bodies` (sign only what we admitted); (3) `Round._abandon` bails at `close_by + w_valid_margin` and hands every held tx back to the current mempool via `Coordinator._on_abandoned`, where the same door refuses anything aged out. Three cited sites, one property, no per-tx staleness check. Tested by `TestAbandonmentOnTimeout`. |
+| Round carries bodies, not just hashes, for its held transactions | `Round.add_local` takes `Iterable[SignedTransaction]`; `Round._local_bodies: dict[Digest, SignedTransaction] \| None`; `Round.slice_bodies` and `Round.surviving` return `tuple[SignedTransaction, ...]` so the Coordinator receives bodies at ratification without a Mempool sidecar. Enforces the possession invariant at the Round's input rather than by convention. |
+| a Round that cannot form quorum abandons rather than hangs | `Round.State.ABANDONED`; `Round._abandon` fires from `tick` when `abandon_by` passes in state FINALIZE; `Coordinator._on_abandoned` re-admits every held tx via `mempool.admit`. Tested by `TestAbandonmentOnTimeout`. |
 | an equivocating peer's contradiction is preserved as evidence past GONE | `Round._on_sig` (detects equivocation before dropping on `GONE`); `Round.equivocations()` for the observability layer |
 | the running Node uses `Round` for consensus | `dude.coordinator.Coordinator` — `Node.tick` calls `Coordinator.tick`, which opens Rounds at bucket boundaries, drives them, hands ratified Blocks to `Store.apply`, and pushes surviving hashes back to the current Mempool through the same admission door. |
 | **block-shaped ratification via `Coordinator._settle`** | `dude.round.Block` is the ratified shape; `Coordinator._settle` looks up bodies from the frozen Mempool and passes them as an ordered tuple to `Store.apply`. Block metadata (bucket, signers, sigs) is not yet persisted — the log records transactions per-entry, not blocks-as-entries. Moves into L5 settlement (SPECv2 #block-shape-settled). |
+
+### L5 settlement
+
+| requirement | enforced by |
+|---|---|
+| ratified is not settled (#ratified-is-not-settled) | `SettleRound` state machine — `SettleState.COLLECTING → SETTLED` distinct from `Round.State.COLLECT/FINALIZE/GONE/ABANDONED`; `Coordinator._on_ratified` enqueues to `pending` rather than committing |
+| deterministic application per-tx (#deterministic-application-per-tx) | `settle.apply_to` (one evaluator, one order); `Store.commit_block` uses the same evaluator; `_Settling.applied` is the ordered tuple |
+| non-applying txs re-enter current mempool (#fall-through-through-the-door) | `Coordinator._on_settled` — `s.surviving` and `s.dropped` are re-admitted via `self.mempool.admit` through the one door |
+| settlement signs the post-apply anchors (#settlement-signs-post-anchors) | `SettleSig.sign(kp, slice_hash, anchors)` — sig covers `(_ANCHORS_DOMAIN, slice_hash, block_num, height, prev_block, state_root, acc_state, acc_log)` |
+| settlement converges by quorum on anchors (#settlement-quorum-on-anchors) | `SettleRound._try_settle` — quorum of matching `SettleSig` messages agreeing on our anchors |
+| peer divergent anchors are evidence (#settlement-peer-divergence-is-evidence) | `SettleRound._divergences` accumulator; `SettleRound.divergences()` accessor |
+| our own state disagreeing is InvariantError (#settlement-self-divergence-is-invariant) | `Coordinator._on_settled` calls `_expect_anchors` which raises `InvariantError` on any mismatch of head / state_root / A_state / A_log |
+| Coordinator filters already-settled before preview (#already-settled-filtering) | `Coordinator._start_settling` — `store._settled_hashes(...)` drops slice txs already in the log before feeding `settle.apply_to` |
+| fall-through re-admission re-broadcasts (#fall-through-re-broadcasts) | `Coordinator._on_settled` and `_on_abandoned` call `self.reflood(tx, now)` for every re-admitted tx (Node wires it to `lambda tx, now: self._flood(Verb.SUBMIT, tx.raw, now)`) |
+| every ratified bucket runs settlement, even empty (#empty-bucket-still-settles) | `SettleRound` accepts empty slice (empty `hashes` tuple); `Coordinator._start_settling` promotes empty ratifications unchanged; `Anchors.block_num` increments regardless |
+| settlement does not cross Mempool (#settlement-does-not-cross-mempool) | **structural** — `dude/consensus/settle_round.py` imports neither `Mempool` nor `Coordinator`; enforced by CI review |
+| settlement may hang (#settlement-may-hang) | **deferred** — no timeout on `SettleRound.COLLECTING`; the operational shape is to detect via observability and act by roster change, not by state-machine timeout |
+| block shape is SETTLED (#block-shape-settled) | `SettledBlock` dataclass; `SettledBlock.block_hash` computed over `_identity_bytes()` only (identity/proof split, sig-independent) |
+| empty blocks still increment block_num (#block-num-is-monotone) | `Coordinator._start_settling` computes `block_num = (store.head_block_num() or 0) + 1` unconditionally; covered by `Anchors.block_num` in every SettleSig |
+| manager signature overrides quorum (#manager-sig-overrides-quorum) | `Management.authorization` — `[*roster, anchor]` composition; bitmap slot `n − 1` reserved for manager; `SettledBlock.sign_by_manager`; `bootstrap()` uses it for block 1 |
+| chain roots at anchor identity (#genesis-stamp-anchors-the-chain) | `genesis_stamp(manager) = crypto.h("dude.genesis:" ‖ manager.bytes)`; Follower and Coordinator use it as `prev_block` when `head_block_hash() is None` |
+
+### L6 sync
+
+| requirement | enforced by |
+|---|---|
+| joiner starts from anchor alone (#joiner-starts-from-anchor) | `Store.provision(manager)` seeds a bare store; `bootstrap()` produces block 1 with manager sig; `test_fresh_joiner_pulls_block_1_via_manager_sig` end-to-end |
+| no trusted frontier (#no-trusted-frontier) | `Follower._on_settled_block` runs the full verify pipeline on every pulled block — no whitelist, no "trust this height" shortcut |
+| sync is log replay (#sync-is-log-replay) | `Follower._on_settled_block` — chain link + settle_sigs + body-block correspondence + body sigs + preview-anchors-match, then `store.commit_block` |
+| per-tx authority at replay (#per-tx-authority-verified-at-replay) | `Follower._preview_matches_signed_anchors` → `settle.apply_to` → `Management.may_write` — same evaluator/authoriser as production |
+| routine height polling is the trigger (#height-poll-is-the-trigger) | `Follower.tick` iterates `_poll_at`, emits `HeightAsk`; `Follower.caught_up()` requires f+1 fresh witnesses at `(my_num, my_tip)` |
+| same-height mismatched tip = divergence (#poll-detects-divergent-tips) | `Follower._on_height_reply` — `my_tip is not None and block_num == my_num and tip_hash != my_tip` → `_bad_sources.add(from_)` |
+| height is a hint, never a floor (#height-is-a-hint) | `HeightReply` is unsigned at message layer; verified only by the full GETBLOCK pull; `_bad_sources` catches liars at chain-link check |
+| GETBLOCK refuses with reason (#getblock-refuses-with-reason) | `SyncRefusal` closed enum (`NOT_YET_SETTLED`, `UNKNOWN`, `INVALID`); `Refused` message; `serve_getblock` returns typed refusals |
+| sync in its own module (#sync-in-its-own-module) | **structural** — `dude/sync/` package; Coordinator and Follower share only `Store`; neither imports the other |
+| roster walks forward with the log (#roster-walks-forward) | Follower applies blocks in `block_num` order via `commit_block`; roster is read via `Management(store).roster()` on demand, so it grows with the log naturally |
+| SMT is not part of sync (#smt-for-light-clients) | **deferred** — sync ships bodies, not SMT proofs; light-client path is a post-M7 arc |
+| sync test shape (#sync-test-shape) | `dude/tests/test_sync.py` direct-wired `Follower` scenarios (6 test classes); `dude/tests/test_sync_e2e.py` full-stack |
+| sync safety vs full BFT (#sync-safety-vs-full-bft) | **deferred** — persistence of `_bad_sources` and cross-attestation retention are noted future arcs; `_bad_sources` is in-memory today |
 
 ### Transport
 

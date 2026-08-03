@@ -31,7 +31,7 @@ from .core.errors import DudeError
 from .core.units import Millis
 from .net import Verb
 from .net.address import Endpoint
-from .net.envelope import Envelope, Frame, MessageId, SignedEnvelope, new_message_id
+from .net.envelope import Envelope, Frame, SignedEnvelope, new_message_id
 from .net.link import Peer, Transport
 from .net.postman import Postman
 from .net.transports import address_of

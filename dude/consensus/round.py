@@ -33,6 +33,7 @@ from ..core.errors import DudeError
 from ..core.units import Millis
 from ..net.envelope import Verb
 from ..net.postman import Recipient, Target
+from ..store.ops import SignedTransaction
 from .mempool import Bucket
 
 _SLICE_DOMAIN = b"dude.round.slice"
@@ -251,15 +252,24 @@ def _slice_hash(
 
 
 class State(Enum):
-    """The three states of a Round's lifecycle (#round-lifecycle).
+    """The four states of a Round's lifecycle (#round-lifecycle).
 
-    A Round transitions COLLECT -> FINALIZE exactly once (when local holdings are handed over),
-    and FINALIZE -> GONE exactly once (when a quorum signs the same slice). No other transitions
-    exist; a Round cannot regress."""
+    A Round transitions COLLECT -> FINALIZE exactly once (when local holdings are handed over).
+    From FINALIZE it takes ONE of two exits:
+      * FINALIZE -> GONE when a quorum signs the same slice (ratification, terminal-success).
+      * FINALIZE -> ABANDONED when `abandon_by` passes without ratification (terminal-timeout).
+
+    ABANDONED is what saves the "silence is refusal" property from turning into an indefinite
+    hang. If quorum cannot form -- because peers hold divergent evidence, or a minority is
+    silent, or the network is bad -- the Round gives up. `surviving()` then returns every body
+    the node held for this bucket, and the Coordinator re-admits them through the current-
+    mempool door where anything past `w_valid` is refused for free (#endorser-refuses-stale).
+    A Round cannot regress: once in GONE or ABANDONED, it never leaves."""
 
     COLLECT = auto()
     FINALIZE = auto()
     GONE = auto()
+    ABANDONED = auto()
 
 
 class Round:
@@ -274,13 +284,14 @@ class Round:
     rather than raising, because a stray message is a routine outcome under gossip and reordering.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913, PLR0917 -- cadence + identity are all required, no defaults
         self,
         bucket: Bucket,
         me: crypto.Keypair,
         roster: tuple[crypto.PublicKey, ...],
         now: Millis,
         close_by: Millis,
+        abandon_by: Millis,
     ) -> None:
         """Construct a Round for `bucket`.
 
@@ -291,16 +302,29 @@ class Round:
         quorum size, the signer-bitmap width, and who Round will accept `Sig` messages from.
         Round does NOT own how the roster is chosen -- that is management state (L2).
 
+        `close_by` and `abandon_by` are the two cadence deadlines and BOTH are required. There
+        is no "no timeout" mode -- an indefinite-hang Round would defeat #endorser-refuses-stale
+        (see the state docstring) and turn every stuck round into a permanent hazard.
+
         `close_by` is the wall time at which collection ends and finalize begins. It is a
         parameter rather than a mode change signalled later, so tests hand it in as data and the
         Coordinator computes it from the bucket boundary + propagation margin. Every node in the
         cluster is expected to be given roughly the same `close_by` -- honest clock skew is
         absorbed by the propagation margin, and if two nodes finalize at slightly different times
-        they still compute the same slice because their evidence has stopped changing."""
+        they still compute the same slice because their evidence has stopped changing.
+
+        `abandon_by` is the wall time past which, if we are still in FINALIZE, we transition
+        to ABANDONED and hand every held tx back to the current mempool for re-admission
+        through the one door. Coordinator derives it from the mempool's `w_valid_margin` so
+        no honest node ever signs (or is still trying to sign) an aged-out slice; tests can
+        set it to whatever cadence they're exercising. Must be strictly greater than
+        `close_by`."""
         if me.public not in roster:
             raise RoundError("my public key is not in the roster")
         if close_by <= now:
             raise RoundError(f"close_by={close_by} is not in the future (now={now})")
+        if abandon_by <= close_by:
+            raise RoundError(f"abandon_by={abandon_by} must be > close_by={close_by}")
         self._bucket = bucket
         self._me = me
         self._roster = roster
@@ -308,37 +332,54 @@ class Round:
         self._state = State.COLLECT
         self._now = now
         self._close_by = close_by
-        self._local: frozenset[crypto.Digest] | None = None
+        self._abandon_by: Millis = abandon_by
+        self._local_bodies: dict[crypto.Digest, SignedTransaction] | None = None
+        """Bodies for the txs this node holds for this bucket -- indexed by op_hash. The dict
+        arriving via `add_local` is what makes possession structural: Round cannot advance out
+        of COLLECT without bodies in hand, so a slice we later sign is by construction backed
+        by transactions we can produce for settlement (#slice-is-intersection)."""
         self._peer_holds: dict[crypto.PublicKey, frozenset[crypto.Digest]] = {}
         self._peer_sigs: dict[crypto.PublicKey, Sig] = {}
         self._my_sig: Sig | None = None
         self._equivocations: list[tuple[crypto.PublicKey, Sig, Sig]] = []
         self._ratified: Block | None = None
-        self._surviving: tuple[crypto.Digest, ...] = ()
+        self._slice_bodies: tuple[SignedTransaction, ...] = ()
+        """Bodies for the ratified slice, in canonical (sorted-hash) order. Populated in
+        `_finalize` alongside `_ratified` so the Coordinator receives bodies + Block as one
+        pair on ratification -- no post-hoc Mempool lookup."""
+        self._surviving: tuple[SignedTransaction, ...] = ()
+        """Bodies for txs we held but did NOT include in the ratified slice. The Coordinator
+        re-admits these through the current-mempool door (#fall-through-through-the-door)."""
         self._outbox: list[tuple[Target, RoundMsg]] = []
         self._pending_slice_hashes: frozenset[crypto.Digest] = frozenset()
 
     # -- inputs ------------------------------------------------------------------------------- #
 
-    def add_local(self, hashes: frozenset[crypto.Digest]) -> None:
-        """The Mempool has closed and hands over what this node held for this bucket.
+    def add_local(self, bodies: Iterable[SignedTransaction]) -> None:
+        """The Mempool has closed and hands over the transactions this node held for this bucket.
 
         MUST be called exactly once, and MUST be called before Round can transition out of
         COLLECT. Calling twice raises `RoundError` -- the local holdings are what they are,
         and any "second thought" is a bug.
 
+        `bodies` is an iterable of SignedTransactions -- **not just hashes**. Round stores the
+        bodies (indexed by `op_hash`) so possession is structural: a slice this node signs is
+        by construction backed by transactions we can produce for settlement. Sans-body hashes
+        cannot enter here, so the "sign only what we hold" invariant (#slice-is-intersection)
+        is impossible to bypass at this seam.
+
         This is the ONLY input that determines this node's initial contribution; further changes
         to this node's holdings (a late tx admitted after bucket close) are not this Round's
         concern -- they go to the next Round via Mempool re-admission (#rejects-through-same-door).
         """
-        if self._local is not None:
+        if self._local_bodies is not None:
             raise RoundError("add_local called twice; local holdings are set once")
         if self._state is not State.COLLECT:
             raise RoundError(f"add_local in state {self._state.name}; expected COLLECT")
-        self._local = hashes
+        self._local_bodies = {tx.op_hash: tx for tx in bodies}
         # Advertise what I hold. Peers combine my Held with theirs to compute the same slice I
         # will compute; convergence is by shared observation, not by delegation.
-        self._outbox.append((Recipient.ALL, Held(self._bucket, hashes)))
+        self._outbox.append((Recipient.ALL, Held(self._bucket, frozenset(self._local_bodies))))
 
     def receive(self, msg: RoundMsg, from_: crypto.PublicKey, now: Millis) -> None:
         """A message arrived from a peer. VERIFY, THEN INCORPORATE OR DROP.
@@ -421,7 +462,7 @@ class Round:
         self._try_ratify()
 
     def tick(self, now: Millis) -> None:
-        """Advance time. May transition state, may emit messages, may ratify.
+        """Advance time. May transition state, may emit messages, may ratify, may abandon.
 
         `now` is monotone by contract; a tick with `now` less than the last observed time raises
         `RoundError`. Round has no other clock."""
@@ -432,8 +473,19 @@ class Round:
         # sign whatever holdings we have observed. This is the load-bearing property for
         # convergence -- if nodes finalized on quorum-many holdings instead, different nodes
         # would sign based on different observation orders and their sigs would not match.
-        if self._state is State.COLLECT and self._local is not None and now >= self._close_by:
+        if (
+            self._state is State.COLLECT
+            and self._local_bodies is not None
+            and now >= self._close_by
+        ):
             self._finalize()
+        # Time-driven abandonment (#endorser-refuses-stale). If we're still stuck in FINALIZE
+        # past the abandon deadline, quorum failed to form -- either honest silence (peers held
+        # divergent evidence), a stale-tx refusal from a majority, or a network fault. Give up
+        # and let the current mempool re-admit our txs through its one door; anything past
+        # w_valid will refuse itself for free.
+        if self._state is State.FINALIZE and now >= self._abandon_by:
+            self._abandon()
 
     # -- outputs ------------------------------------------------------------------------------ #
 
@@ -455,19 +507,41 @@ class Round:
         Once non-None, stable for the remainder of the Round's life. When non-None, Round is in
         state GONE and no further processing occurs on `receive` or `tick`.
 
-        `surviving()` is meaningful only after this returns non-None."""
+        `slice_bodies()` is meaningful only after this returns non-None. `surviving()` is
+        meaningful in either terminal state (GONE or ABANDONED)."""
         return self._ratified
 
-    def surviving(self) -> Iterable[crypto.Digest]:
-        """Transaction hashes this node held but that did not make the ratified slice.
+    def abandoned(self) -> bool:
+        """True iff the Round gave up before ratifying (state is ABANDONED). Terminal; once
+        True, stable. Coordinator polls this alongside `ratified()` to route: on `abandoned()`,
+        every body in `surviving()` re-enters the current mempool via its one door, and any
+        that's now past `w_valid` is refused there for free (#endorser-refuses-stale)."""
+        return self._state is State.ABANDONED
 
-        Available only when `ratified()` is non-None; calling before raises `RoundError`.
-        The Coordinator hands these back to the current-collecting Mempool via its one
-        admission door -- some may re-enter, some may be rejected against the newly-updated
-        state, and both outcomes are correct (#rejects-through-same-door)."""
-        if self._ratified is None:
-            raise RoundError("surviving() called before ratified()")
+    def surviving(self) -> tuple[SignedTransaction, ...]:
+        """Transactions this node held but that did not make the ratified slice.
+
+        Available in either terminal state:
+          * On GONE (ratified): the fall-through -- txs held but not in the slice. Some may
+            re-enter the current mempool, some may be rejected against the newly-updated state,
+            and both outcomes are correct (#rejects-through-same-door).
+          * On ABANDONED: every tx we held for this bucket -- nothing settled, so everything
+            re-enters through the same door and anything past `w_valid` is refused there.
+
+        Calling in a non-terminal state raises `RoundError`. Bodies, not hashes: possession is
+        what makes re-admission useful."""
+        if self._state not in (State.GONE, State.ABANDONED):
+            raise RoundError(f"surviving() called in state {self._state.name}")
         return self._surviving
+
+    def slice_bodies(self) -> tuple[SignedTransaction, ...]:
+        """Bodies for the ratified slice, in canonical (sorted-hash) order. The tuple the
+        Coordinator hands straight to `settle.apply_to` for the L5 preview -- no lookup, no
+        Mempool reference. Available only when `ratified()` is non-None; calling before
+        raises `RoundError`."""
+        if self._ratified is None:
+            raise RoundError("slice_bodies() called before ratified()")
+        return self._slice_bodies
 
     def equivocations(self) -> Iterable[tuple[crypto.PublicKey, Sig, Sig]]:
         """Pairs of `Sig` messages from one peer that name different slices for this bucket.
@@ -490,8 +564,8 @@ class Round:
 
         Includes the local set only after `add_local` has been called."""
         got: dict[crypto.PublicKey, frozenset[crypto.Digest]] = dict(self._peer_holds)
-        if self._local is not None:
-            got[self._me.public] = self._local
+        if self._local_bodies is not None:
+            got[self._me.public] = frozenset(self._local_bodies)
         return got
 
     def _compute_slice(self, local: frozenset[crypto.Digest]) -> frozenset[crypto.Digest]:
@@ -547,18 +621,25 @@ class Round:
         """Called by `tick` when `close_by` has passed. Compute the slice from whatever holdings
         we have accumulated, sign it, transition to FINALIZE.
 
-        Precondition (checked by caller): `state is COLLECT` and `local is not None`. Late-
-        arriving Helds after this point still update `peer_holds`, but do not change the slice
-        this node signed -- convergence rests on all nodes signing based on their observed
-        evidence AT CLOSE_BY, not on continually revising."""
-        local = self._local
-        if local is None:  # unreachable given tick's guard, but the narrower makes ty happy
+        Precondition (checked by caller): `state is COLLECT` and `_local_bodies is not None`.
+        Late-arriving Helds after this point still update `peer_holds`, but do not change the
+        slice this node signed -- convergence rests on all nodes signing based on their
+        observed evidence AT CLOSE_BY, not on continually revising."""
+        bodies = self._local_bodies
+        if bodies is None:  # unreachable given tick's guard, but the narrower makes ty happy
             return
-        slice_hashes = self._compute_slice(local)
+        local_hashes = frozenset(bodies)
+        slice_hashes = self._compute_slice(local_hashes)
         my_sig = Sig.sign(self._me, self._bucket, _slice_hash(self._bucket, slice_hashes))
         self._my_sig = my_sig
         self._peer_sigs[self._me.public] = my_sig  # my own vote counts toward my own ratification
-        self._surviving = tuple(sorted(h for h in local if h not in slice_hashes))
+        # `_slice_bodies` is the ordered bodies for the slice, in canonical (sorted-hash) order
+        # -- what Coordinator hands straight to `settle.apply_to`. `_surviving` is the bodies
+        # for the leftover, what re-enters the current mempool via
+        # #fall-through-through-the-door. Both set at finalize regardless of whether we go on
+        # to ratify -- the accessors guard on `_ratified is not None`.
+        self._slice_bodies = tuple(bodies[h] for h in sorted(slice_hashes))
+        self._surviving = tuple(bodies[h] for h in sorted(bodies) if h not in slice_hashes)
         self._pending_slice_hashes = slice_hashes
         self._state = State.FINALIZE
         self._outbox.append((Recipient.ALL, my_sig))
@@ -585,3 +666,18 @@ class Round:
             sigs=tuple(sigs),
         )
         self._state = State.GONE
+
+    def _abandon(self) -> None:
+        """Called by `tick` when `abandon_by` has passed while still in FINALIZE. Every held
+        body becomes `_surviving`, transition to ABANDONED. Coordinator re-admits everything
+        via the current-mempool door on the next drain cycle (#endorser-refuses-stale).
+
+        Precondition (checked by caller): `state is FINALIZE`. `_local_bodies` is non-None
+        because FINALIZE is only reached from COLLECT via `_finalize`, which requires it."""
+        bodies = self._local_bodies
+        if bodies is None:  # unreachable given state, narrower for ty
+            return
+        # Overwrite `_surviving` from the partial (non-slice-only) view set in `_finalize`:
+        # nothing settled, so every body we held is unresolved and re-enters the door.
+        self._surviving = tuple(bodies[h] for h in sorted(bodies))
+        self._state = State.ABANDONED

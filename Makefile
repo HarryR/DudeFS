@@ -71,11 +71,13 @@ typecheck:
 test:
 	"$(PY)" -m unittest discover -s $(SRC)/tests -t .
 
-# Coverage, reported without a --fail-under floor for now: a ratchet against a number nobody has
-# measured on THIS tree would be a number pretending to be a gate. Set one once it means something.
+# Coverage with a 90% floor. Current tree measures 93% (2026-08-03); 90 is a floor a hair below
+# actual, so a temporary in-progress dip does not fail the gate. The CI step name has always
+# claimed this ratchet; before today it was cosmetic (the Makefile ran no floor) and the step
+# passed at any coverage. The number is real now -- raise it as coverage climbs.
 coverage:
 	"$(PY)" -m coverage run --source=$(SRC) -m unittest discover -s $(SRC)/tests -t .
-	"$(PY)" -m coverage report -m
+	"$(PY)" -m coverage report -m --fail-under=90
 
 # CI-style gate: no writes, fails on any issue.
 check: lint format-check typecheck test
