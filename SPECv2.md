@@ -482,13 +482,44 @@ via the same one door as any other submission.
   for a slice cannot back that slice at settlement — so the possession invariant is structural
   at the Round's input, not a passing convention.
 
+### The pipeline has three stages, one instance each {#one-of-each-in-flight}
+
+At any moment the cluster's L3/L4/L5 pipeline holds AT MOST three things (#one-of-each-in-flight):
+
+  1. **One Mempool** — the current bucket's admission window (accepting txs).
+  2. **One Round** — the previous bucket's slice-agreement in progress.
+  3. **One SettleRound** — the bucket before that's anchor-agreement in progress.
+
+Each stage takes one bucket width (`delta`) as its cadence budget. The pipeline advances one
+stage per bucket boundary:
+
+  - Mempool(W) closes → its bodies feed a new Round(W).
+  - Round(W-1) reached ratification → its Block promotes into a new SettleRound(W-1).
+  - SettleRound(W-2) reached SETTLED → commit; or ABANDONED → fall-through
+    (#fall-through-through-the-door).
+
+**No queue.** There is never more than one Round in flight and never more than one SettleRound
+in flight. If a stage did not complete in its bucket window, it ABANDONS on cadence -- its
+tx set re-enters the mempool via the one door. The abandoning stage's slot frees, and the
+next bucket's promotion can happen. A queue between stages would let a slow stage build up
+work behind it; the abandon-on-cadence discipline is what turns that risk into bounded loss
+(one bucket's worth of ratification/settlement work re-attempted, not an unbounded backlog).
+
+**Admission never stops.** The one thing that keeps running regardless of pipeline health is
+Mempool admission -- the current bucket's door is always open, txs land in it as normal.
+Skipped Rounds (a Round couldn't open because the previous Round's Block is still waiting for
+the Settle slot to clear) don't lose the txs -- they collect in the mempool and the eventual
+next Round that opens gets them.
+
 ### Rounds pipeline {#pipelining}
 
-- A Round in `finalize` MUST NOT block the next `collect` window from opening. A slow round does
-  not stop admission.
-- Blocks settle in bucket order. If Round(W+1) reaches ratification before Round(W), its block
-  waits — position assignment is monotone, and admission depends on currently-settled state,
-  which requires deterministic block order.
+- A Round in `finalize` MUST NOT block the mempool from admitting for the next bucket. A slow
+  round does not stop admission (#one-of-each-in-flight). Round abandonment on cadence is what
+  keeps the next Round's opening from waiting indefinitely.
+- Blocks settle in bucket order. There is never more than one Round or one SettleRound in
+  flight at a time; block position (`block_num`) is assigned at `_start_settling` time from
+  the current `store.head_block_num()`, so an abandoned SettleRound does not consume a
+  `block_num` -- the next Round's Block re-attempts the same position.
 
 ### Exclusion is by selection during slice construction {#exclusion-by-selection}
 
@@ -703,9 +734,10 @@ change while the overlay is alive.
   computed from the stack.
 - When N SETTLES: `store.apply(slice_N)` commits. `layer_N` becomes semantically equivalent
   to base (delta folded down); `layer_N_plus_1` continues to read correctly through it.
-- If N never SETTLES (indefinite hang, deferred per #settlement-may-hang), `layer_N` stays
-  frozen and `layer_N_plus_1` continues to function as an overlay; nothing commits down
-  until the hang resolves.
+- If N abandons rather than SETTLES (SettleRound(N) hit `abandon_by` without quorum,
+  #settlement-may-hang), `layer_N`'s delta is discarded; the slice's txs re-enter the mempool
+  via fall-through; the next Round's Block re-attempts block position N. `layer_N_plus_1`
+  is discarded too (it was stacked on `layer_N`'s frozen state, which never lands).
 
 ## L5 — Settlement {#settlement-layer}
 
@@ -839,21 +871,24 @@ turns that into a SETTLED block.
   next bucket; using it to satisfy a lookup for the previous bucket would let a slice's contents
   drift under settlement's feet.
 
-### Settlement may hang; not solved here {#settlement-may-hang}
+### Settlement abandons on cadence {#settlement-may-hang}
 
-- A slice MAY be RATIFIED and never SETTLE: fewer than a quorum can produce matching post-apply
-  signatures (partial holdings on the ⊆-local edge cases, one node down at the wrong moment, a
-  transient partition during the exchange). The block stays in the RATIFIED-but-not-SETTLED state
-  indefinitely and the head does not advance.
-- A related failure mode observed while building Stage 3: once a node falls out of the
-  settlement quorum for even one block (its own SettleRound stays COLLECTING while peers reach
-  SETTLED among themselves), its Store diverges from the cluster's -- and no subsequent bucket's
-  settlement will help it recover. Peers refuse the diverged tx as a duplicate against their
-  log; the re-broadcast (#fall-through-re-broadcasts) keeps the tx local. That node is stuck
-  until L6 sync (#sync-is-log-replay) hands it the blocks it missed.
-- Both failure modes are known gaps in the tentative spec. A resolution mechanism is planned
-  but deliberately not written here -- get the settle-when-it-does-settle path rock-solid
-  first, then close the hang case surgically. L6 sync is the recovery half.
+- A SettleRound that has not reached a matching-anchor quorum by its `abandon_by` deadline
+  MUST transition to ABANDONED. The slice's txs re-enter the mempool via the one door
+  (#fall-through-through-the-door); no block commits; `block_num` is not consumed. The next
+  Round's Block re-attempts the same block position on the next cycle
+  (#one-of-each-in-flight).
+- `abandon_by` is one bucket width (`delta`) after the SettleRound starts, so the abandonment
+  beat aligns with the pipeline cadence. If the SettleRound was going to succeed, it would
+  have by then; if it did not, further waiting only stalls the pipeline.
+- The related "one node falls out of the settlement quorum while peers settle without it"
+  failure mode is recovered via L6 sync (#sync-is-log-replay). The stragglers pull the
+  SETTLED block from a peer that did settle it, chain-verify, and continue -- the local
+  SettleRound they had going for that block position is abandoned by cadence and its txs
+  re-enter their mempool (mostly duplicates against the just-synced block, refused for free
+  via the `_settled_hashes` check).
+- Both cases -- cluster-wide hang and one-node-fell-behind -- resolve via the same
+  abandon-then-retry-or-sync loop. No new mechanism.
 
 ### The block is the SETTLED thing {#block-shape-settled}
 
@@ -1514,7 +1549,8 @@ visible rather than plausible.
 | fall-through re-admission re-broadcasts (#fall-through-re-broadcasts) | `Coordinator._on_settled` and `_on_abandoned` call `self.reflood(tx, now)` for every re-admitted tx (Node wires it to `lambda tx, now: self._flood(Verb.SUBMIT, tx.raw, now)`) |
 | every ratified bucket runs settlement, even empty (#empty-bucket-still-settles) | `SettleRound` accepts empty slice (empty `hashes` tuple); `Coordinator._start_settling` promotes empty ratifications unchanged; `Anchors.block_num` increments regardless |
 | settlement does not cross Mempool (#settlement-does-not-cross-mempool) | **structural** — `dude/consensus/settle_round.py` imports neither `Mempool` nor `Coordinator`; enforced by CI review |
-| settlement may hang (#settlement-may-hang) | **deferred** — no timeout on `SettleRound.COLLECTING`; the operational shape is to detect via observability and act by roster change, not by state-machine timeout |
+| settlement abandons on cadence (#settlement-may-hang) | `SettleRound.abandon_by` (required constructor arg) + `tick()` transitions COLLECTING → ABANDONED when `now >= abandon_by`; `Coordinator._on_settle_abandoned` re-admits `applied + dropped + surviving` via mempool door and clears the settling slot |
+| pipeline holds one of each in flight (#one-of-each-in-flight) | `Coordinator` state: `mempool: Mempool`, `current_round: Round \| None`, `settling: _Settling \| None`. No queue between stages -- if Round ratifies while settling is busy, `current_round` holds the ratified Round until the next tick clears settling and `_promote_to_settling` fires; if settling is busy AND bucket boundary crosses, next Round doesn't open (mempool keeps admitting for the current bucket) |
 | block shape is SETTLED (#block-shape-settled) | `SettledBlock` dataclass; `SettledBlock.block_hash` computed over `_identity_bytes()` only (identity/proof split, sig-independent) |
 | empty blocks still increment block_num (#block-num-is-monotone) | `Coordinator._start_settling` computes `block_num = (store.head_block_num() or 0) + 1` unconditionally; covered by `Anchors.block_num` in every SettleSig |
 | manager signature overrides quorum (#manager-sig-overrides-quorum) | `Management.authorization` — `[*roster, anchor]` composition; bitmap slot `n − 1` reserved for manager; `SettledBlock.sign_by_manager`; `bootstrap()` uses it for block 1 |

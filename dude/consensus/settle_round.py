@@ -353,7 +353,7 @@ def genesis_stamp(manager: crypto.PublicKey) -> crypto.Digest:
 
 
 class SettleState(Enum):
-    """Two states, one direction (#ratified-is-not-settled).
+    """Three states, one direction (#ratified-is-not-settled + #one-of-each-in-flight).
 
     Ordinal 0 is INVALID by convention (#no-exceptions-for-control-flow), so a Go port's
     zero-valued struct field lands on a named invalid rather than on a real state."""
@@ -363,6 +363,11 @@ class SettleState(Enum):
     """Awaiting peer SettleSigs. Own sig is already in the outbox."""
     SETTLED = auto()
     """A quorum of matching sigs converged; `settled()` returns the SettledBlock."""
+    ABANDONED = auto()
+    """`abandon_by` passed without quorum. Terminal; `settled()` stays None. Coordinator
+    re-admits the slice txs through the mempool via #fall-through-through-the-door.
+    Distinguishing "hung indefinitely" from "we tried and it didn't come together" is what
+    keeps the pipeline moving (#one-of-each-in-flight)."""
 
 
 class SettleRound:
@@ -373,14 +378,19 @@ class SettleRound:
     convergence transitions to SETTLED; `settled()` yields the block for the Coordinator to
     commit."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0913, PLR0917 -- construction inputs, all required
         self,
         block: Block,
         me: crypto.Keypair,
         roster: tuple[crypto.PublicKey, ...],
         anchors: Anchors,
-        now: Millis,  # noqa: ARG002 -- reserved for hang-detection when #settlement-may-hang lands
+        now: Millis,  # noqa: ARG002 -- reserved for telemetry
+        abandon_by: Millis,
     ):
+        """`abandon_by` is the wall time past which, if still COLLECTING, we transition to
+        ABANDONED. Coordinator derives it from the bucket cadence (`_start_settling` time
+        + delta), so the pipeline advances one stage per bucket boundary with no queue
+        (#one-of-each-in-flight). Same discipline as `Round.abandon_by`."""
         if me.public not in roster:
             raise SettleError(f"me ({me.public.hex()[:8]}) is not in the roster")
         self._block = block
@@ -389,6 +399,7 @@ class SettleRound:
         self._quorum = quorum.size(len(roster))
         self._anchors = anchors
         self._slice_hash = block.slice_hash
+        self._abandon_by = abandon_by
         # Pre-verified sigs, keyed by signer. Only sigs whose anchors match ours land here.
         self._sigs: dict[crypto.PublicKey, crypto.Signature] = {}
         # Peer sigs whose anchors did NOT match. Kept for observability, never counted.
@@ -448,8 +459,11 @@ class SettleRound:
         self._outbox.clear()
         return drained
 
-    def tick(self, _now: Millis) -> None:
-        """No-op today. Hang detection lands with #settlement-may-hang."""
+    def tick(self, now: Millis) -> None:
+        """Advance time. If still COLLECTING at or past `abandon_by`, transition to ABANDONED
+        (#one-of-each-in-flight + #settlement-may-hang). Terminal; no further state changes."""
+        if self._state is SettleState.COLLECTING and now >= self._abandon_by:
+            self._state = SettleState.ABANDONED
 
     # -- terminal ---------------------------------------------------------------------------- #
 
@@ -459,6 +473,13 @@ class SettleRound:
     def settled(self) -> SettledBlock | None:
         """The settled block once a quorum has converged, else None."""
         return self._settled
+
+    def abandoned(self) -> bool:
+        """True iff `abandon_by` passed without a quorum forming. Terminal; once True, stable.
+        Coordinator polls this alongside `settled()` to route: on `abandoned()`, the slice
+        txs re-enter the mempool via #fall-through-through-the-door, and the settling slot
+        clears so the next Round's Block can promote (#one-of-each-in-flight)."""
+        return self._state is SettleState.ABANDONED
 
     def divergences(self) -> tuple[tuple[crypto.PublicKey, Anchors], ...]:
         """Peer SettleSigs whose anchors disagreed with ours. Evidence for the observability

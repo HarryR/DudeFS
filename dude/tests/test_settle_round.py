@@ -25,6 +25,10 @@ from dude.net.postman import Recipient
 
 T0 = 1_700_000_000_000
 DELTA = 1_000
+ABANDON_BY = T0 + 1_000 * DELTA
+"""SettleRound abandonment deadline for the scenario suite. Far past every test's runtime so
+no test's SettleRound times out incidentally. Abandonment behaviour has its own dedicated
+test class that sets a shorter value on purpose."""
 
 
 def _wire(nodes: dict[crypto.PublicKey, SettleRound], now: int) -> None:
@@ -72,7 +76,7 @@ def _setup(
     roster = tuple(k.public for k in keys)
     b = block if block is not None else _block()
     a = anchors if anchors is not None else _anchors()
-    rounds = {k.public: SettleRound(b, k, roster, a, T0) for k in keys}
+    rounds = {k.public: SettleRound(b, k, roster, a, T0, ABANDON_BY) for k in keys}
     return keys, rounds
 
 
@@ -153,9 +157,9 @@ class TestDivergenceIsEvidenceNotCrash(unittest.TestCase):
         divergent = _anchors(root_seed=b"divergent")
 
         # Nodes 0 and 1 sign honest; node 2 signs divergent
-        r0 = SettleRound(block, keys[0], roster, honest, T0)
-        r1 = SettleRound(block, keys[1], roster, honest, T0)
-        r2 = SettleRound(block, keys[2], roster, divergent, T0)
+        r0 = SettleRound(block, keys[0], roster, honest, T0, ABANDON_BY)
+        r1 = SettleRound(block, keys[1], roster, honest, T0, ABANDON_BY)
+        r2 = SettleRound(block, keys[2], roster, divergent, T0, ABANDON_BY)
         nodes = {keys[0].public: r0, keys[1].public: r1, keys[2].public: r2}
 
         _run(nodes)
@@ -177,9 +181,9 @@ class TestDivergenceIsEvidenceNotCrash(unittest.TestCase):
         keys = [crypto.Keypair.generate() for _ in range(3)]
         roster = tuple(k.public for k in keys)
         block = _block()
-        r0 = SettleRound(block, keys[0], roster, _anchors(root_seed=b"honest"), T0)
-        r1 = SettleRound(block, keys[1], roster, _anchors(root_seed=b"honest"), T0)
-        r2 = SettleRound(block, keys[2], roster, _anchors(root_seed=b"divergent"), T0)
+        r0 = SettleRound(block, keys[0], roster, _anchors(root_seed=b"honest"), T0, ABANDON_BY)
+        r1 = SettleRound(block, keys[1], roster, _anchors(root_seed=b"honest"), T0, ABANDON_BY)
+        r2 = SettleRound(block, keys[2], roster, _anchors(root_seed=b"divergent"), T0, ABANDON_BY)
         nodes = {keys[0].public: r0, keys[1].public: r1, keys[2].public: r2}
 
         _run(nodes)
@@ -198,9 +202,9 @@ class TestDivergenceIsEvidenceNotCrash(unittest.TestCase):
         keys = [crypto.Keypair.generate() for _ in range(3)]
         roster = tuple(k.public for k in keys)
         block = _block()
-        r0 = SettleRound(block, keys[0], roster, _anchors(root_seed=b"honest"), T0)
-        r1 = SettleRound(block, keys[1], roster, _anchors(root_seed=b"honest"), T0)
-        r2 = SettleRound(block, keys[2], roster, _anchors(root_seed=b"divergent"), T0)
+        r0 = SettleRound(block, keys[0], roster, _anchors(root_seed=b"honest"), T0, ABANDON_BY)
+        r1 = SettleRound(block, keys[1], roster, _anchors(root_seed=b"honest"), T0, ABANDON_BY)
+        r2 = SettleRound(block, keys[2], roster, _anchors(root_seed=b"divergent"), T0, ABANDON_BY)
         nodes = {keys[0].public: r0, keys[1].public: r1, keys[2].public: r2}
 
         _run(nodes)
@@ -226,7 +230,7 @@ class TestBadInputIsSilentlyDropped(unittest.TestCase):
         block = _block()
         anchors = _anchors()
 
-        target_round = SettleRound(block, keys[0], roster, anchors, T0)
+        target_round = SettleRound(block, keys[0], roster, anchors, T0, ABANDON_BY)
 
         # A SettleSig claiming to be from keys[1] with a bogus signature
         forged = SettleSig(
@@ -246,7 +250,7 @@ class TestBadInputIsSilentlyDropped(unittest.TestCase):
         our_block = _block(bucket=1)
         other_block = _block(bucket=99)  # different bucket -> different slice_hash
 
-        r0 = SettleRound(our_block, keys[0], roster, _anchors(), T0)
+        r0 = SettleRound(our_block, keys[0], roster, _anchors(), T0, ABANDON_BY)
 
         # Genuine sig, but over the OTHER block's slice_hash
         wrong = SettleSig.sign(keys[1], other_block.slice_hash, _anchors())
@@ -262,7 +266,7 @@ class TestBadInputIsSilentlyDropped(unittest.TestCase):
         block = _block()
         anchors = _anchors()
 
-        r0 = SettleRound(block, keys[0], roster, anchors, T0)
+        r0 = SettleRound(block, keys[0], roster, anchors, T0, ABANDON_BY)
 
         # A perfectly valid signature -- but from a key that is not in the roster.
         msg = SettleSig.sign(stranger, block.slice_hash, anchors)
@@ -276,7 +280,7 @@ class TestBadInputIsSilentlyDropped(unittest.TestCase):
         roster = tuple(k.public for k in keys)
         outsider = crypto.Keypair.generate()
         with self.assertRaises(SettleError):
-            SettleRound(_block(), outsider, roster, _anchors(), T0)
+            SettleRound(_block(), outsider, roster, _anchors(), T0, ABANDON_BY)
 
 
 # --------------------------------------------------------------------------------------------- #
@@ -324,8 +328,8 @@ class TestSettledBlockEncoding(unittest.TestCase):
         roster = tuple(k.public for k in keys)
         block = _block()
         anchors = _anchors(block_num=block_num, height=height)
-        r0 = SettleRound(block, keys[0], roster, anchors, T0)
-        r1 = SettleRound(block, keys[1], roster, anchors, T0)
+        r0 = SettleRound(block, keys[0], roster, anchors, T0, ABANDON_BY)
+        r1 = SettleRound(block, keys[1], roster, anchors, T0, ABANDON_BY)
         # Deliver r1's sig to r0 to reach the 2-of-3 quorum.
         for target, msg in r1.outbox():
             if target is Recipient.ALL or target == keys[0].public:
@@ -398,8 +402,8 @@ class TestChainLinkIsSigned(unittest.TestCase):
             acc_state=a_chain_x.acc_state,
             acc_log=a_chain_x.acc_log,
         )
-        r_x = SettleRound(block, keys[0], roster, a_chain_x, T0)
-        r_y = SettleRound(block, keys[1], roster, a_chain_y, T0)
+        r_x = SettleRound(block, keys[0], roster, a_chain_x, T0, ABANDON_BY)
+        r_y = SettleRound(block, keys[1], roster, a_chain_y, T0, ABANDON_BY)
         # Deliver each side's sig to the other. Both see divergent anchors and drop.
         for target, msg in r_y.outbox():
             if target is Recipient.ALL or target == keys[0].public:
@@ -438,6 +442,84 @@ class TestGenesisStamp(unittest.TestCase):
         special-case encoding at height 1 vs later heights."""
         stamp = genesis_stamp(crypto.Keypair.generate().public)
         self.assertEqual(len(stamp), 32)
+
+
+# --------------------------------------------------------------------------------------------- #
+# Abandonment on cadence (#one-of-each-in-flight + #settlement-may-hang).                       #
+# --------------------------------------------------------------------------------------------- #
+
+
+class TestSettleRoundAbandonOnTimeout(unittest.TestCase):
+    """A SettleRound that cannot reach quorum by `abandon_by` MUST transition to ABANDONED
+    rather than hang indefinitely. This is what keeps the pipeline moving -- Coordinator
+    frees the settling slot and the next Round's Block can promote."""
+
+    def test_isolated_settle_abandons_after_deadline(self):
+        """A single-node SettleRound (no peers to send sigs) at n=3 requires quorum of 2 --
+        can't reach with 1 sig. Ticking past abandon_by transitions it to ABANDONED."""
+        close_by = T0 + 3 * DELTA
+        abandon_by = T0 + 5 * DELTA
+        keys = [crypto.Keypair.generate() for _ in range(3)]
+        roster = tuple(k.public for k in keys)
+        block = _block()
+        anchors = _anchors()
+
+        # Only construct one SettleRound (isolated); no peer sigs will ever arrive.
+        r = SettleRound(block, keys[0], roster, anchors, T0, abandon_by)
+        self.assertEqual(r.state(), SettleState.COLLECTING)
+        self.assertFalse(r.abandoned())
+
+        # Tick before deadline: still COLLECTING.
+        r.tick(close_by)
+        self.assertEqual(r.state(), SettleState.COLLECTING)
+        self.assertFalse(r.abandoned())
+
+        # Tick past deadline: ABANDONED.
+        r.tick(abandon_by)
+        self.assertTrue(r.abandoned())
+        self.assertEqual(r.state(), SettleState.ABANDONED)
+        self.assertIsNone(r.settled())
+
+    def test_abandoned_is_terminal_no_late_settle(self):
+        """Once ABANDONED, further peer sigs arriving late MUST NOT flip the state back to
+        SETTLED. Abandonment is one-way."""
+        abandon_by = T0 + 5 * DELTA
+        keys = [crypto.Keypair.generate() for _ in range(3)]
+        roster = tuple(k.public for k in keys)
+        block = _block()
+        anchors = _anchors()
+
+        r0 = SettleRound(block, keys[0], roster, anchors, T0, abandon_by)
+        # Force abandonment.
+        r0.tick(abandon_by)
+        self.assertTrue(r0.abandoned())
+
+        # Peer sigs from nodes 1 and 2 arrive after abandonment. Would have been enough for
+        # quorum (2 with our own already-counted sig). Must NOT flip to SETTLED.
+        r1_sig = SettleSig.sign(keys[1], block.slice_hash, anchors)
+        r2_sig = SettleSig.sign(keys[2], block.slice_hash, anchors)
+        r0.receive(r1_sig, from_=keys[1].public, now=abandon_by + DELTA)
+        r0.receive(r2_sig, from_=keys[2].public, now=abandon_by + DELTA)
+
+        # State stays ABANDONED; settled() stays None.
+        self.assertTrue(r0.abandoned())
+        self.assertEqual(r0.state(), SettleState.ABANDONED)
+        self.assertIsNone(r0.settled())
+
+    def test_settled_before_deadline_does_not_abandon(self):
+        """If quorum forms BEFORE abandon_by, we're SETTLED -- ticking past abandon_by later
+        does NOT flip to ABANDONED (already terminal in SETTLED)."""
+        abandon_by = T0 + 5 * DELTA
+        _keys, nodes = _setup(3)
+        _run(nodes)
+        # Verify all settled first.
+        for r in nodes.values():
+            self.assertEqual(r.state(), SettleState.SETTLED)
+        # Now tick past the (default very-far) abandon_by used by _setup; state stays SETTLED.
+        for r in nodes.values():
+            r.tick(abandon_by)
+            self.assertEqual(r.state(), SettleState.SETTLED)
+            self.assertFalse(r.abandoned())
 
 
 if __name__ == "__main__":

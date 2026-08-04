@@ -557,6 +557,11 @@ class Round:
         """Current lifecycle state, for tests and observability."""
         return self._state
 
+    def bucket(self) -> Bucket:
+        """The bucket this Round is for. Coordinator uses it to route inbound messages
+        (#one-of-each-in-flight -- exactly one Round in flight, so this identifies it)."""
+        return self._bucket
+
     # -- internals ---------------------------------------------------------------------------- #
 
     def _all_holdings(self) -> dict[crypto.PublicKey, frozenset[crypto.Digest]]:
