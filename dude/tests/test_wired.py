@@ -45,7 +45,7 @@ WIRED = {
     "verify_possession": "a grant to a key nobody proved they hold",
     "accept": "an envelope for someone else, out of window, or unsigned",
     "may_write": "a write into a store the author holds no grant for",
-    "_violations": "a roster whose failure-domain placement cannot survive its own bound",
+    "would_brick": "a roster change that would shrink a safe cluster to n<3 (#quorum-gate)",
     "admit": "a transaction outside the admission window, or already settled",
     "holds": "a transaction whose guards do not hold against committed state",
     "_disagrees": "a transferred run that does not reproduce a signed commitment",

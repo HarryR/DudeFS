@@ -478,7 +478,8 @@ class TestCaughtUpRequiresFreshWitnesses(unittest.TestCase):
         my_num = joiner_store.head_block_num() or 0
         my_tip = joiner_store.head_block_hash()
         assert my_tip is not None
-        # f+1 for n=3 (two-thirds) is 1 tolerance + 1 = 2. Deliver two matching reports.
+        # corroboration(3) = tolerates(3) + 1 = 0 + 1 = 1. One matching report suffices, but
+        # deliver two -- higher-than-threshold is still a valid "caught up" state.
         for node in c.nodes[:2]:
             follower.receive(
                 HeightReply(block_num=my_num, tip_hash=my_tip),

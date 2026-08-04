@@ -403,13 +403,48 @@ via the same one door as any other submission.
 
 ### The quorum rule {#quorum-gate}
 
-- Consensus decisions MUST be settled against one quorum rule, computed by one module. Two callers
-  computing quorum arithmetic independently is how their answers come to disagree.
-- The default rule is two-thirds: `size(n) = ceil(2n/3)`, `tolerates(n) = n - size(n)`, and
-  `corroboration(n) = tolerates(n) + 1 = f + 1`.
+- Consensus decisions MUST be settled against **one** quorum rule, computed by **one** module
+  (`dude.quorum`). Two callers computing quorum arithmetic independently is how their answers
+  come to disagree, so every question -- size, tolerates, spare, corroboration, would_brick,
+  domain composition -- lives behind a module-level function name and no caller does the
+  arithmetic inline. Rule choice is not configurable per node; deployment flexibility lives
+  in the roster size `n`, not in the rule.
+- The rule IS two-thirds:
+  - `size(n) = ceil(2n/3)` -- how many must AGREE
+  - `spare(n) = n − size(n)` -- how many may be offline while a quorum remains reachable
+  - `intersection(n) = 2·size(n) − n` -- guaranteed overlap between any two quorums
+  - `tolerates(n) = max(0, intersection(n) − 1)` -- byzantine faults tolerated
+  - `corroboration(n) = tolerates(n) + 1 = f + 1` -- how many fresh witnesses need agree
+  - `max_domain(n) = min(spare, tolerates)` -- ADVISORY composition ceiling
+  - `would_brick(n) = (n < 3)` -- hard bricking condition (spare=0, any reboot removes quorum)
 - The distinction between a quorum (how many must AGREE for consensus) and `f+1` (how many must
   ANSWER before one of them is honest) matters and diverges in both directions. Small clusters
   where the two coincide MUST NOT be a licence to conflate them in code.
+- **`max_domain` is advisory, not enforcement.** Rack-awareness that severely interferes with
+  routine operation is worse than none. Legitimate improvement moves (diluting a concentrated
+  cluster) frequently pass through composition-violating intermediate states, and refusing
+  them one-at-a-time turned a growth mechanism into a footgun. The operator inspects
+  `check_domains()` and acts; no `dude.quorum` function refuses on composition alone. In
+  production, single-domain concentration IS the failure mode that bites (provider outage
+  removes quorum) -- reporting it is worth doing, hard refusal is not.
+
+### Roster change refuses a hard brick {#roster-change-refuses-brick}
+
+- `Management.change_roster(add, remove)` MUST refuse if the change would move the cluster
+  from a safe state (`n_before >= 3`) into a bricked state (`n_after < 3`). Below n=3 the
+  spare is zero, so any single node offline removes quorum -- operationally a brick, not just
+  a fragile state.
+- The refusal is one-sided: growth INTO or THROUGH a bricked size is allowed (bootstrap starts
+  at n=0 and grows). Only SHRINKING a safe cluster into brick is refused. This lets a batched
+  bootstrap reach the target n in one atomic step without a would-brick intermediate check
+  blocking it, while still preventing an operational mistake from turning a working cluster
+  into one that a single reboot brings down.
+- Escape hatch: `intervene()` (#anchor-is-the-axiom) authors arbitrary manager-signed
+  mutations that bypass this check. Use when a deliberate shrink into a bricked state is
+  necessary (e.g., replacing a compromised roster during an incident).
+- Refusal happens at AUTHORING (`change_roster` raises `ManagementError` and returns no
+  Transaction). Refusal at APPLY would brick the cluster (the transaction sits in the mempool
+  and blocks progress); authoring is the correct gate.
 
 ### Round buckets {#buckets}
 
@@ -1437,8 +1472,11 @@ visible rather than plausible.
 
 | requirement | enforced by |
 |---|---|
-| quorum arithmetic has one implementation | `dude.quorum` |
-| `f+1` is decided by the quorum module | `quorum.corroboration` |
+| quorum arithmetic has one implementation and no configurability (#quorum-gate) | `dude.quorum` -- flat module of `size`/`intersection`/`tolerates`/`corroboration`/`spare`/`max_domain`/`satisfied`/`would_brick`/`domain_advisory`. No `Rule` class, no `DEFAULT`, no rule parameters anywhere. Every caller asks the module a named question; none computes. |
+| `f+1` is decided by the quorum module | `quorum.corroboration`; consumed by `Follower.caught_up` for the fresh-witness threshold (#freshness-needs-many) |
+| composition is advisory, not enforcement (#quorum-gate) | `quorum.domain_advisory` returns violations for operator inspection via `Management.check_domains`; no code path refuses on it |
+| roster change refuses a hard brick (#roster-change-refuses-brick) | `Management.change_roster` raises `ManagementError` iff `quorum.would_brick(n_after) AND NOT quorum.would_brick(n_before)` -- shrinking a safe cluster into an unrecoverable state. Batched atomic add+remove sidesteps one-at-a-time refusal; anchor rescue via `intervene()` bypasses this check when a deliberate shrink is needed |
+| roster change is atomic (#roster-change-is-atomic) | `Management.change_roster` composes P_NODE writes/deletes, P_POP deletes, AND a fresh P_ROSTER commitment (serial = current + 1) into one Transaction. `add_node` and `remove_node` are wrappers -- the previous `remove_node` skipped the commitment update; fixed. |
 | ratification counts distinct signers | `crypto.bitmap_indices` |
 | ratification verifies every named signature | `crypto.Ed25519ListMultiSig.verify` |
 | ratification threshold is derived, not passed | `attested` (block variant) derives from the roster it is given |

@@ -190,7 +190,7 @@ class Follower:
         n = len(roster)
         if n == 0:
             return False  # can't compute f+1 without a roster
-        threshold = quorum.DEFAULT.size(n) - quorum.DEFAULT.tolerates(n)  # `f + 1`
+        threshold = quorum.corroboration(n)  # f + 1 (#freshness-needs-many)
         my_num = self.store.head_block_num() or 0
         my_tip = self.store.head_block_hash() or genesis_stamp(self._require_anchor())
         matches = 0

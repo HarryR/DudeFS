@@ -17,7 +17,17 @@ from ..consensus.mempool import (
     Tunables,
 )
 from ..core import crypto
-from ..quorum import MAJORITY, MAJORITY_PLUS, TWO_THIRDS, QuorumError, satisfied, size
+from ..quorum import (
+    QuorumError,
+    corroboration,
+    intersection,
+    max_domain,
+    satisfied,
+    size,
+    spare,
+    tolerates,
+    would_brick,
+)
 from ..store import Store, ops
 from ..store.management import Management
 
@@ -35,38 +45,48 @@ def write(kp: crypto.Keypair, key: str, value: bytes, ts: int) -> ops.SignedTran
 
 
 class TestQuorum(unittest.TestCase):
+    """The rule is two-thirds (#quorum-gate). Not configurable per node -- deployment
+    flexibility lives in the roster size, not in the rule."""
+
     def test_intersection_is_the_fault_budget(self):
-        """A rule is a statement about tolerable faults, not a comfort level."""
-        self.assertEqual(size(4, TWO_THIRDS), 3)
-        self.assertEqual(TWO_THIRDS.intersection(4), 2)
-        self.assertEqual(TWO_THIRDS.tolerates(4), 1)
+        """A quorum is a statement about tolerable faults, not a comfort level."""
+        self.assertEqual(size(4), 3)
+        self.assertEqual(intersection(4), 2)
+        self.assertEqual(tolerates(4), 1)
 
     def test_three_nodes_tolerate_no_collusion(self):
-        """Worth pinning because it is counter-intuitive and the old package demoed on 3 nodes:
-        two-thirds of 3 is 2, so two quorums overlap in ONE node, which need not be honest."""
-        self.assertEqual(size(3, TWO_THIRDS), 2)
-        self.assertEqual(TWO_THIRDS.tolerates(3), 0)
-        self.assertEqual(MAJORITY.tolerates(3), 0)
+        """Worth pinning because it is counter-intuitive: two-thirds of 3 is 2, so two quorums
+        overlap in ONE node, which need not be honest -- so `tolerates(3) == 0`. This is why
+        `corroboration(3) == 1`: a single honest fresh witness is enough at n=3."""
+        self.assertEqual(size(3), 2)
+        self.assertEqual(tolerates(3), 0)
+        self.assertEqual(corroboration(3), 1)
 
     def test_safety_and_liveness_move_in_opposite_directions(self):
-        """`tolerates` alone is a trap: `majority+1` at n=4 wants 4 of 4, so its safety overlap
-        looks excellent while one node rebooting stops the cluster. Both numbers have to be read."""
-        self.assertEqual(size(4, MAJORITY_PLUS), 4)  # unanimity
-        self.assertEqual(MAJORITY_PLUS.tolerates(4), 3)  # safety: looks superb
-        self.assertEqual(MAJORITY_PLUS.spare(4), 0)  # liveness: nothing may be down
-        self.assertEqual(TWO_THIRDS.spare(4), 1)  # the same n, one node may fail
+        """`tolerates` alone is a trap. At n=11 two-thirds gives spare=3 and tolerates=4, so
+        SAFETY (byzantine bound) is 4 while LIVENESS (crash bound) is only 3. Both matter."""
+        self.assertEqual(size(11), 8)
+        self.assertEqual(tolerates(11), 4)  # safety: 4 collusion allowed
+        self.assertEqual(spare(11), 3)  # liveness: 3 crashes allowed
+        # max_domain is the tighter of the two, i.e. what production really has to live under.
+        self.assertEqual(max_domain(11), 3)
 
-    def test_refuses_vacuous_and_unsatisfiable(self):
+    def test_refuses_vacuous(self):
         """`n=0` must raise, not return 0: a quorum satisfied by nobody agreeing finalises
         everything."""
         with self.assertRaises(QuorumError):
             size(0)
-        with self.assertRaises(QuorumError):
-            size(1, MAJORITY_PLUS)  # needs 2 of 1
 
     def test_satisfied(self):
         self.assertFalse(satisfied(10, 6))
         self.assertTrue(satisfied(10, 7))
+
+    def test_would_brick_at_small_n(self):
+        """n<3 leaves every node required for quorum. One reboot removes progress."""
+        self.assertTrue(would_brick(1))
+        self.assertTrue(would_brick(2))
+        self.assertFalse(would_brick(3))
+        self.assertFalse(would_brick(11))
 
 
 class TestBuckets(unittest.TestCase):

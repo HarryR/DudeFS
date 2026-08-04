@@ -328,7 +328,7 @@ class Round:
         self._bucket = bucket
         self._me = me
         self._roster = roster
-        self._quorum = quorum.DEFAULT.size(len(roster))
+        self._quorum = quorum.size(len(roster))
         self._state = State.COLLECT
         self._now = now
         self._close_by = close_by

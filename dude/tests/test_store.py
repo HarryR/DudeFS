@@ -385,57 +385,49 @@ class TestFailureDomains(unittest.TestCase):
     def test_availability_binds_not_safety(self):
         """At n=11 two-thirds gives spare=3 and tolerates=4. Seizure removes AVAILABILITY, so the
         smaller bound is the real one — the two move in opposite directions (see `spare`)."""
-        rule = quorum.TWO_THIRDS
-        self.assertEqual(rule.spare(11), 3)
-        self.assertEqual(rule.tolerates(11), 4)
-        self.assertEqual(rule.max_domain(11), 3)
+        self.assertEqual(quorum.spare(11), 3)
+        self.assertEqual(quorum.tolerates(11), 4)
+        self.assertEqual(quorum.max_domain(11), 3)
 
-    def test_a_sound_spread_passes_the_check_at_its_target_size(self):
-        """3-3-3-2 across four providers is sound at n=11: max_domain(11) is 3."""
-        recs = {}
-        for prov in ["p:a"] * 3 + ["p:b"] * 3 + ["p:c"] * 3 + ["p:d"] * 2:
-            kp = crypto.Keypair.generate()
-            recs[kp.public] = management.NodeRecord(kp.public, (b"x",), frozenset({prov.encode()}))
-        self.assertEqual(management._violations(recs, quorum.TWO_THIRDS), {})
+    def test_a_sound_spread_is_advisory_clean(self):
+        """3-3-3-2 across four providers is sound at n=11: max_domain(11) is 3. `domain_advisory`
+        returns empty (no over-count domains)."""
+        counts = {b"p:a": 3, b"p:b": 3, b"p:c": 3, b"p:d": 2}
+        self.assertEqual(quorum.domain_advisory(counts, 11), {})
 
-    def test_a_sound_roster_may_be_unreachable_one_node_at_a_time(self):
-        """The growth constraint, found by implementing the check.
+    def test_concentrated_spread_shows_up_in_advisory_only(self):
+        """A 4-4-3 spread at n=11 has two provider-groups over the max_domain(11)=3 bound.
+        `domain_advisory` reports them; `change_roster` does NOT refuse on this (composition
+        is advisory only, #quorum-gate). Rack-awareness that severely interferes with routine
+        operation is worse than none -- enforcing this at the authoring boundary blocks
+        legitimate incremental improvements to a concentrated cluster."""
+        counts = {b"p:a": 4, b"p:b": 4, b"p:c": 3}
+        self.assertEqual(quorum.domain_advisory(counts, 11), {b"p:a": 4, b"p:b": 4})
 
-        The bound TIGHTENS as `n` falls, so an arrangement valid at the target size can be
-        refused on
-        the way there: 3-3-3-2 is fine at n=11, but at n=4 the bound is 1. A target roster must be
-        reached by a BATCHED change, not by repeated `add_node`."""
-        self.assertEqual(quorum.TWO_THIRDS.max_domain(11), 3)  # 3 per provider is fine at target
-        self.assertEqual(quorum.TWO_THIRDS.max_domain(4), 1)  # ...but only 1 on the way there
-        self._add(0, {b"p:x"})
-        self._add(1, {b"p:y"})
+    def test_add_node_no_longer_refuses_on_composition(self):
+        """The old strict-refusal was blocking legitimate growth (single-provider first steps,
+        dilution of a concentrated cluster). `change_roster` refuses only on `would_brick`;
+        composition remains advisory via `check_domains`."""
+        # Add multiple nodes into the same provider without any raise -- would have failed the
+        # old strict `add_node`.
+        self._add(0, {b"p:a"})
+        self._add(1, {b"p:a"})
         self._add(2, {b"p:a"})
-        with self.assertRaises(management.ManagementError):
-            self._add(3, {b"p:a"})  # the SECOND p:a, at n=4 where the bound is 1
+        self._add(3, {b"p:a"})  # would have hit "n=4, max_domain=1" refusal previously
+        # And the advisory picks up the concentration as guidance for the operator.
+        adv = self.mgmt.check_domains()
+        # At n=4, max_domain(4)=1, so p:a with 4 nodes is over the bound.
+        self.assertIn(b"p:a", adv)
+        self.assertEqual(adv[b"p:a"], 4)
 
-    def test_a_concentrated_spread_is_refused(self):
-        """Refused at the point it would break, not discovered later by an operator reading a
-        spreadsheet of eleven country names."""
-        recs = {}
-        for prov in ["p:a"] * 4 + ["p:b"] * 4 + ["p:c"] * 3:
-            kp = crypto.Keypair.generate()
-            recs[kp.public] = management.NodeRecord(kp.public, (b"x",), frozenset({prov.encode()}))
-        bad = management._violations(recs, quorum.TWO_THIRDS)
-        self.assertEqual(bad, {b"p:a": 4, b"p:b": 4})  # 4-4-3 at n=11: two groups over the bound
-
-    def test_the_bound_is_vacuous_while_the_roster_is_too_small(self):
-        """`max_domain` is 0 below n=4, because no placement makes a 1-node roster survivable.
-        Enforcing it there would forbid the FIRST node and make bootstrap impossible."""
-        self.assertEqual(quorum.TWO_THIRDS.max_domain(1), 0)
-        self._add(0, {b"p:a"})  # must not raise
-        self.assertEqual(self.mgmt.check_domains(), {})
-
-    def test_adding_a_node_can_reduce_tolerance(self):
-        """The counter-intuitive case, and the reason the check runs on every roster change: `f`
-        falls out of `n`, so growing the roster can shrink what any one domain may hold."""
-        self.assertEqual(quorum.TWO_THIRDS.max_domain(4), 1)
-        self.assertEqual(quorum.TWO_THIRDS.max_domain(5), 1)
-        self.assertEqual(quorum.TWO_THIRDS.max_domain(7), 2)
+    def test_max_domain_arithmetic(self):
+        """The advisory ceiling is `min(spare, tolerates)`. At small n both are tiny; grows
+        slowly. This drives what the operator SEES in `check_domains`, not what they can DO."""
+        self.assertEqual(quorum.max_domain(1), 0)  # nothing tolerable
+        self.assertEqual(quorum.max_domain(4), 1)
+        self.assertEqual(quorum.max_domain(5), 1)
+        self.assertEqual(quorum.max_domain(7), 2)
+        self.assertEqual(quorum.max_domain(11), 3)
 
     def test_domains_are_opaque(self):
         """Nothing parses a label. `rack:` and `psu:` need no schema change, and a nonsense label is

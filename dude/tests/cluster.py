@@ -12,7 +12,7 @@ from ..net import Verb
 from ..net.envelope import Envelope
 from ..net.transports import InProc, Switchboard, address_of, name_of
 from ..node import Node
-from ..store import Store, ops
+from ..store import Store, management, ops
 from ..store.management import Management, Role
 from ..tunables import DEFAULT
 
@@ -74,11 +74,17 @@ class Cluster:
             tx = tx + mgmt.authorise(
                 kp.public, Role.NODE, frozenset({D}), frozenset(), kp.prove_possession()
             )
-            tx = tx + mgmt.add_node(kp.public, (address_of(kp.public).encode(),))
-        # STEP 7: membership is stated ONCE, in the same transaction that creates the rows. A
-        # `node/` row set with no commitment cannot be checked for completeness, so a verifier
-        # refuses the log -- `#roster-change-is-atomic` is why both land together or neither does.
-        tx = tx + mgmt.set_roster([kp.public for kp in self.keys], serial=1)
+        # STEP 7 (#roster-change-is-atomic): one atomic change adds every node AND emits the
+        # manager-signed roster commitment. Batched via `change_roster` so `would_brick` sees
+        # the post-batch n (>=3), not the one-at-a-time intermediate n=1 that would refuse.
+        # A node-row set with no commitment cannot be checked for completeness, so a verifier
+        # refuses the log -- the atomic composition IS what makes bootstrap survivable.
+        tx = tx + mgmt.change_roster(
+            add=tuple(
+                management.NodeRecord(kp.public, (address_of(kp.public).encode(),), frozenset())
+                for kp in self.keys
+            )
+        )
         return (tx.sign(self.mgr, T0),)
 
     def provisioned(self) -> Store:

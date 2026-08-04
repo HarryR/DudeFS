@@ -682,7 +682,7 @@ class TestPropertySafetyUnderPartition(unittest.TestCase):
             with self.subTest(seed=seed):
                 rng = random.Random(seed)
                 n = rng.randint(3, 7)
-                q = quorum.DEFAULT.size(n)
+                q = quorum.size(n)
                 # Partition needs n - 1 >= quorum for the connected part to make progress.
                 if n - 1 < q:
                     continue

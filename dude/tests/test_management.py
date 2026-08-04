@@ -21,7 +21,7 @@ from ..consensus.settle_round import _settle_payload
 from ..core import crypto
 from ..core.errors import InvariantError
 from ..store import Store, ops
-from ..store.management import Management, Role
+from ..store.management import Management, ManagementError, NodeRecord, Role
 
 T0 = 1_700_000_000_000
 
@@ -295,6 +295,162 @@ class TestAnchorImmutable(unittest.TestCase):
             s.provision(other.public)
         # Anchor unchanged.
         self.assertEqual(s.anchor(), anchor.public)
+
+
+# --------------------------------------------------------------------------------------------- #
+# change_roster: batched atomic add+remove, brick-refuse only, advisory composition.            #
+# --------------------------------------------------------------------------------------------- #
+
+
+def _addr(n: int) -> bytes:
+    """A stub address for tests. `management.Address` is a type alias for `bytes`, and
+    `NodeRecord.addresses` is a tuple of those bytes -- no parsing goes on at this layer."""
+    return f"inproc:n{n}".encode()
+
+
+def _seed_cluster(mgmt: Management, anchor: crypto.Keypair, size: int) -> list[crypto.Keypair]:
+    """Bootstrap a cluster of `size` nodes via one atomic change_roster call, applied to the
+    store. Returns the node keypairs."""
+    kps = [crypto.Keypair.generate() for _ in range(size)]
+    tx = mgmt.change_roster(
+        add=tuple(NodeRecord(kp.public, (_addr(i),), frozenset()) for i, kp in enumerate(kps))
+    )
+    mgmt.store.apply((tx.sign(anchor, T0),), auth=mgmt)
+    return kps
+
+
+class TestChangeRosterBatched(unittest.TestCase):
+    """`change_roster` composes add + remove atomically. Batching sidesteps the one-at-a-time
+    growth trap that made the old strict `add_node` refuse legitimate cluster construction."""
+
+    def test_atomic_batch_add_from_zero_reaches_target(self):
+        """From empty (n=0) to n=3 in one atomic change_roster: works even though the
+        intermediate n<3 states would would_brick if inspected."""
+        anchor = crypto.Keypair.generate()
+        _s, mgmt = _provisioned(anchor)
+        kps = _seed_cluster(mgmt, anchor, 3)
+        self.assertEqual(len(mgmt.nodes()), 3)
+        for kp in kps:
+            self.assertIn(kp.public, mgmt.nodes())
+
+    def test_batch_atomic_writes_p_node_p_pop_and_p_roster_together(self):
+        """The one atomic tx must include the roster commitment update
+        (#roster-change-is-atomic). Prove by checking `roster_commitment` reflects the
+        post-state after apply."""
+        anchor = crypto.Keypair.generate()
+        _s, mgmt = _provisioned(anchor)
+        kps = _seed_cluster(mgmt, anchor, 3)
+        commit = mgmt.roster_commitment()
+        assert commit is not None
+        serial, members = commit
+        self.assertEqual(serial, 1)  # first commitment after provisioning
+        self.assertEqual(set(members), {kp.public for kp in kps})
+
+
+class TestChangeRosterBrickRefusal(unittest.TestCase):
+    """Only one refusal path: `quorum.would_brick(n_after) AND NOT quorum.would_brick(n_before)`.
+    Shrinking a safe cluster into a bricked state is refused; growth into or through bricked
+    states is allowed (bootstrap starts at n=0)."""
+
+    def test_shrink_from_safe_to_bricked_is_refused(self):
+        anchor = crypto.Keypair.generate()
+        _s, mgmt = _provisioned(anchor)
+        kps = _seed_cluster(mgmt, anchor, 3)
+        # Now try to remove 2 nodes: n=3 (safe) -> n=1 (bricked). Refused.
+        with self.assertRaises(ManagementError):
+            mgmt.change_roster(remove=(kps[0].public, kps[1].public))
+
+    def test_shrink_within_bricked_range_is_allowed(self):
+        """If n_before is already bricked (n<3), any shrink that doesn't make it worse is
+        allowed. This preserves growth-from-zero and any legitimate remove-only ops in an
+        already-degraded cluster."""
+        anchor = crypto.Keypair.generate()
+        _s, mgmt = _provisioned(anchor)
+        # Grow to n=2 via a batched change (still bricked).
+        kps = _seed_cluster(mgmt, anchor, 2)
+        # Remove one, going 2 -> 1. n_before is already bricked, so no refusal.
+        tx = mgmt.change_roster(remove=(kps[0].public,))
+        # Must not raise; apply and verify.
+        mgmt.store.apply((tx.sign(anchor, T0),), auth=mgmt)
+        self.assertEqual(len(mgmt.nodes()), 1)
+
+    def test_growth_through_bricked_states_is_allowed(self):
+        """Bootstrap starts at n=0 and grows through n=1, n=2 before hitting n=3. Under the
+        would-brick rule, growing INTO a bricked state is fine; only shrinking into brick is
+        refused. The batch abstraction means intermediate n values never exist externally."""
+        anchor = crypto.Keypair.generate()
+        _s, mgmt = _provisioned(anchor)
+        # add=1 from n=0: n_after=1, bricked, but n_before also bricked -- allowed.
+        kp1 = crypto.Keypair.generate()
+        tx = mgmt.change_roster(add=(NodeRecord(kp1.public, (_addr(1),), frozenset()),))
+        mgmt.store.apply((tx.sign(anchor, T0),), auth=mgmt)
+        self.assertEqual(len(mgmt.nodes()), 1)
+
+
+class TestChangeRosterAdvisoryComposition(unittest.TestCase):
+    """Domain concentration is ADVISORY, not enforcement (#quorum-gate). `change_roster`
+    does NOT refuse on `domain_advisory` returning non-empty -- the operator sees the
+    concentration via `check_domains` and decides."""
+
+    def test_concentrating_all_nodes_in_one_domain_is_allowed(self):
+        """A cluster whose entire roster shares one domain would lose quorum when that
+        domain fails, but `change_roster` allows it. Enforcing at authoring blocked the
+        legitimate case of building a small cluster on one provider before diversifying;
+        it also blocked incremental dilution of a concentrated cluster."""
+        anchor = crypto.Keypair.generate()
+        _s, mgmt = _provisioned(anchor)
+        # Four nodes, all in provider "hetzner". At n=4 max_domain(4)=1, so this is 3 over.
+        # The old add_node refused this; change_roster allows it.
+        kps = [crypto.Keypair.generate() for _ in range(4)]
+        tx = mgmt.change_roster(
+            add=tuple(
+                NodeRecord(kp.public, (_addr(i),), frozenset({b"provider:hetzner"}))
+                for i, kp in enumerate(kps)
+            )
+        )
+        mgmt.store.apply((tx.sign(anchor, T0),), auth=mgmt)
+        # The advisory reports the concentration.
+        adv = mgmt.check_domains()
+        self.assertEqual(adv, {b"provider:hetzner": 4})
+
+    def test_add_node_wrapper_composes_via_change_roster(self):
+        """`add_node` becomes a wrapper on `change_roster(add=[...])`. Same brick-refuse
+        semantics, same commitment update. Verify by adding a node into an existing safe
+        cluster and observing the commitment serial advances."""
+        anchor = crypto.Keypair.generate()
+        _s, mgmt = _provisioned(anchor)
+        _seed_cluster(mgmt, anchor, 3)
+        commit_before = mgmt.roster_commitment()
+        assert commit_before is not None
+
+        kp_new = crypto.Keypair.generate()
+        tx = mgmt.add_node(kp_new.public, (_addr(9),))
+        mgmt.store.apply((tx.sign(anchor, T0),), auth=mgmt)
+
+        commit_after = mgmt.roster_commitment()
+        assert commit_after is not None
+        self.assertEqual(commit_after[0], commit_before[0] + 1)
+        self.assertIn(kp_new.public, commit_after[1])
+        self.assertEqual(len(mgmt.nodes()), 4)
+
+    def test_remove_node_wrapper_updates_commitment(self):
+        """`remove_node` becomes a wrapper on `change_roster(remove=[...])`, fixing its
+        previous violation of #roster-change-is-atomic (used to emit a bare Del P_NODE with
+        no commitment update)."""
+        anchor = crypto.Keypair.generate()
+        _s, mgmt = _provisioned(anchor)
+        kps = _seed_cluster(mgmt, anchor, 4)  # start at n=4 so remove takes us to n=3, safe
+
+        commit_before = mgmt.roster_commitment()
+        assert commit_before is not None
+        tx = mgmt.remove_node(kps[0].public)
+        mgmt.store.apply((tx.sign(anchor, T0),), auth=mgmt)
+
+        commit_after = mgmt.roster_commitment()
+        assert commit_after is not None
+        self.assertEqual(commit_after[0], commit_before[0] + 1)
+        self.assertNotIn(kps[0].public, commit_after[1])
+        self.assertEqual(len(mgmt.nodes()), 3)
 
 
 if __name__ == "__main__":

@@ -32,7 +32,7 @@ from .. import quorum
 from ..core import codec, crypto
 from ..core.errors import DudeError
 from . import ops
-from .layer import Index, Reader
+from .layer import Reader
 
 if TYPE_CHECKING:
     from .store import Store
@@ -276,7 +276,7 @@ class Management:
         if manager_slot in set_indices:
             return True  # manager override -- authorizes alone
         roster_signer_count = sum(1 for i in set_indices if i < manager_slot)
-        return roster_signer_count >= quorum.DEFAULT.size(len(roster))
+        return roster_signer_count >= quorum.size(len(roster))
 
     def possession_proof(self, who: crypto.PublicKey) -> crypto.Signature | None:
         raw = self.store.get(self.store_id, P_POP + who)
@@ -291,44 +291,85 @@ class Management:
 
     # -- writes: emit mutations, apply nothing -------------------------------- #
 
+    def change_roster(
+        self,
+        add: Iterable[NodeRecord] = (),
+        remove: Iterable[crypto.PublicKey] = (),
+    ) -> ops.Transaction:
+        """Batched atomic roster change: add nodes, remove nodes, and update the manager-signed
+        commitment in ONE transaction (#roster-change-is-atomic).
+
+        HARD BRICK REFUSAL. Refuses if the post-state has `quorum.would_brick(n_after)` --
+        equivalently, `n_after < 3`, where any single node reboot leaves quorum unreachable.
+        That is the only refusal path: composition (domain concentration) is ADVISORY only,
+        per `quorum.domain_advisory` (#quorum-gate). Rack-awareness that severely interferes
+        with routine operation is worse than none; legitimate improvement moves to a
+        concentrated cluster frequently pass through composition-violating intermediate
+        states, and refusing them one-at-a-time turned a growth mechanism into a footgun.
+        The operator inspects `check_domains()` and acts.
+
+        BATCHING. Adds and removes commit atomically. Intermediate states do not exist
+        externally, so a roster change reaches its target composition in one step -- the
+        one-at-a-time growth constraint noted in the earlier `add_node` docstring
+        (3-3-3-2 across four providers not reachable node-by-node) is dissolved by this API.
+
+        THE ESCAPE HATCH. `intervene()` (#anchor-is-the-axiom) lets the anchor sign arbitrary
+        mutation ops, bypassing this composition-agnostic path entirely. Use when a routine
+        `change_roster` cannot reach a safe post-state in one batch."""
+        add = tuple(add)
+        remove = tuple(remove)
+        before = self.nodes()
+        after: dict[crypto.PublicKey, NodeRecord] = dict(before)
+        for who in remove:
+            after.pop(who, None)
+        for rec in add:
+            after[rec.identity] = rec
+        n_before = len(before)
+        n_after = len(after)
+        # THE ONLY REFUSAL: you cannot ENTER a bricked state from a safe one. Growth through
+        # n<3 is allowed (bootstrap starts at n=0), same-size or larger transitions are always
+        # allowed. Shrinking a safe cluster (n>=3) down to n<3 is refused, because that turns a
+        # working cluster into one that a single reboot bricks. Use intervene() for anchor
+        # rescue if a shrink into brick is truly deliberate.
+        if not quorum.would_brick(n_before) and quorum.would_brick(n_after):
+            raise ManagementError(
+                f"change_roster would shrink from n={n_before} (safe) to n={n_after} "
+                f"(would_brick); refused. Use intervene() for anchor rescue if deliberate."
+            )
+        # Compose one atomic Transaction. Order:
+        #   1. Remove: Del P_NODE + Del P_POP for each removed identity
+        #   2. Add:    Set P_NODE for each added record
+        #   3. Commit: Set P_ROSTER with fresh commitment (serial = current + 1)
+        # PoPs for added nodes are the caller's business (they come via `authorise`, which is
+        # a separate step composed onto this transaction).
+        steps: list[ops.Mutation] = []
+        for who in remove:
+            steps.append(ops.Del(self.store_id, P_NODE + who))
+            steps.append(ops.Del(self.store_id, P_POP + who))
+        steps.extend(
+            ops.Set(
+                self.store_id,
+                P_NODE + rec.identity,
+                codec.encode([list(rec.addresses), sorted(rec.domains)]),
+            )
+            for rec in add
+        )
+        # Roster commitment: sorted members of the post-state, next serial.
+        current = self.roster_commitment()
+        next_serial = (current[0] + 1) if current is not None else 1
+        commitment = codec.encode([next_serial, sorted(bytes(m) for m in after)])
+        steps.append(ops.Set(self.store_id, P_ROSTER, commitment))
+        return ops.writes(*steps)
+
     def add_node(
         self,
         who: crypto.PublicKey,
         addresses: tuple[Address, ...],
         domains: frozenset[Domain] = frozenset(),
-        rule: quorum.Rule = quorum.DEFAULT,
     ) -> ops.Transaction:
-        """Admit a node, REFUSING a roster that would violate the failure-domain bound.
-
-        NOTE THE GROWTH CONSTRAINT, found by implementing this. The bound TIGHTENS as `n`
-        falls, so a
-        roster that is sound at its target size may be unreachable one node at a time:
-        3-3-3-2 across
-        four providers is fine at n=11, but at n=4 the bound is 1 and the third node of the first
-        provider is refused. A target roster must therefore be reached by a BATCHED roster change,
-        not by repeated `add_node` -- which is the same reason growth goes through `change_roster`
-        rather than repeated promotion.
-
-        Checked here rather than left to an operator, because the failure mode is silent: a
-        roster can
-        look diverse — eleven countries — while three of them are one billing account. And note that
-        ADDING a node can REDUCE effective tolerance, since `f` falls out of `n`."""
-        after = dict(self.nodes())
-        after[who] = NodeRecord(who, addresses, domains)
-        bad = _violations(after, rule)
-        if bad:
-            raise ManagementError(
-                "failure-domain bound exceeded: "
-                + ", ".join(f"{d.decode(errors='replace')}={c}" for d, c in sorted(bad.items()))
-                + f" > {rule.max_domain(len(after))} allowed at n={len(after)}"
-            )
-        return ops.writes(
-            ops.Set(
-                self.store_id,
-                P_NODE + who,
-                codec.encode([list(addresses), sorted(domains)]),
-            )
-        )
+        """Convenience wrapper on `change_roster`: single-node add. See `change_roster` for
+        the full semantics (batched, brick-refuse only, advisory composition)."""
+        return self.change_roster(add=(NodeRecord(who, addresses, domains),))
 
     def domain_groups(self) -> dict[Domain, frozenset[crypto.PublicKey]]:
         """Which nodes share each label. A pure fold over the roster."""
@@ -338,15 +379,28 @@ class Management:
                 groups.setdefault(d, set()).add(rec.identity)
         return {d: frozenset(m) for d, m in groups.items()}
 
-    def check_domains(self, rule: quorum.Rule = quorum.DEFAULT) -> dict[Domain, int]:
-        """Domains over the bound, empty if the roster is sound. Callable by anyone, any time."""
-        return _violations(self.nodes(), rule)
+    def check_domains(self) -> dict[Domain, int]:
+        """Domains over the advisory `max_domain(n)` bound. Empty when composition is sound.
+
+        ADVISORY, NOT ENFORCEMENT. `change_roster` does NOT refuse on this -- callers use it
+        for operator inspection (#quorum-gate, `quorum.domain_advisory`). In production this
+        IS the failure mode that bites (single-provider concentration → provider outage →
+        cluster loses quorum until recovery), which is why it is worth reporting; it stays
+        advisory because hard refusal blocks legitimate incremental improvements."""
+        counts: dict[Domain, int] = {}
+        for rec in self.nodes().values():
+            for d in rec.domains:
+                counts[d] = counts.get(d, 0) + 1
+        return quorum.domain_advisory(counts, len(self.nodes()))
 
     def remove_node(self, who: crypto.PublicKey) -> ops.Transaction:
-        """Removal ALONE. Forward secrecy needs the rotation that follows, and
-        #roster-change-is-atomic says the
-        two belong in one transaction — compose this with `distribute`, do not call it alone."""
-        return ops.writes(ops.Del(self.store_id, P_NODE + who))
+        """Convenience wrapper on `change_roster`: single-node remove. See `change_roster`
+        for the full semantics.
+
+        NOTE: previously this emitted a bare `Del P_NODE` without the roster-commitment
+        update, silently violating #roster-change-is-atomic. Now delegates to `change_roster`
+        which composes the commitment update, PoP deletion, and node deletion atomically."""
+        return self.change_roster(remove=(who,))
 
     def authorise(
         self,
@@ -387,41 +441,3 @@ class Management:
         return ops.writes(
             *(ops.Set(self.store_id, _wrap_key(epoch, who), wraps[who]) for who in sorted(wraps))
         )
-
-    # -- historical node sets ------------------------------------------------- #
-
-    def roster_at(self, _idx: Index) -> tuple[crypto.PublicKey, ...]:
-        """NOT IMPLEMENTED, deliberately, and the reason is worth reading.
-
-        #replay-does-not-readjudicate says an endorsement is valid for the node set in force
-        *at its position*, which
-        invites a historical query. But compaction may have collected the management operations that
-        would answer it — a node added and later removed annihilates entirely (#accumulators) — so
-        for old enough positions the answer is genuinely unrecoverable.
-
-        That is not a gap, because nothing needs it: replay does not re-adjudicate
-        (#replay-does-not-readjudicate), and a replayer's check is the accumulator against a quorum
-        attestation (#collection-is-ratified). Historical
-        node sets are needed only to verify an endorsement *while in use*, which is near-current.
-
-        Left as an explicit refusal rather than absent, so a caller reaching for it discovers
-        the reasoning instead of writing a version that is wrong past the compaction horizon."""
-        raise ManagementError(
-            "historical node sets are not reconstructible past compaction; verify against the "
-            "attested accumulator instead (#collection-is-ratified)"
-        )
-
-
-def _violations(nodes: dict[crypto.PublicKey, NodeRecord], rule: quorum.Rule) -> dict[Domain, int]:
-    """Labels held by more nodes than the rule allows. One invariant, no per-axis logic."""
-    limit = rule.max_domain(len(nodes))
-    if limit < 1:
-        # A roster too small to tolerate ANY loss -- at n<=3 two-thirds gives max_domain 0. The
-        # bound has nothing to say there: no placement makes a 1-node roster survivable, so
-        # it would forbid the FIRST node and make bootstrap impossible. Found by implementing it.
-        return {}
-    counts: dict[Domain, int] = {}
-    for rec in nodes.values():
-        for d in rec.domains:
-            counts[d] = counts.get(d, 0) + 1
-    return {d: c for d, c in counts.items() if c > limit}
