@@ -27,7 +27,7 @@ from dude.sync.adapter import (
     SettledBlockReply,
     SyncRefusal,
 )
-from dude.sync.follower import Follower, serve_getblock, serve_height
+from dude.sync.follower import Follower, HeightReport, serve_getblock, serve_height
 from dude.tunables import DEFAULT
 
 from .cluster import DELTA, T0, Cluster, D
@@ -220,9 +220,11 @@ class TestByzantinePeerIsHandled(unittest.TestCase):
         self.honest = self.c.nodes[0]
         self.byz = crypto.Keypair.generate()  # not on the cluster; just a fake pubkey
 
-    def test_lied_higher_height_wasted_one_getblock_then_dropped(self):
-        """Byzantine peer says head=999, we ask GetBlock(2), they refuse (they have no such
-        block) -- follower drops them as a source and does not corrupt state."""
+    def test_lied_higher_height_wastes_one_getblock_then_pull_clears(self):
+        """Byzantine peer says head=999, we ask GetBlock(2), they refuse -- pull clears, state
+        unchanged. Per #no-shun-only-priority, byz is NOT blacklisted: they remain a valid
+        pull candidate and would be tried again if they were the only source above us. The
+        cost of the lie is one round-trip, not permanent exclusion."""
         self.follower.add_peer(self.byz.public, now=T0)
         self.follower.tick(T0)
         # First outbox drain: a HeightAsk to byz. Serve a lying reply.
@@ -244,11 +246,12 @@ class TestByzantinePeerIsHandled(unittest.TestCase):
             self.byz.public,
             now,
         )
-        # Follower must have dropped byz as a source and cleared _pulling.
+        # Pull cleared, state unchanged. Byz remains an eligible candidate -- picking again
+        # next tick returns byz because they're the only peer above us.
         self.assertIsNone(self.follower._pulling)
-        self.assertIn(self.byz.public, self.follower._bad_sources)
-        # State unchanged.
         self.assertEqual(self.joiner_store.head_block_num(), 1)
+        # Prove no exclusion: byz is still the pick.
+        self.assertEqual(self.follower._pick_pull_source(), self.byz.public)
 
     def test_bad_settle_sig_dropped(self):
         """A peer serves a block whose settle_sigs don't verify. Follower drops without touching
@@ -284,11 +287,14 @@ class TestByzantinePeerIsHandled(unittest.TestCase):
             self.byz.public,
             now,
         )
-        self.assertIn(self.byz.public, self.follower._bad_sources)
+        # Pull cleared, state unchanged. Byz stays eligible (#no-shun-only-priority) --
+        # verification failure does not shun.
+        self.assertIsNone(self.follower._pulling)
         self.assertEqual(self.joiner_store.head_block_num(), 1)
 
-    def test_bad_chain_link_dropped(self):
-        """A peer serves a block whose prev_block doesn't chain back to our head. Drop peer."""
+    def test_bad_chain_link_clears_pull_no_shun(self):
+        """A peer serves a block whose prev_block doesn't chain back to our head. Pull
+        clears; peer stays eligible per #no-shun-only-priority."""
         self.follower.add_peer(self.byz.public, now=T0)
         self.follower.tick(T0)
         self.follower.outbox()
@@ -325,16 +331,17 @@ class TestByzantinePeerIsHandled(unittest.TestCase):
             self.byz.public,
             now,
         )
-        self.assertIn(self.byz.public, self.follower._bad_sources)
+        self.assertIsNone(self.follower._pulling)
         self.assertEqual(self.joiner_store.head_block_num(), 1)
 
-    def test_omitted_bodies_dropped_by_preview_mismatch(self):
+    def test_omitted_bodies_clear_pull_via_preview_mismatch(self):
         """A peer serves a real block but omits some of the applied bodies. Preview computes
-        different anchors → mismatch → drop peer. State never touched.
+        different anchors → mismatch → pull clears (no state touched). Peer stays eligible
+        per #no-shun-only-priority.
 
-        SETUP: fresh joiner at block 1; byz is the only peer. Byz claims height 2 and serves
-        block 2 with the last body omitted. Preview against the truncated body set yields
-        different anchors than what block 2's sigs cover -> mismatch -> drop.
+        SETUP: fresh joiner at block 1; byz is the only peer. Byz claims height N and serves
+        block N with the last body omitted. Preview against the truncated body set yields
+        different anchors than what block N's sigs cover -> mismatch -> clear pull.
         """
         # Ensure block 2 has multiple bodies to have something to omit.
         for i in range(3):
@@ -399,8 +406,8 @@ class TestByzantinePeerIsHandled(unittest.TestCase):
             self.byz.public,
             T0 + POLL,
         )
-        # Byz dropped, joiner head still at target_num - 1.
-        self.assertIn(self.byz.public, follower._bad_sources)
+        # Pull cleared, joiner head still at target_num - 1. Byz stays a candidate.
+        self.assertIsNone(follower._pulling)
         self.assertEqual(fresh_joiner.head_block_num(), target_num - 1)
 
 
@@ -411,30 +418,37 @@ class TestByzantinePeerIsHandled(unittest.TestCase):
 
 class TestForkDetectionAtPollTime(unittest.TestCase):
     """SPECv2 #poll-detects-divergent-tips: a peer reporting same block_num but different
-    tip_hash than ours is on a different chain -- drop as sync source."""
+    tip_hash than ours is on a different chain. Per #no-shun-only-priority + the updated
+    #poll-detects-divergent-tips, this is an observability signal, NOT an exclusion decision
+    -- WE may be the wrong side of the fork, so locking in "they're bad" is a permanent
+    misconfiguration hazard. Sync stays safe regardless: a peer on the wrong chain serves
+    blocks that fail chain-link check on our side."""
 
-    def test_same_num_different_tip_drops_peer(self):
+    def test_same_num_different_tip_is_observability_only(self):
         c = Cluster()
         _run_cluster_producing_n_blocks(c, 2)
         joiner_store = c.provisioned()
-        # Manually push the joiner to have block 2 with the honest chain first.
+        # Catch up joiner via honest first, so it has a definite head/tip.
         honest = c.nodes[0]
         follower = _make_follower(joiner_store)
         follower.add_peer(honest.me.public, now=T0)
         _catch_up(follower, honest.store, honest.me.public)
 
-        # Now a byz peer reports our block_num but with a different tip.
         my_num = joiner_store.head_block_num()
         assert my_num is not None
         byz = crypto.Keypair.generate()
-        # Deliver a HeightReply with mismatched tip -- follower can decide directly.
         follower.receive(
             HeightReply(block_num=my_num, tip_hash=crypto.h(b"different-chain")),
             byz.public,
             T0,
         )
-        # Fork detected -- byz in bad sources; joiner state untouched.
-        assert byz.public in follower._bad_sources
+        # Fork observed: HeightReport recorded. No exclusion, no blacklist -- byz stays a
+        # regular peer. Only reason byz isn't picked as a pull source right now is that it
+        # reports the same block_num as our head (not strictly ABOVE), not because we're
+        # shunning it.
+        self.assertIn(byz.public, follower._heads)
+        # State untouched.
+        self.assertEqual(joiner_store.head_block_num(), my_num)
 
 
 # --------------------------------------------------------------------------------------------- #
@@ -509,10 +523,12 @@ class TestCaughtUpRequiresFreshWitnesses(unittest.TestCase):
 
 
 class TestPullTimeout(unittest.TestCase):
-    """A peer that answers HEIGHT but never SETTLED_BLOCK/REFUSED must eventually be dropped
-    so the joiner can try another source."""
+    """A peer that answers HEIGHT but never SETTLED_BLOCK/REFUSED has its in-flight pull
+    cleared at `pull_timeout` so the joiner can try another source. Per
+    #no-shun-only-priority, the silent peer is NOT excluded from future picks -- if it stays
+    the highest-reporting peer, it gets picked again."""
 
-    def test_silent_peer_drops_after_pull_timeout(self):
+    def test_silent_peer_pull_clears_after_timeout(self):
         c = Cluster()
         _run_cluster_producing_n_blocks(c, 2)
         joiner_store = c.provisioned()
@@ -531,10 +547,104 @@ class TestPullTimeout(unittest.TestCase):
         follower.tick(T0 + POLL)
         # A GetBlock went out; drain it.
         follower.outbox()
-        # Now advance beyond pull_timeout.
+        # Now advance beyond pull_timeout. Tick clears the stale pull AND (in the same tick)
+        # the picker immediately re-picks silent because they're the only source above us --
+        # that IS the "no shun" behavior: we retry against the same peer rather than exclude.
         follower.tick(T0 + POLL + PULL_TIMEOUT + 1)
-        self.assertIsNone(follower._pulling)
-        self.assertIn(silent.public, follower._bad_sources)
+        assert follower._pulling is not None, "expected a fresh pull to the still-eligible peer"
+        self.assertEqual(follower._pulling.peer, silent.public)
+        # sent_at is the new tick, not the old one -- proves it's a fresh pull, not the stale one.
+        self.assertEqual(follower._pulling.sent_at, T0 + POLL + PULL_TIMEOUT + 1)
+
+
+# --------------------------------------------------------------------------------------------- #
+# Priority-based pull picking (#no-shun-only-priority).                                         #
+# --------------------------------------------------------------------------------------------- #
+
+
+class TestPickPullSourcePriority(unittest.TestCase):
+    """`_pick_pull_source` prefers peers with a more recent successful reply (`_last_ok_at`),
+    falls back to reported head height, and NEVER excludes any peer above our head. Every
+    peer that reports a head above ours is a candidate every time."""
+
+    def test_recent_success_wins_over_older_success(self):
+        """Two peers above our head, one answered a poll more recently -- it gets picked."""
+        c = Cluster()
+        _run_cluster_producing_n_blocks(c, 2)
+        joiner_store = c.provisioned()
+        follower = _make_follower(joiner_store)
+        older = crypto.Keypair.generate()
+        newer = crypto.Keypair.generate()
+        follower.add_peer(older.public, now=T0)
+        follower.add_peer(newer.public, now=T0)
+
+        # Both report the same head; older's HeightReply arrives at T0, newer's at T0 + 1.
+        follower.receive(HeightReply(block_num=2, tip_hash=crypto.h(b"tip")), older.public, T0)
+        follower.receive(HeightReply(block_num=2, tip_hash=crypto.h(b"tip")), newer.public, T0 + 1)
+
+        # Priority: newer's _last_ok_at is more recent, so newer is picked.
+        self.assertEqual(follower._pick_pull_source(), newer.public)
+
+    def test_no_success_history_still_picked_when_only_candidate(self):
+        """A peer with NO `_last_ok_at` entry -- never verified anything -- is still picked
+        when nobody higher-priority exists. The default of 0 means 'pick last', not
+        'exclude'."""
+        c = Cluster()
+        _run_cluster_producing_n_blocks(c, 2)
+        joiner_store = c.provisioned()
+        follower = _make_follower(joiner_store)
+        rando = crypto.Keypair.generate()
+        follower.add_peer(rando.public, now=T0)
+
+        # Directly inject a HeightReport WITHOUT the _last_ok_at update path -- simulates a
+        # scenario where we know about a peer via some other channel but never got a valid
+        # reply from them. (In practice this is not how HeightReport arrives, but the picker
+        # must tolerate the state.)
+        follower._heads[rando.public] = HeightReport(block_num=2, tip_hash=crypto.h(b"tip"), at=T0)
+
+        # Rando has no _last_ok_at, but is the only peer above -- picked anyway.
+        self.assertEqual(follower._pick_pull_source(), rando.public)
+
+    def test_higher_head_wins_ties_on_recency(self):
+        """Two peers with equal `_last_ok_at`, different reported heights -- higher head
+        wins."""
+        c = Cluster()
+        _run_cluster_producing_n_blocks(c, 2)
+        joiner_store = c.provisioned()
+        follower = _make_follower(joiner_store)
+        lower = crypto.Keypair.generate()
+        higher = crypto.Keypair.generate()
+        follower.add_peer(lower.public, now=T0)
+        follower.add_peer(higher.public, now=T0)
+
+        # Both HeightReplys at the same `now` -- same _last_ok_at.
+        follower.receive(HeightReply(block_num=2, tip_hash=crypto.h(b"a")), lower.public, T0)
+        follower.receive(HeightReply(block_num=5, tip_hash=crypto.h(b"b")), higher.public, T0)
+
+        self.assertEqual(follower._pick_pull_source(), higher.public)
+
+    def test_failed_peer_stays_eligible_when_alone(self):
+        """A peer whose pull failed (bad block) has `_pulling` cleared but is NOT excluded.
+        When they're the only source above us, next tick picks them again."""
+        c = Cluster()
+        _run_cluster_producing_n_blocks(c, 2)
+        joiner_store = c.provisioned()
+        follower = _make_follower(joiner_store)
+        honest = c.nodes[0]
+        follower.add_peer(honest.me.public, now=T0)
+
+        # Honest is above us; picker picks honest.
+        follower.receive(
+            HeightReply(block_num=2, tip_hash=crypto.h(b"any")),
+            honest.me.public,
+            T0,
+        )
+        self.assertEqual(follower._pick_pull_source(), honest.me.public)
+
+        # Simulate a bad reply: cancel the (hypothetical) pull. Peer stays picked-eligible.
+        follower._pulling = None  # what a verification failure would leave us at
+        # Picker returns the same peer -- no exclusion happened.
+        self.assertEqual(follower._pick_pull_source(), honest.me.public)
 
 
 if __name__ == "__main__":

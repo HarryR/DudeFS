@@ -58,7 +58,7 @@ from .adapter import (
 
 class FollowerError(DudeError):
     """A misuse of the Follower API (called out of order, contradictory input). Not for peer
-    misbehaviour -- that is a silent drop, tracked via `_bad_sources`. Not for invariant
+    misbehaviour -- that is a silent drop that clears the in-flight pull. Not for invariant
     violation -- that is `InvariantError`."""
 
 
@@ -92,6 +92,12 @@ class Follower:
     and produces `SyncMsg` values at its `receive`/`outbox` boundary; touches Store only through
     `commit_block`.
 
+    NO BLACKLIST (#no-shun-only-priority). Every peer above our head is always a candidate for
+    the next pull. A peer that serves a bad block, times out, refuses, or reports a divergent
+    tip costs us one round-trip and loses priority -- but stays in the pool. Fault-tolerance
+    rests on retry, not on accumulating grudges: local exclusion state is state that can be
+    wrong forever (a network flap turns into a permanent misconfiguration).
+
     NOT thread-safe. Neither is Coordinator; both live inside a single-threaded Node."""
 
     me: crypto.Keypair
@@ -101,11 +107,11 @@ class Follower:
     _heads: dict[crypto.PublicKey, HeightReport] = field(default_factory=dict)
     _poll_at: dict[crypto.PublicKey, Millis] = field(default_factory=dict)
     _pulling: PullInFlight | None = None
-    _bad_sources: set[crypto.PublicKey] = field(default_factory=set)
-    """Peers dropped from the pull-source pool: they served a bad block, refused when they
-    said they had the height, or reported a divergent tip. Still polled (in case telemetry
-    cares) but not asked to serve GetBlock. In-memory only -- persistence is a post-L6 arc
-    (SPECv2 #sync-safety-vs-full-bft)."""
+    _last_ok_at: dict[crypto.PublicKey, Millis] = field(default_factory=dict)
+    """When each peer last gave us a valid reply (HeightReply or a SETTLED block that
+    committed). The ONLY per-peer priority signal (#no-shun-only-priority): peers with a
+    recent success are preferred by `_pick_pull_source`; peers with a stale or absent entry
+    are still candidates, just picked later. Local, in-memory only; resets on restart."""
     _outbox: list[OutboxItem] = field(default_factory=list)
 
     # -- membership ------------------------------------------------------------------------- #
@@ -137,12 +143,13 @@ class Follower:
         # XXX: dropped -- `HeightAsk` and `GetBlock` are the answering side's concern; the
         # Follower is the ASKING side. Node's dispatcher routes those to `serve_*` helpers.
 
-    def on_bad_reply(self, from_: crypto.PublicKey) -> None:
-        """The wire got a reply from `from_` that didn't decode. Drop as a pull source and
-        clear any in-flight pull to this peer. Called by Node when `decode` fails on
-        SETTLED_BLOCK -- a peer serving garbage is not a decoder concern, it's a source
-        concern."""
-        self._drop_source(from_)
+    def cancel_pull(self, from_: crypto.PublicKey) -> None:
+        """Cancel the in-flight pull if it's to `from_`. Called by Node when a SETTLED_BLOCK
+        reply from `from_` didn't decode at the wire boundary -- we've wasted this round-trip,
+        but no state persists (#no-shun-only-priority). Next tick's picker retries, priority-
+        ordered by recent success."""
+        if self._pulling is not None and self._pulling.peer == from_:
+            self._pulling = None
 
     def tick(self, now: Millis) -> None:
         """Advance time. Poll peers whose deadline has passed; time out an in-flight pull that
@@ -152,16 +159,13 @@ class Follower:
             if now >= deadline:
                 self._enqueue(peer, HeightAsk())
                 self._poll_at[peer] = now + self.tunables.poll_interval
-        # 2. Pull timeout: if we've been waiting too long, give up on this peer for this pull.
+        # 2. Pull timeout: clear the in-flight pull. Per #no-shun-only-priority, the peer
+        # stays picked-eligible; its priority signal `_last_ok_at` didn't advance for this
+        # exchange, so the picker naturally prefers peers that DID reply successfully.
         p = self._pulling
         if p is not None and now - p.sent_at > self.tunables.pull_timeout:
-            # XXX: dropped -- peer did not answer in time. This peer stays polled (its
-            # HeightReply is still evidence toward caught_up) but is a `_bad_sources` for now;
-            # a future refinement could track "unhelpful for this block_num" instead of a
-            # blanket drop.
-            self._bad_sources.add(p.peer)
             self._pulling = None
-        # 3. If not pulling and any healthy peer is above us, pull.
+        # 3. If not pulling and any peer is above us, pull.
         if self._pulling is None:
             source = self._pick_pull_source()
             if source is not None:
@@ -203,20 +207,21 @@ class Follower:
     # -- inbound dispatch ------------------------------------------------------------------- #
 
     def _on_height_reply(self, msg: HeightReply, from_: crypto.PublicKey, now: Millis) -> None:
-        # Fork detection: same block_num as ours but different tip means we're on different
-        # chains (#poll-detects-divergent-tips). Drop as a sync source, keep the report for
-        # observability.
-        my_num = self.store.head_block_num() or 0
-        my_tip = self.store.head_block_hash()
-        if my_tip is not None and msg.block_num == my_num and msg.tip_hash != my_tip:
-            self._bad_sources.add(from_)
+        # Fork detection at poll-time is an observability signal, not an exclusion decision
+        # per #poll-detects-divergent-tips and #no-shun-only-priority. Same block_num with a
+        # different tip means we and this peer are on different chains, but WE may be the
+        # wrong side. Record the report; sync itself stays safe because a peer on the wrong
+        # chain serves blocks that fail chain-link check on our side.
         self._heads[from_] = HeightReport(msg.block_num, msg.tip_hash, now)
+        # A valid HeightReply is a success signal for the picker priority. Peers that answer
+        # our polls become higher-priority pull candidates than peers that go silent.
+        self._last_ok_at[from_] = now
 
     def _on_settled_block(  # noqa: PLR0911 -- verification pipeline is intentionally linear
         self,
         msg: SettledBlockReply,
         from_: crypto.PublicKey,
-        now: Millis,  # noqa: ARG002 -- reserved for pull-latency telemetry
+        now: Millis,
     ) -> None:
         p = self._pulling
         if p is None or from_ != p.peer:
@@ -227,25 +232,25 @@ class Follower:
         sb = sbwb.block
         # -- Verify block_num matches what we asked for --
         if sb.anchors.block_num != p.block_num:
-            self._drop_source(from_)
+            self._pulling = None
             return
         # -- Verify chain link against our current head (or genesis for the first block) --
         expected_prev = self.store.head_block_hash()
         if expected_prev is None:
             expected_prev = genesis_stamp(self._require_anchor())
         if sb.anchors.prev_block != expected_prev:
-            self._drop_source(from_)
+            self._pulling = None
             return
         # -- Verify body-block correspondence (bodies are a subset of slice hashes) --
         body_hashes = frozenset(tx.op_hash for tx in sbwb.bodies)
         slice_hashes = frozenset(sb.block.hashes)
         if not body_hashes.issubset(slice_hashes):
-            self._drop_source(from_)
+            self._pulling = None
             return
         # -- Verify each body's own signature --
         for tx in sbwb.bodies:
             if not tx.verify():
-                self._drop_source(from_)
+                self._pulling = None
                 return
         # Authorize the block. Management encapsulates the multisig verify (against the
         # current roster) AND the manager-slot override (against `store.anchor()`); a True
@@ -256,14 +261,14 @@ class Follower:
         if not self.mgmt.authorization(
             sb.signers, sb.settle_sigs, _settle_payload(sb.block.slice_hash, sb.anchors)
         ):
-            self._drop_source(from_)
+            self._pulling = None
             return
         # Preview via Layer, verify computed anchors match signed anchors, THEN commit. This
         # is the peer-omission catch: a peer serving a subset of the real applied set would
         # produce different projected anchors and we drop before touching Store.
         bodies_ordered = tuple(sorted(sbwb.bodies, key=lambda tx: tx.op_hash))
         if not self._preview_matches_signed_anchors(bodies_ordered, sb.anchors):
-            self._drop_source(from_)
+            self._pulling = None
             return
         # -- Commit. `first_height` is `store.head() + 1` at this moment (mirrors
         #    coordinator's `base_head + 1`), since we're about to apply bodies_ordered.
@@ -277,6 +282,9 @@ class Follower:
             batch=bodies_ordered,
             auth=self.mgmt,
         )
+        # Success signal: this peer served us a verified block. Bumps their picker priority
+        # for the next pull (#no-shun-only-priority).
+        self._last_ok_at[from_] = now
         self._pulling = None
 
     def _on_refused(
@@ -289,12 +297,9 @@ class Follower:
         if p is None or from_ != p.peer:
             # XXX: dropped -- refusal to something we didn't ask, or from a peer we didn't ask.
             return
-        # For now, any refusal clears the pull and marks the peer as unhelpful. A future
-        # refinement could keep the peer as a source but skip THIS block_num against them
-        # (NOT_YET_SETTLED means "try again later against this peer", UNKNOWN means "never
-        # ask them again"). Keeping the two treatments identical avoids a state explosion
-        # until scenarios demand the distinction.
-        self._bad_sources.add(from_)
+        # Refusal is a valid protocol response but not what we wanted. Clear the pull and try
+        # someone else next tick (#no-shun-only-priority). We don't advance `_last_ok_at` --
+        # the peer didn't help us -- so the picker naturally prefers peers that DID.
         self._pulling = None
 
     # -- internals -------------------------------------------------------------------------- #
@@ -302,25 +307,20 @@ class Follower:
     def _enqueue(self, peer: crypto.PublicKey, msg: SyncMsg) -> None:
         self._outbox.append((peer, msg))
 
-    def _drop_source(self, peer: crypto.PublicKey) -> None:
-        """Move a peer to `_bad_sources` and clear any in-flight pull to that peer."""
-        self._bad_sources.add(peer)
-        if self._pulling is not None and self._pulling.peer == peer:
-            self._pulling = None
-
     def _pick_pull_source(self) -> crypto.PublicKey | None:
-        """Highest-reporting healthy peer above our head, or None. Ties broken arbitrarily
-        (dict order, which Python guarantees is insertion-order stable)."""
+        """Highest-priority peer above our head, or None (#no-shun-only-priority).
+
+        Priority = most recent successful reply (`_last_ok_at`); ties fall back to reported
+        head height; further ties use dict insertion order (Python-stable). Every peer above
+        our head is a candidate -- there is no exclusion, no blacklist. A peer that failed
+        us in the past retains eligibility; its `_last_ok_at` just didn't advance, so
+        recently-successful peers are picked first."""
         my_num = self.store.head_block_num() or 0
-        best: tuple[Index, crypto.PublicKey] | None = None
-        for peer, hr in self._heads.items():
-            if peer in self._bad_sources:
-                continue
-            if hr.block_num <= my_num:
-                continue
-            if best is None or hr.block_num > best[0]:
-                best = (hr.block_num, peer)
-        return best[1] if best else None
+        candidates = [(peer, hr) for peer, hr in self._heads.items() if hr.block_num > my_num]
+        if not candidates:
+            return None
+        candidates.sort(key=lambda p_hr: (-self._last_ok_at.get(p_hr[0], 0), -p_hr[1].block_num))
+        return candidates[0][0]
 
     def _require_anchor(self) -> crypto.PublicKey:
         """The manager pubkey. Must be present -- a node without an anchor is unprovisioned

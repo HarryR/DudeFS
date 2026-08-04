@@ -272,6 +272,42 @@ Two ECMH accumulators, and they answer different questions.
 - The store id is cleartext in every operation, so a node can check `author may write store`
   without ever seeing a key.
 
+### The anchor is the axiom {#anchor-is-the-axiom}
+
+- A store has one **anchor** — the pubkey provisioned at `store.provision(anchor)`. It is the
+  root of trust: `may_write` returns True for the anchor against any `store_id`, without
+  consulting any grant record. Checking the anchor's authority against a log the anchor itself
+  authorises would be circular; treating them as always-may-write is what makes bootstrap a
+  manager-signed block rather than a special-cased evaluator bypass.
+- The anchor is **immutable per store**. `store.provision()` is one-shot; no operation
+  replaces `store.anchor()`. Anchor rotation is deferred — loss of the anchor cold-key
+  permanently ends the cluster's emergency-intervention capability, while the ordinary
+  consensus path continues to work unimpaired.
+- The anchor is the **only** identity that may exercise the block-level override
+  (#manager-sig-overrides-quorum). A `Role.MANAGER` grant does NOT confer this power — see
+  #role-manager-grant.
+- Emergency intervention MUST use the same block construction as bootstrap, via one shared
+  code path. There is no separate "emergency intervention" wire shape or evaluator branch:
+  same manager-slot bitmap, same settle payload, same follower verification. What differs
+  between bootstrap and later interventions is only the state of the store (empty vs.
+  populated) at the moment of construction.
+
+### Role.MANAGER is a normal grant with blanket authorship {#role-manager-grant}
+
+- `Role.MANAGER` is one of the ordinary roles (alongside `NODE`, `CLIENT`, `COMPACTOR`) granted
+  via `authorise` (#possession-proof required, same as every grant). A cluster MAY have zero,
+  one, or many Role.MANAGER identities at any time.
+- Role.MANAGER grants confer **blanket authorship**: `may_write` returns True for any
+  `store_id`, and `may_send` returns True for any operation kind. They do NOT confer the
+  anchor's block-level override.
+- Rotation is ordinary. A Role.MANAGER identity is added by `authorise` and removed by
+  `revoke` (#absence-is-revocation). The change is one transaction, quorum-authorized or
+  anchor-authorized like any other grant mutation.
+- The layering intent: the anchor is cold and unrotatable (see #trust-tiers — "manager: root
+  of trust; cold; offline ~99% of the time"); Role.MANAGER identities are its warm-online
+  delegates that carry day-to-day management authority. Blanket authorship is a large hammer,
+  but every use is log-visible (signed op, signed grant of the role, signed revocation).
+
 ### Roster and grants are settled state {#authority-is-log-state}
 
 - The set of authorised nodes, the set of authorised writers, and every grant MUST be entries in
@@ -849,11 +885,13 @@ turns that into a SETTLED block.
     pubkey alone -- no roster needed pre-block-1. See `dude.consensus.bootstrap`.
   - **Emergency intervention**: post-bootstrap, the manager can sign a block to unstick a
     hung cluster (settlement-may-hang tail case) or replace a compromised roster. Uses the
-    same slot; the follower's verification path is uniform.
-- **Security implication**: manager key compromise = ability to sign fraudulent blocks
-  unilaterally. This IS the trust model already (manager is the anchor of all authority);
-  this rule makes the implication concrete and elevates the importance of manager key
-  rotation to the level of roster rotation. Not a new threat, just made wire-visible.
+    same slot AND the same block construction (#anchor-is-the-axiom mandates one shared
+    code path); the follower's verification path is uniform.
+- **Security implication**: anchor key compromise = ability to sign fraudulent blocks
+  unilaterally. This IS the trust model already (the anchor is the axiom of all authority --
+  #anchor-is-the-axiom); this rule makes the implication concrete and wire-visible. There
+  is no anchor rotation mechanism (deferred, see #anchor-is-the-axiom), so anchor-key hygiene
+  is operationally paramount and cannot be delegated to a rotation cadence.
 - **Hybrid blocks**: a block with both a quorum of roster sigs AND the manager sig is
   permitted but not produced by any current path -- either sig set alone authorizes, and
   a producer would not add the redundancy. Follower accepts hybrids on verification via
@@ -971,14 +1009,17 @@ SMT proofs, and any compaction-aware sync path are deferred (see #compaction-def
 - If a peer's `HEIGHT_REPLY` names the same `n` as the joiner's own head but a DIFFERENT
   `tip_hash`, the joiner and peer are on different chains at that height — a fork, or one of
   them has been corrupted.
-- The joiner MUST drop that peer as a sync source (a peer on the wrong chain can serve no useful
-  block) and log the divergence loudly enough for observability to catch. It MUST NOT try to
-  reconcile automatically: a real fork is a human problem, and silent auto-resolution would risk
-  adopting the wrong side.
+- Fork detection is an **observability signal, not an exclusion decision**. The joiner MUST
+  log the divergence loudly enough for humans/tooling to catch, and MUST NOT try to reconcile
+  automatically (a real fork is a human problem, silent auto-resolution risks adopting the
+  wrong side). The joiner MUST NOT blacklist the peer on this evidence alone — WE may be the
+  side that is wrong, and locking in "they're bad" against evidence that could point either
+  way is a permanent local misconfiguration waiting to happen (#no-shun-only-priority).
 - Fork detection at poll time — before any block pull — is the payoff of carrying `tip_hash`
   in `HEIGHT_REPLY` rather than just `n`. Without it, divergence surfaces only when a
   chain-link check fails during a pull, which is later and with less signal about which peer
-  drifted.
+  drifted. Either way, sync itself is safe: a peer on the wrong chain serves blocks that fail
+  chain-link check on our side, so nothing bad ends up in our Store.
 - A same-height matched tip is the affirmative signal: the joiner and peer agree on the chain
   up to `n`. This is what f+1 concordance rests on.
 
@@ -986,10 +1027,33 @@ SMT proofs, and any compaction-aware sync path are deferred (see #compaction-def
 
 - `HEIGHT_REPLY` is UNSIGNED and MUST NOT be trusted for any signed statement. It drives the
   "am I behind?" decision and nothing else. A peer that lies about its height wastes our pull
-  request — we ask for `GETBLOCK(N)`, they refuse (or reply with a block that fails chain
-  verification), we drop them from the poll set.
+  request — we ask for `GETBLOCK(N)`, they refuse or reply with a block that fails chain
+  verification, we retry against another peer (#no-shun-only-priority — no exclusion, just a
+  cheap round-trip).
 - Correctness rests entirely on the block payload's own verification (chain link + settle_sigs
   against roster-at-height). The height poll is a scheduling hint; the block-pull is the truth.
+
+### Sync tolerates misbehaving peers; it does not shun them {#no-shun-only-priority}
+
+- Sync fault-tolerance rests on RETRY, not on ACCUMULATING GRUDGES. A peer that serves a bad
+  block, times out on a pull, refuses a GETBLOCK, or reports a divergent tip MUST NOT be
+  blacklisted, banned, or permanently deprioritised. Every peer above our head remains a
+  candidate for the next pull.
+- The follower MAY track a per-peer **priority signal** — most naturally, the timestamp of
+  the peer's last valid reply — and prefer peers with more recent success when picking a pull
+  source. This is a scheduling preference, not an exclusion decision: a peer with a stale (or
+  absent) priority signal is still picked when it is the only source above our head or when
+  higher-priority peers are exhausted.
+- The rationale: any exclusion path is a path by which a byzantine or transient event can
+  cause a node to permanently mis-classify honest peers as bad. Local shun state is state
+  that can be wrong forever (a network flap turns into a permanent grudge; a fork-detection
+  false-positive locks out the honest majority). Better to pay a bounded per-pull retry cost
+  than to carry a hidden misconfiguration across restarts. See #sync-safety-vs-full-bft: sync
+  is safe against `< f+1` malicious peers WITHOUT any exclusion mechanism.
+- If cross-node evidence retention and manager-driven ejection ever land (currently OWED in
+  the Trust section), those act on GLOBAL, ATTESTED evidence via management ops that touch
+  the roster — not on local per-follower blacklists. Local shun would not compose with them
+  and MUST NOT be introduced as a shortcut.
 
 ### GETBLOCK refuses with a reason when the block is absent {#getblock-refuses-with-reason}
 
@@ -1054,14 +1118,19 @@ SMT proofs, and any compaction-aware sync path are deferred (see #compaction-def
   authority (#per-tx-authority-verified-at-replay). Under the standard threat model (fewer
   than `f+1` colluding nodes), a joiner cannot be lied into a false head or a false block.
 - L6 does NOT deliver **full BFT observability**: cross-author attestation retention,
-  monotonicity conviction across time, shun-as-local-read-policy against convicted keys, and
-  manager-driven ejection on evidence. Those are the SPECv2 Trust section rows (currently
-  OWED, deferred alongside settlement-first-consumer note). They are needed to actively
-  detect-and-eject adversaries; they are NOT needed to keep sync itself safe against them.
+  monotonicity conviction across time, and manager-driven ejection on evidence. Those are
+  the SPECv2 Trust section rows (currently OWED). They are needed to actively detect-and-
+  eject adversaries; they are NOT needed to keep sync itself safe against them.
+- Local per-follower blacklists were explicitly REJECTED (#no-shun-only-priority). The
+  follower does not maintain any "banned peer" state — no `_bad_sources`, no persistent
+  denylist, no fork-detection exclusion. Every peer above our head remains a candidate for
+  the next pull; a priority signal (most recent successful reply) is the only per-peer state
+  and it decays naturally as time passes.
 - The line is honest debt: an active adversary at `< f+1` cannot break sync but MAY cost
-  wasted round-trips (a lying peer refused, dropped, retried against another). Ejection would
-  make the cost `O(1)` instead of `O(retries)`. L6 tolerates the cost; ejection is a
-  post-L6 arc.
+  wasted round-trips (a lying peer refused, retried against another). Ejection via management
+  op would make the cost `O(1)` instead of `O(retries)`. L6 tolerates the cost; ejection is
+  a post-L6 arc via the Trust section — global, attested, log-visible, and composable with
+  the roster mechanism, not a local shortcut.
 
 ### Compaction is deferred {#compaction-deferred}
 
@@ -1345,6 +1414,12 @@ visible rather than plausible.
 | authority is store-scoped | `Management.may_write` |
 | roster changes are one transaction | `Management.add_node` / `set_roster` return one `Transaction` |
 | revocation is deletion of a row | `Management.revoke` returns a `Del` |
+| the anchor is always authorised (#anchor-is-the-axiom) | `Management.may_write` short-circuits True for `who == self.store.anchor()`; `Management.may_send` treats the anchor via the same rule; `Management.authorization` reserves bitmap slot `N` for the anchor pubkey |
+| the anchor is the only identity that may exercise the block override (#anchor-is-the-axiom) | `Management.authorization` verifies bitmap slot `N` against `self.store.anchor()` -- no `Role.MANAGER` grant reaches that slot |
+| anchor rotation is deferred (#anchor-is-the-axiom) | **deferred** -- `Store.provision` is one-shot; no operation replaces `store.anchor()`. Loss of the anchor cold-key ends emergency-intervention capability, not the cluster |
+| bootstrap and emergency intervention share ONE block-construction path (#anchor-is-the-axiom) | Both call `dude.consensus.bootstrap._build_manager_signed_block(...)` (or equivalent shared helper); no `sign_by_manager` on `SettledBlock` outside that helper |
+| Role.MANAGER confers blanket authorship (#role-manager-grant) | `Management.may_write` returns True on `g.role is Role.MANAGER` for any `store_id`; `Management.may_send` returns True on `g.role is Role.MANAGER` for any kind |
+| Role.MANAGER grants rotate via ordinary authorise/revoke (#role-manager-grant) | `Management.authorise(who, role=Role.MANAGER, pop=...)` creates the grant; `Management.revoke(who)` removes it; both are ordinary `Transaction`s subject to quorum or anchor authorization |
 
 ### L3 mempool
 
@@ -1416,14 +1491,15 @@ visible rather than plausible.
 | sync is log replay (#sync-is-log-replay) | `Follower._on_settled_block` — chain link + settle_sigs + body-block correspondence + body sigs + preview-anchors-match, then `store.commit_block` |
 | per-tx authority at replay (#per-tx-authority-verified-at-replay) | `Follower._preview_matches_signed_anchors` → `settle.apply_to` → `Management.may_write` — same evaluator/authoriser as production |
 | routine height polling is the trigger (#height-poll-is-the-trigger) | `Follower.tick` iterates `_poll_at`, emits `HeightAsk`; `Follower.caught_up()` requires f+1 fresh witnesses at `(my_num, my_tip)` |
-| same-height mismatched tip = divergence (#poll-detects-divergent-tips) | `Follower._on_height_reply` — `my_tip is not None and block_num == my_num and tip_hash != my_tip` → `_bad_sources.add(from_)` |
-| height is a hint, never a floor (#height-is-a-hint) | `HeightReply` is unsigned at message layer; verified only by the full GETBLOCK pull; `_bad_sources` catches liars at chain-link check |
+| same-height mismatched tip = divergence (#poll-detects-divergent-tips) | `Follower._on_height_reply` observes the mismatch; it is stored as a HeightReport (observability signal) but does NOT feed any exclusion decision. Fork resolution is human/tooling territory per #no-shun-only-priority. |
+| height is a hint, never a floor (#height-is-a-hint) | `HeightReply` is unsigned at message layer; verified only by the full GETBLOCK pull; a peer that lies about height wastes one round-trip and loses priority (no exclusion) |
 | GETBLOCK refuses with reason (#getblock-refuses-with-reason) | `SyncRefusal` closed enum (`NOT_YET_SETTLED`, `UNKNOWN`, `INVALID`); `Refused` message; `serve_getblock` returns typed refusals |
 | sync in its own module (#sync-in-its-own-module) | **structural** — `dude/sync/` package; Coordinator and Follower share only `Store`; neither imports the other |
 | roster walks forward with the log (#roster-walks-forward) | Follower applies blocks in `block_num` order via `commit_block`; roster is read via `Management(store).roster()` on demand, so it grows with the log naturally |
 | SMT is not part of sync (#smt-for-light-clients) | **deferred** — sync ships bodies, not SMT proofs; light-client path is a post-M7 arc |
 | sync test shape (#sync-test-shape) | `dude/tests/test_sync.py` direct-wired `Follower` scenarios (6 test classes); `dude/tests/test_sync_e2e.py` full-stack |
-| sync safety vs full BFT (#sync-safety-vs-full-bft) | **deferred** — persistence of `_bad_sources` and cross-attestation retention are noted future arcs; `_bad_sources` is in-memory today |
+| tolerance, not shunning (#no-shun-only-priority) | `Follower` maintains no blacklist. Priority-based `_pick_pull_source` prefers peers with the most recent successful reply (`_last_ok_at`); every peer above our head remains a candidate. On any failure -- bad decode, chain-link violation, timeout, refusal, fork detection -- the in-flight pull clears and next tick picks again from the same pool. |
+| sync safety vs full BFT (#sync-safety-vs-full-bft) | **deferred, no local state to persist** -- with no blacklist there is no persistence question; the priority signal (`_last_ok_at`) is in-memory-only and self-heals on restart. Global adversary detection lives in the Trust section (OWED). |
 
 ### Transport
 

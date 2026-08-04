@@ -272,14 +272,15 @@ class Node:
     def _on_settled_block(self, env: SignedEnvelope, now: Millis) -> None:
         """A peer's answer to our GETBLOCK. Decode, route to the Follower, which runs the full
         verify pipeline (chain link + settle_sigs + body-sig + preview-anchors-match) and
-        commits on success -- or drops the peer on any failure (#sync-is-log-replay). A decode
-        failure means the peer served garbage; drop as a pull source via `on_bad_reply`."""
+        commits on success -- or clears the in-flight pull on any failure
+        (#sync-is-log-replay + #no-shun-only-priority). A decode failure means the peer served
+        garbage; cancel the pull so next tick picks another peer."""
         try:
             msg = SyncMsg.decode(env.env.verb, env.env.body)
         except (SyncAdapterError, DudeError):
             # SettleError (from SettledBlockWithBodies.decode) is a DudeError; either shape of
             # decode failure means the pulling peer served garbage.
-            self.follower.on_bad_reply(env.frm)
+            self.follower.cancel_pull(env.frm)
             return
         self.follower.receive(msg, env.frm, now)
 

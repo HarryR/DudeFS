@@ -227,7 +227,13 @@ class Management:
 
     def may_send(self, who: crypto.PublicKey, kind: int) -> bool:
         """Whether `who` may author an operation of this kind — the grant that has no store, e.g. a
-        compaction (#coarse-acl)."""
+        compaction (#coarse-acl).
+
+        THE ANCHOR IS ALWAYS AUTHORISED (#anchor-is-the-axiom), same rule as `may_write` --
+        applied consistently here so `may_write` and `may_send` do not disagree about the
+        axiomatic identity."""
+        if who == self.store.anchor():
+            return True
         g = self.grant_of(who)
         if g is None:
             return False
