@@ -107,6 +107,28 @@ class Verb(IntEnum):
     """The reply to GETBLOCK. Body is `SettledBlock.encode()`. Peers serve from `store.settled_at`
     (persisted at commit time, #block-shape-settled)."""
 
+    # -- light-client retrieval (#light-client, #light-client-get, #light-client-cert-chain) --- #
+    GET_ANCHORS = 40
+    """A light client asks: what is your current head, and (optionally) the current identity
+    chain? Body carries `known_roster_fingerprint | None` -- the responder omits the roster
+    bundle when the client already has the current one cached."""
+    ANCHORS_REPLY = 41
+    """`(anchors, signers, settle_sigs, roster_fingerprint, roster_bundle | None)`. A light
+    client uses this for `f+1` corroboration of the head (#light-client-freshness) plus
+    first-time or fingerprint-mismatch identity-chain fetch (#light-client-cert-chain)."""
+    GET_PROOF = 42
+    """A light client asks for `(store_id, name, block_num)` and receives a value or
+    non-membership proof against `anchors.state_root` at that block_num
+    (#light-client-get, #light-client-nonmembership). Any one responder that holds the state
+    can serve; the client verifies the proof against a state_root it already trusts."""
+    PROOF_REPLY = 43
+    """`(value | ABSENT, proof, state_root)`. Verified by the client against its trusted
+    state_root; failure to match is drop-and-retry, not a fault against the responder."""
+    LITE_REFUSED = 44
+    """A refusal to serve a light-client request. Distinct verb from `REFUSED` so
+    `_DECODERS` can dispatch unambiguously by verb without conflating sync-refusal and
+    lite-refusal enums. Carries a `LiteRefusal` reason."""
+
     # -- diagnostics ---------------------------------------------------------------------------- #
     REFUSED = 90
     """A refusal, carrying a reason. Never silence: a client can only correct a clock fault if it is

@@ -1558,6 +1558,112 @@ rather than an environment it has to arrange.
 - A request whose answer is only ever solicited MUST be registered as awaiting a reply. An
   unregistered request is answered correctly and its answer discarded at the door, which is silent.
 
+### P_NODE stores endpoints, not bare addresses {#peer-endpoint-in-log}
+
+- Each P_NODE row's address field MUST store encoded `Endpoint`s, not raw address bytes. An
+  `Endpoint` is `(Address, options: Mapping[bytes, bytes])` where `options` carry per-endpoint
+  configuration only the transport for that scheme understands (TLS material, mixnet profile,
+  connection-concurrency limits).
+- Bare address storage discards the options field, so any per-peer transport configuration a
+  manager wants to set — the whole reason `Endpoint.options` exists — is silently unrepresentable
+  in the log. Rectifies the mismatch between what `Endpoint.parse` accepts (bare address OR full
+  encoded endpoint, both well-defined shapes) and what P_NODE actually writes today (bare only).
+- The #cert on the P_NODE row covers row content, which now includes the endpoint options. A
+  manager who edits options edits a cert-attested field; a hostile responder cannot fake options
+  without a manager key.
+- Existing P_NODE rows carrying bare addresses stay decodable — `Endpoint.parse` already accepts
+  the shorter form (address.py's "shorter well-defined form" latitude). New writes MUST use the
+  encoded-Endpoint form.
+
+### Endpoint options carry per-peer transport config, not global tunables {#peer-options-are-endpoint-options}
+
+- `LinkTunables` today carries a mix: some fields are genuinely cluster-wide policy (breaker
+  thresholds, retry-budget ratios), others are per-endpoint deployment choices in disguise. The
+  per-endpoint ones belong in `Endpoint.options`, not in a global tunables surface copied
+  per-peer at construction.
+- The rule for what goes where: **if a setting changes where the bytes go, it belongs in the
+  address; if only the transport for that endpoint reads it, it belongs in the options; if it is
+  a policy the whole cluster agrees on, it belongs in the tunables surface**. Anything else
+  couples a per-deployment choice into a per-cluster dial.
+- `LinkTunables` shrinks accordingly. A per-peer field that survives there is a candidate for
+  the next audit.
+
+### Postman owns dialling; scheme resolution is module-level {#postman-owns-dialling}
+
+- `Postman` is the sole owner of peer lifecycle. Its public API is `add_peer(pubkey, endpoints)`,
+  `remove_peer(pubkey)`, and the outbound-send / inbound-deliver path already there. **Nothing
+  outside Postman writes to `postman.peers` directly.** The dict-mutation path was a leak — it
+  meant peer wire configuration lived above the transport-owning layer, in every caller.
+- The scheme-to-dialler mapping (`Scheme → Callable[[Endpoint], Transport]`) lives at
+  module scope in `dude.net.postman`. It is a deployment fact ("this build can dial UNIX and TCP,
+  test builds also dial INPROC"), not a per-Postman configuration. Deployments register their
+  diallers at process startup; `add_peer` looks up each endpoint's scheme in the map.
+- Postman does not know how any transport works internally, and no transport knows about any
+  other transport. `add_peer(pubkey, endpoints)` composes: for each endpoint, dispatch on scheme;
+  construct the transport by calling the dialler with the endpoint (options and all); hand the
+  result to `Peer.reconfigure`.
+- **`Node.connect(pubkey, transport)` is deleted.** Callers that used to pre-construct a
+  transport and hand it in now let Postman do it, driven by the roster (#roster-drives-peers).
+
+### The Node reconciles its peers from the roster on tick {#roster-drives-peers}
+
+- On every `Node.tick(now)`, the node MUST reconcile `postman.peers` against
+  `mgmt.roster() ∪ (identities holding a valid P_GRANT with role CLIENT or COMPACTOR)`. New
+  members get `postman.add_peer(pubkey, endpoints)` where `endpoints` come from the P_NODE row's
+  now-encoded endpoint field (or from a CLIENT's own P_GRANT-adjacent record where the shape
+  lands). Departed members get `postman.remove_peer(pubkey)`.
+- The gap this closes: today `postman.peers` is populated ONCE at cluster construction by an
+  external caller (`Node.connect`), and no path from a settled `change_roster` reaches the
+  transport layer. A `change_roster(add=X)` produces a roster in which X exists on paper but
+  nobody in the cluster can send to X — X sits silent forever. `change_roster(remove=X)` leaves
+  a stale transport open. Neither case is caught by any test in the tree because the entire test
+  surface wires all peers statically at t=0.
+- **Existing tests are load-bearing under the OLD assumption** (static roster after
+  construction) and stay working under the new one, because reconciliation converges to the same
+  peer set on the first tick after genesis lands. But the test surface MUST also include one
+  case where a roster change happens post-construction and the transport layer reflects it —
+  otherwise this row is enforced by convention and nothing catches a regression.
+- CLIENT and COMPACTOR identities need to be in `postman.peers` because nodes REPLY to them —
+  outbound goes through Postman regardless of whether the counter-party is a roster member.
+  Grant absence is the eviction signal, mirroring how #absence-is-revocation acts at every other
+  authority check.
+
+### InProc is a paired loopback, not a routing switchboard {#inproc-is-a-loopback}
+
+- The `InProc` transport MUST be shaped like every other transport this codebase implements:
+  it names one endpoint, sends bytes to another endpoint's address, and receives bytes addressed
+  to it. That is the whole of `Transport`. TCP over sockets, UNIX over sockets, and InProc over
+  a module-scope dictionary all match this shape.
+- `Switchboard` was a routing table that duplicated what Postman was supposed to do, with a
+  test-only partition table bolted on. Both duties leave InProc. The routing table becomes a
+  module-scope `_INBOXES: dict[str, InProc]` — registration happens in `InProc.__post_init__`,
+  unregistration in `close()`. Sends do a module-level lookup, exactly the way TCP delegates
+  to the kernel's socket table.
+- Callers construct an InProc for their own identity; the module registry does the rest.
+  Cluster construction stops passing a `Switchboard` around because there is nothing to pass —
+  the process itself is the switchboard.
+- Rationale is the SPEC's own claim about transports: **the point of InProc is that everything
+  above the carrier is exercised for real**. A routing table on top of the carrier defeats that
+  point — Postman's routing goes untested because InProc quietly does the routing instead.
+
+### Partitions live in tests, not in transports {#partitions-are-test-only}
+
+- The protocol has no notion of a partition. From either side, a partition looks like silence —
+  which is what the retry + breaker + timeout machinery already models. Adding a "partition"
+  concept inside the transport is protocol logic done at the wrong layer, and test scaffolding
+  smuggled into production code.
+- Tests that need to simulate a partition remove the target from the sender's `postman.peers`:
+  `postman.remove_peer(pubkey)`. Symmetric partition removes on both sides. This IS what the
+  protocol sees when a partition really happens — the sender's routing table has no live path
+  to the target.
+- Whole-graph tuning is the same primitive: any pairwise reachability the test wants to model
+  is expressed by choosing which peers each Postman has. No `cut/heal` methods anywhere; no
+  `_PARTITIONED` set inside a transport.
+- `Switchboard.cut/heal` is retired. `test_gestalt` and any other partition-using test migrates
+  to the `remove_peer` pattern. `test_round`'s own partition scaffolding, which already sits
+  above the transport, is unaffected — it was doing the right thing all along and only
+  confirmed that partition-in-transport was the mistake.
+
 ### RTT sampling must be attributable {#rtt-attribution}
 
 - A sample MUST come only from a message transmitted exactly once, on exactly one link. Karn &
@@ -1778,6 +1884,12 @@ visible rather than plausible.
 | sign then seal | `envelope.py`: `SignedEnvelope` then `seal` |
 | a peer is an identity, correlation is `(peer, mid)` | `Mailbox.arrived` |
 | a solicited-answer request is registered as awaiting | `Mailbox.post(await_reply=True)` (required parameter) |
+| P_NODE stores endpoints (with options), not bare addresses (#peer-endpoint-in-log) | **OWED** — `Management.change_roster` and `nodes()` currently encode/decode `codec.encode([list(rec.addresses), ...])` as raw address bytes. Lands with the Postman-owns-dialling wave (Wave A of #postman-owns-dialling) |
+| endpoint options carry per-peer transport config (#peer-options-are-endpoint-options) | **OWED** — `LinkTunables` is still applied per-peer from a global at `node.py:158`. Field-by-field audit + migration to `Endpoint.options` lands with #postman-owns-dialling |
+| Postman owns dialling; scheme→dialler is module-level (#postman-owns-dialling) | **OWED** — `Postman` today has no `add_peer`/`remove_peer`, no dialler map; peer configuration lives in `Node.connect(pubkey, transport)` external calls. Deletion of `Node.connect` and introduction of the module map lands as its own wave |
+| the Node reconciles peers from the roster on tick (#roster-drives-peers) | **OWED** — no reconciliation exists. Rows in P_NODE do not currently reach the transport layer post-genesis. Gate for the light-client work: this must land first |
+| InProc is a paired loopback, not a routing switchboard (#inproc-is-a-loopback) | **OWED** — `dude/net/transports/inproc.py` currently has `Switchboard` as an explicit routing object with a shared inbox dict; every cluster test passes it around. Reshaping to module-level registry lands with #postman-owns-dialling; existing tests migrate to the new shape |
+| partitions live in tests, not in transports (#partitions-are-test-only) | **OWED** — `Switchboard.cut/heal` and `partitioned: set` are still there and used by `test_gestalt`. Retire with the InProc reshape; migrate `test_gestalt`'s partition case to `postman.remove_peer` |
 | RTT sample only from a single-attempt, single-link message | `Mailbox.arrived` returns unattributable otherwise |
 | timeouts are built from variance, per-link | `net.link.Peer` (RTO from SRTT + 4·RTTVAR) |
 | only the breaker declares a link down | `net.link.Breaker` |
