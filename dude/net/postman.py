@@ -152,6 +152,30 @@ class Postman:
         (#partitions-are-test-only): remove the target from both sides."""
         self.peers.pop(pubkey, None)
 
+    def attach_transport(self, scheme: Scheme, transport: Transport) -> None:
+        """Inject a pre-constructed transport for `scheme`, bypassing the module-scope
+        dialler. Idempotent -- re-attaching the same instance is a no-op; replacing
+        with a different instance is an error, because links already built against the
+        first transport would silently keep using it.
+
+        THE ASYMMETRY BETWEEN INPROC AND TCP LIVES HERE. The `Dialler` contract
+        assumes the endpoint tells the transport how to construct itself: for InProc
+        the endpoint's value IS a stable identity, so `dial(endpoint, me)` can
+        construct a fresh loopback. For TCP the endpoint tells you where a PEER
+        listens, which is unrelated to where WE should listen -- so the caller
+        constructs the `TCP(listen_host=..., listen_port=...)` first, then attaches
+        it here BEFORE any `add_peer`. Not a workaround; the two carrier shapes just
+        genuinely differ."""
+        existing = self._transports_by_scheme.get(scheme)
+        if existing is transport:
+            return
+        if existing is not None:
+            raise PostmanError(
+                f"transport for scheme {scheme.name} already attached; "
+                f"replacing it would orphan links already built against the old one"
+            )
+        self._transports_by_scheme[scheme] = transport
+
     def _dial(self, endpoint: Endpoint) -> Transport:
         """Look up (or lazily construct) the transport for `endpoint`'s scheme. Cached
         per scheme in `_transports_by_scheme`. Raises `PostmanError` if no dialler is
