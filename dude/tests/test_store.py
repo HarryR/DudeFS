@@ -6,7 +6,7 @@ import random
 import unittest
 
 from dude import quorum
-from dude.core import codec, crypto
+from dude.core import crypto
 from dude.store import management, ops, settle, store
 
 D = ops.STORE_DATA
@@ -370,7 +370,10 @@ class TestFailureDomains(unittest.TestCase):
                     management.Role.MANAGER,
                     frozenset({ops.STORE_MANAGEMENT, ops.STORE_DATA}),
                     frozenset(),
-                    self.mgr.prove_possession(),
+                    pop=self.mgr.prove_possession(),
+                    cert=management.Cert.sign_grant(
+                        self.mgr, self.mgr.public, management.Role.MANAGER
+                    ),
                 ).sign(self.mgr, 1),
             ),
             auth=self.mgmt,
@@ -378,7 +381,12 @@ class TestFailureDomains(unittest.TestCase):
 
     def _add(self, n, domains):
         kp = crypto.Keypair.generate()
-        tx = self.mgmt.add_node(kp.public, (f"inproc:{n}".encode(),), frozenset(domains))
+        tx = self.mgmt.add_node(
+            kp.public,
+            (f"inproc:{n}".encode(),),
+            management.Cert.sign_roster(self.mgr, kp.public),
+            frozenset(domains),
+        )
         self.store.apply((tx.sign(self.mgr, 1),), auth=self.mgmt)
         return kp
 
@@ -444,22 +452,6 @@ class TestFailureDomains(unittest.TestCase):
         self.assertEqual(groups[b"p:x"], frozenset({a.public, b.public}))
         self.assertEqual(groups[b"c:de"], frozenset({a.public}))
         self.assertEqual(self.mgmt.nodes()[a.public].addresses, (b"inproc:0",))
-
-    def test_a_record_without_domains_still_reads(self):
-        """The pre-domains shape is a shorter well-defined form, not a malformed one."""
-        kp = crypto.Keypair.generate()
-        raw = codec.encode([b"inproc:legacy"])
-        self.store.apply(
-            (
-                ops.writes(ops.Set(ops.STORE_MANAGEMENT, management.P_NODE + kp.public, raw)).sign(
-                    self.mgr, 1
-                ),
-            ),
-            auth=self.mgmt,
-        )
-        rec = self.mgmt.nodes()[kp.public]
-        self.assertEqual(rec.addresses, (b"inproc:legacy",))
-        self.assertEqual(rec.domains, frozenset())
 
 
 class TestMultiSigRoundTrip(unittest.TestCase):

@@ -292,21 +292,93 @@ Two ECMH accumulators, and they answer different questions.
   between bootstrap and later interventions is only the state of the store (empty vs.
   populated) at the moment of construction.
 
-### Role.MANAGER is a normal grant with blanket authorship {#role-manager-grant}
+### Nodes are the storage layer, not authors {#nodes-are-not-authors}
 
-- `Role.MANAGER` is one of the ordinary roles (alongside `NODE`, `CLIENT`, `COMPACTOR`) granted
+- The four kinds of participant are: the anchor (root of trust, cold), managers (warm
+  delegates, author management ops), clients (author data ops within their scope), and
+  storage nodes. Storage nodes are the DATABASE — they arbitrate the log, sign settlement
+  as a quorum, and serve reads. They do NOT author transactions on their own key's authority.
+- A storage node's identity lives in P_NODE with a #cert; it does NOT get a P_GRANT.
+  `may_write` on a bare node identity returns False. To do anything to data, a node's key
+  must contribute to a quorum-signed settle or be gated by a manager.
+- This is by design (#trust-tiers — storage nodes are untrusted, on cheap VPS). A node
+  compromised in isolation cannot mutate data — the quorum multi-sig is what admits writes.
+- The `Role` enum is exactly `{MANAGER, CLIENT, COMPACTOR}`. There is no Role.NODE.
+
+### Role.MANAGER is anchor-only {#role-manager-grant}
+
+- `Role.MANAGER` is one of the authoring roles (alongside `CLIENT` and `COMPACTOR`) granted
   via `authorise` (#possession-proof required, same as every grant). A cluster MAY have zero,
   one, or many Role.MANAGER identities at any time.
 - Role.MANAGER grants confer **blanket authorship**: `may_write` returns True for any
   `store_id`, and `may_send` returns True for any operation kind. They do NOT confer the
   anchor's block-level override.
-- Rotation is ordinary. A Role.MANAGER identity is added by `authorise` and removed by
-  `revoke` (#absence-is-revocation). The change is one transaction, quorum-authorized or
-  anchor-authorized like any other grant mutation.
-- The layering intent: the anchor is cold and unrotatable (see #trust-tiers — "manager: root
-  of trust; cold; offline ~99% of the time"); Role.MANAGER identities are its warm-online
-  delegates that carry day-to-day management authority. Blanket authorship is a large hammer,
-  but every use is log-visible (signed op, signed grant of the role, signed revocation).
+- **Only the anchor** grants or revokes Role.MANAGER. Managers cannot grant or revoke other
+  managers, and quorum-authorised operations MUST NOT create or destroy a Role.MANAGER grant.
+  The reason is #light-client-cert-chain: a light client verifies the chain
+  `anchor → manager → CLIENT / node roster entry` using only signatures, without reading the
+  log; letting managers create other managers would put a hop in that chain the anchor did
+  not directly authorise.
+- Similarly Role.COMPACTOR is anchor-only. Compactors act on the whole log; the authority
+  to appoint one belongs at the axiom.
+- Role.CLIENT is anchor-OR-manager granted. Managers can add and remove clients as ordinary
+  operational work.
+- Every grant on-log MUST carry a #cert whose signer is authorised for that role
+  (anchor-only for MANAGER/COMPACTOR, anchor-or-manager for CLIENT). Rotation is via
+  `authorise` / `revoke` (#absence-is-revocation).
+
+### One authorisation cert shape, everywhere {#cert}
+
+- A **Cert** is `(signer, subject, purpose, sig)` where `sig = Sig_signer(_CERT_DOMAIN ||
+  purpose || subject)`. One struct, one shape, applied on every authority-carrying row:
+  - P_GRANT rows: `purpose = role.value` (`"manager"` / `"client"` / `"compactor"`).
+  - P_NODE rows: `purpose = "roster"`.
+- The domain tag and purpose binding together ensure: (1) a cert signed for one purpose
+  cannot be replayed as another (an anchor's client-cert for X cannot be stuffed into an
+  X-as-MANAGER row); (2) a cert bytes cannot be composed with any other anchor-signed
+  artefact.
+- Signer-authority rules (checked at read time by Management):
+  - MANAGER or COMPACTOR purpose: `cert.signer` MUST be `store.anchor()`.
+  - CLIENT or ROSTER purpose: `cert.signer` MUST be either `store.anchor()` OR an identity
+    currently holding a valid Role.MANAGER grant.
+- Read-side checks on every P_GRANT / P_NODE decode: (a) `cert.subject == row_key`; (b)
+  `cert.purpose` matches the row's role or `"roster"`; (c) `cert.verify()` (sig-only);
+  (d) `cert.signer` satisfies the per-purpose authority rule. Failing any means the row is
+  treated as absent by `may_write` / `may_send` / `roster()`.
+- Per-row (not batched). Adding, removing, or re-attesting one identity touches only that
+  row and its cert; the others are unaffected.
+- No serial number. The row is either present (attestation valid) or absent (revoked). Log
+  ratification ordering is the only order that matters; a stale cert cannot be replayed
+  because it can only enter the log via a settled tx, and the current log-state is the
+  authority (#log-is-authoritative).
+
+### Management operations should be typed, not smuggled {#typed-management-ops-owed}
+
+The current shape emits management writes as generic `ops.Set(P_GRANT + who, ...)` /
+`ops.Set(P_NODE + who, ...)`. `Management.authorise` / `change_roster` validate the cert
+at construction time before emitting; a well-behaved caller cannot land a malformed grant.
+The read side (`may_write`, `roster()`) also refuses invalid rows, so authority forgery
+is closed either way.
+
+The gap: a caller who bypasses the API and composes an `ops.Set(P_GRANT + who, garbage)`
+directly can land the malformed row in state — a manager has blanket authorship of the
+management store. Read-side checks refuse the invalid row (`may_write` returns False),
+but a decode error on subsequent management reads is a poison-pill DoS risk. This is
+not new attack surface — a manager can DoS the cluster by many routes — but it is a real
+shape gap.
+
+The RIGHT fix is not a validator hook at the settle boundary. A validator would
+re-implement the exact rules `authorise` already enforces, and two implementations of the
+same rules disagree by construction. The honest fix is **typed management operations as
+first-class op types** (`ops.Authorise`, `ops.Revoke`, `ops.AddRosterEntry`,
+`ops.RemoveRosterEntry`, `ops.DistributeWrappedMaster`) so a malformed grant is
+unexpressible at the op vocabulary — DDL as its own verb set, not smuggled through
+generic `Set` / `Del`.
+
+Deferred until after the light-client work, at which point the management role gets
+re-examined and the typed-op refactor can compose with whatever that reshapes. Anyone
+tempted to add an eval-time `check_write` hook in the meantime: read this note first,
+because that path was considered and rejected as re-implementation.
 
 ### Roster and grants are settled state {#authority-is-log-state}
 
@@ -604,7 +676,7 @@ be re-proposed.
 ### Evidence outlives ratification {#evidence-outlives-ratification}
 
 - A peer whose signatures over two different slices for the same bucket both verify HAS
-  equivocated (#cross-attestation), and this is proof against their key. The evidence MUST be
+  equivocated, and this is proof against their key. The evidence MUST be
   detected and preserved for the observability layer to act on, **regardless of whether the
   receiving node has already ratified**.
 - A byzantine peer's contradiction is evidence that outlives any one round; discarding it because
@@ -853,7 +925,7 @@ turns that into a SETTLED block.
   still open a SettleRound and exchange sigs. The settlement quorum's agreement is what makes
   the head advance-preserving invariant checkable — an empty settle_sigs bitmap signed over
   `(slice_hash=∅, height=head, anchors=current)` proves the quorum saw the same state at that
-  bucket boundary, which is a floor #freshness-is-gathered (once trust re-lands) can lean on.
+  bucket boundary.
 - Empty settlements MUST NOT be optimised out. Cost is one message round per bucket regardless
   of workload; that is the shape the design targets (#durability-over-latency) and skipping it
   breaks the "every bucket has a signed post-anchor commitment" property.
@@ -987,7 +1059,8 @@ turns that into a SETTLED block.
 
 The path a joining or lagging node walks to become current, in the world where nothing has been
 compacted and every node still holds every block from genesis. Fast sync, light-client sync via
-SMT proofs, and any compaction-aware sync path are deferred (see #compaction-deferred).
+SMT proofs (#light-client), and any compaction-aware sync path (#compaction) are the next
+design arcs.
 
 ### A joiner starts from the anchor alone {#joiner-starts-from-anchor}
 
@@ -1120,16 +1193,16 @@ SMT proofs, and any compaction-aware sync path are deferred (see #compaction-def
   false-positive locks out the honest majority). Better to pay a bounded per-pull retry cost
   than to carry a hidden misconfiguration across restarts. See #sync-safety-vs-full-bft: sync
   is safe against `< f+1` malicious peers WITHOUT any exclusion mechanism.
-- If cross-node evidence retention and manager-driven ejection ever land (currently OWED in
-  the Trust section), those act on GLOBAL, ATTESTED evidence via management ops that touch
-  the roster — not on local per-follower blacklists. Local shun would not compose with them
-  and MUST NOT be introduced as a shortcut.
+- Manager-driven ejection stays available as an operator recourse via ordinary
+  `Management.revoke` on the evidence an operator gathers out-of-band. It acts on the roster,
+  not on any per-follower state; local shun would not compose with it and MUST NOT be
+  introduced as a shortcut.
 
 ### GETBLOCK refuses with a reason when the block is absent {#getblock-refuses-with-reason}
 
 - A peer receiving `GETBLOCK(n)` for a height it does not hold (has not settled yet, or has
   compacted it away in a future world) MUST respond with `REFUSED` naming the reason:
-  `NOT_YET_SETTLED` (n > my head), `COMPACTED_AWAY` (post-#compaction-deferred), or
+  `NOT_YET_SETTLED` (n > my head), `COMPACTED_AWAY` (post-#compaction), or
   `UNKNOWN` (n is well below my head but I don't have it — pathological).
 - Silence is not the answer. The requester's timeout would fire, waste a full RTT, and re-attempt
   against the same peer or a different one with no more information. Explicit refusal lets the
@@ -1163,12 +1236,10 @@ SMT proofs, and any compaction-aware sync path are deferred (see #compaction-def
 
 ### The SMT is not part of sync {#smt-for-light-clients}
 
-- The compressed sparse Merkle tree (#state-root) exists so a light client can be shown a
-  membership or non-membership proof for a single key without holding any log. It is not a
-  primitive of full-node sync.
-- Full-node sync recomputes the SMT locally by folding the log; a joiner never trusts an
-  SMT root from a peer as a sync shortcut. That shortcut is exactly the fast-sync path, and
-  fast sync is deferred.
+- The compressed sparse Merkle tree (#state-root) exists for #light-client retrieval, not
+  for full-node sync. Full-node sync recomputes the SMT locally by folding the log; a joiner
+  never trusts an SMT root from a peer as a sync shortcut. That shortcut is exactly the
+  fast-sync path (#compaction), which is a separate arc.
 
 ### Test shape {#sync-test-shape}
 
@@ -1187,97 +1258,137 @@ SMT proofs, and any compaction-aware sync path are deferred (see #compaction-def
   `f+1` fresh witnesses (#height-poll-is-the-trigger) + per-block chain-and-sigs + per-tx
   authority (#per-tx-authority-verified-at-replay). Under the standard threat model (fewer
   than `f+1` colluding nodes), a joiner cannot be lied into a false head or a false block.
-- L6 does NOT deliver **full BFT observability**: cross-author attestation retention,
-  monotonicity conviction across time, and manager-driven ejection on evidence. Those are
-  the SPECv2 Trust section rows (currently OWED). They are needed to actively detect-and-
-  eject adversaries; they are NOT needed to keep sync itself safe against them.
+- No BFT observability layer is planned. A Byzantine minority is filtered as noise at every
+  merge point (Held tally, Sig tally, SettleSig tally, sync verify) — the pipeline stays safe
+  and cadence stays on wall-clock without cross-author attestation retention, monotonicity
+  conviction, or evidence-driven ejection. Those axioms and their machinery are retired (see
+  the retired-tags list).
 - Local per-follower blacklists were explicitly REJECTED (#no-shun-only-priority). The
   follower does not maintain any "banned peer" state — no `_bad_sources`, no persistent
   denylist, no fork-detection exclusion. Every peer above our head remains a candidate for
   the next pull; a priority signal (most recent successful reply) is the only per-peer state
   and it decays naturally as time passes.
-- The line is honest debt: an active adversary at `< f+1` cannot break sync but MAY cost
-  wasted round-trips (a lying peer refused, retried against another). Ejection via management
-  op would make the cost `O(1)` instead of `O(retries)`. L6 tolerates the cost; ejection is
-  a post-L6 arc via the Trust section — global, attested, log-visible, and composable with
-  the roster mechanism, not a local shortcut.
+- The accepted cost: an active adversary at `< f+1` cannot break sync but MAY cost wasted
+  round-trips (a lying peer refused, retried against another). The cost is bounded by
+  `pull_timeout × retries_until_honest_source_picked` per pull; correctness is unaffected.
 
-### Compaction is deferred {#compaction-deferred}
+### Compaction is the next work {#compaction}
 
-- The compactor role (a distinct key with its own authorisation to propose truncation),
-  entry discard below a ratified checkpoint (SPEC L1's OWED row), and any sync path shaped for
-  a compacted log are deliberately out of scope for the tentative L6.
-- The no-compaction path MUST work correctly and be exhaustively tested before compaction is
-  introduced. Once it does, compaction becomes a surgical addition — a compactor-signed
-  checkpoint that renders older blocks discardable, and a fast-sync path that adopts state at a
-  ratified checkpoint rather than replaying from genesis.
+- The compactor role (a distinct key with its own authorisation to propose truncation), entry
+  discard below a ratified checkpoint (SPEC L1's OWED row), and any sync path shaped for a
+  compacted log are the next design arc. The no-compaction path is rock-solid — the gate is
+  met.
+- Compaction is a compactor-signed checkpoint that renders older blocks discardable, plus a
+  fast-sync path that adopts state at a ratified checkpoint rather than replaying from
+  genesis. Compaction is also the vehicle for #secrecy-by-key-death: routine truncation drops
+  ciphertext under old keys as they age out, turning compaction into the conveyor that
+  enforces forward secrecy. `#wrapped-masters` retention returns with this work — an epoch key
+  becomes retirable exactly when compaction has driven its refcount to zero.
+- Requirements not yet specified: compactor identity + authorisation, checkpoint shape,
+  ratification-and-discard atomicity, fast-sync verb shape, and how a joiner reasons about a
+  checkpoint as the root of its walk rather than genesis.
 
 ---
 
-## Trust (cross-cutting) — currently OWED
+## Light client retrieval {#light-client}
 
-The requirements in this section describe the attestation duty that was ripped in
-2026-08-01 as "a mitigation nothing consults" (CLAUDE.md trap #7): the machinery ran on
-every tick, produced convictions, and no production path acted on them. The principles
-survive — a node that signs a lower height after a higher one is convictable, `f+1` fresh
-distinct answers are the currency floor, self-contradiction is terminal — but the code that
-observes and enforces them is not here. The natural first consumer is L5 settlement
-(#settlement-signs-post-anchors is exactly a signed-monotone claim about state), and until
-then the trust section is a specification of what MUST hold once the machinery returns
-rather than of what the code currently checks. The enforcement rows for this section have
-been struck from the table.
+The path a client that does NOT hold the log walks to read a single key. Distinct from L6
+sync (which drives a node to a verifiable head by replaying blocks) and from the worker
+API (which serves reads to a client that trusts its own daemon). A light client trusts only
+the manager pubkey; it wants the current value for one key without holding any blocks.
 
-### Storage nodes are untrusted {#nodes-are-untrusted}
+### Retrieval names one key, returns value + proof {#light-client-get}
 
-- Storage nodes hold no keys and no trusted component. They arbitrate the log; they do not vouch
-  for its contents.
-- A node's own statement about itself is a hint, never a floor. Signed self-reports are
-  DIAGNOSTIC — they let peers detect a rollback if the node ever contradicts an earlier statement,
-  and are not a source of currency (#monotonicity).
+- The retrieval verb is `GETKEY(store, name) → (value | ∅, proof, anchors, settle_sigs)`.
+- `proof` is an SMT membership or non-membership proof against `anchors.state_root`.
+  `anchors` are the anchors of the latest SETTLED block the responder holds; `settle_sigs`
+  are the quorum's signatures over those anchors (#block-shape-settled).
+- Value present iff the SMT walk terminates at a leaf whose path matches the requested key.
+  Non-membership is proved by the terminal-node structure per #state-root.
 
-### Authenticity is self-verifying, currency is not {#the-lemma}
+### The client verifies from the anchor alone {#light-client-verify}
 
-- A signature proves who authored a payload. It does not prove *when*.
-- A malicious node can serve a perfectly authentic, perfectly stale world, correctly signed
-  throughout. Distinguishing that from the current world requires the count of independent fresh
-  witnesses; no signature or hash can substitute.
+- A light client holds the anchor pubkey and nothing else durable. On each retrieval:
+  1. Corroborate the head anchors from `f+1` distinct responders via `GETANCHORS` — see
+     #light-client-freshness. This establishes trust in `(block_num, state_root)`.
+  2. Extract the roster via #light-client-cert-chain — anchor-verifiable, no state-root
+     dependency.
+  3. Verify `settle_sigs` in each corroborated reply against the extracted roster (via
+     `Management.authorization`); a responder whose sig doesn't verify was lying, but
+     corroboration already gave the honest answer.
+  4. Ask any one responder for `GETPROOF(store_id, name, block_num)`. Verify the returned
+     `proof` against the trusted `state_root`; if `Value`, verify the leaf's credential
+     authorises whoever last wrote it.
+- No trust in the responder. A malicious responder can only refuse or serve a proof that
+  fails verification; it cannot produce a valid proof for a value the quorum did not agree.
 
-### Freshness needs `f+1` witnesses {#freshness-needs-many}
+### The cert chain reaches the roster from the anchor alone {#light-client-cert-chain}
 
-- Currency MUST be established by `f+1` distinct fresh statements — the smallest set of which at
-  least one must be honest.
-- A quorum is not the right threshold here: at n=3 two-thirds tolerates zero faults, so one honest
-  fresh answer is already `f+1` while a quorum is two. `f+1` is decided by the quorum module and
-  computed nowhere else (#quorum-gate).
+- The chain is `anchor → manager Cert (P_GRANT) → roster Cert (P_NODE)`, each a #cert the
+  light client verifies directly.
+- A light client verifies one roster entry as:
+  1. `entry_cert.verify()` — signature-only check.
+  2. Either `entry_cert.signer == anchor` (entry is anchor-attested; done) OR fetch the
+     manager's P_GRANT row cert for `entry_cert.signer`, verify it via steps 1–2 recursively
+     against the anchor, and check its P_GRANT row membership at `state_root` (revocation
+     check).
+  3. Check the entry's own P_NODE row membership at `state_root` (revocation check).
+- Currency of the roster IS the SMT membership at the trusted `state_root` — a cert whose
+  row has been revoked (row deleted) fails the membership proof and is rejected. The cert
+  chain gives provenance; the state-root proof gives currency.
+- A roster refresh from a single responder is safe: the responder can neither forge a cert
+  chain (no anchor key) nor forge a state-root membership proof (state_root was corroborated
+  from f+1). The two together close the "malicious node ships fake roster" attack.
 
-### Freshness is gathered, never proved {#freshness-is-gathered}
+### The roster is a corroborated read, not a bootstrapped fetch {#light-client-roster}
 
-- Every attestation carries the author's own clock. It is an assertion, not a ratified fact — no
-  peer can recompute another's clock.
-- Recent-looking attestations from `f+1` distinct keys inside a bounded window are the only
-  currency evidence available. An adversary holding fewer than `f+1` keys cannot manufacture recent
-  ones; it can replay, and a replay looks old.
+- A light client's initial roster comes from the same `GETANCHORS` reply that corroborates
+  the head anchors. Each responder ships `(anchors, settle_sigs, roster_bundle)` where
+  `roster_bundle` is the RosterEntryCert-plus-membership-proof list for each entry.
+- When `known_roster_fingerprint` in the request matches the responder's current fingerprint,
+  the responder omits `roster_bundle` — the client uses its cached roster (already verified
+  against the anchor per #light-client-cert-chain).
+- On fingerprint mismatch, the responder ships the fresh `roster_bundle`; the client
+  re-verifies the chain and replaces its cache. No separate "roster fetch" verb — the roster
+  rides GETANCHORS as an optional field.
 
-### Monotonicity is a duty {#monotonicity}
+### Non-membership is a first-class answer {#light-client-nonmembership}
 
-- A node MUST NOT sign a claim about a lower height after having signed a claim about a higher one.
-  A durable monotone counter is bumped and committed *before* the claim is signed, so signing over
-  uncommitted state is not expressible.
-- The counter is separate from the height. Ordering claims by the quantity under dispute is
-  circular: if the counter *were* the height, a regression would be unorderable and therefore
-  unconvictable.
-- Gaps in the counter are free; reuse is fatal.
+- A light client asking "does this key exist" MUST receive a proof either way. The SMT's
+  compressed-tree structure encodes non-membership as a proof-of-absence at the level where
+  the walk terminates.
+- Silence is not a valid answer. A responder that does not hold the requested subtree MUST
+  refuse with a reason, same shape as #getblock-refuses-with-reason: closed enum,
+  exhaustive-match at the client.
 
-### Peers keep the evidence {#cross-attestation}
+### The retrieval path is stateless per request {#light-client-stateless}
 
-- Attestations MUST be gossiped, and receiving peers MUST retain the latest one per author.
-- A pair of signed statements from one key that contradict each other is EVIDENCE — self-contained,
-  needing no third party, valid forever.
-- Contradiction MUST be self-contradiction only. Clock skew MUST NOT be convictable — an NTP step
-  backwards is a road bump, not a fault.
-- A shun is a LOCAL read policy against a convicted key. It does not alter the roster and does not
-  alter quorum arithmetic. Ejection is a manager action on the evidence; there is no rehabilitation
-  path, because recovery is re-join as a new identity.
+- Each `GETKEY` is a single request/reply exchange. No session, no subscription, no keepalive
+  from the client's perspective. A light client on a bad link retries the whole verb.
+- The responder MUST answer from the latest SETTLED block it holds; it MUST NOT synthesise
+  a proof against an in-flight state. Freshness against the cluster head is the client's
+  concern — #light-client-freshness.
+
+### Freshness comes from f+1 witnesses at the retrieval layer {#light-client-freshness}
+
+- A light client wanting "the current value" MUST corroborate the answer against `f+1`
+  distinct responders that agree on `(anchors.block_num, anchors.state_root, value_hash)`.
+  One responder's answer, however well-signed, only proves "some SETTLED block held this
+  value" — not "the current one".
+- Same principle as #height-poll-is-the-trigger applied at retrieval time: signatures are
+  self-verifying, currency is not.
+- A client willing to accept staleness (e.g. archival reads) may skip this and take one
+  responder's answer as an at-that-height fact. The requirement is that this is an explicit
+  choice, not a silent default.
+
+### The SMT is a primitive of retrieval, not of consensus {#light-client-smt-scope}
+
+- `#state-root` computes the SMT from the live view (#live-view). Consensus does not touch
+  it directly — Round agrees on slices of transactions, SettleRound agrees on anchors
+  (which include the state root as one field). Light client retrieval is the only
+  requirement that walks the SMT for individual proofs.
+- Requirements not yet specified: the wire shape of `proof` (path bytes + sibling digests),
+  the retrieval refusal enum, and the freshness-corroboration timeout.
 
 ---
 
@@ -1313,10 +1424,11 @@ Applies at L3 and L4.
 The **encoding-half** of this section stays wired: `Set.epoch` is on the wire, `live.epoch`
 is stored, values carry their keyepoch cleartext next to the ciphertext. The **retirement-
 half** — `Management.retire`, the `Drained` predicate, `Store.epoch_live`, the refcount over
-live values — was ripped in 2026-08-01 as a mitigation nothing consults, together with the
-attestation duty. The whole subsystem returns when the client encryption layer lands (Harry:
-"the actual thing up and running properly first before adding new operations"). The
-enforcement row for #wrapped-masters retention is OWED; #value-carries-epoch stays wired.
+live values — was ripped in 2026-08-01 as a mitigation nothing consults. It returns with
+client encryption and #compaction together: compaction is the conveyor that drives the
+refcount down (routine truncation drops ciphertext under old keys), and client encryption is
+the consumer that makes an epoch key meaningful in the first place. The enforcement row for
+#wrapped-masters retention is OWED; #value-carries-epoch stays wired.
 
 ### Two secrets, never one {#two-secrets}
 
@@ -1489,7 +1601,10 @@ visible rather than plausible.
 | anchor rotation is deferred (#anchor-is-the-axiom) | **deferred** -- `Store.provision` is one-shot; no operation replaces `store.anchor()`. Loss of the anchor cold-key ends emergency-intervention capability, not the cluster |
 | bootstrap and emergency intervention share ONE block-construction path (#anchor-is-the-axiom) | Both call `dude.consensus.bootstrap._build_manager_signed_block(...)` (or equivalent shared helper); no `sign_by_manager` on `SettledBlock` outside that helper |
 | Role.MANAGER confers blanket authorship (#role-manager-grant) | `Management.may_write` returns True on `g.role is Role.MANAGER` for any `store_id`; `Management.may_send` returns True on `g.role is Role.MANAGER` for any kind |
-| Role.MANAGER grants rotate via ordinary authorise/revoke (#role-manager-grant) | `Management.authorise(who, role=Role.MANAGER, pop=...)` creates the grant; `Management.revoke(who)` removes it; both are ordinary `Transaction`s subject to quorum or anchor authorization |
+| Nodes are not authors (#nodes-are-not-authors) | `Role` enum has no `NODE` member; `Management.authorise` cannot express a node-as-author grant. A bare node identity has no P_GRANT row, so `may_write` returns False. Being in P_NODE keyspace with a valid #cert is the only sense in which a node is "in" the system |
+| Only the anchor grants or revokes MANAGER / COMPACTOR (#role-manager-grant) | **partial** — `Management.authorise(role=MANAGER \| COMPACTOR, cert=...)` requires an anchor-signed Cert and validates it before emitting the mutation. Log-boundary refusal of a raw `Set P_GRANT` bypassing `authorise` is DEFERRED per #typed-management-ops-owed |
+| One authorisation cert shape (#cert) | **partial** — `Management.Cert` is one dataclass covering every authority-carrying row. `authorise` and `change_roster` require it; `may_write`, `may_send`, and `roster()` verify it on read (subject, purpose, signature, signer-authority-for-purpose). Log-boundary refusal of a cert-less or wrong-purpose write is DEFERRED per #typed-management-ops-owed |
+| Management operations should be typed, not smuggled (#typed-management-ops-owed) | **OWED** — API-side plumbing (this row's Cert enforcement) is a halfway house; the design fix is typed management op types so wrong-shape writes are unexpressible. Deferred until after light-client work per Harry's ruling |
 
 ### L3 mempool
 
@@ -1570,10 +1685,30 @@ visible rather than plausible.
 | GETBLOCK refuses with reason (#getblock-refuses-with-reason) | `SyncRefusal` closed enum (`NOT_YET_SETTLED`, `UNKNOWN`, `INVALID`); `Refused` message; `serve_getblock` returns typed refusals |
 | sync in its own module (#sync-in-its-own-module) | **structural** — `dude/sync/` package; Coordinator and Follower share only `Store`; neither imports the other |
 | roster walks forward with the log (#roster-walks-forward) | Follower applies blocks in `block_num` order via `commit_block`; roster is read via `Management(store).roster()` on demand, so it grows with the log naturally |
-| SMT is not part of sync (#smt-for-light-clients) | **deferred** — sync ships bodies, not SMT proofs; light-client path is a post-M7 arc |
+| SMT is not part of sync (#smt-for-light-clients) | **structural** — `Follower` ships bodies (never SMT proofs) and computes `state_root` locally via `Layer` per applied block; the light-client path (#light-client) is a separate arc |
 | sync test shape (#sync-test-shape) | `dude/tests/test_sync.py` direct-wired `Follower` scenarios (6 test classes); `dude/tests/test_sync_e2e.py` full-stack |
 | tolerance, not shunning (#no-shun-only-priority) | `Follower` maintains no blacklist. Priority-based `_pick_pull_source` prefers peers with the most recent successful reply (`_last_ok_at`); every peer above our head remains a candidate. On any failure -- bad decode, chain-link violation, timeout, refusal, fork detection -- the in-flight pull clears and next tick picks again from the same pool. |
-| sync safety vs full BFT (#sync-safety-vs-full-bft) | **deferred, no local state to persist** -- with no blacklist there is no persistence question; the priority signal (`_last_ok_at`) is in-memory-only and self-heals on restart. Global adversary detection lives in the Trust section (OWED). |
+| sync safety vs full BFT (#sync-safety-vs-full-bft) | **structural, no observability layer planned** — the merge points (`Round._on_sig`, `Round._compute_slice`, `SettleRound.receive`, `Follower._on_settled_block`) each drop unauthenticated / divergent / wrong-slice messages from quorum counting. No blacklist, no persistent per-peer state; `_last_ok_at` is in-memory priority only. |
+
+### Light client retrieval
+
+| requirement | enforced by |
+|---|---|
+| retrieval names one key, returns value + proof (#light-client-get) | **OWED** — no `GETKEY` verb, no light-client server-side handler, no client-side verifier |
+| client verifies from anchor alone (#light-client-verify) | **OWED** — no client-side verify pipeline exists; the anchor pubkey lives in `Store.anchor()` for the full-node path only |
+| cert chain reaches roster from anchor alone (#light-client-cert-chain) | **partial** — the cert-emission and cert-storage halves land with #manager-cert / #roster-entry-cert (Management side); the client-side chain-walker is OWED until light client is built |
+| roster is a corroborated read via GETANCHORS (#light-client-roster) | **OWED** — no GETANCHORS verb yet; roster ships in the reply via the cert bundle once the wire lands |
+| non-membership is first-class (#light-client-nonmembership) | **partial** — `smt.py` supports non-membership proofs structurally; no retrieval verb consumes them yet |
+| retrieval is stateless per request (#light-client-stateless) | **OWED** — no verb, so no session model to check |
+| freshness via f+1 responders (#light-client-freshness) | **OWED** — no client-side corroboration loop; shape parallels `Follower.caught_up()` |
+| SMT is a retrieval primitive, not consensus (#light-client-smt-scope) | **structural** — `smt.py` is imported by `store.py` and `layer.py` only; no consensus module (Round, SettleRound, Coordinator) references it |
+
+### Compaction
+
+| requirement | enforced by |
+|---|---|
+| compaction is the next design arc (#compaction) | **OWED** — compactor role, checkpoint shape, ratification-and-discard atomicity, fast-sync verb, checkpoint-as-walk-root all unspecified |
+| entries below the last ratified checkpoint may be discarded (#log-is-authoritative L1 row) | **OWED** — see above; also blocks `#wrapped-masters` retention (the conveyor Harry described) |
 
 ### Transport
 
@@ -1591,16 +1726,6 @@ visible rather than plausible.
 | retries are budgeted per peer | `Peer.budget` (token bucket) |
 | multi-homed attempts are staggered, spending the budget | `Plan.next` (staggered dial with token spend) |
 | malformed input is refused loudly | typed extractors in `codec` and every `decode` raising rather than repairing |
-
-### Trust / attestation
-
-Every row here was OWED as of 2026-08-01, and the whole table was struck rather than
-carried at debt. The Trust section preamble names why: the machinery ran with no consumer
-in production, so the mitigation was doing nothing that could be missed. When L5 settlement
-lands its post-apply signature exchange, the first four rows return there naturally (a
-node signing a lower height after a higher one is exactly the shape settlement collects).
-The remaining rows return alongside — self-contradiction, shun-as-local-policy, relayed-
-verdict-recomputed — once the observability layer that reads them is on the map.
 
 ---
 
@@ -1630,21 +1755,24 @@ Tags kept here rather than deleted, so stale citations resolve to an explanation
 - `#conveyor` — retired at L0–L4. The primitives are in Keys (#wrapped-masters,
   #value-carries-epoch). The DUTY (which layer re-encrypts, when) is L5+ and will get a fresh
   anchor when it settles. Do not cite `#conveyor` from new code.
+- `#cross-attestation`, `#freshness-is-gathered`, `#monotonicity`, `#peers-keep-evidence`,
+  `#the-lemma`, `#nodes-are-untrusted` — the attestation duty and its axioms. Ripped
+  2026-08-01 as a mitigation nothing consults; not returning. A Byzantine minority is filtered
+  as noise at every merge point (Held tally, Sig tally, SettleSig tally, sync verify), so the
+  pipeline stays safe against `< f+1` without observing them explicitly. The one honest cost
+  — O(retries) wasted round-trips in the sync path when a peer lies — is accepted; see
+  #sync-safety-vs-full-bft.
+- `#freshness-needs-many` is NOT here — it looked like a Trust axiom but is in fact live: the
+  `f+1` corroboration rule is enforced by `Follower.caught_up()` and `quorum.corroboration()`.
+  Its home is L6 sync (see the requirement in-body under `#height-poll-is-the-trigger`).
 
-The following are OWED rather than retired — the requirement stands, but the machinery that
-enforced it was struck 2026-08-01 as "a mitigation nothing consults" and will return with
-whichever layer becomes its first real consumer. Cite them freely; expect no enforcement
-until the return commit names them again.
+The following is OWED rather than retired — the requirement stands, but the machinery that
+enforced it was struck 2026-08-01 and will return with its real consumer:
 
-- `#cross-attestation`, `#freshness-needs-many`, `#freshness-is-gathered`, `#monotonicity`,
-  `#peers-keep-evidence` — the attestation duty. Returns with L5 settlement (post-apply
-  signatures ARE monotone claims about state, checked by the same shape as attestation).
-- `#the-lemma`, `#nodes-are-untrusted` — the trust axioms these principles state stay
-  settled; nothing changed about the threat model. The rows are here because the machinery
-  that made them checkable is gone.
 - `#wrapped-masters` retention rule (refcount over live values, retire-when-zero) — the
-  DUTY was ripped with the conveyor. Returns with client encryption. `#value-carries-epoch`
-  is NOT here — the wire format survives.
+  DUTY was ripped with the conveyor. Returns with client encryption + compaction, which
+  together form the conveyor that re-encrypts forward and enforces #secrecy-by-key-death.
+  `#value-carries-epoch` is NOT here — the wire format survives.
 
 Two wire-verb sets went with these rips and have no anchor to retire (verbs are enum
 members, not SPEC tags); noted here for grepability:

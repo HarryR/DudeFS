@@ -21,7 +21,7 @@ from ..consensus.settle_round import _settle_payload
 from ..core import crypto
 from ..core.errors import InvariantError
 from ..store import Store, ops
-from ..store.management import Management, ManagementError, NodeRecord, Role
+from ..store.management import Cert, Management, ManagementError, NodeRecord, Role
 
 T0 = 1_700_000_000_000
 
@@ -95,7 +95,12 @@ class TestRoleManagerGrant(unittest.TestCase):
 
         # Anchor grants Role.MANAGER to warm_mgr. Requires possession proof.
         pop = warm_mgr.prove_possession()
-        grant = mgmt.authorise(warm_mgr.public, Role.MANAGER, pop=pop)
+        grant = mgmt.authorise(
+            warm_mgr.public,
+            Role.MANAGER,
+            pop=pop,
+            cert=Cert.sign_grant(anchor, warm_mgr.public, Role.MANAGER),
+        )
         s.apply((_sign(anchor, grant),), auth=mgmt)
 
         # warm_mgr may write any store, including one not named in `stores`.
@@ -116,7 +121,11 @@ class TestRoleManagerGrant(unittest.TestCase):
 
         pop = client.prove_possession()
         grant = mgmt.authorise(
-            client.public, Role.CLIENT, stores=frozenset({ops.STORE_DATA}), pop=pop
+            client.public,
+            Role.CLIENT,
+            stores=frozenset({ops.STORE_DATA}),
+            pop=pop,
+            cert=Cert.sign_grant(anchor, client.public, Role.CLIENT),
         )
         s.apply((_sign(anchor, grant),), auth=mgmt)
 
@@ -134,7 +143,12 @@ class TestRoleManagerGrant(unittest.TestCase):
         warm_mgr = crypto.Keypair.generate()
         s, mgmt = _provisioned(anchor)
         pop = warm_mgr.prove_possession()
-        grant = mgmt.authorise(warm_mgr.public, Role.MANAGER, pop=pop)
+        grant = mgmt.authorise(
+            warm_mgr.public,
+            Role.MANAGER,
+            pop=pop,
+            cert=Cert.sign_grant(anchor, warm_mgr.public, Role.MANAGER),
+        )
         s.apply((_sign(anchor, grant),), auth=mgmt)
         # Roster is empty (warm_mgr is granted MANAGER but not added to the roster). N = 1;
         # the manager slot is position 0. Sign the payload with warm_mgr and try to occupy
@@ -163,7 +177,12 @@ class TestRoleManagerRotation(unittest.TestCase):
         pop = warm_mgr.prove_possession()
 
         # Grant.
-        grant = mgmt.authorise(warm_mgr.public, Role.MANAGER, pop=pop)
+        grant = mgmt.authorise(
+            warm_mgr.public,
+            Role.MANAGER,
+            pop=pop,
+            cert=Cert.sign_grant(anchor, warm_mgr.public, Role.MANAGER),
+        )
         s.apply((_sign(anchor, grant),), auth=mgmt)
         self.assertIsNotNone(mgmt.grant_of(warm_mgr.public))
         self.assertTrue(mgmt.may_write(s, warm_mgr.public, ops.STORE_DATA))
@@ -182,7 +201,12 @@ class TestRoleManagerRotation(unittest.TestCase):
 
         for m in (m1, m2):
             pop = m.prove_possession()
-            grant = mgmt.authorise(m.public, Role.MANAGER, pop=pop)
+            grant = mgmt.authorise(
+                m.public,
+                Role.MANAGER,
+                pop=pop,
+                cert=Cert.sign_grant(anchor, m.public, Role.MANAGER),
+            )
             s.apply((_sign(anchor, grant),), auth=mgmt)
         self.assertTrue(mgmt.may_write(s, m1.public, ops.STORE_DATA))
         self.assertTrue(mgmt.may_write(s, m2.public, ops.STORE_DATA))
@@ -216,7 +240,11 @@ class TestEmergencyIntervention(unittest.TestCase):
         client = crypto.Keypair.generate()
         pop = client.prove_possession()
         grant = mgmt.authorise(
-            client.public, Role.CLIENT, stores=frozenset({ops.STORE_DATA}), pop=pop
+            client.public,
+            Role.CLIENT,
+            stores=frozenset({ops.STORE_DATA}),
+            pop=pop,
+            cert=Cert.sign_grant(anchor, client.public, Role.CLIENT),
         )
         grant_tx = _sign(anchor, grant)
         sbwb = intervene(s, anchor, bodies=(grant_tx,), bucket=1)
@@ -313,7 +341,10 @@ def _seed_cluster(mgmt: Management, anchor: crypto.Keypair, size: int) -> list[c
     store. Returns the node keypairs."""
     kps = [crypto.Keypair.generate() for _ in range(size)]
     tx = mgmt.change_roster(
-        add=tuple(NodeRecord(kp.public, (_addr(i),), frozenset()) for i, kp in enumerate(kps))
+        add=tuple(
+            NodeRecord(kp.public, (_addr(i),), Cert.sign_roster(anchor, kp.public), frozenset())
+            for i, kp in enumerate(kps)
+        )
     )
     mgmt.store.apply((tx.sign(anchor, T0),), auth=mgmt)
     return kps
@@ -382,7 +413,13 @@ class TestChangeRosterBrickRefusal(unittest.TestCase):
         _s, mgmt = _provisioned(anchor)
         # add=1 from n=0: n_after=1, bricked, but n_before also bricked -- allowed.
         kp1 = crypto.Keypair.generate()
-        tx = mgmt.change_roster(add=(NodeRecord(kp1.public, (_addr(1),), frozenset()),))
+        tx = mgmt.change_roster(
+            add=(
+                NodeRecord(
+                    kp1.public, (_addr(1),), Cert.sign_roster(anchor, kp1.public), frozenset()
+                ),
+            )
+        )
         mgmt.store.apply((tx.sign(anchor, T0),), auth=mgmt)
         self.assertEqual(len(mgmt.nodes()), 1)
 
@@ -404,7 +441,12 @@ class TestChangeRosterAdvisoryComposition(unittest.TestCase):
         kps = [crypto.Keypair.generate() for _ in range(4)]
         tx = mgmt.change_roster(
             add=tuple(
-                NodeRecord(kp.public, (_addr(i),), frozenset({b"provider:hetzner"}))
+                NodeRecord(
+                    kp.public,
+                    (_addr(i),),
+                    Cert.sign_roster(anchor, kp.public),
+                    frozenset({b"provider:hetzner"}),
+                )
                 for i, kp in enumerate(kps)
             )
         )
@@ -424,7 +466,7 @@ class TestChangeRosterAdvisoryComposition(unittest.TestCase):
         assert commit_before is not None
 
         kp_new = crypto.Keypair.generate()
-        tx = mgmt.add_node(kp_new.public, (_addr(9),))
+        tx = mgmt.add_node(kp_new.public, (_addr(9),), Cert.sign_roster(anchor, kp_new.public))
         mgmt.store.apply((tx.sign(anchor, T0),), auth=mgmt)
 
         commit_after = mgmt.roster_commitment()

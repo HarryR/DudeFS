@@ -13,7 +13,7 @@ from ..net.envelope import Envelope
 from ..net.transports import InProc, Switchboard, address_of, name_of
 from ..node import Node
 from ..store import Store, management, ops
-from ..store.management import Management, Role
+from ..store.management import Cert, Management, Role
 from ..tunables import DEFAULT
 
 D = ops.STORE_DATA
@@ -62,26 +62,36 @@ class Cluster:
         pump, which advances time internally so Round has room to finalize."""
 
     def _genesis(self) -> tuple[ops.SignedTransaction, ...]:
-        mgmt = Management(Store())
+        # Provision the scratch store with the anchor pubkey so `verify_cert` (called by
+        # `authorise` and `change_roster` at construction time) has an anchor to resolve
+        # signer-authority against. The mutations composed here are applied to the real
+        # per-node stores later; this scratch instance is purely a factory for the tx.
+        scratch = Store()
+        scratch.provision(self.mgr.public)
+        mgmt = Management(scratch)
+        # Anchor-signed cert attesting the mgr identity as MANAGER (#cert). In this test
+        # setup the anchor and the manager are the same key, so this is self-attesting
+        # via the anchor's authority — cluster.py is not modelling a distinct manager.
+        mgr_cert = Cert.sign_grant(self.mgr, self.mgr.public, Role.MANAGER)
         tx = mgmt.authorise(
             self.mgr.public,
             Role.MANAGER,
             frozenset({M, D}),
             frozenset(),
-            self.mgr.prove_possession(),
+            pop=self.mgr.prove_possession(),
+            cert=mgr_cert,
         )
-        for kp in self.keys:
-            tx = tx + mgmt.authorise(
-                kp.public, Role.NODE, frozenset({D}), frozenset(), kp.prove_possession()
-            )
-        # STEP 7 (#roster-change-is-atomic): one atomic change adds every node AND emits the
-        # manager-signed roster commitment. Batched via `change_roster` so `would_brick` sees
-        # the post-batch n (>=3), not the one-at-a-time intermediate n=1 that would refuse.
-        # A node-row set with no commitment cannot be checked for completeness, so a verifier
-        # refuses the log -- the atomic composition IS what makes bootstrap survivable.
+        # Nodes are not authors (#nodes-are-not-authors) — no P_GRANT for them. The
+        # roster entries below establish them as consensus signers via P_NODE, each with
+        # an anchor-signed roster #cert.
         tx = tx + mgmt.change_roster(
             add=tuple(
-                management.NodeRecord(kp.public, (address_of(kp.public).encode(),), frozenset())
+                management.NodeRecord(
+                    kp.public,
+                    (address_of(kp.public).encode(),),
+                    Cert.sign_roster(self.mgr, kp.public),
+                    frozenset(),
+                )
                 for kp in self.keys
             )
         )

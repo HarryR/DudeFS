@@ -49,12 +49,15 @@ class ManagementError(DudeError):
 
 
 class Role(Enum):
-    """Who someone is. Coarse, per #coarse-acl — the grant is by store or by operation kind, never
-    by path prefix, because a node must check it without reading a key
-    (#management-is-cleartext)."""
+    """Who someone is, when they are an AUTHOR. Coarse, per #coarse-acl — the grant is by
+    store or by operation kind, never by path prefix, because a node must check it without
+    reading a key (#management-is-cleartext).
+
+    STORAGE NODES ARE NOT AUTHORS (#nodes-are-not-authors). A node's identity does not have
+    a Role — being a node means having a P_NODE row (with a #cert). Nodes arbitrate the
+    log; they do not author transactions on their own key's authority."""
 
     MANAGER = b"manager"
-    NODE = b"node"
     CLIENT = b"client"
     COMPACTOR = b"compactor"
 
@@ -68,14 +71,84 @@ ever COUNTS. That is what lets a deployment add axes (`rack:`, `psu:`, `cable:`)
 schema
 change or a version bump."""
 
+_CERT_DOMAIN = b"dude.management.cert:"
+_CERT_PURPOSE_ROSTER = b"roster"
+
+
+@dataclass(frozen=True, slots=True)
+class Cert:
+    """One authorisation cert shape, applied on every authority-carrying row (#cert).
+
+    On a P_GRANT row: `purpose = role.value` (e.g. `b"manager"`). On a P_NODE row:
+    `purpose = _CERT_PURPOSE_ROSTER` (`b"roster"`).
+
+    The domain tag plus purpose binding is what stops an anchor-signed CLIENT cert from
+    being repurposed into a MANAGER row: different bytes get signed for different purposes,
+    so the sig doesn't verify when carried across.
+
+    `verify()` is signature-only. Whether the signer is authorised for the purpose (anchor
+    only for MANAGER/COMPACTOR; anchor OR valid manager for CLIENT/ROSTER) is
+    `Management.verify_cert`, which reads state to answer."""
+
+    signer: crypto.PublicKey
+    subject: crypto.PublicKey
+    purpose: bytes
+    sig: crypto.Signature
+
+    @classmethod
+    def sign(cls, signer: crypto.Keypair, subject: crypto.PublicKey, purpose: bytes) -> Cert:
+        return cls(
+            signer.public,
+            subject,
+            purpose,
+            signer.sign(_CERT_DOMAIN + purpose + b":" + subject),
+        )
+
+    @classmethod
+    def sign_grant(cls, signer: crypto.Keypair, subject: crypto.PublicKey, role: Role) -> Cert:
+        """Build a #cert attesting a grant of `role` to `subject`. Purpose is `role.value`."""
+        return cls.sign(signer, subject, role.value)
+
+    @classmethod
+    def sign_roster(cls, signer: crypto.Keypair, subject: crypto.PublicKey) -> Cert:
+        """Build a #cert attesting `subject`'s presence in the roster. Purpose is
+        `_CERT_PURPOSE_ROSTER` (`b"roster"`)."""
+        return cls.sign(signer, subject, _CERT_PURPOSE_ROSTER)
+
+    def verify(self) -> bool:
+        """True if the signature matches `self.signer` over `(purpose, subject)`. Does not
+        check whether the signer is currently authorised — see `Management.verify_cert`."""
+        return self.signer.verify(_CERT_DOMAIN + self.purpose + b":" + self.subject, self.sig)
+
+    def encode(self) -> bytes:
+        return codec.encode([self.signer, self.subject, self.purpose, self.sig])
+
+    @classmethod
+    def decode(cls, raw: bytes) -> Cert:
+        try:
+            p = codec.as_seq(codec.decode(raw), 4)
+            return cls(
+                signer=crypto.PublicKey(codec.as_bytes(p[0])),
+                subject=crypto.PublicKey(codec.as_bytes(p[1])),
+                purpose=codec.as_bytes(p[2]),
+                sig=crypto.Signature(codec.as_bytes(p[3])),
+            )
+        except DudeError as e:
+            raise ManagementError(f"malformed Cert: {e}") from e
+
 
 @dataclass(frozen=True, slots=True)
 class NodeRecord:
     """A node's membership record. Its PRESENCE is membership (#presence-is-membership);
-    deletion is removal."""
+    deletion is removal.
+
+    Carries a #cert with `purpose=b"roster"` attesting the entry from anchor or a valid
+    manager. `nodes()` returns every row in the P_NODE keyspace; `roster()` filters out any
+    row whose cert fails the authority check."""
 
     identity: crypto.PublicKey
     addresses: tuple[Address, ...]
+    cert: Cert
     domains: frozenset[Domain] = frozenset()
     """Which failure domains this node shares with others. Rack-aware placement, generalised:
     when one
@@ -85,12 +158,16 @@ class NodeRecord:
 @dataclass(frozen=True, slots=True)
 class Grant:
     """What an identity may write. `stores` is the set of store ids; `kinds` the operation kinds
-    (the compactor's grant is a KIND, not a store — there is no compaction store, #coarse-acl)."""
+    (the compactor's grant is a KIND, not a store — there is no compaction store, #coarse-acl).
+
+    `cert` is required (#cert) — `purpose == role.value`. `may_write` / `may_send` refuse
+    a grant whose cert does not verify or whose signer is not authorised for the role."""
 
     identity: crypto.PublicKey
     role: Role
     stores: frozenset[int]
     kinds: frozenset[int]
+    cert: Cert
 
 
 # --------------------------------------------------------------------------- #
@@ -123,32 +200,85 @@ class Management:
     # -- reads ---------------------------------------------------------------- #
 
     def nodes(self) -> dict[crypto.PublicKey, NodeRecord]:
-        """Every node currently in the roster. A prefix scan (#presence-is-membership:
-        presence is membership)."""
+        """Every node currently in the P_NODE keyspace. A prefix scan
+        (#presence-is-membership: presence is membership).
+
+        RETURNS EVERY ENTRY — including any with an invalid #cert. Callers that want "who
+        is actually authorised" use `roster()`, which filters. Callers that want "what rows
+        are in the P_NODE keyspace" (introspection, tests) use this."""
         out: dict[crypto.PublicKey, NodeRecord] = {}
         for name, _prov, value, _ep in self.store.prefix(self.store_id, P_NODE):
             who = crypto.PublicKey(name[len(P_NODE) :])
-            rec = codec.decode(value)
-            # A bare address list is the pre-domains shape. Accepted because it is a shorter
-            # well-defined form, not a malformed one — the same latitude `Endpoint.parse` takes.
-            if isinstance(rec, list | tuple) and rec and isinstance(rec[0], list | tuple):
-                f = codec.as_seq(rec, 2)
-                addrs = tuple(codec.as_bytes(a) for a in codec.as_seq(f[0]))
-                doms = frozenset(codec.as_bytes(d) for d in codec.as_seq(f[1]))
-            else:
-                addrs = tuple(codec.as_bytes(a) for a in codec.as_seq(rec))
-                doms = frozenset()
-            out[who] = NodeRecord(who, addrs, doms)
+            f = codec.as_seq(codec.decode(value), 3)
+            addrs = tuple(codec.as_bytes(a) for a in codec.as_seq(f[0]))
+            doms = frozenset(codec.as_bytes(d) for d in codec.as_seq(f[1]))
+            cert = Cert.decode(codec.as_bytes(f[2]))
+            out[who] = NodeRecord(who, addrs, cert, doms)
         return out
 
     def roster(self) -> tuple[crypto.PublicKey, ...]:
-        """The roster as a sorted tuple — sorted because a signer bitmap indexes into it, and two
-        implementations must agree on the order. Never rely on mapping iteration order for this:
-        Go randomises it, so an unsorted roster would produce different bitmaps per language.
+        """The roster as a sorted tuple of currently-authorised nodes — sorted because a
+        signer bitmap indexes into it, and two implementations must agree on the order.
+        Never rely on mapping iteration order for this: Go randomises it, so an unsorted
+        roster would produce different bitmaps per language.
+
+        FILTERS INVALIDLY-ATTESTED ENTRIES. Each entry's #cert must verify AND its signer
+        must be authorised for the roster purpose (anchor or a currently-valid manager).
+        Rows that fail this check appear in `nodes()` for introspection but are absent from
+        the roster used for authorisation and quorum arithmetic.
+
+        Also refuses entries whose cert `subject` or `purpose` do not match the row — a
+        cert-substitution attempt where an anchor-signed cert for X is stuffed into Y's
+        row fails at the subject check.
 
         THIS IS THE ONE ROSTER SOURCE. `Store.roster()` used to delegate here; deleted. Anyone
         needing the roster asks Management (which is what owns authority questions in general)."""
-        return tuple(sorted(self.nodes()))
+        out: list[crypto.PublicKey] = []
+        for who, rec in self.nodes().items():
+            if rec.cert.subject != who:
+                continue
+            if rec.cert.purpose != _CERT_PURPOSE_ROSTER:
+                continue
+            if not self.verify_cert(rec.cert):
+                continue
+            out.append(who)
+        return tuple(sorted(out))
+
+    def verify_cert(self, cert: Cert) -> bool:  # noqa: PLR0911 -- each early-return names a distinct refusal reason; collapsing them into one `and`-chain hides which check failed
+        """True iff `cert` is signature-valid AND its signer is authorised for its
+        `purpose` (#cert):
+
+          * `purpose == b"manager"` or `b"compactor"`: signer MUST be the store's anchor.
+          * `purpose == b"client"` or `b"roster"`: signer MUST be the store's anchor OR
+            an identity currently holding a valid Role.MANAGER grant.
+
+        Signature-only check for the manager-cert-to-anchor hop; the manager's grant-row
+        presence is checked implicitly via `_read_grant`, which returns None if the row
+        has been deleted (#absence-is-revocation).
+
+        Returns False on an unprovisioned store — no anchor means no authority."""
+        anchor = self.store.anchor()
+        if anchor is None:
+            return False
+        if not cert.verify():
+            return False
+        anchor_only_purposes = (Role.MANAGER.value, Role.COMPACTOR.value)
+        anchor_or_manager_purposes = (Role.CLIENT.value, _CERT_PURPOSE_ROSTER)
+        if cert.purpose in anchor_only_purposes:
+            return cert.signer == anchor
+        if cert.purpose in anchor_or_manager_purposes:
+            if cert.signer == anchor:
+                return True
+            grant = self._read_grant(self.store, cert.signer)
+            if grant is None or grant.role is not Role.MANAGER:
+                return False
+            return (
+                grant.cert.subject == cert.signer
+                and grant.cert.purpose == Role.MANAGER.value
+                and grant.cert.verify()
+                and grant.cert.signer == anchor
+            )
+        return False
 
     def addresses_of(self, who: crypto.PublicKey) -> tuple[Address, ...]:
         """Where `who` can be reached. A node may be multi-homed; `dude.net` chooses among them."""
@@ -184,20 +314,25 @@ class Management:
     def _read_grant(self, reader: Reader, who: crypto.PublicKey) -> Grant | None:
         """The primitive grant lookup. Reads from `reader` (typically `self.store`, but the
         transaction's own layer during evaluation) so a grant made by an earlier step is
-        visible to a later step's check."""
+        visible to a later step's check.
+
+        Row content is always 4 fields: role, stores, kinds, cert-bytes. A grant on-log
+        always carries a #cert (`authorise` refuses to build a grant without one)."""
         raw = reader.get(self.store_id, P_GRANT + who)
         if raw is None:
             return None
-        f = codec.as_seq(codec.decode(raw[1]), 3)
+        f = codec.as_seq(codec.decode(raw[1]), 4)
         try:
             role = Role(codec.as_bytes(f[0]))
         except ValueError as e:
             raise ManagementError(f"unknown role for {who.hex()[:8]}") from e
+        cert = Cert.decode(codec.as_bytes(f[3]))
         return Grant(
             who,
             role,
             frozenset(codec.as_int(x) for x in codec.as_seq(f[1])),
             frozenset(codec.as_int(x) for x in codec.as_seq(f[2])),
+            cert,
         )
 
     def grant_of(self, who: crypto.PublicKey) -> Grant | None:
@@ -209,21 +344,29 @@ class Management:
         """`#coarse-acl`'s check: may `who` write `store_id`? The one authority question a node
         can answer blind, because the store id is cleartext in every operation.
 
-        THE ANCHOR IS ALWAYS AUTHORISED. The manager pubkey (`store.anchor()`, provisioned
-        out-of-band) is the axiom the whole authority chain hangs from -- their grants are
-        what create the rest of the roster's authority in the first place. Checking their
-        authority against a log they themselves authorise would be circular; treating them as
+        THE ANCHOR IS ALWAYS AUTHORISED. The anchor pubkey (`store.anchor()`, provisioned
+        out-of-band) is the axiom the whole authority chain hangs from -- its grants are
+        what create the rest of the roster's authority in the first place. Checking its
+        authority against a log it itself authorises would be circular; treating it as
         always-may-write is what makes bootstrap a manager-signed block rather than a special-
         cased evaluator bypass (`auth=None`, deleted).
+
+        GRANTS ARE CERT-CHECKED. Every grant carries a #cert; the grant is honoured only
+        if the cert's subject matches the row key, its purpose matches the row's role, its
+        signature verifies, and its signer is authorised for that role. A row that fails
+        any of those is treated as absent, closing the direct-write bypass at read-time
+        even before eval-time enforcement lands.
 
         Takes `reader` per call so a grant made by an earlier step in a transaction is visible
         to a later step's check (authorise -> use -> revoke, in one atomic transaction)."""
         if who == self.store.anchor():
             return True
         g = self._read_grant(reader, who)
-        if g is None:
+        if g is None or not self._grant_cert_ok(g):
             return False
-        return g.role is Role.MANAGER or store_id in g.stores
+        if g.role is Role.MANAGER:
+            return True
+        return store_id in g.stores
 
     def may_send(self, who: crypto.PublicKey, kind: int) -> bool:
         """Whether `who` may author an operation of this kind — the grant that has no store, e.g. a
@@ -231,13 +374,25 @@ class Management:
 
         THE ANCHOR IS ALWAYS AUTHORISED (#anchor-is-the-axiom), same rule as `may_write` --
         applied consistently here so `may_write` and `may_send` do not disagree about the
-        axiomatic identity."""
+        axiomatic identity. Grants are cert-checked (#cert), same rule as `may_write`."""
         if who == self.store.anchor():
             return True
         g = self.grant_of(who)
-        if g is None:
+        if g is None or not self._grant_cert_ok(g):
             return False
-        return g.role is Role.MANAGER or kind in g.kinds
+        if g.role is Role.MANAGER:
+            return True
+        return kind in g.kinds
+
+    def _grant_cert_ok(self, g: Grant) -> bool:
+        """The cert-consistency check every grant-honouring path runs. Cert `subject` must
+        match the grant identity, `purpose` must match `role.value`, signature must verify,
+        and signer must be authorised for the role. See `verify_cert` for the signer rule."""
+        if g.cert.subject != g.identity:
+            return False
+        if g.cert.purpose != g.role.value:
+            return False
+        return self.verify_cert(g.cert)
 
     def authorization(
         self,
@@ -336,9 +491,28 @@ class Management:
                 f"change_roster would shrink from n={n_before} (safe) to n={n_after} "
                 f"(would_brick); refused. Use intervene() for anchor rescue if deliberate."
             )
+        # Validate every added entry's #cert at construction time. Cert must attest the
+        # roster purpose, target the entry's identity, verify, and be signed by an
+        # authorised signer (anchor or currently-valid manager). Eval-time refusal of a
+        # raw `Set P_NODE` bypassing this is OWED.
+        for rec in add:
+            if rec.cert.subject != rec.identity:
+                raise ManagementError(
+                    f"cert.subject {rec.cert.subject.hex()[:8]} does not match node "
+                    f"identity {rec.identity.hex()[:8]}"
+                )
+            if rec.cert.purpose != _CERT_PURPOSE_ROSTER:
+                raise ManagementError(
+                    f"cert.purpose {rec.cert.purpose!r} is not the roster purpose"
+                )
+            if not self.verify_cert(rec.cert):
+                raise ManagementError(
+                    f"cert for node {rec.identity.hex()[:8]} does not verify or signer "
+                    f"is not authorised"
+                )
         # Compose one atomic Transaction. Order:
         #   1. Remove: Del P_NODE + Del P_POP for each removed identity
-        #   2. Add:    Set P_NODE for each added record
+        #   2. Add:    Set P_NODE for each added record (addresses + domains + cert)
         #   3. Commit: Set P_ROSTER with fresh commitment (serial = current + 1)
         # PoPs for added nodes are the caller's business (they come via `authorise`, which is
         # a separate step composed onto this transaction).
@@ -350,7 +524,7 @@ class Management:
             ops.Set(
                 self.store_id,
                 P_NODE + rec.identity,
-                codec.encode([list(rec.addresses), sorted(rec.domains)]),
+                codec.encode([list(rec.addresses), sorted(rec.domains), rec.cert.encode()]),
             )
             for rec in add
         )
@@ -365,11 +539,12 @@ class Management:
         self,
         who: crypto.PublicKey,
         addresses: tuple[Address, ...],
+        cert: Cert,
         domains: frozenset[Domain] = frozenset(),
     ) -> ops.Transaction:
         """Convenience wrapper on `change_roster`: single-node add. See `change_roster` for
-        the full semantics (batched, brick-refuse only, advisory composition)."""
-        return self.change_roster(add=(NodeRecord(who, addresses, domains),))
+        the full semantics (batched, brick-refuse only, advisory composition, cert-checked)."""
+        return self.change_roster(add=(NodeRecord(who, addresses, cert, domains),))
 
     def domain_groups(self) -> dict[Domain, frozenset[crypto.PublicKey]]:
         """Which nodes share each label. A pure fold over the roster."""
@@ -402,21 +577,46 @@ class Management:
         which composes the commitment update, PoP deletion, and node deletion atomically."""
         return self.change_roster(remove=(who,))
 
-    def authorise(
+    def authorise(  # noqa: PLR0913, PLR0917 -- every arg is a distinct required piece of a grant; collapsing them hides intent and forces callers to build dicts
         self,
         who: crypto.PublicKey,
         role: Role,
         stores: frozenset[int] = frozenset(),
         kinds: frozenset[int] = frozenset(),
         pop: crypto.Signature | None = None,
+        cert: Cert | None = None,
     ) -> ops.Transaction:
-        """Authorise an identity. `pop` is the subject's proof that it holds the secret half — the
-        manager never certifies a key it did not see proven (#possession-proof), so this
-        refuses without it
-        rather than trusting the caller to have checked."""
+        """Authorise an identity (#role-manager-grant, #cert).
+
+        `pop` is the subject's proof that it holds the secret half — the anchor/manager
+        never certifies a key it did not see proven (#possession-proof).
+
+        `cert` is the #cert attesting the grant. It is validated here rather than trusted:
+          * `cert.subject` MUST equal `who`.
+          * `cert.purpose` MUST equal `role.value`.
+          * `cert.verify()` MUST hold (signature-only).
+          * `cert.signer` MUST be authorised for the role: anchor-only for MANAGER and
+            COMPACTOR, anchor-or-currently-valid-manager for CLIENT.
+
+        Refuses at construction time on any missing / invalid input. This is the API-side
+        check; eval-time refusal of a raw `Set P_GRANT` bypassing this method is OWED (see
+        the enforcement table for #cert)."""
         if pop is None or not who.verify_possession(pop):
             raise ManagementError(f"no valid possession proof for {who.hex()[:8]}")
-        record = codec.encode([role.value, sorted(stores), sorted(kinds)])
+        if cert is None:
+            raise ManagementError(f"authorise requires a #cert (role={role.name})")
+        if cert.subject != who:
+            raise ManagementError(
+                f"cert.subject {cert.subject.hex()[:8]} does not match grant subject "
+                f"{who.hex()[:8]}"
+            )
+        if cert.purpose != role.value:
+            raise ManagementError(f"cert.purpose {cert.purpose!r} does not match role {role.name}")
+        if not self.verify_cert(cert):
+            raise ManagementError(
+                f"cert does not verify or signer is not authorised for role {role.name}"
+            )
+        record = codec.encode([role.value, sorted(stores), sorted(kinds), cert.encode()])
         return ops.writes(
             ops.Set(self.store_id, P_GRANT + who, record),
             ops.Set(self.store_id, P_POP + who, pop),

@@ -26,7 +26,7 @@ from dude.consensus.bootstrap import intervene
 from dude.consensus.settle_round import SettledBlock
 from dude.core import crypto
 from dude.net.transports import name_of
-from dude.store.management import Role
+from dude.store.management import Cert, Role
 
 from .cluster import DELTA, Cluster, D
 
@@ -70,7 +70,13 @@ class TestIntervenePropagatesViaSync(unittest.TestCase):
         pop = new_client.prove_possession()
         grant_tx = (
             c.nodes[0]
-            .mgmt.authorise(new_client.public, Role.CLIENT, stores=frozenset({D}), pop=pop)
+            .mgmt.authorise(
+                new_client.public,
+                Role.CLIENT,
+                stores=frozenset({D}),
+                pop=pop,
+                cert=Cert.sign_grant(c.mgr, new_client.public, Role.CLIENT),
+            )
             .sign(c.mgr, c._clock)
         )
 
