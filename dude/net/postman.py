@@ -18,16 +18,50 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import NamedTuple
 
 from ..core import crypto
+from ..core.errors import DudeError
 from ..core.units import Millis
+from .address import Endpoint, Scheme
 from .envelope import EnvelopeError, Frame, SignedEnvelope
-from .link import Link, Peer
+from .link import Link, LinkTunables, Peer, Transport
 from .mailbox import Expired, Mailbox, Reply, Transmit
 from .plan import Decision, GiveUp, Plan, Send, Wait
+
+
+class PostmanError(DudeError):
+    """A misconfiguration Postman cannot recover from: an `add_peer` for a scheme with no
+    registered dialler, or a transport constructor that itself raised. Not for peer-level
+    failures (link down, breaker open) — those are policy outcomes below Postman."""
+
+
+type Dialler = Callable[[Endpoint, crypto.Keypair], Transport]
+"""How Postman obtains a `Transport` for an endpoint. Takes the whole `Endpoint` (so
+the transport receives its options) plus the caller's identity (so identity-bound
+transports like InProc know who is dialling). Registered per-scheme at module scope
+via `register_dialler`, one entry per scheme this build can dial."""
+
+
+_DIALLERS: dict[Scheme, Dialler] = {}
+"""Module-scope scheme->dialler map (#postman-owns-dialling). A deployment fact, not
+a per-Postman config. Test builds register INPROC; production builds register TCP/UNIX.
+Populated at process startup (or, for tests, at cluster construction) via
+`register_dialler(scheme, dialler)`."""
+
+
+def register_dialler(scheme: Scheme, dialler: Dialler) -> None:
+    """Register (or replace) the dialler for `scheme`. Idempotent — re-registering the
+    same scheme with the same dialler at test setup is fine."""
+    _DIALLERS[scheme] = dialler
+
+
+def _reset_diallers_for_tests() -> None:
+    """Clear the dialler registry. Test-only hook, called by cluster harness setup."""
+    _DIALLERS.clear()
 
 
 class Recipient(Enum):
@@ -68,7 +102,11 @@ class Sample:
 
 @dataclass(slots=True)
 class Postman:
-    """Drives the mailbox and the peers. Holds the keypair, reads the clock, performs the I/O."""
+    """Drives the mailbox and the peers. Holds the keypair, reads the clock, performs the I/O.
+
+    Owns peer lifecycle (#postman-owns-dialling). Callers register endpoints via
+    `add_peer(pubkey, endpoints)`; Postman looks up the scheme→dialler in the module-scope
+    registry and constructs the transport. Nothing outside Postman writes to `peers`."""
 
     me: crypto.Keypair
     mailbox: Mailbox = field(default_factory=Mailbox)
@@ -76,10 +114,61 @@ class Postman:
     window: Millis = 5_000
     """The conversation window a receiver will apply to us — see `SignedEnvelope.fresh`."""
 
+    link_tunables: LinkTunables = field(default_factory=LinkTunables)
+    """Per-Peer link-policy dials -- one set applied uniformly to every peer this Postman
+    owns. Per-endpoint policy (TLS material, mixnet profile) lives in
+    `Endpoint.options` instead (#peer-options-are-endpoint-options)."""
+
     plan: Plan = field(default_factory=Plan)
     """The policy. `Postman` decides NOTHING — it asks, executes, and reports. The stagger delay and
     the give-up-when-no-links case used to be inline here; both were policy smuggled into the
     executor, and both now live in `Plan` where they can be tested without a socket."""
+
+    _transports_by_scheme: dict[Scheme, Transport] = field(default_factory=dict, init=False)
+    """Cache of transports this Postman has already dialled, keyed by scheme. Some
+    transports (InProc, and typically a single TCP client) are one-per-Postman; the cache
+    reuses them across peers of the same scheme so `add_peer` for two peers on the same
+    scheme doesn't duplicate carrier state."""
+
+    def add_peer(self, pubkey: crypto.PublicKey, endpoints: tuple[Endpoint, ...]) -> None:
+        """Register or reconfigure a peer with `endpoints` we should try to reach it at.
+        Uses the module-scope scheme→dialler map to construct any transports not already
+        cached. See #postman-owns-dialling.
+
+        Idempotent: adding a peer that already exists reconfigures its endpoints (which
+        preserves the surviving links' estimator/breaker state via `Peer.reconfigure`)."""
+        peer = self.peers.get(pubkey)
+        if peer is None:
+            peer = Peer(pubkey, self._dial, self.link_tunables)
+            self.peers[pubkey] = peer
+        peer.reconfigure(endpoints)
+
+    def remove_peer(self, pubkey: crypto.PublicKey) -> None:
+        """Drop a peer from the routing table. Idempotent. Outbound messages already
+        queued for this peer will time out and reap normally — the Postman's tick loop
+        sees `peer = self.peers.get(...) is None` and lets the deadline handle it.
+
+        This is also the mechanism tests use to simulate a partition
+        (#partitions-are-test-only): remove the target from both sides."""
+        self.peers.pop(pubkey, None)
+
+    def _dial(self, endpoint: Endpoint) -> Transport:
+        """Look up (or lazily construct) the transport for `endpoint`'s scheme. Cached
+        per scheme in `_transports_by_scheme`. Raises `PostmanError` if no dialler is
+        registered for the scheme."""
+        scheme = endpoint.address.scheme
+        transport = self._transports_by_scheme.get(scheme)
+        if transport is not None:
+            return transport
+        dialler = _DIALLERS.get(scheme)
+        if dialler is None:
+            raise PostmanError(
+                f"no dialler registered for scheme {scheme.name}; "
+                f"call postman.register_dialler(...) at startup"
+            )
+        transport = dialler(endpoint, self.me)
+        self._transports_by_scheme[scheme] = transport
+        return transport
 
     def tick(self, now: Millis) -> tuple[Expired, ...]:
         """One round: act on what is due, then reap what has expired.

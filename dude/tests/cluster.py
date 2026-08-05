@@ -7,16 +7,31 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 from ..consensus.bootstrap import bootstrap
 from ..core import crypto
 from ..net import Verb
+from ..net.address import Endpoint, Scheme
 from ..net.envelope import Envelope
+from ..net.postman import register_dialler
 from ..net.transports import InProc, address_of, name_of
 from ..net.transports.inproc import _reset_for_tests
 from ..node import Node
 from ..store import Store, management, ops
 from ..store.management import Cert, Management, Role
 from ..tunables import DEFAULT
+
+
+def _inproc_dialler(_endpoint: Endpoint, me: crypto.Keypair) -> InProc:
+    """Construct an InProc for `me` -- registers it in the module-scope registry so peers
+    can reach us by name. Called by Postman when a peer's endpoint has scheme INPROC.
+
+    Ignores `_endpoint` because InProc's routing is by target name inside `send()`, not
+    by the dialler's endpoint parameter. Different from TCP where each endpoint would
+    dial to a different socket."""
+    return InProc(name_of(me.public))
+
 
 D = ops.STORE_DATA
 M = ops.STORE_MANAGEMENT
@@ -33,14 +48,18 @@ class Cluster:
         # collide with ours. (#inproc-is-a-loopback: the registry is process-wide, so tests
         # that construct clusters back-to-back share it and MUST manage their own hygiene.)
         _reset_for_tests()
+        # Register the InProc dialler so Postman knows how to dial INPROC endpoints.
+        # Idempotent per #postman-owns-dialling; re-registration is fine.
+        register_dialler(Scheme.INPROC, _inproc_dialler)
 
         self.mgr = crypto.Keypair.generate()
         self.keys = [crypto.Keypair.generate() for _ in range(size)]
         self.nodes: list[Node] = []
-        # Every Node has ONE InProc registered under its own name; it is the sole entry
-        # point for both outbound sends (send to any target address) and inbound receives
-        # (drain its own inbox). Peers share the SAME InProc instance because there is
-        # nothing per-peer at the transport layer -- the target address is what routes.
+        # Each Postman constructed by `Node(...)` will lazily dial its own InProc via the
+        # module-scope dialler on the first `add_peer` call. We keep a reference to each
+        # Node's transport so tests that need to drain (e.g. `_quiesce`) can find it.
+        # Typed as InProc because tests reach in for `.receive()`, which is InProc-specific
+        # (real transports don't need an inbox because the OS delivers to their fd).
         self._transports: dict[crypto.PublicKey, InProc] = {}
 
         # Every node starts with the SAME block 1 -- a manager-signed genesis block that
@@ -59,17 +78,21 @@ class Cluster:
             # at init; every node produces byte-equal block 1 because the inputs are identical).
             bootstrap(store, self.mgr, genesis)
             node = Node(kp, store)
-            self._transports[kp.public] = InProc(name_of(kp.public))
             self.nodes.append(node)
-        # Wire every pair: each node's Postman gets every other peer, using the node's ONE
-        # shared InProc transport. `node.connect` stays the current single-transport API
-        # here; the Postman.add_peer / roster-driven reconciliation refactor lands in a
-        # later commit.
+        # Wire every pair via `Node.add_peer(pubkey, endpoints)`. The first `add_peer` on
+        # each Node causes its Postman to dial an InProc (via the module-scope dialler)
+        # and register it under `name_of(kp.public)`. We grab the resulting transport
+        # after the first add_peer so `_quiesce` can drain each Node's inbox.
         for node in self.nodes:
-            transport = self._transports[node.me.public]
             for other in self.keys:
                 if other.public != node.me.public:
-                    node.connect(other.public, transport)
+                    node.add_peer(other.public, (Endpoint(address_of(other.public)),))
+            # Cast is safe because the dialler for INPROC always returns InProc; the
+            # narrowing is only needed because Postman's cache is typed generically.
+            self._transports[node.me.public] = cast(
+                "InProc",
+                node.postman._transports_by_scheme[Scheme.INPROC],
+            )
         self._clock: int = T0
         """The cluster's own monotone clock. `pump(now)` treats its `now` argument as a floor:
         if a test calls `pump(T0)` then `pump(T0 + DELTA)`, the second pump continues from

@@ -9,10 +9,12 @@ proves that the Node dispatch wiring reaches it correctly through the wire stack
 from __future__ import annotations
 
 import unittest
+from typing import cast
 
 from dude.consensus.settle_round import SettledBlock
 from dude.core import crypto
-from dude.net.transports import InProc, name_of
+from dude.net.address import Endpoint, Scheme
+from dude.net.transports import InProc, address_of
 from dude.node import Node
 from dude.store import Store, ops
 
@@ -50,13 +52,16 @@ class TestFreshNodeJoinsClusterAndCatchesUp(unittest.TestCase):
         joiner_store.provision(c.mgr.public)
         joiner = Node(joiner_kp, joiner_store)
 
-        # Give the joiner its own InProc (registers under its own name in the module-scope
-        # registry). Node 0 already has one; the joiner sends to node 0 through the joiner's
-        # transport, node 0 replies through node 0's transport. Both directions route via
-        # the module registry -- no `Switchboard` to bind or plumb through.
-        joiner_transport = InProc(name_of(joiner_kp.public))
-        joiner.connect(c.nodes[0].me.public, joiner_transport)
-        c.nodes[0].connect(joiner_kp.public, c._transports[c.nodes[0].me.public])
+        # Wire the joiner via `Node.add_peer`. The joiner's Postman dials INPROC lazily
+        # via the module-scope dialler; node 0's Postman likewise adds the joiner as a
+        # peer. The module-scope InProc registry routes frames both directions -- no
+        # switchboard, no factory injection.
+        joiner.add_peer(c.nodes[0].me.public, (Endpoint(address_of(c.nodes[0].me.public)),))
+        c.nodes[0].add_peer(joiner_kp.public, (Endpoint(address_of(joiner_kp.public)),))
+        joiner_transport = cast(
+            "InProc",
+            joiner.postman._transports_by_scheme[Scheme.INPROC],
+        )
 
         # Pump time forward with all four nodes. Each pump: tick every node (drives their
         # follower + coordinator), quiesce dissemination. The joiner's tick fires HEIGHT

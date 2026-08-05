@@ -32,9 +32,7 @@ from .core.units import Millis
 from .net import Verb
 from .net.address import Endpoint
 from .net.envelope import Envelope, Frame, SignedEnvelope, new_message_id
-from .net.link import Peer, Transport
 from .net.postman import Postman
-from .net.transports import address_of
 from .store import Store, ops
 from .store.management import Management
 from .sync.adapter import (
@@ -115,7 +113,11 @@ class Node:
     Coordinator PRODUCES blocks, Follower CONSUMES them, they never talk to each other."""
 
     def __post_init__(self) -> None:
-        self.postman = Postman(self.me, window=self.tunables.net.window)
+        self.postman = Postman(
+            self.me,
+            window=self.tunables.net.window,
+            link_tunables=self.tunables.link,
+        )
         self.adapter = RoundAdapter(self.me, self.postman, self.tunables.net.ttl)
         self.settle_adapter = SettleAdapter(self.me, self.postman, self.tunables.net.ttl)
         self.sync_adapter = SyncAdapter(self.me, self.postman, self.tunables.net.ttl)
@@ -147,17 +149,19 @@ class Node:
     def mgmt(self) -> Management:
         return Management(self.store)
 
-    def connect(self, peer: crypto.PublicKey, transport: Transport) -> None:
-        """Add a peer reachable in-process. A real deployment reads endpoints from the management
-        store instead; this is the same `Peer` either way.
+    def add_peer(self, peer: crypto.PublicKey, endpoints: tuple[Endpoint, ...]) -> None:
+        """Add or update a peer's reachability. Composes `postman.add_peer` (transport
+        layer) with `follower.add_peer` (sync-poll layer). Callers pass endpoints; Postman
+        dials transports via the module-scope scheme→dialler map (#postman-owns-dialling).
 
-        The follower also learns about the peer here so its next `tick` polls them for HEIGHT.
-        Initial poll deadline is 0, i.e. "poll on the very next tick" -- callers usually
-        `connect` at cluster construction time when the clock is not yet advanced, so any
-        reasonable `tick(now)` will fire the first poll immediately."""
-        p = Peer(peer, lambda _e: transport, self.tunables.link)
-        p.reconfigure((Endpoint(address_of(peer)),))
-        self.postman.peers[peer] = p
+        Follower's initial poll deadline is 0, i.e. "poll on the very next tick" -- typical
+        callers add peers at cluster construction time when the clock is not yet advanced,
+        so any reasonable `tick(now)` will fire the first poll immediately.
+
+        This helper stays as a thin convenience while `#roster-drives-peers` is OWED.
+        Once tick-time reconciliation lands, Node will not need to be told about peers at
+        all -- the roster in state drives it."""
+        self.postman.add_peer(peer, endpoints)
         self.follower.add_peer(peer, now=0)
 
     def roster(self) -> tuple[crypto.PublicKey, ...]:
