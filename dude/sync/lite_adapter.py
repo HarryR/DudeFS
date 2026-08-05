@@ -528,11 +528,38 @@ _DECODERS: dict[Verb, Callable[[bytes], LiteMsg]] = {
 }
 
 
+# --------------------------------------------------------------------------------------------- #
+# The adapter                                                                                   #
+# --------------------------------------------------------------------------------------------- #
+
+
+class LiteAdapter:
+    """Send lite-client messages via a Postman. Parallels `SyncAdapter` for `SyncMsg`.
+
+    Node uses `reply(env, msg, now)` to answer inbound `GET_ANCHORS` / `GET_PROOF`.
+    LightClient (when built) uses `send(peer, msg, now, await_reply=True)` for outbound
+    requests."""
+
+    def __init__(self, me: crypto.Keypair, postman, ttl):
+        self.me = me
+        self.postman = postman
+        self.ttl = ttl
+
+    def reply(self, to, msg: LiteMsg, now):
+        """Answer an inbound request. Uses `env.answer(verb, body)` so `reply_to` echoes
+        the original's MessageId -- what the requester's mailbox uses to correlate."""
+        verb, body = msg.encode()
+        self.postman.mailbox.post(
+            to.answer(verb, body).sign(self.me, now), now, self.ttl, await_reply=False
+        )
+
+
 __all__ = [
     "ABSENT_MARKER",
     "AnchorsReply",
     "GetAnchors",
     "GetProof",
+    "LiteAdapter",
     "LiteAdapterError",
     "LiteMsg",
     "LiteRefusal",

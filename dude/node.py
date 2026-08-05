@@ -43,6 +43,16 @@ from .sync.adapter import (
     SyncRefusal,
 )
 from .sync.follower import Follower, serve_getblock, serve_height
+from .sync.lite import serve_get_anchors, serve_get_proof
+from .sync.lite_adapter import (
+    GetAnchors,
+    GetProof,
+    LiteAdapter,
+    LiteAdapterError,
+    LiteMsg,
+    LiteRefusal,
+    LiteRefused,
+)
 from .tunables import DEFAULT, Tunables
 
 REPLIES = frozenset({Verb.PONG, Verb.BODIES, Verb.REFUSED})
@@ -63,6 +73,8 @@ HANDLED = frozenset(
         Verb.GETBLOCK,
         Verb.SETTLED_BLOCK,
         Verb.PING,
+        Verb.GET_ANCHORS,
+        Verb.GET_PROOF,
     }
 )
 """Verbs this node acts on.
@@ -100,6 +112,7 @@ class Node:
     adapter: RoundAdapter = field(init=False)
     settle_adapter: SettleAdapter = field(init=False)
     sync_adapter: SyncAdapter = field(init=False)
+    lite_adapter: LiteAdapter = field(init=False)
     coordinator: Coordinator = field(init=False)
     """Owns the current Mempool, the in-flight Rounds, and drives them on tick. See
     `dude.coordinator`. Node's role in consensus is: hand SUBMIT bodies to
@@ -125,6 +138,7 @@ class Node:
         self.adapter = RoundAdapter(self.me, self.postman, self.tunables.net.ttl)
         self.settle_adapter = SettleAdapter(self.me, self.postman, self.tunables.net.ttl)
         self.sync_adapter = SyncAdapter(self.me, self.postman, self.tunables.net.ttl)
+        self.lite_adapter = LiteAdapter(self.me, self.postman, self.tunables.net.ttl)
         self.coordinator = Coordinator(
             self.me,
             self.store,
@@ -323,6 +337,62 @@ class Node:
             self.follower.cancel_pull(env.frm)
             return
         self.follower.receive(msg, env.frm, now)
+
+    def _lite_authorised(self, requester: crypto.PublicKey) -> bool:
+        """Auth gate for light-client verbs (#light-client-verify, Harry's ruling that the
+        cluster is strictly permissioned). `requester` MUST be one of:
+          * The anchor (#anchor-is-the-axiom, always authorised).
+          * A currently-attested Role.MANAGER (blanket authorship).
+          * A currently-attested Role.CLIENT (the light client's own grant).
+          * A currently-attested Role.COMPACTOR (for future compactor-side reads).
+          * A currently-attested roster member (nodes reading each other, e.g. for sync).
+
+        Uses `Management.may_send(requester, 0)` for grant checks -- MANAGER blanket
+        makes it True; other roles fall back to the store roster membership check."""
+        if requester == self.store.anchor():
+            return True
+        if requester in self.mgmt.roster():
+            return True
+        grant = self.mgmt.grant_of(requester)
+        return grant is not None
+
+    def _on_get_anchors(self, env: SignedEnvelope, now: Millis) -> None:
+        """A light client (or another node) asks for our current anchors + optionally
+        the identity chain (#light-client-piggyback). Auth: sender must be a known
+        identity per #light-client-verify. Decode failure earns a LITE_REFUSED with
+        MALFORMED_QUERY."""
+        if not self._lite_authorised(env.frm):
+            self.lite_adapter.reply(env, LiteRefused(LiteRefusal.MALFORMED_QUERY), now)
+            return
+        try:
+            req = LiteMsg.decode(env.env.verb, env.env.body)
+        except (LiteAdapterError, DudeError):
+            self.lite_adapter.reply(env, LiteRefused(LiteRefusal.MALFORMED_QUERY), now)
+            return
+        if not isinstance(req, GetAnchors):
+            return  # verb-routed here; type guard
+        reply = serve_get_anchors(
+            self.store, self.mgmt, req, self.tunables.light_client.liveness_window
+        )
+        self.lite_adapter.reply(env, reply, now)
+
+    def _on_get_proof(self, env: SignedEnvelope, now: Millis) -> None:
+        """A light client asks for a value + SMT proof at some block_num
+        (#light-client-get). Same auth + decode shape as _on_get_anchors."""
+        if not self._lite_authorised(env.frm):
+            self.lite_adapter.reply(env, LiteRefused(LiteRefusal.MALFORMED_QUERY), now)
+            return
+        try:
+            req = LiteMsg.decode(env.env.verb, env.env.body)
+        except (LiteAdapterError, DudeError):
+            self.lite_adapter.reply(env, LiteRefused(LiteRefusal.MALFORMED_QUERY), now)
+            return
+        if not isinstance(req, GetProof):
+            return
+        reply = serve_get_proof(
+            self.store, self.mgmt, req, self.tunables.light_client.liveness_window
+        )
+        self.lite_adapter.reply(env, reply, now)
 
     # -- the round ----------------------------------------------------------------------------- #
 

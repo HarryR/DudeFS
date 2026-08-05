@@ -165,18 +165,16 @@ class TestVerbCoverage(unittest.TestCase):
         than crashing on an unknown verb; the enum entries should be moved to a retired section
         in a follow-up cleanup.
 
-        `GET_ANCHORS`/`ANCHORS_REPLY`/`GET_PROOF`/`PROOF_REPLY`/`LITE_REFUSED` are the light-
-        client verbs added ahead of the LightClient landing (#light-client). Handlers land
-        with that wave; until then they are unimplemented-and-ignored the same way retired
-        verbs are."""
+        `ANCHORS_REPLY` / `PROOF_REPLY` / `LITE_REFUSED` are the light-client REPLY verbs --
+        the client's own concern. They're routed by the Postman correlation path, so Node
+        doesn't dispatch them; they show up in UNIMPLEMENTED until the LightClient state
+        machine that consumes them lands."""
         self.assertEqual(
             UNIMPLEMENTED,
             {
                 Verb.PROPOSE,
                 Verb.ENDORSE,
-                Verb.GET_ANCHORS,
                 Verb.ANCHORS_REPLY,
-                Verb.GET_PROOF,
                 Verb.PROOF_REPLY,
                 Verb.LITE_REFUSED,
             },

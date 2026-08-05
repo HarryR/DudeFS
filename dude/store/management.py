@@ -307,6 +307,73 @@ class Management:
             )
         return False
 
+    def manager_grants(self) -> tuple[Grant, ...]:
+        """Every currently-attested Role.MANAGER grant. Prefix scan over P_GRANT,
+        filtered to `role is Role.MANAGER` and cert-valid. Used by the light-client
+        bundle: the manager set is what verifies roster-entry certs whose signer isn't
+        the anchor directly (#light-client-cert-chain)."""
+        out: list[Grant] = []
+        for name, _prov, _value, _ep in self.store.prefix(self.store_id, P_GRANT):
+            who = crypto.PublicKey(name[len(P_GRANT) :])
+            grant = self._read_grant(self.store, who)
+            if grant is None or grant.role is not Role.MANAGER:
+                continue
+            if not self._grant_cert_ok(grant):
+                continue
+            out.append(grant)
+        # Sort by identity for deterministic bundle content.
+        out.sort(key=lambda g: bytes(g.identity))
+        return tuple(out)
+
+    def roster_commitment_full(  # noqa: PLR0911 -- each early-return names a distinct refusal reason; collapsing hides which check failed
+        self,
+    ) -> tuple[int, tuple[crypto.PublicKey, ...], crypto.Digest, Cert] | None:
+        """Same shape as `roster_commitment()` but also returns the state_fingerprint and
+        the commitment cert -- what the light-client bundle needs to ship the full
+        signed commitment (#roster-commitment-cert, #light-client-cert-chain).
+
+        Runs the same cross-checks as `roster_commitment()` and returns None on any
+        failure, so a caller that trusts a non-None result trusts the commitment fully."""
+        raw = self.store.get(self.store_id, P_ROSTER)
+        if raw is None:
+            return None
+        try:
+            f = codec.as_seq(codec.decode(raw[1]), 4)
+            serial = codec.as_int(f[0])
+            members_seq = codec.as_seq(f[1])
+            members = tuple(crypto.PublicKey(codec.as_bytes(m)) for m in members_seq)
+            state_fingerprint = crypto.Digest(codec.as_bytes(f[2]))
+            cert = Cert.decode(codec.as_bytes(f[3]))
+        except DudeError:
+            return None
+        content_bytes = codec.encode([serial, sorted(bytes(m) for m in members), state_fingerprint])
+        if cert.subject != crypto.h(content_bytes):
+            return None
+        if cert.purpose != _CERT_PURPOSE_ROSTER_COMMITMENT:
+            return None
+        if not self.verify_cert(cert):
+            return None
+        # Reuse the state-cross-check from roster_commitment(): the commitment attests a
+        # state that MUST match the P_NODE rows on hand.
+        member_set = set(members)
+        current_nodes = self.nodes()
+        expected_state = crypto.h(
+            codec.encode(
+                [
+                    [
+                        bytes(rec.identity),
+                        sorted(ep.encode() for ep in rec.endpoints),
+                        sorted(rec.domains),
+                    ]
+                    for rec in sorted(current_nodes.values(), key=lambda r: bytes(r.identity))
+                    if rec.identity in member_set
+                ]
+            )
+        )
+        if expected_state != state_fingerprint:
+            return None
+        return serial, members, state_fingerprint, cert
+
     def endpoints_of(self, who: crypto.PublicKey) -> tuple[Endpoint, ...]:
         """Where `who` can be reached, and with what per-endpoint options
         (#peer-endpoint-in-log). A node may be multi-homed; `dude.net` chooses among them.
