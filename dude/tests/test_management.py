@@ -20,6 +20,7 @@ from ..consensus.bootstrap import bootstrap, intervene
 from ..consensus.settle_round import _settle_payload
 from ..core import crypto
 from ..core.errors import InvariantError
+from ..net.address import Address, Endpoint, Scheme
 from ..store import Store, ops
 from ..store.management import Cert, Management, ManagementError, NodeRecord, Role
 
@@ -330,10 +331,11 @@ class TestAnchorImmutable(unittest.TestCase):
 # --------------------------------------------------------------------------------------------- #
 
 
-def _addr(n: int) -> bytes:
-    """A stub address for tests. `management.Address` is a type alias for `bytes`, and
-    `NodeRecord.addresses` is a tuple of those bytes -- no parsing goes on at this layer."""
-    return f"inproc:n{n}".encode()
+def _endpoint(n: int) -> Endpoint:
+    """A stub endpoint for tests. `NodeRecord.endpoints` is a tuple of full `Endpoint`s
+    (address + options) per #peer-endpoint-in-log; wrapping the address in an Endpoint
+    with empty options is the minimum a caller has to do."""
+    return Endpoint(Address(Scheme.INPROC, f"n{n}"))
 
 
 def _seed_cluster(mgmt: Management, anchor: crypto.Keypair, size: int) -> list[crypto.Keypair]:
@@ -343,7 +345,7 @@ def _seed_cluster(mgmt: Management, anchor: crypto.Keypair, size: int) -> list[c
     tx = mgmt.change_roster(
         commitment_signer=anchor,
         add=tuple(
-            NodeRecord(kp.public, (_addr(i),), Cert.sign_roster(anchor, kp.public), frozenset())
+            NodeRecord(kp.public, (_endpoint(i),), Cert.sign_roster(anchor, kp.public), frozenset())
             for i, kp in enumerate(kps)
         ),
     )
@@ -418,7 +420,7 @@ class TestChangeRosterBrickRefusal(unittest.TestCase):
             commitment_signer=anchor,
             add=(
                 NodeRecord(
-                    kp1.public, (_addr(1),), Cert.sign_roster(anchor, kp1.public), frozenset()
+                    kp1.public, (_endpoint(1),), Cert.sign_roster(anchor, kp1.public), frozenset()
                 ),
             ),
         )
@@ -446,7 +448,7 @@ class TestChangeRosterAdvisoryComposition(unittest.TestCase):
             add=tuple(
                 NodeRecord(
                     kp.public,
-                    (_addr(i),),
+                    (_endpoint(i),),
                     Cert.sign_roster(anchor, kp.public),
                     frozenset({b"provider:hetzner"}),
                 )
@@ -471,7 +473,7 @@ class TestChangeRosterAdvisoryComposition(unittest.TestCase):
         kp_new = crypto.Keypair.generate()
         tx = mgmt.add_node(
             kp_new.public,
-            (_addr(9),),
+            (_endpoint(9),),
             Cert.sign_roster(anchor, kp_new.public),
             commitment_signer=anchor,
         )

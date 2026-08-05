@@ -128,7 +128,7 @@ class Cluster:
             add=tuple(
                 management.NodeRecord(
                     kp.public,
-                    (address_of(kp.public).encode(),),
+                    (Endpoint(address_of(kp.public)),),
                     Cert.sign_roster(self.mgr, kp.public),
                     frozenset(),
                 )

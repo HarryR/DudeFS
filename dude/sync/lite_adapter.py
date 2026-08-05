@@ -30,6 +30,7 @@ from typing import ClassVar
 from ..consensus.settle_round import Anchors
 from ..core import codec, crypto
 from ..core.errors import DudeError
+from ..net.address import Endpoint
 from ..net.envelope import Verb
 from ..store.management import Cert, Grant, NodeRecord, Role
 
@@ -135,12 +136,13 @@ class RosterBundle:
 
 def _encode_node_record(rec: NodeRecord) -> bytes:
     """Wire form of a P_NODE row content, shipped in a RosterBundle. Same layout as the
-    P_NODE row itself: `[addresses, sorted_domains, cert]`, plus the identity pubkey so
-    the client doesn't have to key-match to reconstruct."""
+    P_NODE row itself: `[encoded_endpoints, sorted_domains, cert]`, plus the identity
+    pubkey so the client doesn't have to key-match to reconstruct. Endpoints carry
+    per-endpoint options via `Endpoint.encode` (#peer-endpoint-in-log)."""
     return codec.encode(
         [
             rec.identity,
-            list(rec.addresses),
+            sorted(ep.encode() for ep in rec.endpoints),
             sorted(rec.domains),
             rec.cert.encode(),
         ]
@@ -150,10 +152,10 @@ def _encode_node_record(rec: NodeRecord) -> bytes:
 def _decode_node_record(raw: bytes) -> NodeRecord:
     p = codec.as_seq(codec.decode(raw), 4)
     identity = crypto.PublicKey(codec.as_bytes(p[0]))
-    addresses = tuple(codec.as_bytes(a) for a in codec.as_seq(p[1]))
+    endpoints = tuple(Endpoint.parse(codec.as_bytes(e)) for e in codec.as_seq(p[1]))
     domains = frozenset(codec.as_bytes(d) for d in codec.as_seq(p[2]))
     cert = Cert.decode(codec.as_bytes(p[3]))
-    return NodeRecord(identity, addresses, cert, domains)
+    return NodeRecord(identity, endpoints, cert, domains)
 
 
 def _encode_grant(g: Grant) -> bytes:

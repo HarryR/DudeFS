@@ -31,17 +31,12 @@ from typing import TYPE_CHECKING
 from .. import quorum
 from ..core import codec, crypto
 from ..core.errors import DudeError
+from ..net.address import Endpoint
 from . import ops
 from .layer import Reader
 
 if TYPE_CHECKING:
     from .store import Store
-
-# A transport locator, opaque here on purpose: the management store records WHERE a node can be
-# reached as a string, and `dude.net` owns what the string means. Keeping the parse out of the store
-# is what stops carrier vocabulary leaking into the log (#transport-adds-no-trust — transport adds
-# no trust).
-type Address = bytes
 
 
 class ManagementError(DudeError):
@@ -162,10 +157,15 @@ class NodeRecord:
 
     Carries a #cert with `purpose=b"roster"` attesting the entry from anchor or a valid
     manager. `nodes()` returns every row in the P_NODE keyspace; `roster()` filters out any
-    row whose cert fails the authority check."""
+    row whose cert fails the authority check.
+
+    ENDPOINTS, NOT BARE ADDRESSES (#peer-endpoint-in-log). Each entry is a full `Endpoint`
+    (address + options). Per-endpoint transport config (TLS material, mixnet profile,
+    concurrency limits) travels with the identity through the log; the cert covers row
+    content so a hostile responder cannot fake options without a manager key."""
 
     identity: crypto.PublicKey
-    addresses: tuple[Address, ...]
+    endpoints: tuple[Endpoint, ...]
     cert: Cert
     domains: frozenset[Domain] = frozenset()
     """Which failure domains this node shares with others. Rack-aware placement, generalised:
@@ -228,10 +228,14 @@ class Management:
         for name, _prov, value, _ep in self.store.prefix(self.store_id, P_NODE):
             who = crypto.PublicKey(name[len(P_NODE) :])
             f = codec.as_seq(codec.decode(value), 3)
-            addrs = tuple(codec.as_bytes(a) for a in codec.as_seq(f[0]))
+            # Each stored bytes entry is the wire form of an Endpoint (address + options),
+            # per #peer-endpoint-in-log. Endpoint.parse tolerates both the encoded-endpoint
+            # shape and a bare-address shape, so a row written before this change still
+            # decodes as `Endpoint(address, options={})`.
+            endpoints = tuple(Endpoint.parse(codec.as_bytes(e)) for e in codec.as_seq(f[0]))
             doms = frozenset(codec.as_bytes(d) for d in codec.as_seq(f[1]))
             cert = Cert.decode(codec.as_bytes(f[2]))
-            out[who] = NodeRecord(who, addrs, cert, doms)
+            out[who] = NodeRecord(who, endpoints, cert, doms)
         return out
 
     def roster(self) -> tuple[crypto.PublicKey, ...]:
@@ -302,10 +306,14 @@ class Management:
             )
         return False
 
-    def addresses_of(self, who: crypto.PublicKey) -> tuple[Address, ...]:
-        """Where `who` can be reached. A node may be multi-homed; `dude.net` chooses among them."""
+    def endpoints_of(self, who: crypto.PublicKey) -> tuple[Endpoint, ...]:
+        """Where `who` can be reached, and with what per-endpoint options
+        (#peer-endpoint-in-log). A node may be multi-homed; `dude.net` chooses among them.
+
+        Returns full `Endpoint`s (address + options), not bare addresses -- Postman needs
+        the options to dial correctly. See #peer-options-are-endpoint-options."""
         rec = self.nodes().get(who)
-        return rec.addresses if rec else ()
+        return rec.endpoints if rec else ()
 
     def roster_commitment(self) -> tuple[int, tuple[crypto.PublicKey, ...]] | None:
         """The manager's signed statement of WHO THE MEMBERS ARE, and which revision it is.
@@ -561,11 +569,20 @@ class Management:
         for who in remove:
             steps.append(ops.Del(self.store_id, P_NODE + who))
             steps.append(ops.Del(self.store_id, P_POP + who))
+        # Encode each endpoint via `Endpoint.encode` (address + options) so per-endpoint
+        # options travel with the row (#peer-endpoint-in-log). Sorted by encoded bytes for
+        # deterministic on-wire ordering.
         steps.extend(
             ops.Set(
                 self.store_id,
                 P_NODE + rec.identity,
-                codec.encode([list(rec.addresses), sorted(rec.domains), rec.cert.encode()]),
+                codec.encode(
+                    [
+                        sorted(ep.encode() for ep in rec.endpoints),
+                        sorted(rec.domains),
+                        rec.cert.encode(),
+                    ]
+                ),
             )
             for rec in add
         )
@@ -591,17 +608,20 @@ class Management:
     def add_node(
         self,
         who: crypto.PublicKey,
-        addresses: tuple[Address, ...],
+        endpoints: tuple[Endpoint, ...],
         cert: Cert,
         *,
         commitment_signer: crypto.Keypair,
         domains: frozenset[Domain] = frozenset(),
     ) -> ops.Transaction:
         """Convenience wrapper on `change_roster`: single-node add. See `change_roster` for
-        the full semantics (batched, brick-refuse only, advisory composition, cert-checked)."""
+        the full semantics (batched, brick-refuse only, advisory composition, cert-checked).
+
+        `endpoints` are full `Endpoint`s (address + per-endpoint options), not bare
+        addresses -- see #peer-endpoint-in-log."""
         return self.change_roster(
             commitment_signer=commitment_signer,
-            add=(NodeRecord(who, addresses, cert, domains),),
+            add=(NodeRecord(who, endpoints, cert, domains),),
         )
 
     def domain_groups(self) -> dict[Domain, frozenset[crypto.PublicKey]]:

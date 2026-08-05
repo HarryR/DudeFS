@@ -7,6 +7,7 @@ import unittest
 
 from dude import quorum
 from dude.core import crypto
+from dude.net.address import Address, Endpoint, Scheme
 from dude.store import management, ops, settle, store
 
 D = ops.STORE_DATA
@@ -383,7 +384,7 @@ class TestFailureDomains(unittest.TestCase):
         kp = crypto.Keypair.generate()
         tx = self.mgmt.add_node(
             kp.public,
-            (f"inproc:{n}".encode(),),
+            (Endpoint(Address(Scheme.INPROC, f"n{n}")),),
             management.Cert.sign_roster(self.mgr, kp.public),
             commitment_signer=self.mgr,
             domains=frozenset(domains),
@@ -452,7 +453,10 @@ class TestFailureDomains(unittest.TestCase):
         groups = self.mgmt.domain_groups()
         self.assertEqual(groups[b"p:x"], frozenset({a.public, b.public}))
         self.assertEqual(groups[b"c:de"], frozenset({a.public}))
-        self.assertEqual(self.mgmt.nodes()[a.public].addresses, (b"inproc:0",))
+        self.assertEqual(
+            self.mgmt.nodes()[a.public].endpoints,
+            (Endpoint(Address(Scheme.INPROC, "n0")),),
+        )
 
 
 class TestMultiSigRoundTrip(unittest.TestCase):
