@@ -341,10 +341,11 @@ def _seed_cluster(mgmt: Management, anchor: crypto.Keypair, size: int) -> list[c
     store. Returns the node keypairs."""
     kps = [crypto.Keypair.generate() for _ in range(size)]
     tx = mgmt.change_roster(
+        commitment_signer=anchor,
         add=tuple(
             NodeRecord(kp.public, (_addr(i),), Cert.sign_roster(anchor, kp.public), frozenset())
             for i, kp in enumerate(kps)
-        )
+        ),
     )
     mgmt.store.apply((tx.sign(anchor, T0),), auth=mgmt)
     return kps
@@ -389,7 +390,7 @@ class TestChangeRosterBrickRefusal(unittest.TestCase):
         kps = _seed_cluster(mgmt, anchor, 3)
         # Now try to remove 2 nodes: n=3 (safe) -> n=1 (bricked). Refused.
         with self.assertRaises(ManagementError):
-            mgmt.change_roster(remove=(kps[0].public, kps[1].public))
+            mgmt.change_roster(commitment_signer=anchor, remove=(kps[0].public, kps[1].public))
 
     def test_shrink_within_bricked_range_is_allowed(self):
         """If n_before is already bricked (n<3), any shrink that doesn't make it worse is
@@ -400,7 +401,7 @@ class TestChangeRosterBrickRefusal(unittest.TestCase):
         # Grow to n=2 via a batched change (still bricked).
         kps = _seed_cluster(mgmt, anchor, 2)
         # Remove one, going 2 -> 1. n_before is already bricked, so no refusal.
-        tx = mgmt.change_roster(remove=(kps[0].public,))
+        tx = mgmt.change_roster(commitment_signer=anchor, remove=(kps[0].public,))
         # Must not raise; apply and verify.
         mgmt.store.apply((tx.sign(anchor, T0),), auth=mgmt)
         self.assertEqual(len(mgmt.nodes()), 1)
@@ -414,11 +415,12 @@ class TestChangeRosterBrickRefusal(unittest.TestCase):
         # add=1 from n=0: n_after=1, bricked, but n_before also bricked -- allowed.
         kp1 = crypto.Keypair.generate()
         tx = mgmt.change_roster(
+            commitment_signer=anchor,
             add=(
                 NodeRecord(
                     kp1.public, (_addr(1),), Cert.sign_roster(anchor, kp1.public), frozenset()
                 ),
-            )
+            ),
         )
         mgmt.store.apply((tx.sign(anchor, T0),), auth=mgmt)
         self.assertEqual(len(mgmt.nodes()), 1)
@@ -440,6 +442,7 @@ class TestChangeRosterAdvisoryComposition(unittest.TestCase):
         # The old add_node refused this; change_roster allows it.
         kps = [crypto.Keypair.generate() for _ in range(4)]
         tx = mgmt.change_roster(
+            commitment_signer=anchor,
             add=tuple(
                 NodeRecord(
                     kp.public,
@@ -448,7 +451,7 @@ class TestChangeRosterAdvisoryComposition(unittest.TestCase):
                     frozenset({b"provider:hetzner"}),
                 )
                 for i, kp in enumerate(kps)
-            )
+            ),
         )
         mgmt.store.apply((tx.sign(anchor, T0),), auth=mgmt)
         # The advisory reports the concentration.
@@ -466,7 +469,12 @@ class TestChangeRosterAdvisoryComposition(unittest.TestCase):
         assert commit_before is not None
 
         kp_new = crypto.Keypair.generate()
-        tx = mgmt.add_node(kp_new.public, (_addr(9),), Cert.sign_roster(anchor, kp_new.public))
+        tx = mgmt.add_node(
+            kp_new.public,
+            (_addr(9),),
+            Cert.sign_roster(anchor, kp_new.public),
+            commitment_signer=anchor,
+        )
         mgmt.store.apply((tx.sign(anchor, T0),), auth=mgmt)
 
         commit_after = mgmt.roster_commitment()
@@ -485,7 +493,7 @@ class TestChangeRosterAdvisoryComposition(unittest.TestCase):
 
         commit_before = mgmt.roster_commitment()
         assert commit_before is not None
-        tx = mgmt.remove_node(kps[0].public)
+        tx = mgmt.remove_node(kps[0].public, commitment_signer=anchor)
         mgmt.store.apply((tx.sign(anchor, T0),), auth=mgmt)
 
         commit_after = mgmt.roster_commitment()

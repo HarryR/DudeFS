@@ -330,27 +330,59 @@ Two ECMH accumulators, and they answer different questions.
 ### One authorisation cert shape, everywhere {#cert}
 
 - A **Cert** is `(signer, subject, purpose, sig)` where `sig = Sig_signer(_CERT_DOMAIN ||
-  purpose || subject)`. One struct, one shape, applied on every authority-carrying row:
-  - P_GRANT rows: `purpose = role.value` (`"manager"` / `"client"` / `"compactor"`).
-  - P_NODE rows: `purpose = "roster"`.
+  purpose || subject)`. `subject` is `bytes`, not a pubkey — the shape covers both
+  identity certs (subject is the identity's pubkey) and content-commitment certs (subject
+  is `H(content)`; see #roster-commitment-cert).
+- Applied on every authority-carrying row:
+  - P_GRANT rows: `purpose = role.value` (`"manager"` / `"client"` / `"compactor"`);
+    `subject = identity_pubkey`.
+  - P_NODE rows: `purpose = "roster"`; `subject = identity_pubkey`.
+  - P_ROSTER row: `purpose = "roster_commitment"`; `subject = H(serial ‖ sorted_members)`
+    (see #roster-commitment-cert).
 - The domain tag and purpose binding together ensure: (1) a cert signed for one purpose
   cannot be replayed as another (an anchor's client-cert for X cannot be stuffed into an
   X-as-MANAGER row); (2) a cert bytes cannot be composed with any other anchor-signed
   artefact.
 - Signer-authority rules (checked at read time by Management):
   - MANAGER or COMPACTOR purpose: `cert.signer` MUST be `store.anchor()`.
-  - CLIENT or ROSTER purpose: `cert.signer` MUST be either `store.anchor()` OR an identity
-    currently holding a valid Role.MANAGER grant.
-- Read-side checks on every P_GRANT / P_NODE decode: (a) `cert.subject == row_key`; (b)
-  `cert.purpose` matches the row's role or `"roster"`; (c) `cert.verify()` (sig-only);
-  (d) `cert.signer` satisfies the per-purpose authority rule. Failing any means the row is
-  treated as absent by `may_write` / `may_send` / `roster()`.
-- Per-row (not batched). Adding, removing, or re-attesting one identity touches only that
-  row and its cert; the others are unaffected.
+  - CLIENT, ROSTER, or ROSTER_COMMITMENT purpose: `cert.signer` MUST be either
+    `store.anchor()` OR an identity currently holding a valid Role.MANAGER grant.
+- Read-side checks on every P_GRANT / P_NODE / P_ROSTER decode: (a) subject matches the
+  attested content (row key for identity certs; recomputed `H(content)` for commitment
+  certs); (b) `cert.purpose` matches the row's role or the fixed purpose (`"roster"` /
+  `"roster_commitment"`); (c) `cert.verify()` (sig-only); (d) `cert.signer` satisfies the
+  per-purpose authority rule. Failing any means the row is treated as absent by `may_write`
+  / `may_send` / `roster()` / `roster_commitment()`.
+- Per-row for identity certs (not batched). Adding, removing, or re-attesting one identity
+  touches only that row and its cert; the others are unaffected. The commitment cert is
+  the exception — see #roster-commitment-cert.
 - No serial number. The row is either present (attestation valid) or absent (revoked). Log
   ratification ordering is the only order that matters; a stale cert cannot be replayed
   because it can only enter the log via a settled tx, and the current log-state is the
   authority (#log-is-authoritative).
+
+### The roster commitment carries its own cert {#roster-commitment-cert}
+
+- The P_ROSTER row content is `[serial, sorted_members, cert]`. `cert.purpose =
+  "roster_commitment"`; `cert.subject = crypto.h(codec.encode([serial, sorted_members]))`.
+  Signer is anchor or a currently-valid manager (same rule as roster entry certs).
+- The commitment cert is what makes the roster **complete** — verifiable outside the
+  state-root chain. Individual per-entry P_NODE certs prove **provenance** ("this identity
+  was legitimately admitted"); the commitment cert proves **completeness** ("the current
+  roster is EXACTLY this set at serial N"). Both are needed; each catches attacks the
+  other cannot:
+  - A lying bootstrap that ships a subset of the real roster: caught by the commitment
+    (subset produces a different `H(serial ‖ members)` than the cert's subject).
+  - An eventually-compromised manager who signs a commitment adding a fake member: caught
+    by the per-entry cert chain (fake member has no anchor-provenanced entry cert).
+- **Re-issued on every roster change** — one manager signature per change, no cascade.
+  Adding or removing one node changes `H(serial ‖ members)`, so the commitment cert is
+  reminted. Per-entry certs of unaffected nodes stay valid.
+- **Light client bootstrap depends on this**: without a commitment cert, a light client
+  needs `state_root` to trust the roster, which needs the roster to verify — circular.
+  The commitment cert breaks the circle by making the roster anchor-verifiable directly.
+- `Cert.subject: bytes` was generalised (from `PublicKey`) precisely to accommodate the
+  content-hash subject here — one struct covers both identity and commitment attestation.
 
 ### Management operations should be typed, not smuggled {#typed-management-ops-owed}
 
@@ -1308,48 +1340,74 @@ the manager pubkey; it wants the current value for one key without holding any b
 
 ### The client verifies from the anchor alone {#light-client-verify}
 
-- A light client holds the anchor pubkey and nothing else durable. On each retrieval:
-  1. Corroborate the head anchors from `f+1` distinct responders via `GETANCHORS` — see
-     #light-client-freshness. This establishes trust in `(block_num, state_root)`.
-  2. Extract the roster via #light-client-cert-chain — anchor-verifiable, no state-root
-     dependency.
-  3. Verify `settle_sigs` in each corroborated reply against the extracted roster (via
-     `Management.authorization`); a responder whose sig doesn't verify was lying, but
-     corroboration already gave the honest answer.
-  4. Ask any one responder for `GETPROOF(store_id, name, block_num)`. Verify the returned
-     `proof` against the trusted `state_root`; if `Value`, verify the leaf's credential
-     authorises whoever last wrote it.
-- No trust in the responder. A malicious responder can only refuse or serve a proof that
-  fails verification; it cannot produce a valid proof for a value the quorum did not agree.
+- A light client holds the anchor pubkey and nothing else durable. Bootstrap unfolds in
+  three phases; each pass through establishes one trust piece:
+  1. **Identity chain from one node** (see #light-client-cert-chain). The bootstrap node
+     ships the current manager set (P_GRANT MANAGER rows), the roster commitment (P_ROSTER
+     row with its #roster-commitment-cert), and each roster entry (P_NODE rows with certs).
+     Each cert verifies against anchor via one or two hops — no `state_root` dependency.
+     A lying bootstrap cannot inject fake identities (no anchor key); a subset attack is
+     caught by the commitment cert whose subject binds `H(serial ‖ members)`.
+  2. **Head corroboration from `f+1` roster members** (see #light-client-freshness).
+     `GETANCHORS` against `f+1` distinct members; wait for `f+1` agreeing on
+     `(block_num, state_root, prev_block, roster_serial)`. Verify `settle_sigs` in each
+     reply against the roster from step 1 (via `Management.authorization`). This
+     establishes trust in `(block_num, state_root)`.
+  3. **Per-key reads** (steady state). `GETPROOF(store_id, name, block_num)` against any
+     one responder. Verify the returned `proof` against the trusted `state_root`; if
+     `Value`, verify the leaf's credential authorises whoever last wrote it.
+- No trust in the responder at any phase. A malicious responder can only refuse or serve
+  a proof that fails verification; it cannot produce valid proofs, valid certs, or valid
+  `settle_sigs` for anything the anchor did not attest or the quorum did not agree.
 
 ### The cert chain reaches the roster from the anchor alone {#light-client-cert-chain}
 
-- The chain is `anchor → manager Cert (P_GRANT) → roster Cert (P_NODE)`, each a #cert the
-  light client verifies directly.
-- A light client verifies one roster entry as:
-  1. `entry_cert.verify()` — signature-only check.
-  2. Either `entry_cert.signer == anchor` (entry is anchor-attested; done) OR fetch the
-     manager's P_GRANT row cert for `entry_cert.signer`, verify it via steps 1–2 recursively
-     against the anchor, and check its P_GRANT row membership at `state_root` (revocation
-     check).
-  3. Check the entry's own P_NODE row membership at `state_root` (revocation check).
-- Currency of the roster IS the SMT membership at the trusted `state_root` — a cert whose
-  row has been revoked (row deleted) fails the membership proof and is rejected. The cert
-  chain gives provenance; the state-root proof gives currency.
-- A roster refresh from a single responder is safe: the responder can neither forge a cert
-  chain (no anchor key) nor forge a state-root membership proof (state_root was corroborated
-  from f+1). The two together close the "malicious node ships fake roster" attack.
+Two independent attestation layers, each catching attacks the other cannot:
+
+**Provenance (per-entry #cert)** — chain is `anchor → manager Cert (P_GRANT) → roster
+Cert (P_NODE)`. Verifies one roster entry as:
+1. `entry_cert.verify()` — signature-only check.
+2. Either `entry_cert.signer == anchor` (entry is anchor-attested; done) OR fetch the
+   manager's P_GRANT row cert for `entry_cert.signer`, verify it recursively against the
+   anchor.
+3. Once `state_root` is trusted (phase 2 of #light-client-verify), check the entry's own
+   P_NODE row membership at `state_root` for currency (revocation).
+
+**Completeness (#roster-commitment-cert)** — chain is `anchor → manager commitment Cert
+(P_ROSTER)`. Verifies as:
+1. `commitment_cert.verify()`.
+2. Recompute `H(codec.encode([serial, sorted_members]))` and check it equals
+   `commitment_cert.subject`.
+3. Verify `commitment_cert.signer` is anchor or a valid manager (same recursive check as
+   above).
+
+Both are needed and orthogonal:
+- Lying bootstrap ships a SUBSET of the real roster → caught by completeness (subset's
+  hash doesn't match commitment cert's subject).
+- Compromised manager signs a commitment adding a FAKE member → caught by provenance
+  (fake member has no anchor-provenanced entry cert).
+
+Currency comes from `state_root`: a cert whose row has been revoked (row deleted) fails
+the SMT membership proof and is rejected. Provenance is state-root-independent; completeness
+is state-root-independent; currency needs state-root. Bootstrap acquires state-root in
+phase 2 after acquiring the identity chain in phase 1.
+
+A roster refresh from a single responder is safe: the responder can neither forge a cert
+chain (no anchor key), forge a valid commitment (would require the manager key AND matching
+the current serial that f+1 corroboration will surface), nor forge a state-root membership
+proof (state_root was corroborated from f+1).
 
 ### The roster is a corroborated read, not a bootstrapped fetch {#light-client-roster}
 
 - A light client's initial roster comes from the same `GETANCHORS` reply that corroborates
   the head anchors. Each responder ships `(anchors, settle_sigs, roster_bundle)` where
-  `roster_bundle` is the RosterEntryCert-plus-membership-proof list for each entry.
+  `roster_bundle` is the commitment cert + per-entry certs + membership proofs.
 - When `known_roster_fingerprint` in the request matches the responder's current fingerprint,
   the responder omits `roster_bundle` — the client uses its cached roster (already verified
   against the anchor per #light-client-cert-chain).
 - On fingerprint mismatch, the responder ships the fresh `roster_bundle`; the client
-  re-verifies the chain and replaces its cache. No separate "roster fetch" verb — the roster
+  re-verifies both the commitment cert and each entry cert, replaces its cache. No separate
+  "roster fetch" verb — the roster
   rides GETANCHORS as an optional field.
 
 ### Non-membership is a first-class answer {#light-client-nonmembership}
@@ -1603,7 +1661,8 @@ visible rather than plausible.
 | Role.MANAGER confers blanket authorship (#role-manager-grant) | `Management.may_write` returns True on `g.role is Role.MANAGER` for any `store_id`; `Management.may_send` returns True on `g.role is Role.MANAGER` for any kind |
 | Nodes are not authors (#nodes-are-not-authors) | `Role` enum has no `NODE` member; `Management.authorise` cannot express a node-as-author grant. A bare node identity has no P_GRANT row, so `may_write` returns False. Being in P_NODE keyspace with a valid #cert is the only sense in which a node is "in" the system |
 | Only the anchor grants or revokes MANAGER / COMPACTOR (#role-manager-grant) | **partial** — `Management.authorise(role=MANAGER \| COMPACTOR, cert=...)` requires an anchor-signed Cert and validates it before emitting the mutation. Log-boundary refusal of a raw `Set P_GRANT` bypassing `authorise` is DEFERRED per #typed-management-ops-owed |
-| One authorisation cert shape (#cert) | **partial** — `Management.Cert` is one dataclass covering every authority-carrying row. `authorise` and `change_roster` require it; `may_write`, `may_send`, and `roster()` verify it on read (subject, purpose, signature, signer-authority-for-purpose). Log-boundary refusal of a cert-less or wrong-purpose write is DEFERRED per #typed-management-ops-owed |
+| One authorisation cert shape (#cert) | **partial** — `Management.Cert` is one dataclass covering every authority-carrying row (`subject: bytes` covers both identity certs and content-commitment certs). `authorise` and `change_roster` require it; `may_write`, `may_send`, `roster()`, and `roster_commitment()` verify it on read (subject, purpose, signature, signer-authority-for-purpose). Log-boundary refusal of a cert-less or wrong-purpose write is DEFERRED per #typed-management-ops-owed |
+| Roster commitment carries its own cert (#roster-commitment-cert) | **partial** — P_ROSTER row content is `[serial, sorted_members, cert]`; `Cert.sign_roster_commitment(signer, encode([serial, members]))` binds `subject = H(content)`. `change_roster` requires a `commitment_signer` keypair (anchor or valid manager), emits the cert with the mutation. `Management.roster_commitment()` decodes, recomputes the hash, verifies the cert, and returns None on any failure. Log-boundary refusal DEFERRED per #typed-management-ops-owed |
 | Management operations should be typed, not smuggled (#typed-management-ops-owed) | **OWED** — API-side plumbing (this row's Cert enforcement) is a halfway house; the design fix is typed management op types so wrong-shape writes are unexpressible. Deferred until after light-client work per Harry's ruling |
 
 ### L3 mempool

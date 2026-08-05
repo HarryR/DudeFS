@@ -385,7 +385,8 @@ class TestFailureDomains(unittest.TestCase):
             kp.public,
             (f"inproc:{n}".encode(),),
             management.Cert.sign_roster(self.mgr, kp.public),
-            frozenset(domains),
+            commitment_signer=self.mgr,
+            domains=frozenset(domains),
         )
         self.store.apply((tx.sign(self.mgr, 1),), auth=self.mgmt)
         return kp

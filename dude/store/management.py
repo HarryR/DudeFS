@@ -73,30 +73,40 @@ change or a version bump."""
 
 _CERT_DOMAIN = b"dude.management.cert:"
 _CERT_PURPOSE_ROSTER = b"roster"
+_CERT_PURPOSE_ROSTER_COMMITMENT = b"roster_commitment"
 
 
 @dataclass(frozen=True, slots=True)
 class Cert:
     """One authorisation cert shape, applied on every authority-carrying row (#cert).
 
-    On a P_GRANT row: `purpose = role.value` (e.g. `b"manager"`). On a P_NODE row:
-    `purpose = _CERT_PURPOSE_ROSTER` (`b"roster"`).
+    `subject` is `bytes` rather than `PublicKey` because the shape covers TWO kinds of
+    attestation:
+      * Identity attestations (P_GRANT, P_NODE): `subject` is the identity's pubkey bytes.
+      * Content-commitment attestations (P_ROSTER commitment): `subject` is `crypto.h(content)`.
+    Since `PublicKey` is a `bytes` subclass, comparing `cert.subject == pubkey` still works
+    structurally for identity certs.
+
+    Purpose values in use:
+      * `role.value` (`b"manager"` / `b"client"` / `b"compactor"`) — P_GRANT identity cert
+      * `b"roster"` — P_NODE identity cert
+      * `b"roster_commitment"` — P_ROSTER content-commitment cert (subject is `H(serial ‖ members)`)
 
     The domain tag plus purpose binding is what stops an anchor-signed CLIENT cert from
     being repurposed into a MANAGER row: different bytes get signed for different purposes,
     so the sig doesn't verify when carried across.
 
     `verify()` is signature-only. Whether the signer is authorised for the purpose (anchor
-    only for MANAGER/COMPACTOR; anchor OR valid manager for CLIENT/ROSTER) is
-    `Management.verify_cert`, which reads state to answer."""
+    only for MANAGER/COMPACTOR; anchor OR valid manager for CLIENT/ROSTER/ROSTER_COMMITMENT)
+    is `Management.verify_cert`, which reads state to answer."""
 
     signer: crypto.PublicKey
-    subject: crypto.PublicKey
+    subject: bytes
     purpose: bytes
     sig: crypto.Signature
 
     @classmethod
-    def sign(cls, signer: crypto.Keypair, subject: crypto.PublicKey, purpose: bytes) -> Cert:
+    def sign(cls, signer: crypto.Keypair, subject: bytes, purpose: bytes) -> Cert:
         return cls(
             signer.public,
             subject,
@@ -107,13 +117,21 @@ class Cert:
     @classmethod
     def sign_grant(cls, signer: crypto.Keypair, subject: crypto.PublicKey, role: Role) -> Cert:
         """Build a #cert attesting a grant of `role` to `subject`. Purpose is `role.value`."""
-        return cls.sign(signer, subject, role.value)
+        return cls.sign(signer, bytes(subject), role.value)
 
     @classmethod
     def sign_roster(cls, signer: crypto.Keypair, subject: crypto.PublicKey) -> Cert:
         """Build a #cert attesting `subject`'s presence in the roster. Purpose is
         `_CERT_PURPOSE_ROSTER` (`b"roster"`)."""
-        return cls.sign(signer, subject, _CERT_PURPOSE_ROSTER)
+        return cls.sign(signer, bytes(subject), _CERT_PURPOSE_ROSTER)
+
+    @classmethod
+    def sign_roster_commitment(cls, signer: crypto.Keypair, commitment_bytes: bytes) -> Cert:
+        """Build a #cert attesting the roster commitment. `commitment_bytes` is
+        `codec.encode([serial, sorted_members])` -- what the P_ROSTER row content promises.
+        The cert's subject is `crypto.h(commitment_bytes)`, so a subset of members produces
+        a different hash and the cert fails to verify against it."""
+        return cls.sign(signer, crypto.h(commitment_bytes), _CERT_PURPOSE_ROSTER_COMMITMENT)
 
     def verify(self) -> bool:
         """True if the signature matches `self.signer` over `(purpose, subject)`. Does not
@@ -129,7 +147,7 @@ class Cert:
             p = codec.as_seq(codec.decode(raw), 4)
             return cls(
                 signer=crypto.PublicKey(codec.as_bytes(p[0])),
-                subject=crypto.PublicKey(codec.as_bytes(p[1])),
+                subject=codec.as_bytes(p[1]),
                 purpose=codec.as_bytes(p[2]),
                 sig=crypto.Signature(codec.as_bytes(p[3])),
             )
@@ -263,7 +281,11 @@ class Management:
         if not cert.verify():
             return False
         anchor_only_purposes = (Role.MANAGER.value, Role.COMPACTOR.value)
-        anchor_or_manager_purposes = (Role.CLIENT.value, _CERT_PURPOSE_ROSTER)
+        anchor_or_manager_purposes = (
+            Role.CLIENT.value,
+            _CERT_PURPOSE_ROSTER,
+            _CERT_PURPOSE_ROSTER_COMMITMENT,
+        )
         if cert.purpose in anchor_only_purposes:
             return cert.signer == anchor
         if cert.purpose in anchor_or_manager_purposes:
@@ -297,19 +319,31 @@ class Management:
         can withhold a newer commitment but cannot forge a higher serial without the manager's key,
         so believing the highest one you can verify is correct rather than credulous. Without it a
         genuine-but-superseded roster — members since removed, whose keys an adversary may still
-        hold — verifies perfectly."""
+        hold — verifies perfectly.
+
+        CERT-CHECKED (#roster-commitment-cert). Row content is
+        `[serial, sorted_members, cert.encode()]`. Cert's subject MUST equal
+        `crypto.h(codec.encode([serial, sorted_members]))` — any tamper with the serial or the
+        member set produces a different hash and the cert fails to verify. Signer MUST be
+        anchor or a currently-valid manager. Returns None on any check failure, so a caller
+        that trusts a non-None result trusts the commitment fully."""
         raw = self.store.get(self.store_id, P_ROSTER)
         if raw is None:
             return None
-        f = codec.as_seq(codec.decode(raw[1]), 2)
-        members = tuple(crypto.PublicKey(codec.as_bytes(m)) for m in codec.as_seq(f[1]))
-        return codec.as_int(f[0]), members
-
-    def set_roster(self, members: Iterable[crypto.PublicKey], serial: int) -> ops.Transaction:
-        """Emit the commitment for a membership set. SORTED, because the value is compared byte for
-        byte against an enumeration and two orderings of one set must not be two commitments."""
-        record = codec.encode([serial, sorted(bytes(m) for m in members)])
-        return ops.writes(ops.Set(self.store_id, P_ROSTER, record))
+        f = codec.as_seq(codec.decode(raw[1]), 3)
+        serial = codec.as_int(f[0])
+        members_seq = codec.as_seq(f[1])
+        members = tuple(crypto.PublicKey(codec.as_bytes(m)) for m in members_seq)
+        cert = Cert.decode(codec.as_bytes(f[2]))
+        # Recompute the commitment binding and verify.
+        content_bytes = codec.encode([serial, sorted(bytes(m) for m in members)])
+        if cert.subject != crypto.h(content_bytes):
+            return None
+        if cert.purpose != _CERT_PURPOSE_ROSTER_COMMITMENT:
+            return None
+        if not self.verify_cert(cert):
+            return None
+        return serial, members
 
     def _read_grant(self, reader: Reader, who: crypto.PublicKey) -> Grant | None:
         """The primitive grant lookup. Reads from `reader` (typically `self.store`, but the
@@ -448,11 +482,18 @@ class Management:
 
     def change_roster(
         self,
+        *,
+        commitment_signer: crypto.Keypair,
         add: Iterable[NodeRecord] = (),
         remove: Iterable[crypto.PublicKey] = (),
     ) -> ops.Transaction:
-        """Batched atomic roster change: add nodes, remove nodes, and update the manager-signed
-        commitment in ONE transaction (#roster-change-is-atomic).
+        """Batched atomic roster change: add nodes, remove nodes, and update the
+        commitment-cert-carrying P_ROSTER row in ONE transaction (#roster-change-is-atomic,
+        #roster-commitment-cert).
+
+        `commitment_signer` is the keypair that signs the P_ROSTER commitment cert. Must be
+        the anchor OR an identity currently holding a valid Role.MANAGER grant. Passed
+        keyword-only so it is impossible to forget alongside the add / remove positionals.
 
         HARD BRICK REFUSAL. Refuses if the post-state has `quorum.would_brick(n_after)` --
         equivalently, `n_after < 3`, where any single node reboot leaves quorum unreachable.
@@ -528,11 +569,23 @@ class Management:
             )
             for rec in add
         )
-        # Roster commitment: sorted members of the post-state, next serial.
+        # Roster commitment: sorted members of the post-state, next serial. Commitment cert
+        # is signed by `commitment_signer` (anchor or manager); its subject binds
+        # `H(serial ‖ sorted_members)` (#roster-commitment-cert) so a subset produces a
+        # different hash and the cert fails to verify.
         current = self.roster_commitment()
         next_serial = (current[0] + 1) if current is not None else 1
-        commitment = codec.encode([next_serial, sorted(bytes(m) for m in after)])
-        steps.append(ops.Set(self.store_id, P_ROSTER, commitment))
+        commitment_content = codec.encode([next_serial, sorted(bytes(m) for m in after)])
+        commitment_cert = Cert.sign_roster_commitment(commitment_signer, commitment_content)
+        if not self.verify_cert(commitment_cert):
+            raise ManagementError(
+                f"commitment_signer {commitment_signer.public.hex()[:8]} is not authorised "
+                f"to sign the roster commitment (must be anchor or a valid manager)"
+            )
+        commitment_row = codec.encode(
+            [next_serial, sorted(bytes(m) for m in after), commitment_cert.encode()]
+        )
+        steps.append(ops.Set(self.store_id, P_ROSTER, commitment_row))
         return ops.writes(*steps)
 
     def add_node(
@@ -540,11 +593,16 @@ class Management:
         who: crypto.PublicKey,
         addresses: tuple[Address, ...],
         cert: Cert,
+        *,
+        commitment_signer: crypto.Keypair,
         domains: frozenset[Domain] = frozenset(),
     ) -> ops.Transaction:
         """Convenience wrapper on `change_roster`: single-node add. See `change_roster` for
         the full semantics (batched, brick-refuse only, advisory composition, cert-checked)."""
-        return self.change_roster(add=(NodeRecord(who, addresses, cert, domains),))
+        return self.change_roster(
+            commitment_signer=commitment_signer,
+            add=(NodeRecord(who, addresses, cert, domains),),
+        )
 
     def domain_groups(self) -> dict[Domain, frozenset[crypto.PublicKey]]:
         """Which nodes share each label. A pure fold over the roster."""
@@ -568,14 +626,16 @@ class Management:
                 counts[d] = counts.get(d, 0) + 1
         return quorum.domain_advisory(counts, len(self.nodes()))
 
-    def remove_node(self, who: crypto.PublicKey) -> ops.Transaction:
+    def remove_node(
+        self, who: crypto.PublicKey, *, commitment_signer: crypto.Keypair
+    ) -> ops.Transaction:
         """Convenience wrapper on `change_roster`: single-node remove. See `change_roster`
         for the full semantics.
 
         NOTE: previously this emitted a bare `Del P_NODE` without the roster-commitment
         update, silently violating #roster-change-is-atomic. Now delegates to `change_roster`
         which composes the commitment update, PoP deletion, and node deletion atomically."""
-        return self.change_roster(remove=(who,))
+        return self.change_roster(commitment_signer=commitment_signer, remove=(who,))
 
     def authorise(  # noqa: PLR0913, PLR0917 -- every arg is a distinct required piece of a grant; collapsing them hides intent and forces callers to build dicts
         self,

@@ -85,6 +85,7 @@ class Cluster:
         # roster entries below establish them as consensus signers via P_NODE, each with
         # an anchor-signed roster #cert.
         tx = tx + mgmt.change_roster(
+            commitment_signer=self.mgr,
             add=tuple(
                 management.NodeRecord(
                     kp.public,
@@ -93,7 +94,7 @@ class Cluster:
                     frozenset(),
                 )
                 for kp in self.keys
-            )
+            ),
         )
         return (tx.sign(self.mgr, T0),)
 
