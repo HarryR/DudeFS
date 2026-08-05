@@ -33,7 +33,7 @@ from .net import Verb
 from .net.envelope import Envelope, Frame, SignedEnvelope, new_message_id
 from .net.postman import Postman
 from .store import Store, ops
-from .store.management import Management
+from .store.management import P_GRANT, Management, Role
 from .sync.adapter import (
     GetBlock,
     Refused,
@@ -129,6 +129,12 @@ class Node:
     reconciled. Serial-gate for #roster-drives-peers: skip the full pass on tick unless the
     serial has advanced (roster has actually changed)."""
 
+    _managed_peers: set[crypto.PublicKey] = field(default_factory=set, init=False)
+    """Peers `_reconcile_peers` itself added -- roster members and CLIENT / COMPACTOR
+    authors. The removal pass only revokes membership from THIS set, so manually-added
+    peers (bootstrap-outside-the-roster, e.g. a joining node not yet in the roster --
+    see `test_sync_e2e`) survive reconciliation."""
+
     def __post_init__(self) -> None:
         self.postman = Postman(
             self.me,
@@ -168,37 +174,40 @@ class Node:
         return Management(self.store)
 
     def _reconcile_peers(self, now: Millis) -> None:
-        """Sync `postman.peers` against the current roster (#roster-drives-peers).
+        """Sync `postman.peers` against the current roster + author grants
+        (#roster-drives-peers).
 
-        Called from `tick` gated on the roster commitment's serial: if the serial has not
-        advanced since our last reconcile, the roster has not changed, and we skip the
-        full pass. Serial-gate cost is one SMT-backed lookup per tick (`roster_commitment()`);
-        the full pass runs only when the roster genuinely changes (add/remove/endpoint edit
-        -- any of which bumps the serial and the state_fingerprint).
+        Two passes, one call:
+          * `_reconcile_roster` — gated on the roster commitment serial; adds roster
+            members with their P_NODE endpoints and registers them with the Follower.
+          * `_reconcile_grants` — runs every tick; adds CLIENT / COMPACTOR authors from
+            their P_GRANT endpoints. No gate because grants don't touch the roster
+            commitment, and the scan is O(authorised).
 
-        ADDITIONS: for each roster member not yet in `postman.peers`, dial them via
-        `postman.add_peer(pubkey, endpoints)` using the endpoints stored in the P_NODE row.
-        Also register with `follower.add_peer` so the sync-poll cadence covers them.
-
-        REMOVALS: for each pubkey in `postman.peers` that is neither in the current roster
-        nor our own identity, drop via `postman.remove_peer(pubkey)`. Follower reads the
-        roster via `Management(store).roster()` on demand, so it self-clears for absent
-        peers without an explicit remove.
-
-        CLIENTS / COMPACTORS are NOT reconciled here. They do not have P_NODE rows
-        (nodes-are-not-authors distinguishes storage nodes from author identities). The
-        reply-path for a client that pings us is added on demand at receive-time -- see
-        the light-client wave for the handling."""
+        REMOVALS at the end: any `_managed_peers` pubkey (a peer this reconciler itself
+        added on some prior tick) that is no longer in the roster and no longer a valid
+        author grant is dropped. Peers added outside reconciliation (bootstrap-out-of-
+        roster wiring in `test_sync_e2e`) are left alone."""
         commitment = self.mgmt.roster_commitment()
         if commitment is None:
             return
-        serial = commitment[0]
+        roster = set(self.mgmt.roster())
+        self._reconcile_roster(commitment[0], roster, now)
+        author_pubkeys = self._reconcile_grants()
+        keep = roster | author_pubkeys
+        for pubkey in list(self._managed_peers):
+            if pubkey not in keep:
+                if pubkey in self.postman.peers:
+                    self.postman.remove_peer(pubkey)
+                self._managed_peers.discard(pubkey)
+
+    def _reconcile_roster(self, serial: int, roster: set[crypto.PublicKey], now: Millis) -> None:
+        """Add any roster member missing from `postman.peers`, register with the Follower
+        for sync polls. Gated: skip when the commitment serial hasn't advanced."""
         if serial == self._last_reconciled_serial:
             return
         self._last_reconciled_serial = serial
-        roster = set(self.mgmt.roster())
         nodes = self.mgmt.nodes()
-        # Additions: any roster member not currently in our postman.peers, and not us.
         for pubkey in roster:
             if pubkey == self.me.public:
                 continue
@@ -209,10 +218,28 @@ class Node:
                 continue  # roster listed a member with no endpoints; skip until they show up
             self.postman.add_peer(pubkey, rec.endpoints)
             self.follower.add_peer(pubkey, now=now)
-        # Removals: anything currently in postman.peers that isn't in the roster.
-        for pubkey in list(self.postman.peers):
-            if pubkey not in roster:
-                self.postman.remove_peer(pubkey)
+            self._managed_peers.add(pubkey)
+
+    def _reconcile_grants(self) -> set[crypto.PublicKey]:
+        """Add every CLIENT / COMPACTOR author (with declared endpoints) to `postman.peers`
+        so replies can flow back to them. Returns the set of authored identities, for the
+        caller's removal pass to spare. Follower is not touched -- authors are not
+        consensus peers and don't get sync polls."""
+        authors: set[crypto.PublicKey] = set()
+        for name, _prov, _value, _ep in self.store.prefix(self.mgmt.store_id, P_GRANT):
+            who = crypto.PublicKey(name[len(P_GRANT) :])
+            grant = self.mgmt.grant_of(who)
+            if grant is None:
+                continue
+            if grant.role not in (Role.CLIENT, Role.COMPACTOR):
+                continue
+            if not grant.endpoints:
+                continue  # grant without endpoints; can't dial (auto-add on receive is OWED)
+            authors.add(who)
+            if who not in self.postman.peers:
+                self.postman.add_peer(who, grant.endpoints)
+                self._managed_peers.add(who)
+        return authors
 
     def roster(self) -> tuple[crypto.PublicKey, ...]:
         """MANAGEMENT'S ANSWER, and nowhere else. `Management` owns everything about who is

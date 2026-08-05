@@ -180,13 +180,19 @@ class Grant:
     (the compactor's grant is a KIND, not a store — there is no compaction store, #coarse-acl).
 
     `cert` is required (#cert) — `purpose == role.value`. `may_write` / `may_send` refuse
-    a grant whose cert does not verify or whose signer is not authorised for the role."""
+    a grant whose cert does not verify or whose signer is not authorised for the role.
+
+    `endpoints` are where this identity can be reached (for CLIENT / COMPACTOR grants;
+    empty for MANAGER whose identity nodes never need to dial). Nodes use these via
+    #roster-drives-peers to add the identity to `postman.peers` on tick, so replies to
+    inbound requests from this identity can flow back. Same shape as `NodeRecord.endpoints`."""
 
     identity: crypto.PublicKey
     role: Role
     stores: frozenset[int]
     kinds: frozenset[int]
     cert: Cert
+    endpoints: tuple[Endpoint, ...] = ()
 
 
 # --------------------------------------------------------------------------- #
@@ -452,23 +458,27 @@ class Management:
         transaction's own layer during evaluation) so a grant made by an earlier step is
         visible to a later step's check.
 
-        Row content is always 4 fields: role, stores, kinds, cert-bytes. A grant on-log
-        always carries a #cert (`authorise` refuses to build a grant without one)."""
+        Row content is 5 fields: role, stores, kinds, cert-bytes, endpoints. A grant
+        on-log always carries a #cert (`authorise` refuses to build a grant without one).
+        Endpoints may be empty (MANAGER); populated for CLIENT / COMPACTOR so nodes can
+        reach the identity when replying to inbound requests (#roster-drives-peers)."""
         raw = reader.get(self.store_id, P_GRANT + who)
         if raw is None:
             return None
-        f = codec.as_seq(codec.decode(raw[1]), 4)
+        f = codec.as_seq(codec.decode(raw[1]), 5)
         try:
             role = Role(codec.as_bytes(f[0]))
         except ValueError as e:
             raise ManagementError(f"unknown role for {who.hex()[:8]}") from e
         cert = Cert.decode(codec.as_bytes(f[3]))
+        endpoints = tuple(Endpoint.parse(codec.as_bytes(e)) for e in codec.as_seq(f[4]))
         return Grant(
             who,
             role,
             frozenset(codec.as_int(x) for x in codec.as_seq(f[1])),
             frozenset(codec.as_int(x) for x in codec.as_seq(f[2])),
             cert,
+            endpoints,
         )
 
     def grant_of(self, who: crypto.PublicKey) -> Grant | None:
@@ -778,6 +788,7 @@ class Management:
         kinds: frozenset[int] = frozenset(),
         pop: crypto.Signature | None = None,
         cert: Cert | None = None,
+        endpoints: tuple[Endpoint, ...] = (),
     ) -> ops.Transaction:
         """Authorise an identity (#role-manager-grant, #cert).
 
@@ -809,7 +820,15 @@ class Management:
             raise ManagementError(
                 f"cert does not verify or signer is not authorised for role {role.name}"
             )
-        record = codec.encode([role.value, sorted(stores), sorted(kinds), cert.encode()])
+        record = codec.encode(
+            [
+                role.value,
+                sorted(stores),
+                sorted(kinds),
+                cert.encode(),
+                sorted(ep.encode() for ep in endpoints),
+            ]
+        )
         return ops.writes(
             ops.Set(self.store_id, P_GRANT + who, record),
             ops.Set(self.store_id, P_POP + who, pop),

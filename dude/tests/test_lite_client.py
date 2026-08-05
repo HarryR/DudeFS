@@ -22,7 +22,9 @@ from .cluster import DELTA, T0, Cluster
 
 
 def _provision_client(c: Cluster, kp: crypto.Keypair) -> None:
-    """Grant Role.CLIENT via intervene on every store."""
+    """Grant Role.CLIENT via intervene on every store, with the client's InProc endpoint
+    baked into the P_GRANT row so nodes can dial back via `_reconcile_peers`
+    (#roster-drives-peers)."""
     mgmt = Management(c.nodes[0].store)
     grant_tx = mgmt.authorise(
         kp.public,
@@ -30,15 +32,27 @@ def _provision_client(c: Cluster, kp: crypto.Keypair) -> None:
         stores=frozenset(),
         pop=kp.prove_possession(),
         cert=Cert.sign_grant(c.mgr, kp.public, Role.CLIENT),
+        endpoints=(Endpoint(address_of(kp.public)),),
     ).sign(c.mgr, T0)
     for node in c.nodes:
         intervene(node.store, c.mgr, bodies=(grant_tx,), bucket=444)
 
 
 def _pump(c: Cluster, client: LightClient, client_inbox: InProc, now: int, rounds: int = 5) -> None:
-    """Drive the wire: tick everyone, drain each side into `receive`. Repeat until quiet
-    or `rounds` exhausted (whichever first)."""
+    """Drive the wire: reconcile each node's peers against the current membership
+    (`_reconcile_peers` -- so the client's P_GRANT-declared endpoint becomes a
+    dial-able peer), flush outbound on every side, and drain each inbox back into
+    `receive`. Repeat until quiet or `rounds` exhausted.
+
+    NOTE we call `_reconcile_peers` rather than the full `node.tick(now)` here: the
+    latter also drives the consensus round, and `Cluster.pump` in the surrounding test
+    is already the one advancing consensus. Duplicating that here races commit-block
+    against itself. Peer reconciliation is the only part of `tick` a light-client test
+    needs; consensus stays with the cluster."""
     for _ in range(rounds):
+        # Peer reconciliation on every node -- picks up CLIENT/COMPACTOR grants.
+        for node in c.nodes:
+            node._reconcile_peers(now)
         # Client + nodes flush outbound.
         client.tick(now)
         for node in c.nodes:
@@ -61,18 +75,14 @@ class TestLightClientBootstrap(unittest.TestCase):
         c = Cluster()
         client_kp = crypto.Keypair.generate()
         _provision_client(c, client_kp)
-        # Also ensure nodes can reply outbound to the client (no roster reconciliation
-        # for CLIENT identities yet -- OWED).
-        for node in c.nodes:
-            node.postman.add_peer(client_kp.public, (Endpoint(address_of(client_kp.public)),))
 
-        # Build the LightClient. Its Postman uses the module-scope INPROC dialler.
+        # Build the LightClient. Its Postman uses the module-scope INPROC dialler. The
+        # reverse direction (nodes dialling this client) is set up by each node's
+        # `_reconcile_peers` on tick, using the endpoints baked into the P_GRANT row.
         client_postman = Postman(client_kp)
         client = LightClient(me=client_kp, anchor=c.mgr.public, postman=client_postman)
         for node in c.nodes:
             client.add_bootstrap_peer(node.me.public, (Endpoint(address_of(node.me.public)),))
-        # Grab the client's InProc for drain.
-
         client_inbox = cast("InProc", client_postman._transports_by_scheme[Scheme.INPROC])
 
         # Kick off bootstrap.
@@ -100,8 +110,6 @@ class TestLightClientRead(unittest.TestCase):
 
         client_kp = crypto.Keypair.generate()
         _provision_client(c, client_kp)
-        for node in c.nodes:
-            node.postman.add_peer(client_kp.public, (Endpoint(address_of(client_kp.public)),))
 
         client_postman = Postman(client_kp)
         client = LightClient(me=client_kp, anchor=c.mgr.public, postman=client_postman)
@@ -135,8 +143,6 @@ class TestLightClientRead(unittest.TestCase):
         c = Cluster()
         client_kp = crypto.Keypair.generate()
         _provision_client(c, client_kp)
-        for node in c.nodes:
-            node.postman.add_peer(client_kp.public, (Endpoint(address_of(client_kp.public)),))
 
         client_postman = Postman(client_kp)
         client = LightClient(me=client_kp, anchor=c.mgr.public, postman=client_postman)
