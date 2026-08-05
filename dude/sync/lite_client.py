@@ -28,6 +28,7 @@ from ..core.units import Millis
 from ..net.address import Endpoint
 from ..net.envelope import Frame
 from ..net.postman import Postman
+from ..store import smt
 from ..store.management import Grant, Role
 from ..tunables import DEFAULT, Tunables
 from .lite_adapter import (
@@ -343,8 +344,9 @@ class LightClient:
         self.state = State.READY
 
     def _on_read_reply(self, reply_to: bytes, msg: LiteMsg, now: Millis) -> None:  # noqa: ARG002
-        """Reply to an outstanding GET_PROOF. Verify chain-link + settle_sigs, record
-        the result, advance trusted head."""
+        """Reply to an outstanding GET_PROOF. Verify the header chain + settle_sigs to
+        establish `head_state_root`, then verify the SMT proof against that root,
+        record the result, advance trusted head."""
         entry = self._pending_reads[reply_to]
         if isinstance(msg, LiteRefused):
             entry.result = Failed(reason=msg.reason.value)
@@ -365,18 +367,36 @@ class LightClient:
                 return
             self._swap_roster(msg.bundle, msg.roster_fingerprint)
         # Chain-verify headers[] against current trusted head + roster, then advance
-        # to responder's head (which is `msg.head`, a full SettledBlock).
+        # to responder's head (which is `msg.head`, a full SettledBlock). `_advance_head`
+        # updates `trusted_state.head_state_root` on success -- that's the root the SMT
+        # proof must verify against.
         if not self._advance_head(msg.headers, msg.head):
             entry.result = Failed(reason="header chain-link or settle_sigs verify failed")
             return
-        # SMT proof verify against state_root is OWED. For now, trust the value/proof
-        # field as-served (the responder's settle_sigs are quorum-attested for this
-        # state_root, which we just verified via chain-link).
+        # Verify the SMT proof against the freshly-verified head_state_root -- see SPEC
+        # anchor light-client-nonmembership. A responder serving a wrong value or a
+        # fabricated proof fails here.
+        try:
+            proof = smt.Proof.decode(msg.proof)
+        except DudeError:
+            entry.result = Failed(reason="malformed proof")
+            return
+        held = None if msg.absent else (msg.value, msg.credential)
+        assert self.trusted_state is not None  # noqa: S101 -- narrowing; _advance_head keeps it non-None on success
+        if not smt.verify(
+            self.trusted_state.head_state_root,
+            entry.store_id,
+            entry.name,
+            held,
+            proof,
+        ):
+            entry.result = Failed(reason="proof-verify-failed")
+            return
         entry.result = GetResult(
             value=msg.value,
             absent=msg.absent,
             block_num=msg.head.anchors.block_num,
-            state_root=msg.state_root,
+            state_root=msg.head.anchors.state_root,
         )
 
     def _swap_roster(self, bundle: RosterBundle, fingerprint: crypto.Digest) -> None:

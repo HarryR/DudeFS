@@ -7,15 +7,18 @@
 from __future__ import annotations
 
 import unittest
+from dataclasses import replace
 from typing import cast
 
 from dude.consensus.bootstrap import intervene
 from dude.core import crypto
 from dude.net.address import Endpoint, Scheme
+from dude.net.envelope import Envelope, Frame, SignedEnvelope, Verb
 from dude.net.postman import Postman
 from dude.net.transports import InProc, address_of
 from dude.store import ops
 from dude.store.management import Cert, Management, Role
+from dude.sync.lite_adapter import ProofReply
 from dude.sync.lite_client import PENDING, Failed, GetResult, LightClient, State
 
 from .cluster import DELTA, T0, Cluster
@@ -36,6 +39,39 @@ def _provision_client(c: Cluster, kp: crypto.Keypair) -> None:
     ).sign(c.mgr, T0)
     for node in c.nodes:
         intervene(node.store, c.mgr, bodies=(grant_tx,), bucket=444)
+
+
+def _mutate_frame_to_client(
+    frame: Frame,
+    client_kp: crypto.Keypair,
+    server_kp: crypto.Keypair,
+    mutate_proof_reply,
+    now: int,
+) -> Frame:
+    """Unseal a frame addressed to `client_kp`, decode the envelope; if the verb is
+    `PROOF_REPLY`, apply `mutate_proof_reply(reply) -> ProofReply` to the decoded
+    ProofReply and re-emit the frame with a fresh envelope signed by `server_kp` and
+    re-sealed to the client. Non-PROOF_REPLY frames pass through unchanged.
+
+    Used to simulate a byzantine responder: the envelope signature and the frame's
+    sealed structure are honest (a real server signed it), but the ProofReply's payload
+    has been swapped for something the SMT proof no longer verifies against."""
+    raw = client_kp.open_sealed_raw(frame.sealed)
+    signed = SignedEnvelope.decode(raw)
+    if signed.env.verb is not Verb.PROOF_REPLY:
+        return frame
+    reply = ProofReply._decode(signed.env.body)
+    mutated = mutate_proof_reply(reply)
+    verb, body = mutated.encode()
+    new_env = Envelope(
+        to=signed.env.to,
+        verb=verb,
+        mid=signed.env.mid,
+        body=body,
+        reply_to=signed.env.reply_to,
+        reply_ts=signed.env.reply_ts,
+    )
+    return new_env.sign(server_kp, now).seal()
 
 
 def _pump(c: Cluster, client: LightClient, client_inbox: InProc, now: int, rounds: int = 5) -> None:
@@ -138,6 +174,78 @@ class TestLightClientRead(unittest.TestCase):
         assert isinstance(result, GetResult)
         self.assertFalse(result.absent)
         self.assertEqual(result.value, b"present")
+
+    def test_byzantine_value_fails_proof_verify(self):
+        """A responder signs an honest envelope (real settle_sigs, real head, real SMT
+        proof for the ACTUAL live value) but swaps the value it claims. The SMT commits
+        to `leaf_hash(path, h(value), h(cred))`; recomputing that with the swapped
+        value produces a different terminal, and the fold to root fails.
+
+        Load-bearing for #light-client-nonmembership: back when `serve_get_proof` shipped
+        `proof: bytes = b""` and the client's `_on_read_reply` just trusted the value,
+        this exact test would have passed with the swapped value -- the whole point of
+        that trap was that verification WASN'T happening. If this test ever passes with
+        an empty/placeholder proof pipeline, verification has been silently disabled again."""
+        c = Cluster()
+        key = crypto.h(b"lite-client-byz")
+        tx = ops.writes(ops.Set(ops.STORE_DATA, key, b"present")).sign(c.mgr, T0)
+        c.submit(c.mgr, tx, to=0, now=T0)
+        c.pump(T0)
+        c.pump(T0 + DELTA)
+
+        client_kp = crypto.Keypair.generate()
+        _provision_client(c, client_kp)
+
+        client_postman = Postman(client_kp)
+        client = LightClient(me=client_kp, anchor=c.mgr.public, postman=client_postman)
+        for node in c.nodes:
+            client.add_bootstrap_peer(node.me.public, (Endpoint(address_of(node.me.public)),))
+
+        client_inbox = cast("InProc", client_postman._transports_by_scheme[Scheme.INPROC])
+
+        client.bootstrap(T0 + 2 * DELTA)
+        _pump(c, client, client_inbox, T0 + 2 * DELTA)
+        _pump(c, client, client_inbox, T0 + 3 * DELTA)
+        self.assertTrue(client.bootstrapped())
+
+        rid = client.request_get(
+            store_id=ops.STORE_DATA,
+            name=key,
+            peer=c.nodes[0].me.public,
+            now=T0 + 4 * DELTA,
+        )
+
+        # Custom pump: intercept the client's inbox and swap the value on any PROOF_REPLY.
+        # Everything else (bootstrap replies, sync noise) passes through untouched.
+        server_kp = c.nodes[0].me
+        now = T0 + 4 * DELTA
+        rounds = 5
+
+        def mutate(reply):
+            return replace(reply, value=b"NOT-THE-REAL-VALUE")
+
+        for _ in range(rounds):
+            for node in c.nodes:
+                node._reconcile_peers(now)
+            client.tick(now)
+            for node in c.nodes:
+                node.postman.tick(now)
+            delivered = 0
+            for node in c.nodes:
+                for frame in c._transports[node.me.public].receive():
+                    node.receive(frame, now)
+                    delivered += 1
+            for frame in client_inbox.receive():
+                mutated_frame = _mutate_frame_to_client(frame, client_kp, server_kp, mutate, now)
+                client.receive(mutated_frame, now)
+                delivered += 1
+            if delivered == 0:
+                break
+
+        result = client.poll(rid)
+        self.assertIsInstance(result, Failed, f"got {result!r}")
+        assert isinstance(result, Failed)
+        self.assertEqual(result.reason, "proof-verify-failed")
 
     def test_stale_client_gets_refusal_and_drops_trusted_state(self):
         c = Cluster()

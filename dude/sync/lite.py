@@ -16,6 +16,7 @@ from ..consensus.settle_round import SettledBlock
 from ..core import crypto
 from ..store import Store
 from ..store.management import Management
+from ..store.smt import Tree
 from .lite_adapter import (
     ABSENT_MARKER,
     AnchorsReply,
@@ -95,19 +96,19 @@ def serve_get_proof(  # noqa: PLR0911, PLR0912, C901 -- each early-return names 
     liveness_window: int,
 ) -> ProofReply | LiteRefused:
     """Answer a `GET_PROOF`. Same piggyback rules as `serve_get_anchors` for the reply
-    envelope; the value+proof come from the store at the requested `block_num`.
+    envelope; the value + credential + SMT proof come from the store at the requested
+    `block_num`. The client verifies via `smt.verify(head.anchors.state_root, ...)`
+    (#light-client-nonmembership).
 
     Refuses with:
       * NO_STATE -- no SETTLED block.
       * NOT_YET_SETTLED -- `block_num > head`.
       * UNKNOWN_STORE / MALFORMED_QUERY -- bad request.
       * STALE_CLIENT / FORK_DETECTED -- same rules as serve_get_anchors.
-      * INTERNAL -- assemble failure.
-
-    SMT PROOF SHAPE. Slice 1 lands the wire shape; the actual SMT-walker that
-    produces the `proof: bytes` plugs in with the LightClient wave. For now, the
-    proof field is empty -- server has the state but doesn't yet emit walks.
-    Placeholder documented as OWED against #light-client-nonmembership."""
+      * TOO_OLD -- `block_num < head`. In the no-compaction path the SMT lives on
+        `live` and only the current head has a reconstructable tree; historical
+        proofs require compaction-aware retrieval (deferred with #compaction).
+      * INTERNAL -- assemble failure."""
     head_num = store.head_block_num()
     if not head_num:
         return LiteRefused(LiteRefusal.NO_STATE)
@@ -140,16 +141,22 @@ def serve_get_proof(  # noqa: PLR0911, PLR0912, C901 -- each early-return names 
         if head_num - client_num > liveness_window:
             return LiteRefused(LiteRefusal.STALE_CLIENT)
 
-    # Value at the requested block_num. In the no-compaction world the current live
-    # view IS the state at head; for block_num < head we would need to reconstruct.
-    # For Slice 1, only serve requests at head_num.
+    # No-compaction: the SMT over `live` reflects the state at `head_num`. Proofs at
+    # earlier block_nums would need historical state reconstruction, which is a
+    # compaction-aware path (#compaction, deferred).
     if request.block_num != head_num:
         return LiteRefused(LiteRefusal.TOO_OLD)
 
-    row = store.get(request.store_id, request.name)
-    value = row[1] if row is not None else ABSENT_MARKER
-    absent = row is None
-    proof: bytes = b""  # OWED: SMT walker for #light-client-nonmembership
+    held = store.get(request.store_id, request.name)
+    if held is None:
+        value: bytes = ABSENT_MARKER
+        credential: bytes = b""
+        absent = True
+    else:
+        value = held.value
+        credential = held.cred
+        absent = False
+    proof = Tree(store.db).prove(request.store_id, request.name).encode()
 
     _, _, _, commitment_cert = commitment
     roster_fingerprint = crypto.Digest(commitment_cert.subject)
@@ -160,9 +167,9 @@ def serve_get_proof(  # noqa: PLR0911, PLR0912, C901 -- each early-return names 
 
     return ProofReply(
         value=value,
+        credential=credential,
         absent=absent,
         proof=proof,
-        state_root=head_block.anchors.state_root,
         head=head_block,
         roster_fingerprint=roster_fingerprint,
         bundle=bundle,

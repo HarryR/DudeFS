@@ -392,27 +392,31 @@ ABSENT_MARKER = b""
 
 @dataclass(frozen=True, slots=True)
 class ProofReply(LiteMsg):
-    """Value or non-membership proof for a `GET_PROOF` request, piggybacked with any
+    """Value + credential + SMT proof for a `GET_PROOF` request, piggybacked with any
     catch-up info the client needs (headers + optional bundle refresh).
 
-    - `value/absent/proof/state_root` -- the requested proof at `block_num`. Client
-      verifies against a trusted state_root at that height.
-    - `anchors/signers/settle_sigs/roster_fingerprint` -- the responder's CURRENT head,
-      used to advance client's trusted head via #light-client-header-chain.
-    - `bundle` -- a fresh RosterBundle iff the client's cached fingerprint doesn't match
-      the responder's current fingerprint (#light-client-roster-change-in-window).
+    - `value / credential / absent / proof` -- the SMT proof-emitting pair at
+      `block_num`. The client verifies `smt.verify(head.anchors.state_root, store_id,
+      name, (value, credential) or None, Proof.decode(proof))`; the SMT leaf commits to
+      BOTH value and credential (#light-client-nonmembership), so both are required to
+      reconstruct the terminal.
+    - `head` -- the responder's CURRENT head, a full `SettledBlock`. Client uses it to
+      advance trusted head via #light-client-header-chain; its `anchors.state_root` is
+      the root the proof verifies against.
+    - `roster_fingerprint` / `bundle` -- fresh RosterBundle iff the client's cached
+      fingerprint doesn't match the responder's (#light-client-roster-change-in-window).
     - `headers[]` -- 0 to `liveness_window` SettledBlocks between the client's
       `known_trusted_block` and the responder's head. Empty when caught up.
 
-    Slice 1 places `proof: bytes` as an opaque wire field -- the SMT proof shape pins
-    when the client-side verifier lands."""
+    There is DELIBERATELY no separate `state_root` field: `head.anchors.state_root` is
+    the one authoritative source and duplicating it invites two-field-must-agree traps."""
 
     verb: ClassVar[Verb] = Verb.PROOF_REPLY
 
     value: bytes  # ABSENT_MARKER for non-membership; opaque bytes otherwise
+    credential: bytes  # b"" for non-membership; opaque bytes otherwise
     absent: bool
-    proof: bytes
-    state_root: crypto.Digest
+    proof: bytes  # `smt.Proof.encode()`; `smt.Proof.decode()` at the client
     head: SettledBlock
     roster_fingerprint: crypto.Digest
     bundle: RosterBundle | None
@@ -422,9 +426,9 @@ class ProofReply(LiteMsg):
         return codec.encode(
             [
                 self.value,
+                self.credential,
                 1 if self.absent else 0,
                 self.proof,
-                self.state_root,
                 self.head.encode(),
                 self.roster_fingerprint,
                 self.bundle._encode() if self.bundle is not None else b"",  # noqa: SLF001
@@ -443,9 +447,9 @@ class ProofReply(LiteMsg):
             headers = tuple(SettledBlock.decode(codec.as_bytes(h)) for h in codec.as_seq(p[7]))
             return cls(
                 value=codec.as_bytes(p[0]),
-                absent=codec.as_int(p[1]) == 1,
-                proof=codec.as_bytes(p[2]),
-                state_root=crypto.Digest(codec.as_bytes(p[3])),
+                credential=codec.as_bytes(p[1]),
+                absent=codec.as_int(p[2]) == 1,
+                proof=codec.as_bytes(p[3]),
                 head=head,
                 roster_fingerprint=roster_fingerprint,
                 bundle=bundle,
