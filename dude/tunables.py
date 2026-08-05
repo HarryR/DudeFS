@@ -163,6 +163,22 @@ class SyncTunables:
 
 
 @dataclass(frozen=True, slots=True)
+class LightClientTunables:
+    """Dials for a light client (#light-client).
+
+    `liveness_window` doubles as the piggyback header cap and the stale-client threshold
+    (#light-client-liveness): a light client is 'live' iff its `trusted_block` is within
+    this many blocks of the responder's head. Under #one-of-each-in-flight one block
+    advances per bucket, so this is equivalent to lagging by no more than `liveness_window`
+    buckets."""
+
+    liveness_window: int = 2
+    """Blocks (== buckets). Default 2: one bucket of normal cadence + one bucket of jitter.
+    A client farther behind than this is not live; a responder MUST refuse its request with
+    `LiteRefusal.STALE_CLIENT` and the client MUST re-bootstrap."""
+
+
+@dataclass(frozen=True, slots=True)
 class Tunables:
     """The one surface. Pass this down; do not reach for a group's defaults directly."""
 
@@ -172,6 +188,7 @@ class Tunables:
     plan: PlanTunables = field(default_factory=PlanTunables)
     mempool: MempoolTunables = field(default_factory=MempoolTunables)
     sync: SyncTunables = field(default_factory=SyncTunables)
+    light_client: LightClientTunables = field(default_factory=LightClientTunables)
 
     def __post_init__(self) -> None:
         """Refuse a configuration whose dials contradict their own derivation.

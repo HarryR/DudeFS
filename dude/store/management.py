@@ -122,10 +122,11 @@ class Cert:
 
     @classmethod
     def sign_roster_commitment(cls, signer: crypto.Keypair, commitment_bytes: bytes) -> Cert:
-        """Build a #cert attesting the roster commitment. `commitment_bytes` is
-        `codec.encode([serial, sorted_members])` -- what the P_ROSTER row content promises.
-        The cert's subject is `crypto.h(commitment_bytes)`, so a subset of members produces
-        a different hash and the cert fails to verify against it."""
+        """Build a #cert attesting the roster commitment (#roster-commitment-cert).
+        `commitment_bytes` is `codec.encode([serial, sorted_members, state_fingerprint])`
+        -- the three fields the cert binds together. The cert's subject is
+        `crypto.h(commitment_bytes)`, so ANY change to membership, endpoints, or domains
+        produces a different hash and the cert fails to verify against it."""
         return cls.sign(signer, crypto.h(commitment_bytes), _CERT_PURPOSE_ROSTER_COMMITMENT)
 
     def verify(self) -> bool:
@@ -330,26 +331,52 @@ class Management:
         hold — verifies perfectly.
 
         CERT-CHECKED (#roster-commitment-cert). Row content is
-        `[serial, sorted_members, cert.encode()]`. Cert's subject MUST equal
-        `crypto.h(codec.encode([serial, sorted_members]))` — any tamper with the serial or the
-        member set produces a different hash and the cert fails to verify. Signer MUST be
-        anchor or a currently-valid manager. Returns None on any check failure, so a caller
-        that trusts a non-None result trusts the commitment fully."""
+        `[serial, sorted_members, state_fingerprint, cert.encode()]`. Cert's subject MUST equal
+        `crypto.h(codec.encode([serial, sorted_members, state_fingerprint]))` -- any tamper
+        with any of the three (member set, endpoints, domains) produces a different hash and
+        the cert fails to verify. Signer MUST be anchor or a currently-valid manager. Returns
+        None on any check failure, so a caller that trusts a non-None result trusts the
+        commitment fully.
+
+        RECOMPUTES `state_fingerprint` from the current P_NODE rows and checks it matches the
+        stored fingerprint. If not, the commitment attests a different state than the log
+        holds -- a mismatch that should not occur in practice (the same tx that writes the
+        commitment writes the P_NODE rows), and if it does, treat the commitment as invalid."""
         raw = self.store.get(self.store_id, P_ROSTER)
         if raw is None:
             return None
-        f = codec.as_seq(codec.decode(raw[1]), 3)
+        f = codec.as_seq(codec.decode(raw[1]), 4)
         serial = codec.as_int(f[0])
         members_seq = codec.as_seq(f[1])
         members = tuple(crypto.PublicKey(codec.as_bytes(m)) for m in members_seq)
-        cert = Cert.decode(codec.as_bytes(f[2]))
+        state_fingerprint = crypto.Digest(codec.as_bytes(f[2]))
+        cert = Cert.decode(codec.as_bytes(f[3]))
         # Recompute the commitment binding and verify.
-        content_bytes = codec.encode([serial, sorted(bytes(m) for m in members)])
+        content_bytes = codec.encode([serial, sorted(bytes(m) for m in members), state_fingerprint])
         if cert.subject != crypto.h(content_bytes):
             return None
         if cert.purpose != _CERT_PURPOSE_ROSTER_COMMITMENT:
             return None
         if not self.verify_cert(cert):
+            return None
+        # Cross-check the state_fingerprint against the actual P_NODE rows. Mismatch means
+        # the commitment attests a state different from what the log holds; refuse.
+        member_set = set(members)
+        current_nodes = self.nodes()
+        expected_state = crypto.h(
+            codec.encode(
+                [
+                    [
+                        bytes(rec.identity),
+                        sorted(ep.encode() for ep in rec.endpoints),
+                        sorted(rec.domains),
+                    ]
+                    for rec in sorted(current_nodes.values(), key=lambda r: bytes(r.identity))
+                    if rec.identity in member_set
+                ]
+            )
+        )
+        if expected_state != state_fingerprint:
             return None
         return serial, members
 
@@ -586,13 +613,32 @@ class Management:
             )
             for rec in add
         )
-        # Roster commitment: sorted members of the post-state, next serial. Commitment cert
-        # is signed by `commitment_signer` (anchor or manager); its subject binds
-        # `H(serial ‖ sorted_members)` (#roster-commitment-cert) so a subset produces a
-        # different hash and the cert fails to verify.
+        # Roster commitment (#roster-commitment-cert). Payload binds THREE fields:
+        #   1. serial            -- monotone, bumps per change
+        #   2. sorted_members    -- pubkeys only (membership fingerprint)
+        #   3. state_fingerprint -- H over per-member (pubkey, endpoints, domains)
+        # The cert covers all three atomically. A change to ANY of them (membership,
+        # endpoints, options, domains) produces a different subject and requires a fresh
+        # cert. Signer is anchor or a currently-valid manager.
         current = self.roster_commitment()
         next_serial = (current[0] + 1) if current is not None else 1
-        commitment_content = codec.encode([next_serial, sorted(bytes(m) for m in after)])
+        sorted_members = sorted(bytes(m) for m in after)
+        # state_fingerprint captures the FULL per-member state so light clients and node
+        # reconciliation can detect endpoint / option / domain changes with a single hash
+        # compare (#light-client-piggyback, #roster-drives-peers). Members sorted by
+        # pubkey so the hash is deterministic across implementations.
+        state_content = codec.encode(
+            [
+                [
+                    bytes(rec.identity),
+                    sorted(ep.encode() for ep in rec.endpoints),
+                    sorted(rec.domains),
+                ]
+                for rec in sorted(after.values(), key=lambda r: bytes(r.identity))
+            ]
+        )
+        state_fingerprint = crypto.h(state_content)
+        commitment_content = codec.encode([next_serial, sorted_members, state_fingerprint])
         commitment_cert = Cert.sign_roster_commitment(commitment_signer, commitment_content)
         if not self.verify_cert(commitment_cert):
             raise ManagementError(
@@ -600,7 +646,7 @@ class Management:
                 f"to sign the roster commitment (must be anchor or a valid manager)"
             )
         commitment_row = codec.encode(
-            [next_serial, sorted(bytes(m) for m in after), commitment_cert.encode()]
+            [next_serial, sorted_members, state_fingerprint, commitment_cert.encode()]
         )
         steps.append(ops.Set(self.store_id, P_ROSTER, commitment_row))
         return ops.writes(*steps)

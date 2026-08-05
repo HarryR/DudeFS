@@ -363,26 +363,49 @@ Two ECMH accumulators, and they answer different questions.
 
 ### The roster commitment carries its own cert {#roster-commitment-cert}
 
-- The P_ROSTER row content is `[serial, sorted_members, cert]`. `cert.purpose =
-  "roster_commitment"`; `cert.subject = crypto.h(codec.encode([serial, sorted_members]))`.
-  Signer is anchor or a currently-valid manager (same rule as roster entry certs).
-- The commitment cert is what makes the roster **complete** — verifiable outside the
-  state-root chain. Individual per-entry P_NODE certs prove **provenance** ("this identity
-  was legitimately admitted"); the commitment cert proves **completeness** ("the current
-  roster is EXACTLY this set at serial N"). Both are needed; each catches attacks the
-  other cannot:
+- The P_ROSTER row content is `[serial, sorted_members, state_fingerprint, cert]`.
+  - `serial` -- monotone, bumps per roster change.
+  - `sorted_members` -- the list of member pubkeys, sorted. The **membership
+    fingerprint** consumers.
+  - `state_fingerprint = crypto.h(codec.encode([[pubkey, sorted_endpoint_bytes,
+    sorted_domains] for each member in sorted-by-pubkey order]))` -- a digest over the
+    complete per-member roster state. Changes when any endpoint / option / domain of any
+    member changes.
+  - `cert` -- one cert covering all three: `cert.purpose = "roster_commitment"`;
+    `cert.subject = crypto.h(codec.encode([serial, sorted_members, state_fingerprint]))`.
+    Signer is anchor or a currently-valid manager.
+- **`roster_fingerprint` (the wire field) = `cert.subject`.** One digest that changes when
+  membership, endpoints, or domains change. Light clients cache it and compare on every
+  reply (#light-client-piggyback); Nodes gate reconciliation on serial change or
+  fingerprint change (#roster-drives-peers).
+- **Split fingerprints for different consumers**:
+  - **Membership fingerprint** = `H(serial ‖ sorted_members)`. Consensus-side callers
+    (`Follower.caught_up`, signer-bitmap construction) care only about who signs and can
+    ignore endpoint churn.
+  - **State fingerprint** = as above. Node reconciliation and light-client caches care
+    about the full state.
+  - Both are covered by the ONE cert signature -- the cert's subject binds all three
+    fields together, so verifying the cert verifies both fingerprints atomically.
+- The commitment cert is what makes the roster **complete** and **verifiable outside the
+  state-root chain**. Individual per-entry P_NODE certs prove **provenance** ("this
+  identity was legitimately admitted"); the commitment cert proves **completeness AND
+  state** ("the current roster is EXACTLY this set at serial N with EXACTLY these
+  endpoints"). Both attestation layers catch attacks the other cannot:
   - A lying bootstrap that ships a subset of the real roster: caught by the commitment
-    (subset produces a different `H(serial ‖ members)` than the cert's subject).
+    (subset produces a different fingerprint than the cert's subject).
+  - A lying bootstrap that ships the real membership but wrong endpoints: caught by the
+    state fingerprint.
   - An eventually-compromised manager who signs a commitment adding a fake member: caught
     by the per-entry cert chain (fake member has no anchor-provenanced entry cert).
-- **Re-issued on every roster change** — one manager signature per change, no cascade.
-  Adding or removing one node changes `H(serial ‖ members)`, so the commitment cert is
-  reminted. Per-entry certs of unaffected nodes stay valid.
+- **Re-issued on every roster change or endpoint change** -- one manager signature per
+  change, no cascade. Adding or removing one node, or updating one node's endpoints,
+  changes the fingerprint, so the commitment cert is reminted. Per-entry certs of
+  unaffected nodes stay valid.
 - **Light client bootstrap depends on this**: without a commitment cert, a light client
-  needs `state_root` to trust the roster, which needs the roster to verify — circular.
+  needs `state_root` to trust the roster, which needs the roster to verify -- circular.
   The commitment cert breaks the circle by making the roster anchor-verifiable directly.
 - `Cert.subject: bytes` was generalised (from `PublicKey`) precisely to accommodate the
-  content-hash subject here — one struct covers both identity and commitment attestation.
+  content-hash subject here -- one struct covers both identity and commitment attestation.
 
 ### Management operations should be typed, not smuggled {#typed-management-ops-owed}
 
@@ -1340,75 +1363,154 @@ the manager pubkey; it wants the current value for one key without holding any b
 
 ### The client verifies from the anchor alone {#light-client-verify}
 
-- A light client holds the anchor pubkey and nothing else durable. Bootstrap unfolds in
-  three phases; each pass through establishes one trust piece:
-  1. **Identity chain from one node** (see #light-client-cert-chain). The bootstrap node
-     ships the current manager set (P_GRANT MANAGER rows), the roster commitment (P_ROSTER
-     row with its #roster-commitment-cert), and each roster entry (P_NODE rows with certs).
-     Each cert verifies against anchor via one or two hops — no `state_root` dependency.
-     A lying bootstrap cannot inject fake identities (no anchor key); a subset attack is
-     caught by the commitment cert whose subject binds `H(serial ‖ members)`.
-  2. **Head corroboration from `f+1` roster members** (see #light-client-freshness).
-     `GETANCHORS` against `f+1` distinct members; wait for `f+1` agreeing on
-     `(block_num, state_root, prev_block, roster_serial)`. Verify `settle_sigs` in each
-     reply against the roster from step 1 (via `Management.authorization`). This
-     establishes trust in `(block_num, state_root)`.
-  3. **Per-key reads** (steady state). `GETPROOF(store_id, name, block_num)` against any
-     one responder. Verify the returned `proof` against the trusted `state_root`; if
-     `Value`, verify the leaf's credential authorises whoever last wrote it.
+- A light client holds the anchor pubkey and nothing else durable. Bootstrap is two RTs;
+  steady-state reads are one RT each. See #light-client-bootstrap, #light-client-piggyback,
+  #light-client-header-chain.
+- **Bootstrap (RT1)**: `GET_ANCHORS(fingerprint=None, trusted_block=None)` to a bootstrap
+  peer. Reply ships the roster bundle (commitment + P_NODE rows + P_GRANT MANAGER rows,
+  each with its #cert). Verify the cert chain from anchor per #light-client-cert-chain.
+  Reply also carries this responder's current anchors + settle_sigs — first candidate for
+  the trusted head.
+- **Bootstrap (RT2)**: `GET_ANCHORS(fingerprint=cached, trusted_block=None)` in parallel
+  to `f+1` roster members drawn from the bundle. Wait for `f+1` distinct replies whose
+  `roster_fingerprint` matches. This is the corroboration step -- corroboration is on the
+  ROSTER, not on state_root (see below).
+- **Steady state**: `GET_PROOF(store, name, block_num, fingerprint=cached,
+  trusted_block=(N, H))` to any one responder. Reply is one RT and:
+  1. Carries `(value|absent, proof, state_root)` at the requested block_num.
+  2. Piggybacks the responder's current anchors + settle_sigs + `roster_fingerprint`
+     (#light-client-piggyback).
+  3. Includes 0-2 headers between the client's trusted_block and the responder's head
+     (#light-client-header-chain), and a fresh bundle if fingerprint changed
+     (#light-client-roster-change-in-window).
+- **Corroboration is on the roster, not on state_root.** `settle_sigs` are already a
+  quorum multi-sig -- one valid `settle_sigs` = `>= quorum` roster members attesting to
+  that block's state_root. Once the roster is corroborated, a single valid `settle_sigs`
+  is sufficient trust for its block's state_root. This resolves the moving-target problem:
+  different responders can be at different heads (they always will be, at cadence), and
+  each reply is independently verifiable.
 - No trust in the responder at any phase. A malicious responder can only refuse or serve
   a proof that fails verification; it cannot produce valid proofs, valid certs, or valid
   `settle_sigs` for anything the anchor did not attest or the quorum did not agree.
 
 ### The cert chain reaches the roster from the anchor alone {#light-client-cert-chain}
 
-Two independent attestation layers, each catching attacks the other cannot:
+Two independent attestation layers on the roster bundle, each catching attacks the other
+cannot:
 
 **Provenance (per-entry #cert)** — chain is `anchor → manager Cert (P_GRANT) → roster
 Cert (P_NODE)`. Verifies one roster entry as:
 1. `entry_cert.verify()` — signature-only check.
 2. Either `entry_cert.signer == anchor` (entry is anchor-attested; done) OR fetch the
-   manager's P_GRANT row cert for `entry_cert.signer`, verify it recursively against the
-   anchor.
-3. Once `state_root` is trusted (phase 2 of #light-client-verify), check the entry's own
-   P_NODE row membership at `state_root` for currency (revocation).
+   manager's P_GRANT row cert for `entry_cert.signer` from the bundle's `managers` list,
+   verify it recursively against the anchor.
 
 **Completeness (#roster-commitment-cert)** — chain is `anchor → manager commitment Cert
 (P_ROSTER)`. Verifies as:
 1. `commitment_cert.verify()`.
-2. Recompute `H(codec.encode([serial, sorted_members]))` and check it equals
-   `commitment_cert.subject`.
+2. Recompute the commitment payload (`serial`, `sorted_members`, `state_fingerprint`)
+   from the bundle contents and check its hash equals `commitment_cert.subject`.
 3. Verify `commitment_cert.signer` is anchor or a valid manager (same recursive check as
    above).
 
 Both are needed and orthogonal:
 - Lying bootstrap ships a SUBSET of the real roster → caught by completeness (subset's
-  hash doesn't match commitment cert's subject).
+  computed hash doesn't match commitment cert's subject).
 - Compromised manager signs a commitment adding a FAKE member → caught by provenance
   (fake member has no anchor-provenanced entry cert).
 
-Currency comes from `state_root`: a cert whose row has been revoked (row deleted) fails
-the SMT membership proof and is rejected. Provenance is state-root-independent; completeness
-is state-root-independent; currency needs state-root. Bootstrap acquires state-root in
-phase 2 after acquiring the identity chain in phase 1.
+Currency of the roster comes from the `f+1` corroboration in bootstrap RT2: honest
+majority ensures the cached commitment is the current one at that moment. Ongoing currency
+is maintained via `roster_fingerprint` on every steady-state reply
+(#light-client-roster-change-in-window).
 
-A roster refresh from a single responder is safe: the responder can neither forge a cert
-chain (no anchor key), forge a valid commitment (would require the manager key AND matching
-the current serial that f+1 corroboration will surface), nor forge a state-root membership
-proof (state_root was corroborated from f+1).
+### Every reply carries what the client needs to catch up {#light-client-piggyback}
 
-### The roster is a corroborated read, not a bootstrapped fetch {#light-client-roster}
+- Every light-client request carries the client's current view:
+  `(known_roster_fingerprint | None, known_trusted_block | None)`.
+- Every reply carries what the client needs to advance:
+  - `roster_fingerprint` at the responder's current head. If it differs from the client's
+    known one, the reply MUST also carry a fresh `RosterBundle`.
+  - `headers[]` — 0 to `liveness_window` (#light-client-liveness) `SettledBlock`s covering
+    the gap between the client's `known_trusted_block` and the responder's head. Empty
+    when they match.
+- The client uses the piggyback opportunistically: one RT for a read AND a state advance.
+  A client polling at cadence stays caught up with no dedicated catch-up round trips.
+- **Server caps the header count** at `liveness_window` (default 2 blocks). If the client
+  is farther behind, the responder refuses with `STALE_CLIENT` per #light-client-stale.
 
-- A light client's initial roster comes from the same `GETANCHORS` reply that corroborates
-  the head anchors. Each responder ships `(anchors, settle_sigs, roster_bundle)` where
-  `roster_bundle` is the commitment cert + per-entry certs + membership proofs.
-- When `known_roster_fingerprint` in the request matches the responder's current fingerprint,
-  the responder omits `roster_bundle` — the client uses its cached roster (already verified
-  against the anchor per #light-client-cert-chain).
-- On fingerprint mismatch, the responder ships the fresh `roster_bundle`; the client
-  re-verifies both the commitment cert and each entry cert, replaces its cache. No separate
-  "roster fetch" verb — the roster
-  rides GETANCHORS as an optional field.
+### Chain-link on every read; drop on mismatch {#light-client-header-chain}
+
+- The client MUST chain-verify every piggybacked header before advancing its
+  `trusted_block`. For each `header` in the received range, in order:
+  1. `header.anchors.prev_block` MUST equal the previous header's `block_hash` (or the
+     client's current `trusted_block_hash` for the first header).
+  2. `header.settle_sigs` MUST verify against the trusted roster.
+  3. If verification passes, advance `trusted_block = (header.anchors.block_num,
+     header.block_hash, header.anchors.state_root)`.
+- If any check fails, drop the entire reply. The responder is either lying, on a fork, or
+  buggy; the client's `trusted_block` stays unchanged. Retry against another responder.
+- Chain-verification is what turns "trusted head at bootstrap" into "trusted head at any
+  later block" without needing to re-corroborate the roster. Each block's `settle_sigs`
+  are a fresh quorum attestation; the chain-link ensures they belong to the same history
+  as the corroborated bootstrap head.
+
+### Liveness: within one cadence-window of head, or re-bootstrap {#light-client-liveness}
+
+- A light client is **live** iff its `trusted_block` lags the responder's head by no more
+  than `liveness_window` blocks. Under #one-of-each-in-flight, blocks advance at cadence
+  rate (one per bucket), so this is equivalent to lagging by no more than
+  `liveness_window` buckets.
+- **Default `liveness_window = 2`** — enough for one bucket's normal cadence plus one
+  bucket of jitter. Tunable per deployment via `LightClientTunables.liveness_window`.
+- The `piggyback_cap` (max headers in a reply) IS `liveness_window` — the same number
+  serves both purposes. Beyond it, the client is not live.
+- Rationale: the point of a light client is real-time or near-real-time access. If a
+  client is more than a couple of blocks behind, they've missed the cadence and the data
+  they'd receive is not "recent". Walking forward across many blocks would deliver stale
+  intermediate views the client has no reason to trust. Re-bootstrap costs ~2 RTs, same
+  as multi-hop catch-up; cleaner state.
+- Not a wall-clock bound. Anchors don't carry timestamps (per #the-lemma, timestamps
+  aren't ratifiable), and block_num is what both sides agree on directly.
+
+### Stale client re-bootstraps {#light-client-stale}
+
+- A `GET_ANCHORS` or `GET_PROOF` request carrying `known_trusted_block=(N, H)` MUST be
+  refused with `LiteRefused(STALE_CLIENT)` if the responder's head at `M` satisfies
+  `M - N > liveness_window` (#light-client-liveness).
+- The client's response to `STALE_CLIENT`: discard `trusted_roster`, `trusted_block`,
+  `roster_fingerprint`. Re-bootstrap from scratch per #light-client-verify.
+- No walking-forward-across-many-blocks path. The `piggyback_cap` cannot be exceeded to
+  serve a stale client, because doing so would encourage clients to poll less frequently
+  than the cadence, which defeats the liveness contract.
+
+### Fork detected: re-bootstrap {#light-client-fork-detected}
+
+- A request carrying `known_trusted_block=(N, H)` MUST be refused with
+  `LiteRefused(FORK_DETECTED)` if `H != store.settled_at(N).block_hash` at the responder.
+  The client's trusted head is on a chain the responder does not hold.
+- Client's response: full re-bootstrap. Their previous corroboration was either against
+  responders on a bad fork, or the responder they're now talking to is Byzantine and on
+  a bad fork. Re-bootstrap with `f+1` corroboration surfaces the truth (majority honest by
+  threat-model assumption).
+- Not a `SILENT_DROP`: silence would let a byzantine responder stall the client
+  indefinitely. Explicit refusal lets the client immediately switch responders.
+
+### Roster change inside the header window {#light-client-roster-change-in-window}
+
+- If any header in the piggybacked range advances the roster (its block contains a
+  `change_roster` tx that changes `roster_fingerprint`), the reply MUST also carry the
+  fresh `RosterBundle` (as `bundle`). No exceptions: a client that receives a header
+  changing the roster without the corresponding bundle cannot verify subsequent headers.
+- The client processes the batch in order:
+  1. Verify headers up to and including the roster-changing block against the OLD trusted
+     roster.
+  2. Verify the new bundle (cert chain from anchor per #light-client-cert-chain).
+  3. Advance `trusted_roster` to the new bundle.
+  4. Verify headers after the roster-changing block against the NEW roster.
+- If a batch would straddle multiple roster changes, the responder MUST truncate at the
+  first change (send `headers[N+1..change_block]` + new bundle). The client catches up
+  incrementally, one roster change per RT.
 
 ### Non-membership is a first-class answer {#light-client-nonmembership}
 
@@ -1421,23 +1523,11 @@ proof (state_root was corroborated from f+1).
 
 ### The retrieval path is stateless per request {#light-client-stateless}
 
-- Each `GETKEY` is a single request/reply exchange. No session, no subscription, no keepalive
-  from the client's perspective. A light client on a bad link retries the whole verb.
+- Each `GET_ANCHORS` / `GET_PROOF` is a single request/reply exchange. No session, no
+  subscription, no keepalive from the client's perspective. A light client on a bad link
+  retries the whole verb.
 - The responder MUST answer from the latest SETTLED block it holds; it MUST NOT synthesise
-  a proof against an in-flight state. Freshness against the cluster head is the client's
-  concern — #light-client-freshness.
-
-### Freshness comes from f+1 witnesses at the retrieval layer {#light-client-freshness}
-
-- A light client wanting "the current value" MUST corroborate the answer against `f+1`
-  distinct responders that agree on `(anchors.block_num, anchors.state_root, value_hash)`.
-  One responder's answer, however well-signed, only proves "some SETTLED block held this
-  value" — not "the current one".
-- Same principle as #height-poll-is-the-trigger applied at retrieval time: signatures are
-  self-verifying, currency is not.
-- A client willing to accept staleness (e.g. archival reads) may skip this and take one
-  responder's answer as an at-that-height fact. The requirement is that this is an explicit
-  choice, not a silent default.
+  a proof against an in-flight state.
 
 ### The SMT is a primitive of retrieval, not of consensus {#light-client-smt-scope}
 
@@ -1445,8 +1535,7 @@ proof (state_root was corroborated from f+1).
   it directly — Round agrees on slices of transactions, SettleRound agrees on anchors
   (which include the state root as one field). Light client retrieval is the only
   requirement that walks the SMT for individual proofs.
-- Requirements not yet specified: the wire shape of `proof` (path bytes + sibling digests),
-  the retrieval refusal enum, and the freshness-corroboration timeout.
+- Requirements not yet specified: the wire shape of `proof` (path bytes + sibling digests).
 
 ---
 
@@ -1768,7 +1857,7 @@ visible rather than plausible.
 | Nodes are not authors (#nodes-are-not-authors) | `Role` enum has no `NODE` member; `Management.authorise` cannot express a node-as-author grant. A bare node identity has no P_GRANT row, so `may_write` returns False. Being in P_NODE keyspace with a valid #cert is the only sense in which a node is "in" the system |
 | Only the anchor grants or revokes MANAGER / COMPACTOR (#role-manager-grant) | **partial** — `Management.authorise(role=MANAGER \| COMPACTOR, cert=...)` requires an anchor-signed Cert and validates it before emitting the mutation. Log-boundary refusal of a raw `Set P_GRANT` bypassing `authorise` is DEFERRED per #typed-management-ops-owed |
 | One authorisation cert shape (#cert) | **partial** — `Management.Cert` is one dataclass covering every authority-carrying row (`subject: bytes` covers both identity certs and content-commitment certs). `authorise` and `change_roster` require it; `may_write`, `may_send`, `roster()`, and `roster_commitment()` verify it on read (subject, purpose, signature, signer-authority-for-purpose). Log-boundary refusal of a cert-less or wrong-purpose write is DEFERRED per #typed-management-ops-owed |
-| Roster commitment carries its own cert (#roster-commitment-cert) | **partial** — P_ROSTER row content is `[serial, sorted_members, cert]`; `Cert.sign_roster_commitment(signer, encode([serial, members]))` binds `subject = H(content)`. `change_roster` requires a `commitment_signer` keypair (anchor or valid manager), emits the cert with the mutation. `Management.roster_commitment()` decodes, recomputes the hash, verifies the cert, and returns None on any failure. Log-boundary refusal DEFERRED per #typed-management-ops-owed |
+| Roster commitment carries its own cert (#roster-commitment-cert) | **partial** — P_ROSTER row content is `[serial, sorted_members, state_fingerprint, cert]`; `Cert.sign_roster_commitment(signer, encode([serial, sorted_members, state_fingerprint]))` binds `subject = H(content)` with all three fields signed. `change_roster` computes `state_fingerprint` from post-state entries (endpoints + domains per member), requires a `commitment_signer` keypair (anchor or valid manager), emits the cert with the mutation. `Management.roster_commitment()` decodes, recomputes both fingerprints, verifies the cert, and returns None on any failure. Log-boundary refusal DEFERRED per #typed-management-ops-owed |
 | Management operations should be typed, not smuggled (#typed-management-ops-owed) | **OWED** — API-side plumbing (this row's Cert enforcement) is a halfway house; the design fix is typed management op types so wrong-shape writes are unexpressible. Deferred until after light-client work per Harry's ruling |
 
 ### L3 mempool
@@ -1859,13 +1948,17 @@ visible rather than plausible.
 
 | requirement | enforced by |
 |---|---|
-| retrieval names one key, returns value + proof (#light-client-get) | **OWED** — no `GETKEY` verb, no light-client server-side handler, no client-side verifier |
-| client verifies from anchor alone (#light-client-verify) | **OWED** — no client-side verify pipeline exists; the anchor pubkey lives in `Store.anchor()` for the full-node path only |
-| cert chain reaches roster from anchor alone (#light-client-cert-chain) | **partial** — the cert-emission and cert-storage halves land with #manager-cert / #roster-entry-cert (Management side); the client-side chain-walker is OWED until light client is built |
-| roster is a corroborated read via GETANCHORS (#light-client-roster) | **OWED** — no GETANCHORS verb yet; roster ships in the reply via the cert bundle once the wire lands |
-| non-membership is first-class (#light-client-nonmembership) | **partial** — `smt.py` supports non-membership proofs structurally; no retrieval verb consumes them yet |
-| retrieval is stateless per request (#light-client-stateless) | **OWED** — no verb, so no session model to check |
-| freshness via f+1 responders (#light-client-freshness) | **OWED** — no client-side corroboration loop; shape parallels `Follower.caught_up()` |
+| retrieval names one key, returns value + proof (#light-client-get) | **OWED** — no light-client server-side handler, no client-side verifier |
+| client verifies from anchor alone (#light-client-verify) | **partial** — verbs (`GET_ANCHORS`, `ANCHORS_REPLY`, `GET_PROOF`, `PROOF_REPLY`, `LITE_REFUSED`) registered in `net.envelope.Verb`; typed messages in `dude/sync/lite_adapter.py`. Server-side handlers + client-side state machine OWED |
+| cert chain reaches roster from anchor alone (#light-client-cert-chain) | **partial** — cert-emission and cert-storage halves land with #cert / #roster-commitment-cert (Management side); the client-side chain-walker is OWED |
+| every reply carries what the client needs to catch up (#light-client-piggyback) | **partial** — `GetAnchors` and `GetProof` message shapes carry `known_trusted_block` and `known_roster_fingerprint`; replies carry `headers[]` and `bundle`. Server-side computation of the delta and client-side consumption of it are OWED |
+| chain-link on every read; drop on mismatch (#light-client-header-chain) | **OWED** — server-side header emission and client-side chain-verify both live in the LightClient wave |
+| liveness within `liveness_window` blocks of head (#light-client-liveness) | **partial** — `LightClientTunables.liveness_window` defined (default 2). Server-side stale-detection + client-side re-bootstrap trigger OWED |
+| stale client re-bootstraps (#light-client-stale) | **partial** — `LiteRefusal.STALE_CLIENT` in the closed enum; server-side and client-side handling OWED |
+| fork detected: re-bootstrap (#light-client-fork-detected) | **partial** — `LiteRefusal.FORK_DETECTED` in the closed enum; server-side chain-hash check + client-side re-bootstrap trigger OWED |
+| roster change inside the header window ships bundle (#light-client-roster-change-in-window) | **OWED** — server-side detection of a roster-changing header in the range + bundle-piggyback OWED |
+| non-membership is first-class (#light-client-nonmembership) | **partial** — `smt.py` supports non-membership proofs structurally; server-side proof-serving and client-side verifier OWED |
+| retrieval is stateless per request (#light-client-stateless) | **structural** — no session-object type exists; each request/reply is self-contained by design |
 | SMT is a retrieval primitive, not consensus (#light-client-smt-scope) | **structural** — `smt.py` is imported by `store.py` and `layer.py` only; no consensus module (Round, SettleRound, Coordinator) references it |
 
 ### Compaction
