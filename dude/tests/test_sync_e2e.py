@@ -52,12 +52,21 @@ class TestFreshNodeJoinsClusterAndCatchesUp(unittest.TestCase):
         joiner_store.provision(c.mgr.public)
         joiner = Node(joiner_kp, joiner_store)
 
-        # Wire the joiner via `Node.add_peer`. The joiner's Postman dials INPROC lazily
-        # via the module-scope dialler; node 0's Postman likewise adds the joiner as a
-        # peer. The module-scope InProc registry routes frames both directions -- no
-        # switchboard, no factory injection.
-        joiner.add_peer(c.nodes[0].me.public, (Endpoint(address_of(c.nodes[0].me.public)),))
-        c.nodes[0].add_peer(joiner_kp.public, (Endpoint(address_of(joiner_kp.public)),))
+        # Bootstrap-outside-the-roster wiring: reconciliation from `mgmt.roster()`
+        # doesn't add the joiner to node 0's peers (joiner isn't in the roster yet), and
+        # doesn't add node 0 to the joiner's peers (joiner's store is empty). Both sides
+        # need a manual bootstrap peer added directly to postman + follower.
+        joiner.postman.add_peer(
+            c.nodes[0].me.public,
+            (Endpoint(address_of(c.nodes[0].me.public)),),
+        )
+        joiner.follower.add_peer(c.nodes[0].me.public, now=0)
+        c.nodes[0].postman.add_peer(
+            joiner_kp.public,
+            (Endpoint(address_of(joiner_kp.public)),),
+        )
+        # Force the joiner's Postman to dial the INPROC transport by triggering the first
+        # add_peer above; grab it for the drain loop below.
         joiner_transport = cast(
             "InProc",
             joiner.postman._transports_by_scheme[Scheme.INPROC],

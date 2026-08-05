@@ -30,7 +30,6 @@ from .core import crypto
 from .core.errors import DudeError
 from .core.units import Millis
 from .net import Verb
-from .net.address import Endpoint
 from .net.envelope import Envelope, Frame, SignedEnvelope, new_message_id
 from .net.postman import Postman
 from .store import Store, ops
@@ -112,6 +111,11 @@ class Node:
     and Follower share the Store as their only meeting point (#sync-in-its-own-module) --
     Coordinator PRODUCES blocks, Follower CONSUMES them, they never talk to each other."""
 
+    _last_reconciled_serial: int = field(default=-1, init=False)
+    """The last roster commitment serial `_reconcile_peers` acted on. -1 means never
+    reconciled. Serial-gate for #roster-drives-peers: skip the full pass on tick unless the
+    serial has advanced (roster has actually changed)."""
+
     def __post_init__(self) -> None:
         self.postman = Postman(
             self.me,
@@ -149,20 +153,52 @@ class Node:
     def mgmt(self) -> Management:
         return Management(self.store)
 
-    def add_peer(self, peer: crypto.PublicKey, endpoints: tuple[Endpoint, ...]) -> None:
-        """Add or update a peer's reachability. Composes `postman.add_peer` (transport
-        layer) with `follower.add_peer` (sync-poll layer). Callers pass endpoints; Postman
-        dials transports via the module-scope scheme→dialler map (#postman-owns-dialling).
+    def _reconcile_peers(self, now: Millis) -> None:
+        """Sync `postman.peers` against the current roster (#roster-drives-peers).
 
-        Follower's initial poll deadline is 0, i.e. "poll on the very next tick" -- typical
-        callers add peers at cluster construction time when the clock is not yet advanced,
-        so any reasonable `tick(now)` will fire the first poll immediately.
+        Called from `tick` gated on the roster commitment's serial: if the serial has not
+        advanced since our last reconcile, the roster has not changed, and we skip the
+        full pass. Serial-gate cost is one SMT-backed lookup per tick (`roster_commitment()`);
+        the full pass runs only when the roster genuinely changes (add/remove/endpoint edit
+        -- any of which bumps the serial and the state_fingerprint).
 
-        This helper stays as a thin convenience while `#roster-drives-peers` is OWED.
-        Once tick-time reconciliation lands, Node will not need to be told about peers at
-        all -- the roster in state drives it."""
-        self.postman.add_peer(peer, endpoints)
-        self.follower.add_peer(peer, now=0)
+        ADDITIONS: for each roster member not yet in `postman.peers`, dial them via
+        `postman.add_peer(pubkey, endpoints)` using the endpoints stored in the P_NODE row.
+        Also register with `follower.add_peer` so the sync-poll cadence covers them.
+
+        REMOVALS: for each pubkey in `postman.peers` that is neither in the current roster
+        nor our own identity, drop via `postman.remove_peer(pubkey)`. Follower reads the
+        roster via `Management(store).roster()` on demand, so it self-clears for absent
+        peers without an explicit remove.
+
+        CLIENTS / COMPACTORS are NOT reconciled here. They do not have P_NODE rows
+        (nodes-are-not-authors distinguishes storage nodes from author identities). The
+        reply-path for a client that pings us is added on demand at receive-time -- see
+        the light-client wave for the handling."""
+        commitment = self.mgmt.roster_commitment()
+        if commitment is None:
+            return
+        serial = commitment[0]
+        if serial == self._last_reconciled_serial:
+            return
+        self._last_reconciled_serial = serial
+        roster = set(self.mgmt.roster())
+        nodes = self.mgmt.nodes()
+        # Additions: any roster member not currently in our postman.peers, and not us.
+        for pubkey in roster:
+            if pubkey == self.me.public:
+                continue
+            if pubkey in self.postman.peers:
+                continue
+            rec = nodes.get(pubkey)
+            if rec is None or not rec.endpoints:
+                continue  # roster listed a member with no endpoints; skip until they show up
+            self.postman.add_peer(pubkey, rec.endpoints)
+            self.follower.add_peer(pubkey, now=now)
+        # Removals: anything currently in postman.peers that isn't in the roster.
+        for pubkey in list(self.postman.peers):
+            if pubkey not in roster:
+                self.postman.remove_peer(pubkey)
 
     def roster(self) -> tuple[crypto.PublicKey, ...]:
         """MANAGEMENT'S ANSWER, and nowhere else. `Management` owns everything about who is
@@ -293,9 +329,15 @@ class Node:
     def tick(self, now: Millis) -> None:
         """Advance the consensus round, the sync loop, and the wire.
 
+        Reconciles peers against the current roster first (#roster-drives-peers), so any
+        `change_roster` that settled since our last tick flows to the transport layer
+        before consensus tries to use it. The reconcile is serial-gated: a single roster-
+        commitment read per tick, full pass only when the serial has advanced.
+
         Coordinator drives Round + SettleRound + commit. Follower drives sync polls, pull
         timeouts, and pull initiation; its outbox contains the HEIGHT / GETBLOCK envelopes to
         post via the mailbox."""
+        self._reconcile_peers(now)
         self.coordinator.tick(now)
         self.follower.tick(now)
         self._flush_follower(now)

@@ -79,14 +79,14 @@ class Cluster:
             bootstrap(store, self.mgr, genesis)
             node = Node(kp, store)
             self.nodes.append(node)
-        # Wire every pair via `Node.add_peer(pubkey, endpoints)`. The first `add_peer` on
-        # each Node causes its Postman to dial an InProc (via the module-scope dialler)
-        # and register it under `name_of(kp.public)`. We grab the resulting transport
-        # after the first add_peer so `_quiesce` can drain each Node's inbox.
+        # No explicit peer wiring here (#roster-drives-peers). Each Node's first `tick`
+        # runs `_reconcile_peers`, which reads `mgmt.roster()` + `mgmt.nodes()` from the
+        # store the bootstrap block already populated and calls `postman.add_peer` for
+        # every other roster member. The `postman._transports_by_scheme[INPROC]` entry
+        # is populated as a side effect of that first `add_peer`, so we need to force
+        # one tick here to have transports available for `_quiesce` to drain.
         for node in self.nodes:
-            for other in self.keys:
-                if other.public != node.me.public:
-                    node.add_peer(other.public, (Endpoint(address_of(other.public)),))
+            node.tick(T0)
             # Cast is safe because the dialler for INPROC always returns InProc; the
             # narrowing is only needed because Postman's cache is typed generically.
             self._transports[node.me.public] = cast(
