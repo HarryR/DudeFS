@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import ClassVar
 
-from ..consensus.settle_round import Anchors, SettledBlock
+from ..consensus.settle_round import SettledBlock
 from ..core import codec, crypto
 from ..core.errors import DudeError
 from ..net.address import Endpoint
@@ -288,39 +288,35 @@ class GetAnchors(LiteMsg):
 
 @dataclass(frozen=True, slots=True)
 class AnchorsReply(LiteMsg):
-    """The responder's current SETTLED head anchors + settle_sigs, plus the roster
-    fingerprint and (optionally) the full identity bundle and piggybacked headers.
+    """The responder's current SETTLED head as a full `SettledBlock` (slice + anchors +
+    quorum multisig), plus the roster fingerprint and (optionally) the full identity
+    bundle and piggybacked headers.
+
+    Why the whole `SettledBlock`, not just anchors + settle_sigs: `settle_sigs` cover
+    `_settle_payload(slice_hash, anchors)`, and `slice_hash` derives from the slice
+    (bucket + sorted hashes). Without the slice content the client cannot verify the
+    signatures. Shipping the full `SettledBlock` costs bytes proportional to the slice
+    size but is the only shape that lets the client verify independently.
 
     Client uses this in two ways:
       1. **Bootstrap** (first call, fingerprint=None, trusted_block=None): decode
-         `bundle`, verify the cert chain from the anchor, cache the roster, then fan out
-         to `f+1` roster members to corroborate `roster_fingerprint`.
+         `bundle`, verify the cert chain from the anchor, cache the roster, then fan
+         out to `f+1` roster members to corroborate `roster_fingerprint`.
       2. **Steady state** (bundle omitted iff fingerprint matches): use `headers[]` to
          chain-verify from the client's trusted_block up to the responder's head
-         (#light-client-header-chain), and use `anchors + settle_sigs` as the new
-         trusted head."""
+         (#light-client-header-chain), and use `head` as the new trusted head."""
 
     verb: ClassVar[Verb] = Verb.ANCHORS_REPLY
 
-    anchors: Anchors
-    signers: crypto.SignerBitmap
-    settle_sigs: tuple[crypto.Signature, ...]
+    head: SettledBlock
     roster_fingerprint: crypto.Digest
     bundle: RosterBundle | None
     headers: tuple[SettledBlock, ...]
 
     def _encode(self) -> bytes:
-        a = self.anchors
         return codec.encode(
             [
-                a.block_num,
-                a.height,
-                a.prev_block,
-                a.state_root,
-                a.acc_state,
-                a.acc_log,
-                self.signers,
-                list(self.settle_sigs),
+                self.head.encode(),
                 self.roster_fingerprint,
                 self.bundle._encode() if self.bundle is not None else b"",  # noqa: SLF001
                 [h.encode() for h in self.headers],
@@ -330,24 +326,15 @@ class AnchorsReply(LiteMsg):
     @classmethod
     def _decode(cls, body: bytes) -> AnchorsReply:
         try:
-            p = codec.as_seq(codec.decode(body), 11)
-            anchors = Anchors(
-                block_num=codec.as_int(p[0]),
-                height=codec.as_int(p[1]),
-                prev_block=crypto.Digest(codec.as_bytes(p[2])),
-                state_root=crypto.Digest(codec.as_bytes(p[3])),
-                acc_state=crypto.Accumulator(codec.as_bytes(p[4])),
-                acc_log=crypto.Accumulator(codec.as_bytes(p[5])),
-            )
-            signers = crypto.SignerBitmap(codec.as_bytes(p[6]))
-            settle_sigs = tuple(crypto.Signature(codec.as_bytes(s)) for s in codec.as_seq(p[7]))
-            roster_fingerprint = crypto.Digest(codec.as_bytes(p[8]))
-            bundle_bytes = codec.as_bytes(p[9])
+            p = codec.as_seq(codec.decode(body), 4)
+            head = SettledBlock.decode(codec.as_bytes(p[0]))
+            roster_fingerprint = crypto.Digest(codec.as_bytes(p[1]))
+            bundle_bytes = codec.as_bytes(p[2])
             bundle = RosterBundle._decode(bundle_bytes) if bundle_bytes else None  # noqa: SLF001
-            headers = tuple(SettledBlock.decode(codec.as_bytes(h)) for h in codec.as_seq(p[10]))
+            headers = tuple(SettledBlock.decode(codec.as_bytes(h)) for h in codec.as_seq(p[3]))
         except DudeError as e:
             raise LiteAdapterError(f"malformed ANCHORS_REPLY body: {e}") from e
-        return cls(anchors, signers, settle_sigs, roster_fingerprint, bundle, headers)
+        return cls(head, roster_fingerprint, bundle, headers)
 
 
 @dataclass(frozen=True, slots=True)
@@ -426,29 +413,19 @@ class ProofReply(LiteMsg):
     absent: bool
     proof: bytes
     state_root: crypto.Digest
-    anchors: Anchors
-    signers: crypto.SignerBitmap
-    settle_sigs: tuple[crypto.Signature, ...]
+    head: SettledBlock
     roster_fingerprint: crypto.Digest
     bundle: RosterBundle | None
     headers: tuple[SettledBlock, ...]
 
     def _encode(self) -> bytes:
-        a = self.anchors
         return codec.encode(
             [
                 self.value,
                 1 if self.absent else 0,
                 self.proof,
                 self.state_root,
-                a.block_num,
-                a.height,
-                a.prev_block,
-                a.state_root,
-                a.acc_state,
-                a.acc_log,
-                self.signers,
-                list(self.settle_sigs),
+                self.head.encode(),
                 self.roster_fingerprint,
                 self.bundle._encode() if self.bundle is not None else b"",  # noqa: SLF001
                 [h.encode() for h in self.headers],
@@ -458,29 +435,18 @@ class ProofReply(LiteMsg):
     @classmethod
     def _decode(cls, body: bytes) -> ProofReply:
         try:
-            p = codec.as_seq(codec.decode(body), 15)
-            anchors = Anchors(
-                block_num=codec.as_int(p[4]),
-                height=codec.as_int(p[5]),
-                prev_block=crypto.Digest(codec.as_bytes(p[6])),
-                state_root=crypto.Digest(codec.as_bytes(p[7])),
-                acc_state=crypto.Accumulator(codec.as_bytes(p[8])),
-                acc_log=crypto.Accumulator(codec.as_bytes(p[9])),
-            )
-            signers = crypto.SignerBitmap(codec.as_bytes(p[10]))
-            settle_sigs = tuple(crypto.Signature(codec.as_bytes(s)) for s in codec.as_seq(p[11]))
-            roster_fingerprint = crypto.Digest(codec.as_bytes(p[12]))
-            bundle_bytes = codec.as_bytes(p[13])
+            p = codec.as_seq(codec.decode(body), 8)
+            head = SettledBlock.decode(codec.as_bytes(p[4]))
+            roster_fingerprint = crypto.Digest(codec.as_bytes(p[5]))
+            bundle_bytes = codec.as_bytes(p[6])
             bundle = RosterBundle._decode(bundle_bytes) if bundle_bytes else None  # noqa: SLF001
-            headers = tuple(SettledBlock.decode(codec.as_bytes(h)) for h in codec.as_seq(p[14]))
+            headers = tuple(SettledBlock.decode(codec.as_bytes(h)) for h in codec.as_seq(p[7]))
             return cls(
                 value=codec.as_bytes(p[0]),
                 absent=codec.as_int(p[1]) == 1,
                 proof=codec.as_bytes(p[2]),
                 state_root=crypto.Digest(codec.as_bytes(p[3])),
-                anchors=anchors,
-                signers=signers,
-                settle_sigs=settle_sigs,
+                head=head,
                 roster_fingerprint=roster_fingerprint,
                 bundle=bundle,
                 headers=headers,
@@ -544,6 +510,18 @@ class LiteAdapter:
         self.me = me
         self.postman = postman
         self.ttl = ttl
+
+    def send(self, to: crypto.PublicKey, msg: LiteMsg, now) -> bytes:
+        """Post a directed request. Returns the message-id, which the caller can
+        correlate with the eventual reply if it tracks its own outstanding requests.
+        All light-client verbs are request-reply, so `await_reply=True` is implicit."""
+        from ..net.envelope import Envelope, new_message_id  # noqa: PLC0415
+
+        verb, body = msg.encode()
+        mid = new_message_id()
+        env = Envelope(to, verb, mid, body).sign(self.me, now)
+        self.postman.mailbox.post(env, now, self.ttl, await_reply=True)
+        return mid
 
     def reply(self, to, msg: LiteMsg, now):
         """Answer an inbound request. Uses `env.answer(verb, body)` so `reply_to` echoes

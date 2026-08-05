@@ -81,9 +81,7 @@ def serve_get_anchors(  # noqa: PLR0911 -- each early-return maps to a distinct 
     headers = _headers_since(store, tb, head_num)
 
     return AnchorsReply(
-        anchors=head_block.anchors,
-        signers=head_block.signers,
-        settle_sigs=head_block.settle_sigs,
+        head=head_block,
         roster_fingerprint=roster_fingerprint,
         bundle=bundle,
         headers=headers,
@@ -165,9 +163,7 @@ def serve_get_proof(  # noqa: PLR0911, PLR0912, C901 -- each early-return names 
         absent=absent,
         proof=proof,
         state_root=head_block.anchors.state_root,
-        anchors=head_block.anchors,
-        signers=head_block.signers,
-        settle_sigs=head_block.settle_sigs,
+        head=head_block,
         roster_fingerprint=roster_fingerprint,
         bundle=bundle,
         headers=headers,
