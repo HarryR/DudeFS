@@ -16,7 +16,6 @@ from ..core import codec, crypto
 from ..core.errors import DudeError, InvariantError
 from ..net import Verb
 from ..net.envelope import Envelope, Frame
-from ..net.transports import name_of
 from ..node import (
     _DISPATCH,
     HANDLED,
@@ -66,10 +65,15 @@ class TestGestalt(unittest.TestCase):
 
     def test_a_partitioned_node_still_settles_through_the_others(self):
         """Node 2 cannot hear node 0 directly. It must still learn the transaction, because the
-        client needs a link to ONE node and the rest is the cluster's problem."""
-        a, c = name_of(self.c.keys[0].public), name_of(self.c.keys[2].public)
-        self.c.board.cut(a, c)
-        self.c.board.cut(c, a)
+        client needs a link to ONE node and the rest is the cluster's problem.
+
+        The partition is modelled by removing each side from the OTHER's `postman.peers` --
+        symmetric partition, per #partitions-are-test-only. That IS what a partition looks
+        like to the protocol: the sender has no live route to the target."""
+        a_pk = self.c.keys[0].public
+        c_pk = self.c.keys[2].public
+        self.c.nodes[0].postman.peers.pop(c_pk, None)
+        self.c.nodes[2].postman.peers.pop(a_pk, None)
 
         key = crypto.h(b"partitioned")
         tx = ops.writes(ops.Set(D, key, b"relayed")).sign(self.client, T0)
@@ -159,8 +163,24 @@ class TestVerbCoverage(unittest.TestCase):
         them -- Round's own `HELD`/`SIG` do the job now (SPECv2 #round-lifecycle). They stay in
         the enum's retired range so a stale peer sending one is unimplemented-and-ignored rather
         than crashing on an unknown verb; the enum entries should be moved to a retired section
-        in a follow-up cleanup."""
-        self.assertEqual(UNIMPLEMENTED, {Verb.PROPOSE, Verb.ENDORSE})
+        in a follow-up cleanup.
+
+        `GET_ANCHORS`/`ANCHORS_REPLY`/`GET_PROOF`/`PROOF_REPLY`/`LITE_REFUSED` are the light-
+        client verbs added ahead of the LightClient landing (#light-client). Handlers land
+        with that wave; until then they are unimplemented-and-ignored the same way retired
+        verbs are."""
+        self.assertEqual(
+            UNIMPLEMENTED,
+            {
+                Verb.PROPOSE,
+                Verb.ENDORSE,
+                Verb.GET_ANCHORS,
+                Verb.ANCHORS_REPLY,
+                Verb.GET_PROOF,
+                Verb.PROOF_REPLY,
+                Verb.LITE_REFUSED,
+            },
+        )
 
     def test_every_handled_verb_has_a_handler(self):
         """Derived, not listed: `_DISPATCH` is built from `HANDLED`, so a verb claimed as handled

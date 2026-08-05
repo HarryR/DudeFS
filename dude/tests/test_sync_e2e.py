@@ -50,18 +50,13 @@ class TestFreshNodeJoinsClusterAndCatchesUp(unittest.TestCase):
         joiner_store.provision(c.mgr.public)
         joiner = Node(joiner_kp, joiner_store)
 
-        # Wire the joiner into the switchboard AND connect it bidirectionally with node 0.
-        # The joiner will poll node 0 for HEIGHT and pull blocks via GETBLOCK; node 0 will
-        # answer both requests via its own dispatch.
-        c.board.bind(name_of(joiner_kp.public))
-        joiner.connect(
-            c.nodes[0].me.public,
-            InProc(name_of(joiner_kp.public), c.board),
-        )
-        c.nodes[0].connect(
-            joiner_kp.public,
-            InProc(name_of(c.nodes[0].me.public), c.board),
-        )
+        # Give the joiner its own InProc (registers under its own name in the module-scope
+        # registry). Node 0 already has one; the joiner sends to node 0 through the joiner's
+        # transport, node 0 replies through node 0's transport. Both directions route via
+        # the module registry -- no `Switchboard` to bind or plumb through.
+        joiner_transport = InProc(name_of(joiner_kp.public))
+        joiner.connect(c.nodes[0].me.public, joiner_transport)
+        c.nodes[0].connect(joiner_kp.public, c._transports[c.nodes[0].me.public])
 
         # Pump time forward with all four nodes. Each pump: tick every node (drives their
         # follower + coordinator), quiesce dissemination. The joiner's tick fires HEIGHT
@@ -77,7 +72,10 @@ class TestFreshNodeJoinsClusterAndCatchesUp(unittest.TestCase):
                 for node in [*c.nodes, joiner]:
                     node.postman.tick(now)
                 for node in [*c.nodes, joiner]:
-                    frames = c.board.drain(name_of(node.me.public))
+                    transport = (
+                        joiner_transport if node is joiner else c._transports[node.me.public]
+                    )
+                    frames = transport.receive()
                     for frame in frames:
                         node.receive(frame, now)
                         delivered += 1

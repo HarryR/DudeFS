@@ -9,6 +9,6 @@
 # retry is a transmission the link layer cannot count, which breaks Karn's rule and the retry budget
 # at once), no timeouts, no state, no opinions about what it is carrying.
 
-from .inproc import InProc, Switchboard, address_of, name_of
+from .inproc import InProc, address_of, name_of
 
-__all__ = ["InProc", "Switchboard", "address_of", "name_of"]
+__all__ = ["InProc", "address_of", "name_of"]

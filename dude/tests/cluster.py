@@ -1,8 +1,9 @@
-# The cluster harness: three nodes, one switchboard, and no I/O at all.
+# The cluster harness: three nodes and the module-scope InProc registry, no I/O at all.
 #
 # Shared by every end-to-end suite, which is why it lives here rather than in one of them. `now` is
-# an integer the test advances, so a cluster's round is deterministic and a partition is a value —
-# no sockets, no threads, no sleeping.
+# an integer the test advances, so a cluster's round is deterministic — no sockets, no threads, no
+# sleeping. Partitions are simulated by `postman.remove_peer(pubkey)` (see
+# #partitions-are-test-only) rather than by a switchboard-level cut/heal.
 
 from __future__ import annotations
 
@@ -10,7 +11,8 @@ from ..consensus.bootstrap import bootstrap
 from ..core import crypto
 from ..net import Verb
 from ..net.envelope import Envelope
-from ..net.transports import InProc, Switchboard, address_of, name_of
+from ..net.transports import InProc, address_of, name_of
+from ..net.transports.inproc import _reset_for_tests
 from ..node import Node
 from ..store import Store, management, ops
 from ..store.management import Cert, Management, Role
@@ -27,10 +29,19 @@ class Cluster:
     can configure is a cluster whose test failures need debugging first."""
 
     def __init__(self, size: int = 3):
-        self.board = Switchboard()
+        # Reset the module-scope InProc registry, so a prior test's residual entries do not
+        # collide with ours. (#inproc-is-a-loopback: the registry is process-wide, so tests
+        # that construct clusters back-to-back share it and MUST manage their own hygiene.)
+        _reset_for_tests()
+
         self.mgr = crypto.Keypair.generate()
         self.keys = [crypto.Keypair.generate() for _ in range(size)]
         self.nodes: list[Node] = []
+        # Every Node has ONE InProc registered under its own name; it is the sole entry
+        # point for both outbound sends (send to any target address) and inbound receives
+        # (drain its own inbox). Peers share the SAME InProc instance because there is
+        # nothing per-peer at the transport layer -- the target address is what routes.
+        self._transports: dict[crypto.PublicKey, InProc] = {}
 
         # Every node starts with the SAME block 1 -- a manager-signed genesis block that
         # establishes the initial roster (#manager-sig-overrides-quorum). Every node's store
@@ -48,12 +59,17 @@ class Cluster:
             # at init; every node produces byte-equal block 1 because the inputs are identical).
             bootstrap(store, self.mgr, genesis)
             node = Node(kp, store)
-            self.board.bind(name_of(kp.public))
+            self._transports[kp.public] = InProc(name_of(kp.public))
             self.nodes.append(node)
+        # Wire every pair: each node's Postman gets every other peer, using the node's ONE
+        # shared InProc transport. `node.connect` stays the current single-transport API
+        # here; the Postman.add_peer / roster-driven reconciliation refactor lands in a
+        # later commit.
         for node in self.nodes:
+            transport = self._transports[node.me.public]
             for other in self.keys:
                 if other.public != node.me.public:
-                    node.connect(other.public, InProc(name_of(node.me.public), self.board))
+                    node.connect(other.public, transport)
         self._clock: int = T0
         """The cluster's own monotone clock. `pump(now)` treats its `now` argument as a floor:
         if a test calls `pump(T0)` then `pump(T0 + DELTA)`, the second pump continues from
@@ -148,16 +164,21 @@ class Cluster:
     def _quiesce(self, now: int, away: set[int]) -> None:
         """Deliver until no more frames are in flight, at `now` fixed. Dissemination chains
         (SUBMIT re-flood, HELD/SIG relays) happen inside one bucket in production; the harness
-        preserves that shape here."""
+        preserves that shape here.
+
+        Frames are pulled from each node's own InProc transport (module-scope registry
+        does the routing at send-time). A partitioned node's transport still holds any
+        frames delivered before the partition — for `pump_without`, those queued frames
+        stay queued and are drained normally when the node comes back."""
         for _ in range(len(self.nodes) + 1):
             for i, node in enumerate(self.nodes):
                 if i not in away:
                     node.postman.tick(now)
             delivered = 0
             for i, node in enumerate(self.nodes):
-                frames = self.board.drain(name_of(node.me.public))
                 if i in away:
                     continue
+                frames = self._transports[node.me.public].receive()
                 for frame in frames:
                     node.receive(frame, now)
                     delivered += 1

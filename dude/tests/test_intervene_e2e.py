@@ -25,7 +25,6 @@ import unittest
 from dude.consensus.bootstrap import intervene
 from dude.consensus.settle_round import SettledBlock
 from dude.core import crypto
-from dude.net.transports import name_of
 from dude.store.management import Cert, Role
 
 from .cluster import DELTA, Cluster, D
@@ -43,9 +42,9 @@ def _sync_only_pump(c: Cluster, now: int, iterations: int = 30) -> int:
             # follower.tick). Follower is otherwise disconnected from the wire.
             node._flush_follower(now)
             node.postman.tick(now)
-        # Deliver frames.
+        # Deliver frames from each node's own transport inbox.
         for node in c.nodes:
-            frames = c.board.drain(name_of(node.me.public))
+            frames = c._transports[node.me.public].receive()
             for frame in frames:
                 node.receive(frame, now)
         now += DELTA
