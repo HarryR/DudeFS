@@ -210,19 +210,21 @@ class Envelope:
 
     @classmethod
     def decode(cls, raw: bytes) -> Envelope:
-        f = codec.as_seq(codec.decode(raw), 6)
         try:
-            verb = Verb(codec.as_int(f[1]))
+            f = codec.as_seq(codec.decode(raw), 6)
+            to = crypto.PublicKey(codec.as_bytes(f[0]))
+            verb_int = codec.as_int(f[1])
+            mid = codec.as_bytes(f[2])
+            body = codec.as_bytes(f[3])
+            reply_to = codec.as_bytes(f[4])
+            reply_ts = codec.as_int(f[5])
+        except (codec.CodecError, crypto.CryptoError) as exc:
+            raise EnvelopeError(f"malformed envelope: {exc}") from exc
+        try:
+            verb = Verb(verb_int)
         except ValueError as exc:
-            raise EnvelopeError(f"unknown verb {codec.as_int(f[1])}") from exc
-        return cls(
-            crypto.PublicKey(codec.as_bytes(f[0])),
-            verb,
-            codec.as_bytes(f[2]),
-            codec.as_bytes(f[3]),
-            codec.as_bytes(f[4]),
-            codec.as_int(f[5]),
-        )
+            raise EnvelopeError(f"unknown verb {verb_int}") from exc
+        return cls(to, verb, mid, body, reply_to, reply_ts)
 
     def sign(self, kp: crypto.Keypair, ts: int) -> SignedEnvelope:
         """Author this envelope, now. Authorship and time arrive together, so there is no window in

@@ -117,6 +117,28 @@ class TestSignedFields(unittest.TestCase):
             SignedEnvelope.decode(codec.encode([body, self.a.sign(body)]))
         self.assertIn("999", str(cm.exception))
 
+    def test_envelope_encode_and_decode_agree_on_field_count(self):
+        """CLAUDE.md trap #1: encode/decode halves that drift and fail in silence. Both halves
+        being self-consistent means round-trip tests don't catch it -- only a test that pins the
+        field COUNT does. This is the same discipline as `test_wrong_field_count_raises` in
+        `test_round_adapter.py`.
+
+        If a field is added to `Envelope.encode` without a matching bump to `Envelope.decode`'s
+        `as_seq(..., N)`, this test fails at the shorter-list case. If a field is added to
+        decode without encode, the too-many-fields case catches it. Both directions are
+        pinned because the trap fires either way."""
+        stamped = Envelope(self.b.public, Verb.PING, b"x" * 16).sign(self.a, T0)
+        # Six fields is what `Envelope.encode` currently emits (to, verb, mid, body,
+        # reply_to, reply_ts). Anything else must be a hard decode refusal.
+        for wrong in (5, 7):
+            malformed_inner = codec.encode([b""] * wrong)
+            body = codec.encode([self.a.public, T0, malformed_inner])
+            with self.assertRaises(EnvelopeError):
+                SignedEnvelope.decode(codec.encode([body, self.a.sign(body)]))
+        # And the well-formed six-field shape must survive round-trip -- so the count
+        # this test pins is exactly the count the code uses.
+        self.assertEqual(SignedEnvelope.decode(stamped.raw), stamped)
+
 
 class TestCorrelation(unittest.TestCase):
     """The message id exists for a BUG: with no request-response binding there is no relationship
