@@ -22,15 +22,19 @@
 
 from __future__ import annotations
 
+import contextlib
+import queue
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from .consensus import Coordinator, Mempool, RoundAdapter, SettleAdapter
 from .core import crypto
 from .core.errors import DudeError
-from .core.units import Millis
+from .core.units import Millis, now_ms
 from .net import Verb
 from .net.envelope import Envelope, Frame, SignedEnvelope, new_message_id
+from .net.link import Listener
 from .net.postman import Postman
 from .store import Store, ops
 from .store.management import P_GRANT, Management, Role
@@ -134,6 +138,26 @@ class Node:
     authors. The removal pass only revokes membership from THIS set, so manually-added
     peers (bootstrap-outside-the-roster, e.g. a joining node not yet in the roster --
     see `test_sync_e2e`) survive reconciliation."""
+
+    _inbox: queue.SimpleQueue[Frame] = field(default_factory=queue.SimpleQueue, init=False)
+    """The one door for inbound frames. Every attached `Listener` pushes into this queue
+    from its own thread (production path via `start(*listeners)`); the owned Node thread
+    consumes from it via `queue.get(timeout=tick_interval)`. Thread-safety primitive, not
+    delivery policy -- correlation and freshness happen after `queue.get`, in
+    `postman.deliver` on the node thread."""
+
+    _stopping: threading.Event = field(default_factory=threading.Event, init=False)
+    """Signalled by `stop()`. The `_run` loop checks it at the top of every iteration
+    and exits when set. `queue.get(timeout=...)` doesn't wake early on set; worst-case
+    stop-to-exit lag is one `tick_interval`."""
+
+    _thread: threading.Thread | None = field(default=None, init=False)
+    """The owned thread running `_run`. `None` when not started; a live `Thread` between
+    `start()` and `stop()`. Never accessed by callers -- kept only so `stop()` can join."""
+
+    _listeners: tuple[Listener, ...] = field(default=(), init=False)
+    """The listeners attached in `start(*listeners)`, kept so `stop()` can shut each one.
+    Empty tuple when not started."""
 
     def __post_init__(self) -> None:
         self.postman = Postman(
@@ -439,6 +463,81 @@ class Node:
         self.follower.tick(now)
         self._flush_follower(now)
         self.postman.tick(now)
+
+    # -- lifecycle ----------------------------------------------------------------------------- #
+
+    def start(self, *listeners: Listener) -> None:
+        """Begin serving. Each listener starts pushing every complete inbound frame into
+        our shared `_inbox`; the owned node thread drains the inbox and drives `tick()`
+        on cadence. Once returned, this Node is running until `stop()` is called.
+
+        TRANSACTIONAL over `listeners`: if any listener's `start()` raises (e.g.
+        `TCPListener` with a port conflict), every listener already started gets stopped
+        in reverse order and the exception propagates unchanged. A running node with
+        only some of its listeners is not a shape we support -- the caller was told to
+        listen on N addresses; delivering fewer would be silent degradation.
+
+        Idempotent: calling `start(...)` on an already-started node is a no-op (the
+        listeners argument is ignored). To attach listeners incrementally, stop first."""
+        if self._thread is not None:
+            return
+        started: list[Listener] = []
+        try:
+            for listener in listeners:
+                listener.start(self._inbox)
+                started.append(listener)
+        except Exception:
+            for listener in reversed(started):
+                # Best-effort during rollback; the outer raise names the real problem.
+                with contextlib.suppress(Exception):
+                    listener.stop()
+            raise
+        self._listeners = tuple(started)
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"node-{self.me.public.hex()[:8]}",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self, timeout: float = 5.0) -> None:
+        """Signal shutdown; close every listener; join the node thread. Bounded by
+        `timeout` on the join -- the loop notices `_stopping` within one tick_interval
+        (10 ms with defaults), so 5 s is generous. Idempotent."""
+        self._stopping.set()
+        for listener in self._listeners:
+            # Best-effort during shutdown; nothing to escalate to.
+            with contextlib.suppress(Exception):
+                listener.stop()
+        self._listeners = ()
+        thread = self._thread
+        self._thread = None
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=timeout)
+
+    def _run(self) -> None:
+        """Owned-thread body. Two jobs:
+
+          1. Drain `_inbox` (with a timeout matching `tunables.tick_interval`) and call
+             `receive(frame, now_ms())` for each frame.
+          2. When the tick interval has elapsed since the last tick, call `tick(now_ms())`.
+
+        `queue.get(timeout=...)` is the whole rate-limiting mechanism -- the loop wakes
+        immediately when a frame arrives OR after `tick_interval` when quiet. No sleep,
+        no spin. Standard Python producer/consumer shape, mechanical Tokio translation
+        (channel + select! + interval)."""
+        tick_interval_ms = self.tunables.tick_interval
+        last_tick = now_ms()
+        while not self._stopping.is_set():
+            try:
+                frame = self._inbox.get(timeout=tick_interval_ms / 1000)
+                self.receive(frame, now_ms())
+            except queue.Empty:
+                pass
+            now = now_ms()
+            if now - last_tick >= tick_interval_ms:
+                self.tick(now)
+                last_tick = now
 
     def _flush_follower(self, now: Millis) -> None:
         """Post the Follower's outbox to the mailbox. Follower emits `(peer, SyncMsg)` pairs for

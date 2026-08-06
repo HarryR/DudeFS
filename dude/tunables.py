@@ -85,6 +85,14 @@ class TimingTunables:
     """Message waves between a closed bucket and a settled batch: propose, endorse, count. Protocol
     shape rather than a dial — it changes only if the round changes."""
 
+    ticks_per_cadence: int = 10
+    """How many runtime ticks fit inside the smallest scheduling cadence anything above the driver
+    needs. Consumed by `Tunables.tick_interval` -- the Node/LightClient main-loop reads this many
+    ticks per whichever is smallest of `plan.backoff_base`, `sync.poll_interval`, `mempool.delta`.
+    Ten is the RFC 6298 discretisation feel (G at 1 ms, base retry at 100 ms, sample well before the
+    retry fires). A mixnet deployment where every tick wakes an expensive relay dials this DOWN;
+    a low-latency deployment can leave it or turn it up."""
+
     @property
     def dissemination(self) -> Millis:
         """How long a message needs to reach a quorum, worst case."""
@@ -231,6 +239,31 @@ class Tunables:
                 f"plan.backoff_cap ({self.plan.backoff_cap}ms) exceeds the deadline it is spent "
                 f"against, net.ttl ({self.net.ttl}ms), so it can never bind before the deadline"
             )
+        if self.timing.ticks_per_cadence < 1:
+            raise InvariantError(
+                f"timing.ticks_per_cadence ({self.timing.ticks_per_cadence}) must be >= 1; "
+                f"a driver loop that doesn't tick at all cannot advance consensus"
+            )
+
+    @property
+    def tick_interval(self) -> Millis:
+        """Node/LightClient main-loop cadence -- how often `_run()` fires `tick(now)` on quiet
+        cycles. Derived so `timing.ticks_per_cadence` ticks fit inside the smallest scheduling
+        cadence anything above the driver needs, and events don't wait for the next tick.
+
+        Bounded above by all three (retries can't wait longer than a backoff, follower polls
+        can't wait longer than their interval, consensus can't wait longer than a bucket).
+        Bounded below by `link.granularity` -- no scheduling in the system asks finer, and a
+        loop that ticks faster is CPU spent for no wake-up event to match.
+
+        With defaults: `min(100, 1000, 1000) / 10 = 10 ms`. A mixnet deployment (large RTT,
+        expensive relays) lowers `ticks_per_cadence`; a low-latency deployment can leave it."""
+        smallest_cadence = min(
+            self.plan.backoff_base,
+            self.sync.poll_interval,
+            self.mempool.delta,
+        )
+        return max(self.link.granularity, smallest_cadence // self.timing.ticks_per_cadence)
 
 
 DEFAULT = Tunables()

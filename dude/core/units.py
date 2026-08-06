@@ -13,6 +13,19 @@
 
 from __future__ import annotations
 
+import time
+
 type Millis = int
-"""Wall-time in milliseconds. Always a parameter -- nothing in the codebase reads a clock except
-`Postman`, so every function that takes `now: Millis` is deterministic in its arguments."""
+"""Wall-time in milliseconds. Always a parameter through most of the codebase -- every
+function that takes `now: Millis` is deterministic in its arguments, which is what lets
+tests drive time by handing in `T0 + DELTA * N`. The ONE legitimate wall-clock reader is
+the runtime driver loop (`Node._run` / `LightClient._run`), via `now_ms()` below."""
+
+
+def now_ms() -> Millis:
+    """Read the wall clock as `Millis`. Called only by the runtime driver loops -- the
+    one place a real clock enters the system. Production Node/LightClient own a thread
+    that reads this every tick; test callers pass `T0 + DELTA * N` explicitly and never
+    reach for it. Uses `time.time_ns()` (monotonic-enough for tick cadence; not a
+    replacement for `time.monotonic()` where duration matters)."""
+    return time.time_ns() // 1_000_000

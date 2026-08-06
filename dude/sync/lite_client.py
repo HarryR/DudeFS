@@ -17,6 +17,9 @@
 
 from __future__ import annotations
 
+import contextlib
+import queue
+import threading
 from dataclasses import dataclass, field
 from enum import Enum, auto
 
@@ -24,9 +27,10 @@ from .. import quorum
 from ..consensus.settle_round import SettledBlock, _settle_payload
 from ..core import codec, crypto
 from ..core.errors import DudeError
-from ..core.units import Millis
+from ..core.units import Millis, now_ms
 from ..net.address import Endpoint
 from ..net.envelope import Frame
+from ..net.link import Listener
 from ..net.postman import Postman
 from ..store import smt
 from ..store.management import Grant, Role
@@ -177,6 +181,14 @@ class LightClient:
     """mid -> peer, so an incoming AnchorsReply during BOOTSTRAPPING routes to the right
     peer's _BootstrapReply."""
 
+    _inbox: queue.SimpleQueue[Frame] = field(default_factory=queue.SimpleQueue, init=False)
+    """See `Node._inbox` -- same shape. One door for inbound frames from any attached
+    Listener; the owned client thread drains it in `_run`."""
+
+    _stopping: threading.Event = field(default_factory=threading.Event, init=False)
+    _thread: threading.Thread | None = field(default=None, init=False)
+    _listeners: tuple[Listener, ...] = field(default=(), init=False)
+
     def __post_init__(self) -> None:
         self.adapter = LiteAdapter(self.me, self.postman, self.tunables.net.ttl)
 
@@ -277,6 +289,61 @@ class LightClient:
         time-driven state machine right now -- bootstrap and reads are event-driven off
         replies. Retry / bootstrap-timeout policy is OWED (would live here)."""
         self.postman.tick(now)
+
+    # -- lifecycle ---------------------------------------------------------------------------- #
+    # Same shape as `Node.start` / `Node.stop` / `Node._run` -- one comment there covers both.
+
+    def start(self, *listeners: Listener) -> None:
+        """Begin serving. Same transactional shape as `Node.start`: each listener starts
+        pushing into `_inbox`; on any listener raising, previously-started listeners get
+        stopped in reverse order and the exception propagates. Idempotent."""
+        if self._thread is not None:
+            return
+        started: list[Listener] = []
+        try:
+            for listener in listeners:
+                listener.start(self._inbox)
+                started.append(listener)
+        except Exception:
+            for listener in reversed(started):
+                with contextlib.suppress(Exception):
+                    listener.stop()
+            raise
+        self._listeners = tuple(started)
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"lite-{self.me.public.hex()[:8]}",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self, timeout: float = 5.0) -> None:
+        """Signal shutdown; close listeners; join. Idempotent."""
+        self._stopping.set()
+        for listener in self._listeners:
+            with contextlib.suppress(Exception):
+                listener.stop()
+        self._listeners = ()
+        thread = self._thread
+        self._thread = None
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=timeout)
+
+    def _run(self) -> None:
+        """Owned-thread body: drain `_inbox`, drive `tick()` on cadence. Same shape as
+        `Node._run`."""
+        tick_interval_ms = self.tunables.tick_interval
+        last_tick = now_ms()
+        while not self._stopping.is_set():
+            try:
+                frame = self._inbox.get(timeout=tick_interval_ms / 1000)
+                self.receive(frame, now_ms())
+            except queue.Empty:
+                pass
+            now = now_ms()
+            if now - last_tick >= tick_interval_ms:
+                self.tick(now)
+                last_tick = now
 
     # -- internals ---------------------------------------------------------------------------- #
 

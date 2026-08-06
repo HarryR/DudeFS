@@ -37,8 +37,12 @@ from ..tunables import DEFAULT, NetTunables, TimingTunables, Tunables
 
 
 class TestTheDeclaredSetIsSmall(unittest.TestCase):
-    def test_five_declared_quantities_and_nothing_else(self):
-        """If this grows, a derivation is being bypassed by declaring the answer instead."""
+    def test_declared_quantities_and_nothing_else(self):
+        """If this grows, a derivation is being bypassed by declaring the answer instead.
+
+        Only declarable additions are first-principles quantities of the deployment (an RTT
+        bound, a skew tolerance) or protocol counts (hops, waves, ticks per cadence) --
+        things that are NOT arithmetic over other declared values."""
         self.assertEqual(
             sorted(TimingTunables.__dataclass_fields__),
             [
@@ -46,6 +50,7 @@ class TestTheDeclaredSetIsSmall(unittest.TestCase):
                 "clock_skew",
                 "hops_to_quorum",
                 "rtt_max",
+                "ticks_per_cadence",
                 "waves_to_settle",
             ],
         )

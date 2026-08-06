@@ -184,7 +184,13 @@ class Store:
     """The log plus its derived view, over one SQLite connection."""
 
     def __init__(self, path: str = ":memory:"):
-        self.db = sqlite3.connect(path, isolation_level=None)
+        # `check_same_thread=False` -- the Store gets created on one thread (Node's
+        # constructor, called from a runtime bring-up thread) and used on another
+        # (Node's owned `_run` thread after `start()`). Our discipline is that only ONE
+        # thread accesses a given Store at a time (Node.start() spawns the thread, and
+        # Node.stop() joins it before any other caller touches the store); sqlite's
+        # default same-thread check is over-restrictive for that pattern.
+        self.db = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA foreign_keys=ON")
         self.db.executescript(_SCHEMA)
