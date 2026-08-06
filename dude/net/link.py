@@ -21,6 +21,7 @@
 
 from __future__ import annotations
 
+import queue
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
@@ -39,13 +40,43 @@ class LinkError(DudeError):
 
 
 class Transport(Protocol):
-    """A carrier. Deliberately tiny: no retries, no timeouts, no state, no opinions.
+    """A carrier's SEND side. Deliberately tiny: no retries, no timeouts, no state, no opinions.
 
     Everything a transport knows is "did the bytes leave". It must not retry internally, because a
     hidden retry is a transmission this layer cannot count, and an uncounted transmission breaks R2
-    (the sample looks single-attempt when it was not) and R6 (the budget never sees the load)."""
+    (the sample looks single-attempt when it was not) and R6 (the budget never sees the load).
+
+    RECEIVE-SIDE IS `Listener` -- separate protocol, separate object, separate lifecycle. A carrier
+    that both sends and receives (TCP, UNIX, InProc) ships two concrete types: `TCPClient` and
+    `TCPListener`, etc. Postman holds the `Transport` (send side) per scheme; Node holds the
+    `Listener` (receive side). The split is what lets a node be dialler-only (behind a NAT, only
+    outbound) or listener-only in some deployments; it also stops one class from having two roles
+    with two constructors' worth of unrelated configuration."""
 
     def send(self, address: Address, frame: Frame) -> None: ...
+
+
+class Listener(Protocol):
+    """A carrier's RECEIVE side. Owns inbound bytes: a listen socket (for TCP/UNIX), or the
+    receiving half of a paired loopback (for InProc). Same discipline as `Transport` -- tiny
+    contract, no policy.
+
+    THREE METHODS, two shapes of caller:
+
+      * `start(inbox)` + `stop()` -- production. The listener spawns whatever thread it needs
+        to accept + read, and pushes every complete inbound `Frame` into `inbox`. `stop()` is
+        the bounded, idempotent shutdown that closes sockets and joins the thread.
+      * `drain()` -- tests. Returns whatever the listener has already buffered internally,
+        without starting a thread. Same underlying buffer either way; `start()` additionally
+        forwards each new frame into the caller-supplied queue.
+
+    The two paths coexist so tests drive `tick()`/`receive()` deterministically from one thread
+    while production runs the same primitives from a Node-owned thread. Same public API for both;
+    no test-only subclass, no private-state reach."""
+
+    def start(self, inbox: queue.SimpleQueue[Frame]) -> None: ...
+    def stop(self) -> None: ...
+    def drain(self) -> tuple[Frame, ...]: ...
 
 
 # --------------------------------------------------------------------------------------------- #

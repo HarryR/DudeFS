@@ -10,7 +10,6 @@
 # at once), no timeouts, no state, no opinions about what it is carrying.
 
 from .inproc import InProc, address_of, name_of
-from .tcp import TCP
-from .tcp import endpoint_of as tcp_address_of
+from .tcp import TCPClient, TCPListener
 
-__all__ = ["TCP", "InProc", "address_of", "name_of", "tcp_address_of"]
+__all__ = ["InProc", "TCPClient", "TCPListener", "address_of", "name_of"]
