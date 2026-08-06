@@ -137,11 +137,6 @@ UNDRIVEN = {
         "client's wraps rides along with rotating that client. Listed because it still has no "
         "caller anywhere, not because the round owes it."
     ),
-    "provision": (
-        "`Store.provision` refuses re-provisioning into another cluster, and only tests call it: "
-        "the provisioning path — an operator standing a node up — does not exist in this tree. The "
-        "refusal is real and its caller is owed, which is the same shape as `mgmt.retire`."
-    ),
     "store.epochs": (
         "The conveyor's work queue, oldest epoch first, with no reader and no verb, so the layer "
         "that would convey cannot ask what to convey. Owed by a verb plus the worker/client layer "

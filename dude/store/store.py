@@ -1,32 +1,51 @@
 # dude.store.store — the log and the derived view, on SQLite. See SPEC.md (#settlement).
 #
 # TWO COMPONENTS, ONE DATABASE (#one-write-vocabulary). They are separate in interface — the
-# log is a
-# sequence, the store is derived state — and share one SQLite file because a settlement must
-# append entries, update chain pointers, update the live view and update the accumulator
-# ATOMICALLY. That single transaction is what makes "only the log is authoritative"
-# survivable across a crash mid-settlement; hand-rolling it would mean re-earning transactionality
-# SQLite already has.
+# log is a sequence, the store is derived state — and share one SQLite file because a
+# settlement must append entries, update chain pointers, update the live view and update the
+# accumulator ATOMICALLY. That single transaction is what makes "only the log is authoritative"
+# survivable across a crash mid-settlement; hand-rolling it would mean re-earning
+# transactionality SQLite already has.
+#
+# READER / WRITER SPLIT. Store owns TWO sqlite connections to one DB:
+#   * `_writer_conn` -- protected by `_writer_lock`. All mutations go here, inside a
+#     `BEGIN IMMEDIATE ... COMMIT` block. `store.write() as w:` scope hands the writer to
+#     the caller.
+#   * fresh reader connection per `store.snapshot() as r:` scope -- opened, BEGIN pins a
+#     snapshot for the scope's lifetime, closed on exit. Different threads calling
+#     `snapshot()` simultaneously each get their own independent snapshot via SQLite's
+#     WAL isolation.
+# Convenience one-shot methods on Store (`store.get(...)`, `store.head_block_num()`,
+# `store.commit_block(...)`, `store.apply(...)`, `store.provision(...)`) open a scope
+# internally so every existing caller keeps working.
+#
+# StoreReader implements the `Reader` and `View` protocols in dude.store.layer. StoreWriter
+# inherits StoreReader and adds mutation methods -- because a Writer's reads MUST use the
+# writer connection so `_apply_within`'s mid-batch reads (direct or via Layer) see the
+# transaction's own state.
 #
 # THE INVARIANT EVERYTHING RESTS ON, and the one worth testing hardest:
 #
 #     applying entries incrementally == replaying the log from scratch
 #
-# The live view and the accumulator are caches of a fold (#one-write-vocabulary — state is tacit).
-# If they can
-# disagree with the log there are two truths, and `rebuild()` exists so that claim is checkable
-# rather than asserted.
+# The live view and the accumulator are caches of a fold (#one-write-vocabulary — state is
+# tacit). If they can disagree with the log there are two truths, and `rebuild()` exists so
+# that claim is checkable rather than asserted.
 #
-# WHY `live` HOLDS THE VALUE rather than pointing at its entry: compaction deletes entries while
-# preserving state (#collect-whole-segment), so the current value has to survive its log entry being
-# collected.
-# It is also why the accumulated element is over `(name, value)` and computable from `live` alone.
+# WHY `live` HOLDS THE VALUE rather than pointing at its entry: compaction deletes entries
+# while preserving state (#collect-whole-segment), so the current value has to survive its
+# log entry being collected. It is also why the accumulated element is over `(name, value)`
+# and computable from `live` alone.
 
 from __future__ import annotations
 
+import contextlib
+import os
 import sqlite3
+import tempfile
 import threading
 from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import NamedTuple
 
@@ -181,145 +200,52 @@ def _unverified(e: Entry) -> str | None:
     return None
 
 
-class _SerializedConnection(sqlite3.Connection):
-    """A `sqlite3.Connection` that serializes `execute` / `executemany` / `executescript`
-    with an RLock. Python's sqlite3 requires either same-thread-only or external
-    serialization for shared connections; `check_same_thread=False` alone is not enough
-    (two threads calling `execute` concurrently produces `sqlite3.InterfaceError: bad
-    parameter or other API misuse`).
-
-    Our access pattern is `db.execute(...).fetchone()` or `.fetchall()` on one line
-    per call site -- cursors are transient. Locking `execute` covers every path a caller
-    goes through; cursor operations are safe because each cursor is used entirely inside
-    the lifetime of the acquiring caller's expression."""
-
-    _lock: threading.RLock
-
-    def _serialized_lock(self) -> threading.RLock:
-        # Lazy-init because `__init__` on sqlite3.Connection is opaque and we can't
-        # override it cleanly; first call allocates.
-        lock = getattr(self, "_lock", None)
-        if lock is None:
-            lock = threading.RLock()
-            self._lock = lock
-        return lock
-
-    def execute(self, *args, **kwargs):
-        with self._serialized_lock():
-            return super().execute(*args, **kwargs)
-
-    def executemany(self, *args, **kwargs):
-        with self._serialized_lock():
-            return super().executemany(*args, **kwargs)
-
-    def executescript(self, *args, **kwargs):
-        with self._serialized_lock():
-            return super().executescript(*args, **kwargs)
+# ============================================================================= #
+# StoreReader -- read-only view backed by ONE connection inside a BEGIN.        #
+# ============================================================================= #
 
 
-class Store:
-    """The log plus its derived view, over one SQLite connection."""
+class StoreReader:
+    """Read-only view of the store, backed by ONE sqlite connection. When constructed
+    inside a `store.snapshot()` scope, the connection has a `BEGIN` open, pinning a
+    snapshot for the scope's lifetime (SQLite WAL isolation). Implements the `Reader`
+    AND `View` protocols in `dude.store.layer`, so anything that takes a `Reader` (e.g.
+    `settle.evaluate`) works with a StoreReader.
 
-    def __init__(self, path: str = ":memory:"):
-        # `check_same_thread=False` + a serialized-connection subclass. Store is
-        # constructed on one thread (Node's constructor, called from a runtime bring-up
-        # thread) and then used on Node's owned `_run` thread after `start()`. An
-        # inspection thread (a test's `_wait_until` predicate, a CLI, an admin
-        # endpoint) may also read concurrently -- the lock inside `_SerializedConnection`
-        # keeps sqlite from raising InterfaceError under that traffic.
-        self.db = sqlite3.connect(
-            path,
-            isolation_level=None,
-            check_same_thread=False,
-            factory=_SerializedConnection,
-        )
-        self.db.execute("PRAGMA journal_mode=WAL")
-        self.db.execute("PRAGMA foreign_keys=ON")
-        self.db.executescript(_SCHEMA)
-        self.tree = smt.Tree(self.db)
+    `_memoize = False`: this class's SMT operations don't write to `smt_memo` -- the
+    writer maintains it. Reader recomputes on memo miss (correct, and usually a memo
+    hit in practice because the writer keeps the tree warm)."""
 
-    def close(self) -> None:
-        self.db.close()
+    _memoize: bool = False
 
-    # -- meta ---------------------------------------------------------------- #
+    def __init__(self, conn: sqlite3.Connection):
+        self._conn = conn
+        self._tree = smt.Tree(conn, memoize=self._memoize)
 
-    def _get_meta(self, k: str, default: bytes) -> bytes:
-        row = self.db.execute("SELECT v FROM meta WHERE k=?", (k,)).fetchone()
-        return row[0] if row else default
-
-    def _set_meta(self, k: str, v: bytes) -> None:
-        self.db.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", (k, v))
-
-    def accumulator(self) -> crypto.Accumulator:
-        """`A_state`: the ECMH fingerprint of the whole live state (#accumulators). O(1) to
-        read, O(Δ)
-        to maintain, and the thing a compaction must leave unchanged (#accumulators)."""
-        return crypto.Accumulator(self._get_meta("acc", crypto.ACC_IDENTITY))
-
-    def log_accumulator(self) -> crypto.Accumulator:
-        """`A_log`: the ECMH fingerprint of the log itself (#replay-does-not-readjudicate).
-        Equal `A_state` with unequal
-        `A_log` means *same state, different history* — legitimate across compaction generations.
-        Unequal at the same head means a fork or corruption, not lag."""
-        return crypto.Accumulator(self._get_meta("acc_log", crypto.ACC_IDENTITY))
-
-    def _log_add(self, idx: Index, op_hash: crypto.Digest) -> None:
-        self._set_meta("acc_log", crypto.acc_add(self.log_accumulator(), log_element(idx, op_hash)))
-
-    # -- LOG ----------------------------------------------------------------- #
-
-    def head(self) -> Index:
-        """The highest settled index. Zero on an empty log."""
-        row = self.db.execute("SELECT MAX(idx) FROM entry").fetchone()
-        return row[0] or 0
-
-    def entries(self, frm: Index = 1, to: Index | None = None) -> Iterator[Entry]:
-        """Replay range, inclusive. The only way anyone derives state
-        (#replay-does-not-readjudicate)."""
-        hi = self.head() if to is None else to
-        rows = self.db.execute(
-            "SELECT idx, raw FROM entry WHERE idx BETWEEN ? AND ? ORDER BY idx", (frm, hi)
-        ).fetchall()
-        for idx, raw in rows:
-            yield Entry(idx, ops.SignedTransaction.decode(raw))
-
-    # -- STORE --------------------------------------------------------------- #
+    # -- Reader protocol (get, prefix) ---------------------------------------- #
 
     def get(self, store: int, name: bytes) -> Held | None:
         """`(provenance, value)`, or None if absent. `provenance` is the CURRENT head only — the
         chain behind it is a traversal (`history`), and compaction may have collapsed it
         (#provenance)."""
-        row = self.db.execute(
+        row = self._conn.execute(
             "SELECT head, value, epoch, cred FROM live WHERE store=? AND name=?", (store, name)
         ).fetchone()
         return Held(row[0], row[1], row[2], row[3]) if row else None
 
     def prefix(self, store: int, pre: bytes) -> Iterator[Row]:
         """Every live `(name, provenance, value)` in `store` whose name starts with `pre`, in name
-        order. A range scan on the `(store, name)` primary key, not a table walk.
-
-        Enumeration is what the management store needs and a data store cannot offer: control keys
-        are cleartext paths (#management-is-cleartext), so `b"node/"` is a meaningful
-        prefix, whereas data keys are
-        opaque derived tokens whose structure lives only in the client that derived them."""
+        order. A range scan on the `(store, name)` primary key, not a table walk."""
         hi = _prefix_upper(pre)
-        # `Row(*r)` at the boundary, not a bare yield of the driver's tuples: the SELECT's column
-        # order is the only thing that made `(name, head, value)` mean anything, and naming it here
-        # is what stops a reordered SELECT silently transposing provenance and value.
-        #
-        # MATERIALIZED via `fetchall()` inside `execute`'s critical section rather than
-        # streamed. Streaming would keep a cursor alive across the yield boundary, and
-        # under multi-thread traffic another `execute` on the same connection can invalidate
-        # a mid-iteration cursor -- observed as `TypeError: 'NoneType' object is not
-        # subscriptable` when the cursor returned garbage rows. `fetchall()` while the
-        # connection lock is held (via `_SerializedConnection.execute`) is thread-safe.
-        if hi is None:  # the prefix is all 0xFF; nothing sorts above it
-            rows = self.db.execute(
+        # MATERIALIZED via `fetchall()` inside the same call as `execute` -- streaming a cursor
+        # across the yield boundary would race any concurrent execute on this connection.
+        if hi is None:
+            rows = self._conn.execute(
                 "SELECT name, head, value, epoch FROM live WHERE store=? AND name>=? ORDER BY name",
                 (store, pre),
             ).fetchall()
         else:
-            rows = self.db.execute(
+            rows = self._conn.execute(
                 "SELECT name, head, value, epoch FROM live"
                 " WHERE store=? AND name>=? AND name<? ORDER BY name",
                 (store, pre, hi),
@@ -327,35 +253,255 @@ class Store:
         for name, head, value, epoch in rows:
             yield Row(name, head, value, epoch)
 
+    # -- View protocol (accumulator, state_root, hash_under, is_frozen) ------- #
+
+    def accumulator(self) -> crypto.Accumulator:
+        """`A_state`: the ECMH fingerprint of the whole live state (#accumulators). O(1) to read."""
+        return crypto.Accumulator(self._get_meta("acc", crypto.ACC_IDENTITY))
+
+    def log_accumulator(self) -> crypto.Accumulator:
+        """`A_log`: the ECMH fingerprint of the log itself (#replay-does-not-readjudicate)."""
+        return crypto.Accumulator(self._get_meta("acc_log", crypto.ACC_IDENTITY))
+
+    def state_root(self) -> crypto.Digest:
+        """One commitment to all live state, against which a single key can be PROVED."""
+        return self._tree.root()
+
+    def hash_under(self, prefix: bytes, depth: int) -> crypto.Digest:
+        """SMT subtree hash under `prefix` at `depth`."""
+        return self._tree.hash_under(prefix, depth)
+
+    def prove(self, store: int, name: bytes) -> smt.Proof:
+        """Presence or absence, by the same walk. Absence is what makes revocation checkable
+        (#absence-is-revocation)."""
+        return self._tree.prove(store, name)
+
+    @property
+    def is_frozen(self) -> bool:
+        """A Reader's snapshot never moves for its lifetime (WAL isolation)."""
+        return True
+
     def holds(self, pred: ops.Predicate) -> bool:
-        """Evaluate one predicate against committed state. See the free `holds`, which is the one
-        implementation and works against any `Reader`."""
+        """Evaluate one predicate against committed state."""
         return holds(self, pred)
 
-    # -- SETTLEMENT ---------------------------------------------------------- #
+    # -- log / meta reads ----------------------------------------------------- #
+
+    def head(self) -> Index:
+        """The highest settled index. Zero on an empty log."""
+        row = self._conn.execute("SELECT MAX(idx) FROM entry").fetchone()
+        return row[0] or 0
+
+    def entries(self, frm: Index = 1, to: Index | None = None) -> Iterator[Entry]:
+        """Replay range, inclusive. The only way anyone derives state
+        (#replay-does-not-readjudicate)."""
+        hi = self.head() if to is None else to
+        rows = self._conn.execute(
+            "SELECT idx, raw FROM entry WHERE idx BETWEEN ? AND ? ORDER BY idx", (frm, hi)
+        ).fetchall()
+        for idx, raw in rows:
+            yield Entry(idx, ops.SignedTransaction.decode(raw))
+
+    def settled_at(self, block_num: Index) -> bytes | None:
+        """The encoded SETTLED block bytes at `block_num`, or None if not held."""
+        row = self._conn.execute(
+            "SELECT bytes FROM block WHERE block_num=?", (block_num,)
+        ).fetchone()
+        return bytes(row[0]) if row else None
+
+    def bodies_of_block(self, block_num: Index) -> tuple[ops.SignedTransaction, ...]:
+        """The tx bodies this block committed, in log-idx order. Empty for empty blocks and
+        for unknown blocks."""
+        row = self._conn.execute(
+            "SELECT first_height, height FROM block WHERE block_num=?", (block_num,)
+        ).fetchone()
+        if row is None:
+            return ()
+        first_height, height = row
+        if first_height > height:
+            return ()
+        return tuple(e.item for e in self.entries(first_height, height))
+
+    def head_block_hash(self) -> crypto.Digest | None:
+        """`H(SettledBlock.encode())` at the current head, or None if no block is settled yet."""
+        row = self._conn.execute(
+            "SELECT hash FROM block ORDER BY block_num DESC LIMIT 1"
+        ).fetchone()
+        return crypto.Digest(bytes(row[0])) if row else None
+
+    def head_block_num(self) -> Index | None:
+        """The monotone block counter at the current head, or None if no block is settled yet."""
+        row = self._conn.execute("SELECT MAX(block_num) FROM block").fetchone()
+        return row[0] if row and row[0] is not None else None
+
+    def credential(self, store: int, name: bytes) -> bytes:
+        """The signed transaction that authorised this row's value, or empty if none is kept."""
+        row = self._conn.execute(
+            "SELECT cred FROM live WHERE store=? AND name=?", (store, name)
+        ).fetchone()
+        return row[0] if row else b""
+
+    # -- provisioning reads --------------------------------------------------- #
+
+    def anchor(self) -> crypto.PublicKey | None:
+        """The manager public key this node was provisioned with, or None if it was not."""
+        raw = self._get_meta("anchor", b"")
+        return crypto.PublicKey(raw) if raw else None
+
+    def seeds(self) -> tuple[bytes, ...]:
+        """The addresses this node was provisioned with, to reach the cluster at all."""
+        raw = self._get_meta("seeds", b"")
+        return tuple(codec.as_bytes(a) for a in codec.as_seq(codec.decode(raw))) if raw else ()
+
+    def roster_serial(self) -> int:
+        """The highest roster revision this node has accepted."""
+        return int.from_bytes(self._get_meta("roster_serial", b""))
+
+    # -- composed reads: the acceptance-of-a-replayed-log checks -------------- #
+
+    def wrong_cluster(self) -> str | None:
+        """`None` if the log we hold is the one our anchor authorises, else why not."""
+        held = self.anchor()
+        if held is None:
+            return "no anchor: this node was never provisioned with a manager key"
+        grant = self._mgmt().grant_of(held)
+        if grant is None:
+            return "the log holds no grant for the manager we were provisioned with"
+        if grant.role is not Role.MANAGER:
+            return f"our anchor holds {grant.role.value} in this log, not manager"
+        return None
+
+    def unvouched_roster(self) -> str | None:
+        """`None` if every roster row traces to our anchor, else the first one that does not."""
+        held = self.anchor()
+        if held is None:
+            return "no anchor: this node was never provisioned with a manager key"
+        for who in self._mgmt().roster():
+            name = P_NODE + who
+            author = settle.vouched(self, ops.STORE_MANAGEMENT, name, self.credential(0, name))
+            if author is None:
+                return (
+                    f"roster row for {who.hex()[:8]} carries no credential vouching for its value"
+                )
+            if author != held:
+                return f"roster row for {who.hex()[:8]} is vouched by {author.hex()[:8]}, not by us"
+        return None
+
+    def roster_incomplete(self) -> str | None:
+        """`None` if the roster we hold is the whole roster the manager signed, else why not."""
+        held = self.anchor()
+        if held is None:
+            return "no anchor: this node was never provisioned with a manager key"
+        mgmt = self._mgmt()
+        commitment = mgmt.roster_commitment()
+        if commitment is None:
+            return "the log states no roster commitment, so a subset could not be detected"
+        author = settle.vouched(self, ops.STORE_MANAGEMENT, P_ROSTER, self.credential(0, P_ROSTER))
+        if author != held:
+            return f"the roster commitment is vouched by {author.hex()[:8] if author else 'nobody'}"
+        serial, members = commitment
+        if members != mgmt.roster():
+            return (
+                f"the roster commitment names {len(members)} members, the log holds a different set"
+            )
+        if serial < self.roster_serial():
+            return f"roster serial {serial} is older than the {self.roster_serial()} already seen"
+        return None
+
+    # -- internals ------------------------------------------------------------ #
+
+    def _get_meta(self, k: str, default: bytes) -> bytes:
+        row = self._conn.execute("SELECT v FROM meta WHERE k=?", (k,)).fetchone()
+        return row[0] if row else default
+
+    def _rows_in_path_range(
+        self, lo: bytes, hi: bytes
+    ) -> Iterator[tuple[int, bytes, bytes, bytes]]:
+        """Every live `(store, name, value, credential)` whose SMT path falls inside `[lo, hi]`.
+        Used by `Layer` when computing projected root hashes."""
+        rows = self._conn.execute(
+            "SELECT store, name, value, cred FROM live WHERE path BETWEEN ? AND ? ORDER BY path",
+            (lo, hi),
+        ).fetchall()
+        for st, name, value, cred in rows:
+            yield int(st), name, value, cred
+
+    def _settled_hashes(self, want: tuple[crypto.Digest, ...]) -> set[bytes]:
+        """Which of these op hashes the log already holds. One query, not one per transaction."""
+        if not want:
+            return set()
+        marks = ",".join("?" * len(want))
+        rows = self._conn.execute(
+            f"SELECT op_hash FROM entry WHERE op_hash IN ({marks})",  # noqa: S608
+            want,
+        ).fetchall()
+        return {r[0] for r in rows}
+
+    def _mgmt(self) -> Management:
+        """A Management view over this Reader. Used by composed acceptance-checks; internal
+        so callers don't couple to it. Note: `Management` still type-annotates its
+        parameter as `Store`, but at runtime it uses only methods on StoreReader
+        (get, prefix, anchor, credential). Wave 3 will split Management into
+        MgmtReader/MgmtWriter and this cast disappears."""
+        from typing import cast  # noqa: PLC0415 -- local; only used by this shim
+
+        return Management(cast("Store", self))
+
+
+# ============================================================================= #
+# StoreWriter -- mutating view on the writer connection, inside BEGIN IMMEDIATE #
+# ============================================================================= #
+
+
+class StoreWriter(StoreReader):
+    """Mutating view backed by the writer connection, inside a `BEGIN IMMEDIATE`
+    transaction held under Store's writer lock. Inherits every read from StoreReader
+    -- but the reads run on the WRITER connection, so `_apply_within`'s mid-batch
+    reads (direct or via Layer) see the transaction's own state, not the last
+    committed snapshot.
+
+    `_memoize = True`: the writer maintains `smt_memo` via `tree.invalidate` and
+    subsequent `tree.hash_under` calls that repopulate memo on the changed ancestors."""
+
+    _memoize: bool = True
+
+    # -- write-side helpers --------------------------------------------------- #
+
+    def _set_meta(self, k: str, v: bytes) -> None:
+        self._conn.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", (k, v))
+
+    def _log_add(self, idx: Index, op_hash: crypto.Digest) -> None:
+        self._set_meta("acc_log", crypto.acc_add(self.log_accumulator(), log_element(idx, op_hash)))
+
+    def _remember_roster_serial(self) -> None:
+        """Advance the roster high-water mark, having accepted the run that carried it."""
+        commitment = self._mgmt().roster_commitment()
+        if commitment is not None and commitment[0] > self.roster_serial():
+            self._set_meta("roster_serial", commitment[0].to_bytes(8))
+
+    # -- provisioning --------------------------------------------------------- #
+
+    def provision(self, manager: crypto.PublicKey, seeds: Iterable[bytes] = ()) -> None:
+        """Record the anchor. Idempotent for the same key, and REFUSED for a different one."""
+        held = self.anchor()
+        if held is not None and held != manager:
+            raise InvariantError(
+                "this node is provisioned to a different manager; re-provisioning would move it "
+                "between clusters while keeping its identity and its attested height"
+            )
+        self._set_meta("anchor", manager)
+        if seeds:
+            self._set_meta("seeds", codec.encode(sorted(seeds)))
+
+    # -- SETTLEMENT ----------------------------------------------------------- #
 
     def apply(self, batch: tuple[ops.SignedTransaction, ...], auth: settle.Authoriser) -> Applied:
-        """Settle an **already-ordered** batch: evaluate each transaction, commit the survivors
-        (#settlement).
+        """Settle an already-ordered batch inside the current writer transaction.
 
-        Policy lives in `dude.store.settle` and persistence lives here. This method decides nothing
-        about guards or authority — it drives the evaluator, commits what survives, and owns the one
-        SQL transaction that makes a crash mid-settlement leave the store at the previous batch
-        boundary rather than half-applied.
-
-        Ordering is NOT decided here either: that is the discriminator's job one layer up (2.13).
-
-        `commit_block` is the same shape plus a block-bytes persist in the same transaction --
-        that is the entry point production settlement uses, so a crash cannot leave txs
-        committed with no matching block record."""
-        self.db.execute("BEGIN IMMEDIATE")
-        try:
-            applied = self._apply_within(batch, auth)
-            self.db.execute("COMMIT")
-        except Exception:
-            self.db.execute("ROLLBACK")
-            raise
-        return applied
+        `commit_block` is the same shape plus a block-bytes persist -- that is the entry
+        point production settlement uses, so a crash cannot leave txs committed with no
+        matching block record."""
+        return self._apply_within(batch, auth)
 
     def commit_block(  # noqa: PLR0913
         self,
@@ -369,60 +515,40 @@ class Store:
     ) -> Applied:
         """Apply the batch and persist the SETTLED block bytes atomically (#atomic-write).
 
-        `block_num` is the monotone per-block counter (from `Anchors.block_num`); it uniquely
-        indexes this block in the chain. `first_height` is the log-idx the FIRST tx would land
-        at (whether or not there is one) -- for a joiner replaying, this pins the entry-table
-        range this block covers, so `bodies_of_block(n)` can return exactly the applied bodies
-        without needing to walk the prior chain. `block_bytes` is opaque here -- store persists
-        them; the consensus layer knows their shape (SettledBlock.encode). `block_hash` is the
-        sig-independent chain identity (SettledBlock.block_hash), stored alongside so a
-        successor's chain-link check needs one lookup, not a hash.
+        `block_num` is the monotone per-block counter (from `Anchors.block_num`); it
+        uniquely indexes this block in the chain. `first_height` is the log-idx the FIRST
+        tx would land at (whether or not there is one). `block_bytes` is opaque here.
+        `block_hash` is the sig-independent chain identity (SettledBlock.block_hash).
 
-        ONE SQL TRANSACTION. A crash between "txs applied" and "block persisted" would leave the
-        store in a state where entries exist but no block record names them -- opaque to sync,
-        because a joiner asks `GETBLOCK n` and gets nothing while the head has advanced. Folding
-        them in one commit means such a state is impossible by construction.
+        Runs inside the writer transaction already opened by `Store.write()` -- the
+        caller's `with` scope commits or rolls back around this call.
 
-        IDEMPOTENT ON REDUNDANT-COMMIT. Coordinator and Follower can both reach "commit block N"
-        when their timings race: Coordinator settles block N locally, Follower's in-flight
-        GETBLOCK for block N returns from a peer that ALSO just settled it. Both have the same
-        block bytes and same hash (both saw the same consensus outcome), so committing twice is
-        the safe no-op case. A DIFFERENT hash at the same block_num is a fork and raises --
-        that's a real fault, not a race, and calls up the chain."""
-        existing = self.db.execute(
+        IDEMPOTENT ON REDUNDANT-COMMIT. Coordinator and Follower can both reach
+        "commit block N" when their timings race. Both have the same block bytes and
+        same hash (both saw the same consensus outcome), so committing twice is the
+        safe no-op case. A DIFFERENT hash at the same block_num is a fork and raises."""
+        existing = self._conn.execute(
             "SELECT hash FROM block WHERE block_num=?", (block_num,)
         ).fetchone()
         if existing is not None:
             if existing[0] == block_hash:
-                # Idempotent: same block already committed by the peer path. Return an
-                # empty Applied -- everything the caller would have persisted is already there.
                 return Applied(settled=(), dropped=())
             raise InvariantError(
                 f"fork at block_num={block_num}: existing hash "
                 f"{crypto.Digest(existing[0]).hex()[:8]} != new {block_hash.hex()[:8]}"
             )
-        self.db.execute("BEGIN IMMEDIATE")
-        try:
-            applied = self._apply_within(batch, auth)
-            # `height` is the log-idx of the last tx (or prior head for an empty block, per
-            # #empty-bucket-still-settles). `block_num` is monotone regardless.
-            height = self.head()
-            self.db.execute(
-                "INSERT INTO block (block_num, first_height, height, bytes, hash)"
-                " VALUES (?, ?, ?, ?, ?)",
-                (block_num, first_height, height, block_bytes, block_hash),
-            )
-            self.db.execute("COMMIT")
-        except Exception:
-            self.db.execute("ROLLBACK")
-            raise
+        applied = self._apply_within(batch, auth)
+        height = self.head()
+        self._conn.execute(
+            "INSERT INTO block (block_num, first_height, height, bytes, hash) VALUES (?,?,?,?,?)",
+            (block_num, first_height, height, block_bytes, block_hash),
+        )
         return applied
 
     def _apply_within(
         self, batch: tuple[ops.SignedTransaction, ...], auth: settle.Authoriser
     ) -> Applied:
-        """The transactional body shared by `apply` and `commit_block`. The caller MUST have
-        opened `BEGIN IMMEDIATE` and MUST issue `COMMIT`/`ROLLBACK` around this call."""
+        """Settle the batch inside the current writer transaction (caller owns BEGIN/COMMIT)."""
         settled: list[tuple[Index, crypto.Digest]] = []
         dropped: list[Dropped] = []
         already = self._settled_hashes(tuple(tx.op_hash for tx in batch))
@@ -430,16 +556,9 @@ class Store:
         idx = self.head()
         for tx in batch:
             if tx.op_hash in already:
-                # Already in the log — it arrived by TRANSFER while this bucket was settling.
-                # A duplicate is a routine outcome and is reported rather than raised: the
-                # alternative was `entry.op_hash UNIQUE` throwing out of a frame handler, i.e.
-                # a race reported as corruption (#no-exceptions-for-control-flow).
                 dropped.append(Dropped(tx.op_hash, settle.Reason.SETTLED))
                 continue
             verdict, layer = settle.evaluate(self, tx, auth)
-            # Walrus on `why` rather than `if not verdict`, because a verdict is exactly "no
-            # reason or a reason" — testing the reason IS testing success, and it narrows the
-            # type so the reason needs no `or "rejected"` fallback for a case that cannot occur.
             if (why := verdict.why) is not None:
                 dropped.append(Dropped(tx.op_hash, why))
                 continue
@@ -449,111 +568,25 @@ class Store:
         self._set_meta("acc", acc)
         return Applied(tuple(settled), tuple(dropped))
 
-    def settled_at(self, block_num: Index) -> bytes | None:
-        """The encoded SETTLED block bytes at `block_num`, or None if not held. Used by peers
-        serving `GETBLOCK n` to joiners (#sync-is-log-replay)."""
-        row = self.db.execute("SELECT bytes FROM block WHERE block_num=?", (block_num,)).fetchone()
-        return bytes(row[0]) if row else None
-
-    def bodies_of_block(self, block_num: Index) -> tuple[ops.SignedTransaction, ...]:
-        """The tx bodies this block committed, in log-idx order. Empty for empty blocks and
-        for unknown blocks. Peers building a `SettledBlockWithBodies` reply to `GETBLOCK n`
-        call `settled_at(n)` first to distinguish "unknown" from "empty"; if the block exists,
-        this returns exactly the bodies that applied when the block committed."""
-        row = self.db.execute(
-            "SELECT first_height, height FROM block WHERE block_num=?", (block_num,)
-        ).fetchone()
-        if row is None:
-            return ()
-        first_height, height = row
-        if first_height > height:
-            return ()  # empty block: range is [N+1, N], nothing to fetch
-        return tuple(e.item for e in self.entries(first_height, height))
-
-    def head_block_hash(self) -> crypto.Digest | None:
-        """`H(SettledBlock.encode())` at the current head, or None if no block is settled yet.
-        Successor's `Anchors.prev_block` names this (#genesis-stamp-anchors-the-chain -- when
-        None, the genesis stamp takes its place)."""
-        row = self.db.execute("SELECT hash FROM block ORDER BY block_num DESC LIMIT 1").fetchone()
-        return crypto.Digest(bytes(row[0])) if row else None
-
-    def head_block_num(self) -> Index | None:
-        """The monotone block counter at the current head, or None if no block is settled yet.
-        Successor's `Anchors.block_num` is this + 1."""
-        row = self.db.execute("SELECT MAX(block_num) FROM block").fetchone()
-        return row[0] if row and row[0] is not None else None
-
     def replay(self, items: Iterable[Entry], expect: Commitment | None = None) -> str | None:
-        """Apply already-settled entries **at their recorded indices**, without re-adjudicating.
-
-        This is #replay-does-not-readjudicate, and it differs from `apply` in two ways that
-        both matter:
-
-        * **Positions are preserved, never re-assigned.** A settled index is part of the log's
-          identity — chain pointers and compaction drop sets reference entries BY index — so
-          renumbering on replay silently invalidates every one of them.
-        * **Predicates are not evaluated.** In a compacted log the state a predicate referenced has
-          been collected, so re-evaluation would fail every retained entry and produce nothing
-          (#replay-does-not-readjudicate). Predicate evaluation belongs to settlement and
-          happened once; a replayer's
-          check is the accumulator against a quorum attestation (#collection-is-ratified),
-          not a re-decision.
-
-        Signatures ARE verified: self-contained, always possible, and there is never an excuse.
-
-        **A collection in the run is RATIFIED OR REFUSED.** This used to apply any `Compaction` a
-        peer put in a run, with no signature check anywhere — so bulk transfer was a data-loss
-        primitive: hand a catching-up node an unsigned marker and it forgot the segment, permanently
-        and on one peer's word. `Store.collect` was the only place that ever verified a marker
-        (#collection-is-ratified). The marker is also passed THROUGH to `_collect` now, so the
-        quorum's signatures survive into this node's own checkpoint instead of being replaced by a
-        locally fabricated one nobody signed.
-
-        `expect` is the sender's own signed commitment, and it is the WEAKER of the two anchors: it
-        says only that the sender is internally consistent, which a liar can arrange. The stronger
-        one is this node's ratified checkpoint, and both are checked wherever the run reaches their
-        height — every commitment must agree or the whole batch is ROLLED BACK, before it is
-        committed rather than detected afterwards.
-
-        RETURNS THE REFUSAL, and raises nothing for it `[H]`. A run that does not reconcile is
-        THEIR fault and a routine outcome — a bounded `PULL` races the sender's own progress, a
-        sighting goes stale, a peer lies — so it comes back as a reason a log line can carry, in
-        the house idiom of `Compaction.attested` (#no-exceptions-for-control-flow). It used to be a
-        `StoreError` out of a frame handler, i.e. one peer's ordinary message taking a node's
-        process down. `None` means the run was applied; anything else means nothing was."""
-        self.db.execute("BEGIN IMMEDIATE")
-        try:
-            acc = self.accumulator()
-            for e in items:
-                if (why := _unverified(e)) is not None:
-                    self.db.execute("ROLLBACK")
-                    return why
-                acc = self._commit(e.idx, e.item, e.item.txn.mutations, acc)
-            self._set_meta("acc", acc)
-            if (why := self._unacceptable(expect)) is not None:
-                self.db.execute("ROLLBACK")
-                return why
-            self._remember_roster_serial()
-            self.db.execute("COMMIT")
-        except Exception:
-            # Still here, and still re-raising: a bug of OURS mid-replay must not be reported as a
-            # refusal of THEIRS. `InvariantError` travels this path (see core/errors.py).
-            self.db.execute("ROLLBACK")
-            raise
+        """Apply already-settled entries at their recorded indices, without re-adjudicating.
+        See the pre-split docstring for the full rationale (#replay-does-not-readjudicate)."""
+        acc = self.accumulator()
+        for e in items:
+            if (why := _unverified(e)) is not None:
+                # Caller's `with store.write()` scope will re-raise our exception if we raise --
+                # but a bad replay signature is THEIR fault (routine outcome), so we return the
+                # reason and expect the caller to rollback by raising or by explicit contract.
+                raise _ReplayRefusedError(why)
+            acc = self._commit(e.idx, e.item, e.item.txn.mutations, acc)
+        self._set_meta("acc", acc)
+        if (why := self._unacceptable(expect)) is not None:
+            raise _ReplayRefusedError(why)
+        self._remember_roster_serial()
         return None
 
     def _unacceptable(self, expect: Commitment | None) -> str | None:
-        """Everything judged AFTER a run is applied and BEFORE it is committed. `None` to commit.
-
-        AFTERWARDS IS THE POINT, not laziness: a from-scratch replay begins with genesis, so neither
-        the manager grant nor the roster exists until the run lands. Checking first would refuse the
-        only run that could ever establish them. Checking after refuses a STRANGER'S log, which is
-        the case that matters — a log introducing its own manager and its own roster checks out
-        against itself, and only the anchor can say no.
-
-        Two kinds of question, in order. Does this agree with the sender's own signed claim (if
-        the run reached its height), and is this the log our anchor authorises (its manager grant,
-        then every roster row's credential)."""
+        """Everything judged AFTER a run is applied and BEFORE it is committed."""
         if (
             expect is not None
             and self.head() == expect.head
@@ -561,29 +594,14 @@ class Store:
         ):
             return why
         if self.anchor() is None:
-            return None  # unprovisioned: it cannot answer
+            return None
         for why in (self.wrong_cluster(), self.unvouched_roster(), self.roster_incomplete()):
             if why is not None:
                 return f"refusing a log this node's anchor does not authorise: {why}"
         return None
 
-    def _remember_roster_serial(self) -> None:
-        """Advance the roster high-water mark, having accepted the run that carried it.
-
-        Separate from the check that reads it: a verifier that also recorded would decide and commit
-        in one act, and could not be run twice safely."""
-
-        commitment = self.mgmt.roster_commitment()
-        if commitment is not None and commitment[0] > self.roster_serial():
-            self._set_meta("roster_serial", commitment[0].to_bytes(8))
-
     def _disagrees(self, expect: Commitment) -> str | None:
-        """`None` if every commitment agrees, else which one did not — in words a log line can
-        carry, the same shape as `Compaction.attested`.
-
-        Every commitment, not just one. `A_state` alone would pass a log that differs by any
-        number of superseded entries — exactly the divergence this system has already been bitten
-        by once."""
+        """`None` if every commitment agrees, else which one did not."""
         for what, mine, theirs in (
             ("state", self.accumulator(), expect.acc_state),
             ("log", self.log_accumulator(), expect.acc_log),
@@ -603,285 +621,328 @@ class Store:
         mutations: tuple[ops.Mutation, ...],
         acc: crypto.Accumulator,
     ) -> crypto.Accumulator:
-        """Append one transaction at `idx` and fold `mutations` into the live view and `acc`.
-
-        Takes the mutation sequence rather than re-deriving it from `tx`, because the evaluator has
-        already produced it in order — and because replay hands over the same shape without any
-        evaluation having happened (#replay-does-not-readjudicate)."""
-        # The credential a `Set` leaves behind is the transaction doing it, FOR EVERY STORE `[H]`.
-        # It was management-only while the leaf hashed the value alone, on the reasoning that data
-        # rows derive their authority from management state — true of the authority, and no use to
-        # a reader holding a row: the chain existed and nothing carried it. Now the leaf commits to
-        # it (`smt.leaf_hash`), so every row answers "who was permitted to write this" without a
-        # second lookup, and the log's own history is not the only thing that can say.
-        #
-        # Storage: a transaction writing 100 keys stores 100 copies. Deduplicating by `op_hash`
-        # with live rows referencing it is the natural fix and the same refcount shape as epochs;
-        # inline until the numbers say otherwise (#credential-in-every-leaf).
+        """Append one transaction at `idx` and fold `mutations` into the live view and `acc`."""
         cred = tx.raw
-        self.db.execute(
+        self._conn.execute(
             "INSERT INTO entry (idx, op_hash, raw, author, ts) VALUES (?,?,?,?,?)",
             (idx, tx.op_hash, tx.raw, tx.author, tx.ts),
         )
         self._log_add(idx, tx.op_hash)
-        # Effects, in order — the last write to a key wins (#last-write-wins).
-        #    The accumulator is maintained HERE and only here: each step removes whatever the key
-        #    currently holds and adds what it will hold. Doing any of it in the loop above would
-        #    subtract the prior element twice, which is exactly the bug the set-then-del identity
-        #    test caught.
         for m in mutations:
             cur = self.get(m.store, m.name)
             if cur:
                 acc = crypto.acc_sub(acc, element(m.store, m.name, cur[1]))
             path = smt.path_of(m.store, m.name)
-            # Both commitments move together, in this transaction, for the same reason the live
-            # view does: two truths about one state is the failure the store exists to prevent.
-            self.tree.invalidate(path)
+            self._tree.invalidate(path)
             if isinstance(m, ops.Set):
-                self.db.execute(
+                self._conn.execute(
                     "INSERT OR REPLACE INTO live (store, name, head, value, path, epoch, cred)"
                     " VALUES (?,?,?,?,?,?,?)",
                     (m.store, m.name, idx, m.value, path, m.epoch, cred),
                 )
                 acc = crypto.acc_add(acc, element(m.store, m.name, m.value))
             else:
-                self.db.execute("DELETE FROM live WHERE store=? AND name=?", (m.store, m.name))
+                self._conn.execute("DELETE FROM live WHERE store=? AND name=?", (m.store, m.name))
         return acc
 
-    def _settled_hashes(self, want: tuple[crypto.Digest, ...]) -> set[bytes]:
-        """Which of these op hashes the log already holds. One query, not one per transaction."""
-        if not want:
-            return set()
-        # The only interpolation is a run of `?`, one per parameter; every value is still bound.
-        marks = ",".join("?" * len(want))
-        rows = self.db.execute(
-            f"SELECT op_hash FROM entry WHERE op_hash IN ({marks})",  # noqa: S608
-            want,
-        ).fetchall()
-        return {r[0] for r in rows}
 
-    # -- the invariant, made checkable --------------------------------------- #
+class _ReplayRefusedError(Exception):
+    """Internal signal used inside `StoreWriter.replay` to short-circuit the transaction
+    with a returnable reason. Caught in `Store.replay`'s convenience wrapper, converted
+    back to a string return; the writer's `with` scope rolls back on the exception."""
 
-    def rebuild(self) -> Store:
-        """A fresh store holding the same log, replayed from scratch into a new database.
+    def __init__(self, why: str):
+        super().__init__(why)
+        self.why = why
 
-        This exists so "the derived view equals a replay of the log" is a TEST rather than a claim
-        (#content-address), and it is the same operation as total-loss recovery: given the log,
-        everything else is reconstructible.
 
-        It re-evaluates predicates and RAISES if one fails, which is
-        #replay-does-not-readjudicate — in an uncompacted
-        region a predicate that fails on replay means the log and the view disagree, i.e. corruption
-        rather than a decision. **Once compaction exists this is no longer the whole story**: a
-        compacted log cannot re-evaluate predicates whose referenced state was collected, so replay
-        there APPLIES without re-adjudicating and correctness comes from comparing the accumulator
-        against a quorum attestation (#collection-is-ratified). This method is the
-        uncompacted case."""
-        fresh = Store(":memory:")
-        fresh.replay(list(self.entries()))
-        return fresh
+# ============================================================================= #
+# Store -- facade owning both connections and providing scopes + shortcuts.     #
+# ============================================================================= #
 
-    # -- COMPACTION (#collection-is-a-log-entry, 11.2a-i, 11.4b) ------------------------------ #
+
+class Store:
+    """The log plus its derived view, on SQLite. Owns two connections to one DB:
+    a writer (serialised via `_writer_lock`) and a per-snapshot fresh reader.
+
+    Callers use scopes explicitly for anything that composes multiple reads or writes:
+        with store.snapshot() as r:      # snapshot-consistent reads across the scope
+            v1 = r.get(...); v2 = r.roster()
+        with store.write() as w:         # exclusive write transaction
+            w.commit_block(...)
+
+    For one-shot calls, Store keeps convenience wrappers that internally open a scope --
+    `store.get(...)`, `store.head_block_num()`, `store.commit_block(...)`, etc. Every
+    existing caller keeps working."""
+
+    def __init__(self, path: str = ":memory:"):
+        # For `path == ":memory:"` we back the store with a temp file that gets deleted on
+        # close. Two reasons the naive `sqlite3.connect(":memory:")` fails us:
+        #   * Each `sqlite3.connect(":memory:")` opens a NEW empty DB -- the writer and
+        #     each reader would see different DBs.
+        #   * `PRAGMA journal_mode=WAL` is silently downgraded on `:memory:`, so there's
+        #     no snapshot isolation across connections.
+        # The obvious alternative -- `file:name?mode=memory&cache=shared` -- shares the DB
+        # across connections but reverts to shared-cache locking semantics: a writer
+        # holding BEGIN IMMEDIATE blocks any concurrent reader with `database table is
+        # locked`. That's the opposite of what we need.
+        # A tempfile gives real WAL, real snapshot isolation, real cross-connection
+        # sharing, and cleans up on close(). Perf overhead is tiny for the test sizes we
+        # care about (~1 ms per Store construction).
+        self._tempfile_path: str | None = None
+        if path == ":memory:":
+            fd, self._tempfile_path = tempfile.mkstemp(prefix="dude-store-", suffix=".sqlite")
+            os.close(fd)
+            path = self._tempfile_path
+        self._conn_uri = path
+        self._writer_conn = sqlite3.connect(
+            self._conn_uri,
+            check_same_thread=False,
+            isolation_level=None,
+        )
+        self._writer_lock = threading.RLock()
+        self._writer_conn.execute("PRAGMA journal_mode=WAL")
+        self._writer_conn.execute("PRAGMA foreign_keys=ON")
+        self._writer_conn.executescript(_SCHEMA)
 
     @property
-    def mgmt(self) -> Management:
-        """A Management view over this store. Constructed on demand; Management holds no state
-        beyond `store` and `store_id`, so re-constructing is cheap and there is nothing to
-        invalidate. Callers that need the roster or an authority check reach for this rather
-        than wrapping `Management(store)` themselves -- one meeting point for everything
-        authority-related. `Store.roster()` is deleted; `store.mgmt.roster()` is the answer."""
-        return Management(self)
+    def db(self) -> sqlite3.Connection:
+        """Compat shim for tests that read raw SQLite state directly. Production callers
+        should use `store.snapshot()` / `store.write()` scopes. Returns the writer
+        connection -- tests using this outside a writer scope get the last-committed
+        state (they only ever do SELECTs)."""
+        return self._writer_conn
+
+    def close(self) -> None:
+        """Close the writer connection and delete the backing temp file if any. Reader
+        connections are per-scope and close on scope exit, so nothing lingers there.
+        Idempotent."""
+        with contextlib.suppress(sqlite3.Error):
+            self._writer_conn.close()
+        if self._tempfile_path is not None:
+            for suffix in ("", "-wal", "-shm"):
+                with contextlib.suppress(OSError):
+                    os.unlink(self._tempfile_path + suffix)
+            self._tempfile_path = None
+
+    def __del__(self) -> None:
+        # Best-effort cleanup for callers that don't call close(). SQLite finalizers
+        # will close the connection anyway; the tempfile removal is what this catches.
+        with contextlib.suppress(Exception):
+            self.close()
+
+    # -- scopes -------------------------------------------------------------- #
+
+    def _open_reader_conn(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(
+            self._conn_uri,
+            check_same_thread=False,
+            isolation_level=None,
+        )
+        conn.execute("PRAGMA foreign_keys=ON")
+        return conn
+
+    @contextmanager
+    def snapshot(self) -> Iterator[StoreReader]:
+        """A snapshot-consistent read scope. Opens a FRESH reader connection, opens a
+        transaction, and PINS the snapshot via a trivial SELECT before yielding --
+        SQLite's default `BEGIN` is deferred, meaning the snapshot only starts at the
+        first read. Doing that first read here means the caller's later reads inside the
+        scope all see the state as of `snapshot()` entry, not as of "first caller read"
+        (which is fragile: any commit in that window would move the snapshot).
+
+        Different threads calling `snapshot()` simultaneously each get their own
+        independent connection and their own snapshot via WAL isolation. Connection
+        closes on scope exit."""
+        conn = self._open_reader_conn()
+        try:
+            conn.execute("BEGIN")
+            # Force snapshot acquisition NOW, not at first user read. A cheap read
+            # against a table that always exists (meta) is enough -- SQLite pins the
+            # WAL frame at this point.
+            conn.execute("SELECT 1 FROM meta LIMIT 0").fetchone()
+            try:
+                yield StoreReader(conn)
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+        finally:
+            conn.close()
+
+    @contextmanager
+    def write(self) -> Iterator[StoreWriter]:
+        """The exclusive write transaction. Acquires the writer lock, opens `BEGIN
+        IMMEDIATE` on the writer connection, yields a StoreWriter, COMMITs on success or
+        ROLLBACKs on exception. Only one writer at a time -- SQLite's own constraint,
+        made explicit through the lock."""
+        with self._writer_lock:
+            self._writer_conn.execute("BEGIN IMMEDIATE")
+            try:
+                yield StoreWriter(self._writer_conn)
+                self._writer_conn.execute("COMMIT")
+            except Exception:
+                self._writer_conn.execute("ROLLBACK")
+                raise
+
+    # -- convenience one-shot reads (preserve every existing call site) ------ #
+
+    def get(self, store: int, name: bytes) -> Held | None:
+        with self.snapshot() as r:
+            return r.get(store, name)
+
+    def prefix(self, store: int, pre: bytes) -> Iterator[Row]:
+        # `prefix` yields; materialize inside the scope so results outlive it.
+        with self.snapshot() as r:
+            yield from list(r.prefix(store, pre))
+
+    def head(self) -> Index:
+        with self.snapshot() as r:
+            return r.head()
+
+    def entries(self, frm: Index = 1, to: Index | None = None) -> Iterator[Entry]:
+        with self.snapshot() as r:
+            yield from list(r.entries(frm, to))
+
+    def settled_at(self, block_num: Index) -> bytes | None:
+        with self.snapshot() as r:
+            return r.settled_at(block_num)
+
+    def bodies_of_block(self, block_num: Index) -> tuple[ops.SignedTransaction, ...]:
+        with self.snapshot() as r:
+            return r.bodies_of_block(block_num)
+
+    def head_block_hash(self) -> crypto.Digest | None:
+        with self.snapshot() as r:
+            return r.head_block_hash()
+
+    def head_block_num(self) -> Index | None:
+        with self.snapshot() as r:
+            return r.head_block_num()
 
     def credential(self, store: int, name: bytes) -> bytes:
-        """The signed transaction that authorised this row's value, or empty if none is kept."""
-        row = self.db.execute(
-            "SELECT cred FROM live WHERE store=? AND name=?", (store, name)
-        ).fetchone()
-        return row[0] if row else b""
+        with self.snapshot() as r:
+            return r.credential(store, name)
 
-    # -- THE STATE ROOT (#state-root) ------------------------------------------ #
+    def accumulator(self) -> crypto.Accumulator:
+        with self.snapshot() as r:
+            return r.accumulator()
+
+    def log_accumulator(self) -> crypto.Accumulator:
+        with self.snapshot() as r:
+            return r.log_accumulator()
 
     def state_root(self) -> crypto.Digest:
-        """One commitment to all live state, against which a single key can be PROVED.
-
-        Kept alongside `A_state` rather than replacing it: the accumulator answers "do we agree" in
-        O(1) and nodes ask that constantly, while this is paid when a proof is served or a
-        checkpoint is cut."""
-        return self.tree.root()
+        with self.snapshot() as r:
+            return r.state_root()
 
     def hash_under(self, prefix: bytes, depth: int) -> crypto.Digest:
-        """SMT subtree hash under `prefix` at `depth`. Exposed on Store so a `Layer(base=store)`
-        can compose its own projected root by delegating unchanged subtrees to the base
-        (SPECv2 #view-protocol)."""
-        return self.tree.hash_under(prefix, depth)
+        with self.snapshot() as r:
+            return r.hash_under(prefix, depth)
 
     def prove(self, store: int, name: bytes) -> smt.Proof:
-        """Presence or absence, by the same walk. Absence is the valuable half — it is what makes
-        a revocation checkable rather than asserted (#absence-is-revocation)."""
-        return self.tree.prove(store, name)
+        with self.snapshot() as r:
+            return r.prove(store, name)
 
-    @property
-    def is_frozen(self) -> bool:
-        """Always True in the current single-threaded Coordinator (SPECv2 #store-serial-settle):
-        the discipline is that Store.apply is not called while any Layer over Store is OPEN, so
-        from a Layer's perspective the Store is de facto frozen for the Layer's lifetime. When
-        `Store.freeze()` becomes real machinery (snapshot work), this becomes a version-handle
-        check rather than a constant."""
-        return True
+    def anchor(self) -> crypto.PublicKey | None:
+        with self.snapshot() as r:
+            return r.anchor()
+
+    def seeds(self) -> tuple[bytes, ...]:
+        with self.snapshot() as r:
+            return r.seeds()
+
+    def roster_serial(self) -> int:
+        with self.snapshot() as r:
+            return r.roster_serial()
+
+    def wrong_cluster(self) -> str | None:
+        with self.snapshot() as r:
+            return r.wrong_cluster()
+
+    def unvouched_roster(self) -> str | None:
+        with self.snapshot() as r:
+            return r.unvouched_roster()
+
+    def roster_incomplete(self) -> str | None:
+        with self.snapshot() as r:
+            return r.roster_incomplete()
+
+    def holds(self, pred: ops.Predicate) -> bool:
+        with self.snapshot() as r:
+            return r.holds(pred)
 
     def _rows_in_path_range(
         self, lo: bytes, hi: bytes
     ) -> Iterator[tuple[int, bytes, bytes, bytes]]:
-        """Every live `(store, name, value, credential)` whose SMT path falls inside `[lo, hi]`.
-        The fast path a `Layer` uses to compute effective leaves during a projected root walk;
-        one indexed range scan against `live_by_path`."""
-        rows = self.db.execute(
-            "SELECT store, name, value, cred FROM live WHERE path BETWEEN ? AND ? ORDER BY path",
-            (lo, hi),
-        ).fetchall()
-        for st, name, value, cred in rows:
-            yield int(st), name, value, cred
+        # Called by Layer over Store as base -- must yield real rows, so materialize.
+        with self.snapshot() as r:
+            yield from list(r._rows_in_path_range(lo, hi))  # noqa: SLF001
 
-    # -- ATTESTATION (#monotonicity) ------------------------------------------ #
+    def _settled_hashes(self, want: tuple[crypto.Digest, ...]) -> set[bytes]:
+        # Called by Coordinator when previewing a slice.
+        with self.snapshot() as r:
+            return r._settled_hashes(want)  # noqa: SLF001
 
-    def anchor(self) -> crypto.PublicKey | None:
-        """The manager public key this node was provisioned with, or None if it was not.
+    @property
+    def is_frozen(self) -> bool:
+        """Store implements View for callers that construct `Layer(store)` -- a Store,
+        by test discipline, is not mutated while a Layer over it is OPEN, so from the
+        Layer's perspective it is de facto frozen. When real snapshotting arrives this
+        becomes a version-handle check; today it is a constant."""
+        return True
 
-        THE ONE VALUE NOT DERIVED FROM ANYTHING `[H]`: *"the manager public key is provided to the
-        new node when it bootstraps and would be retained through a new bootstrap."* Everything else
-        a node believes is reached from here — the roster by the credentials the manager signed, the
-        quorum by that roster, the state by the quorum's root — so it is the axiom of the bootstrap
-        chain (#bootstrap-anchor).
+    @property
+    def mgmt(self) -> Management:
+        """A Management view over this store. Convenience for read-only mgmt calls
+        (`store.mgmt.roster()`, `store.mgmt.grant_of(...)`). For tx composition
+        (change_roster, authorise, etc.) with snapshot consistency, use
+        `with store.snapshot() as r: MgmtWriter(r).X(...)` explicitly."""
+        return Management(self)
 
-        IN `meta` AND NOT IN THE LOG, deliberately. It is what VALIDATES the log, so taking it from
-        the log would be circular: a forged genesis would introduce its own manager and check out
-        against itself. Durable because it must survive the wipe that makes a node re-bootstrap; if
-        it does not survive, the node is unprovisioned and cannot verify anything."""
-        raw = self._get_meta("anchor", b"")
-        return crypto.PublicKey(raw) if raw else None
+    # -- convenience one-shot writes ----------------------------------------- #
 
-    def seeds(self) -> tuple[bytes, ...]:
-        """The addresses this node was provisioned with, to reach the cluster at all.
+    def apply(self, batch: tuple[ops.SignedTransaction, ...], auth: settle.Authoriser) -> Applied:
+        with self.write() as w:
+            return w.apply(batch, auth)
 
-        THE SECOND THING THAT CANNOT BE DERIVED `[H]`: *"we need to know the manager key, we need
-        f+1 nodes to determine freshness"* — and reaching `f+1` nodes needs `f+1` addresses, which
-        cannot be obtained by asking, because asking requires an address. So they are provisioning
-        input alongside the anchor, and retained for the same reason.
-
-        Addresses only. WHO answers is established by their signatures and by the anchor chain; a
-        seed that turns out to be a stranger costs a wasted connection and nothing else."""
-        raw = self._get_meta("seeds", b"")
-        return tuple(codec.as_bytes(a) for a in codec.as_seq(codec.decode(raw))) if raw else ()
+    def commit_block(  # noqa: PLR0913
+        self,
+        block_num: Index,
+        *,
+        first_height: Index,
+        block_bytes: bytes,
+        block_hash: crypto.Digest,
+        batch: tuple[ops.SignedTransaction, ...],
+        auth: settle.Authoriser,
+    ) -> Applied:
+        with self.write() as w:
+            return w.commit_block(
+                block_num,
+                first_height=first_height,
+                block_bytes=block_bytes,
+                block_hash=block_hash,
+                batch=batch,
+                auth=auth,
+            )
 
     def provision(self, manager: crypto.PublicKey, seeds: Iterable[bytes] = ()) -> None:
-        """Record the anchor. Idempotent for the same key, and REFUSED for a different one.
+        with self.write() as w:
+            w.provision(manager, seeds)
 
-        Re-provisioning to a different manager would move a node between clusters silently, taking
-        its identity and its attestation history with it — and its monotone height, which is the one
-        thing #monotonicity says cannot be forged. An operator who genuinely means it deletes the
-        store, which is the same act as retiring the identity."""
-        held = self.anchor()
-        if held is not None and held != manager:
-            raise InvariantError(
-                "this node is provisioned to a different manager; re-provisioning would move it "
-                "between clusters while keeping its identity and its attested height"
-            )
-        self._set_meta("anchor", manager)
-        if seeds:
-            self._set_meta("seeds", codec.encode(sorted(seeds)))
-
-    def wrong_cluster(self) -> str | None:
-        """`None` if the log we hold is the one our anchor authorises, else why not.
-
-        The second step of the chain: the log's own manager grant MUST name the key we were given.
-        A log that does not is a different cluster's, and adopting anything from it — a roster, a
-        checkpoint, a state root — would be believing a stranger's whole world.
-
-        An unprovisioned node cannot answer this and says so rather than passing: it holds no
-        axiom, so nothing it could check would mean anything."""
-
-        held = self.anchor()
-        if held is None:
-            return "no anchor: this node was never provisioned with a manager key"
-        grant = self.mgmt.grant_of(held)
-        if grant is None:
-            return "the log holds no grant for the manager we were provisioned with"
-        if grant.role is not Role.MANAGER:
-            return f"our anchor holds {grant.role.value} in this log, not manager"
+    def replay(self, items: Iterable[Entry], expect: Commitment | None = None) -> str | None:
+        """See `StoreWriter.replay`. Returns the refusal reason or None on success."""
+        try:
+            with self.write() as w:
+                w.replay(items, expect)
+        except _ReplayRefusedError as e:
+            return e.why
         return None
 
-    def unvouched_roster(self) -> str | None:
-        """`None` if every roster row traces to our anchor, else the first one that does not.
-
-        STEP 6 OF THE CHAIN (#bootstrap-anchor), and the reason the credential travels with the row:
-        collection eventually forgets the entry that first set a roster row, so without the carried
-        credential a joiner could only take the roster on the word of the quorum — and the roster is
-        what defines that quorum. Circular, and this is the way out.
-
-        VOUCHED BY THE ANCHOR ITSELF, not by "a manager". `replay` does not re-adjudicate authority,
-        so a forged log can hold a `grant` row naming a manager nobody authorised, and a check that
-        accepted "signed by some manager in this log" would accept a roster that manager wrote.
-        The anchor is the only key not taken from the log, so it is the only one worth checking
-        against.
-
-        MANAGER ROTATION IS THEREFORE NOT YET SUPPORTED HERE: a row vouched by a successor key would
-        need the chain of grants from the anchor forward, walked and verified. `[H]` the manager is
-        cold and is not revoked, so nothing needs it today — but a rotation would break this check,
-        which is the correct direction to fail in.
-
-        Unprovisioned nodes get "no anchor": holding no axiom, they cannot answer the question."""
-
-        held = self.anchor()
-        if held is None:
-            return "no anchor: this node was never provisioned with a manager key"
-        for who in self.mgmt.roster():
-            name = P_NODE + who
-            author = settle.vouched(self, ops.STORE_MANAGEMENT, name, self.credential(0, name))
-            if author is None:
-                return (
-                    f"roster row for {who.hex()[:8]} carries no credential vouching for its value"
-                )
-            if author != held:
-                return f"roster row for {who.hex()[:8]} is vouched by {author.hex()[:8]}, not by us"
-        return None
-
-    def roster_incomplete(self) -> str | None:
-        """`None` if the roster we hold is the whole roster the manager signed, else why not.
-
-        STEP 7 OF THE CHAIN (#bootstrap-anchor). Step 6 proves every member was authorised by the
-        anchor; it cannot prove NO MEMBER IS MISSING, and a subset is a smaller roster, hence a
-        smaller quorum — a party handed three of eleven rows would compute a quorum of two.
-
-        THREE THINGS, and each is a different attack:
-
-        * the commitment traces to the anchor, or a forged log states its own membership;
-        * it equals the rows we hold, or a subset passes while claiming to be the whole;
-        * its serial never goes backwards, or a genuine-but-superseded roster — members since
-          removed, whose keys an adversary may still hold — verifies perfectly for ever.
-
-        The high-water mark is node-local and durable, like the anchor and the checkpoint, and is
-        advanced by `replay` once the run it came in is accepted. A checker that moved it would
-        decide and record in one act, so the two are kept apart."""
-
-        held = self.anchor()
-        if held is None:
-            return "no anchor: this node was never provisioned with a manager key"
-        commitment = self.mgmt.roster_commitment()
-        if commitment is None:
-            return "the log states no roster commitment, so a subset could not be detected"
-        author = settle.vouched(self, ops.STORE_MANAGEMENT, P_ROSTER, self.credential(0, P_ROSTER))
-        if author != held:
-            return f"the roster commitment is vouched by {author.hex()[:8] if author else 'nobody'}"
-        serial, members = commitment
-        if members != self.mgmt.roster():
-            return (
-                f"the roster commitment names {len(members)} members, the log holds a different set"
-            )
-        if serial < self.roster_serial():
-            return f"roster serial {serial} is older than the {self.roster_serial()} already seen"
-        return None
-
-    def roster_serial(self) -> int:
-        """The highest roster revision this node has accepted. Monotone, and durable so it survives
-        the restart that would otherwise let an old roster back in."""
-        return int.from_bytes(self._get_meta("roster_serial", b""))
+    def rebuild(self) -> Store:
+        """A fresh store holding the same log, replayed from scratch into a new database.
+        The invariant made checkable: `applying entries incrementally == replaying the log
+        from scratch`."""
+        fresh = Store(":memory:")
+        fresh.replay(list(self.entries()))
+        return fresh

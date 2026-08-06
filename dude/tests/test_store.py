@@ -218,7 +218,8 @@ class TestReplayEquivalence(unittest.TestCase):
         """If the incremental accumulator were wrong, the differential test must notice. Prove the
         test can fail rather than trusting that it would."""
         s = self._randomised(0)
-        s._set_meta("acc", crypto.ACC_IDENTITY)  # corrupt the cache only
+        with s.write() as w:
+            w._set_meta("acc", crypto.ACC_IDENTITY)  # corrupt the cache only
         fresh = s.rebuild()
         self.assertNotEqual(s.accumulator(), fresh.accumulator())
 

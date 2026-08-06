@@ -226,10 +226,23 @@ def verify(
 
 
 class Tree:
-    """The tree over a store's `live` table. Holds no state of its own beyond a memo table."""
+    """The tree over a store's `live` table. Holds no state of its own beyond a memo table.
 
-    def __init__(self, db: sqlite3.Connection):
+    `memoize=True` (default): `hash_under` INSERTs computed subtree hashes into `smt_memo`
+    on cache miss, so subsequent calls are O(1) SELECTs. This is the writer's mode --
+    every block commit maintains the memo via `invalidate + hash_under` on the ancestors
+    of changed leaves, keeping the whole tree's root computation O(log N) per block.
+
+    `memoize=False`: `hash_under` reads memo but never writes. Reader's mode -- the reader
+    connection may not hold the SQLite write lock, and semantically a read should not
+    mutate. In steady state the writer keeps the memo warm; the reader's O(log N)
+    `prove()` walks hit those entries. On cold subtrees the reader recomputes on the fly
+    (still O(log N) per sibling, bounded by tree depth, not tree size). See the plan for
+    the full complexity analysis."""
+
+    def __init__(self, db: sqlite3.Connection, memoize: bool = True):
         self.db = db
+        self.memoize = memoize
 
     def _leaves(self, path: bytes, depth: int) -> list[tuple[bytes, crypto.Digest]]:
         """The leaves under a prefix, at most two — which is all any decision here needs.
@@ -268,10 +281,11 @@ class Tree:
         node = branch_hash(
             depth, lo, self.hash_under(left, depth + 1), self.hash_under(right, depth + 1)
         )
-        self.db.execute(
-            "INSERT OR REPLACE INTO smt_memo (depth, prefix, hash) VALUES (?,?,?)",
-            (depth, lo, node),
-        )
+        if self.memoize:
+            self.db.execute(
+                "INSERT OR REPLACE INTO smt_memo (depth, prefix, hash) VALUES (?,?,?)",
+                (depth, lo, node),
+            )
         return node
 
     def root(self) -> crypto.Digest:
