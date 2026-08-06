@@ -409,7 +409,6 @@ class Peer:
         )
         for a in removed:
             del self.links[a]
-        for a in removed:
             self.endpoints.pop(a, None)
         for a in added:
             self.links[a] = standard(a, self.dial(by_address[a]), self.budget, self.t)
@@ -443,6 +442,3 @@ class Peer:
     def _rto(self, link: Link) -> Millis:
         est = link.find(Estimator)
         return est.rto() if est else self.t.rto_initial
-
-    def __len__(self) -> int:
-        return len(self.links)

@@ -135,6 +135,17 @@ class NetTunables:
     so no timing quantity derives it: the requester asks again from where it got to, which costs
     round trips and never correctness."""
 
+    max_frame_bytes: int = 1 << 24
+    """Cap on a single wire frame -- refuse to send anything larger, refuse to allocate anything
+    larger on receive. 16 MiB by default: bigger than any well-formed envelope in this codebase,
+    small enough that a hostile stream advertising "the next frame is 4 GiB" costs one length-word
+    read and a connection close, not a 4 GiB allocation.
+
+    Carrier-agnostic on purpose. Every carrier that has framing (TCP, UNIX, any future stream
+    transport) has to agree with its peer on the ceiling, or a well-formed frame from one side is
+    a refusal on the other. Living in `NetTunables` is what makes that agreement expressible in
+    one place; a per-transport constant makes it a coincidence that could drift."""
+
 
 @dataclass(frozen=True, slots=True)
 class SyncTunables:

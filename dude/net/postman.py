@@ -28,7 +28,7 @@ from ..core.errors import DudeError
 from ..core.units import Millis
 from .address import Endpoint, Scheme
 from .envelope import EnvelopeError, Frame, SignedEnvelope
-from .link import Link, LinkTunables, Peer, Transport
+from .link import LinkTunables, Peer, Transport
 from .mailbox import Expired, Mailbox, Reply, Transmit
 from .plan import Decision, GiveUp, Plan, Send, Wait
 
@@ -89,15 +89,6 @@ class Received(NamedTuple):
 
     envelope: SignedEnvelope
     reply: Reply | None
-
-
-@dataclass(frozen=True, slots=True)
-class Sample:
-    """What a round produced for one link. Handed to the link's policies by `Postman`, which is the
-    only object that can decide attribution — it alone sees both the message and the paths."""
-
-    link: Link
-    rtt: Millis | None
 
 
 @dataclass(slots=True)
