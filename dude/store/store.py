@@ -25,6 +25,7 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from typing import NamedTuple
@@ -180,17 +181,58 @@ def _unverified(e: Entry) -> str | None:
     return None
 
 
+class _SerializedConnection(sqlite3.Connection):
+    """A `sqlite3.Connection` that serializes `execute` / `executemany` / `executescript`
+    with an RLock. Python's sqlite3 requires either same-thread-only or external
+    serialization for shared connections; `check_same_thread=False` alone is not enough
+    (two threads calling `execute` concurrently produces `sqlite3.InterfaceError: bad
+    parameter or other API misuse`).
+
+    Our access pattern is `db.execute(...).fetchone()` or `.fetchall()` on one line
+    per call site -- cursors are transient. Locking `execute` covers every path a caller
+    goes through; cursor operations are safe because each cursor is used entirely inside
+    the lifetime of the acquiring caller's expression."""
+
+    _lock: threading.RLock
+
+    def _serialized_lock(self) -> threading.RLock:
+        # Lazy-init because `__init__` on sqlite3.Connection is opaque and we can't
+        # override it cleanly; first call allocates.
+        lock = getattr(self, "_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._lock = lock
+        return lock
+
+    def execute(self, *args, **kwargs):
+        with self._serialized_lock():
+            return super().execute(*args, **kwargs)
+
+    def executemany(self, *args, **kwargs):
+        with self._serialized_lock():
+            return super().executemany(*args, **kwargs)
+
+    def executescript(self, *args, **kwargs):
+        with self._serialized_lock():
+            return super().executescript(*args, **kwargs)
+
+
 class Store:
     """The log plus its derived view, over one SQLite connection."""
 
     def __init__(self, path: str = ":memory:"):
-        # `check_same_thread=False` -- the Store gets created on one thread (Node's
-        # constructor, called from a runtime bring-up thread) and used on another
-        # (Node's owned `_run` thread after `start()`). Our discipline is that only ONE
-        # thread accesses a given Store at a time (Node.start() spawns the thread, and
-        # Node.stop() joins it before any other caller touches the store); sqlite's
-        # default same-thread check is over-restrictive for that pattern.
-        self.db = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
+        # `check_same_thread=False` + a serialized-connection subclass. Store is
+        # constructed on one thread (Node's constructor, called from a runtime bring-up
+        # thread) and then used on Node's owned `_run` thread after `start()`. An
+        # inspection thread (a test's `_wait_until` predicate, a CLI, an admin
+        # endpoint) may also read concurrently -- the lock inside `_SerializedConnection`
+        # keeps sqlite from raising InterfaceError under that traffic.
+        self.db = sqlite3.connect(
+            path,
+            isolation_level=None,
+            check_same_thread=False,
+            factory=_SerializedConnection,
+        )
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA foreign_keys=ON")
         self.db.executescript(_SCHEMA)
@@ -235,9 +277,10 @@ class Store:
         """Replay range, inclusive. The only way anyone derives state
         (#replay-does-not-readjudicate)."""
         hi = self.head() if to is None else to
-        for idx, raw in self.db.execute(
+        rows = self.db.execute(
             "SELECT idx, raw FROM entry WHERE idx BETWEEN ? AND ? ORDER BY idx", (frm, hi)
-        ):
+        ).fetchall()
+        for idx, raw in rows:
             yield Entry(idx, ops.SignedTransaction.decode(raw))
 
     # -- STORE --------------------------------------------------------------- #
@@ -263,17 +306,24 @@ class Store:
         # `Row(*r)` at the boundary, not a bare yield of the driver's tuples: the SELECT's column
         # order is the only thing that made `(name, head, value)` mean anything, and naming it here
         # is what stops a reordered SELECT silently transposing provenance and value.
+        #
+        # MATERIALIZED via `fetchall()` inside `execute`'s critical section rather than
+        # streamed. Streaming would keep a cursor alive across the yield boundary, and
+        # under multi-thread traffic another `execute` on the same connection can invalidate
+        # a mid-iteration cursor -- observed as `TypeError: 'NoneType' object is not
+        # subscriptable` when the cursor returned garbage rows. `fetchall()` while the
+        # connection lock is held (via `_SerializedConnection.execute`) is thread-safe.
         if hi is None:  # the prefix is all 0xFF; nothing sorts above it
             rows = self.db.execute(
                 "SELECT name, head, value, epoch FROM live WHERE store=? AND name>=? ORDER BY name",
                 (store, pre),
-            )
+            ).fetchall()
         else:
             rows = self.db.execute(
                 "SELECT name, head, value, epoch FROM live"
                 " WHERE store=? AND name>=? AND name<? ORDER BY name",
                 (store, pre, hi),
-            )
+            ).fetchall()
         for name, head, value, epoch in rows:
             yield Row(name, head, value, epoch)
 
@@ -331,7 +381,26 @@ class Store:
         ONE SQL TRANSACTION. A crash between "txs applied" and "block persisted" would leave the
         store in a state where entries exist but no block record names them -- opaque to sync,
         because a joiner asks `GETBLOCK n` and gets nothing while the head has advanced. Folding
-        them in one commit means such a state is impossible by construction."""
+        them in one commit means such a state is impossible by construction.
+
+        IDEMPOTENT ON REDUNDANT-COMMIT. Coordinator and Follower can both reach "commit block N"
+        when their timings race: Coordinator settles block N locally, Follower's in-flight
+        GETBLOCK for block N returns from a peer that ALSO just settled it. Both have the same
+        block bytes and same hash (both saw the same consensus outcome), so committing twice is
+        the safe no-op case. A DIFFERENT hash at the same block_num is a fork and raises --
+        that's a real fault, not a race, and calls up the chain."""
+        existing = self.db.execute(
+            "SELECT hash FROM block WHERE block_num=?", (block_num,)
+        ).fetchone()
+        if existing is not None:
+            if existing[0] == block_hash:
+                # Idempotent: same block already committed by the peer path. Return an
+                # empty Applied -- everything the caller would have persisted is already there.
+                return Applied(settled=(), dropped=())
+            raise InvariantError(
+                f"fork at block_num={block_num}: existing hash "
+                f"{crypto.Digest(existing[0]).hex()[:8]} != new {block_hash.hex()[:8]}"
+            )
         self.db.execute("BEGIN IMMEDIATE")
         try:
             applied = self._apply_within(batch, auth)
@@ -588,7 +657,7 @@ class Store:
         rows = self.db.execute(
             f"SELECT op_hash FROM entry WHERE op_hash IN ({marks})",  # noqa: S608
             want,
-        )
+        ).fetchall()
         return {r[0] for r in rows}
 
     # -- the invariant, made checkable --------------------------------------- #
@@ -666,10 +735,11 @@ class Store:
         """Every live `(store, name, value, credential)` whose SMT path falls inside `[lo, hi]`.
         The fast path a `Layer` uses to compute effective leaves during a projected root walk;
         one indexed range scan against `live_by_path`."""
-        for st, name, value, cred in self.db.execute(
+        rows = self.db.execute(
             "SELECT store, name, value, cred FROM live WHERE path BETWEEN ? AND ? ORDER BY path",
             (lo, hi),
-        ):
+        ).fetchall()
+        for st, name, value, cred in rows:
             yield int(st), name, value, cred
 
     # -- ATTESTATION (#monotonicity) ------------------------------------------ #

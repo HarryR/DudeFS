@@ -238,14 +238,11 @@ class Tree:
         building it in one place is what keeps `hash_under` and `prove` agreeing about what a leaf
         is."""
         lo, hi = bounds(path, depth)
-        return [
-            (r[0], leaf_hash(r[0], crypto.h(r[1]), crypto.h(r[2])))
-            for r in self.db.execute(
-                "SELECT path, value, cred FROM live"
-                " WHERE path>=? AND path<=? ORDER BY path LIMIT 2",
-                (lo, hi),
-            )
-        ]
+        rows = self.db.execute(
+            "SELECT path, value, cred FROM live WHERE path>=? AND path<=? ORDER BY path LIMIT 2",
+            (lo, hi),
+        ).fetchall()
+        return [(r[0], leaf_hash(r[0], crypto.h(r[1]), crypto.h(r[2]))) for r in rows]
 
     def hash_under(self, path: bytes, depth: int) -> crypto.Digest:
         """The hash of the subtree under `path`'s first `depth` bits.
