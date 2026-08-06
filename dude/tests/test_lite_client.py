@@ -8,20 +8,32 @@ from __future__ import annotations
 
 import unittest
 from dataclasses import replace
-from typing import cast
 
 from dude.consensus.bootstrap import intervene
 from dude.core import crypto
 from dude.net.address import Endpoint, Scheme
 from dude.net.envelope import Envelope, Frame, SignedEnvelope, Verb
 from dude.net.postman import Postman
-from dude.net.transports import InProc, address_of
+from dude.net.transports import InProcClient, InProcListener, address_of, name_of
 from dude.store import ops
 from dude.store.management import Cert, Management, Role
 from dude.sync.lite_adapter import ProofReply
 from dude.sync.lite_client import PENDING, Failed, GetResult, LightClient, State
 
 from .cluster import DELTA, T0, Cluster
+
+
+def _build_light_client(c: Cluster, kp: crypto.Keypair) -> tuple[LightClient, InProcListener]:
+    """Same shape as production: construct the listener + client explicitly, attach the
+    client to the LightClient's Postman, register bootstrap peers. Returns both so the
+    test pump can drain the listener via `.drain()`."""
+    listener = InProcListener(name_of(kp.public))
+    postman = Postman(kp)
+    postman.attach_transport(Scheme.INPROC, InProcClient())
+    client = LightClient(me=kp, anchor=c.mgr.public, postman=postman)
+    for node in c.nodes:
+        client.add_bootstrap_peer(node.me.public, (Endpoint(address_of(node.me.public)),))
+    return client, listener
 
 
 def _provision_client(c: Cluster, kp: crypto.Keypair) -> None:
@@ -74,10 +86,16 @@ def _mutate_frame_to_client(
     return new_env.sign(server_kp, now).seal()
 
 
-def _pump(c: Cluster, client: LightClient, client_inbox: InProc, now: int, rounds: int = 5) -> None:
+def _pump(
+    c: Cluster,
+    client: LightClient,
+    client_listener: InProcListener,
+    now: int,
+    rounds: int = 5,
+) -> None:
     """Drive the wire: reconcile each node's peers against the current membership
     (`_reconcile_peers` -- so the client's P_GRANT-declared endpoint becomes a
-    dial-able peer), flush outbound on every side, and drain each inbox back into
+    dial-able peer), flush outbound on every side, and drain each listener back into
     `receive`. Repeat until quiet or `rounds` exhausted.
 
     NOTE we call `_reconcile_peers` rather than the full `node.tick(now)` here: the
@@ -93,13 +111,13 @@ def _pump(c: Cluster, client: LightClient, client_inbox: InProc, now: int, round
         client.tick(now)
         for node in c.nodes:
             node.postman.tick(now)
-        # Deliver each side's inbox.
+        # Deliver each side's listener via the public drain() API.
         delivered = 0
         for node in c.nodes:
-            for frame in c._transports[node.me.public].receive():
+            for frame in c.listeners[node.me.public].drain():
                 node.receive(frame, now)
                 delivered += 1
-        for frame in client_inbox.receive():
+        for frame in client_listener.drain():
             client.receive(frame, now)
             delivered += 1
         if delivered == 0:
@@ -112,19 +130,17 @@ class TestLightClientBootstrap(unittest.TestCase):
         client_kp = crypto.Keypair.generate()
         _provision_client(c, client_kp)
 
-        # Build the LightClient. Its Postman uses the module-scope INPROC dialler. The
-        # reverse direction (nodes dialling this client) is set up by each node's
-        # `_reconcile_peers` on tick, using the endpoints baked into the P_GRANT row.
-        client_postman = Postman(client_kp)
-        client = LightClient(me=client_kp, anchor=c.mgr.public, postman=client_postman)
-        for node in c.nodes:
-            client.add_bootstrap_peer(node.me.public, (Endpoint(address_of(node.me.public)),))
-        client_inbox = cast("InProc", client_postman._transports_by_scheme[Scheme.INPROC])
+        # Build the LightClient. `_build_light_client` constructs the InProcClient +
+        # InProcListener explicitly and attaches the client to the Postman -- same
+        # shape as production. The reverse direction (nodes dialling this client) is
+        # set up by each node's `_reconcile_peers` on tick, using the endpoints baked
+        # into the P_GRANT row.
+        client, client_listener = _build_light_client(c, client_kp)
 
         # Kick off bootstrap.
         client.bootstrap(T0 + DELTA)
-        _pump(c, client, client_inbox, T0 + DELTA)
-        _pump(c, client, client_inbox, T0 + 2 * DELTA)
+        _pump(c, client, client_listener, T0 + DELTA)
+        _pump(c, client, client_listener, T0 + 2 * DELTA)
 
         self.assertTrue(client.bootstrapped(), f"state {client.state.name}")
         ts = client.trusted_state
@@ -147,16 +163,11 @@ class TestLightClientRead(unittest.TestCase):
         client_kp = crypto.Keypair.generate()
         _provision_client(c, client_kp)
 
-        client_postman = Postman(client_kp)
-        client = LightClient(me=client_kp, anchor=c.mgr.public, postman=client_postman)
-        for node in c.nodes:
-            client.add_bootstrap_peer(node.me.public, (Endpoint(address_of(node.me.public)),))
-
-        client_inbox = cast("InProc", client_postman._transports_by_scheme[Scheme.INPROC])
+        client, client_listener = _build_light_client(c, client_kp)
 
         client.bootstrap(T0 + 2 * DELTA)
-        _pump(c, client, client_inbox, T0 + 2 * DELTA)
-        _pump(c, client, client_inbox, T0 + 3 * DELTA)
+        _pump(c, client, client_listener, T0 + 2 * DELTA)
+        _pump(c, client, client_listener, T0 + 3 * DELTA)
         self.assertTrue(client.bootstrapped())
 
         # Now do a read.
@@ -166,7 +177,7 @@ class TestLightClientRead(unittest.TestCase):
             peer=c.nodes[0].me.public,
             now=T0 + 4 * DELTA,
         )
-        _pump(c, client, client_inbox, T0 + 4 * DELTA)
+        _pump(c, client, client_listener, T0 + 4 * DELTA)
 
         result = client.poll(rid)
         self.assertNotIsInstance(result, type(PENDING), "read still pending")
@@ -196,16 +207,11 @@ class TestLightClientRead(unittest.TestCase):
         client_kp = crypto.Keypair.generate()
         _provision_client(c, client_kp)
 
-        client_postman = Postman(client_kp)
-        client = LightClient(me=client_kp, anchor=c.mgr.public, postman=client_postman)
-        for node in c.nodes:
-            client.add_bootstrap_peer(node.me.public, (Endpoint(address_of(node.me.public)),))
-
-        client_inbox = cast("InProc", client_postman._transports_by_scheme[Scheme.INPROC])
+        client, client_listener = _build_light_client(c, client_kp)
 
         client.bootstrap(T0 + 2 * DELTA)
-        _pump(c, client, client_inbox, T0 + 2 * DELTA)
-        _pump(c, client, client_inbox, T0 + 3 * DELTA)
+        _pump(c, client, client_listener, T0 + 2 * DELTA)
+        _pump(c, client, client_listener, T0 + 3 * DELTA)
         self.assertTrue(client.bootstrapped())
 
         rid = client.request_get(
@@ -215,7 +221,7 @@ class TestLightClientRead(unittest.TestCase):
             now=T0 + 4 * DELTA,
         )
 
-        # Custom pump: intercept the client's inbox and swap the value on any PROOF_REPLY.
+        # Custom pump: intercept the client's listener and swap the value on any PROOF_REPLY.
         # Everything else (bootstrap replies, sync noise) passes through untouched.
         server_kp = c.nodes[0].me
         now = T0 + 4 * DELTA
@@ -232,10 +238,10 @@ class TestLightClientRead(unittest.TestCase):
                 node.postman.tick(now)
             delivered = 0
             for node in c.nodes:
-                for frame in c._transports[node.me.public].receive():
+                for frame in c.listeners[node.me.public].drain():
                     node.receive(frame, now)
                     delivered += 1
-            for frame in client_inbox.receive():
+            for frame in client_listener.drain():
                 mutated_frame = _mutate_frame_to_client(frame, client_kp, server_kp, mutate, now)
                 client.receive(mutated_frame, now)
                 delivered += 1
@@ -252,16 +258,11 @@ class TestLightClientRead(unittest.TestCase):
         client_kp = crypto.Keypair.generate()
         _provision_client(c, client_kp)
 
-        client_postman = Postman(client_kp)
-        client = LightClient(me=client_kp, anchor=c.mgr.public, postman=client_postman)
-        for node in c.nodes:
-            client.add_bootstrap_peer(node.me.public, (Endpoint(address_of(node.me.public)),))
-
-        client_inbox = cast("InProc", client_postman._transports_by_scheme[Scheme.INPROC])
+        client, client_listener = _build_light_client(c, client_kp)
 
         client.bootstrap(T0 + DELTA)
-        _pump(c, client, client_inbox, T0 + DELTA)
-        _pump(c, client, client_inbox, T0 + 2 * DELTA)
+        _pump(c, client, client_listener, T0 + DELTA)
+        _pump(c, client, client_listener, T0 + 2 * DELTA)
         self.assertTrue(client.bootstrapped())
 
         # Move cluster far ahead so client's trusted head is stale.
@@ -274,7 +275,7 @@ class TestLightClientRead(unittest.TestCase):
             peer=c.nodes[0].me.public,
             now=T0 + 20 * DELTA,
         )
-        _pump(c, client, client_inbox, T0 + 20 * DELTA)
+        _pump(c, client, client_listener, T0 + 20 * DELTA)
 
         result = client.poll(rid)
         self.assertIsInstance(result, Failed)

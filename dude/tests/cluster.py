@@ -4,34 +4,25 @@
 # an integer the test advances, so a cluster's round is deterministic — no sockets, no threads, no
 # sleeping. Partitions are simulated by `postman.remove_peer(pubkey)` (see
 # #partitions-are-test-only) rather than by a switchboard-level cut/heal.
+#
+# EACH NODE OWNS AN InProcClient (send side, attached to Postman) AND AN InProcListener
+# (receive side, drained by `_quiesce`). Constructed explicitly per node before `node.tick`
+# fires reconciliation, so the shape is identical to what a production main() does with TCP
+# -- no dialler-per-scheme reach-through, no cast-into-private-state.
 
 from __future__ import annotations
-
-from typing import cast
 
 from ..consensus.bootstrap import bootstrap
 from ..core import crypto
 from ..net import Verb
 from ..net.address import Endpoint, Scheme
 from ..net.envelope import Envelope
-from ..net.postman import register_dialler
-from ..net.transports import InProc, address_of, name_of
+from ..net.transports import InProcClient, InProcListener, address_of, name_of
 from ..net.transports.inproc import _reset_for_tests
 from ..node import Node
 from ..store import Store, management, ops
 from ..store.management import Cert, Management, Role
 from ..tunables import DEFAULT
-
-
-def _inproc_dialler(_endpoint: Endpoint, me: crypto.Keypair) -> InProc:
-    """Construct an InProc for `me` -- registers it in the module-scope registry so peers
-    can reach us by name. Called by Postman when a peer's endpoint has scheme INPROC.
-
-    Ignores `_endpoint` because InProc's routing is by target name inside `send()`, not
-    by the dialler's endpoint parameter. Different from TCP where each endpoint would
-    dial to a different socket."""
-    return InProc(name_of(me.public))
-
 
 D = ops.STORE_DATA
 M = ops.STORE_MANAGEMENT
@@ -40,27 +31,21 @@ DELTA = DEFAULT.mempool.delta
 
 
 class Cluster:
-    """Three nodes and a switchboard. Deliberately not a fixture helper with options — a cluster you
-    can configure is a cluster whose test failures need debugging first."""
+    """Three nodes and their listeners. Deliberately not a fixture helper with options — a cluster
+    you can configure is a cluster whose test failures need debugging first."""
 
     def __init__(self, size: int = 3):
         # Reset the module-scope InProc registry, so a prior test's residual entries do not
         # collide with ours. (#inproc-is-a-loopback: the registry is process-wide, so tests
         # that construct clusters back-to-back share it and MUST manage their own hygiene.)
         _reset_for_tests()
-        # Register the InProc dialler so Postman knows how to dial INPROC endpoints.
-        # Idempotent per #postman-owns-dialling; re-registration is fine.
-        register_dialler(Scheme.INPROC, _inproc_dialler)
 
         self.mgr = crypto.Keypair.generate()
         self.keys = [crypto.Keypair.generate() for _ in range(size)]
         self.nodes: list[Node] = []
-        # Each Postman constructed by `Node(...)` will lazily dial its own InProc via the
-        # module-scope dialler on the first `add_peer` call. We keep a reference to each
-        # Node's transport so tests that need to drain (e.g. `_quiesce`) can find it.
-        # Typed as InProc because tests reach in for `.receive()`, which is InProc-specific
-        # (real transports don't need an inbox because the OS delivers to their fd).
-        self._transports: dict[crypto.PublicKey, InProc] = {}
+        # Public dict of every node's listener, keyed by pubkey. `_quiesce` drains via
+        # `listener.drain()` -- a public API, no cast, no reach into Postman internals.
+        self.listeners: dict[crypto.PublicKey, InProcListener] = {}
 
         # Every node starts with the SAME block 1 -- a manager-signed genesis block that
         # establishes the initial roster (#manager-sig-overrides-quorum). Every node's store
@@ -78,21 +63,20 @@ class Cluster:
             # at init; every node produces byte-equal block 1 because the inputs are identical).
             bootstrap(store, self.mgr, genesis)
             node = Node(kp, store)
+            # Listener registers this identity in the module-scope InProc registry so other
+            # nodes' clients can find us. Client is the send-side transport Postman attaches
+            # -- one per node, stateless, all outbound goes through it.
+            listener = InProcListener(name_of(kp.public))
+            self.listeners[kp.public] = listener
+            node.postman.attach_transport(Scheme.INPROC, InProcClient())
             self.nodes.append(node)
         # No explicit peer wiring here (#roster-drives-peers). Each Node's first `tick`
         # runs `_reconcile_peers`, which reads `mgmt.roster()` + `mgmt.nodes()` from the
         # store the bootstrap block already populated and calls `postman.add_peer` for
-        # every other roster member. The `postman._transports_by_scheme[INPROC]` entry
-        # is populated as a side effect of that first `add_peer`, so we need to force
-        # one tick here to have transports available for `_quiesce` to drain.
+        # every other roster member. The listener is already registered, so peers can
+        # reach us the moment we advertise our address.
         for node in self.nodes:
             node.tick(T0)
-            # Cast is safe because the dialler for INPROC always returns InProc; the
-            # narrowing is only needed because Postman's cache is typed generically.
-            self._transports[node.me.public] = cast(
-                "InProc",
-                node.postman._transports_by_scheme[Scheme.INPROC],
-            )
         self._clock: int = T0
         """The cluster's own monotone clock. `pump(now)` treats its `now` argument as a floor:
         if a test calls `pump(T0)` then `pump(T0 + DELTA)`, the second pump continues from
@@ -189,8 +173,9 @@ class Cluster:
         (SUBMIT re-flood, HELD/SIG relays) happen inside one bucket in production; the harness
         preserves that shape here.
 
-        Frames are pulled from each node's own InProc transport (module-scope registry
-        does the routing at send-time). A partitioned node's transport still holds any
+        Frames are pulled from each node's own listener via `.drain()` -- a public API on
+        the `Listener` protocol, identical to what a production main loop would call in
+        the tick between `_run` iterations. A partitioned node's listener still holds any
         frames delivered before the partition — for `pump_without`, those queued frames
         stay queued and are drained normally when the node comes back."""
         for _ in range(len(self.nodes) + 1):
@@ -201,8 +186,7 @@ class Cluster:
             for i, node in enumerate(self.nodes):
                 if i in away:
                     continue
-                frames = self._transports[node.me.public].receive()
-                for frame in frames:
+                for frame in self.listeners[node.me.public].drain():
                     node.receive(frame, now)
                     delivered += 1
             if delivered == 0:

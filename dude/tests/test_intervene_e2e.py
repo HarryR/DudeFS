@@ -42,10 +42,9 @@ def _sync_only_pump(c: Cluster, now: int, iterations: int = 30) -> int:
             # follower.tick). Follower is otherwise disconnected from the wire.
             node._flush_follower(now)
             node.postman.tick(now)
-        # Deliver frames from each node's own transport inbox.
+        # Deliver frames from each node's own listener via the public drain() API.
         for node in c.nodes:
-            frames = c._transports[node.me.public].receive()
-            for frame in frames:
+            for frame in c.listeners[node.me.public].drain():
                 node.receive(frame, now)
         now += DELTA
     return now

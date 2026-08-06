@@ -9,12 +9,11 @@ proves that the Node dispatch wiring reaches it correctly through the wire stack
 from __future__ import annotations
 
 import unittest
-from typing import cast
 
 from dude.consensus.settle_round import SettledBlock
 from dude.core import crypto
 from dude.net.address import Endpoint, Scheme
-from dude.net.transports import InProc, address_of
+from dude.net.transports import InProcClient, InProcListener, address_of, name_of
 from dude.node import Node
 from dude.store import Store, ops
 
@@ -47,10 +46,15 @@ class TestFreshNodeJoinsClusterAndCatchesUp(unittest.TestCase):
         assert producer_head is not None and producer_head >= 3
 
         # A joiner starting with only the manager pubkey -- no bootstrap, no genesis.
+        # Construct the listener + client explicitly, matching what a production
+        # `main()` would do (client + listener per identity, attach client to Postman,
+        # drain listener via the pump).
         joiner_kp = crypto.Keypair.generate()
         joiner_store = Store()
         joiner_store.provision(c.mgr.public)
+        joiner_listener = InProcListener(name_of(joiner_kp.public))
         joiner = Node(joiner_kp, joiner_store)
+        joiner.postman.attach_transport(Scheme.INPROC, InProcClient())
 
         # Bootstrap-outside-the-roster wiring: reconciliation from `mgmt.roster()`
         # doesn't add the joiner to node 0's peers (joiner isn't in the roster yet), and
@@ -65,32 +69,26 @@ class TestFreshNodeJoinsClusterAndCatchesUp(unittest.TestCase):
             joiner_kp.public,
             (Endpoint(address_of(joiner_kp.public)),),
         )
-        # Force the joiner's Postman to dial the INPROC transport by triggering the first
-        # add_peer above; grab it for the drain loop below.
-        joiner_transport = cast(
-            "InProc",
-            joiner.postman._transports_by_scheme[Scheme.INPROC],
-        )
 
         # Pump time forward with all four nodes. Each pump: tick every node (drives their
-        # follower + coordinator), quiesce dissemination. The joiner's tick fires HEIGHT
-        # polls; node 0 answers; joiner pulls; verifies; commits; repeat. Round enforces
-        # monotone `now`, so start from wherever the cluster's own clock ended up.
+        # follower + coordinator), quiesce dissemination via each listener's `.drain()`.
+        # The joiner's tick fires HEIGHT polls; node 0 answers; joiner pulls; verifies;
+        # commits; repeat. Round enforces monotone `now`, so start from wherever the
+        # cluster's own clock ended up.
+        listeners_by_node = {
+            **c.listeners,
+            joiner_kp.public: joiner_listener,
+        }
         now = c._clock
         for _ in range(20):
             for node in [*c.nodes, joiner]:
                 node.tick(now)
-            # Deliver everything in flight.
             for _ in range(10):
                 delivered = 0
                 for node in [*c.nodes, joiner]:
                     node.postman.tick(now)
                 for node in [*c.nodes, joiner]:
-                    transport = (
-                        joiner_transport if node is joiner else c._transports[node.me.public]
-                    )
-                    frames = transport.receive()
-                    for frame in frames:
+                    for frame in listeners_by_node[node.me.public].drain():
                         node.receive(frame, now)
                         delivered += 1
                 if delivered == 0:

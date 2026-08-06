@@ -9,7 +9,14 @@
 # retry is a transmission the link layer cannot count, which breaks Karn's rule and the retry budget
 # at once), no timeouts, no state, no opinions about what it is carrying.
 
-from .inproc import InProc, address_of, name_of
+from .inproc import InProcClient, InProcListener, address_of, name_of
 from .tcp import TCPClient, TCPListener
 
-__all__ = ["InProc", "TCPClient", "TCPListener", "address_of", "name_of"]
+__all__ = [
+    "InProcClient",
+    "InProcListener",
+    "TCPClient",
+    "TCPListener",
+    "address_of",
+    "name_of",
+]
