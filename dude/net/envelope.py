@@ -138,6 +138,19 @@ class Verb(IntEnum):
 type MessageId = bytes
 MESSAGE_ID_SIZE = 16
 
+MAX_FRAME_BYTES = 1 << 24
+"""Cap on the wire size of one `Frame`. Every stream carrier (TCP, UNIX, any future
+byte-stream) must refuse to send anything larger and must refuse to allocate on receive
+anything larger. 16 MiB is far above any well-formed envelope in this codebase (an
+envelope carries one op, one settled block, one sync reply — none approach this) and
+small enough that a hostile stream advertising "the next frame is 4 GiB" costs one
+length-word read and a connection close, not a 4 GiB allocation.
+
+CLUSTER-WIDE INVARIANT, not a tunable. Two peers with different caps see well-formed
+frames from each other as refusals; a per-carrier or per-node value would silently
+desync. Living beside `Frame`, imported by every carrier that has framing, is what
+keeps the number one number."""
+
 
 def new_message_id() -> MessageId:
     """A fresh correlation id.

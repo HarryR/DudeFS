@@ -30,17 +30,13 @@ from dataclasses import dataclass, field
 
 from ...core.errors import DudeError
 from ..address import Address, Scheme
-from ..envelope import Frame
+from ..envelope import MAX_FRAME_BYTES, Frame
 from ..link import LinkError, Transport
 
 _LEN = struct.Struct(">I")
-"""4-byte big-endian frame length prefix. Max frame ~4 GiB, capped in practice at
-`_MAX_FRAME` -- any advertised size beyond that is treated as a malformed sender and the
-connection is dropped."""
-
-_MAX_FRAME = 1 << 24  # 16 MiB -- generous ceiling; a well-formed envelope is much smaller.
-"""Cap on advertised frame length. A stream that says "the next frame is 4 GiB" is either
-malformed or hostile; either way, cheaper to drop the connection than to allocate."""
+"""4-byte big-endian frame length prefix. Max frame ~4 GiB by the field itself, capped
+in practice by `MAX_FRAME_BYTES` (from `dude.net.envelope`) -- any advertised size
+beyond that is treated as a malformed sender and the connection is dropped."""
 
 
 @dataclass(slots=True)
@@ -104,8 +100,8 @@ class TCP(Transport):
         if address.scheme is not Scheme.TCP:
             raise LinkError(f"tcp cannot dial {address.scheme.value.decode()}")
         payload = frame.raw
-        if len(payload) > _MAX_FRAME:
-            raise LinkError(f"frame too large: {len(payload)} > {_MAX_FRAME}")
+        if len(payload) > MAX_FRAME_BYTES:
+            raise LinkError(f"frame too large: {len(payload)} > {MAX_FRAME_BYTES}")
         blob = _LEN.pack(len(payload)) + payload
         sock = self._outbound.get(address)
         if sock is None:
@@ -202,7 +198,7 @@ class TCP(Transport):
         pure buffer parsing."""
         while len(buf) >= _LEN.size:
             (length,) = _LEN.unpack_from(buf, 0)
-            if length > _MAX_FRAME:
+            if length > MAX_FRAME_BYTES:
                 self._closesock(sock, out=False)
                 return
             if len(buf) < _LEN.size + length:
