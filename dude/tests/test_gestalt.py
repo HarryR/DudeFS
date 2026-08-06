@@ -314,14 +314,11 @@ def _submit_and_wait(  # noqa: PLR0913, PLR0917 -- one helper with all the param
     """Submit `tx` to `nodes[to]` and RETRY every bucket until `observed()` is true or
     `max_bucket_attempts` runs out. Returns whether the observation happened.
 
-    Why the retry loop: `Node._on_submit` refloods once, best-effort. If a single
-    SUBMIT racing a bucket boundary lands in the target's mempool AFTER the boundary
-    but its reflood to peers doesn't complete before THEIR boundary, the target
-    proposes the tx alone next round -- nodes[1..N-1] have no body so the largest-
-    intersection-over-quorum degenerates to empty and the tx sits in one mempool for
-    a full cycle. In production a client tracking the SUBMIT via mailbox reissues on
-    timeout; in tests we do the same explicitly. Idempotent by op_hash so multiple
-    landings all dedup to one mempool entry."""
+    In production a client tracking the SUBMIT via mailbox reissues on timeout; in tests
+    we do the same explicitly. Idempotent by op_hash so multiple landings all dedup to
+    one mempool entry, and the retry is a cheap defensive backstop for any transient
+    wire hiccup the scenario cannot rehearse -- the fix for HELD-drop-during-tick-gap
+    (Node._run ticks before dispatch) is what makes a SINGLE submit reliably settle."""
     target = nodes[to]
     rec = target.mgmt.nodes()[target.me.public]
     import contextlib  # noqa: PLC0415 -- local; only used here
@@ -515,15 +512,28 @@ class TestScenario(unittest.TestCase):
                 delta_ms=_FAST.mempool.delta,
             )
             if not ok_phase3:
+                # Small diagnostic: the two smoking guns for consensus stalls in this
+                # scenario are (a) `add_in_pool` differing across nodes (dissemination
+                # gap) and (b) `peers_reporting=0` while `round_local_has_add=True`
+                # (HELDs are silently dropped -- the bug fixed by "tick before every
+                # frame" in `Node._run`). Keep both fields when adding assertions.
                 diag_lines = ["phase 3: change_roster(add) did not settle on every existing node"]
                 for i, n in enumerate(nodes):
-                    roster = n.mgmt.roster()
-                    pool = n.coordinator.mempool.pending
-                    mp_size = sum(len(v) for v in pool.values())
+                    coord = n.coordinator
+                    r = coord.current_round
+                    in_pool = any(add_tx.op_hash in b for b in coord.mempool.pending.values())
+                    r_local = (
+                        r is not None
+                        and r._local_bodies is not None
+                        and add_tx.op_hash in r._local_bodies
+                    )
+                    r_peers = len(r._peer_holds) if r else 0
                     diag_lines.append(
                         f"  node{i}: head={n.store.head_block_num()} "
-                        f"roster_size={len(roster)} n4_in_roster={n4_kp.public in roster} "
-                        f"mempool_size={mp_size}"
+                        f"round_bucket={r.bucket() if r else None} "
+                        f"n4_in_roster={n4_kp.public in n.mgmt.roster()} "
+                        f"add_in_pool={in_pool} round_local_has_add={r_local} "
+                        f"peers_reporting={r_peers}"
                     )
                 raise AssertionError("\n".join(diag_lines))
             # Bring node 4 up: it needs its store bootstrapped with the SAME genesis

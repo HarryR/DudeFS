@@ -162,14 +162,21 @@ class Coordinator:
         """A HELD or SIG envelope from a peer. Route to the in-flight Round if its bucket
         matches, drop otherwise. Under #one-of-each-in-flight there is exactly one Round in
         flight at a time; a message for a different bucket is either a stragler from a
-        past-done bucket or gossip from a peer ahead of us."""
+        past-done bucket or gossip from a peer ahead of us.
+
+        CALLER CONTRACT: `tick(now)` must have run at (or after) `now` before this call, so
+        `current_round` reflects the bucket the driver would open at `now`. `Node._run`
+        does this by ticking before dispatching every inbound frame; without it, a HELD/SIG
+        for the current bucket that arrived microseconds before this node's own scheduled
+        tick was dropped, and consensus stalled on any tx the whole cluster held (see
+        `Node._run`'s docstring for the found-and-fixed writeup)."""
         try:
             bucket = RoundMsg.bucket_of(env.env.body)
         except RoundAdapterError:
             return  # malformed body, dropped
         r = self.current_round
         if r is None or r.bucket() != bucket:
-            return  # no matching Round: already done or not opened yet -- routine
+            return  # no matching Round: truly past or truly future -- routine
         try:
             self.adapter.deliver(env, r, now)
         except RoundAdapterError:

@@ -525,19 +525,29 @@ class Node:
         `queue.get(timeout=...)` is the whole rate-limiting mechanism -- the loop wakes
         immediately when a frame arrives OR after `tick_interval` when quiet. No sleep,
         no spin. Standard Python producer/consumer shape, mechanical Tokio translation
-        (channel + select! + interval)."""
+        (channel + select! + interval).
+
+        TICK BEFORE EVERY FRAME, and it did not `[H]`: a peer's HELD/SIG for the current
+        bucket often arrives in the ~tick_interval window BEFORE this node's own scheduled
+        tick has opened the matching Round. `Coordinator.on_round_msg` drops the message
+        as "no matching Round" and the round finalises with `holdings < quorum` on every
+        node in a symmetric way -- empty slice signed, empty block ratified, the tx sits
+        in every node's mempool forever while empty blocks stream past. Ticking before
+        dispatch closes that gap: whichever event advances state (a scheduled tick or an
+        inbound frame), the Coordinator sees `now` before we ask it to route by bucket."""
         tick_interval_ms = self.tunables.tick_interval
         last_tick = now_ms()
         while not self._stopping.is_set():
             try:
                 frame = self._inbox.get(timeout=tick_interval_ms / 1000)
-                self.receive(frame, now_ms())
             except queue.Empty:
-                pass
+                frame = None
             now = now_ms()
-            if now - last_tick >= tick_interval_ms:
+            if frame is not None or now - last_tick >= tick_interval_ms:
                 self.tick(now)
                 last_tick = now
+            if frame is not None:
+                self.receive(frame, now)
 
     def _flush_follower(self, now: Millis) -> None:
         """Post the Follower's outbox to the mailbox. Follower emits `(peer, SyncMsg)` pairs for
