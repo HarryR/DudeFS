@@ -317,8 +317,10 @@ def _submit_and_wait(  # noqa: PLR0913, PLR0917 -- one helper with all the param
     In production a client tracking the SUBMIT via mailbox reissues on timeout; in tests
     we do the same explicitly. Idempotent by op_hash so multiple landings all dedup to
     one mempool entry, and the retry is a cheap defensive backstop for any transient
-    wire hiccup the scenario cannot rehearse -- the fix for HELD-drop-during-tick-gap
-    (Node._run ticks before dispatch) is what makes a SINGLE submit reliably settle."""
+    wire hiccup the scenario cannot rehearse -- the actual reason a single submit reliably
+    settles now is `Coordinator.on_round_msg` / `on_settle_msg` invoking `Coordinator.tick(now)`
+    before dispatch, so a peer's HELD/SIG arriving before our scheduled tick finds consensus
+    state already advanced to `now`."""
     target = nodes[to]
     rec = target.mgmt.nodes()[target.me.public]
     import contextlib  # noqa: PLC0415 -- local; only used here

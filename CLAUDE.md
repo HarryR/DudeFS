@@ -88,13 +88,20 @@ Each of these cost real time, most of them twice.
    to empty would have made an unauthenticated leaf constructible by forgetting an argument;
    `Mailbox.post`'s `await_reply` defaulting to `False` meant no production request ever awaited its
    answer. Make the wrong thing unsayable rather than discouraged.
-9. **A driver that ticks on a timer but dispatches out of band.** `Node._run` used to tick on the
-   `tick_interval` cadence and dispatch inbound frames whenever they arrived. A peer's HELD/SIG for
-   the current bucket often reached us in the ~tick_interval gap before our own scheduled tick had
-   opened the matching Round; `Coordinator.on_round_msg` dropped it as "no matching Round" and every
-   node signed an empty slice on a bucket the whole cluster held the same tx for. The mempool
-   stayed at 1 tx, empty blocks streamed past, and a single SUBMIT never settled -- looked exactly
-   like a reflood-loss bug at every layer we inspected. The fix is a caller contract: whichever
-   event advances state (a scheduled tick or an inbound frame), the state advances first. Written
-   into the docstrings of both `Node._run` and `Coordinator.on_round_msg` so the two ends can't
-   drift.
+9. **State advancement scheduled on a timer that races the events depending on it.** Consensus
+   state (`settling`, `current_round`, `current_bucket`, `mempool`) was only advanced by
+   `Coordinator.tick`, called on `tick_interval` cadence from `Node._run`. `Coordinator.on_round_msg`
+   and `on_settle_msg` dispatched incoming frames by routing on THAT state -- so a peer's HELD/SIG
+   for the current bucket that arrived in the ~tick_interval window before our own tick had
+   advanced state was dropped as "no matching Round" / "not for the block we are settling", and
+   consensus stalled on buckets the whole cluster held the same tx for. Mempool stayed at one tx
+   per node, empty blocks streamed past, one SUBMIT never settled -- looked exactly like a
+   reflood-loss bug at every layer we inspected. First try (tick-per-frame in `Node._run`) was
+   correct but blunt: O(F) full node ticks including reconcile / postman / follower. Second try
+   (a narrower `_close_current_bucket` sub-primitive) was insufficient because opening the next
+   Round requires the previous one to have TICKED to ABANDONED first. Real fix: `on_round_msg` and
+   `on_settle_msg` invoke `Coordinator.tick(now)` themselves before dispatching -- the atomic
+   state-advance primitive is what the dispatch path needs, and it's O(1) in steady state and only
+   runs per-Round/Settle-message (not per-frame). The scheduled tick and the message-triggered
+   tick land at the same state; the naming makes the invariant load-bearing rather than a lucky
+   property of timing.

@@ -164,16 +164,19 @@ class Coordinator:
         flight at a time; a message for a different bucket is either a stragler from a
         past-done bucket or gossip from a peer ahead of us.
 
-        CALLER CONTRACT: `tick(now)` must have run at (or after) `now` before this call, so
-        `current_round` reflects the bucket the driver would open at `now`. `Node._run`
-        does this by ticking before dispatching every inbound frame; without it, a HELD/SIG
-        for the current bucket that arrived microseconds before this node's own scheduled
-        tick was dropped, and consensus stalled on any tx the whole cluster held (see
-        `Node._run`'s docstring for the found-and-fixed writeup)."""
+        ADVANCES STATE TO `now` FIRST. A peer's message is itself evidence wall-clock has
+        crossed, and dropping consists of dispatching by bucket, so `current_round` must
+        reflect the bucket the driver would have opened at `now`. `_close_current_bucket`
+        alone is not enough here: opening the next Round requires the previous one to have
+        cleared (ratified + promoted, or abandoned), which in turn needs `current_round.tick`
+        and possibly `_on_round_abandoned`. `self.tick(now)` is the full atomic state
+        advancement -- microseconds when nothing needs to change, only invoked for Round
+        messages (not every frame). See CLAUDE.md note 9."""
         try:
             bucket = RoundMsg.bucket_of(env.env.body)
         except RoundAdapterError:
             return  # malformed body, dropped
+        self.tick(now)
         r = self.current_round
         if r is None or r.bucket() != bucket:
             return  # no matching Round: truly past or truly future -- routine
@@ -186,11 +189,16 @@ class Coordinator:
         """A SETTLE_SIG envelope from a peer. Route to the currently-settling block if the
         slice_hash matches, drop otherwise. If we are behind (peer's slice is for a bucket we
         have not ratified yet), the sig is dropped -- gossip will catch us up naturally when
-        we ratify our own view of that bucket."""
+        we ratify our own view of that bucket.
+
+        Same state-advancement contract as `on_round_msg`: `self.tick(now)` before dispatch,
+        so a SettleSig arriving just after our Round B ratified but before our scheduled tick
+        promoted it into the settling slot lands in the block that's now there."""
         try:
             sh = SettleSig.slice_hash_of(env.env.body)
         except SettleAdapterError:
             return
+        self.tick(now)
         if self.settling is None or self.settling.block.slice_hash != sh:
             return  # not for the block we are settling
         try:
@@ -243,11 +251,35 @@ class Coordinator:
         ):
             self._promote_to_settling(now)
 
-        # Swap on bucket boundaries: freeze the current mempool into a Round, open a fresh
-        # mempool for the next bucket. Only if the previous Round has fully cleared -- if
-        # `current_round` still holds a ratified block waiting for settling to free, this
-        # bucket boundary is skipped and the current mempool keeps collecting; the txs join
-        # the eventual next Round when the pipeline unblocks.
+        # Freeze mempool + open the next Round. See `_close_current_bucket` for why the
+        # primitive is factored: `on_round_msg` calls it too, so a peer's HELD/SIG that
+        # arrives before our own scheduled tick still lands in an open Round.
+        self._close_current_bucket(now)
+
+    def _close_current_bucket(self, now: Millis) -> None:
+        """Freeze the current mempool, install a fresh one, open the next Round -- the atomic
+        primitive for advancing `(mempool, current_bucket, current_round)`.
+
+        Callable from any path that has learned wall-clock has crossed `current_bucket + 1`'s
+        start. Two such paths exist:
+          * the scheduled `tick(now_ms())`, and
+          * `on_round_msg` receiving a HELD/SIG for a bucket ahead of ours -- a peer's message
+            is proof at least one node has crossed, and under the clock-skew bound we must
+            have too.
+
+        Naming the primitive is what keeps the two callers from drifting: an unnamed atomic
+        sequence has one caller by accident, a named one has any caller with the same
+        standing (#failure-modes note 9). Before this was factored, HELD/SIG arriving in the
+        ~tick_interval gap before our tick opened the matching Round was silently dropped as
+        "no matching Round" and every node signed empty slices on buckets the whole cluster
+        held the same tx for.
+
+        NO-OP when caught up, or when a Round is still in flight -- #one-of-each-in-flight
+        means Round B+1 waits for Round B to clear (ratify + promote to settling, or abandon).
+        Safe to call speculatively; the guards make repeated calls at the same `now` idempotent.
+
+        ATOMIC by construction: the three steps run inside one method call under Python's GIL,
+        no observer sees a torn intermediate. A threaded port takes one lock around the body."""
         while self.current_bucket < self._bucket_of(now) and self.current_round is None:
             frozen = self.mempool
             self.mempool = Mempool(self.tunables.mempool)
