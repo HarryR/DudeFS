@@ -212,11 +212,18 @@ def _wrap_key(epoch: int, who: crypto.PublicKey) -> bytes:
     return P_WRAP + epoch.to_bytes(8, "big") + who
 
 
-class Management:
-    """The management store, read and written through one place.
+class MgmtReader:
+    """The management store's READ surface -- every query that returns pure data (bool,
+    dict, Grant, NodeRecord, ...). Used by:
 
-    Self-contained by design: a caller that holds this needs no other knowledge of how membership,
-    authorisation or key distribution are encoded."""
+      * `settle.evaluate`'s auth check, with a Layer-Reader passed to `may_write`.
+      * External observation (`node.mgmt.roster()`, `store.mgmt.grant_of(...)`) via
+        the Store's convenience wrappers.
+      * Composed read snapshots (`with store.snapshot() as r: MgmtReader(r).nodes()`)
+        when a caller needs a coherent moment across multiple reads.
+
+    Self-contained: a caller that holds this needs no other knowledge of how membership,
+    authorisation, or key distribution are encoded."""
 
     def __init__(self, store: Store, store_id: int = ops.STORE_MANAGEMENT):
         self.store = store
@@ -590,6 +597,47 @@ class Management:
         raw = self.store.get(self.store_id, _wrap_key(epoch, who))
         return crypto.SealedBlob(raw[1]) if raw else None
 
+    def domain_groups(self) -> dict[Domain, frozenset[crypto.PublicKey]]:
+        """Which nodes share each label. A pure fold over the roster."""
+        groups: dict[Domain, set[crypto.PublicKey]] = {}
+        for rec in self.nodes().values():
+            for d in rec.domains:
+                groups.setdefault(d, set()).add(rec.identity)
+        return {d: frozenset(m) for d, m in groups.items()}
+
+    def check_domains(self) -> dict[Domain, int]:
+        """Domains over the advisory `max_domain(n)` bound. Empty when composition is sound.
+
+        ADVISORY, NOT ENFORCEMENT. `change_roster` does NOT refuse on this -- callers use it
+        for operator inspection (#quorum-gate, `quorum.domain_advisory`). In production this
+        IS the failure mode that bites (single-provider concentration → provider outage →
+        cluster loses quorum until recovery), which is why it is worth reporting; it stays
+        advisory because hard refusal blocks legitimate incremental improvements."""
+        counts: dict[Domain, int] = {}
+        for rec in self.nodes().values():
+            for d in rec.domains:
+                counts[d] = counts.get(d, 0) + 1
+        return quorum.domain_advisory(counts, len(self.nodes()))
+
+
+class MgmtWriter(MgmtReader):
+    """The management store's TRANSACTION-COMPOSING surface. Every method here READS the
+    store (inherited from MgmtReader) to compose an unsigned `ops.Transaction`; the tx
+    then gets signed and submitted through consensus. Nothing here writes to the store
+    directly -- that's `Store.commit_block`'s job at settle time.
+
+    Snapshot consistency matters here: a composed tx's cert can reference the roster,
+    the anchor, and the current commitment; if those reads race a writer's commit, the
+    tx's eval-time check will fail. Callers should wrap in a snapshot scope:
+
+        with store.snapshot() as r:
+            tx = MgmtWriter(r).change_roster(commitment_signer=..., add=...)
+        tx.sign(mgr, now).submit(...)
+
+    Store's convenience `store.mgmt.change_roster(...)` bypass exists for one-shot
+    read-consistent-enough cases (a quiet cluster) but is not safe under a concurrent
+    writer -- use the snapshot form for any operator-authored change_roster."""
+
     # -- writes: emit mutations, apply nothing -------------------------------- #
 
     def change_roster(
@@ -747,28 +795,6 @@ class Management:
             add=(NodeRecord(who, endpoints, cert, domains),),
         )
 
-    def domain_groups(self) -> dict[Domain, frozenset[crypto.PublicKey]]:
-        """Which nodes share each label. A pure fold over the roster."""
-        groups: dict[Domain, set[crypto.PublicKey]] = {}
-        for rec in self.nodes().values():
-            for d in rec.domains:
-                groups.setdefault(d, set()).add(rec.identity)
-        return {d: frozenset(m) for d, m in groups.items()}
-
-    def check_domains(self) -> dict[Domain, int]:
-        """Domains over the advisory `max_domain(n)` bound. Empty when composition is sound.
-
-        ADVISORY, NOT ENFORCEMENT. `change_roster` does NOT refuse on this -- callers use it
-        for operator inspection (#quorum-gate, `quorum.domain_advisory`). In production this
-        IS the failure mode that bites (single-provider concentration → provider outage →
-        cluster loses quorum until recovery), which is why it is worth reporting; it stays
-        advisory because hard refusal blocks legitimate incremental improvements."""
-        counts: dict[Domain, int] = {}
-        for rec in self.nodes().values():
-            for d in rec.domains:
-                counts[d] = counts.get(d, 0) + 1
-        return quorum.domain_advisory(counts, len(self.nodes()))
-
     def remove_node(
         self, who: crypto.PublicKey, *, commitment_signer: crypto.Keypair
     ) -> ops.Transaction:
@@ -853,3 +879,11 @@ class Management:
         return ops.writes(
             *(ops.Set(self.store_id, _wrap_key(epoch, who), wraps[who]) for who in sorted(wraps))
         )
+
+
+# Backward-compatibility alias. `Management(store)` continues to construct a
+# tx-composer object with all methods. New code that composes state-changing txs
+# should prefer `MgmtWriter(reader)` explicitly, inside a `store.snapshot()` scope,
+# so the reads that compose the tx see a consistent snapshot (Bug A prevention).
+# Pure-read callers can use MgmtReader or `Store.mgmt` for a one-shot read.
+Management = MgmtWriter
