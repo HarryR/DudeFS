@@ -3,7 +3,7 @@
 The scenario: the manager holds the anchor cold-key. They call `intervene()` against ONE node's
 store, which commits a manager-signed block directly (bypassing consensus). The rest of the
 cluster sees that node's head advance via routine HEIGHT polls, pulls the new block via
-GETBLOCK, verifies it against the anchor slot in `Management.authorization`, and commits.
+GETBLOCK, verifies it against the anchor slot in `MgmtReader.authorises`, and commits.
 
 This is the load-bearing property: an operator holding the anchor key can push a block into
 one node, and normal sync propagates it to every other node with no special path -- no
@@ -25,7 +25,7 @@ import unittest
 from dude.consensus.bootstrap import intervene
 from dude.consensus.settle_round import SettledBlock
 from dude.core import crypto
-from dude.store.management import Cert, Role
+from dude.store.management import Cert, MgmtWriter, Role
 
 from .cluster import DELTA, Cluster, D
 
@@ -63,12 +63,12 @@ class TestIntervenePropagatesViaSync(unittest.TestCase):
 
         # A fresh client identity that the manager will grant into the cluster via
         # intervention. Any deterministic tx would do; a grant makes the effect observable
-        # in Management.grant_of() after propagation.
+        # in MgmtReader.grant_of() after propagation.
         new_client = crypto.Keypair.generate()
         pop = new_client.prove_possession()
         grant_tx = (
-            c.nodes[0]
-            .mgmt.authorise(
+            MgmtWriter(c.nodes[0].store)
+            .authorise(
                 new_client.public,
                 Role.CLIENT,
                 stores=frozenset({D}),
@@ -87,7 +87,7 @@ class TestIntervenePropagatesViaSync(unittest.TestCase):
         self.assertEqual(c.nodes[2].store.head_block_num(), 1)
 
         # Drive sync only (no Coordinator). Nodes 1 and 2 poll HEIGHT; node 0 replies "I'm
-        # at 2"; nodes 1 and 2 pull block 2 via GETBLOCK; verify via Management.authorization
+        # at 2"; nodes 1 and 2 pull block 2 via GETBLOCK; verify via MgmtReader.authorises
         # (which accepts the manager slot); commit. No special wire path, no special verifier.
         _sync_only_pump(c, c._clock, iterations=30)
 
@@ -108,7 +108,7 @@ class TestIntervenePropagatesViaSync(unittest.TestCase):
             block_hashes.add(SettledBlock.decode(raw).block_hash)
         self.assertEqual(len(block_hashes), 1, "nodes disagree on block 2 identity")
 
-        # And the grant is visible in every node's Management view -- proves the tx applied,
+        # And the grant is visible in every node's management view -- proves the tx applied,
         # not just that the block bytes were stored.
         for i, node in enumerate(c.nodes):
             grant = node.mgmt.grant_of(new_client.public)

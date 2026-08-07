@@ -4,7 +4,7 @@ emergency-intervention path.
 Two distinct "manager" concepts (#anchor-is-the-axiom + #role-manager-grant):
   * The **anchor** — one immutable pubkey per store, provisioned at `store.provision()`.
     `may_write` and `may_send` return True unconditionally for it. Holds bitmap slot N in
-    `Management.authorization` for the block-level override.
+    `MgmtWriter.authorises` (inherited) for the block-level override.
   * A **Role.MANAGER grant** — any number of runtime-granted identities. Blanket authorship
     via `may_write`/`may_send`. Does NOT get the block override.
 
@@ -22,7 +22,7 @@ from ..core import crypto
 from ..core.errors import DudeError, InvariantError
 from ..net.address import Address, Endpoint, Scheme
 from ..store import Store, ops
-from ..store.management import Cert, Management, ManagementError, NodeRecord, Role
+from ..store.management import Cert, ManagementError, MgmtWriter, NodeRecord, Role
 
 T0 = 1_700_000_000_000
 
@@ -31,10 +31,10 @@ def _sign(kp: crypto.Keypair, tx: ops.Transaction) -> ops.SignedTransaction:
     return tx.sign(kp, T0)
 
 
-def _provisioned(anchor_kp: crypto.Keypair) -> tuple[Store, Management]:
+def _provisioned(anchor_kp: crypto.Keypair) -> tuple[Store, MgmtWriter]:
     s = Store()
     s.provision(anchor_kp.public)
-    return s, Management(s)
+    return s, MgmtWriter(s)
 
 
 # --------------------------------------------------------------------------------------------- #
@@ -137,9 +137,9 @@ class TestRoleManagerGrant(unittest.TestCase):
 
     def test_role_manager_does_not_get_block_override(self):
         """A Role.MANAGER grant may author operations blanket, but its signature does NOT
-        satisfy `Management.authorization`'s manager-slot -- that slot is anchor-only
+        satisfy `MgmtReader.authorises`' manager-slot -- that slot is anchor-only
         (#anchor-is-the-axiom). Wire this by fabricating a bitmap that names the manager
-        slot with a warm-manager sig; authorization returns False."""
+        slot with a warm-manager sig; `authorises` returns False."""
         anchor = crypto.Keypair.generate()
         warm_mgr = crypto.Keypair.generate()
         s, mgmt = _provisioned(anchor)
@@ -156,14 +156,12 @@ class TestRoleManagerGrant(unittest.TestCase):
         # the manager slot with warm_mgr's sig.
         payload = b"any payload"
         warm_sig = warm_mgr.sign(payload)
-        signers, sigs = crypto.Ed25519ListMultiSig.combine({0: warm_sig}, 1)
-        # authorization checks the anchor slot against `store.anchor()`, which is anchor's
+        # `authorises` checks the anchor slot against `store.anchor()`, which is anchor's
         # pubkey -- NOT warm_mgr's. warm_sig doesn't verify against anchor's pubkey.
-        self.assertFalse(mgmt.authorization(signers, tuple(sigs), payload))
+        self.assertFalse(mgmt.authorises(crypto.MultiSig.combine({0: warm_sig}, 1), payload))
         # And the anchor's own sig at the same slot DOES verify.
         anchor_sig = anchor.sign(payload)
-        signers, sigs = crypto.Ed25519ListMultiSig.combine({0: anchor_sig}, 1)
-        self.assertTrue(mgmt.authorization(signers, tuple(sigs), payload))
+        self.assertTrue(mgmt.authorises(crypto.MultiSig.combine({0: anchor_sig}, 1), payload))
 
 
 class TestRoleManagerRotation(unittest.TestCase):
@@ -214,8 +212,7 @@ class TestRoleManagerRotation(unittest.TestCase):
         # Neither reaches the block override -- that stays anchor-only.
         payload = b"payload"
         m1_sig = m1.sign(payload)
-        signers, sigs = crypto.Ed25519ListMultiSig.combine({0: m1_sig}, 1)
-        self.assertFalse(mgmt.authorization(signers, tuple(sigs), payload))
+        self.assertFalse(mgmt.authorises(crypto.MultiSig.combine({0: m1_sig}, 1), payload))
 
 
 # --------------------------------------------------------------------------------------------- #
@@ -255,11 +252,10 @@ class TestEmergencyIntervention(unittest.TestCase):
         self.assertEqual(sbwb.block.anchors.block_num, 2)
         self.assertEqual(sbwb.block.anchors.prev_block, pre_head_hash)
 
-        # Verifies via the same Management.authorization path as any other block.
+        # Verifies via the same MgmtReader.authorises path as any other block.
         self.assertTrue(
-            mgmt.authorization(
-                sbwb.block.signers,
-                sbwb.block.settle_sigs,
+            mgmt.authorises(
+                sbwb.block.multisig,
                 _settle_payload(sbwb.block.block.slice_hash, sbwb.block.anchors),
             )
         )
@@ -285,7 +281,7 @@ class TestEmergencyIntervention(unittest.TestCase):
         """The bitmap layout, signed payload, and SettledBlock shape are IDENTICAL between
         bootstrap and intervene -- there is no separate emergency wire form
         (#anchor-is-the-axiom's shared code path). Assert by checking that both blocks
-        verify via the same `Management.authorization` call with the same construction."""
+        verify via the same `MgmtReader.authorises` call with the same construction."""
         anchor = crypto.Keypair.generate()
         s, mgmt = _provisioned(anchor)
         bs = bootstrap(s, anchor, bodies=())
@@ -294,14 +290,13 @@ class TestEmergencyIntervention(unittest.TestCase):
         for sbwb in (bs, iv):
             payload = _settle_payload(sbwb.block.block.slice_hash, sbwb.block.anchors)
             self.assertTrue(
-                mgmt.authorization(sbwb.block.signers, sbwb.block.settle_sigs, payload),
+                mgmt.authorises(sbwb.block.multisig, payload),
                 f"block {sbwb.block.anchors.block_num} failed uniform authorization",
             )
         # Both have the manager slot set at bitmap position N (the last).
         for sbwb in (bs, iv):
             n = len(mgmt.roster()) + 1
-            indices = crypto.bitmap_indices(sbwb.block.signers, n)
-            self.assertIn(n - 1, indices, "manager slot not set")
+            self.assertIn(n - 1, sbwb.block.multisig.indices(n), "manager slot not set")
 
 
 # --------------------------------------------------------------------------------------------- #
@@ -338,7 +333,9 @@ def _endpoint(n: int) -> Endpoint:
     return Endpoint(Address(Scheme.INPROC, f"n{n}"))
 
 
-def _seed_cluster(mgmt: Management, anchor: crypto.Keypair, size: int) -> list[crypto.Keypair]:
+def _seed_cluster(
+    s: Store, mgmt: MgmtWriter, anchor: crypto.Keypair, size: int
+) -> list[crypto.Keypair]:
     """Bootstrap a cluster of `size` nodes via one atomic change_roster call, applied to the
     store. Returns the node keypairs."""
     kps = [crypto.Keypair.generate() for _ in range(size)]
@@ -349,7 +346,7 @@ def _seed_cluster(mgmt: Management, anchor: crypto.Keypair, size: int) -> list[c
             for i, kp in enumerate(kps)
         ),
     )
-    mgmt.store.apply((tx.sign(anchor, T0),), auth=mgmt)
+    s.apply((tx.sign(anchor, T0),), auth=mgmt)
     return kps
 
 
@@ -361,8 +358,8 @@ class TestChangeRosterBatched(unittest.TestCase):
         """From empty (n=0) to n=3 in one atomic change_roster: works even though the
         intermediate n<3 states would would_brick if inspected."""
         anchor = crypto.Keypair.generate()
-        _s, mgmt = _provisioned(anchor)
-        kps = _seed_cluster(mgmt, anchor, 3)
+        s, mgmt = _provisioned(anchor)
+        kps = _seed_cluster(s, mgmt, anchor, 3)
         self.assertEqual(len(mgmt.nodes()), 3)
         for kp in kps:
             self.assertIn(kp.public, mgmt.nodes())
@@ -372,8 +369,8 @@ class TestChangeRosterBatched(unittest.TestCase):
         (#roster-change-is-atomic). Prove by checking `roster_commitment` reflects the
         post-state after apply."""
         anchor = crypto.Keypair.generate()
-        _s, mgmt = _provisioned(anchor)
-        kps = _seed_cluster(mgmt, anchor, 3)
+        s, mgmt = _provisioned(anchor)
+        kps = _seed_cluster(s, mgmt, anchor, 3)
         commit = mgmt.roster_commitment()
         assert commit is not None
         serial, members = commit
@@ -388,8 +385,8 @@ class TestChangeRosterBrickRefusal(unittest.TestCase):
 
     def test_shrink_from_safe_to_bricked_is_refused(self):
         anchor = crypto.Keypair.generate()
-        _s, mgmt = _provisioned(anchor)
-        kps = _seed_cluster(mgmt, anchor, 3)
+        s, mgmt = _provisioned(anchor)
+        kps = _seed_cluster(s, mgmt, anchor, 3)
         # Now try to remove 2 nodes: n=3 (safe) -> n=1 (bricked). Refused.
         with self.assertRaises(ManagementError):
             mgmt.change_roster(commitment_signer=anchor, remove=(kps[0].public, kps[1].public))
@@ -399,13 +396,13 @@ class TestChangeRosterBrickRefusal(unittest.TestCase):
         allowed. This preserves growth-from-zero and any legitimate remove-only ops in an
         already-degraded cluster."""
         anchor = crypto.Keypair.generate()
-        _s, mgmt = _provisioned(anchor)
+        s, mgmt = _provisioned(anchor)
         # Grow to n=2 via a batched change (still bricked).
-        kps = _seed_cluster(mgmt, anchor, 2)
+        kps = _seed_cluster(s, mgmt, anchor, 2)
         # Remove one, going 2 -> 1. n_before is already bricked, so no refusal.
         tx = mgmt.change_roster(commitment_signer=anchor, remove=(kps[0].public,))
         # Must not raise; apply and verify.
-        mgmt.store.apply((tx.sign(anchor, T0),), auth=mgmt)
+        s.apply((tx.sign(anchor, T0),), auth=mgmt)
         self.assertEqual(len(mgmt.nodes()), 1)
 
     def test_growth_through_bricked_states_is_allowed(self):
@@ -413,7 +410,7 @@ class TestChangeRosterBrickRefusal(unittest.TestCase):
         would-brick rule, growing INTO a bricked state is fine; only shrinking into brick is
         refused. The batch abstraction means intermediate n values never exist externally."""
         anchor = crypto.Keypair.generate()
-        _s, mgmt = _provisioned(anchor)
+        s, mgmt = _provisioned(anchor)
         # add=1 from n=0: n_after=1, bricked, but n_before also bricked -- allowed.
         kp1 = crypto.Keypair.generate()
         tx = mgmt.change_roster(
@@ -424,7 +421,7 @@ class TestChangeRosterBrickRefusal(unittest.TestCase):
                 ),
             ),
         )
-        mgmt.store.apply((tx.sign(anchor, T0),), auth=mgmt)
+        s.apply((tx.sign(anchor, T0),), auth=mgmt)
         self.assertEqual(len(mgmt.nodes()), 1)
 
 
@@ -439,7 +436,7 @@ class TestChangeRosterAdvisoryComposition(unittest.TestCase):
         legitimate case of building a small cluster on one provider before diversifying;
         it also blocked incremental dilution of a concentrated cluster."""
         anchor = crypto.Keypair.generate()
-        _s, mgmt = _provisioned(anchor)
+        s, mgmt = _provisioned(anchor)
         # Four nodes, all in provider "hetzner". At n=4 max_domain(4)=1, so this is 3 over.
         # The old add_node refused this; change_roster allows it.
         kps = [crypto.Keypair.generate() for _ in range(4)]
@@ -455,7 +452,7 @@ class TestChangeRosterAdvisoryComposition(unittest.TestCase):
                 for i, kp in enumerate(kps)
             ),
         )
-        mgmt.store.apply((tx.sign(anchor, T0),), auth=mgmt)
+        s.apply((tx.sign(anchor, T0),), auth=mgmt)
         # The advisory reports the concentration.
         adv = mgmt.check_domains()
         self.assertEqual(adv, {b"provider:hetzner": 4})
@@ -465,8 +462,8 @@ class TestChangeRosterAdvisoryComposition(unittest.TestCase):
         semantics, same commitment update. Verify by adding a node into an existing safe
         cluster and observing the commitment serial advances."""
         anchor = crypto.Keypair.generate()
-        _s, mgmt = _provisioned(anchor)
-        _seed_cluster(mgmt, anchor, 3)
+        s, mgmt = _provisioned(anchor)
+        _seed_cluster(s, mgmt, anchor, 3)
         commit_before = mgmt.roster_commitment()
         assert commit_before is not None
 
@@ -477,7 +474,7 @@ class TestChangeRosterAdvisoryComposition(unittest.TestCase):
             Cert.sign_roster(anchor, kp_new.public),
             commitment_signer=anchor,
         )
-        mgmt.store.apply((tx.sign(anchor, T0),), auth=mgmt)
+        s.apply((tx.sign(anchor, T0),), auth=mgmt)
 
         commit_after = mgmt.roster_commitment()
         assert commit_after is not None
@@ -490,13 +487,13 @@ class TestChangeRosterAdvisoryComposition(unittest.TestCase):
         previous violation of #roster-change-is-atomic (used to emit a bare Del P_NODE with
         no commitment update)."""
         anchor = crypto.Keypair.generate()
-        _s, mgmt = _provisioned(anchor)
-        kps = _seed_cluster(mgmt, anchor, 4)  # start at n=4 so remove takes us to n=3, safe
+        s, mgmt = _provisioned(anchor)
+        kps = _seed_cluster(s, mgmt, anchor, 4)  # start at n=4 so remove takes us to n=3, safe
 
         commit_before = mgmt.roster_commitment()
         assert commit_before is not None
         tx = mgmt.remove_node(kps[0].public, commitment_signer=anchor)
-        mgmt.store.apply((tx.sign(anchor, T0),), auth=mgmt)
+        s.apply((tx.sign(anchor, T0),), auth=mgmt)
 
         commit_after = mgmt.roster_commitment()
         assert commit_after is not None

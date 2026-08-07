@@ -47,7 +47,7 @@ from ..core.units import Millis
 from ..net.envelope import SignedEnvelope
 from ..store import Layer, Store, settle
 from ..store.layer import Index
-from ..store.management import Management
+from ..store.management import MgmtReader
 from ..store.ops import SignedTransaction
 from ..store.store import log_element
 from ..tunables import Tunables
@@ -124,9 +124,10 @@ class Coordinator:
         self.mempool = Mempool(self.tunables.mempool)
 
     @property
-    def mgmt(self) -> Management:
-        """Fresh per call: the store may have moved since last time."""
-        return Management(self.store)
+    def mgmt(self) -> MgmtReader:
+        """Fresh per call: the store may have moved since last time. READ side only -- the
+        Coordinator authorises and reads the roster; it never composes a management tx."""
+        return MgmtReader(self.store)
 
     def _bucket_of(self, now: Millis) -> Bucket:
         return self.tunables.mempool.bucket(now)

@@ -18,7 +18,7 @@ import unittest
 from dude.consensus.settle_round import Anchors, SettledBlock, SettledBlockWithBodies
 from dude.core import crypto
 from dude.store import Store, ops
-from dude.store.management import Management
+from dude.store.management import MgmtReader
 from dude.sync.adapter import (
     GetBlock,
     HeightAsk,
@@ -46,7 +46,7 @@ def _make_follower(store: Store) -> Follower:
     return Follower(
         me=crypto.Keypair.generate(),
         store=store,
-        mgmt=Management(store),
+        mgmt=MgmtReader(store),
         tunables=DEFAULT.sync,
     )
 
@@ -186,7 +186,7 @@ class TestFreshJoinerFromAnchor(unittest.TestCase):
 
     def test_fresh_joiner_pulls_block_1_via_manager_sig(self):
         """The load-bearing property: block 1 is manager-signed, joiner has no roster to
-        verify against, but `_verify_authorization` accepts the manager-slot sig."""
+        verify against, but `MgmtReader.authorises` accepts the manager-slot sig."""
         _catch_up(self.follower, self.producer.store, self.producer.me.public)
         self.assertEqual(
             self.joiner_store.head_block_num(),
@@ -278,8 +278,10 @@ class TestByzantinePeerIsHandled(unittest.TestCase):
         bad_sb = SettledBlock(
             block=real_sb.block,
             anchors=real_sb.anchors,
-            signers=real_sb.signers,
-            settle_sigs=tuple(crypto.Signature(bytes(64)) for _ in real_sb.settle_sigs),
+            multisig=crypto.MultiSig(
+                real_sb.multisig.bitmap,
+                tuple(crypto.Signature(bytes(64)) for _ in real_sb.multisig.sigs),
+            ),
         )
         bad_bodies = self.honest.store.bodies_of_block(2)
         self.follower.receive(
@@ -322,8 +324,7 @@ class TestByzantinePeerIsHandled(unittest.TestCase):
         bad_sb = SettledBlock(
             block=real_sb.block,
             anchors=bad_anchors,
-            signers=real_sb.signers,
-            settle_sigs=real_sb.settle_sigs,
+            multisig=real_sb.multisig,
         )
         bad_bodies = self.honest.store.bodies_of_block(2)
         self.follower.receive(
@@ -388,7 +389,7 @@ class TestByzantinePeerIsHandled(unittest.TestCase):
                 block_bytes=real_bytes,
                 block_hash=real_sb.block_hash,
                 batch=real_bodies,
-                auth=Management(fresh_joiner),
+                auth=MgmtReader(fresh_joiner),
             )
 
         # Follower ticks: sees byz above (target_num > our target_num - 1), issues GetBlock.

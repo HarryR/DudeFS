@@ -35,13 +35,13 @@ def _at(st, m):
     return ops.Set(st, m.name, m.value, m.epoch) if isinstance(m, ops.Set) else ops.Del(st, m.name)
 
 
-def provisioned(kp: crypto.Keypair) -> tuple[store.Store, management.Management]:
-    """A fresh Store provisioned with `kp` as the manager anchor, plus its Management. Tests
+def provisioned(kp: crypto.Keypair) -> tuple[store.Store, management.MgmtReader]:
+    """A fresh Store provisioned with `kp` as the manager anchor, plus its MgmtReader. Tests
     that authored transactions under the pre-`auth=None`-removal shape use this so the
     anchor-is-always-authorised rule handles their writes without invoking a bypass."""
     s = store.Store()
     s.provision(kp.public)
-    return s, management.Management(s)
+    return s, management.MgmtReader(s)
 
 
 class TestSettlement(unittest.TestCase):
@@ -146,7 +146,7 @@ class TestAccumulator(unittest.TestCase):
         vals = [b"v%d" % i for i in range(6)]
         a, b = provisioned(self.kp)[0], provisioned(self.kp)[0]
         for st, order in ((a, range(6)), (b, reversed(range(6)))):
-            m = management.Management(st)
+            m = management.MgmtReader(st)
             for i in order:
                 st.apply((tx(self.kp, (), (ops.Set(0, names[i], vals[i]),)),), auth=m)
         self.assertEqual(a.accumulator(), b.accumulator())
@@ -364,7 +364,7 @@ class TestFailureDomains(unittest.TestCase):
         self.mgr = crypto.Keypair.generate()
         self.store = store.Store()
         self.store.provision(self.mgr.public)
-        self.mgmt = management.Management(self.store)
+        self.mgmt = management.MgmtWriter(self.store)
         self.store.apply(
             (
                 self.mgmt.authorise(
@@ -470,35 +470,31 @@ class TestMultiSigRoundTrip(unittest.TestCase):
         self.roster = sorted(k.public for k in self.kps)
 
     def _sign(self, msg, who):
-        shares = {
-            self.roster.index(k.public): crypto.Ed25519ListMultiSig.sign_share(k._seed, msg)
-            for k in who
-        }
-        return crypto.Ed25519ListMultiSig.combine(shares, len(self.roster))
+        shares = {self.roster.index(k.public): crypto.sign_share(k._seed, msg) for k in who}
+        return crypto.MultiSig.combine(shares, len(self.roster))
 
     def test_a_genuine_multisig_verifies(self):
-        bm, sigs = self._sign(b"claim", self.kps[:4])
-        self.assertTrue(crypto.Ed25519ListMultiSig.verify(bm, sigs, b"claim", self.roster))
+        ms = self._sign(b"claim", self.kps[:4])
+        self.assertTrue(ms.verify(b"claim", self.roster))
 
     def test_a_different_message_does_not(self):
-        bm, sigs = self._sign(b"claim", self.kps[:4])
-        self.assertFalse(crypto.Ed25519ListMultiSig.verify(bm, sigs, b"other", self.roster))
+        ms = self._sign(b"claim", self.kps[:4])
+        self.assertFalse(ms.verify(b"other", self.roster))
 
     def test_a_signature_from_outside_the_roster_does_not(self):
         stranger = crypto.Keypair.generate()
-        bm, sigs = self._sign(b"claim", self.kps[:3])
-        forged = list(sigs)
-        forged[0] = crypto.Ed25519ListMultiSig.sign_share(stranger._seed, b"claim")
-        self.assertFalse(crypto.Ed25519ListMultiSig.verify(bm, forged, b"claim", self.roster))
+        ms = self._sign(b"claim", self.kps[:3])
+        forged = list(ms.sigs)
+        forged[0] = crypto.sign_share(stranger._seed, b"claim")
+        self.assertFalse(crypto.MultiSig(ms.bitmap, tuple(forged)).verify(b"claim", self.roster))
 
     def test_the_bitmap_names_who_signed(self):
-        bm, _sigs = self._sign(b"claim", [self.kps[0], self.kps[2]])
-        idx = crypto.bitmap_indices(bm, len(self.roster))
+        ms = self._sign(b"claim", [self.kps[0], self.kps[2]])
         self.assertEqual(
-            sorted(idx),
+            sorted(ms.indices(len(self.roster))),
             sorted([self.roster.index(self.kps[0].public), self.roster.index(self.kps[2].public)]),
         )
-        self.assertEqual(crypto.bitmap_count(bm, len(self.roster)), 2)
+        self.assertEqual(ms.count(len(self.roster)), 2)
 
 
 class TestTransferAndSettlementRace(unittest.TestCase):
@@ -511,7 +507,7 @@ class TestTransferAndSettlementRace(unittest.TestCase):
         # Provision the test key as the anchor so its writes pass authority via the anchor-
         # is-always-authorised rule -- the shape that replaced `auth=None` (Path (a)).
         self.s.provision(self.kp.public)
-        self.mgmt = management.Management(self.s)
+        self.mgmt = management.MgmtReader(self.s)
 
     def test_a_transaction_already_in_the_log_is_dropped_not_raised(self):
         """`entry.op_hash UNIQUE` is what makes a settled transaction unrepeatable, and it used to

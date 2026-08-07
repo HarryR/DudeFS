@@ -34,7 +34,7 @@ from ..net.link import Listener
 from ..net.postman import Postman
 from ..net.session import Inbound, Session, SessionBindError
 from ..store import smt
-from ..store.management import Grant, Role
+from ..store.management import Authorization, Grant, Role
 from ..tunables import DEFAULT, Tunables
 from .lite_adapter import (
     AnchorsReply,
@@ -524,9 +524,7 @@ class LightClient:
                 # Special case: no headers, no advance -- responder_head IS trusted head.
                 return header.block_hash == self.trusted_state.head.block_hash
             payload = _settle_payload(header.block.slice_hash, header.anchors)
-            if not _verify_multisig(
-                header.signers, header.settle_sigs, payload, roster, self.anchor
-            ):
+            if not Authorization(header.multisig, payload, roster, self.anchor).verify():
                 return False
             prev_hash = header.block_hash
         # Advance to the last verified block.
@@ -628,35 +626,17 @@ def _verify_grant_cert(grant: Grant, anchor: crypto.PublicKey, expected_role: Ro
 def _verify_settle_sigs_against_bundle(
     anchor: crypto.PublicKey, reply: AnchorsReply, bundle: RosterBundle
 ) -> bool:
-    """Verify the AnchorsReply's head settle_sigs against the roster derived from the
+    """Verify the AnchorsReply's head quorum proof against the roster derived from the
     bundle. Used at bootstrap time before trusted_state exists. The reply carries a full
-    `SettledBlock`, so slice_hash is directly available."""
+    `SettledBlock`, so slice_hash is directly available.
+
+    `Authorization` is the SAME type a node uses via `MgmtReader.authorises`; the only
+    difference is where the roster came from -- a cert-verified bundle here, the log
+    there."""
     roster = tuple(sorted(bundle.commitment_members))
     head = reply.head
     payload = _settle_payload(head.block.slice_hash, head.anchors)
-    return _verify_multisig(head.signers, head.settle_sigs, payload, roster, anchor)
-
-
-def _verify_multisig(
-    signers: crypto.SignerBitmap,
-    sigs: tuple[crypto.Signature, ...],
-    payload: bytes,
-    roster: tuple[crypto.PublicKey, ...],
-    anchor: crypto.PublicKey,
-) -> bool:
-    """Verify an Ed25519 list-multisig against `[*roster, anchor]`. Mirrors
-    `Management.authorization`'s composition -- `settle_sigs` are always built with the
-    anchor override slot at index `len(roster)`, so verification must include it."""
-    signer_set = [*roster, anchor]
-    if not crypto.Ed25519ListMultiSig.verify(signers, list(sigs), payload, signer_set):
-        return False
-    # A quorum of roster slots suffices; manager slot alone also suffices.
-    n = len(signer_set)
-    set_indices = crypto.bitmap_indices(signers, n)
-    if (n - 1) in set_indices:
-        return True  # anchor slot signed -- authorises alone
-    roster_signer_count = sum(1 for i in set_indices if i < len(roster))
-    return roster_signer_count >= quorum.size(len(roster))
+    return Authorization(head.multisig, payload, roster, anchor).verify()
 
 
 __all__ = [

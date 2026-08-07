@@ -547,5 +547,3 @@ class TCPListener(Listener):
             self._listener.close()
         with contextlib.suppress(Exception):
             self._selector.close()
-
-

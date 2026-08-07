@@ -26,9 +26,10 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
 from enum import Enum
-from typing import NamedTuple, Self
+from typing import ClassVar, NamedTuple, Self
 
 import nacl.bindings
 import nacl.exceptions
@@ -551,61 +552,83 @@ def bitmap_count(bitmap: SignerBitmap, n: int) -> int:
 # --------------------------------------------------------------------------- #
 
 
-class Ed25519ListMultiSig:
-    """The concatenated-signature-list instantiation (DESIGN §8, decided for
-    v1): a signer bitmap plus one Ed25519 signature per signer, all over the
-    identical message. A drop-in for a future BLS aggregate behind this same
-    interface. No proof-of-possession needed (lists don't
-    aggregate)."""
+@dataclass(frozen=True, slots=True)
+class MultiSig:
+    """A quorum proof: which positions signed, and their signatures — ONE value.
 
-    suite_id = MULTISIG_SUITE
+    THE TWO HALVES ARE MEANINGLESS APART. `sigs[k]` belongs to the k'th SET bit of `bitmap`,
+    ascending; neither half can be checked, counted or transmitted without the other. Carried
+    as two parallel fields on a record, that pairing is a convention every construction site
+    and every decoder has to remember, and "is this proof good?" becomes a four-argument call
+    that two modules came to implement independently (see `management.Authorization`).
 
-    @staticmethod
-    def sign_share(sk: Seed, msg: bytes) -> Signature:
-        return _ed25519_sign(sk, msg)
+    A FIELD TYPE, NOT A RECORD. Records that carry a proof (`round.Block`,
+    `settle_round.SettledBlock`) write its two positions inline, exactly as they write
+    `Anchors`' six. `MultiSig` owns the pairing and the checking; the containing record owns
+    its own layout (#encoding-owned-by-dataclass).
 
-    @staticmethod
-    def combine(
-        shares_by_index: dict[int, Signature], n: int
-    ) -> tuple[SignerBitmap, list[Signature]]:
-        """shares_by_index: {roster_index: signature}. Returns (bitmap, sigs)
-        with sigs ordered by ascending index to match bitmap iteration."""
+    The concatenated-signature-list instantiation (v1): one Ed25519 signature per signer, all
+    over the identical message. A BLS aggregate would replace the fields and keep the
+    interface; no proof-of-possession is needed because lists do not aggregate."""
+
+    bitmap: SignerBitmap
+    sigs: tuple[Signature, ...]
+
+    suite_id: ClassVar[bytes] = MULTISIG_SUITE
+
+    @classmethod
+    def combine(cls, shares_by_index: dict[int, Signature], n: int) -> Self:
+        """`{signer_index: signature}` over an `n`-position set -> one proof, with `sigs`
+        ordered by ascending index so it stays parallel to bitmap iteration."""
         indices = sorted(shares_by_index)
-        bitmap = bitmap_set(indices, n)
-        sigs = [shares_by_index[i] for i in indices]
-        return bitmap, sigs
+        return cls(bitmap_set(indices, n), tuple(shares_by_index[i] for i in indices))
 
-    @staticmethod
-    def verify(
-        bitmap: SignerBitmap, sigs: list[Signature], msg: bytes, roster_pubkeys: list[PublicKey]
-    ) -> bool:
-        """Verify every listed signature against its named roster member over
-        the identical `msg`. Quorum/majority sizing is the QC layer's job
-        (artifacts.py); here we only check that the claimed signers really
-        signed."""
-        n = len(roster_pubkeys)
-        indices = bitmap_indices(bitmap, n)
-        if len(indices) != len(sigs):
+    def indices(self, n: int) -> list[int]:
+        """The set positions, ascending. Raises `CryptoError` if the bitmap is the wrong
+        width for `n` — it arrives off the wire, and a short one would otherwise index out
+        of range, which is not a `DudeError` and therefore a process kill under crash-only."""
+        return bitmap_indices(self.bitmap, n)
+
+    def count(self, n: int) -> int:
+        return len(self.indices(n))
+
+    def verify(self, msg: bytes, signers: Sequence[PublicKey]) -> bool:
+        """Every listed signature verifies against the signer its bit names, over the
+        identical `msg`. `signers` is the position-indexed set the bitmap addresses — for a
+        block that is `[*roster, anchor]`, composed by the caller that knows the layout.
+
+        WHAT THIS DOES NOT ANSWER: whether enough of them signed. Threshold is policy over a
+        roster, and lives with the roster (`management.Authorization`)."""
+        indices = self.indices(len(signers))
+        if len(indices) != len(self.sigs):
             return False
-        for idx, sig in zip(indices, sigs, strict=False):
+        for idx, sig in zip(indices, self.sigs, strict=True):
             # `PublicKey.verify`, NOT `_ed25519_verify`: the latter RAISES the specific reason and
             # returns None, so `if not ...` was vacuously true and EVERY multisig verification
             # returned False. Introduced when verification split into typed errors, and invisible
             # because nothing exercised this path.
-            if not roster_pubkeys[idx].verify(msg, sig):
+            if not signers[idx].verify(msg, sig):
                 return False
         return True
 
     # `verify_each` -- per-signer messages -- is STRUCK, not kept `[H]` (smallest-correct, no
     # option-keeping). It had no caller anywhere, tests included, and it was salvage from the
     # previous package: its docstring cited a `finding-17` and an `issue_seq` field that do not
-    # exist here. Every share signs identical bytes by construction (`Compaction.attest_bytes`
-    # is a function of the claim alone), which is what lets signatures POOL across nodes that
-    # independently noticed the same segment. If per-signer messages are ever needed, the thing to
-    # write is the one the caller then needs, not this.
+    # exist here. Every share signs identical bytes by construction, which is what lets signatures
+    # POOL across nodes that independently noticed the same claim. If per-signer messages are ever
+    # needed, the thing to write is the one the caller then needs, not this.
 
 
-MULTISIG = Ed25519ListMultiSig
+UNSIGNED = MultiSig(NO_SIGNERS, ())
+"""Nobody has signed. Named so an absent proof reads as a state rather than as a pair of
+forgotten fields — Round's ratify credentials are transient and never persist, so a decoded
+`SettledBlock` carries this rather than a plausible-looking empty bitmap."""
+
+
+def sign_share(sk: Seed, msg: bytes) -> Signature:
+    """One signer's contribution to a `MultiSig`. A bare Ed25519 signature; named so the
+    share-then-combine shape is visible at the call site."""
+    return _ed25519_sign(sk, msg)
 
 
 # --------------------------------------------------------------------------- #

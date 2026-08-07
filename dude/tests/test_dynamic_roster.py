@@ -13,7 +13,7 @@ from dude.consensus.bootstrap import intervene
 from dude.core import crypto
 from dude.net.address import Endpoint
 from dude.net.transports import address_of
-from dude.store.management import Cert, Management, NodeRecord
+from dude.store.management import Cert, MgmtWriter, NodeRecord
 
 from .cluster import DELTA, T0, Cluster
 
@@ -37,7 +37,7 @@ class TestRosterAdditionReachesPostman(unittest.TestCase):
         # needing a full consensus round in the harness.
         new_kp = crypto.Keypair.generate()
         new_endpoint = Endpoint(address_of(new_kp.public))
-        mgmt_scratch = Management(c.nodes[0].store)
+        mgmt_scratch = MgmtWriter(c.nodes[0].store)
         add_tx = mgmt_scratch.change_roster(
             commitment_signer=c.mgr,
             add=(
@@ -89,17 +89,21 @@ class TestRosterAdditionReachesPostman(unittest.TestCase):
 
         # After a change_roster lands, next tick advances the serial.
         add_kp = crypto.Keypair.generate()
-        add_tx = node.mgmt.change_roster(
-            commitment_signer=c.mgr,
-            add=(
-                NodeRecord(
-                    add_kp.public,
-                    (Endpoint(address_of(add_kp.public)),),
-                    Cert.sign_roster(c.mgr, add_kp.public),
-                    frozenset(),
+        add_tx = (
+            MgmtWriter(node.store)
+            .change_roster(
+                commitment_signer=c.mgr,
+                add=(
+                    NodeRecord(
+                        add_kp.public,
+                        (Endpoint(address_of(add_kp.public)),),
+                        Cert.sign_roster(c.mgr, add_kp.public),
+                        frozenset(),
+                    ),
                 ),
-            ),
-        ).sign(c.mgr, T0)
+            )
+            .sign(c.mgr, T0)
+        )
         for n in c.nodes:
             intervene(n.store, c.mgr, bodies=(add_tx,), bucket=888)
         node.tick(T0 + 2 * DELTA)
@@ -120,8 +124,8 @@ class TestRosterRemovalDropsPeer(unittest.TestCase):
 
         # Manager removes the victim.
         remove_tx = (
-            c.nodes[0]
-            .mgmt.change_roster(
+            MgmtWriter(c.nodes[0].store)
+            .change_roster(
                 commitment_signer=c.mgr,
                 remove=(victim,),
             )

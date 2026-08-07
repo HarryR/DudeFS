@@ -26,7 +26,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING
+from typing import Protocol
 
 from .. import quorum
 from ..core import codec, crypto
@@ -34,9 +34,6 @@ from ..core.errors import DudeError
 from ..net.address import Endpoint
 from . import ops
 from .layer import Reader
-
-if TYPE_CHECKING:
-    from .store import Store
 
 
 class ManagementError(DudeError):
@@ -93,7 +90,7 @@ class Cert:
 
     `verify()` is signature-only. Whether the signer is authorised for the purpose (anchor
     only for MANAGER/COMPACTOR; anchor OR valid manager for CLIENT/ROSTER/ROSTER_COMMITMENT)
-    is `Management.verify_cert`, which reads state to answer."""
+    is `MgmtReader.verify_cert`, which reads state to answer."""
 
     signer: crypto.PublicKey
     subject: bytes
@@ -131,7 +128,7 @@ class Cert:
 
     def verify(self) -> bool:
         """True if the signature matches `self.signer` over `(purpose, subject)`. Does not
-        check whether the signer is currently authorised — see `Management.verify_cert`."""
+        check whether the signer is currently authorised — see `MgmtReader.verify_cert`."""
         return self.signer.verify(_CERT_DOMAIN + self.purpose + b":" + self.subject, self.sig)
 
     def encode(self) -> bytes:
@@ -149,6 +146,45 @@ class Cert:
             )
         except DudeError as e:
             raise ManagementError(f"malformed Cert: {e}") from e
+
+
+@dataclass(frozen=True, slots=True)
+class Authorization:
+    """May this payload be treated as authorised? (#manager-sig-overrides-quorum)
+
+    ONE SHAPE, TWO WAYS TO BUILD IT, AND THAT IS THE POINT. A node reads `roster` and `anchor`
+    from its own log and asks via `MgmtReader.authorises`; a light client holds them from a
+    cert-verified `RosterBundle` and constructs this directly. Both then run the SAME `verify`.
+    The rule lived in two places for one release -- `MgmtReader.authorization` and the light
+    client's own `_verify_multisig` -- and the light-client copy was never asked to refuse
+    anything, so the pair could have drifted arbitrarily far without a test noticing. An
+    authorisation rule with two implementations has no implementation.
+
+    BITMAP LAYOUT: `len(roster) + 1` positions. `0..N-1` are roster members in `roster` order;
+    position `N` is the manager override, verified against the anchor. The `+1` is why the
+    manager is not a roster member: putting it in the roster would move quorum arithmetic every
+    time the cluster grew.
+
+    TRUE if EITHER the manager slot signed (authorises alone) OR a quorum of roster slots did.
+    FALSE if the multisig itself does not verify, or only sub-quorum roster slots signed with no
+    override. Raises `CryptoError` (a `DudeError`) if the bitmap is the wrong width for the
+    signer set -- it arrives off the wire, so a typed refusal rather than an IndexError."""
+
+    multisig: crypto.MultiSig
+    payload: bytes
+    roster: tuple[crypto.PublicKey, ...]
+    anchor: crypto.PublicKey
+
+    def verify(self) -> bool:
+        signers = (*self.roster, self.anchor)
+        if not self.multisig.verify(self.payload, signers):
+            return False
+        manager_slot = len(self.roster)
+        set_indices = self.multisig.indices(len(signers))
+        if manager_slot in set_indices:
+            return True  # manager override -- authorises alone
+        roster_signers = sum(1 for i in set_indices if i < manager_slot)
+        return roster_signers >= quorum.size(len(self.roster))
 
 
 @dataclass(frozen=True, slots=True)
@@ -325,6 +361,23 @@ def _wrap_key(epoch: int, who: crypto.PublicKey) -> bytes:
     return P_WRAP + epoch.to_bytes(8, "big") + who
 
 
+class Source(Reader, Protocol):
+    """What a management view reads FROM: `Reader`'s rows, plus the anchor they are judged
+    against.
+
+    Rows alone are not enough -- #anchor-is-the-axiom means every authority question bottoms
+    out at the provisioned anchor, so a management view that could not ask for it would have to
+    be handed one by each caller, and a caller that supplies an anchor is a caller that can
+    supply the wrong one. `Store` and the `StoreReader` a `store.snapshot()` yields both satisfy
+    this; a `Layer` does NOT, which is correct -- an overlay has rows but no provisioning.
+
+    Narrower than `Store` on purpose. The previous shape annotated the constructor as `Store`
+    while using only these three methods, so every snapshot-scoped caller had to `cast` a
+    `StoreReader` it already held into a `Store` it did not have."""
+
+    def anchor(self) -> crypto.PublicKey | None: ...
+
+
 class MgmtReader:
     """The management store's READ surface -- every query that returns pure data (bool,
     dict, Grant, NodeRecord, ...). Used by:
@@ -338,8 +391,8 @@ class MgmtReader:
     Self-contained: a caller that holds this needs no other knowledge of how membership,
     authorisation, or key distribution are encoded."""
 
-    def __init__(self, store: Store, store_id: int = ops.STORE_MANAGEMENT):
-        self.store = store
+    def __init__(self, src: Source, store_id: int = ops.STORE_MANAGEMENT):
+        self.src = src
         self.store_id = store_id
 
     # -- reads ---------------------------------------------------------------- #
@@ -352,7 +405,7 @@ class MgmtReader:
         is actually authorised" use `roster()`, which filters. Callers that want "what rows
         are in the P_NODE keyspace" (introspection, tests) use this."""
         out: dict[crypto.PublicKey, NodeRecord] = {}
-        for name, _prov, value, _ep in self.store.prefix(self.store_id, P_NODE):
+        for name, _prov, value, _ep in self.src.prefix(self.store_id, P_NODE):
             who = crypto.PublicKey(name[len(P_NODE) :])
             out[who] = NodeRecord.decode_row(who, value)
         return out
@@ -398,7 +451,7 @@ class MgmtReader:
         has been deleted (#absence-is-revocation).
 
         Returns False on an unprovisioned store — no anchor means no authority."""
-        anchor = self.store.anchor()
+        anchor = self.src.anchor()
         if anchor is None:
             return False
         if not cert.verify():
@@ -414,7 +467,7 @@ class MgmtReader:
         if cert.purpose in anchor_or_manager_purposes:
             if cert.signer == anchor:
                 return True
-            grant = self._read_grant(self.store, cert.signer)
+            grant = self._read_grant(self.src, cert.signer)
             if grant is None or grant.role is not Role.MANAGER:
                 return False
             return (
@@ -431,9 +484,9 @@ class MgmtReader:
         bundle: the manager set is what verifies roster-entry certs whose signer isn't
         the anchor directly (#light-client-cert-chain)."""
         out: list[Grant] = []
-        for name, _prov, _value, _ep in self.store.prefix(self.store_id, P_GRANT):
+        for name, _prov, _value, _ep in self.src.prefix(self.store_id, P_GRANT):
             who = crypto.PublicKey(name[len(P_GRANT) :])
-            grant = self._read_grant(self.store, who)
+            grant = self._read_grant(self.src, who)
             if grant is None or grant.role is not Role.MANAGER:
                 continue
             if not self._grant_cert_ok(grant):
@@ -452,7 +505,7 @@ class MgmtReader:
 
         Runs the same cross-checks as `roster_commitment()` and returns None on any
         failure, so a caller that trusts a non-None result trusts the commitment fully."""
-        raw = self.store.get(self.store_id, P_ROSTER)
+        raw = self.src.get(self.store_id, P_ROSTER)
         if raw is None:
             return None
         try:
@@ -527,7 +580,7 @@ class MgmtReader:
         stored fingerprint. If not, the commitment attests a different state than the log
         holds -- a mismatch that should not occur in practice (the same tx that writes the
         commitment writes the P_NODE rows), and if it does, treat the commitment as invalid."""
-        raw = self.store.get(self.store_id, P_ROSTER)
+        raw = self.src.get(self.store_id, P_ROSTER)
         if raw is None:
             return None
         f = codec.as_seq(codec.decode(raw[1]), 4)
@@ -566,7 +619,7 @@ class MgmtReader:
         return serial, members
 
     def _read_grant(self, reader: Reader, who: crypto.PublicKey) -> Grant | None:
-        """The primitive grant lookup. Reads from `reader` (typically `self.store`, but the
+        """The primitive grant lookup. Reads from `reader` (typically `self.src`, but the
         transaction's own layer during evaluation) so a grant made by an earlier step is
         visible to a later step's check.
 
@@ -578,9 +631,9 @@ class MgmtReader:
         return Grant.decode_row(who, raw[1])
 
     def grant_of(self, who: crypto.PublicKey) -> Grant | None:
-        """The default-reader convenience: look up a grant against `self.store`. Same shape as
-        `_read_grant(self.store, who)`."""
-        return self._read_grant(self.store, who)
+        """The default-reader convenience: look up a grant against `self.src`. Same shape as
+        `_read_grant(self.src, who)`."""
+        return self._read_grant(self.src, who)
 
     def may_write(self, reader: Reader, who: crypto.PublicKey, store_id: int) -> bool:
         """`#coarse-acl`'s check: may `who` write `store_id`? The one authority question a node
@@ -601,7 +654,7 @@ class MgmtReader:
 
         Takes `reader` per call so a grant made by an earlier step in a transaction is visible
         to a later step's check (authorise -> use -> revoke, in one atomic transaction)."""
-        if who == self.store.anchor():
+        if who == self.src.anchor():
             return True
         g = self._read_grant(reader, who)
         if g is None or not self._grant_cert_ok(g):
@@ -617,7 +670,7 @@ class MgmtReader:
         THE ANCHOR IS ALWAYS AUTHORISED (#anchor-is-the-axiom), same rule as `may_write` --
         applied consistently here so `may_write` and `may_send` do not disagree about the
         axiomatic identity. Grants are cert-checked (#cert), same rule as `may_write`."""
-        if who == self.store.anchor():
+        if who == self.src.anchor():
             return True
         g = self.grant_of(who)
         if g is None or not self._grant_cert_ok(g):
@@ -636,54 +689,32 @@ class MgmtReader:
             return False
         return self.verify_cert(g.cert)
 
-    def authorization(
-        self,
-        bitmap: crypto.SignerBitmap,
-        sigs: tuple[crypto.Signature, ...],
-        payload: bytes,
-    ) -> bool:
-        """Verify a block-shape multisig against the current roster + anchor
-        (SPECv2 #manager-sig-overrides-quorum).
+    def authorises(self, multisig: crypto.MultiSig, payload: bytes) -> bool:
+        """Is this block-shape proof authorised against OUR roster and anchor
+        (SPECv2 #manager-sig-overrides-quorum)?
 
-        BITMAP LAYOUT: `len(roster) + 1` positions. Indices `0..N-1` are roster members;
-        index `N` is the manager slot, verified against `self.store.anchor()`. Delegates to
-        `Ed25519ListMultiSig.verify` with `[*roster, anchor]` as the effective signer set --
-        the roster-append composition is encapsulated here so no caller needs to know about
-        the manager slot's position.
+        The roster and the anchor are not parameters: this object reads them from the log it
+        already holds. A caller that had to supply them could supply the wrong ones, and the
+        one caller that legitimately holds its own -- a light client, whose roster came from a
+        cert-verified bundle rather than from a log -- builds an `Authorization` directly.
+        Both run the same `verify`.
 
-        TRUE if EITHER:
-          - the manager slot signed (anchor override) -- authorizes alone; OR
-          - a quorum of roster slots signed (ordinary consensus path).
-
-        FALSE if the multisig itself failed to verify (bad sig, wrong signer, bitmap/sig
-        length mismatch) OR if only sub-quorum roster slots signed with no manager override.
-
-        Raises `ManagementError` if the store is not provisioned (no anchor to verify the
-        override slot against) -- a Management being asked to authorize with no manager
-        anchor is a misconfiguration, not a routine failure."""
-        anchor = self.store.anchor()
+        Raises `ManagementError` if the store is not provisioned: there is no anchor to check
+        the override slot against, which is a misconfiguration, not a routine failure."""
+        anchor = self.src.anchor()
         if anchor is None:
             raise ManagementError("cannot authorize: store has no manager anchor")
-        roster = self.roster()
-        n = len(roster) + 1  # +1 for the manager override slot
-        if not crypto.Ed25519ListMultiSig.verify(bitmap, list(sigs), payload, [*roster, anchor]):
-            return False
-        set_indices = crypto.bitmap_indices(bitmap, n)
-        manager_slot = n - 1
-        if manager_slot in set_indices:
-            return True  # manager override -- authorizes alone
-        roster_signer_count = sum(1 for i in set_indices if i < manager_slot)
-        return roster_signer_count >= quorum.size(len(roster))
+        return Authorization(multisig, payload, self.roster(), anchor).verify()
 
     def possession_proof(self, who: crypto.PublicKey) -> crypto.Signature | None:
-        raw = self.store.get(self.store_id, P_POP + who)
+        raw = self.src.get(self.store_id, P_POP + who)
         return crypto.Signature(raw[1]) if raw else None
 
     def wrapped_master(self, epoch: int, who: crypto.PublicKey) -> crypto.SealedBlob | None:
         """`who`'s sealed copy of the epoch master (#wrapped-masters). Opening it is the
         holder's business;
         this layer never sees a secret."""
-        raw = self.store.get(self.store_id, _wrap_key(epoch, who))
+        raw = self.src.get(self.store_id, _wrap_key(epoch, who))
         return crypto.SealedBlob(raw[1]) if raw else None
 
     def domain_groups(self) -> dict[Domain, frozenset[crypto.PublicKey]]:
@@ -951,11 +982,3 @@ class MgmtWriter(MgmtReader):
         return ops.writes(
             *(ops.Set(self.store_id, _wrap_key(epoch, who), wraps[who]) for who in sorted(wraps))
         )
-
-
-# Backward-compatibility alias. `Management(store)` continues to construct a
-# tx-composer object with all methods. New code that composes state-changing txs
-# should prefer `MgmtWriter(reader)` explicitly, inside a `store.snapshot()` scope,
-# so the reads that compose the tx see a consistent snapshot (Bug A prevention).
-# Pure-read callers can use MgmtReader or `Store.mgmt` for a one-shot read.
-Management = MgmtWriter

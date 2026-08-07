@@ -18,7 +18,7 @@ import unittest
 
 from dude.core import crypto
 from dude.store import ops
-from dude.store.management import Management
+from dude.store.management import MgmtReader
 from dude.store.store import Store
 
 D = ops.STORE_DATA
@@ -31,7 +31,7 @@ def _tx(kp, key: bytes, value: bytes, ts: int = 1) -> ops.SignedTransaction:
 class TestSnapshotPinsAView(unittest.TestCase):
     """A reader's snapshot MUST return the same value across every read in the scope, even
     while a concurrent writer commits a change to that value. The whole reason the split
-    exists -- composed reads (Management.change_roster and its ilk) don't see mid-flight
+    exists -- composed reads (MgmtReader.change_roster and its ilk) don't see mid-flight
     writer commits."""
 
     def test_snapshot_pins_a_value_that_a_concurrent_writer_changes(self):
@@ -39,7 +39,7 @@ class TestSnapshotPinsAView(unittest.TestCase):
         store = Store()
         try:
             store.provision(mgr.public)
-            mgmt = Management(store)
+            mgmt = MgmtReader(store)
             key = crypto.h(b"pinned-key")
             # Land a first value we can pin a snapshot at.
             store.apply((_tx(mgr, key, b"v0"),), auth=mgmt)
@@ -96,7 +96,7 @@ class TestConcurrentSnapshotsAreIndependent(unittest.TestCase):
         store = Store()
         try:
             store.provision(mgr.public)
-            mgmt = Management(store)
+            mgmt = MgmtReader(store)
             key = crypto.h(b"divergent")
             store.apply((_tx(mgr, key, b"before"),), auth=mgmt)
 
@@ -151,7 +151,7 @@ class TestWriterSerialisesAcrossThreads(unittest.TestCase):
         store = Store()
         try:
             store.provision(mgr.public)
-            mgmt = Management(store)
+            mgmt = MgmtReader(store)
             key_a = crypto.h(b"a")
             key_b = crypto.h(b"b")
 
@@ -191,7 +191,7 @@ class TestInMemoryStoreIsAShareableWALDb(unittest.TestCase):
         store = Store()
         try:
             store.provision(mgr.public)
-            mgmt = Management(store)
+            mgmt = MgmtReader(store)
             key = crypto.h(b"shareable")
             store.apply((_tx(mgr, key, b"landed"),), auth=mgmt)
 

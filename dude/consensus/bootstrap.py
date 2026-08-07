@@ -24,7 +24,7 @@ from __future__ import annotations
 from ..core import crypto
 from ..core.errors import InvariantError
 from ..store import Layer, Store, settle
-from ..store.management import Management
+from ..store.management import MgmtReader
 from ..store.ops import SignedTransaction
 from ..store.store import log_element
 from .round import Block
@@ -48,7 +48,7 @@ def _apply_manager_signed_block(  # noqa: PLR0913 -- construction inputs, all re
 ) -> SettledBlockWithBodies:
     """Build and commit a manager-signed SettledBlock. Shared by `bootstrap` and `intervene`.
 
-    Previews `bodies` through a Layer using the ordinary Management evaluator (anchor is
+    Previews `bodies` through a Layer using the ordinary MgmtReader evaluator (anchor is
     always authorised, #anchor-is-the-axiom, so the manager's own bootstrap grants pass
     naturally with no `auth=None` bypass anywhere). Computes anchors from the layer. Signs
     the settle payload with `manager`. Packs the sig into bitmap slot `len(roster)` (the
@@ -59,7 +59,7 @@ def _apply_manager_signed_block(  # noqa: PLR0913 -- construction inputs, all re
 
     Raises `InvariantError` if the evaluator rejects any body -- a manager-signed block that
     can't apply cleanly is a caller mistake, not a routine failure."""
-    mgmt = Management(store)
+    mgmt = MgmtReader(store)
     layer = Layer(store)
     screened = settle.apply_to(layer, bodies, mgmt)
     if screened.rejects:
@@ -88,8 +88,7 @@ def _apply_manager_signed_block(  # noqa: PLR0913 -- construction inputs, all re
     block = Block(
         bucket=bucket,
         hashes=slice_hashes,
-        signers=crypto.SignerBitmap(b""),  # ratify sigs are transient and unused here
-        sigs=(),
+        multisig=crypto.UNSIGNED,  # ratify sigs are transient and unused here
     )
     manager_sig = manager.sign(_settle_payload(block.slice_hash, anchors))
 
@@ -98,13 +97,11 @@ def _apply_manager_signed_block(  # noqa: PLR0913 -- construction inputs, all re
     # uniform construction (#anchor-is-the-axiom's shared code path).
     roster = mgmt.roster()
     n = len(roster) + 1
-    signers, sigs = crypto.Ed25519ListMultiSig.combine({n - 1: manager_sig}, n)
 
     sb = SettledBlock(
         block=block,
         anchors=anchors,
-        signers=signers,
-        settle_sigs=tuple(sigs),
+        multisig=crypto.MultiSig.combine({n - 1: manager_sig}, n),
     )
     block_bytes = sb.encode()
     store.commit_block(
@@ -171,7 +168,7 @@ def intervene(
     settlement is hung (#settlement-may-hang), replace a compromised roster, or otherwise
     take an action that the ordinary consensus path cannot execute.
 
-    Follower verification is uniform: the block goes through `Management.authorization` and
+    Follower verification is uniform: the block goes through `MgmtReader.authorises` and
     the manager slot check is the same as bootstrap. There is no "emergency" wire flag or
     evaluator bypass (#anchor-is-the-axiom).
 

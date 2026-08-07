@@ -27,7 +27,7 @@ from dude.net.envelope import Envelope
 from dude.net.transports.tcp import TCPDialer, TCPListener
 from dude.node import Node
 from dude.store import Store, management, ops
-from dude.store.management import Cert, Management, Role
+from dude.store.management import Cert, MgmtWriter, Role
 from dude.tunables import DEFAULT
 
 D = ops.STORE_DATA
@@ -55,7 +55,7 @@ def _build_cluster(
     # Genesis roster with TCP endpoints -- each node's listener.bound_address.
     scratch = Store()
     scratch.provision(mgr.public)
-    mgmt = Management(scratch)
+    mgmt = MgmtWriter(scratch)
     mgr_cert = Cert.sign_grant(mgr, mgr.public, Role.MANAGER)
     tx = mgmt.authorise(
         mgr.public,

@@ -28,12 +28,22 @@ history goes in the commit message, and an open question goes in an issue.
 
 `make check` — lint, format-check, typecheck, test. It must be green before a commit.
 
-**Run the test suite repeatedly before believing it.** A duplicate-settlement race once appeared in
-2 of 6 runs and passed the first time; the state walk stalled in roughly half of them.
+**The flake loop is occasional, and it is Harry's call to spend it.** Six full runs is roughly
+eight minutes, so it is not part of the ordinary gate — **ask before running it**, and say what
+in the change makes it worth the time.
 
 ```sh
 for i in 1 2 3 4 5 6; do .venv/bin/python -m unittest discover -s dude/tests -t . -q 2>&1 | tail -2; done
 ```
+
+It exists for one failure mode: a race that a single green run does not disprove. A
+duplicate-settlement race once appeared in 2 of 6 runs and passed the first time; the state walk
+stalled in roughly half of them. So it is worth proposing when a change touches **scheduling,
+threading, ordering, timing, or the wire** — anything where two runs can legitimately differ.
+
+It buys nothing on a change that cannot vary between runs: a rename, a type split, a docstring, a
+pure refactor with no new control flow. Running it there is not caution, it is eight minutes and a
+misleading signal — six greens on a deterministic change say exactly what one green said.
 
 ## Two rules about tests
 

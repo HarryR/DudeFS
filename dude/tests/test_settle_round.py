@@ -45,12 +45,11 @@ def _wire(nodes: dict[crypto.PublicKey, SettleRound], now: int) -> None:
 
 def _block(bucket: int = 1, hashes: tuple[bytes, ...] = ()) -> Block:
     """A stub ratified block. SettleRound only uses `bucket` and `hashes` to derive
-    slice_hash; the signers/sigs are Round's business and irrelevant to settlement."""
+    slice_hash; the ratify proof is Round's business and irrelevant to settlement."""
     return Block(
         bucket=bucket,
         hashes=tuple(sorted(crypto.Digest(h) for h in hashes)),
-        signers=crypto.SignerBitmap(b""),
-        sigs=(),
+        multisig=crypto.UNSIGNED,
     )
 
 
@@ -133,7 +132,7 @@ class TestHonestCluster(unittest.TestCase):
         self.assertEqual(settled.anchors, _anchors())
         # At least a quorum (2 of 3). Depending on delivery order some nodes may capture the
         # third sig before SETTLING; either way, quorum is the floor.
-        self.assertGreaterEqual(len(settled.settle_sigs), 2)
+        self.assertGreaterEqual(len(settled.multisig.sigs), 2)
 
 
 # --------------------------------------------------------------------------------------------- #
@@ -346,8 +345,7 @@ class TestSettledBlockEncoding(unittest.TestCase):
         self.assertEqual(got.block.bucket, sb.block.bucket)
         self.assertEqual(got.block.hashes, sb.block.hashes)
         self.assertEqual(got.anchors, sb.anchors)
-        self.assertEqual(bytes(got.signers), bytes(sb.signers))
-        self.assertEqual(got.settle_sigs, sb.settle_sigs)
+        self.assertEqual(got.multisig, sb.multisig)
 
     def test_block_hash_is_stable_and_sig_independent(self):
         """The chain link -- a successor's `Anchors.prev_block` -- MUST be deterministic AND
@@ -356,13 +354,8 @@ class TestSettledBlockEncoding(unittest.TestCase):
         sb = self._sb()
         # Deterministic: two calls give the same digest.
         self.assertEqual(sb.block_hash, sb.block_hash)
-        # Sig-independent: strip a settle_sig, hash still matches.
-        stripped = SettledBlock(
-            block=sb.block,
-            anchors=sb.anchors,
-            signers=crypto.SignerBitmap(b""),
-            settle_sigs=(),
-        )
+        # Sig-independent: strip the whole proof, hash still matches.
+        stripped = SettledBlock(block=sb.block, anchors=sb.anchors, multisig=crypto.UNSIGNED)
         self.assertEqual(sb.block_hash, stripped.block_hash)
         # NOT equal to H(encode()): the wire bytes include sigs, the chain hash does not.
         self.assertNotEqual(sb.block_hash, crypto.h(sb.encode()))
@@ -372,8 +365,7 @@ class TestSettledBlockEncoding(unittest.TestCase):
         MUST NOT be persisted. The decoded block's ratify credentials are empty."""
         sb = self._sb()
         got = SettledBlock.decode(sb.encode())
-        self.assertEqual(bytes(got.block.signers), b"")
-        self.assertEqual(got.block.sigs, ())
+        self.assertEqual(got.block.multisig, crypto.UNSIGNED)
 
     def test_malformed_bytes_raise_settle_error(self):
         """Bad bytes are a routine peer-input outcome; SettleError is a DudeError that the

@@ -81,18 +81,8 @@ class TestGetBlock(unittest.TestCase):
             acc_state=crypto.acc_element(b"acc-s"),
             acc_log=crypto.acc_element(b"acc-l"),
         )
-        block = Block(
-            bucket=42,
-            hashes=(tx.op_hash,),
-            signers=crypto.SignerBitmap(b""),
-            sigs=(),
-        )
-        sb = SettledBlock(
-            block=block,
-            anchors=anchors,
-            signers=crypto.SignerBitmap(b""),
-            settle_sigs=(),
-        )
+        block = Block(bucket=42, hashes=(tx.op_hash,), multisig=crypto.UNSIGNED)
+        sb = SettledBlock(block=block, anchors=anchors, multisig=crypto.UNSIGNED)
         msg = SettledBlockReply(payload=SettledBlockWithBodies(block=sb, bodies=(tx,)))
 
         verb, body = msg.encode()

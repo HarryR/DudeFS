@@ -21,7 +21,7 @@ from ..net.transports import InProcDialer, InProcListener, address_of, name_of
 from ..net.transports.inproc import _reset_for_tests
 from ..node import Node
 from ..store import Store, management, ops
-from ..store.management import Cert, Management, Role
+from ..store.management import Cert, MgmtWriter, Role
 from ..tunables import DEFAULT
 
 D = ops.STORE_DATA
@@ -91,7 +91,7 @@ class Cluster:
         # per-node stores later; this scratch instance is purely a factory for the tx.
         scratch = Store()
         scratch.provision(self.mgr.public)
-        mgmt = Management(scratch)
+        mgmt = MgmtWriter(scratch)
         # Anchor-signed cert attesting the mgr identity as MANAGER (#cert). In this test
         # setup the anchor and the manager are the same key, so this is self-attesting
         # via the anchor's authority — cluster.py is not modelling a distinct manager.

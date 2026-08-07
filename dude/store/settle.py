@@ -38,7 +38,7 @@ class Authoriser(Protocol):
 
     Taking the reader per call is the whole point: during evaluation it is the transaction's own
     layer, so a grant made by an earlier step is visible to a later step's check.
-    `dude.store.management.Management` satisfies this."""
+    `dude.store.management.MgmtReader` satisfies this."""
 
     def may_write(self, reader: Reader, who: crypto.PublicKey, store_id: int) -> bool: ...
 
@@ -117,7 +117,7 @@ def evaluate(reader: Reader, tx: ops.SignedTransaction, auth: Authoriser) -> tup
 
     `auth` is REQUIRED. The old `Authoriser | None` shape let callers silently skip authority
     by passing None; the new shape forces callers to be explicit. Manager-authored ops flow
-    through `Management.may_write`'s anchor-is-always-authorised rule, so no bypass is needed
+    through `MgmtReader.may_write`'s anchor-is-always-authorised rule, so no bypass is needed
     for bootstrap or manager-authorized blocks."""
     layer = Layer.speculative(reader)
     if not tx.verify():

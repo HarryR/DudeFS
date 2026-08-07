@@ -13,7 +13,6 @@ from __future__ import annotations
 import time
 import unittest
 from collections.abc import Callable
-from typing import cast
 
 from ..consensus.bootstrap import bootstrap
 from ..core import codec, crypto
@@ -32,7 +31,7 @@ from ..node import (
     Node,
 )
 from ..store import Store, management, ops
-from ..store.management import Cert, Management, MgmtWriter, NodeRecord, Role
+from ..store.management import Cert, MgmtWriter, NodeRecord, Role
 from ..store.store import StoreError
 from ..sync.lite_client import LightClient
 from ..tunables import (
@@ -247,7 +246,7 @@ def _genesis(
     `listeners[i].bound_address` because we're on real TCP."""
     scratch = Store()
     scratch.provision(mgr.public)
-    mgmt = Management(scratch)
+    mgmt = MgmtWriter(scratch)
     mgr_cert = Cert.sign_grant(mgr, mgr.public, Role.MANAGER)
     tx = mgmt.authorise(
         mgr.public,
@@ -428,13 +427,12 @@ class TestScenario(unittest.TestCase):
             lc_client = TCPDialer()
             # Snapshot-scoped tx composition: MgmtWriter's reads are pinned to a
             # consistent moment so the composed cert can't reference a mid-flight
-            # writer commit (that's Bug A -- MgmtWriter's docstring names it).
-            # `cast` because MgmtReader still types `store: Store` (Wave 3 kept the
-            # narrow type to avoid breaking tests that do `mgmt.store.apply(...)`).
+            # writer commit (that's Bug A -- MgmtWriter's docstring names it). No cast:
+            # a StoreReader IS a `management.Source`.
             assert lc_listener is not None
             with nodes[0].store.snapshot() as r:
                 grant_tx = (
-                    MgmtWriter(cast("Store", r))
+                    MgmtWriter(r)
                     .authorise(
                         lc_kp.public,
                         Role.CLIENT,
@@ -493,7 +491,7 @@ class TestScenario(unittest.TestCase):
             # Snapshot-scoped composition, same reason as phase 2's grant tx.
             with nodes[0].store.snapshot() as r:
                 add_tx = (
-                    MgmtWriter(cast("Store", r))
+                    MgmtWriter(r)
                     .change_roster(
                         commitment_signer=mgr,
                         add=(

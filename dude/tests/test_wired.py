@@ -16,7 +16,7 @@
 #
 # AND THE SAME FAILURE FOR DUTIES, which hid longer because it looks like nothing at all. A thing
 # can be specified, built, unit-tested and correct while nothing in the round ever calls it. The
-# whole compaction and conveyor subsystem is in that state: `Management.retire` kills an epoch and
+# whole compaction and conveyor subsystem is in that state: `MgmtWriter.retire` kills an epoch and
 # has no caller, `Node.drain` migrates stragglers and has no caller, `Node.maybe_collect` proposes
 # a collection and has no caller, and `Store.epochs` is the backlog queue with no reader. So nothing
 # migrates, nothing collects, nothing retires, and forward secrecy — the point of the conveyor — is
@@ -82,7 +82,7 @@ def _called(tree: ast.AST) -> set[str]:
     and grepping cannot tell the difference.
 
     THE WHOLE CHAIN, not just the attribute, because two duties can share a method name: `retire` is
-    both `Mempool.retire`, which the round calls, and `Management.retire`, which nothing calls. A
+    both `Mempool.retire`, which the round calls, and `MgmtWriter.retire`, which nothing calls. A
     detector that recorded only `retire` reported the second as driven — a guard against believing
     things happen, satisfied by a coincidence of names for the second time."""
     names: set[str] = set()

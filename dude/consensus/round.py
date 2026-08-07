@@ -225,8 +225,7 @@ class Block:
     """The slice, sorted deterministically (`sorted(hashes)`), so `slice_hash` is a pure function
     of the set and any two nodes computing it independently agree."""
 
-    signers: crypto.SignerBitmap
-    sigs: tuple[crypto.Signature, ...]
+    multisig: crypto.MultiSig
     """The quorum's ratification, per #ratification-counts. The bitmap indexes the roster; each
     named signer's signature is over `slice_hash`."""
 
@@ -660,15 +659,13 @@ class Round:
         agreeing = {peer: sig for peer, sig in self._peer_sigs.items() if sig.slice_hash == want}
         if len(agreeing) < self._quorum:
             return
-        # Ratified. Build the Block: the roster-ordered bitmap + parallel signatures, via
-        # the same `combine` primitive `Ed25519ListMultiSig.verify` will read on the other side.
+        # Ratified. Build the Block: the roster-ordered bitmap + parallel signatures, via the
+        # same `combine` primitive `MultiSig.verify` will read on the other side.
         shares = {i: agreeing[m].sig for i, m in enumerate(self._roster) if m in agreeing}
-        signers, sigs = crypto.Ed25519ListMultiSig.combine(shares, len(self._roster))
         self._ratified = Block(
             bucket=self._bucket,
             hashes=tuple(sorted(self._pending_slice_hashes)),
-            signers=signers,
-            sigs=tuple(sigs),
+            multisig=crypto.MultiSig.combine(shares, len(self._roster)),
         )
         self._state = State.GONE
 

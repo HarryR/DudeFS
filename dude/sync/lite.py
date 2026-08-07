@@ -1,7 +1,7 @@
 # dude.sync.lite -- server-side helpers for light-client verbs.
 #
 # WHAT THIS MODULE OWNS. Two pure functions -- `serve_get_anchors` and `serve_get_proof`
-# -- that turn a decoded light-client request + Store + Management into the matching
+# -- that turn a decoded light-client request + Store + MgmtReader into the matching
 # reply (or LiteRefused). Same shape as `dude.sync.follower.serve_getblock`: pure, no
 # I/O, no state. Node's dispatcher calls them; the LiteAdapter posts the reply.
 #
@@ -15,7 +15,7 @@ from __future__ import annotations
 from ..consensus.settle_round import SettledBlock
 from ..core import crypto
 from ..store import Store
-from ..store.management import Management
+from ..store.management import MgmtReader
 from ..store.smt import Tree
 from .lite_adapter import (
     ABSENT_MARKER,
@@ -31,7 +31,7 @@ from .lite_adapter import (
 
 def serve_get_anchors(  # noqa: PLR0911 -- each early-return maps to a distinct LiteRefusal reason
     store: Store,
-    mgmt: Management,
+    mgmt: MgmtReader,
     request: GetAnchors,
     liveness_window: int,
 ) -> AnchorsReply | LiteRefused:
@@ -91,7 +91,7 @@ def serve_get_anchors(  # noqa: PLR0911 -- each early-return maps to a distinct 
 
 def serve_get_proof(  # noqa: PLR0911, PLR0912, C901 -- each early-return names a distinct LiteRefusal; branches map 1:1 to reasons in the closed enum
     store: Store,
-    mgmt: Management,
+    mgmt: MgmtReader,
     request: GetProof,
     liveness_window: int,
 ) -> ProofReply | LiteRefused:
@@ -182,7 +182,7 @@ def serve_get_proof(  # noqa: PLR0911, PLR0912, C901 -- each early-return names 
 # --------------------------------------------------------------------------------------------- #
 
 
-def _build_bundle(mgmt: Management, commitment) -> RosterBundle:
+def _build_bundle(mgmt: MgmtReader, commitment) -> RosterBundle:
     """Assemble the identity chain a light client needs to verify from the anchor
     (#light-client-cert-chain). Contains commitment payload + per-entry P_NODE rows +
     per-manager P_GRANT rows, each with their #cert."""

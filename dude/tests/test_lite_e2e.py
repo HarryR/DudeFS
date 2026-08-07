@@ -2,7 +2,7 @@
 #
 # Two layers:
 #   * `serve_get_anchors` / `serve_get_proof` (`dude.sync.lite`) directly, with a real
-#     Cluster's stores + Management. Verifies bundle shape, piggyback headers, refusal
+#     Cluster's stores + MgmtWriter. Verifies bundle shape, piggyback headers, refusal
 #     paths (STALE_CLIENT, FORK_DETECTED).
 #   * Node dispatch (`_on_get_anchors` / `_on_get_proof`) via a signed envelope handed
 #     to `node.receive`. Verifies auth gate and that a reply is queued on the postman.
@@ -19,7 +19,7 @@ from dude.consensus.settle_round import SettledBlock
 from dude.core import crypto
 from dude.net.envelope import Envelope, new_message_id
 from dude.store import ops
-from dude.store.management import Cert, Management, Role
+from dude.store.management import Cert, MgmtWriter, Role
 from dude.sync.lite import serve_get_anchors, serve_get_proof
 from dude.sync.lite_adapter import (
     AnchorsReply,
@@ -36,7 +36,7 @@ from .cluster import DELTA, T0, Cluster
 
 def _provision_client(c: Cluster, kp: crypto.Keypair) -> None:
     """Grant Role.CLIENT to `kp`, applied via intervene so every store sees it."""
-    mgmt = Management(c.nodes[0].store)
+    mgmt = MgmtWriter(c.nodes[0].store)
     grant_tx = mgmt.authorise(
         kp.public,
         Role.CLIENT,

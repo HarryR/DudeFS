@@ -38,7 +38,7 @@ from .net.link import Listener
 from .net.postman import Postman
 from .net.session import Inbound, Session, SessionBindError
 from .store import Store, ops
-from .store.management import Management
+from .store.management import MgmtReader
 from .sync.adapter import (
     GetBlock,
     Refused,
@@ -181,7 +181,7 @@ class Node:
         self.follower = Follower(
             me=self.me,
             store=self.store,
-            mgmt=Management(self.store),
+            mgmt=MgmtReader(self.store),
             tunables=self.tunables.sync,
         )
 
@@ -195,8 +195,10 @@ class Node:
     # -- membership ---------------------------------------------------------------------------- #
 
     @property
-    def mgmt(self) -> Management:
-        return Management(self.store)
+    def mgmt(self) -> MgmtReader:
+        """READ side only. A node reads authority; it never authors a management tx -- that
+        is the manager's job, and the type says so (#nodes-are-not-authors)."""
+        return MgmtReader(self.store)
 
     def _reconcile_peers(self, now: Millis) -> None:
         """Sync `postman.peers` against the current roster (#roster-drives-peers).
@@ -243,7 +245,7 @@ class Node:
             self._managed_peers.add(pubkey)
 
     def roster(self) -> tuple[crypto.PublicKey, ...]:
-        """MANAGEMENT'S ANSWER, and nowhere else. `Management` owns everything about who is
+        """MANAGEMENT'S ANSWER, and nowhere else. `MgmtReader` owns everything about who is
         authorised; the roster is one such question. `Store.roster` used to shadow this call;
         deleted -- Store does not touch the roster. `store.mgmt.roster()` is the one path."""
         return self.store.mgmt.roster()
@@ -391,7 +393,7 @@ class Node:
           * A currently-attested Role.COMPACTOR (for future compactor-side reads).
           * A currently-attested roster member (nodes reading each other, e.g. for sync).
 
-        Uses `Management.may_send(requester, 0)` for grant checks -- MANAGER blanket
+        Uses `MgmtReader.may_send`(requester, 0)` for grant checks -- MANAGER blanket
         makes it True; other roles fall back to the store roster membership check."""
         if requester == self.store.anchor():
             return True

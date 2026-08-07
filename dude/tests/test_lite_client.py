@@ -10,14 +10,15 @@ import unittest
 from dataclasses import replace
 
 from dude.consensus.bootstrap import intervene
+from dude.consensus.settle_round import SettledBlock
 from dude.core import crypto
 from dude.net.address import Endpoint, Scheme
 from dude.net.envelope import Envelope, Frame, SignedEnvelope, Verb
 from dude.net.postman import Postman
 from dude.net.transports import InProcDialer, InProcListener, address_of, name_of
 from dude.store import ops
-from dude.store.management import Cert, Management, Role
-from dude.sync.lite_adapter import ProofReply
+from dude.store.management import Cert, MgmtWriter, Role
+from dude.sync.lite_adapter import LiteMsg
 from dude.sync.lite_client import PENDING, Failed, GetResult, LightClient, State
 
 from .cluster import DELTA, T0, Cluster
@@ -40,7 +41,7 @@ def _provision_client(c: Cluster, kp: crypto.Keypair) -> None:
     """Grant Role.CLIENT via intervene on every store, with the client's InProc endpoint
     baked into the P_GRANT row so nodes can dial back via `_reconcile_peers`
     (#roster-drives-peers)."""
-    mgmt = Management(c.nodes[0].store)
+    mgmt = MgmtWriter(c.nodes[0].store)
     grant_tx = mgmt.authorise(
         kp.public,
         Role.CLIENT,
@@ -52,28 +53,29 @@ def _provision_client(c: Cluster, kp: crypto.Keypair) -> None:
         intervene(node.store, c.mgr, bodies=(grant_tx,), bucket=444)
 
 
-def _mutate_frame_to_client(
+def _mutate_frame_to_client(  # noqa: PLR0913, PLR0917 -- a byzantine-responder harness needs both identities, the verb it targets, the swap, and the clock; bundling any of them hides what the attack changes
     frame: Frame,
     client_kp: crypto.Keypair,
     server_kp: crypto.Keypair,
-    mutate_proof_reply,
+    target: Verb,
+    mutate,
     now: int,
 ) -> Frame:
     """Unseal a frame addressed to `client_kp`, decode the envelope; if the verb is
-    `PROOF_REPLY`, apply `mutate_proof_reply(reply) -> ProofReply` to the decoded
-    ProofReply and re-emit the frame with a fresh envelope signed by `server_kp` and
-    re-sealed to the client. Non-PROOF_REPLY frames pass through unchanged.
+    `target`, apply `mutate(msg) -> LiteMsg` to the decoded message and re-emit the frame
+    with a fresh envelope signed by `server_kp` and re-sealed to the client. Frames of any
+    other verb pass through unchanged.
 
-    Used to simulate a byzantine responder: the envelope signature and the frame's
-    sealed structure are honest (a real server signed it), but the ProofReply's payload
-    has been swapped for something the SMT proof no longer verifies against."""
+    Used to simulate a byzantine responder: the envelope signature and the frame's sealed
+    structure are honest (a real server signed it), but the payload inside has been swapped
+    for something the client's own verification must reject. Verb-generic because both
+    halves of what a light client verifies -- the SMT proof on a `PROOF_REPLY` and the
+    quorum proof on an `ANCHORS_REPLY` head -- need attacking, and only the first one was."""
     raw = client_kp.open_sealed_raw(frame.sealed)
     signed = SignedEnvelope.decode(raw)
-    if signed.env.verb is not Verb.PROOF_REPLY:
+    if signed.env.verb is not target:
         return frame
-    reply = ProofReply._decode(signed.env.body)
-    mutated = mutate_proof_reply(reply)
-    verb, body = mutated.encode()
+    verb, body = mutate(LiteMsg.decode(signed.env.verb, signed.env.body)).encode()
     new_env = Envelope(
         to=signed.env.to,
         verb=verb,
@@ -147,6 +149,68 @@ class TestLightClientBootstrap(unittest.TestCase):
         self.assertEqual(len(ts.roster), 3)
         self.assertEqual(len(ts.managers), 1)
         self.assertGreater(ts.head.block_num, 0)
+
+    def test_forged_quorum_proof_does_not_reach_ready(self):
+        """The head's quorum proof is checked, and the client refuses on failure.
+
+        THE HALF THIS FILE NEVER ATTACKED. `test_byzantine_value_fails_proof_verify` forges
+        the VALUE and leans on the SMT fold, explicitly leaving the settle sigs honest -- so
+        the client's authorisation check had happy-path coverage only. It was a second
+        implementation of `MgmtWriter.authorises`' rule, and gutting it to `return True`
+        would not have failed a single test. `Authorization` is now the one implementation;
+        this is what holds it.
+
+        The bundle is untouched and verifies, the envelope is honestly signed by a real
+        node, the roster is the real roster -- only the signatures over
+        `(slice_hash, anchors)` are replaced with well-formed garbage. A bitmap of the same
+        width and a sig list of the same length, so nothing short-circuits on shape: the
+        refusal has to come from verifying the signatures themselves."""
+        c = Cluster()
+        client_kp = crypto.Keypair.generate()
+        _provision_client(c, client_kp)
+        client, client_listener = _build_light_client(c, client_kp)
+
+        def forge(msg):
+            head = msg.head
+            return replace(
+                msg,
+                head=SettledBlock(
+                    block=head.block,
+                    anchors=head.anchors,
+                    multisig=crypto.MultiSig(
+                        head.multisig.bitmap,
+                        tuple(crypto.Signature(bytes(64)) for _ in head.multisig.sigs),
+                    ),
+                ),
+            )
+
+        client.bootstrap(T0 + DELTA)
+        for now in (T0 + DELTA, T0 + 2 * DELTA):
+            for _ in range(5):
+                for node in c.nodes:
+                    node._reconcile_peers(now)
+                client.tick(now)
+                for node in c.nodes:
+                    node.postman.tick(now)
+                for node in c.nodes:
+                    for inbound in c.listeners[node.me.public].drain():
+                        node.receive(inbound.frame, now, session=inbound.session)
+                for inbound in client_listener.drain():
+                    client.receive(
+                        _mutate_frame_to_client(
+                            inbound.frame,
+                            client_kp,
+                            c.nodes[0].me,
+                            Verb.ANCHORS_REPLY,
+                            forge,
+                            now,
+                        ),
+                        now,
+                        session=inbound.session,
+                    )
+
+        self.assertFalse(client.bootstrapped(), "forged quorum proof was accepted")
+        self.assertIsNone(client.trusted_state)
 
 
 class TestLightClientRead(unittest.TestCase):
@@ -242,7 +306,7 @@ class TestLightClientRead(unittest.TestCase):
                     delivered += 1
             for inbound in client_listener.drain():
                 mutated_frame = _mutate_frame_to_client(
-                    inbound.frame, client_kp, server_kp, mutate, now
+                    inbound.frame, client_kp, server_kp, Verb.PROOF_REPLY, mutate, now
                 )
                 client.receive(mutated_frame, now, session=inbound.session)
                 delivered += 1

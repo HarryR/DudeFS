@@ -425,7 +425,7 @@ Two ECMH accumulators, and they answer different questions.
 ### Management operations should be typed, not smuggled {#typed-management-ops-owed}
 
 The current shape emits management writes as generic `ops.Set(P_GRANT + who, ...)` /
-`ops.Set(P_NODE + who, ...)`. `Management.authorise` / `change_roster` validate the cert
+`ops.Set(P_NODE + who, ...)`. `MgmtWriter.authorise` / `change_roster` validate the cert
 at construction time before emitting; a well-behaved caller cannot land a malformed grant.
 The read side (`may_write`, `roster()`) also refuses invalid rows, so authority forgery
 is closed either way.
@@ -586,7 +586,7 @@ via the same one door as any other submission.
 
 ### Roster change refuses a hard brick {#roster-change-refuses-brick}
 
-- `Management.change_roster(add, remove)` MUST refuse if the change would move the cluster
+- `MgmtWriter.change_roster(add, remove)` MUST refuse if the change would move the cluster
   from a safe state (`n_before >= 3`) into a bricked state (`n_after < 3`). Below n=3 the
   spare is zero, so any single node offline removes quorum -- operationally a brick, not just
   a fragile state.
@@ -1056,7 +1056,7 @@ turns that into a SETTLED block.
     A_log)`. Deterministic. Two nodes with the same slice + same anchors compute byte-identical
     identity bytes and therefore the same `block_hash = H(identity_bytes)`. This is what a
     successor's `prev_block_hash` names.
-  - **Quorum proof** = `(signer_bitmap, settle_sigs)` — a distinct-signer subset over the
+  - **Quorum proof** = one `MultiSig` (bitmap + parallel sigs) — a distinct-signer subset over the
     `(slice_hash, anchors)` payload, of size `len(roster) + 1` (positions `0..N-1` for roster
     members, position `N` reserved for the manager override — see
     #manager-sig-overrides-quorum). NOT part of `block_hash`. Which sigs a given node holds at
@@ -1095,11 +1095,18 @@ turns that into a SETTLED block.
   only in which bitmap slot carries the sig.
 - **Bitmap layout**: `len(roster) + 1` slots. Positions `0..N-1` are roster members (as
   before); position `N` is reserved for the manager. Bitmap serialization uses the existing
-  `crypto.SignerBitmap` mechanism with the +1 size; sig list is parallel to set bits.
+  `crypto.MultiSig` value with the +1 size; its sig list is parallel to its set bits. The
+  bitmap and the sigs are ONE value, not two fields: they are meaningless apart, and carrying
+  them separately is what let two modules implement the verification rule independently.
 - **Verification**: for each set bit, verify the corresponding sig against roster[i] (for
   i < N) or against `store.anchor()` (for i == N). Block is authorized iff EITHER the
   manager bit N is set with a valid sig, OR the count of set roster bits with valid sigs
   is ≥ `quorum.size(len(roster))`.
+- This rule MUST have exactly ONE implementation, reached by every caller. A node supplies
+  the roster and anchor from its own log; a light client supplies them from a cert-verified
+  bundle (#light-client-cert-chain); both then run the same check over the same type. A
+  second copy of an authorisation rule is not a second check — the copy that is wrong is the
+  one nobody tests, and this rule had exactly that shape for one release.
 - **Why the manager is a distinct slot and NOT a roster member**: roster is the operational
   quorum of nodes; manager is a policy override that sits above. Putting the manager in the
   roster would change quorum arithmetic silently every time the roster grew or shrank.
@@ -1278,7 +1285,7 @@ design arcs.
   than to carry a hidden misconfiguration across restarts. See #sync-safety-vs-full-bft: sync
   is safe against `< f+1` malicious peers WITHOUT any exclusion mechanism.
 - Manager-driven ejection stays available as an operator recourse via ordinary
-  `Management.revoke` on the evidence an operator gathers out-of-band. It acts on the roster,
+  `MgmtWriter.revoke` on the evidence an operator gathers out-of-band. It acts on the roster,
   not on any per-follower state; local shun would not compose with it and MUST NOT be
   introduced as a shortcut.
 
@@ -1599,7 +1606,7 @@ Applies at L3 and L4.
 
 The **encoding-half** of this section stays wired: `Set.epoch` is on the wire, `live.epoch`
 is stored, values carry their keyepoch cleartext next to the ciphertext. The **retirement-
-half** — `Management.retire`, the `Drained` predicate, `Store.epoch_live`, the refcount over
+half** — `MgmtWriter.retire`, the `Drained` predicate, `Store.epoch_live`, the refcount over
 live values — was ripped in 2026-08-01 as a mitigation nothing consults. It returns with
 client encryption and #compaction together: compaction is the conveyor that drives the
 refcount down (routine truncation drops ciphertext under old keys), and client encryption is
@@ -1900,6 +1907,7 @@ visible rather than plausible.
 | the root is a function of the live set alone | `smt.py` tests (insert-then-delete, order-independence) |
 | `A_state` is `(store, name, value)` and excludes provenance | `store.element` |
 | `A_log` is `(index, op_hash)` over retained entries | `store.log_element` |
+| a quorum proof's bitmap and sigs are one value, never two fields | `crypto.MultiSig` — `combine` produces it, `verify` consumes it, `Block` / `SettledBlock` carry it |
 
 ### L1 storage
 
@@ -1909,6 +1917,7 @@ visible rather than plausible.
 | every live row carries a credential | `live.cred NOT NULL` schema, `Held.cred` no default |
 | the leaf commits to the credential | `smt.leaf_hash(path, vhash, chash)` |
 | management is a cleartext prefixed keyspace | `management.py`, keys typed as `P_NODE + …` |
+| reading authority and authoring a management tx are different capabilities | `MgmtReader` (rows + anchor via `management.Source`) and `MgmtWriter(MgmtReader)` (tx composition). No dual-purpose alias: a holder of a read view CANNOT reach `change_roster` / `authorise` / `revoke`, so `Node.mgmt`, `Store.mgmt`, `Coordinator.mgmt` and `Follower.mgmt` are read-only by type rather than by convention |
 | entries below the last ratified checkpoint may be discarded | **OWED** — compaction ripped 2026-08-01 (rip 2/3); no-compaction path holds every entry from genesis, and the compactor role (SPEC L5+) has not been designed |
 | a settled index is preserved on replay | `Store.replay` applies at recorded indices |
 
@@ -1921,18 +1930,18 @@ visible rather than plausible.
 | predicates quote, do not recompute | `ops.Holds` requires a value digest |
 | content address is over the bytes as received | `SignedTransaction.op_hash = h(raw)` |
 | positions are not authored | signature body excludes any position field |
-| authority is store-scoped | `Management.may_write` |
-| roster changes are one transaction | `Management.add_node` / `set_roster` return one `Transaction` |
-| revocation is deletion of a row | `Management.revoke` returns a `Del` |
-| the anchor is always authorised (#anchor-is-the-axiom) | `Management.may_write` short-circuits True for `who == self.store.anchor()`; `Management.may_send` treats the anchor via the same rule; `Management.authorization` reserves bitmap slot `N` for the anchor pubkey |
-| the anchor is the only identity that may exercise the block override (#anchor-is-the-axiom) | `Management.authorization` verifies bitmap slot `N` against `self.store.anchor()` -- no `Role.MANAGER` grant reaches that slot |
+| authority is store-scoped | `MgmtReader.may_write` |
+| roster changes are one transaction | `MgmtWriter.add_node` / `set_roster` return one `Transaction` |
+| revocation is deletion of a row | `MgmtWriter.revoke` returns a `Del` |
+| the anchor is always authorised (#anchor-is-the-axiom) | `MgmtReader.may_write` short-circuits True for `who == self.store.anchor()`; `MgmtReader.may_send` treats the anchor via the same rule; `MgmtReader.authorises` reserves bitmap slot `N` for the anchor pubkey |
+| the anchor is the only identity that may exercise the block override (#anchor-is-the-axiom) | `MgmtReader.Authorization.verify` checks bitmap slot `N` against the anchor it was built with -- no `Role.MANAGER` grant reaches that slot |
 | anchor rotation is deferred (#anchor-is-the-axiom) | **deferred** -- `Store.provision` is one-shot; no operation replaces `store.anchor()`. Loss of the anchor cold-key ends emergency-intervention capability, not the cluster |
-| bootstrap and emergency intervention share ONE block-construction path (#anchor-is-the-axiom) | Both call `dude.consensus.bootstrap._build_manager_signed_block(...)` (or equivalent shared helper); no `sign_by_manager` on `SettledBlock` outside that helper |
-| Role.MANAGER confers blanket authorship (#role-manager-grant) | `Management.may_write` returns True on `g.role is Role.MANAGER` for any `store_id`; `Management.may_send` returns True on `g.role is Role.MANAGER` for any kind |
-| Nodes are not authors (#nodes-are-not-authors) | `Role` enum has no `NODE` member; `Management.authorise` cannot express a node-as-author grant. A bare node identity has no P_GRANT row, so `may_write` returns False. Being in P_NODE keyspace with a valid #cert is the only sense in which a node is "in" the system |
-| Only the anchor grants or revokes MANAGER / COMPACTOR (#role-manager-grant) | **partial** — `Management.authorise(role=MANAGER \| COMPACTOR, cert=...)` requires an anchor-signed Cert and validates it before emitting the mutation. Log-boundary refusal of a raw `Set P_GRANT` bypassing `authorise` is DEFERRED per #typed-management-ops-owed |
-| One authorisation cert shape (#cert) | **partial** — `Management.Cert` is one dataclass covering every authority-carrying row (`subject: bytes` covers both identity certs and content-commitment certs). `authorise` and `change_roster` require it; `may_write`, `may_send`, `roster()`, and `roster_commitment()` verify it on read (subject, purpose, signature, signer-authority-for-purpose). Log-boundary refusal of a cert-less or wrong-purpose write is DEFERRED per #typed-management-ops-owed |
-| Roster commitment carries its own cert (#roster-commitment-cert) | **partial** — P_ROSTER row content is `[serial, sorted_members, state_fingerprint, cert]`; `Cert.sign_roster_commitment(signer, encode([serial, sorted_members, state_fingerprint]))` binds `subject = H(content)` with all three fields signed. `change_roster` computes `state_fingerprint` from post-state entries (endpoints + domains per member), requires a `commitment_signer` keypair (anchor or valid manager), emits the cert with the mutation. `Management.roster_commitment()` decodes, recomputes both fingerprints, verifies the cert, and returns None on any failure. Log-boundary refusal DEFERRED per #typed-management-ops-owed |
+| bootstrap and emergency intervention share ONE block-construction path (#anchor-is-the-axiom) | Both call `dude.consensus.bootstrap._apply_manager_signed_block(...)`; no other site composes a manager-slot `MultiSig` |
+| Role.MANAGER confers blanket authorship (#role-manager-grant) | `MgmtReader.may_write` returns True on `g.role is Role.MANAGER` for any `store_id`; `MgmtReader.may_send` returns True on `g.role is Role.MANAGER` for any kind |
+| Nodes are not authors (#nodes-are-not-authors) | `Role` enum has no `NODE` member; `MgmtWriter.authorise` cannot express a node-as-author grant. A bare node identity has no P_GRANT row, so `may_write` returns False. Being in P_NODE keyspace with a valid #cert is the only sense in which a node is "in" the system |
+| Only the anchor grants or revokes MANAGER / COMPACTOR (#role-manager-grant) | **partial** — `MgmtWriter.authorise(role=MANAGER \| COMPACTOR, cert=...)` requires an anchor-signed Cert and validates it before emitting the mutation. Log-boundary refusal of a raw `Set P_GRANT` bypassing `authorise` is DEFERRED per #typed-management-ops-owed |
+| One authorisation cert shape (#cert) | **partial** — `management.Cert` is one dataclass covering every authority-carrying row (`subject: bytes` covers both identity certs and content-commitment certs). `authorise` and `change_roster` require it; `may_write`, `may_send`, `roster()`, and `roster_commitment()` verify it on read (subject, purpose, signature, signer-authority-for-purpose). Log-boundary refusal of a cert-less or wrong-purpose write is DEFERRED per #typed-management-ops-owed |
+| Roster commitment carries its own cert (#roster-commitment-cert) | **partial** — P_ROSTER row content is `[serial, sorted_members, state_fingerprint, cert]`; `Cert.sign_roster_commitment(signer, encode([serial, sorted_members, state_fingerprint]))` binds `subject = H(content)` with all three fields signed. `change_roster` computes `state_fingerprint` from post-state entries (endpoints + domains per member), requires a `commitment_signer` keypair (anchor or valid manager), emits the cert with the mutation. `MgmtReader.roster_commitment()` decodes, recomputes both fingerprints, verifies the cert, and returns None on any failure. Log-boundary refusal DEFERRED per #typed-management-ops-owed |
 | Management operations should be typed, not smuggled (#typed-management-ops-owed) | **OWED** — API-side plumbing (this row's Cert enforcement) is a halfway house; the design fix is typed management op types so wrong-shape writes are unexpressible. Deferred until after light-client work per Harry's ruling |
 
 ### L3 mempool
@@ -1953,9 +1962,9 @@ visible rather than plausible.
 |---|---|
 | quorum arithmetic has one implementation and no configurability (#quorum-gate) | `dude.quorum` -- flat module of `size`/`intersection`/`tolerates`/`corroboration`/`spare`/`max_domain`/`satisfied`/`would_brick`/`domain_advisory`. No `Rule` class, no `DEFAULT`, no rule parameters anywhere. Every caller asks the module a named question; none computes. |
 | `f+1` is decided by the quorum module | `quorum.corroboration`; consumed by `Follower.caught_up` for the fresh-witness threshold (#freshness-needs-many) |
-| composition is advisory, not enforcement (#quorum-gate) | `quorum.domain_advisory` returns violations for operator inspection via `Management.check_domains`; no code path refuses on it |
-| roster change refuses a hard brick (#roster-change-refuses-brick) | `Management.change_roster` raises `ManagementError` iff `quorum.would_brick(n_after) AND NOT quorum.would_brick(n_before)` -- shrinking a safe cluster into an unrecoverable state. Batched atomic add+remove sidesteps one-at-a-time refusal; anchor rescue via `intervene()` bypasses this check when a deliberate shrink is needed |
-| roster change is atomic (#roster-change-is-atomic) | `Management.change_roster` composes P_NODE writes/deletes, P_POP deletes, AND a fresh P_ROSTER commitment (serial = current + 1) into one Transaction. `add_node` and `remove_node` are wrappers -- the previous `remove_node` skipped the commitment update; fixed. |
+| composition is advisory, not enforcement (#quorum-gate) | `quorum.domain_advisory` returns violations for operator inspection via `MgmtReader.check_domains`; no code path refuses on it |
+| roster change refuses a hard brick (#roster-change-refuses-brick) | `MgmtWriter.change_roster` raises `ManagementError` iff `quorum.would_brick(n_after) AND NOT quorum.would_brick(n_before)` -- shrinking a safe cluster into an unrecoverable state. Batched atomic add+remove sidesteps one-at-a-time refusal; anchor rescue via `intervene()` bypasses this check when a deliberate shrink is needed |
+| roster change is atomic (#roster-change-is-atomic) | `MgmtWriter.change_roster` composes P_NODE writes/deletes, P_POP deletes, AND a fresh P_ROSTER commitment (serial = current + 1) into one Transaction. `add_node` and `remove_node` are wrappers -- the previous `remove_node` skipped the commitment update; fixed. |
 | ratification counts distinct signers | `crypto.bitmap_indices` |
 | ratification verifies every named signature | `crypto.Ed25519ListMultiSig.verify` |
 | ratification threshold is derived, not passed | `attested` (block variant) derives from the roster it is given |
@@ -1997,7 +2006,7 @@ visible rather than plausible.
 | pipeline holds one of each in flight (#one-of-each-in-flight) | `Coordinator` state: `mempool: Mempool`, `current_round: Round \| None`, `settling: _Settling \| None`. No queue between stages -- if Round ratifies while settling is busy, `current_round` holds the ratified Round until the next tick clears settling and `_promote_to_settling` fires; if settling is busy AND bucket boundary crosses, next Round doesn't open (mempool keeps admitting for the current bucket) |
 | block shape is SETTLED (#block-shape-settled) | `SettledBlock` dataclass; `SettledBlock.block_hash` computed over `_identity_bytes()` only (identity/proof split, sig-independent) |
 | empty blocks still increment block_num (#block-num-is-monotone) | `Coordinator._start_settling` computes `block_num = (store.head_block_num() or 0) + 1` unconditionally; covered by `Anchors.block_num` in every SettleSig |
-| manager signature overrides quorum (#manager-sig-overrides-quorum) | `Management.authorization` — `[*roster, anchor]` composition; bitmap slot `n − 1` reserved for manager; `SettledBlock.sign_by_manager`; `bootstrap()` uses it for block 1 |
+| manager signature overrides quorum (#manager-sig-overrides-quorum) | `MgmtReader.Authorization` — ONE dataclass carrying `(multisig, payload, roster, anchor)` with the whole rule on its `verify()`: `[*roster, anchor]` composition, manager slot at index `len(roster)`, `quorum.size` fallback. `MgmtReader.authorises` builds one from the log; `sync.lite_client` builds one from a verified bundle; `bootstrap()` sets the manager slot for block 1. Held by `test_management.test_role_manager_does_not_get_block_override` (node side) and `test_lite_client.test_forged_quorum_proof_does_not_reach_ready` (client side) |
 | chain roots at anchor identity (#genesis-stamp-anchors-the-chain) | `genesis_stamp(manager) = crypto.h("dude.genesis:" ‖ manager.bytes)`; Follower and Coordinator use it as `prev_block` when `head_block_hash() is None` |
 
 ### L6 sync
@@ -2007,7 +2016,7 @@ visible rather than plausible.
 | joiner starts from anchor alone (#joiner-starts-from-anchor) | `Store.provision(manager)` seeds a bare store; `bootstrap()` produces block 1 with manager sig; `test_fresh_joiner_pulls_block_1_via_manager_sig` end-to-end |
 | no trusted frontier (#no-trusted-frontier) | `Follower._on_settled_block` runs the full verify pipeline on every pulled block — no whitelist, no "trust this height" shortcut |
 | sync is log replay (#sync-is-log-replay) | `Follower._on_settled_block` — chain link + settle_sigs + body-block correspondence + body sigs + preview-anchors-match, then `store.commit_block` |
-| per-tx authority at replay (#per-tx-authority-verified-at-replay) | `Follower._preview_matches_signed_anchors` → `settle.apply_to` → `Management.may_write` — same evaluator/authoriser as production |
+| per-tx authority at replay (#per-tx-authority-verified-at-replay) | `Follower._preview_matches_signed_anchors` → `settle.apply_to` → `MgmtReader.may_write` — same evaluator/authoriser as production |
 | routine height polling is the trigger (#height-poll-is-the-trigger) | `Follower.tick` iterates `_poll_at`, emits `HeightAsk`; `Follower.caught_up()` requires f+1 fresh witnesses at `(my_num, my_tip)` |
 | same-height mismatched tip = divergence (#poll-detects-divergent-tips) | `Follower._on_height_reply` observes the mismatch; it is stored as a HeightReport (observability signal) but does NOT feed any exclusion decision. Fork resolution is human/tooling territory per #no-shun-only-priority. |
 | height is a hint, never a floor (#height-is-a-hint) | `HeightReply` is unsigned at message layer; verified only by the full GETBLOCK pull; a peer that lies about height wastes one round-trip and loses priority (no exclusion) |
@@ -2024,7 +2033,7 @@ visible rather than plausible.
 | requirement | enforced by |
 |---|---|
 | retrieval names one key, returns value + proof (#light-client-get) | `sync.lite.serve_get_proof` — value + credential + `smt.Tree.prove(...).encode()` at head; client verifies via `smt.verify(head_state_root, ...)` in `sync.lite_client._on_read_reply`. Byzantine-value regression pinned by `test_lite_client.test_byzantine_value_fails_proof_verify` |
-| client verifies from anchor alone (#light-client-verify) | `sync.lite_client.LightClient` — `bootstrap` → `f+1` corroboration → READY; `_verify_bundle` walks the cert chain from `anchor`; `_verify_multisig` composes roster + anchor exactly as `Management.authorization` does |
+| client verifies from anchor alone (#light-client-verify) | `sync.lite_client.LightClient` — `bootstrap` → `f+1` corroboration → READY; `_verify_bundle` walks the cert chain from `anchor`; the head's quorum proof goes through the SAME `MgmtReader.Authorization` a node uses, differing only in where the roster came from |
 | cert chain reaches roster from anchor alone (#light-client-cert-chain) | `sync.lite_client._verify_bundle` — verifies commitment cert, per-manager cert (anchor-only), per-entry cert (anchor-or-manager); recomputes `state_fingerprint` from bundle entries and checks against commitment subject |
 | every reply carries what the client needs to catch up (#light-client-piggyback) | `sync.lite.serve_get_anchors` / `serve_get_proof` — piggybacks a fresh `RosterBundle` iff the client's fingerprint doesn't match, and `headers[]` from the client's `known_trusted_block` up to head (clamped by fork/stale checks) |
 | chain-link on every read; drop on mismatch (#light-client-header-chain) | `sync.lite_client._advance_head` — walks `headers` + responder head, verifies each `prev_block` link and `settle_sigs` payload; failure returns `Failed("header chain-link or settle_sigs verify failed")` |
@@ -2052,7 +2061,7 @@ visible rather than plausible.
 | sign then seal | `envelope.py`: `SignedEnvelope` then `seal` |
 | a peer is an identity, correlation is `(peer, mid)` | `Mailbox.arrived` |
 | a solicited-answer request is registered as awaiting | `Mailbox.post(await_reply=True)` (required parameter) |
-| P_NODE stores endpoints (with options), not bare addresses (#peer-endpoint-in-log) | `NodeRecord.encode_row` / `decode_row` (dude/store/management.py) + `Management.change_roster` uses `rec.encode_row()` |
+| P_NODE stores endpoints (with options), not bare addresses (#peer-endpoint-in-log) | `NodeRecord.encode_row` / `decode_row` (dude/store/management.py) + `MgmtWriter.change_roster` uses `rec.encode_row()` |
 | endpoint options carry per-peer transport config (#peer-options-are-endpoint-options) | `Endpoint.options` round-tripped through `NodeRecord.encode_row`; per-field audit of `LinkTunables` for candidates to migrate is **OWED** |
 | Postman owns dialling; scheme→dialler is module-level (#postman-owns-dialling) | `Postman.add_peer` / `remove_peer` (dude/net/postman.py), module-scope `_DIALLERS` + `register_dialler`; `Node.connect` deleted |
 | the Node reconciles peers from the roster on tick (#roster-drives-peers) | `Node._reconcile_peers` + `_reconcile_roster` (dude/node.py); serial-gated. **Clients are NOT in it** -- see #grants-are-pure-authority |

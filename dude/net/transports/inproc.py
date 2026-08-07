@@ -253,5 +253,3 @@ def name_of(identity: crypto.PublicKey) -> str:
 
 def address_of(identity: crypto.PublicKey) -> Address:
     return Address(Scheme.INPROC, name_of(identity))
-
-

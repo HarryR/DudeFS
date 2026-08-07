@@ -8,7 +8,7 @@
 # `dude.store.settle` be pure and replay bypasses evaluation (#replay-does-not-readjudicate).
 #
 # TWO PROTOCOLS. `Reader` is the minimal read surface (get, prefix); enough for settle.evaluate,
-# Management, admission. `View(Reader)` extends it with the root-computing surface a Layer's
+# MgmtReader, admission. `View(Reader)` extends it with the root-computing surface a Layer's
 # base must provide (accumulator, state_root, hash_under, is_frozen) -- because a Layer computes
 # its projected roots by composing over its base's roots. Store implements View; Layer
 # implements View. That common shape is the "View abstraction" (SPECv2 #view-abstraction) --
@@ -79,7 +79,7 @@ class Row(NamedTuple):
 
 class Reader(Protocol):
     """The minimal read surface. `Store` implements it over SQLite; `Layer` implements it over
-    another `View`. Anything that only READS state takes this -- including `Management`, which
+    another `View`. Anything that only READS state takes this -- including `MgmtReader`, which
     is how a transaction's own uncommitted grants become visible to its own authority checks
     (and admission, and settle.evaluate, and every guard predicate)."""
 
@@ -178,7 +178,7 @@ class Layer:
 
     def prefix(self, store: int, pre: bytes) -> Iterator[Row]:
         """Merged view. A tombstone in this layer HIDES a base row -- without that, a deleted
-        key would reappear in an enumeration, which is how `Management.nodes()` would resurrect
+        key would reappear in an enumeration, which is how `MgmtReader.nodes`()` would resurrect
         a node removed earlier in the same transaction."""
         rows: dict[bytes, Row] = {r.name: r for r in self._base.prefix(store, pre)}
         for (st, name), held in self._delta.items():

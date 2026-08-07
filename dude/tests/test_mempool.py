@@ -29,7 +29,7 @@ from ..quorum import (
     would_brick,
 )
 from ..store import Store, ops
-from ..store.management import Management
+from ..store.management import MgmtReader
 
 D = ops.STORE_DATA
 M = ops.STORE_MANAGEMENT
@@ -113,7 +113,7 @@ class TestAdmission(unittest.TestCase):
         self.mp = Mempool(self.t)
         self.store = Store()  # the door consults state, so it needs one
         self.store.provision(self.kp.public)  # kp is the anchor => may_write returns True
-        self.mgmt = Management(self.store)
+        self.mgmt = MgmtReader(self.store)
 
     def _admit(self, tx, now=T0):
         return self.mp.admit(tx, now, self.store, self.mgmt)

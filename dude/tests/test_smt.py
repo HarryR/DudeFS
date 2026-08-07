@@ -281,7 +281,7 @@ class TestThroughTheStore(unittest.TestCase):
         self.s = store.Store()
         self.kp = crypto.Keypair.generate()
         self.s.provision(self.kp.public)
-        self.mgmt = management.Management(self.s)
+        self.mgmt = management.MgmtReader(self.s)
 
     def _write(self, name: bytes, value: bytes) -> None:
         self.s.apply((tx(self.kp, muts=(ops.Set(D, name, value),)),), auth=self.mgmt)

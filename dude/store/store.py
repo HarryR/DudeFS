@@ -44,7 +44,7 @@ import os
 import sqlite3
 import tempfile
 import threading
-from collections.abc import Iterable, Iterator
+from collections.abc import Generator, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import NamedTuple
@@ -53,7 +53,7 @@ from ..core import codec, crypto
 from ..core.errors import DudeError, InvariantError
 from . import ops, settle, smt
 from .layer import Held, Index, Row, _prefix_upper, holds
-from .management import P_NODE, P_ROSTER, Management, Role
+from .management import P_NODE, P_ROSTER, MgmtReader, Role
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS entry (
@@ -437,15 +437,11 @@ class StoreReader:
         ).fetchall()
         return {r[0] for r in rows}
 
-    def _mgmt(self) -> Management:
-        """A Management view over this Reader. Used by composed acceptance-checks; internal
-        so callers don't couple to it. Note: `Management` still type-annotates its
-        parameter as `Store`, but at runtime it uses only methods on StoreReader
-        (get, prefix, anchor, credential). Wave 3 will split Management into
-        MgmtReader/MgmtWriter and this cast disappears."""
-        from typing import cast  # noqa: PLC0415 -- local; only used by this shim
-
-        return Management(cast("Store", self))
+    def _mgmt(self) -> MgmtReader:
+        """A management READ view over this Reader. Used by composed acceptance-checks;
+        internal so callers don't couple to it. No cast: `MgmtReader` takes a
+        `management.Source` (rows + anchor), which is exactly what a StoreReader is."""
+        return MgmtReader(self)
 
 
 # ============================================================================= #
@@ -743,7 +739,7 @@ class Store:
         return conn
 
     @contextmanager
-    def snapshot(self) -> Iterator[StoreReader]:
+    def snapshot(self) -> Generator[StoreReader]:
         """A snapshot-consistent read scope. Opens a FRESH reader connection, opens a
         transaction, and PINS the snapshot via a trivial SELECT before yielding --
         SQLite's default `BEGIN` is deferred, meaning the snapshot only starts at the
@@ -771,7 +767,7 @@ class Store:
             conn.close()
 
     @contextmanager
-    def write(self) -> Iterator[StoreWriter]:
+    def write(self) -> Generator[StoreWriter]:
         """The exclusive write transaction. Acquires the writer lock, opens `BEGIN
         IMMEDIATE` on the writer connection, yields a StoreWriter, COMMITs on success or
         ROLLBACKs on exception. Only one writer at a time -- SQLite's own constraint,
@@ -893,12 +889,19 @@ class Store:
         return True
 
     @property
-    def mgmt(self) -> Management:
-        """A Management view over this store. Convenience for read-only mgmt calls
-        (`store.mgmt.roster()`, `store.mgmt.grant_of(...)`). For tx composition
-        (change_roster, authorise, etc.) with snapshot consistency, use
-        `with store.snapshot() as r: MgmtWriter(r).X(...)` explicitly."""
-        return Management(self)
+    def mgmt(self) -> MgmtReader:
+        """A management READ view over this store: `store.mgmt.roster()`,
+        `store.mgmt.grant_of(...)`. READ-ONLY BY TYPE -- composing a state-changing tx needs
+        `MgmtWriter` named explicitly, inside a snapshot scope so the reads that compose the
+        tx see one consistent moment:
+
+            with store.snapshot() as r:
+                tx = MgmtWriter(r).change_roster(...)
+
+        The dual-purpose `Management` alias that used to be returned here made the writer
+        reachable from every read-only holder, which is how a composed tx came to be authored
+        against unsnapshotted reads."""
+        return MgmtReader(self)
 
     # -- convenience one-shot writes ----------------------------------------- #
 

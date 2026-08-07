@@ -24,7 +24,7 @@ from dude.net.address import Endpoint, Scheme
 from dude.net.transports.tcp import TCPDialer, TCPListener
 from dude.node import Node
 from dude.store import Store, management, ops
-from dude.store.management import Cert, Management, Role
+from dude.store.management import Cert, MgmtWriter, Role
 from dude.tunables import DEFAULT
 
 
@@ -41,7 +41,7 @@ def _build_cluster(
 
     scratch = Store()
     scratch.provision(mgr.public)
-    mgmt = Management(scratch)
+    mgmt = MgmtWriter(scratch)
     mgr_cert = Cert.sign_grant(mgr, mgr.public, Role.MANAGER)
     tx = mgmt.authorise(
         mgr.public,

@@ -1,6 +1,6 @@
 # dude.sync.follower -- the follower state machine. See SPECv2 (#sync-layer-no-compaction).
 #
-# WHAT ONE FOLLOWER DOES. Given a Store, a Management view, and a set of peers, drive the
+# WHAT ONE FOLLOWER DOES. Given a Store, a MgmtReader view, and a set of peers, drive the
 # node's head to the cluster's current head by:
 #   * periodically polling peers with `HeightAsk` to learn where they are;
 #   * when any peer reports higher, pulling `GetBlock(my_head + 1)` from that peer;
@@ -41,7 +41,7 @@ from ..core.errors import DudeError, InvariantError
 from ..core.units import Millis
 from ..store import Layer, Store, settle
 from ..store.layer import Index
-from ..store.management import Management
+from ..store.management import MgmtReader
 from ..store.ops import SignedTransaction
 from ..store.store import log_element
 from ..tunables import SyncTunables
@@ -102,7 +102,7 @@ class Follower:
 
     me: crypto.Keypair
     store: Store
-    mgmt: Management
+    mgmt: MgmtReader
     tunables: SyncTunables
     _heads: dict[crypto.PublicKey, HeightReport] = field(default_factory=dict)
     _poll_at: dict[crypto.PublicKey, Millis] = field(default_factory=dict)
@@ -252,15 +252,13 @@ class Follower:
             if not tx.verify():
                 self._pulling = None
                 return
-        # Authorize the block. Management encapsulates the multisig verify (against the
+        # Authorize the block. MgmtReader encapsulates the multisig verify (against the
         # current roster) AND the manager-slot override (against `store.anchor()`); a True
         # here means the block is authoritative by one path or the other, and Follower does
         # not need to know which. Manager-authored bodies then flow through the evaluator
-        # via `Management.may_write`'s anchor-is-always-authorised rule -- no `auth=None`
+        # via `MgmtReader.may_write`'s anchor-is-always-authorised rule -- no `auth=None`
         # bypass anywhere.
-        if not self.mgmt.authorization(
-            sb.signers, sb.settle_sigs, _settle_payload(sb.block.slice_hash, sb.anchors)
-        ):
+        if not self.mgmt.authorises(sb.multisig, _settle_payload(sb.block.slice_hash, sb.anchors)):
             self._pulling = None
             return
         # Preview via Layer, verify computed anchors match signed anchors, THEN commit. This

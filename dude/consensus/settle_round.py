@@ -210,16 +210,18 @@ class SettledBlock:
     same anchors -- else divergence.
 
     RATIFY SIGS ARE NOT ENCODED. Per #block-shape-settled, "what proves the block to a replayer
-    is the settle_sigs alone: a quorum agreed on the outcome, and `slice_hash` inside that
-    payload pins which slice they were agreeing about." Round's `signers`/`sigs` on the wrapped
-    `Block` are transient consensus infrastructure -- the record of HOW the quorum agreed on the
-    slice, not the record THAT they did. `encode()` therefore omits them; `decode()` returns a
-    SettledBlock whose wrapped Block has empty ratify credentials."""
+    is the settle sigs alone: a quorum agreed on the outcome, and `slice_hash` inside that
+    payload pins which slice they were agreeing about." The wrapped `Block`'s own `multisig` is
+    transient consensus infrastructure -- the record of HOW the quorum agreed on the slice, not
+    the record THAT they did. `encode()` therefore omits it; `decode()` returns a SettledBlock
+    whose wrapped Block carries `crypto.UNSIGNED`."""
 
     block: Block
     anchors: Anchors
-    signers: crypto.SignerBitmap
-    settle_sigs: tuple[crypto.Signature, ...]
+    multisig: crypto.MultiSig
+    """The quorum proof over `(slice_hash, anchors)`: roster positions `0..N-1` plus the
+    manager override at position `N` (#manager-sig-overrides-quorum). Checked by
+    `MgmtReader.authorises`, which is the ONE place the roster-versus-override rule lives."""
 
     @property
     def block_hash(self) -> crypto.Digest:
@@ -254,14 +256,17 @@ class SettledBlock:
 
     def encode(self) -> bytes:
         """Wire form (#block-shape-settled). What a peer sends on `SETTLED_BLOCK`, what a
-        producer persists on SETTLED. Layout: `[identity_bytes, signers, settle_sigs]` -- the
-        identity portion comes first because chain-verify hashes only it (`block_hash`), and a
-        joiner can peek without re-decoding the sig section."""
+        producer persists on SETTLED. Layout: `[identity_bytes, bitmap, sigs]` -- the identity
+        portion comes first because chain-verify hashes only it (`block_hash`), and a joiner can
+        peek without re-decoding the proof section.
+
+        The proof's two positions are written INLINE, the way `Anchors`' six are: `MultiSig`
+        owns the pairing, this record owns its own layout (#encoding-owned-by-dataclass)."""
         return codec.encode(
             [
                 self._identity_bytes(),
-                self.signers,
-                list(self.settle_sigs),
+                self.multisig.bitmap,
+                list(self.multisig.sigs),
             ]
         )
 
@@ -281,20 +286,17 @@ class SettledBlock:
                 acc_state=crypto.Accumulator(codec.as_bytes(identity[6])),
                 acc_log=crypto.Accumulator(codec.as_bytes(identity[7])),
             )
-            signers = crypto.SignerBitmap(codec.as_bytes(outer[1]))
-            settle_sigs = tuple(crypto.Signature(codec.as_bytes(s)) for s in codec.as_seq(outer[2]))
+            multisig = crypto.MultiSig(
+                crypto.SignerBitmap(codec.as_bytes(outer[1])),
+                tuple(crypto.Signature(codec.as_bytes(s)) for s in codec.as_seq(outer[2])),
+            )
         except DudeError as e:
             raise SettleError(f"malformed SettledBlock: {e}") from e
-        # Ratify sigs are not on the wire -- reconstruct a Block with empty ratify credentials.
+        # Ratify sigs are not on the wire -- reconstruct a Block with no ratify credentials.
         # A replayer needs `bucket` and `hashes` for `slice_hash` and for applying the slice;
-        # the ratify sigs were Round's transient consensus record and never persist.
-        block = Block(
-            bucket=bucket,
-            hashes=hashes,
-            signers=crypto.SignerBitmap(b""),
-            sigs=(),
-        )
-        return cls(block=block, anchors=anchors, signers=signers, settle_sigs=settle_sigs)
+        # the ratify proof was Round's transient consensus record and never persists.
+        block = Block(bucket=bucket, hashes=hashes, multisig=crypto.UNSIGNED)
+        return cls(block=block, anchors=anchors, multisig=multisig)
 
 
 @dataclass(frozen=True, slots=True)
@@ -496,15 +498,13 @@ class SettleRound:
         # Ratified. Build the SettledBlock with a bitmap of signers plus a reserved manager slot
         # at position `len(roster)` (#manager-sig-overrides-quorum). The manager bit stays 0 in
         # the ordinary quorum path -- bootstrap and emergency-intervention blocks set it via
-        # `SettledBlock.sign_by_manager` instead. Sig list is parallel to set bits, same as
-        # Round's Block (SPECv2 #ratification-counts).
+        # `bootstrap._apply_manager_signed_block` instead. Sig list is parallel to set bits,
+        # same as Round's Block (SPECv2 #ratification-counts).
         n = len(self._roster) + 1  # +1 for the manager override slot
         shares = {i: self._sigs[m] for i, m in enumerate(self._roster) if m in self._sigs}
-        signers, sigs = crypto.Ed25519ListMultiSig.combine(shares, n)
         self._settled = SettledBlock(
             block=self._block,
             anchors=self._anchors,
-            signers=signers,
-            settle_sigs=tuple(sigs),
+            multisig=crypto.MultiSig.combine(shares, n),
         )
         self._state = SettleState.SETTLED
