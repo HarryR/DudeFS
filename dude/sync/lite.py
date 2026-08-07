@@ -75,8 +75,15 @@ def serve_get_anchors(  # noqa: PLR0911 -- each early-return maps to a distinct 
     _, _, _, commitment_cert = commitment
     roster_fingerprint = crypto.Digest(commitment_cert.subject)
 
+    # A BUNDLE IS A BOOTSTRAP ARTEFACT ONLY (#light-client-roster-is-corroborated-only).
+    # Shipped when the client presents no fingerprint -- i.e. it is establishing trust and
+    # will corroborate what it gets across `f+1` peers. NOT shipped on a mismatch: a client
+    # whose fingerprint has moved cannot verify a replacement roster from whoever answered
+    # (a #cert has no serial, so a revoked manager's attestation still verifies to a client
+    # holding no log), so the honest answer is the fingerprint itself -- which tells it to
+    # re-bootstrap. Sending a bundle it must not adopt is bytes plus an attack surface.
     bundle: RosterBundle | None = None
-    if request.known_roster_fingerprint != roster_fingerprint:
+    if request.known_roster_fingerprint is None:
         bundle = _build_bundle(mgmt, commitment)
 
     headers = _headers_since(store, tb, head_num)
@@ -160,8 +167,15 @@ def serve_get_proof(  # noqa: PLR0911, PLR0912, C901 -- each early-return names 
 
     _, _, _, commitment_cert = commitment
     roster_fingerprint = crypto.Digest(commitment_cert.subject)
+    # A BUNDLE IS A BOOTSTRAP ARTEFACT ONLY (#light-client-roster-is-corroborated-only).
+    # Shipped when the client presents no fingerprint -- i.e. it is establishing trust and
+    # will corroborate what it gets across `f+1` peers. NOT shipped on a mismatch: a client
+    # whose fingerprint has moved cannot verify a replacement roster from whoever answered
+    # (a #cert has no serial, so a revoked manager's attestation still verifies to a client
+    # holding no log), so the honest answer is the fingerprint itself -- which tells it to
+    # re-bootstrap. Sending a bundle it must not adopt is bytes plus an attack surface.
     bundle: RosterBundle | None = None
-    if request.known_roster_fingerprint != roster_fingerprint:
+    if request.known_roster_fingerprint is None:
         bundle = _build_bundle(mgmt, commitment)
     headers = _headers_since(store, tb, head_num)
 

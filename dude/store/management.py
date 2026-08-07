@@ -24,7 +24,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Protocol
 
@@ -378,6 +378,80 @@ class Source(Reader, Protocol):
     def anchor(self) -> crypto.PublicKey | None: ...
 
 
+@dataclass(frozen=True, slots=True)
+class Attestation:
+    """One live row whose #cert names some signer — the unit of "what must be re-issued if
+    that signer's authority ends".
+
+    STATE-ONLY, AND THAT IS THE POINT. `key`, `purpose` and `subject` are everything needed
+    to decide whether a proposed replacement cert covers this row, and none of it needs a
+    private key. That is what lets one query serve both sides of the migration: today it
+    drives authoring in `MgmtWriter.revoke`; when management writes become typed opcodes
+    (#typed-management-ops-owed) the same query becomes the APPLY-time completeness check —
+    "did the author supply a cert for every row this identity attested?" — which every node
+    must be able to run holding no keys at all.
+
+    The minting half cannot migrate with it: a replacement cert is a signature, nodes hold
+    no manager key (#nodes-are-not-authors), so an opcode carries pre-minted certs as
+    payload and checks them against this query rather than recomputing them."""
+
+    key: bytes
+    """Row key within the management store, including its prefix."""
+    purpose: bytes
+    """The cert purpose this row carries; a replacement MUST match it (#cert)."""
+    subject: bytes
+    """What the cert attests — the identity for P_NODE / P_GRANT rows, the recomputed
+    content hash for the P_ROSTER commitment (#roster-commitment-cert)."""
+
+
+def attestations_by(
+    src: Reader, signer: crypto.PublicKey, store_id: int = ops.STORE_MANAGEMENT
+) -> tuple[Attestation, ...]:
+    """Every live authority-carrying row whose #cert was signed by `signer`, key-sorted.
+
+    Takes a `Reader`, NOT a `Source`: it asks only what rows exist, never who the anchor is.
+    That is what lets the apply-time consumer hand it the settle-time `Layer` -- an overlay has
+    rows but no provisioning, so a `Source` parameter would have made the migration impossible
+    for the sake of a field this query never reads.
+
+    Pure over state, so it answers the same question at authoring time and at apply time.
+    A prefix scan over P_NODE and P_GRANT plus the single P_ROSTER row — enumerable exactly
+    because management is a cleartext keyspace (#management-is-cleartext); over derived
+    tokens this query would be impossible and compound revocation with it.
+
+    Malformed rows are SKIPPED rather than raised on: this is a query, and a row that will
+    not decode is already refused by every read-side check that matters. Raising here would
+    turn one bad row into a failure to revoke."""
+    out: list[Attestation] = []
+    for name, _prov, value, _ep in src.prefix(store_id, P_NODE):
+        who = crypto.PublicKey(name[len(P_NODE) :])
+        try:
+            rec = NodeRecord.decode_row(who, value)
+        except DudeError:
+            continue
+        if rec.cert.signer == signer:
+            out.append(Attestation(name, _CERT_PURPOSE_ROSTER, bytes(who)))
+    for name, _prov, value, _ep in src.prefix(store_id, P_GRANT):
+        who = crypto.PublicKey(name[len(P_GRANT) :])
+        try:
+            grant = Grant.decode_row(who, value)
+        except DudeError:
+            continue
+        if grant.cert.signer == signer:
+            out.append(Attestation(name, grant.role.value, bytes(who)))
+    raw = src.get(store_id, P_ROSTER)
+    if raw is not None:
+        try:
+            f = codec.as_seq(codec.decode(raw[1]), 4)
+            content = codec.encode([codec.as_int(f[0]), codec.as_seq(f[1]), f[2]])
+            cert = Cert.decode(codec.as_bytes(f[3]))
+        except DudeError:
+            return tuple(sorted(out, key=lambda a: a.key))
+        if cert.signer == signer:
+            out.append(Attestation(P_ROSTER, _CERT_PURPOSE_ROSTER_COMMITMENT, crypto.h(content)))
+    return tuple(sorted(out, key=lambda a: a.key))
+
+
 class MgmtReader:
     """The management store's READ surface -- every query that returns pure data (bool,
     dict, Grant, NodeRecord, ...). Used by:
@@ -477,6 +551,55 @@ class MgmtReader:
                 and grant.cert.signer == anchor
             )
         return False
+
+    def unauthorised_certs(self) -> str | None:
+        """THE INVARIANT: no live row carries a #cert whose signer is not currently authorised
+        for that cert's purpose. Returns a reason naming the first offending row, or None.
+
+        The checker is `verify_cert` — the same per-row predicate the read side already runs,
+        quantified over every row rather than consulted one at a time. One implementation, so
+        there is no second model of the rule to disagree with the first.
+
+        WHAT IT CONVERTS. A row failing `verify_cert` is not an error anywhere: `roster()` just
+        skips it, `may_write` just returns False. That silence is how revoking a manager could
+        take the roster to zero and read as a network fault. This turns the same condition into
+        something a test can assert and an operator can query.
+
+        NOT WIRED INTO `Store._unacceptable`, deliberately. A raw `ops.Del(P_GRANT + who)`
+        composed by hand can still reach this state — that is the standing
+        #typed-management-ops-owed hole, and it is an accepted intermediate. Refusing such a
+        block at the acceptance boundary would be a post-hoc veto on settled state, i.e. a way
+        to brick on exactly the input it is meant to catch. Enforcement arrives with the typed
+        management opcodes, where it is a settle-time decision on a self-describing op."""
+        for prefix, decode in (
+            (P_NODE, lambda who, raw: NodeRecord.decode_row(who, raw).cert),
+            (P_GRANT, lambda who, raw: Grant.decode_row(who, raw).cert),
+        ):
+            for name, _prov, value, _ep in self.src.prefix(self.store_id, prefix):
+                who = crypto.PublicKey(name[len(prefix) :])
+                try:
+                    cert = decode(who, value)
+                except DudeError as e:
+                    return f"row {name!r} will not decode: {e}"
+                if not self.verify_cert(cert):
+                    return (
+                        f"row {name!r} carries a cert signed by "
+                        f"{cert.signer.hex()[:8]}, which is not authorised for "
+                        f"purpose {cert.purpose!r}"
+                    )
+        raw = self.src.get(self.store_id, P_ROSTER)
+        if raw is None:
+            return None
+        try:
+            cert = Cert.decode(codec.as_bytes(codec.as_seq(codec.decode(raw[1]), 4)[3]))
+        except DudeError as e:
+            return f"roster commitment will not decode: {e}"
+        if not self.verify_cert(cert):
+            return (
+                f"the roster commitment is attested by {cert.signer.hex()[:8]}, "
+                f"which is not currently authorised to sign one"
+            )
+        return None
 
     def manager_grants(self) -> tuple[Grant, ...]:
         """Every currently-attested Role.MANAGER grant. Prefix scan over P_GRANT,
@@ -963,14 +1086,99 @@ class MgmtWriter(MgmtReader):
             ops.Set(self.store_id, P_POP + who, pop),
         )
 
-    def revoke(self, who: crypto.PublicKey) -> ops.Transaction:
-        """Forward-only (#absence-is-revocation): operations this identity already authored
-        stay valid, because
-        validity is relative to the position at which they were authorised."""
-        return ops.writes(
-            ops.Del(self.store_id, P_GRANT + who),
-            ops.Del(self.store_id, P_POP + who),
-        )
+    def revoke(self, who: crypto.PublicKey, *, reissue_signer: crypto.Keypair) -> ops.Transaction:
+        """Revoke `who`'s grant AND re-issue every #cert it signed, in ONE transaction.
+
+        COMPOUND, BECAUSE THE READ SIDE RE-ADJUDICATES. `verify_cert` asks whether a cert's
+        signer is authorised NOW, so deleting a manager's grant row silently invalidates every
+        row that manager attested: the P_NODE rows survive untouched and `roster()` stops
+        returning them. Revoking a warm manager that had admitted the cluster's nodes took the
+        roster to ZERO, with no row deleted and no error raised — the node then sits out
+        consensus (`_open_round` refuses `me not in roster`), floods nothing (`_flood` iterates
+        an empty roster) and looks exactly like a network fault. Re-issuing as part of the same
+        transaction is what keeps the invariant (`unauthorised_certs`) true across the change.
+
+        ATOMIC, for #roster-change-is-atomic's reason: a partially re-issued state — some rows
+        re-attested, the grant already gone — is not a state this API can reach.
+
+        FORWARD-ONLY IS UNAFFECTED (#absence-is-revocation). Transactions `who` already authored
+        stay valid; what is replaced is the standing ATTESTATION on live rows, which is a
+        different claim from the authorship of the write that placed them.
+
+        `reissue_signer` is REQUIRED even when nothing needs re-issuing (revoking a client
+        signs nothing). A conditional argument is the trap where a default is right for one
+        caller and silently wrong for another — the wrong thing should be unsayable, not
+        merely discouraged.
+
+        ANCHOR-ONLY FOR MANAGER / COMPACTOR (#role-manager-grant): "Only the anchor grants or
+        revokes Role.MANAGER." Refused here at AUTHORING; the log-boundary refusal of a bare
+        `ops.Del(P_GRANT + who)` composed by hand is DEFERRED with the rest of
+        #typed-management-ops-owed, which is where this whole operation is headed.
+
+        Raises `ManagementError` if the store is unprovisioned, if a manager/compactor
+        revocation is not anchor-signed, or if `reissue_signer` is not itself authorised to
+        sign a replacement."""
+        anchor = self.src.anchor()
+        if anchor is None:
+            raise ManagementError("cannot revoke: store has no manager anchor")
+        target = self.grant_of(who)
+        if (
+            target is not None
+            and target.role in (Role.MANAGER, Role.COMPACTOR)
+            and reissue_signer.public != anchor
+        ):
+            raise ManagementError(
+                f"only the anchor may revoke a {target.role.name} grant (#role-manager-grant); "
+                f"reissue_signer {reissue_signer.public.hex()[:8]} is not the anchor"
+            )
+        attested = attestations_by(self.src, who, self.store_id)
+        steps: list[ops.Mutation] = [self._reissue(att, reissue_signer) for att in attested]
+        steps.append(ops.Del(self.store_id, P_GRANT + who))
+        steps.append(ops.Del(self.store_id, P_POP + who))
+        return ops.writes(*steps)
+
+    def _reissue(self, att: Attestation, signer: crypto.Keypair) -> ops.Mutation:
+        """Rebuild one attested row with a fresh #cert from `signer`, changing NOTHING else.
+
+        Row content is decoded and re-encoded through the owning dataclass so the layout stays
+        in one place (#encoding-owned-by-dataclass). Only the cert field moves:
+
+          * P_NODE — `state_fingerprint` covers `(identity, endpoints, domains)` and not the
+            cert, so re-attesting an entry leaves the roster commitment valid. No cascade.
+          * P_ROSTER — the replacement signs the SAME `[serial, sorted_members,
+            state_fingerprint]`, so `cert.subject` and therefore `roster_fingerprint` are
+            unchanged. A re-issue is not a roster change and MUST NOT look like one: the serial
+            does not bump, light clients do not churn their cached bundle, and
+            `Node._reconcile_peers`' serial gate does not fire."""
+        raw = self.src.get(self.store_id, att.key)
+        if raw is None:  # raced away between query and compose; nothing to re-attest
+            raise ManagementError(f"row {att.key!r} vanished while composing a revocation")
+        if att.key == P_ROSTER:
+            f = codec.as_seq(codec.decode(raw[1]), 4)
+            content = codec.encode([codec.as_int(f[0]), codec.as_seq(f[1]), f[2]])
+            cert = Cert.sign_roster_commitment(signer, content)
+            self._require_signer(cert)
+            return ops.Set(self.store_id, P_ROSTER, codec.encode([f[0], f[1], f[2], cert.encode()]))
+        identity = crypto.PublicKey(att.subject)
+        if att.key.startswith(P_NODE):
+            rec = NodeRecord.decode_row(identity, raw[1])
+            cert = Cert.sign_roster(signer, identity)
+            self._require_signer(cert)
+            return ops.Set(self.store_id, att.key, replace(rec, cert=cert).encode_row())
+        grant = Grant.decode_row(identity, raw[1])
+        cert = Cert.sign_grant(signer, identity, grant.role)
+        self._require_signer(cert)
+        return ops.Set(self.store_id, att.key, replace(grant, cert=cert).encode_row())
+
+    def _require_signer(self, cert: Cert) -> None:
+        """A replacement cert must itself pass the read-side authority check, or the revocation
+        would trade one unauthorised attestation for another. Same guard `change_roster` runs on
+        the commitment cert it mints."""
+        if not self.verify_cert(cert):
+            raise ManagementError(
+                f"reissue_signer {cert.signer.hex()[:8]} is not authorised to sign a "
+                f"{cert.purpose!r} cert (must be anchor or a currently-valid manager)"
+            )
 
     def distribute(
         self, epoch: int, wraps: dict[crypto.PublicKey, crypto.SealedBlob]

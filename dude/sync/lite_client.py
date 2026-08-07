@@ -77,9 +77,10 @@ class State(Enum):
 @dataclass(frozen=True, slots=True)
 class TrustedState:
     """What a bootstrapped client trusts. All fields are anchor-verifiable OR quorum-
-    corroborated at establishment time; subsequent reads may advance `head` and swap
-    `roster_fingerprint` on roster changes (#light-client-header-chain,
-    #light-client-roster-change-in-window).
+    corroborated at establishment time; subsequent reads may advance `head`, but the roster
+    itself is NEVER swapped in place -- a moved fingerprint invalidates this whole object and
+    the client re-bootstraps (#light-client-header-chain,
+    #light-client-roster-is-corroborated-only).
 
     Trust boundary: fields derived from `f+1` corroboration + cert-chain-from-anchor."""
 
@@ -95,8 +96,9 @@ class TrustedState:
     """Where to reach each roster member. Populated from bundle P_NODE rows."""
 
     roster_fingerprint: crypto.Digest
-    """The commitment cert's subject. Sent in every subsequent request; server includes
-    a fresh bundle iff the client's fingerprint doesn't match theirs."""
+    """The commitment cert's subject. Sent in every subsequent request, and compared against
+    every reply: a mismatch means this trusted state is stale and the client re-bootstraps
+    (#light-client-roster-is-corroborated-only)."""
 
     head: TrustedBlock
     """`(block_num, block_hash)` -- the most recent block whose `settle_sigs` we've
@@ -445,13 +447,23 @@ class LightClient:
             entry.result = Failed(reason="unexpected reply verb")
             return
         assert self.trusted_state is not None  # noqa: S101 -- type narrowing for the checker; contract invariants above make this unreachable
-        # If the reply carries a fresh bundle, verify + swap roster BEFORE verifying
-        # subsequent headers (#light-client-roster-change-in-window).
-        if msg.bundle is not None:
-            if not _verify_bundle(self.anchor, msg.bundle):
-                entry.result = Failed(reason="bundle verify failed")
-                return
-            self._swap_roster(msg.bundle, msg.roster_fingerprint)
+        # THE ROSTER FINGERPRINT IS THE TRIPWIRE (#light-client-roster-is-corroborated-only).
+        # It is threaded through every reply precisely so a client can tell whether the
+        # assumptions its cached roster rests on still hold. If it moved, they do not: this
+        # client is by definition working on stale trust, and stale trust is re-established
+        # by `f+1` corroboration, never adopted from whoever happened to answer.
+        #
+        # This branch used to verify a piggybacked bundle and swap the roster in place. A
+        # #cert carries no serial, so a light client holding no log cannot tell a current
+        # manager from a revoked one -- a revoked manager's anchor-signed grant cert verifies
+        # forever. One responder could therefore hand a client a roster of its own keys and
+        # have it adopted, with no collusion. Pinned by
+        # `test_lite_client.TestRevokedManagerCannotForgeARoster`.
+        if msg.roster_fingerprint != self.trusted_state.roster_fingerprint:
+            entry.result = Failed(reason="roster changed; re-bootstrap")
+            self.state = State.UNBOOTSTRAPPED
+            self.trusted_state = None
+            return
         # Chain-verify headers[] against current trusted head + roster, then advance
         # to responder's head (which is `msg.head`, a full SettledBlock). `_advance_head`
         # updates `trusted_state.head_state_root` on success -- that's the root the SMT
@@ -483,20 +495,6 @@ class LightClient:
             absent=msg.absent,
             block_num=msg.head.anchors.block_num,
             state_root=msg.head.anchors.state_root,
-        )
-
-    def _swap_roster(self, bundle: RosterBundle, fingerprint: crypto.Digest) -> None:
-        """Replace `trusted_state.roster`/`managers`/`node_endpoints`/`roster_fingerprint`
-        with the freshly-verified bundle. Called from `_on_read_reply` when the reply's
-        fingerprint differs from ours."""
-        assert self.trusted_state is not None  # noqa: S101 -- type narrowing for the checker; contract invariants above make this unreachable
-        self.trusted_state = TrustedState(
-            roster=tuple(sorted(bundle.commitment_members)),
-            managers=tuple(sorted(g.identity for g in bundle.managers)),
-            node_endpoints={rec.identity: rec.endpoints for rec in bundle.entries},
-            roster_fingerprint=fingerprint,
-            head=self.trusted_state.head,
-            head_state_root=self.trusted_state.head_state_root,
         )
 
     def _advance_head(

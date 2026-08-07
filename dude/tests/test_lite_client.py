@@ -11,14 +11,14 @@ from dataclasses import replace
 
 from dude.consensus.bootstrap import intervene
 from dude.consensus.settle_round import SettledBlock
-from dude.core import crypto
-from dude.net.address import Endpoint, Scheme
+from dude.core import codec, crypto
+from dude.net.address import Address, Endpoint, Scheme
 from dude.net.envelope import Envelope, Frame, SignedEnvelope, Verb
 from dude.net.postman import Postman
 from dude.net.transports import InProcDialer, InProcListener, address_of, name_of
 from dude.store import ops
-from dude.store.management import Cert, MgmtWriter, Role
-from dude.sync.lite_adapter import LiteMsg
+from dude.store.management import Cert, Grant, MgmtWriter, NodeRecord, Role
+from dude.sync.lite_adapter import LiteMsg, RosterBundle
 from dude.sync.lite_client import PENDING, Failed, GetResult, LightClient, State
 
 from .cluster import DELTA, T0, Cluster
@@ -352,3 +352,139 @@ class TestLightClientRead(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRevokedManagerCannotForgeARoster(unittest.TestCase):
+    """A manager that WAS authorised and has since been revoked must not be able to hand a
+    light client a roster of its own choosing.
+
+    WHY THIS IS NOT COVERED BY THE CERT CHAIN. A #cert carries no serial: "the row is either
+    present (attestation valid) or absent (revoked)". Currency for a cert therefore comes only
+    from observing its grant ROW in the log — the one thing a light client does not have. So a
+    revoked manager's anchor-signed grant cert verifies forever on the client side, and the
+    bundle is the single artefact in a light client's diet whose validity is not self-evident
+    from its own signatures. Blocks are fine (settle_sigs are a quorum multi-sig, chain-linked);
+    values are fine (SMT proof under signed anchors); both survive an arbitrary relay. The
+    bundle does not.
+
+    AND STEADY STATE HAS NO CORROBORATION. Bootstrap is covered by `f+1` agreement on
+    `roster_fingerprint`, so a forged roster there needs `f+1` colluding peers. But
+    `_on_read_reply` adopts a fresh bundle from ONE responder, and a responder may attach one
+    whenever it likes. #absence-is-revocation names the intended defence — "the state root's
+    non-inclusion proof over the grant path is the client's evidence" — and the client never
+    asks for one.
+
+    Asserts the CORRECT behaviour: the client's trusted roster is unchanged. It fails today."""
+
+    def test_forged_bundle_from_a_revoked_manager_is_not_adopted(self):
+        c = Cluster()
+        client_kp = crypto.Keypair.generate()
+        _provision_client(c, client_kp)
+
+        # A warm manager is granted, then revoked -- BEFORE the client bootstraps, so the
+        # client is at the responders' head when it reads. (A lagging client's GET_PROOF is
+        # refused TOO_OLD, since the no-compaction SMT only exists at head; that refusal made
+        # a first draft of this test pass without the forged bundle ever being delivered.)
+        # The grant cert stays a genuine anchor-signed artefact; only the ROW is gone, which
+        # is precisely what a light client cannot observe.
+        warm = crypto.Keypair.generate()
+        warm_cert = Cert.sign_grant(c.mgr, warm.public, Role.MANAGER)
+        for node in c.nodes:
+            mgmt = MgmtWriter(node.store)
+            grant = mgmt.authorise(
+                warm.public, Role.MANAGER, pop=warm.prove_possession(), cert=warm_cert
+            )
+            intervene(node.store, c.mgr, bodies=(grant.sign(c.mgr, T0),), bucket=555)
+            revoke = mgmt.revoke(warm.public, reissue_signer=c.mgr)
+            intervene(node.store, c.mgr, bodies=(revoke.sign(c.mgr, T0),), bucket=556)
+            self.assertIsNone(MgmtWriter(node.store).grant_of(warm.public), "revocation failed")
+
+        client, client_listener = _build_light_client(c, client_kp)
+
+        # Bootstrap honestly: f+1 corroboration on the real roster.
+        client.bootstrap(T0 + DELTA)
+        _pump(c, client, client_listener, T0 + DELTA)
+        _pump(c, client, client_listener, T0 + 2 * DELTA)
+        self.assertTrue(client.bootstrapped())
+        ts = client.trusted_state
+        assert ts is not None
+        honest_roster = ts.roster
+
+        # The revoked manager forges an entire roster of keys it controls.
+        attacker_nodes = [crypto.Keypair.generate() for _ in range(3)]
+        entries = tuple(
+            NodeRecord(
+                kp.public,
+                (Endpoint(Address(Scheme.INPROC, f"attacker{i}")),),
+                Cert.sign_roster(warm, kp.public),
+                frozenset(),
+            )
+            for i, kp in enumerate(attacker_nodes)
+        )
+        members = tuple(sorted(kp.public for kp in attacker_nodes))
+        state_fingerprint = crypto.h(
+            codec.encode(
+                [
+                    [
+                        bytes(r.identity),
+                        sorted(ep.encode() for ep in r.endpoints),
+                        sorted(r.domains),
+                    ]
+                    for r in sorted(entries, key=lambda r: bytes(r.identity))
+                ]
+            )
+        )
+        content = codec.encode([99, sorted(bytes(m) for m in members), state_fingerprint])
+        forged = RosterBundle(
+            commitment_serial=99,
+            commitment_members=members,
+            commitment_cert=Cert.sign_roster_commitment(warm, content),
+            entries=entries,
+            managers=(Grant(warm.public, Role.MANAGER, frozenset(), frozenset(), warm_cert),),
+        )
+
+        # Steady state: one responder attaches the forged bundle to an ordinary read reply.
+        rid = client.request_get(
+            store_id=ops.STORE_DATA,
+            name=crypto.h(b"anything"),
+            peer=c.nodes[0].me.public,
+            now=T0 + 3 * DELTA,
+        )
+        self.assertIsNotNone(rid)
+
+        def swap(msg):
+            return replace(
+                msg, bundle=forged, roster_fingerprint=crypto.Digest(forged.commitment_cert.subject)
+            )
+
+        now = T0 + 3 * DELTA
+        for _ in range(5):
+            for node in c.nodes:
+                node._reconcile_peers(now)
+            client.tick(now)
+            for node in c.nodes:
+                node.postman.tick(now)
+            for node in c.nodes:
+                for inbound in c.listeners[node.me.public].drain():
+                    node.receive(inbound.frame, now, session=inbound.session)
+            for inbound in client_listener.drain():
+                client.receive(
+                    _mutate_frame_to_client(
+                        inbound.frame, client_kp, c.nodes[0].me, Verb.PROOF_REPLY, swap, now
+                    ),
+                    now,
+                    session=inbound.session,
+                )
+
+        # The contract: the forged roster is never adopted. A moved fingerprint means this
+        # client's cached trust no longer holds, so it drops that trust and re-bootstraps --
+        # which is where `f+1` corroboration lives. It does NOT take a replacement roster
+        # from whoever happened to answer.
+        after = client.trusted_state
+        attacker_roster = tuple(sorted(kp.public for kp in attacker_nodes))
+        if after is not None:
+            self.assertNotEqual(after.roster, attacker_roster, "forged roster was adopted")
+            self.assertEqual(after.roster, honest_roster, "trusted roster changed")
+        self.assertIsNone(after, "client kept trusting a roster it can no longer verify")
+        self.assertIs(client.state, State.UNBOOTSTRAPPED)
+        self.assertEqual(client.poll(rid), Failed(reason="roster changed; re-bootstrap"))

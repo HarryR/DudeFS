@@ -98,9 +98,12 @@ class LiteRefusal(Enum):
 
 @dataclass(frozen=True, slots=True)
 class RosterBundle:
-    """The identity chain shipped to a light client on first-bootstrap or fingerprint-
-    mismatch. Everything a light client needs to verify the roster from the anchor alone,
-    without touching state_root.
+    """The identity chain shipped to a light client AT BOOTSTRAP ONLY. Everything a light
+    client needs to verify the roster from the anchor alone, without touching state_root.
+
+    Never shipped mid-session: a bundle can only be trusted where `f+1` corroboration
+    applies, because a #cert cannot prove its signer is still authorised to a client holding
+    no log (#light-client-roster-is-corroborated-only).
 
     `commitment_*` is the P_ROSTER row: `(serial, sorted_members, cert)`. The cert's
     subject binds `H(codec.encode([serial, sorted_members]))` so a subset fails to
@@ -363,8 +366,9 @@ class ProofReply(LiteMsg):
     - `head` -- the responder's CURRENT head, a full `SettledBlock`. Client uses it to
       advance trusted head via #light-client-header-chain; its `anchors.state_root` is
       the root the proof verifies against.
-    - `roster_fingerprint` / `bundle` -- fresh RosterBundle iff the client's cached
-      fingerprint doesn't match the responder's (#light-client-roster-change-in-window).
+    - `roster_fingerprint` -- the tripwire. A mismatch against the client's cached value
+      means its trust is stale and it re-bootstraps; `bundle` stays None outside bootstrap
+      (#light-client-roster-is-corroborated-only).
     - `headers[]` -- 0 to `liveness_window` SettledBlocks between the client's
       `known_trusted_block` and the responder's head. Empty when caught up.
 

@@ -22,7 +22,15 @@ from ..core import crypto
 from ..core.errors import DudeError, InvariantError
 from ..net.address import Address, Endpoint, Scheme
 from ..store import Store, ops
-from ..store.management import Cert, ManagementError, MgmtWriter, NodeRecord, Role
+from ..store.management import (
+    P_GRANT,
+    P_POP,
+    Cert,
+    ManagementError,
+    MgmtWriter,
+    NodeRecord,
+    Role,
+)
 
 T0 = 1_700_000_000_000
 
@@ -186,8 +194,11 @@ class TestRoleManagerRotation(unittest.TestCase):
         self.assertIsNotNone(mgmt.grant_of(warm_mgr.public))
         self.assertTrue(mgmt.may_write(s, warm_mgr.public, ops.STORE_DATA))
 
-        # Revoke.
-        s.apply((_sign(anchor, mgmt.revoke(warm_mgr.public)),), auth=mgmt)
+        # Revoke. Anchor re-issues, though this manager attested nothing.
+        s.apply(
+            (_sign(anchor, mgmt.revoke(warm_mgr.public, reissue_signer=anchor)),),
+            auth=mgmt,
+        )
         self.assertIsNone(mgmt.grant_of(warm_mgr.public))
         self.assertFalse(mgmt.may_write(s, warm_mgr.public, ops.STORE_DATA))
         self.assertFalse(mgmt.may_send(warm_mgr.public, 0))
@@ -218,6 +229,118 @@ class TestRoleManagerRotation(unittest.TestCase):
 # --------------------------------------------------------------------------------------------- #
 # Emergency intervention: manager-signed block post-bootstrap.                                  #
 # --------------------------------------------------------------------------------------------- #
+
+
+class TestRevocationIsCompound(unittest.TestCase):
+    """Revoking an identity re-issues every #cert it signed, in the same transaction.
+
+    THE FAILURE THIS EXISTS TO CATCH, measured before the fix: a warm manager admitted three
+    nodes (signing their P_NODE certs and the roster commitment), the anchor revoked that
+    manager, and `roster()` returned ZERO members -- with all three P_NODE rows still present
+    and no error raised anywhere. `verify_cert` asks whether a cert's signer is authorised NOW,
+    so deleting one P_GRANT row silently un-attested every row that manager had signed. A node
+    in that state sits out consensus (`_open_round` refuses `me not in roster`) and floods
+    nothing (`_flood` iterates the roster), which reads as a network fault.
+
+    #absence-is-revocation is unharmed: what gets replaced is the standing ATTESTATION on live
+    rows, not the validity of anything the revoked identity authored."""
+
+    def _cluster_admitted_by_a_warm_manager(self, size=3):
+        """Anchor grants MANAGER to `warm`; `warm` -- not the anchor -- admits `size` nodes,
+        signing both the entry certs and the roster commitment. The ordinary warm-manager
+        operational path, and the one that breaks."""
+        anchor = crypto.Keypair.generate()
+        warm = crypto.Keypair.generate()
+        s, mgmt = _provisioned(anchor)
+        s.apply(
+            (
+                _sign(
+                    anchor,
+                    mgmt.authorise(
+                        warm.public,
+                        Role.MANAGER,
+                        pop=warm.prove_possession(),
+                        cert=Cert.sign_grant(anchor, warm.public, Role.MANAGER),
+                    ),
+                ),
+            ),
+            auth=mgmt,
+        )
+        kps = [crypto.Keypair.generate() for _ in range(size)]
+        add = mgmt.change_roster(
+            commitment_signer=warm,
+            add=tuple(
+                NodeRecord(
+                    kp.public,
+                    (_endpoint(i),),
+                    Cert.sign_roster(warm, kp.public),
+                    frozenset(),
+                )
+                for i, kp in enumerate(kps)
+            ),
+        )
+        s.apply((add.sign(warm, T0),), auth=mgmt)
+        return anchor, warm, s, mgmt, kps
+
+    def test_revoking_the_manager_that_admitted_them_keeps_the_roster(self):
+        anchor, warm, s, mgmt, _kps = self._cluster_admitted_by_a_warm_manager()
+        before = mgmt.roster()
+        self.assertEqual(len(before), 3)
+
+        s.apply((_sign(anchor, mgmt.revoke(warm.public, reissue_signer=anchor)),), auth=mgmt)
+
+        self.assertIsNone(mgmt.grant_of(warm.public), "grant survived revocation")
+        self.assertEqual(mgmt.roster(), before, "revoking the attesting manager dropped nodes")
+        self.assertIsNotNone(mgmt.roster_commitment(), "roster commitment stopped verifying")
+
+    def test_the_invariant_holds_across_revocation(self):
+        """`unauthorised_certs` is the quantified form of the per-row check the read side
+        already runs. It reports the violation the roster silently absorbed."""
+        anchor, warm, s, mgmt, _kps = self._cluster_admitted_by_a_warm_manager()
+        self.assertIsNone(mgmt.unauthorised_certs())
+
+        s.apply((_sign(anchor, mgmt.revoke(warm.public, reissue_signer=anchor)),), auth=mgmt)
+        self.assertIsNone(mgmt.unauthorised_certs(), mgmt.unauthorised_certs())
+
+    def test_a_bare_del_leaves_the_invariant_violated(self):
+        """The accepted intermediate state (#typed-management-ops-owed): a caller who bypasses
+        the API and composes the deletion by hand still reaches an un-attested roster. The
+        invariant REPORTS it -- which is the whole point of naming it -- but nothing refuses
+        the write until management operations become typed opcodes."""
+        anchor, warm, s, mgmt, _kps = self._cluster_admitted_by_a_warm_manager()
+        bare = ops.writes(
+            ops.Del(ops.STORE_MANAGEMENT, P_GRANT + warm.public),
+            ops.Del(ops.STORE_MANAGEMENT, P_POP + warm.public),
+        )
+        s.apply((_sign(anchor, bare),), auth=mgmt)
+
+        self.assertEqual(mgmt.roster(), (), "the roster-collapse precondition changed")
+        self.assertIsNotNone(mgmt.unauthorised_certs(), "invariant did not report the violation")
+
+    def test_only_the_anchor_may_revoke_a_manager(self):
+        """#role-manager-grant: "Only the anchor grants or revokes Role.MANAGER." Refused at
+        AUTHORING; the log-boundary refusal is owed with the typed opcodes."""
+        _anchor, warm, _s, mgmt, _kps = self._cluster_admitted_by_a_warm_manager()
+        with self.assertRaises(ManagementError):
+            mgmt.revoke(warm.public, reissue_signer=warm)
+
+    def test_reissue_does_not_bump_the_serial_or_the_fingerprint(self):
+        """A re-issue is not a roster change and MUST NOT look like one: membership, endpoints
+        and domains are untouched, so `cert.subject` -- which IS `roster_fingerprint` -- stays
+        put. Otherwise every revocation would churn light-client bundles and trip
+        `Node._reconcile_peers`' serial gate for no state change."""
+        anchor, warm, s, mgmt, _kps = self._cluster_admitted_by_a_warm_manager()
+        before = mgmt.roster_commitment_full()
+        assert before is not None
+
+        s.apply((_sign(anchor, mgmt.revoke(warm.public, reissue_signer=anchor)),), auth=mgmt)
+
+        after = mgmt.roster_commitment_full()
+        assert after is not None
+        self.assertEqual(after[0], before[0], "serial bumped on a re-issue")
+        self.assertEqual(after[2], before[2], "state_fingerprint moved on a re-issue")
+        self.assertEqual(after[3].subject, before[3].subject, "roster_fingerprint moved")
+        self.assertEqual(after[3].signer, anchor.public, "cert was not re-signed by the anchor")
 
 
 class TestEmergencyIntervention(unittest.TestCase):

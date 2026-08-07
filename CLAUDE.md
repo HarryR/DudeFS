@@ -1,5 +1,26 @@
 # Working in this repository
 
+## NEVER USE `git checkout` (OR `git restore`) TO UNDO SOMETHING
+
+**This has destroyed uncommitted work repeatedly. It is the single most expensive habit in this
+repo.**
+
+`git checkout -- <path>` does not undo *your last edit*. It throws the file away and replaces it
+with HEAD, taking **every uncommitted change in that file** with it — including the hour of work
+you were part-way through, which is almost always the reason you were editing it at all. It
+succeeds silently, prints nothing, and the loss is only discovered later when a `grep` comes back
+empty. There is no reflog for a working-tree file that was never committed.
+
+The same applies to anything else that moves the working tree to a committed state:
+`git restore`, `git reset --hard`, `git stash`, `git clean`.
+
+**To undo an edit, reverse the edit.** Deleted a line? Put it back. Added a canary or a debug
+line? Delete that line. Gutted a function for a revert-check? `cp` it to the scratchpad FIRST and
+`cp` it back after — never `git checkout`. The undo must be as narrow as the change was.
+
+Switching branches (`git checkout -b`, `git switch`) is a different operation and is fine. It is
+the **path form** that destroys.
+
 ## Where the record lives
 
 **`SPEC.md` is the spec, and it is the only design document.** It states requirements and nothing

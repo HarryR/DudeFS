@@ -16,11 +16,14 @@
 #
 # AND THE SAME FAILURE FOR DUTIES, which hid longer because it looks like nothing at all. A thing
 # can be specified, built, unit-tested and correct while nothing in the round ever calls it. The
-# whole compaction and conveyor subsystem is in that state: `MgmtWriter.retire` kills an epoch and
-# has no caller, `Node.drain` migrates stragglers and has no caller, `Node.maybe_collect` proposes
-# a collection and has no caller, and `Store.epochs` is the backlog queue with no reader. So nothing
-# migrates, nothing collects, nothing retires, and forward secrecy — the point of the conveyor — is
-# unreachable, while every primitive underneath is correct and tested.
+# whole compaction and conveyor subsystem was once in that state: `retire` killed an epoch with no
+# caller, `drain` migrated stragglers with no caller, `maybe_collect` proposed a collection with no
+# caller, `Store.epochs` was a backlog queue with no reader. Nothing migrated, nothing collected,
+# nothing retired, and forward secrecy — the point of the conveyor — was unreachable, while every
+# primitive underneath was correct and tested. That subsystem was struck in full rather than left
+# standing as machinery nobody drove; the REQUIREMENT survives in SPEC (`#wrapped-masters`
+# retention, OWED) and returns with compaction, which is its real consumer. Kept here as the case
+# that motivated this file, not as a description of anything now in the tree.
 #
 # WHAT THIS FILE CAN AND CANNOT DO. It catches a check with no caller — which was four of those six.
 # It cannot catch a check that is called but incomplete (`attested` counting nothing), or one
@@ -54,6 +57,9 @@ WIRED = {
     "unvouched_roster": "a roster row that does not trace to the anchor",
     "roster_incomplete": "a roster that is a subset, unstated, or older than one already seen",
     "vouched": "a credential that does not vouch for the value a row currently holds",
+    "attestations_by": "a revocation that leaves rows attested by the key it just removed",
+    "authorises": "a block whose quorum proof is neither a roster quorum nor the anchor override",
+    "verify_cert": "a row whose #cert signer is not authorised for that cert's purpose",
 }
 """Checks that must have a live consumer in production code.
 
@@ -61,6 +67,16 @@ Keyed by the callable's name — `smt.verify`-style qualified names work too, fo
 ambiguous on its own."""
 
 OWED = {
+    "unauthorised_certs": (
+        "The #revocation-is-compound invariant -- no live row carries a cert whose signer is no "
+        "longer authorised. Asserted by `test_management.TestRevocationIsCompound`, consulted by "
+        "no production decision, and DELIBERATELY so: the state it reports is reachable today by "
+        "a hand-composed `ops.Del` and is an accepted intermediate until management writes become "
+        "typed opcodes (#typed-management-ops-owed). Its consumer is that opcode's apply-time "
+        "check. Wiring it into `Store._unacceptable` before then would refuse, on replay, a log "
+        "the cluster itself settled -- fine live, unadoptable on transfer, which is a worse "
+        "inconsistency than the gap. Do not invent a caller for it in the meantime."
+    ),
     "conflicts": (
         "RULING PENDING: wire the exclusion rule into batch selection, or strike it. Sound either "
         "way -- settlement re-evaluates every guard, which is the backstop `falsifies` names -- so "
@@ -130,24 +146,18 @@ A duty differs from a check: a check refuses something, a duty makes something h
 same way — no caller — but an unperformed duty leaves no trace at all, because nothing refuses and
 nothing errors. The system simply never does the thing."""
 
-UNDRIVEN = {
-    "mgmt.retire": (
-        "NOT a duty of the round `[H]`: wrap rows are not deleted as housekeeping. Retirement is a "
-        "MANAGER operation, and a manager already may write the management store — deleting a "
-        "client's wraps rides along with rotating that client. Listed because it still has no "
-        "caller anywhere, not because the round owes it."
-    ),
-    "store.epochs": (
-        "The conveyor's work queue, oldest epoch first, with no reader and no verb, so the layer "
-        "that would convey cannot ask what to convey. Owed by a verb plus the worker/client layer "
-        "that holds data keys. A node holds none, so re-encryption is correctly absent from this "
-        "tree and is recorded OWED in SPEC's enforcement table rather than here."
-    ),
-}
+UNDRIVEN: dict[str, str] = {}
 """Duties with no driver YET, each naming what owes it.
 
-Same contract as `OWED`: cheap and honest to add, dishonest to leave for ever, and the test below
-fails the moment one becomes driven so the list cannot rot into "we believe this happens"."""
+EMPTY, and that is a claim rather than an oversight: every duty this tree specifies is performed.
+The last two entries named `retire` and `Store.epochs` long after both were struck. A debt entry
+for a symbol that no longer exists can never become driven, so the anti-rot test below could never
+fire for it -- permanently green, guarding nothing. That is the same "we believe this happens" this
+file exists to prevent, wearing the opposite costume. The requirement those two recorded lives in
+SPEC (`#wrapped-masters` retention, OWED), which is its right home.
+
+Same contract as `OWED` when it refills: cheap and honest to add, dishonest to leave for ever, and
+the test below fails the moment one becomes driven so the list cannot rot."""
 
 
 class TestEveryCheckIsConsulted(unittest.TestCase):

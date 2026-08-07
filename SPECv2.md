@@ -477,6 +477,39 @@ because that path was considered and rejected as re-implementation.
 - Revocation is forward-only: transactions the revoked identity has already authored remain valid,
   because validity is relative to the position at which they were authorised.
 
+### Revocation re-issues what the identity attested {#revocation-is-compound}
+
+- Read-side authority checks ask whether a #cert's signer is authorised **now**
+  (`verify_cert`). Deleting a grant row therefore un-attests every live row that identity
+  signed, and the read side absorbs that silently — a row failing the check is not an error,
+  it is simply a row `roster()` skips. Revoking a warm manager that had admitted the cluster's
+  nodes took the roster to ZERO with no row deleted and nothing raised anywhere.
+- Revoking an identity MUST therefore re-issue every #cert it signed — P_NODE entry certs,
+  P_GRANT certs, and the P_ROSTER commitment cert — in the SAME transaction as the deletion,
+  signed by an identity that is itself authorised for each purpose. A partially re-issued
+  state MUST NOT be reachable through the API (#roster-change-is-atomic's argument).
+- This does not weaken #absence-is-revocation's forward-only rule. What is replaced is the
+  standing ATTESTATION on a live row; the validity of anything the revoked identity authored
+  is untouched.
+- A re-issue MUST NOT bump the roster serial or change `roster_fingerprint`: membership,
+  endpoints and domains are unchanged, so `cert.subject` is unchanged. A re-issue is not a
+  roster change and MUST NOT be observable as one, or every revocation would churn every
+  light client's cached bundle and trip node peer-reconciliation for no state change.
+- **The invariant:** no live row carries a #cert whose signer is not currently authorised for
+  that cert's purpose. The checker is `verify_cert` quantified over every row, so there is no
+  second model of the rule to disagree with the first.
+- The invariant MUST NOT be enforced at the log-acceptance boundary. A caller bypassing the
+  API can still compose a bare `ops.Del` of a grant row and reach a violating state; that is
+  the accepted intermediate of #typed-management-ops-owed. Refusing such a block after
+  settlement would be a post-hoc veto on agreed state — a way to brick on exactly the input
+  it means to catch. Enforcement arrives with the typed management opcodes, as a settle-time
+  decision on a self-describing operation.
+- The query "which live rows does this identity attest" MUST be pure over state and carry no
+  key material, because it is the half that migrates: at authoring it drives the re-issue; as
+  a typed opcode it becomes the apply-time completeness check every node runs holding no keys.
+  Minting the replacement certs is signing, so it cannot migrate — a typed opcode carries
+  pre-minted certs as payload and checks them against this query.
+
 ### Grants carry authority, not location {#grants-are-pure-authority}
 
 - A grant MUST be pure authority: `(identity, role, stores, kinds, cert)`. It MUST NOT carry
@@ -1417,8 +1450,8 @@ the manager pubkey; it wants the current value for one key without holding any b
   2. Piggybacks the responder's current anchors + settle_sigs + `roster_fingerprint`
      (#light-client-piggyback).
   3. Includes 0-2 headers between the client's trusted_block and the responder's head
-     (#light-client-header-chain), and a fresh bundle if fingerprint changed
-     (#light-client-roster-change-in-window).
+     (#light-client-header-chain). NO bundle: a fingerprint that has moved means
+     re-bootstrap, not a replacement roster (#light-client-roster-is-corroborated-only).
 - **Corroboration is on the roster, not on state_root.** `settle_sigs` are already a
   quorum multi-sig -- one valid `settle_sigs` = `>= quorum` roster members attesting to
   that block's state_root. Once the roster is corroborated, a single valid `settle_sigs`
@@ -1456,9 +1489,10 @@ Both are needed and orthogonal:
   (fake member has no anchor-provenanced entry cert).
 
 Currency of the roster comes from the `f+1` corroboration in bootstrap RT2: honest
-majority ensures the cached commitment is the current one at that moment. Ongoing currency
-is maintained via `roster_fingerprint` on every steady-state reply
-(#light-client-roster-change-in-window).
+majority ensures the cached commitment is the current one at that moment. It is not
+maintained thereafter, and cannot be: `roster_fingerprint` on every steady-state reply
+tells the client only WHETHER its corroborated roster still stands, never what replaced it
+(#light-client-roster-is-corroborated-only).
 
 ### Every reply carries what the client needs to catch up {#light-client-piggyback}
 
@@ -1532,21 +1566,31 @@ is maintained via `roster_fingerprint` on every steady-state reply
 - Not a `SILENT_DROP`: silence would let a byzantine responder stall the client
   indefinitely. Explicit refusal lets the client immediately switch responders.
 
-### Roster change inside the header window {#light-client-roster-change-in-window}
+### The roster is corroborated, never adopted {#light-client-roster-is-corroborated-only}
 
-- If any header in the piggybacked range advances the roster (its block contains a
-  `change_roster` tx that changes `roster_fingerprint`), the reply MUST also carry the
-  fresh `RosterBundle` (as `bundle`). No exceptions: a client that receives a header
-  changing the roster without the corresponding bundle cannot verify subsequent headers.
-- The client processes the batch in order:
-  1. Verify headers up to and including the roster-changing block against the OLD trusted
-     roster.
-  2. Verify the new bundle (cert chain from anchor per #light-client-cert-chain).
-  3. Advance `trusted_roster` to the new bundle.
-  4. Verify headers after the roster-changing block against the NEW roster.
-- If a batch would straddle multiple roster changes, the responder MUST truncate at the
-  first change (send `headers[N+1..change_block]` + new bundle). The client catches up
-  incrementally, one roster change per RT.
+- A light client MUST NOT adopt a `RosterBundle` outside bootstrap. A bundle is shipped
+  only when the client presents no `roster_fingerprint` — that is, when it is establishing
+  trust and will corroborate what it receives across `f+1` peers.
+- A `#cert` carries no serial: it attests that an identity was authorised, never that it
+  still is. Currency comes only from observing the grant row, which a light client holding
+  no log cannot do — so a revoked manager's anchor-signed grant cert verifies to a light
+  client forever. A bundle is therefore the ONE artefact in a light client's diet whose
+  validity is not self-evident from its own signatures, and it MUST NOT be accepted on the
+  word of whoever answered. Blocks (quorum multi-sig plus chain-link) and values (SMT proof
+  under signed anchors) are self-evident and survive relay through a single node; the roster
+  does not.
+- `roster_fingerprint` on every reply is the tripwire, not a payload. It exists so a client
+  can tell whether the assumptions its cached roster rests on still hold. If it matches, the
+  reply is verifiable against a roster the client already corroborated. If it moved, the
+  client is by definition working on stale trust: it MUST discard `trusted_roster`,
+  `trusted_block` and `roster_fingerprint` and re-bootstrap, exactly as for
+  #light-client-stale and #light-client-fork-detected.
+- Cadence defines what live means. A client within `liveness_window` of head is live and
+  reads against trust it corroborated; anything else is stale, and stale trust is
+  re-established by `f+1`, never patched in place.
+- The cost is one re-bootstrap (two RTs) per roster change per client. Roster changes are
+  rare operator events, and this is the price of never letting one responder decide who the
+  cluster is.
 
 ### Non-membership is a first-class answer {#light-client-nonmembership}
 
@@ -1933,6 +1977,10 @@ visible rather than plausible.
 | authority is store-scoped | `MgmtReader.may_write` |
 | roster changes are one transaction | `MgmtWriter.add_node` / `set_roster` return one `Transaction` |
 | revocation is deletion of a row | `MgmtWriter.revoke` returns a `Del` |
+| revocation re-issues what the identity attested (#revocation-is-compound) | `MgmtWriter.revoke(who, *, reissue_signer)` composes the deletions AND a fresh cert for every row `attestations_by(src, who)` reports, in one `Transaction`; `reissue_signer` is required even when nothing needs re-issuing, so the argument cannot be forgotten where it matters. Held by `test_management.TestRevocationIsCompound` (revert-checked: without the re-issue the roster collapses to zero) |
+| the attestation query is pure over state (#revocation-is-compound) | `management.attestations_by(src, signer, store_id)` — prefix scan over P_NODE / P_GRANT / P_ROSTER returning `(key, purpose, subject)` only. No keys, no Store, reader-parameterised, so a typed opcode can run it at apply time unchanged |
+| no live row carries an unauthorised cert (#revocation-is-compound) | `MgmtReader.unauthorised_certs()` — `verify_cert` quantified over every row. Deliberately NOT wired into `Store._unacceptable`: a bare `ops.Del` can still reach a violating state and refusing it after settlement would brick. Enforcement is OWED with #typed-management-ops-owed |
+| only the anchor revokes MANAGER / COMPACTOR (#role-manager-grant) | **partial** — `MgmtWriter.revoke` raises `ManagementError` unless `reissue_signer` is the anchor when the target holds MANAGER or COMPACTOR. Authoring-side only; log-boundary refusal of a hand-composed `Del` is DEFERRED per #typed-management-ops-owed |
 | the anchor is always authorised (#anchor-is-the-axiom) | `MgmtReader.may_write` short-circuits True for `who == self.store.anchor()`; `MgmtReader.may_send` treats the anchor via the same rule; `MgmtReader.authorises` reserves bitmap slot `N` for the anchor pubkey |
 | the anchor is the only identity that may exercise the block override (#anchor-is-the-axiom) | `MgmtReader.Authorization.verify` checks bitmap slot `N` against the anchor it was built with -- no `Role.MANAGER` grant reaches that slot |
 | anchor rotation is deferred (#anchor-is-the-axiom) | **deferred** -- `Store.provision` is one-shot; no operation replaces `store.anchor()`. Loss of the anchor cold-key ends emergency-intervention capability, not the cluster |
@@ -2040,7 +2088,7 @@ visible rather than plausible.
 | liveness within `liveness_window` blocks of head (#light-client-liveness) | `sync.lite.serve_get_anchors` / `serve_get_proof` — refuses `STALE_CLIENT` when `head - client_num > liveness_window`; window comes from `LightClientTunables.liveness_window` (default 2) |
 | stale client re-bootstraps (#light-client-stale) | server: `LiteRefusal.STALE_CLIENT` returned when the client is past the window (above); client: `LightClient._on_read_reply` drops `trusted_state` and moves to `UNBOOTSTRAPPED` on receipt |
 | fork detected: re-bootstrap (#light-client-fork-detected) | server: `sync.lite.serve_get_*` returns `LiteRefusal.FORK_DETECTED` when the client's `(block_num, block_hash)` mismatches the server's stored block at that height; client: same UNBOOTSTRAPPED drop as STALE |
-| roster change inside the header window ships bundle (#light-client-roster-change-in-window) | **partial** — client-side swap: `LightClient._on_read_reply` verifies + adopts a fresh bundle before verifying subsequent headers. Server-side detection of a roster-changing header IN the piggybacked range is OWED (currently only fingerprint-mismatch triggers a fresh bundle) |
+| the roster is corroborated, never adopted (#light-client-roster-is-corroborated-only) | `LightClient._on_read_reply` refuses on `roster_fingerprint` mismatch — drops `trusted_state`, returns to `UNBOOTSTRAPPED`; no in-place swap exists (`_swap_roster` deleted). `sync.lite.serve_get_anchors` / `serve_get_proof` ship a bundle only when the client presents no fingerprint. Held by `test_lite_client.TestRevokedManagerCannotForgeARoster`, which delivers a roster forged by a genuinely-revoked manager from a single responder |
 | non-membership is first-class (#light-client-nonmembership) | `sync.lite.serve_get_proof` emits `smt.Proof.encode()` regardless of presence (`Tree.prove` proves both); `sync.lite_client._on_read_reply` calls `smt.verify` with `held=None` when `absent=True`; `smt._absent` handles empty-slot and different-occupant shapes |
 | retrieval is stateless per request (#light-client-stateless) | **structural** — no session-object type exists; each request/reply is self-contained by design |
 | SMT is a retrieval primitive, not consensus (#light-client-smt-scope) | **structural** — `smt.py` is imported by `store.py` and `layer.py` only; no consensus module (Round, SettleRound, Coordinator) references it |
@@ -2117,6 +2165,12 @@ Tags kept here rather than deleted, so stale citations resolve to an explanation
   pipeline stays safe against `< f+1` without observing them explicitly. The one honest cost
   — O(retries) wasted round-trips in the sync path when a peer lies — is accepted; see
   #sync-safety-vs-full-bft.
+- `#light-client-roster-change-in-window` — retired. The requirement (ship a fresh bundle
+  mid-session and swap the roster in place) is unsatisfiable safely: a light client cannot
+  distinguish a current manager's attestation from a revoked one's, so one responder could
+  hand it any roster it liked. Superseded by #light-client-roster-is-corroborated-only —
+  a moved fingerprint means re-bootstrap.
+
 - `#freshness-needs-many` is NOT here — it looked like a Trust axiom but is in fact live: the
   `f+1` corroboration rule is enforced by `Follower.caught_up()` and `quorum.corroboration()`.
   Its home is L6 sync (see the requirement in-body under `#height-poll-is-the-trigger`).
