@@ -549,5 +549,3 @@ class TCPListener(Listener):
             self._selector.close()
 
 
-# Backwards-compat alias -- old name for TCPDialer. Delete after all call sites migrate.
-TCPClient = TCPDialer

@@ -255,5 +255,3 @@ def address_of(identity: crypto.PublicKey) -> Address:
     return Address(Scheme.INPROC, name_of(identity))
 
 
-# Backwards-compat alias -- old name for InProcDialer. Delete after all call sites migrate.
-InProcClient = InProcDialer

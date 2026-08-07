@@ -21,7 +21,7 @@ import unittest
 from dude.consensus.bootstrap import bootstrap
 from dude.core import crypto
 from dude.net.address import Endpoint, Scheme
-from dude.net.transports.tcp import TCPClient, TCPListener
+from dude.net.transports.tcp import TCPDialer, TCPListener
 from dude.node import Node
 from dude.store import Store, management, ops
 from dude.store.management import Cert, Management, Role
@@ -30,14 +30,14 @@ from dude.tunables import DEFAULT
 
 def _build_cluster(
     size: int,
-) -> tuple[crypto.Keypair, list[Node], list[TCPClient], list[TCPListener]]:
+) -> tuple[crypto.Keypair, list[Node], list[TCPDialer], list[TCPListener]]:
     """Same shape as `test_sync_e2e_tcp._build_cluster`: bind listeners first so their
     addresses are known, then mint genesis with those addresses, then construct nodes
     with clients attached. Does NOT call `node.start()` -- that's the caller's."""
     mgr = crypto.Keypair.generate()
     keys = [crypto.Keypair.generate() for _ in range(size)]
     listeners = [TCPListener() for _ in keys]
-    clients = [TCPClient() for _ in keys]
+    clients = [TCPDialer() for _ in keys]
 
     scratch = Store()
     scratch.provision(mgr.public)

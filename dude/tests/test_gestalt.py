@@ -23,7 +23,7 @@ from ..net import Verb
 from ..net.address import Endpoint, Scheme
 from ..net.envelope import Envelope, Frame
 from ..net.postman import Postman
-from ..net.transports.tcp import TCPClient, TCPListener
+from ..net.transports.tcp import TCPDialer, TCPListener
 from ..node import (
     _DISPATCH,
     HANDLED,
@@ -277,14 +277,14 @@ def _build_node(
     mgr: crypto.Keypair,
     genesis: tuple[ops.SignedTransaction, ...],
     tunables: Tunables,
-) -> tuple[Node, TCPClient]:
-    """Build a Node with a TCPClient attached. Listener is constructed and passed
+) -> tuple[Node, TCPDialer]:
+    """Build a Node with a TCPDialer attached. Listener is constructed and passed
     separately by the caller (needed before genesis for its bound_address)."""
     store = Store()
     store.provision(mgr.public)
     bootstrap(store, mgr, genesis)
     node = Node(kp, store, tunables=tunables)
-    client = TCPClient()
+    client = TCPDialer()
     node.postman.attach_transport(Scheme.TCP, client)
     return node, client
 
@@ -301,7 +301,7 @@ def _wait_until(pred, timeout_sec: float, interval_sec: float = 0.02) -> bool:
 
 
 def _submit_and_wait(  # noqa: PLR0913, PLR0917 -- one helper with all the parameters is more readable than shuffling them into a params object
-    client: TCPClient,
+    client: TCPDialer,
     nodes: list[Node],
     to: int,
     tx: ops.SignedTransaction,
@@ -357,24 +357,24 @@ class TestScenario(unittest.TestCase):
         genesis = _genesis(mgr, keys, listeners)
 
         nodes: list[Node] = []
-        clients: list[TCPClient] = []
+        clients: list[TCPDialer] = []
         for kp in keys:
             node, tcp_client = _build_node(kp, mgr, genesis, _FAST)
             nodes.append(node)
             clients.append(tcp_client)
 
         # Test's own outbound client, used for external SUBMITs.
-        test_client = TCPClient()
+        test_client = TCPDialer()
 
         # LightClient built later; keep names in scope so the finally block can stop them.
         lc: LightClient | None = None
         lc_listener: TCPListener | None = None
-        lc_client: TCPClient | None = None
+        lc_client: TCPDialer | None = None
 
         # Fourth-node placeholders for phase 4/5.
         n4: Node | None = None
         n4_listener: TCPListener | None = None
-        n4_client: TCPClient | None = None
+        n4_client: TCPDialer | None = None
 
         try:
             # --- PHASE 0: managed-mode start; every node produces empty blocks -------- #
@@ -425,7 +425,7 @@ class TestScenario(unittest.TestCase):
             # row is what nodes will reconcile into their postmans on tick.
             lc_kp = crypto.Keypair.generate()
             lc_listener = TCPListener()
-            lc_client = TCPClient()
+            lc_client = TCPDialer()
             # Snapshot-scoped tx composition: MgmtWriter's reads are pinned to a
             # consistent moment so the composed cert can't reference a mid-flight
             # writer commit (that's Bug A -- MgmtWriter's docstring names it).
@@ -488,7 +488,7 @@ class TestScenario(unittest.TestCase):
             # --- PHASE 3: add a 4th node via the real change_roster path -------------- #
             n4_kp = crypto.Keypair.generate()
             n4_listener = TCPListener()
-            n4_client = TCPClient()
+            n4_client = TCPDialer()
             assert n4_listener is not None  # type-narrow for the composition below
             # Snapshot-scoped composition, same reason as phase 2's grant tx.
             with nodes[0].store.snapshot() as r:

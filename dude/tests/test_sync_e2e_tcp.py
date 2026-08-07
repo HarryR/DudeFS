@@ -6,7 +6,7 @@ Follower verify-and-commit) with actual bytes on 127.0.0.1 sockets, actual lengt
 prefix framing, and actual OS-level connect/accept timing -- the failure modes InProc
 hides by construction (synchronous drain, atomic frame delivery, no port state).
 
-CLIENT/LISTENER SPLIT: every node owns a `TCPClient` (attached to Postman for send)
+CLIENT/LISTENER SPLIT: every node owns a `TCPDialer` (attached to Postman for send)
 and a `TCPListener` (drained by the test pump for receive). The two are physically
 distinct objects with distinct constructors; the listener's `bound_address` is what
 peers dial, and it's known ONLY after bind, which is why listeners get built before
@@ -24,7 +24,7 @@ from dude.core import crypto
 from dude.net import Verb
 from dude.net.address import Endpoint, Scheme
 from dude.net.envelope import Envelope
-from dude.net.transports.tcp import TCPClient, TCPListener
+from dude.net.transports.tcp import TCPDialer, TCPListener
 from dude.node import Node
 from dude.store import Store, management, ops
 from dude.store.management import Cert, Management, Role
@@ -38,19 +38,19 @@ DELTA = DEFAULT.mempool.delta
 
 def _build_cluster(
     size: int,
-) -> tuple[crypto.Keypair, list[Node], list[TCPClient], list[TCPListener]]:
+) -> tuple[crypto.Keypair, list[Node], list[TCPDialer], list[TCPListener]]:
     """Build `size` nodes wired over real TCP. Returns
     `(manager_kp, nodes, clients, listeners)`.
 
     Order matters: LISTENERS bind first so their `bound_address` is known, THEN the
     genesis roster is minted with those addresses, THEN each node's Postman gets its
-    own `TCPClient` attached. Reversing any of these three steps produces a stillborn
+    own `TCPDialer` attached. Reversing any of these three steps produces a stillborn
     cluster -- reconciliation reads addresses from the roster, so the addresses have to
     exist before the roster is minted."""
     mgr = crypto.Keypair.generate()
     keys = [crypto.Keypair.generate() for _ in range(size)]
     listeners = [TCPListener() for _ in keys]  # bind first
-    clients = [TCPClient() for _ in keys]
+    clients = [TCPDialer() for _ in keys]
 
     # Genesis roster with TCP endpoints -- each node's listener.bound_address.
     scratch = Store()
@@ -102,7 +102,7 @@ def _pump_all(
     listeners: dict[crypto.PublicKey, TCPListener],
     now: int,
     rounds: int = 30,
-    dialers: dict[crypto.PublicKey, TCPClient] | None = None,
+    dialers: dict[crypto.PublicKey, TCPDialer] | None = None,
 ) -> None:
     """Drive tick + drain across every node until nothing's moved for a round.
 
@@ -147,7 +147,7 @@ def _produce_blocks(
     listeners: dict[crypto.PublicKey, TCPListener],
     mgr: crypto.Keypair,
     want: int,
-    dialers: dict[crypto.PublicKey, TCPClient] | None = None,
+    dialers: dict[crypto.PublicKey, TCPDialer] | None = None,
 ) -> int:
     """Submit transactions and pump until every node holds at least `want` blocks.
     Returns the final `now`."""
@@ -180,7 +180,7 @@ class TestJoinerCatchesUpOverTCP(unittest.TestCase):
             joiner_store = Store()
             joiner_store.provision(mgr.public)
             joiner_listener = TCPListener()
-            joiner_client = TCPClient()
+            joiner_client = TCPDialer()
             joiner = Node(joiner_kp, joiner_store)
             joiner.postman.attach_transport(Scheme.TCP, joiner_client)
 

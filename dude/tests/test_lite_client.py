@@ -129,7 +129,7 @@ class TestLightClientBootstrap(unittest.TestCase):
         client_kp = crypto.Keypair.generate()
         _provision_client(c, client_kp)
 
-        # Build the LightClient. `_build_light_client` constructs the InProcClient +
+        # Build the LightClient. `_build_light_client` constructs the InProcDialer +
         # InProcListener explicitly and attaches the client to the Postman -- same
         # shape as production. The reverse direction (nodes dialling this client) is
         # set up by each node's `_reconcile_peers` on tick, using the endpoints baked

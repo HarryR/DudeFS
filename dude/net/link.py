@@ -49,7 +49,7 @@ class Transport(Protocol):
     (the sample looks single-attempt when it was not) and R6 (the budget never sees the load).
 
     RECEIVE-SIDE IS `Listener` -- separate protocol, separate object, separate lifecycle. A carrier
-    that both sends and receives (TCP, UNIX, InProc) ships two concrete types: `TCPClient` and
+    that both sends and receives (TCP, UNIX, InProc) ships two concrete types: `TCPDialer` and
     `TCPListener`, etc. Postman holds the `Transport` (send side) per scheme; Node holds the
     `Listener` (receive side). The split is what lets a node be dialler-only (behind a NAT, only
     outbound) or listener-only in some deployments; it also stops one class from having two roles

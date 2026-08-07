@@ -5,7 +5,7 @@
 # sleeping. Partitions are simulated by `postman.remove_peer(pubkey)` (see
 # #partitions-are-test-only) rather than by a switchboard-level cut/heal.
 #
-# EACH NODE OWNS AN InProcClient (send side, attached to Postman) AND AN InProcListener
+# EACH NODE OWNS AN InProcDialer (send side, attached to Postman) AND AN InProcListener
 # (receive side, drained by `_quiesce`). Constructed explicitly per node before `node.tick`
 # fires reconciliation, so the shape is identical to what a production main() does with TCP
 # -- no dialler-per-scheme reach-through, no cast-into-private-state.

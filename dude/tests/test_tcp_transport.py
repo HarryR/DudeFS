@@ -2,7 +2,7 @@
 # here -- these test the CARRIER, not the protocol. Frame construction is minimal-real
 # (through Envelope.sign().seal()) so we're moving actual sealed frame bytes.
 #
-# TWO CONCRETE TYPES: `TCPClient` (send-only) and `TCPListener` (receive-only). Tests
+# TWO CONCRETE TYPES: `TCPDialer` (send-only) and `TCPListener` (receive-only). Tests
 # exercise the split explicitly -- a client sends to a listener's bound_address; the
 # listener drains via `drain()` (test path, no threads).
 
@@ -18,7 +18,7 @@ from dude.net.address import Address, Scheme
 from dude.net.envelope import Envelope, Frame, Verb
 from dude.net.link import LinkError
 from dude.net.session import Inbound
-from dude.net.transports.tcp import TCPClient, TCPListener
+from dude.net.transports.tcp import TCPDialer, TCPListener
 
 
 def _make_frame(sender: crypto.Keypair, recipient: crypto.PublicKey, body: bytes = b"hi") -> Frame:
@@ -50,7 +50,7 @@ class TestTCPRoundTripViaDrain(unittest.TestCase):
         a_kp = crypto.Keypair.generate()
         b_kp = crypto.Keypair.generate()
         listener = TCPListener()  # binds to 127.0.0.1:0
-        client = TCPClient()
+        client = TCPDialer()
         try:
             frame = _make_frame(a_kp, b_kp.public)
             client.send(listener.bound_address, frame)
@@ -67,7 +67,7 @@ class TestTCPRoundTripViaDrain(unittest.TestCase):
         a_kp = crypto.Keypair.generate()
         b_kp = crypto.Keypair.generate()
         listener = TCPListener()
-        client = TCPClient()
+        client = TCPDialer()
         try:
             frames = [_make_frame(a_kp, b_kp.public, body=f"n={i}".encode()) for i in range(20)]
             for f in frames:
@@ -87,7 +87,7 @@ class TestTCPRoundTripViaDrain(unittest.TestCase):
         a_kp = crypto.Keypair.generate()
         b_kp = crypto.Keypair.generate()
         listener = TCPListener()
-        client = TCPClient()
+        client = TCPDialer()
         try:
             big_body = b"x" * (128 * 1024)
             frame = _make_frame(a_kp, b_kp.public, body=big_body)
@@ -104,7 +104,7 @@ class TestTCPRoundTripViaDrain(unittest.TestCase):
         problem to translate (Refused.TRANSPORT at the link layer)."""
         a_kp = crypto.Keypair.generate()
         b_kp = crypto.Keypair.generate()
-        client = TCPClient()
+        client = TCPDialer()
         try:
             # Bind + immediately stop to reserve then release a port -- best-effort dead target.
             probe = TCPListener()
@@ -118,12 +118,12 @@ class TestTCPRoundTripViaDrain(unittest.TestCase):
             client.close()
 
     def test_wrong_scheme_raises_link_error(self):
-        """A `TCPClient` asked to dial an INPROC address refuses at the transport layer.
+        """A `TCPDialer` asked to dial an INPROC address refuses at the transport layer.
         The scheme dispatch above should never route wrong-scheme addresses here, but the
         client still refuses defensively."""
         a_kp = crypto.Keypair.generate()
         b_kp = crypto.Keypair.generate()
-        client = TCPClient()
+        client = TCPDialer()
         try:
             frame = _make_frame(a_kp, b_kp.public)
             with self.assertRaises(LinkError):
@@ -145,7 +145,7 @@ class TestTCPRoundTripViaDrain(unittest.TestCase):
         listener = TCPListener()
         listener.stop()
         listener.stop()  # no raise
-        client = TCPClient()
+        client = TCPDialer()
         client.close()
         client.close()
 
@@ -159,7 +159,7 @@ class TestTCPListenerStartStop(unittest.TestCase):
         b_kp = crypto.Keypair.generate()
         inbox: queue.SimpleQueue[Inbound] = queue.SimpleQueue()
         listener = TCPListener()
-        client = TCPClient()
+        client = TCPDialer()
         try:
             listener.start(inbox)
             frame = _make_frame(a_kp, b_kp.public)
