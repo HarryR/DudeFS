@@ -111,6 +111,25 @@ MUST be re-encryptable forward under a new key without decrypting under the old 
 - Decoding MUST validate at the boundary: extractors turn a decoded value into a typed one or
   raise, never returning `Any` for a downstream to guess at.
 
+### Wire and disk encoding are owned by the dataclass, not by callers {#encoding-owned-by-dataclass}
+
+- Every record type that travels on the wire OR sits on disk MUST expose its encoding as
+  class methods (`encode()` / `decode(raw)`), living on the dataclass that owns its fields.
+  Freestanding `_encode_X` / `_decode_X` helpers in adapter modules MUST NOT reimplement
+  layouts the record type could own.
+- When wire and disk forms differ (typically: identity is a row-key suffix on disk but part
+  of the payload on the wire), BOTH pairs MUST live on the dataclass -- `encode` / `decode`
+  for the wire form, `encode_row` / `decode_row` for the disk form. Every drift the codebase
+  has hit has come from a second implementation of the layout somewhere else, and CLAUDE.md's
+  trap #1 exists because that failure mode is silent (both halves self-consistent, round-trip
+  tests miss it).
+- Every such record type MUST have field-count refusal tests parallel to
+  `test_envelope_encode_and_decode_agree_on_field_count`. Pin the exact count each `encode`
+  emits and each `decode` accepts, on BOTH forms if both exist; a field added to one half
+  without the other will fail loudly.
+- Landed for `NodeRecord`, `Grant`, `TrustedBlock`. `Cert` predates the pattern and already
+  had `encode`/`decode` on the class; the rule generalises what was already true for it.
+
 ### Cryptographic primitives {#primitives}
 
 - Hashing MUST be BLAKE2b, personalised. Domain separation MUST use BLAKE2b personalisation, never
@@ -461,6 +480,21 @@ because that path was considered and rejected as re-implementation.
   grant path is the client's evidence.
 - Revocation is forward-only: transactions the revoked identity has already authored remain valid,
   because validity is relative to the position at which they were authorised.
+
+### Grants carry authority, not location {#grants-are-pure-authority}
+
+- A grant MUST be pure authority: `(identity, role, stores, kinds, cert)`. It MUST NOT carry
+  network endpoints or any other location hint. Where an identity can be reached is a
+  discovery concern; where its authority is is a log concern; the two do not mix.
+- Rules out node-dials-back-to-client at the type level. Clients are ephemeral (may be behind
+  NAT, connection may drop and reconnect); a manager signing a grant doesn't know the
+  recipient's future network address, and a rotated address MUST NOT require a fresh grant.
+  Reply routing goes through the session the client opened (#session-first-reply).
+- Distinct from `NodeRecord`, which DOES carry endpoints (#peer-endpoint-in-log). The
+  asymmetry is honest: nodes ARE dialable at stable, roster-attested addresses; clients are
+  not.
+- Enforced structurally by `Grant`'s fields (`dude.store.management.Grant` -- no `endpoints`
+  attribute) and by `authorise` refusing to accept one.
 
 ### Keys generate where they live {#possession-proof}
 
@@ -1639,13 +1673,18 @@ rather than an environment it has to arrange.
 
 ### A peer is an identity, not a path {#peer-not-path}
 
-- A peer is an identity with several addresses. Identity is the unit of reachability.
-- Correlation of a reply MUST be by `(peer, message id)`, never by the link it arrived on. Send on
-  A, receive on B is ordinary traffic. The dedup key MUST be `(frm, mid)`, never `mid` alone —
-  `mid` is chosen by the sender, so any identity that learns an outstanding id could otherwise
-  hijack the answer.
+- A peer is an identity with several ways to reach it: zero or more dial-Links (dialable
+  addresses from the roster) and zero or more session-Links (open connections either we dialed
+  or the peer opened to us). Identity is the unit of reachability; the union is the routing
+  set (`Peer.usable()`).
+- Correlation of a reply MUST be by `(peer, message id)`, never by the link it arrived on. Send
+  on A, receive on B is ordinary traffic -- multi-homing at the peer level, or a reply flowing
+  back on a session that arrived on a different address than the dial-Link's. The dedup key MUST
+  be `(frm, mid)`, never `mid` alone -- `mid` is chosen by the sender, so any identity that
+  learns an outstanding id could otherwise hijack the answer.
 - A request whose answer is only ever solicited MUST be registered as awaiting a reply. An
-  unregistered request is answered correctly and its answer discarded at the door, which is silent.
+  unregistered request is answered correctly and its answer discarded at the door, which is
+  silent.
 
 ### P_NODE stores endpoints, not bare addresses {#peer-endpoint-in-log}
 
@@ -1696,26 +1735,23 @@ rather than an environment it has to arrange.
 
 ### The Node reconciles its peers from the roster on tick {#roster-drives-peers}
 
-- On every `Node.tick(now)`, the node MUST reconcile `postman.peers` against
-  `mgmt.roster() ∪ (identities holding a valid P_GRANT with role CLIENT or COMPACTOR)`. New
-  members get `postman.add_peer(pubkey, endpoints)` where `endpoints` come from the P_NODE row's
-  now-encoded endpoint field (or from a CLIENT's own P_GRANT-adjacent record where the shape
-  lands). Departed members get `postman.remove_peer(pubkey)`.
-- The gap this closes: today `postman.peers` is populated ONCE at cluster construction by an
-  external caller (`Node.connect`), and no path from a settled `change_roster` reaches the
-  transport layer. A `change_roster(add=X)` produces a roster in which X exists on paper but
-  nobody in the cluster can send to X — X sits silent forever. `change_roster(remove=X)` leaves
-  a stale transport open. Neither case is caught by any test in the tree because the entire test
-  surface wires all peers statically at t=0.
-- **Existing tests are load-bearing under the OLD assumption** (static roster after
-  construction) and stay working under the new one, because reconciliation converges to the same
-  peer set on the first tick after genesis lands. But the test surface MUST also include one
-  case where a roster change happens post-construction and the transport layer reflects it —
-  otherwise this row is enforced by convention and nothing catches a regression.
-- CLIENT and COMPACTOR identities need to be in `postman.peers` because nodes REPLY to them —
-  outbound goes through Postman regardless of whether the counter-party is a roster member.
-  Grant absence is the eviction signal, mirroring how #absence-is-revocation acts at every other
-  authority check.
+- On every `Node.tick(now)`, the node MUST reconcile `postman.peers` against `mgmt.roster()`.
+  New members get `postman.add_peer(pubkey, endpoints)` where `endpoints` come from the
+  P_NODE row's encoded endpoint field (#peer-endpoint-in-log). Departed members get
+  `postman.remove_peer(pubkey)`.
+- **CLIENT / COMPACTOR grants do NOT participate in this reconciliation.** Grants are pure
+  authority (#grants-are-pure-authority) -- they carry no endpoint field, and nodes never
+  dial back to clients. A client reaches a node by dialing it; the reply flows back on the
+  session the client opened (#session-first-reply). A node learns a client is reachable
+  when its first inbound frame arrives on an accepted session, and `Postman.register_session`
+  runs there (#session-bind-on-first-frame).
+- The gap this closes: without reconciliation, `postman.peers` is populated ONCE at cluster
+  construction, and no path from a settled `change_roster` reaches the transport layer. A
+  `change_roster(add=X)` produces a roster in which X exists on paper but nobody in the
+  cluster can send to X. `change_roster(remove=X)` leaves a stale transport open.
+- **The test surface MUST include one case where a roster change happens post-construction
+  and the transport layer reflects it** -- otherwise this row is enforced by convention
+  and nothing catches a regression.
 
 ### InProc is a paired loopback, not a routing switchboard {#inproc-is-a-loopback}
 
@@ -1742,9 +1778,12 @@ rather than an environment it has to arrange.
   concept inside the transport is protocol logic done at the wrong layer, and test scaffolding
   smuggled into production code.
 - Tests that need to simulate a partition remove the target from the sender's `postman.peers`:
-  `postman.remove_peer(pubkey)`. Symmetric partition removes on both sides. This IS what the
-  protocol sees when a partition really happens — the sender's routing table has no live path
-  to the target.
+  `postman.remove_peer(pubkey)`. Symmetric partition removes on both sides. Any live sessions
+  ALSO need to die -- `postman.remove_peer` does the dial-Link removal, but a SessionLink
+  established from an earlier accept survives it, and a real partition kills the socket too.
+  Tests using session-carrying transports must close sessions on both sides (or use
+  `unregister_session`) alongside the peer removal. This IS what the protocol sees when a
+  partition really happens -- the sender's routing table has no live path to the target.
 - Whole-graph tuning is the same primitive: any pairwise reachability the test wants to model
   is expressed by choosing which peers each Postman has. No `cut/heal` methods anywhere; no
   `_PARTITIONED` set inside a transport.
@@ -1752,6 +1791,71 @@ rather than an environment it has to arrange.
   to the `remove_peer` pattern. `test_round`'s own partition scaffolding, which already sits
   above the transport, is unaffected — it was doing the right thing all along and only
   confirmed that partition-in-transport was the mistake.
+
+### Every transport we support is session-oriented {#session-oriented-transport}
+
+- A supported transport MUST produce `Session` objects (in `dude.net.session`). A `Session`
+  is one open connection: identity-bound, bidirectional, `send(frame)` + `close()`, tagged
+  onto every inbound frame as `Inbound(frame, session)`. Two paths produce a Session --
+  `Dialer.dial()` where identity is known at construction (we know who we're calling), and
+  `Listener.accept()` where identity is bound on the first inbound frame (#session-bind-on-
+  first-frame).
+- No `Session | None` seam. A hypothetical sessionless carrier (mixnet-style overlay,
+  XMPP-message with no session state we can observe) MUST NOT be supported without its own
+  architectural conversation about how return paths work in its absence. The current codebase
+  supports TCP and InProc; both are session-oriented; that is the ceiling until a real
+  discussion admits another shape.
+- Rules out the previous "Transport is send-only + Listener is receive-only, and never the
+  two shall meet" split. Under that split, replies HAD to travel back on a fresh dial from
+  the receiver to the sender's advertised endpoint -- which fails whenever the sender has
+  no advertised endpoint (ephemeral clients).
+
+### Session identity binds on the first inbound frame {#session-bind-on-first-frame}
+
+- A newly-accepted `Session` starts with `identity=None`. The dispatch layer (`Node.receive`,
+  `LightClient.receive`) MUST call `session.bind(env.frm)` after `Postman.deliver` verifies
+  the first inbound frame's envelope, then `Postman.register_session(session)` to install a
+  `SessionLink` on `Peer(env.frm).sessions`.
+- Subsequent inbound frames on the same session whose `env.frm` differs from the bound
+  identity MUST close the session and drop the frame. One connection carries one identity,
+  contract -- a misbehaving proxy that tried to multiplex two client identities on one TCP
+  session is refused at this boundary.
+- Dialer-produced sessions bind identity at construction (we know who we called), skipping
+  the "bind on first inbound" step. Same shape thereafter.
+
+### Reply prefers the session the peer opened over dialing back {#session-first-reply}
+
+- `Peer.usable(now)` MUST return session-Links first (freshest-first by `last_activity`),
+  then dial-Links (RTO order). A live session is a zero-cost reply (already connected, one
+  write); the freshest one is the most likely to still be alive.
+- Consequence: if peer B has opened a session to A, A's reply to B travels back on THAT
+  session rather than dialing B's advertised endpoint. Works whether B is a roster member
+  (nodes: has dial-back as fallback) or an ephemeral client (no dial-back, and doesn't need
+  one).
+- Safe because our supported transports are bidirectional (#session-oriented-transport):
+  `TCPDialer` reads replies on its own outbound sockets, so a reply written on the
+  accept-side session lands on the dialer's side and vice-versa. A one-way transport would
+  drop the reply into an un-read socket buffer; we don't support one.
+
+### `postman.can_reply` decides reply-target, not `pubkey in postman.peers` {#can-reply-vs-peer-membership}
+
+- The receiver-side reply check MUST use `postman.can_reply(pubkey) -> bool`: true iff any
+  session-Link OR dial-Link exists for that identity. It MUST NOT gate on `pubkey in
+  postman.peers`, which under the pre-refactor model was a stand-in for "is the counter-party
+  dialable" -- a false answer for clients that have live sessions but no roster row.
+- Silent-drop semantics on false are preserved: replies to identities we cannot reach are
+  dropped rather than queued for TTL expiry. Client polls again.
+
+### Gossip iterates the roster, not the peer table {#gossip-iterates-roster-not-peers}
+
+- `Node._flood` MUST iterate `mgmt.roster()`, not `postman.peers`. Consensus gossip
+  (SUBMIT reflood, HELD, SIG, SETTLE_SIG) is a roster concept -- it goes to consensus peers,
+  which are exactly the roster members.
+- The old code iterated `postman.peers`, which under the pre-refactor model included CLIENT
+  identities because `_reconcile_grants` added them for reply-by-dial. That meant SUBMITs
+  relayed peer-to-peer got flooded to every registered client too, an unintended broadcast.
+  Fixed as a side effect of moving grants out of the peer table; SPEC pins it explicitly
+  so a future refactor doesn't reintroduce the conflation.
 
 ### RTT sampling must be attributable {#rtt-attribution}
 
@@ -1977,12 +2081,19 @@ visible rather than plausible.
 | sign then seal | `envelope.py`: `SignedEnvelope` then `seal` |
 | a peer is an identity, correlation is `(peer, mid)` | `Mailbox.arrived` |
 | a solicited-answer request is registered as awaiting | `Mailbox.post(await_reply=True)` (required parameter) |
-| P_NODE stores endpoints (with options), not bare addresses (#peer-endpoint-in-log) | **OWED** — `Management.change_roster` and `nodes()` currently encode/decode `codec.encode([list(rec.addresses), ...])` as raw address bytes. Lands with the Postman-owns-dialling wave (Wave A of #postman-owns-dialling) |
-| endpoint options carry per-peer transport config (#peer-options-are-endpoint-options) | **OWED** — `LinkTunables` is still applied per-peer from a global at `node.py:158`. Field-by-field audit + migration to `Endpoint.options` lands with #postman-owns-dialling |
-| Postman owns dialling; scheme→dialler is module-level (#postman-owns-dialling) | **OWED** — `Postman` today has no `add_peer`/`remove_peer`, no dialler map; peer configuration lives in `Node.connect(pubkey, transport)` external calls. Deletion of `Node.connect` and introduction of the module map lands as its own wave |
-| the Node reconciles peers from the roster on tick (#roster-drives-peers) | **OWED** — no reconciliation exists. Rows in P_NODE do not currently reach the transport layer post-genesis. Gate for the light-client work: this must land first |
-| InProc is a paired loopback, not a routing switchboard (#inproc-is-a-loopback) | **OWED** — `dude/net/transports/inproc.py` currently has `Switchboard` as an explicit routing object with a shared inbox dict; every cluster test passes it around. Reshaping to module-level registry lands with #postman-owns-dialling; existing tests migrate to the new shape |
-| partitions live in tests, not in transports (#partitions-are-test-only) | **OWED** — `Switchboard.cut/heal` and `partitioned: set` are still there and used by `test_gestalt`. Retire with the InProc reshape; migrate `test_gestalt`'s partition case to `postman.remove_peer` |
+| P_NODE stores endpoints (with options), not bare addresses (#peer-endpoint-in-log) | `NodeRecord.encode_row` / `decode_row` (dude/store/management.py) + `Management.change_roster` uses `rec.encode_row()` |
+| endpoint options carry per-peer transport config (#peer-options-are-endpoint-options) | **PARTIAL** — `Endpoint.options` field exists and is round-tripped; `LinkTunables` still carries some knobs that could be per-endpoint (`breaker_threshold`, `keepalive_interval`). Field-by-field audit pending |
+| Postman owns dialling; scheme→dialler is module-level (#postman-owns-dialling) | `Postman.add_peer` / `remove_peer` (dude/net/postman.py), module-scope `_DIALLERS` + `register_dialler`; `Node.connect` deleted |
+| the Node reconciles peers from the roster on tick (#roster-drives-peers) | `Node._reconcile_peers` + `_reconcile_roster` (dude/node.py); serial-gated. **Clients are NOT in it** -- see #grants-are-pure-authority |
+| InProc is a paired loopback, not a routing switchboard (#inproc-is-a-loopback) | `dude/net/transports/inproc.py` -- module-scope `_INBOXES` registry, `InProcDialer` + `InProcListener` with no shared routing object |
+| partitions live in tests, not in transports (#partitions-are-test-only) | `postman.remove_peer` (dude/net/postman.py) used by `test_gestalt`; `Switchboard.cut/heal` retired |
+| grants carry authority, not location (#grants-are-pure-authority) | `Grant` dataclass in dude/store/management.py has no `endpoints`; `authorise` has no `endpoints` parameter |
+| every supported transport is session-oriented (#session-oriented-transport) | `Session` ABC in `dude/net/session.py`; `TCPSession` (dude/net/transports/tcp.py), `InProcSession` (dude/net/transports/inproc.py); `Inbound(frame, session)` inbox type |
+| session identity binds on the first inbound frame (#session-bind-on-first-frame) | `Session.bind` + `SessionBindError` (dude/net/session.py); `Node._bind_session` and `LightClient._bind_session` call `bind + postman.register_session` after `deliver` verifies |
+| reply prefers the session the peer opened over dialing back (#session-first-reply) | `Peer.usable` (dude/net/link.py) returns session-Links freshest-first, dial-Links after |
+| `postman.can_reply` decides reply-target (#can-reply-vs-peer-membership) | `Postman.can_reply` (dude/net/postman.py); `Node._reply` uses it |
+| gossip iterates the roster, not the peer table (#gossip-iterates-roster-not-peers) | `Node._flood` iterates `self.mgmt.roster()` |
+| wire/disk encoding is owned by the dataclass (#encoding-owned-by-dataclass) | `NodeRecord` + `Grant` + `TrustedBlock` `.encode()` / `.decode()` (+ `.encode_row()` / `.decode_row()` where the two forms differ); `Cert.encode` / `Cert.decode`; drift-guard tests `TestNodeRecordEncoding`, `TestTrustedBlockEncoding` |
 | RTT sample only from a single-attempt, single-link message | `Mailbox.arrived` returns unattributable otherwise |
 | timeouts are built from variance, per-link | `net.link.Peer` (RTO from SRTT + 4·RTTVAR) |
 | only the breaker declares a link down | `net.link.Breaker` |
@@ -2029,6 +2140,23 @@ Tags kept here rather than deleted, so stale citations resolve to an explanation
 - `#freshness-needs-many` is NOT here — it looked like a Trust axiom but is in fact live: the
   `f+1` corroboration rule is enforced by `Follower.caught_up()` and `quorum.corroboration()`.
   Its home is L6 sync (see the requirement in-body under `#height-poll-is-the-trigger`).
+
+The following code-level names / shapes retired as part of the peering rework (see
+#grants-are-pure-authority + #session-first-reply):
+
+- `Grant.endpoints` field — deleted. Grants are pure authority; where a client lives is
+  a discovery concern, not part of the grant. Superseded by session-based reply routing.
+- `Node._reconcile_grants` — deleted. Nothing puts client / compactor identities into
+  `postman.peers` as dial-back targets anymore; return paths come from sessions the client
+  opened (#session-bind-on-first-frame).
+- `TCPClient` — renamed to `TCPDialer` (which is now bidirectional -- sends AND reads
+  replies on its outbound sockets). Old name retained as an alias during migration; delete
+  when call sites are all migrated.
+- `InProcClient` — renamed to `InProcDialer` and now takes a mandatory `me: str` at
+  construction so an `InProcSession` can tag replies with the sender's name. Old name
+  retained as an alias; delete when call sites are all migrated.
+- `_encode_grant` / `_decode_grant` in `dude.sync.lite_adapter` — deleted. Grant wire form
+  now lives on the `Grant` class (#encoding-owned-by-dataclass).
 
 The following is OWED rather than retired — the requirement stands, but the machinery that
 enforced it was struck 2026-08-01 and will return with its real consumer:
