@@ -31,7 +31,7 @@ from ..consensus.settle_round import SettledBlock
 from ..core import codec, crypto
 from ..core.errors import DudeError
 from ..net.envelope import Verb
-from ..store.management import Cert, Grant, NodeRecord, Role
+from ..store.management import Cert, Grant, NodeRecord
 
 
 class LiteAdapterError(DudeError):
@@ -127,7 +127,7 @@ class RosterBundle:
                 sorted(bytes(m) for m in self.commitment_members),
                 self.commitment_cert.encode(),
                 [rec.encode() for rec in self.entries],
-                [_encode_grant(g) for g in self.managers],
+                [g.encode() for g in self.managers],
             ]
         )
 
@@ -139,49 +139,10 @@ class RosterBundle:
             members = tuple(crypto.PublicKey(codec.as_bytes(m)) for m in codec.as_seq(p[1]))
             commitment_cert = Cert.decode(codec.as_bytes(p[2]))
             entries = tuple(NodeRecord.decode(codec.as_bytes(e)) for e in codec.as_seq(p[3]))
-            managers = tuple(_decode_grant(codec.as_bytes(g)) for g in codec.as_seq(p[4]))
+            managers = tuple(Grant.decode(codec.as_bytes(g)) for g in codec.as_seq(p[4]))
         except DudeError as e:
             raise LiteAdapterError(f"malformed RosterBundle: {e}") from e
         return cls(serial, members, commitment_cert, entries, managers)
-
-
-# --------------------------------------------------------------------------------------------- #
-# Grant wire form -- LEFT LOCAL DELIBERATELY. The disk form (`[role, stores, kinds, cert,      #
-# endpoints]`) has an `endpoints` field the wire form drops -- silent drift. It's honest        #
-# rather than accidental: `Grant.endpoints` is a category error (grants are AUTHORITY, not     #
-# location) and the wire quietly refusing to carry it is the codebase telling us so. Full       #
-# cleanup requires unwinding node-dials-back-to-client through the transport layer -- filed    #
-# as a separate follow-up. Do NOT paper over by adding `.encode()` on Grant that pretends the  #
-# two forms agree.                                                                              #
-# --------------------------------------------------------------------------------------------- #
-
-
-def _encode_grant(g: Grant) -> bytes:
-    """Wire form of a P_GRANT row content, shipped in a RosterBundle. Layout mirrors the
-    P_GRANT row: `[identity, role.value, sorted_stores, sorted_kinds, cert]`."""
-    return codec.encode(
-        [
-            g.identity,
-            g.role.value,
-            sorted(g.stores),
-            sorted(g.kinds),
-            g.cert.encode(),
-        ]
-    )
-
-
-def _decode_grant(raw: bytes) -> Grant:
-    p = codec.as_seq(codec.decode(raw), 5)
-    identity = crypto.PublicKey(codec.as_bytes(p[0]))
-    role_bytes = codec.as_bytes(p[1])
-    try:
-        role = Role(role_bytes)
-    except ValueError as e:
-        raise LiteAdapterError(f"unknown role in Grant: {role_bytes!r}") from e
-    stores = frozenset(codec.as_int(x) for x in codec.as_seq(p[2]))
-    kinds = frozenset(codec.as_int(x) for x in codec.as_seq(p[3]))
-    cert = Cert.decode(codec.as_bytes(p[4]))
-    return Grant(identity, role, stores, kinds, cert)
 
 
 # --------------------------------------------------------------------------------------------- #

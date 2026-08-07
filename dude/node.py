@@ -38,7 +38,7 @@ from .net.link import Listener
 from .net.postman import Postman
 from .net.session import Inbound, Session, SessionBindError
 from .store import Store, ops
-from .store.management import P_GRANT, Management, Role
+from .store.management import Management
 from .sync.adapter import (
     GetBlock,
     Refused,
@@ -199,29 +199,26 @@ class Node:
         return Management(self.store)
 
     def _reconcile_peers(self, now: Millis) -> None:
-        """Sync `postman.peers` against the current roster + author grants
-        (#roster-drives-peers).
+        """Sync `postman.peers` against the current roster (#roster-drives-peers).
 
-        Two passes, one call:
-          * `_reconcile_roster` — gated on the roster commitment serial; adds roster
-            members with their P_NODE endpoints and registers them with the Follower.
-          * `_reconcile_grants` — runs every tick; adds CLIENT / COMPACTOR authors from
-            their P_GRANT endpoints. No gate because grants don't touch the roster
-            commitment, and the scan is O(authorised).
+        Roster members get dial-Links so this node can reach them. CLIENT / COMPACTOR
+        grants are AUTHORITY, not location -- they no longer show up in `postman.peers`
+        as dialable peers. Nodes never dial back to clients; when a client wants to hear
+        from us, it opens a connection and we reply on the session it established (see
+        `SessionLink` in `dude.net.link`). Removed: the old `_reconcile_grants` pass and
+        `Grant.endpoints`, both of which existed only to prop up the dial-back-to-client
+        model that this refactor rules out.
 
-        REMOVALS at the end: any `_managed_peers` pubkey (a peer this reconciler itself
-        added on some prior tick) that is no longer in the roster and no longer a valid
-        author grant is dropped. Peers added outside reconciliation (bootstrap-out-of-
-        roster wiring in `test_sync_e2e`) are left alone."""
+        REMOVALS at the end: any `_managed_peers` pubkey that this reconciler added on a
+        prior tick and is no longer in the roster gets dropped. Peers added outside
+        reconciliation (bootstrap-out-of-roster wiring in `test_sync_e2e`) are left alone."""
         commitment = self.mgmt.roster_commitment()
         if commitment is None:
             return
         roster = set(self.mgmt.roster())
         self._reconcile_roster(commitment[0], roster, now)
-        author_pubkeys = self._reconcile_grants()
-        keep = roster | author_pubkeys
         for pubkey in list(self._managed_peers):
-            if pubkey not in keep:
+            if pubkey not in roster:
                 if pubkey in self.postman.peers:
                     self.postman.remove_peer(pubkey)
                 self._managed_peers.discard(pubkey)
@@ -244,27 +241,6 @@ class Node:
             self.postman.add_peer(pubkey, rec.endpoints)
             self.follower.add_peer(pubkey, now=now)
             self._managed_peers.add(pubkey)
-
-    def _reconcile_grants(self) -> set[crypto.PublicKey]:
-        """Add every CLIENT / COMPACTOR author (with declared endpoints) to `postman.peers`
-        so replies can flow back to them. Returns the set of authored identities, for the
-        caller's removal pass to spare. Follower is not touched -- authors are not
-        consensus peers and don't get sync polls."""
-        authors: set[crypto.PublicKey] = set()
-        for name, _prov, _value, _ep in self.store.prefix(self.mgmt.store_id, P_GRANT):
-            who = crypto.PublicKey(name[len(P_GRANT) :])
-            grant = self.mgmt.grant_of(who)
-            if grant is None:
-                continue
-            if grant.role not in (Role.CLIENT, Role.COMPACTOR):
-                continue
-            if not grant.endpoints:
-                continue  # grant without endpoints; can't dial (auto-add on receive is OWED)
-            authors.add(who)
-            if who not in self.postman.peers:
-                self.postman.add_peer(who, grant.endpoints)
-                self._managed_peers.add(who)
-        return authors
 
     def roster(self) -> tuple[crypto.PublicKey, ...]:
         """MANAGEMENT'S ANSWER, and nowhere else. `Management` owns everything about who is
@@ -578,10 +554,18 @@ class Node:
     def _flood(
         self, verb: Verb, body: bytes, now: Millis, skip: crypto.PublicKey | None = None
     ) -> None:
-        """Send to every peer. Flood announcements, pull bodies (#mempool) — at this size the
-        announcement term is small and reconciliation would buy bandwidth at the cost of latency,
-        which is the wrong trade when wave latency IS finality latency."""
-        for who in self.postman.peers:
+        """Send to every roster member. Flood announcements, pull bodies (#mempool) -- at
+        this size the announcement term is small and reconciliation would buy bandwidth at
+        the cost of latency, which is the wrong trade when wave latency IS finality latency.
+
+        ITERATES `mgmt.roster()`, NOT `postman.peers`. Consensus gossip is a roster concept
+        (nodes talk to nodes about consensus), not a connection-liveness concept. The old
+        code iterated `postman.peers` -- which under the pre-refactor model included CLIENT
+        grants because `_reconcile_grants` added them there for reply-by-dial. That meant
+        SUBMITs relayed peer-to-peer got flooded to every registered client too, an
+        unintended broadcast. Fixed as a side effect of moving grants out of the peer
+        table."""
+        for who in self.mgmt.roster():
             if who in (self.me.public, skip):
                 continue
             env = Envelope(who, verb, new_message_id(), body).sign(self.me, now)

@@ -378,8 +378,13 @@ class TestScenario(unittest.TestCase):
 
         try:
             # --- PHASE 0: managed-mode start; every node produces empty blocks -------- #
-            for node, listener in zip(nodes, listeners, strict=True):
-                node.start(listener)
+            # Each node starts BOTH its listener (accepts inbound) AND its dialer (reads
+            # replies on outbound sockets). The dialer is a Listener too from Wave 2 --
+            # its reader-thread feeds the inbox with `Inbound(frame, session)` just like
+            # the listener does. Without starting the dialer, outbound sockets never get
+            # their replies read and consensus stalls.
+            for node, listener, client in zip(nodes, listeners, clients, strict=True):
+                node.start(listener, client)
             # Every node should get past block 1 within a few buckets (Coordinator ticks
             # each bucket boundary; empty rounds ratify on quorum trivially at n=3).
             budget = 5 * (_FAST.mempool.delta / 1000)
@@ -436,7 +441,6 @@ class TestScenario(unittest.TestCase):
                         stores=frozenset(),
                         pop=lc_kp.prove_possession(),
                         cert=Cert.sign_grant(mgr, lc_kp.public, Role.CLIENT),
-                        endpoints=(Endpoint(lc_listener.bound_address),),
                     )
                     .sign(mgr, now_ms())
                 )
@@ -452,20 +456,19 @@ class TestScenario(unittest.TestCase):
                 ),
                 "phase 2: CLIENT grant did not settle on every node",
             )
-            # Then wait for reconciliation to populate the peer -- fires every tick.
-            self.assertTrue(
-                _wait_until(
-                    lambda: all(lc_kp.public in n.postman.peers for n in nodes),
-                    timeout_sec=5 * (_FAST.mempool.delta / 1000),
-                ),
-                "phase 2: CLIENT grant did not reconcile into postman.peers on every node",
-            )
+            # No wait-for-reconcile: nodes don't dial back to clients anymore. The client
+            # dials nodes and replies flow back on the sessions it opened (SessionLink);
+            # a node learns about a client only when the client's first frame arrives on
+            # a session it accepted, at which point Postman.register_session runs.
             lc_postman = Postman(lc_kp)
             lc_postman.attach_transport(Scheme.TCP, lc_client)
             lc = LightClient(me=lc_kp, anchor=mgr.public, postman=lc_postman, tunables=_FAST)
             for i, listener in enumerate(listeners):
                 lc.add_bootstrap_peer(nodes[i].me.public, (Endpoint(listener.bound_address),))
-            lc.start(lc_listener)
+            # LC starts its dialer (which reads replies on outbound sockets); no listener
+            # needed. `lc_listener` above is now unused -- keeping the bind for symmetry
+            # with the old test shape while the refactor lands; removable in a follow-up.
+            lc.start(lc_client)
             lc.bootstrap(now_ms())
             assert lc is not None  # type narrowing after start
             self.assertTrue(
@@ -549,7 +552,8 @@ class TestScenario(unittest.TestCase):
             # reconciliation will do the rest on tick).
             n4.postman.add_peer(nodes[0].me.public, (Endpoint(listeners[0].bound_address),))
             n4.follower.add_peer(nodes[0].me.public, now=now_ms())
-            n4.start(n4_listener)
+            assert n4_client is not None  # phase 3 constructed it above
+            n4.start(n4_listener, n4_client)  # Wave 2: also start the dialer reader
             # Catch up: joiner's head reaches the existing cluster's head.
             self.assertTrue(
                 _wait_until(

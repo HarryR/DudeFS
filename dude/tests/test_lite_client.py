@@ -47,7 +47,6 @@ def _provision_client(c: Cluster, kp: crypto.Keypair) -> None:
         stores=frozenset(),
         pop=kp.prove_possession(),
         cert=Cert.sign_grant(c.mgr, kp.public, Role.CLIENT),
-        endpoints=(Endpoint(address_of(kp.public)),),
     ).sign(c.mgr, T0)
     for node in c.nodes:
         intervene(node.store, c.mgr, bodies=(grant_tx,), bucket=444)

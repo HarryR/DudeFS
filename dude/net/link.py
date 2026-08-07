@@ -588,20 +588,20 @@ class Peer:
         again if none, is `dude.net.plan`'s business. This object holds state, so it must not hold
         policy — the two together are what made selection duplicate across `Mailbox` and here.
 
-        Ordering: DIAL-LINKS FIRST (sorted by measured `rto()` with `Address.sort_key` as tiebreak),
-        then SESSION-LINKS AS FALLBACK (freshest first by `last_activity`) -- for peers with only
-        session-Links (clients with no roster entry) the session is used; for peers with dial-Links
-        the dial-Link wins so today's reply-by-dial behaviour is preserved. Wave 2 will invert this
-        so session-Links win when available -- BUT that requires `TCPDialer` to be bidirectional
-        (currently outbound-only), because a reply going out on the accept-side session lands in
-        the dialer's socket buffer and the dialer never reads it. Ordering + bidirectional dialer
-        flip together. A refusing link is dropped rather than attempted and failed -- that is what
-        the breaker is for."""
-        dial_out = [ln for ln in self.links.values() if ln.available(now)]
-        dial_out.sort(key=lambda ln: (self._rto(ln), ln.address.sort_key))
+        Ordering: SESSION-LINKS FIRST, freshest-first by `last_activity` -- a live session is the
+        cheapest reply path (already connected, one write) and the freshest is the most likely to
+        still be alive. Then DIAL-LINKS, sorted by measured `rto()` with `Address.sort_key` as
+        tiebreak so unmeasured links start in cost order (inproc, unix, tcp) rather than
+        arbitrarily. Safe from Wave 2 onward: `TCPDialer` reads replies on its own outbound
+        sockets, so a reply written on the accept-side session gets received on the dialer's
+        side (or vice-versa) rather than sitting in an un-read socket buffer -- which was the
+        blocker for this flip until Wave 2 landed. A refusing link is dropped rather than
+        attempted and failed -- that is what the breaker is for."""
         session_out = [sl for sl in self.sessions if sl.available(now)]
         session_out.sort(key=lambda sl: -sl.last_activity)  # newest first
-        return (*dial_out, *session_out)
+        dial_out = [ln for ln in self.links.values() if ln.available(now)]
+        dial_out.sort(key=lambda ln: (self._rto(ln), ln.address.sort_key))
+        return (*session_out, *dial_out)
 
     def deliverable(self, now: Millis) -> bool:
         """Is there any path at all right now? A fact, so it lives here; what to do about `False` is

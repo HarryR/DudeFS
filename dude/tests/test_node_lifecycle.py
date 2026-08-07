@@ -105,8 +105,8 @@ class TestNodeLifecycle(unittest.TestCase):
         _mgr, nodes, clients, listeners = _build_cluster(3)
         try:
             # Managed mode: each node gets its listener at start().
-            for node, listener in zip(nodes, listeners, strict=True):
-                node.start(listener)
+            for node, listener, client in zip(nodes, listeners, clients, strict=True):
+                node.start(listener, client)  # dialer is now bidirectional -- start it too
 
             # Empty blocks: no submits, but Coordinator ticks each bucket and closes
             # what's there (nothing). With a 3-node roster the Round hits quorum

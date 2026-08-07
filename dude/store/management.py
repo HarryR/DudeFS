@@ -227,23 +227,85 @@ class NodeRecord:
 
 @dataclass(frozen=True, slots=True)
 class Grant:
-    """What an identity may write. `stores` is the set of store ids; `kinds` the operation kinds
-    (the compactor's grant is a KIND, not a store — there is no compaction store, #coarse-acl).
+    """What an identity may write. Pure authority -- `stores` is the set of store ids; `kinds`
+    the operation kinds (the compactor's grant is a KIND, not a store -- there is no compaction
+    store, #coarse-acl).
 
-    `cert` is required (#cert) — `purpose == role.value`. `may_write` / `may_send` refuse
-    a grant whose cert does not verify or whose signer is not authorised for the role.
+    `cert` is required (#cert) -- `purpose == role.value`. `may_write` / `may_send` refuse a
+    grant whose cert does not verify or whose signer is not authorised for the role.
 
-    `endpoints` are where this identity can be reached (for CLIENT / COMPACTOR grants;
-    empty for MANAGER whose identity nodes never need to dial). Nodes use these via
-    #roster-drives-peers to add the identity to `postman.peers` on tick, so replies to
-    inbound requests from this identity can flow back. Same shape as `NodeRecord.endpoints`."""
+    NO ENDPOINTS. Nodes never dial clients back -- clients are ephemeral, may be behind NAT,
+    connection may drop and reconnect. Replies flow back on the session the client opened (see
+    `SessionLink` in `dude.net.link`). Where an identity CAN be reached is a discovery
+    concern, not an authority concern; grants stay pure. Roster members (nodes) carry their
+    addresses in `NodeRecord.endpoints` because nodes ARE dialable at stable addresses; that
+    asymmetry with clients is what the split makes honest.
+
+    TWO ENCODING FORMS, both owned here (parallels `NodeRecord`):
+      * `encode()` / `decode(raw)` -- WIRE form (5 fields with identity), used by
+        light-client `RosterBundle` and anywhere else a Grant travels standalone.
+      * `encode_row()` / `decode_row(identity, raw)` -- DISK form (4 fields without
+        identity; identity is the P_GRANT row key suffix)."""
 
     identity: crypto.PublicKey
     role: Role
     stores: frozenset[int]
     kinds: frozenset[int]
     cert: Cert
-    endpoints: tuple[Endpoint, ...] = ()
+
+    def encode(self) -> bytes:
+        """Wire form: `[identity, role.value, sorted_stores, sorted_kinds, cert]`."""
+        return codec.encode(
+            [
+                self.identity,
+                self.role.value,
+                sorted(self.stores),
+                sorted(self.kinds),
+                self.cert.encode(),
+            ]
+        )
+
+    @classmethod
+    def decode(cls, raw: bytes) -> Grant:
+        """Parse the wire form. Raises `DudeError` on shape mismatch; `ManagementError` on
+        an unknown role value (semantic, not codec)."""
+        f = codec.as_seq(codec.decode(raw), 5)
+        identity = crypto.PublicKey(codec.as_bytes(f[0]))
+        role_bytes = codec.as_bytes(f[1])
+        try:
+            role = Role(role_bytes)
+        except ValueError as e:
+            raise ManagementError(f"unknown role in Grant: {role_bytes!r}") from e
+        stores = frozenset(codec.as_int(x) for x in codec.as_seq(f[2]))
+        kinds = frozenset(codec.as_int(x) for x in codec.as_seq(f[3]))
+        cert = Cert.decode(codec.as_bytes(f[4]))
+        return cls(identity, role, stores, kinds, cert)
+
+    def encode_row(self) -> bytes:
+        """Disk form (P_GRANT row body): `[role.value, sorted_stores, sorted_kinds, cert]`.
+        Identity is the key suffix on disk."""
+        return codec.encode(
+            [
+                self.role.value,
+                sorted(self.stores),
+                sorted(self.kinds),
+                self.cert.encode(),
+            ]
+        )
+
+    @classmethod
+    def decode_row(cls, identity: crypto.PublicKey, raw: bytes) -> Grant:
+        """Parse the disk form, given `identity` from the P_GRANT row key."""
+        f = codec.as_seq(codec.decode(raw), 4)
+        role_bytes = codec.as_bytes(f[0])
+        try:
+            role = Role(role_bytes)
+        except ValueError as e:
+            raise ManagementError(f"unknown role for {identity.hex()[:8]}") from e
+        stores = frozenset(codec.as_int(x) for x in codec.as_seq(f[1]))
+        kinds = frozenset(codec.as_int(x) for x in codec.as_seq(f[2]))
+        cert = Cert.decode(codec.as_bytes(f[3]))
+        return cls(identity, role, stores, kinds, cert)
 
 
 # --------------------------------------------------------------------------- #
@@ -508,28 +570,12 @@ class MgmtReader:
         transaction's own layer during evaluation) so a grant made by an earlier step is
         visible to a later step's check.
 
-        Row content is 5 fields: role, stores, kinds, cert-bytes, endpoints. A grant
-        on-log always carries a #cert (`authorise` refuses to build a grant without one).
-        Endpoints may be empty (MANAGER); populated for CLIENT / COMPACTOR so nodes can
-        reach the identity when replying to inbound requests (#roster-drives-peers)."""
+        Row body is 4 fields: role, stores, kinds, cert-bytes (identity from key). Decoded
+        via `Grant.decode_row` so the layout stays owned by the dataclass."""
         raw = reader.get(self.store_id, P_GRANT + who)
         if raw is None:
             return None
-        f = codec.as_seq(codec.decode(raw[1]), 5)
-        try:
-            role = Role(codec.as_bytes(f[0]))
-        except ValueError as e:
-            raise ManagementError(f"unknown role for {who.hex()[:8]}") from e
-        cert = Cert.decode(codec.as_bytes(f[3]))
-        endpoints = tuple(Endpoint.parse(codec.as_bytes(e)) for e in codec.as_seq(f[4]))
-        return Grant(
-            who,
-            role,
-            frozenset(codec.as_int(x) for x in codec.as_seq(f[1])),
-            frozenset(codec.as_int(x) for x in codec.as_seq(f[2])),
-            cert,
-            endpoints,
-        )
+        return Grant.decode_row(who, raw[1])
 
     def grant_of(self, who: crypto.PublicKey) -> Grant | None:
         """The default-reader convenience: look up a grant against `self.store`. Same shape as
@@ -843,7 +889,6 @@ class MgmtWriter(MgmtReader):
         kinds: frozenset[int] = frozenset(),
         pop: crypto.Signature | None = None,
         cert: Cert | None = None,
-        endpoints: tuple[Endpoint, ...] = (),
     ) -> ops.Transaction:
         """Authorise an identity (#role-manager-grant, #cert).
 
@@ -856,6 +901,12 @@ class MgmtWriter(MgmtReader):
           * `cert.verify()` MUST hold (signature-only).
           * `cert.signer` MUST be authorised for the role: anchor-only for MANAGER and
             COMPACTOR, anchor-or-currently-valid-manager for CLIENT.
+
+        NO `endpoints` PARAMETER. Grants are pure authority; location is a discovery concern.
+        Nodes never dial back to clients -- clients reach nodes by dialing them, and replies
+        flow back on the session the client opened (`SessionLink`). Roster members carry
+        their own addresses in `NodeRecord.endpoints`; that asymmetry is honest because
+        nodes ARE dialable at stable addresses and clients are not.
 
         Refuses at construction time on any missing / invalid input. This is the API-side
         check; eval-time refusal of a raw `Set P_GRANT` bypassing this method is OWED (see
@@ -875,15 +926,7 @@ class MgmtWriter(MgmtReader):
             raise ManagementError(
                 f"cert does not verify or signer is not authorised for role {role.name}"
             )
-        record = codec.encode(
-            [
-                role.value,
-                sorted(stores),
-                sorted(kinds),
-                cert.encode(),
-                sorted(ep.encode() for ep in endpoints),
-            ]
-        )
+        record = Grant(who, role, stores, kinds, cert).encode_row()
         return ops.writes(
             ops.Set(self.store_id, P_GRANT + who, record),
             ops.Set(self.store_id, P_POP + who, pop),

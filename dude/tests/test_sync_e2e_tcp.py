@@ -102,6 +102,7 @@ def _pump_all(
     listeners: dict[crypto.PublicKey, TCPListener],
     now: int,
     rounds: int = 30,
+    dialers: dict[crypto.PublicKey, TCPClient] | None = None,
 ) -> None:
     """Drive tick + drain across every node until nothing's moved for a round.
 
@@ -109,7 +110,11 @@ def _pump_all(
     round-trip is well under 1 ms, but even a single-digit-microsecond gap between
     `sendall()` returning and the receiving socket becoming readable is enough for
     `selector.select(timeout=0)` to see nothing. Without the sleep the pump exits early
-    and the tests flake."""
+    and the tests flake.
+
+    Wave 2: `TCPDialer` reads replies on its outbound sockets (session-Link path). The
+    deterministic pump drains BOTH listeners (accept-side sessions) AND dialers
+    (dial-side sessions) so no reply is stranded in an un-read socket buffer."""
     for _ in range(rounds):
         for node in nodes:
             node.tick(now)
@@ -123,6 +128,10 @@ def _pump_all(
                 for inbound in listeners[node.me.public].drain():
                     node.receive(inbound.frame, now, session=inbound.session)
                     round_delivered += 1
+                if dialers is not None:
+                    for inbound in dialers[node.me.public].drain():
+                        node.receive(inbound.frame, now, session=inbound.session)
+                        round_delivered += 1
             if round_delivered == 0:
                 break
 
@@ -138,6 +147,7 @@ def _produce_blocks(
     listeners: dict[crypto.PublicKey, TCPListener],
     mgr: crypto.Keypair,
     want: int,
+    dialers: dict[crypto.PublicKey, TCPClient] | None = None,
 ) -> int:
     """Submit transactions and pump until every node holds at least `want` blocks.
     Returns the final `now`."""
@@ -147,7 +157,7 @@ def _produce_blocks(
         key = crypto.h(f"tcp-e2e-{submissions}".encode())
         tx = ops.writes(ops.Set(D, key, b"v")).sign(mgr, now)
         _submit(nodes[0], tx, mgr, now)
-        _pump_all(nodes, listeners, now)
+        _pump_all(nodes, listeners, now, dialers=dialers)
         submissions += 1
         now += DELTA
         if submissions > 30:
@@ -159,9 +169,10 @@ class TestJoinerCatchesUpOverTCP(unittest.TestCase):
     def test_joiner_catches_up_via_the_wire(self):
         mgr, nodes, clients, listener_list = _build_cluster(3)
         listeners = {n.me.public: t for n, t in zip(nodes, listener_list, strict=True)}
+        dialers = {n.me.public: c for n, c in zip(nodes, clients, strict=True)}
 
         try:
-            _produce_blocks(nodes, listeners, mgr, 3)
+            _produce_blocks(nodes, listeners, mgr, 3, dialers=dialers)
             producer_head = nodes[0].store.head_block_num()
             assert producer_head is not None and producer_head >= 3
 
@@ -181,10 +192,11 @@ class TestJoinerCatchesUpOverTCP(unittest.TestCase):
 
             all_nodes = [*nodes, joiner]
             all_listeners = {**listeners, joiner_kp.public: joiner_listener}
+            all_dialers = {**dialers, joiner_kp.public: joiner_client}
 
             now = T0 + DELTA * 10
             for _ in range(20):
-                _pump_all(all_nodes, all_listeners, now)
+                _pump_all(all_nodes, all_listeners, now, dialers=all_dialers)
                 if (joiner_store.head_block_num() or 0) >= producer_head:
                     break
                 now += DELTA
