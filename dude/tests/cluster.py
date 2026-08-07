@@ -17,7 +17,7 @@ from ..core import crypto
 from ..net import Verb
 from ..net.address import Endpoint, Scheme
 from ..net.envelope import Envelope
-from ..net.transports import InProcClient, InProcListener, address_of, name_of
+from ..net.transports import InProcDialer, InProcListener, address_of, name_of
 from ..net.transports.inproc import _reset_for_tests
 from ..node import Node
 from ..store import Store, management, ops
@@ -68,7 +68,7 @@ class Cluster:
             # -- one per node, stateless, all outbound goes through it.
             listener = InProcListener(name_of(kp.public))
             self.listeners[kp.public] = listener
-            node.postman.attach_transport(Scheme.INPROC, InProcClient())
+            node.postman.attach_transport(Scheme.INPROC, InProcDialer(me=name_of(kp.public)))
             self.nodes.append(node)
         # No explicit peer wiring here (#roster-drives-peers). Each Node's first `tick`
         # runs `_reconcile_peers`, which reads `mgmt.roster()` + `mgmt.nodes()` from the
@@ -186,8 +186,8 @@ class Cluster:
             for i, node in enumerate(self.nodes):
                 if i in away:
                     continue
-                for frame in self.listeners[node.me.public].drain():
-                    node.receive(frame, now)
+                for inbound in self.listeners[node.me.public].drain():
+                    node.receive(inbound.frame, now, session=inbound.session)
                     delivered += 1
             if delivered == 0:
                 return

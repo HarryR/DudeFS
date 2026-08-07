@@ -32,6 +32,7 @@ from ..net.address import Endpoint
 from ..net.envelope import Frame
 from ..net.link import Listener
 from ..net.postman import Postman
+from ..net.session import Inbound, Session, SessionBindError
 from ..store import smt
 from ..store.management import Grant, Role
 from ..tunables import DEFAULT, Tunables
@@ -181,7 +182,7 @@ class LightClient:
     """mid -> peer, so an incoming AnchorsReply during BOOTSTRAPPING routes to the right
     peer's _BootstrapReply."""
 
-    _inbox: queue.SimpleQueue[Frame] = field(default_factory=queue.SimpleQueue, init=False)
+    _inbox: queue.SimpleQueue[Inbound] = field(default_factory=queue.SimpleQueue, init=False)
     """See `Node._inbox` -- same shape. One door for inbound frames from any attached
     Listener; the owned client thread drains it in `_run`."""
 
@@ -260,12 +261,18 @@ class LightClient:
 
     # -- I/O boundary ------------------------------------------------------------------------- #
 
-    def receive(self, frame: Frame, now: Millis) -> None:
+    def receive(self, frame: Frame, now: Millis, session: Session | None = None) -> None:
         """One inbound frame -- same crash-only shape as Node.receive. Postman unseals
         and correlates; if the reply matches an outstanding request, dispatch to the
-        right state-machine handler. Bad frames drop silently."""
+        right state-machine handler. Bad frames drop silently.
+
+        `session` is present when the frame arrived via a real transport (see `_run`),
+        None when injected directly by tests. When present, binds identity + registers
+        the session with Postman on first sight, mirroring `Node._bind_session`."""
         try:
             got = self.postman.deliver(frame, now)
+            if session is not None:
+                self._bind_session(session, got.envelope.frm)
         except DudeError:
             return
         env = got.envelope
@@ -336,14 +343,26 @@ class LightClient:
         last_tick = now_ms()
         while not self._stopping.is_set():
             try:
-                frame = self._inbox.get(timeout=tick_interval_ms / 1000)
-                self.receive(frame, now_ms())
+                inbound = self._inbox.get(timeout=tick_interval_ms / 1000)
+                self.receive(inbound.frame, now_ms(), session=inbound.session)
             except queue.Empty:
                 pass
             now = now_ms()
             if now - last_tick >= tick_interval_ms:
                 self.tick(now)
                 last_tick = now
+
+    def _bind_session(self, session: Session, frm: crypto.PublicKey) -> None:
+        """Same shape as `Node._bind_session`. First inbound frame on this session sets
+        `session.identity = frm` and registers a SessionLink on Peer(frm)."""
+        was_unbound = session.identity is None
+        try:
+            session.bind(frm)
+        except SessionBindError:
+            session.close()
+            return
+        if was_unbound:
+            self.postman.register_session(session)
 
     # -- internals ---------------------------------------------------------------------------- #
 

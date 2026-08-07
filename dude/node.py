@@ -36,6 +36,7 @@ from .net import Verb
 from .net.envelope import Envelope, Frame, SignedEnvelope, new_message_id
 from .net.link import Listener
 from .net.postman import Postman
+from .net.session import Inbound, Session, SessionBindError
 from .store import Store, ops
 from .store.management import P_GRANT, Management, Role
 from .sync.adapter import (
@@ -139,7 +140,7 @@ class Node:
     peers (bootstrap-outside-the-roster, e.g. a joining node not yet in the roster --
     see `test_sync_e2e`) survive reconciliation."""
 
-    _inbox: queue.SimpleQueue[Frame] = field(default_factory=queue.SimpleQueue, init=False)
+    _inbox: queue.SimpleQueue[Inbound] = field(default_factory=queue.SimpleQueue, init=False)
     """The one door for inbound frames. Every attached `Listener` pushes into this queue
     from its own thread (production path via `start(*listeners)`); the owned Node thread
     consumes from it via `queue.get(timeout=tick_interval)`. Thread-safety primitive, not
@@ -273,7 +274,7 @@ class Node:
 
     # -- inbound ------------------------------------------------------------------------------- #
 
-    def receive(self, frame: Frame, now: Millis) -> None:
+    def receive(self, frame: Frame, now: Millis, session: Session | None = None) -> None:
         """One inbound frame, fully handled.
 
         CATCHES `DudeError` DELIBERATELY. This is the crash-only boundary the error review flagged:
@@ -291,11 +292,27 @@ class Node:
         `DudeError`, so OUR bugs still take the process down (core/errors.py)."""
         try:
             got = self.postman.deliver(frame, now)
+            if session is not None:
+                self._bind_session(session, got.envelope.frm)
             if got.envelope.env.verb in SOLICITED and got.reply is None:
                 return  # nobody asked; see `SOLICITED`
             self._handle(got.envelope, now)
         except DudeError:
             return  # their fault: drop the frame, keep serving
+
+    def _bind_session(self, session: Session, frm: crypto.PublicKey) -> None:
+        """Bind the session's identity to the envelope's `frm` on first sight; verify on
+        subsequent frames. Register with Postman when identity is newly-bound so the session
+        becomes reachable as a SessionLink on Peer(frm). Identity mismatch closes the session
+        via the transport hook and drops the frame."""
+        was_unbound = session.identity is None
+        try:
+            session.bind(frm)
+        except SessionBindError:
+            session.close()
+            return
+        if was_unbound:
+            self.postman.register_session(session)
 
     def _handle(self, env: SignedEnvelope, now: Millis) -> None:
         """Dispatch by verb.
@@ -537,8 +554,8 @@ class Node:
         last_tick = now_ms()
         while not self._stopping.is_set():
             try:
-                frame = self._inbox.get(timeout=tick_interval_ms / 1000)
-                self.receive(frame, now_ms())
+                inbound = self._inbox.get(timeout=tick_interval_ms / 1000)
+                self.receive(inbound.frame, now_ms(), session=inbound.session)
             except queue.Empty:
                 pass
             now = now_ms()
@@ -573,7 +590,7 @@ class Node:
             self.postman.mailbox.post(env, now, self.tunables.net.ttl, await_reply=False)
 
     def _reply(self, to: SignedEnvelope, verb: Verb, body: bytes, now: Millis) -> None:
-        if to.frm not in self.postman.peers:
+        if not self.postman.can_reply(to.frm):
             return
         self.postman.mailbox.post(
             to.answer(verb, body).sign(self.me, now), now, self.tunables.net.ttl, await_reply=False

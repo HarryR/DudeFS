@@ -28,9 +28,28 @@ from ..core.errors import DudeError
 from ..core.units import Millis
 from .address import Endpoint, Scheme
 from .envelope import EnvelopeError, Frame, SignedEnvelope
-from .link import LinkTunables, Peer, Transport
+from .link import (
+    CircuitBreaker,
+    Estimator,
+    LinkError,
+    LinkTunables,
+    Peer,
+    SessionLink,
+    Transport,
+)
 from .mailbox import Expired, Mailbox, Reply, Transmit
 from .plan import Decision, GiveUp, Plan, Send, Wait
+from .session import Session
+
+
+def _no_dial(_endpoint: Endpoint) -> Transport:
+    """Sentinel `dial` for Peer entries that were only ever reached via inbound sessions.
+    A client with no roster row has no dialable endpoints; if code tries to add a dial-Link
+    via `Peer.reconfigure`, we raise loudly rather than silently returning None. If the peer
+    later becomes dialable (e.g. gets added to the roster), replace with a real dial by
+    calling `add_peer` -- which constructs a fresh Peer, currently; this sentinel only
+    protects the "session-only" invariant during that window."""
+    raise LinkError("peer is session-only; no dial capability configured")
 
 
 class PostmanError(DudeError):
@@ -142,6 +161,83 @@ class Postman:
         This is also the mechanism tests use to simulate a partition
         (#partitions-are-test-only): remove the target from both sides."""
         self.peers.pop(pubkey, None)
+
+    def register_session(self, session: Session) -> None:
+        """Wrap `session` in a `SessionLink` and add it to the appropriate peer's session list.
+        Called by the dispatch layer immediately after `session.bind(env.frm)` succeeds on the
+        first inbound frame from a fresh accepted session, OR after a `dial()` succeeds and
+        the session's identity is known at construction time.
+
+        `session.identity` MUST be set before calling. Creates a Peer entry for identities not
+        already in `self.peers` (a client with no roster row still gets a Peer, populated only
+        with session-links -- no dial-Links until it's a roster member).
+
+        `session.on_close` is set to the SessionLink's `_close()`, so a transport-side close
+        (peer disconnected, socket died) fires the same removal path a send-failure would.
+        Idempotent-ish: if the session has already been registered for its current identity,
+        this is a no-op; register-again with a different identity is a bug and raises."""
+        if session.identity is None:
+            raise PostmanError("register_session called before session.bind()")
+        peer = self.peers.get(session.identity)
+        if peer is None:
+            # Client (or otherwise not-in-roster identity): fresh Peer with no dial capability.
+            # If it later becomes a roster member, `add_peer` reconfigures endpoints and dial-Links
+            # appear alongside the existing session-Links -- reconfigure preserves state.
+            peer = Peer(session.identity, _no_dial, self.link_tunables)
+            self.peers[session.identity] = peer
+        # Check if already registered (idempotent path).
+        for existing in peer.sessions:
+            if existing.session is session:
+                return
+        # Session carries its own peer address (from accept-remote or dial-target); use it so
+        # `Peer.usable()` sorting can name the link. Sort_key isn't the primary axis for
+        # session-links (last_activity is), but consistency with dial-Link's address field
+        # keeps the API uniform.
+        link = SessionLink(
+            address=session.address,
+            session=session,
+            policies=(
+                Estimator(self.link_tunables),
+                CircuitBreaker(self.link_tunables),
+                peer.budget,
+            ),
+        )
+        link.on_close = self._on_session_link_closed
+        session.on_close = link._close  # noqa: SLF001 -- cooperative teardown wiring
+        peer.sessions.append(link)
+
+    def unregister_session(self, session: Session) -> None:
+        """Explicit removal, called by test code or lifecycle wiring that wants to drop a
+        session without waiting for `close()` to propagate. Idempotent."""
+        identity = session.identity
+        if identity is None:
+            return
+        peer = self.peers.get(identity)
+        if peer is None:
+            return
+        peer.sessions = [sl for sl in peer.sessions if sl.session is not session]
+
+    def can_reply(self, pubkey: crypto.PublicKey) -> bool:
+        """True iff we have any usable link to `pubkey` -- session or dial. Replaces the old
+        `pubkey in self.peers` check that assumed reply-by-dial was the only path. A client
+        with a live session but no roster entry answers True here; a node that just went
+        unreachable (all links refusing) answers False; a stranger who has never talked to us
+        answers False."""
+        peer = self.peers.get(pubkey)
+        if peer is None:
+            return False
+        return peer.deliverable(now=0) or bool(peer.sessions) or bool(peer.links)
+
+    def _on_session_link_closed(self, link: SessionLink) -> None:
+        """SessionLink hook: called from `SessionLink._close()` (either transport-side death via
+        `session.on_close` or send-side failure). Removes the link from its peer."""
+        identity = link.session.identity
+        if identity is None:
+            return
+        peer = self.peers.get(identity)
+        if peer is None:
+            return
+        peer.sessions = [sl for sl in peer.sessions if sl is not link]
 
     def attach_transport(self, scheme: Scheme, transport: Transport) -> None:
         """Inject a pre-constructed transport for `scheme`, bypassing the module-scope

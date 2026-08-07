@@ -19,7 +19,12 @@ from enum import Enum
 
 from ..core import crypto
 from ..core.units import Millis
-from .link import Estimator, Link, Peer
+from .link import Estimator, Link, Peer, SessionLink
+
+type AnyLink = Link | SessionLink
+"""Either kind of link Peer.usable() may return -- dial-based `Link` or session-backed
+`SessionLink`. Both share the `send / reply / expired / available / find` shape, so `Plan`
+handles them uniformly without knowing which is which."""
 
 
 class Stalled(Enum):
@@ -55,7 +60,7 @@ class Send:
     """Transmit on these links now. `again_at` is set when another link remains to try — a STAGGER,
     which adds an attempt to a live one, as opposed to a retry which replaces a failed one."""
 
-    links: tuple[Link, ...]
+    links: tuple[AnyLink, ...]
     again_at: Millis | None = None
 
 
@@ -165,7 +170,7 @@ class Plan:
         hi = min(self.t.backoff_cap, self.t.backoff_base * 3 ** max(1, attempts))
         return max(self.t.backoff_base, self.jitter(self.t.backoff_base, hi))
 
-    def stagger(self, picked: list[Link]) -> Millis:
+    def stagger(self, picked: list[AnyLink]) -> Millis:
         """R7's Connection Attempt Delay: `min(cap, best picked link's RTO)`.
 
         RFC 8305 uses a flat 250 ms because a browser has no RTT history for a freshly resolved

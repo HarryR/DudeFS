@@ -17,6 +17,7 @@ from dude.core import crypto
 from dude.net.address import Address, Scheme
 from dude.net.envelope import Envelope, Frame, Verb
 from dude.net.link import LinkError
+from dude.net.session import Inbound
 from dude.net.transports.tcp import TCPClient, TCPListener
 
 
@@ -28,10 +29,13 @@ def _make_frame(sender: crypto.Keypair, recipient: crypto.PublicKey, body: bytes
 def _drain_until(rx: TCPListener, want: int, tries: int = 200) -> tuple[Frame, ...]:
     """Poll `rx.drain()` up to `tries` times, sleeping between polls, until we have at
     least `want` frames or run out of tries. TCP is asynchronous under the hood: even on
-    loopback, the accept + data + read chain takes multiple event-loop turns."""
+    loopback, the accept + data + read chain takes multiple event-loop turns.
+
+    Unwraps `Inbound(frame, session)` -- tests here care about the frames only, session
+    binding is exercised elsewhere via Node.receive."""
     got: list[Frame] = []
     for _ in range(tries):
-        got.extend(rx.drain())
+        got.extend(inbound.frame for inbound in rx.drain())
         if len(got) >= want:
             return tuple(got)
         time.sleep(0.001)
@@ -153,7 +157,7 @@ class TestTCPListenerStartStop(unittest.TestCase):
     def test_frames_appear_in_inbox_after_start(self):
         a_kp = crypto.Keypair.generate()
         b_kp = crypto.Keypair.generate()
-        inbox: queue.SimpleQueue[Frame] = queue.SimpleQueue()
+        inbox: queue.SimpleQueue[Inbound] = queue.SimpleQueue()
         listener = TCPListener()
         client = TCPClient()
         try:
@@ -162,7 +166,7 @@ class TestTCPListenerStartStop(unittest.TestCase):
             client.send(listener.bound_address, frame)
             # Reader thread should push within a few select-cycles.
             got = inbox.get(timeout=2.0)
-            self.assertEqual(got.sealed, frame.sealed)
+            self.assertEqual(got.frame.sealed, frame.sealed)
         finally:
             client.close()
             listener.stop()
@@ -171,7 +175,7 @@ class TestTCPListenerStartStop(unittest.TestCase):
         """`stop()` must return within a bounded time -- specifically well under the
         reader-thread's `select()` block. Otherwise process shutdown drags."""
         listener = TCPListener()
-        inbox: queue.SimpleQueue[Frame] = queue.SimpleQueue()
+        inbox: queue.SimpleQueue[Inbound] = queue.SimpleQueue()
         listener.start(inbox)
         # Give the reader a moment to enter its select() loop.
         time.sleep(0.05)
@@ -184,7 +188,7 @@ class TestTCPListenerStartStop(unittest.TestCase):
 
     def test_start_twice_with_same_inbox_is_idempotent(self):
         listener = TCPListener()
-        inbox: queue.SimpleQueue[Frame] = queue.SimpleQueue()
+        inbox: queue.SimpleQueue[Inbound] = queue.SimpleQueue()
         try:
             listener.start(inbox)
             listener.start(inbox)  # same inbox -- no raise
@@ -195,8 +199,8 @@ class TestTCPListenerStartStop(unittest.TestCase):
         """A different inbox after start is a caller error -- the reader thread is
         already pushing into the first one, and the object doesn't support two."""
         listener = TCPListener()
-        inbox_a: queue.SimpleQueue[Frame] = queue.SimpleQueue()
-        inbox_b: queue.SimpleQueue[Frame] = queue.SimpleQueue()
+        inbox_a: queue.SimpleQueue[Inbound] = queue.SimpleQueue()
+        inbox_b: queue.SimpleQueue[Inbound] = queue.SimpleQueue()
         try:
             listener.start(inbox_a)
             with self.assertRaises(RuntimeError):
@@ -223,7 +227,7 @@ class TestReaderThreadShape(unittest.TestCase):
 
     def test_reader_thread_exits_on_stop(self):
         listener = TCPListener()
-        inbox: queue.SimpleQueue[Frame] = queue.SimpleQueue()
+        inbox: queue.SimpleQueue[Inbound] = queue.SimpleQueue()
         listener.start(inbox)
         thread = listener._thread
         self.assertIsNotNone(thread)

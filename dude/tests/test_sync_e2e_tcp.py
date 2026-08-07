@@ -120,8 +120,8 @@ def _pump_all(
             time.sleep(0.002)
             round_delivered = 0
             for node in nodes:
-                for frame in listeners[node.me.public].drain():
-                    node.receive(frame, now)
+                for inbound in listeners[node.me.public].drain():
+                    node.receive(inbound.frame, now, session=inbound.session)
                     round_delivered += 1
             if round_delivered == 0:
                 break

@@ -21,6 +21,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import queue
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -32,6 +33,7 @@ from ..core.errors import DudeError
 from ..core.units import Millis
 from .address import Address, Endpoint
 from .envelope import Frame
+from .session import Inbound, Session
 
 
 class LinkError(DudeError):
@@ -74,9 +76,9 @@ class Listener(Protocol):
     while production runs the same primitives from a Node-owned thread. Same public API for both;
     no test-only subclass, no private-state reach."""
 
-    def start(self, inbox: queue.SimpleQueue[Frame]) -> None: ...
+    def start(self, inbox: queue.SimpleQueue[Inbound]) -> None: ...
     def stop(self) -> None: ...
-    def drain(self) -> tuple[Frame, ...]: ...
+    def drain(self) -> tuple[Inbound, ...]: ...
 
 
 # --------------------------------------------------------------------------------------------- #
@@ -97,6 +99,16 @@ class LinkTunables:
 
     breaker_threshold: int = 5
     breaker_cooldown: Millis = 5_000
+
+    keepalive_interval: Millis | None = None
+    """If set, the link emits a `PING` on itself once it has been idle for this long -- no
+    frames sent OR received in this interval. The reply's RTT feeds the Estimator normally,
+    AND the traffic keeps a session-backed underlying carrier alive across otherwise-quiet
+    periods (a NAT-only node maintaining outbound sessions to its peers is the direct
+    beneficiary; kernel-level TCP keepalive is too coarse and often disabled). `None` means
+    no keepalive -- the sensible default for stateless carriers or when the caller doesn't
+    care about idle liveness. Per-transport defaults belong to the transport's Link-factory,
+    not here."""
 
     # `stagger_cap` and `max_parallel` are NOT here: they live in `PlanTunables`, which is what
     # reads them. They were declared in both groups with no consumer for this copy, so the two could
@@ -187,7 +199,12 @@ class _Inert:
 class Estimator(_Inert):
     """R2 + R3. Per-link RTT, and the timeout derived from it.
 
-    Refuses nothing — measurement is not a gate. It exists so `rto()` can be asked."""
+    Refuses nothing — measurement is not a gate. It exists so `rto()` can be asked.
+
+    Also tracks `last_activity` -- the timestamp of the most recent send or reply observed on
+    this link. `needs_keepalive(now)` uses it to answer "has this link been idle long enough
+    that we should ping to keep the underlying session alive AND refresh the RTT sample". Two
+    jobs from one clock: liveness for the session, freshness for the estimate."""
 
     t: LinkTunables = field(default_factory=LinkTunables)
     srtt: float | None = None
@@ -196,8 +213,15 @@ class Estimator(_Inert):
     ignored: int = 0
     """Replies that carried no usable sample. Counted rather than discarded silently: a link with
     many ignored and few samples measures itself from a biased subset, which is worth seeing."""
+    last_activity: Millis = 0
+    """Most recent send or reply observed. `0` means never active; keepalive stays off until
+    the first send goes out (there's nothing to keep alive on an untouched link)."""
 
-    def on_reply(self, _now: Millis, rtt: Millis | None, /) -> None:
+    def on_sent(self, now: Millis, /) -> None:
+        self.last_activity = now
+
+    def on_reply(self, now: Millis, rtt: Millis | None, /) -> None:
+        self.last_activity = now
         if rtt is None:  # unattributable — R2. NOT a zero, and not nothing.
             self.ignored += 1
             return
@@ -216,6 +240,17 @@ class Estimator(_Inert):
         if self.srtt is None:
             return self.t.rto_initial
         return max(self.t.rto_floor, int(self.srtt + max(self.t.granularity, 4 * self.rttvar)))
+
+    def needs_keepalive(self, now: Millis) -> bool:
+        """True iff `keepalive_interval` is set AND this link has been active at least once AND
+        that activity is older than the interval. The `last_activity > 0` guard is what stops a
+        freshly-constructed link from immediately firing a keepalive against nothing -- keepalive
+        is for links that WERE active and have gone quiet, not for cold ones."""
+        if self.t.keepalive_interval is None:
+            return False
+        if self.last_activity == 0:
+            return False
+        return (now - self.last_activity) >= self.t.keepalive_interval
 
 
 class Breaker(Enum):
@@ -357,6 +392,96 @@ class Link:
             getattr(p, hook)(now)
 
 
+@dataclass(slots=True)
+class SessionLink:
+    """A Link backed by an OPEN Session (from either a dial or an accept), not by a
+    dial-on-demand address. Same policy contract as `Link` (same `send`/`reply`/`expired`/
+    `available`/`find` shape, same hook order), so `Peer.usable()` can return a mixed list and
+    `Plan.next()` treats them uniformly.
+
+    LIFETIME BOUND TO THE SESSION. When `send()` fails at the transport level, the session
+    is presumed dead: we call `_close()`, which closes the session and fires `on_close` so
+    `Postman.unregister_session` runs. The transport can also signal death independently (peer
+    closed the connection, kernel dropped the socket) -- Postman's `_on_session_close` hook
+    finds the SessionLink for the dead session and removes it. Both paths converge on the same
+    removal.
+
+    NOT A `Link` SUBCLASS by choice. Dataclass inheritance with additional fields is finicky;
+    the send-line and the close-lifecycle are the only real differences and duplicating them
+    reads cleaner than either overriding a hook or plumbing a strategy callable through Link."""
+
+    address: Address
+    """The address of the peer as seen through this session (dialed address for outbound,
+    accepted-from address for inbound). Same field name as `Link.address` so Peer.usable()
+    sorting stays type-agnostic."""
+
+    session: Session
+    policies: tuple[Policy, ...] = ()
+    on_close: Callable[[SessionLink], None] | None = None
+    """Invoked exactly once when the SessionLink dies. Postman sets this at register-time to
+    the removal-from-Peer.sessions routine; SessionLink calls it from `_close()`."""
+
+    _closed: bool = field(default=False, init=False)
+
+    def send(self, frame: Frame, now: Millis) -> Refused | None:
+        """Same contract as `Link.send`. Extra: on transport failure, the session is closed
+        and this SessionLink dies (its `on_close` fires). A dead SessionLink refuses further
+        sends with `Refused.TRANSPORT`."""
+        if self._closed:
+            return Refused.TRANSPORT
+        for p in self.policies:
+            refusal = p.before_send(now)
+            if refusal is not None:
+                return refusal
+        try:
+            self.session.send(frame)
+        except LinkError:
+            self._each("on_failed", now)
+            self._close()
+            return Refused.TRANSPORT
+        self._each("on_sent", now)
+        return None
+
+    def reply(self, now: Millis, rtt: Millis | None) -> None:
+        for p in self.policies:
+            p.on_reply(now, rtt)
+
+    def expired(self, now: Millis) -> None:
+        self._each("on_failed", now)
+
+    def available(self, now: Millis) -> bool:
+        if self._closed:
+            return False
+        return all(p.before_send(now) is None for p in self.policies)
+
+    def find[T](self, kind: type[T]) -> T | None:
+        for p in self.policies:
+            if isinstance(p, kind):
+                return p
+        return None
+
+    @property
+    def last_activity(self) -> Millis:
+        """Delegated to `Session.last_activity` so `Peer.usable()` can sort session-links
+        freshest-first without knowing which policy holds the timestamp."""
+        return self.session.last_activity
+
+    def _close(self) -> None:
+        """Idempotent. Called on transport-side death (Postman._on_session_close) or on
+        send-failure (from `send()`). Whichever fires first wins; the second is a no-op."""
+        if self._closed:
+            return
+        self._closed = True
+        with contextlib.suppress(Exception):
+            self.session.close()  # best-effort teardown; nothing to escalate to
+        if self.on_close is not None:
+            self.on_close(self)
+
+    def _each(self, hook: str, now: Millis) -> None:
+        for p in self.policies:
+            getattr(p, hook)(now)
+
+
 def standard(
     address: Address,
     transport: Transport,
@@ -408,6 +533,11 @@ class Peer:
 
     t: LinkTunables = field(default_factory=LinkTunables)
     links: dict[Address, Link] = field(default_factory=dict)
+    sessions: list[SessionLink] = field(default_factory=list)
+    """Session-backed return paths -- one per open Session, whether we dialed out to this peer
+    or they accepted us. Freshest-first (by `last_activity`) in `usable()`, ahead of dial-Links
+    because a live session is a zero-cost reply. Populated by `Postman.register_session`,
+    pruned by `Postman.unregister_session` / `SessionLink._close()`."""
     endpoints: dict[Address, Endpoint] = field(default_factory=dict)
     """The configuration each link was built from, kept so an options-only change can be applied
     without disturbing the link's measurements."""
@@ -451,24 +581,34 @@ class Peer:
 
     # -- selection ---------------------------------------------------------------------------- #
 
-    def usable(self, now: Millis) -> tuple[Link, ...]:
+    def usable(self, now: Millis) -> tuple[Link | SessionLink, ...]:
         """Links that would accept a send right now, best first.
 
         FACTS ABOUT PATHS, not a decision about a message: how MANY of these to use, and when to try
         again if none, is `dude.net.plan`'s business. This object holds state, so it must not hold
         policy — the two together are what made selection duplicate across `Mailbox` and here.
 
-        Ordering: a refusing link is dropped rather than attempted and failed — that is what the
-        breaker is for. The rest sort by measured `rto()`, with `Address.sort_key` as tiebreak so
-        unmeasured links start in cost order (inproc, unix, tcp) rather than arbitrarily."""
-        out = [ln for ln in self.links.values() if ln.available(now)]
-        out.sort(key=lambda ln: (self._rto(ln), ln.address.sort_key))
-        return tuple(out)
+        Ordering: DIAL-LINKS FIRST (sorted by measured `rto()` with `Address.sort_key` as tiebreak),
+        then SESSION-LINKS AS FALLBACK (freshest first by `last_activity`) -- for peers with only
+        session-Links (clients with no roster entry) the session is used; for peers with dial-Links
+        the dial-Link wins so today's reply-by-dial behaviour is preserved. Wave 2 will invert this
+        so session-Links win when available -- BUT that requires `TCPDialer` to be bidirectional
+        (currently outbound-only), because a reply going out on the accept-side session lands in
+        the dialer's socket buffer and the dialer never reads it. Ordering + bidirectional dialer
+        flip together. A refusing link is dropped rather than attempted and failed -- that is what
+        the breaker is for."""
+        dial_out = [ln for ln in self.links.values() if ln.available(now)]
+        dial_out.sort(key=lambda ln: (self._rto(ln), ln.address.sort_key))
+        session_out = [sl for sl in self.sessions if sl.available(now)]
+        session_out.sort(key=lambda sl: -sl.last_activity)  # newest first
+        return (*dial_out, *session_out)
 
     def deliverable(self, now: Millis) -> bool:
         """Is there any path at all right now? A fact, so it lives here; what to do about `False` is
         policy, so it does not."""
-        return any(ln.available(now) for ln in self.links.values())
+        return any(ln.available(now) for ln in self.links.values()) or any(
+            sl.available(now) for sl in self.sessions
+        )
 
     def _rto(self, link: Link) -> Millis:
         est = link.find(Estimator)

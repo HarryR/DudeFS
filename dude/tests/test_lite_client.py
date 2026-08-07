@@ -14,7 +14,7 @@ from dude.core import crypto
 from dude.net.address import Endpoint, Scheme
 from dude.net.envelope import Envelope, Frame, SignedEnvelope, Verb
 from dude.net.postman import Postman
-from dude.net.transports import InProcClient, InProcListener, address_of, name_of
+from dude.net.transports import InProcDialer, InProcListener, address_of, name_of
 from dude.store import ops
 from dude.store.management import Cert, Management, Role
 from dude.sync.lite_adapter import ProofReply
@@ -29,7 +29,7 @@ def _build_light_client(c: Cluster, kp: crypto.Keypair) -> tuple[LightClient, In
     test pump can drain the listener via `.drain()`."""
     listener = InProcListener(name_of(kp.public))
     postman = Postman(kp)
-    postman.attach_transport(Scheme.INPROC, InProcClient())
+    postman.attach_transport(Scheme.INPROC, InProcDialer(me=name_of(kp.public)))
     client = LightClient(me=kp, anchor=c.mgr.public, postman=postman)
     for node in c.nodes:
         client.add_bootstrap_peer(node.me.public, (Endpoint(address_of(node.me.public)),))
@@ -114,11 +114,11 @@ def _pump(
         # Deliver each side's listener via the public drain() API.
         delivered = 0
         for node in c.nodes:
-            for frame in c.listeners[node.me.public].drain():
-                node.receive(frame, now)
+            for inbound in c.listeners[node.me.public].drain():
+                node.receive(inbound.frame, now, session=inbound.session)
                 delivered += 1
-        for frame in client_listener.drain():
-            client.receive(frame, now)
+        for inbound in client_listener.drain():
+            client.receive(inbound.frame, now, session=inbound.session)
             delivered += 1
         if delivered == 0:
             return
@@ -238,12 +238,14 @@ class TestLightClientRead(unittest.TestCase):
                 node.postman.tick(now)
             delivered = 0
             for node in c.nodes:
-                for frame in c.listeners[node.me.public].drain():
-                    node.receive(frame, now)
+                for inbound in c.listeners[node.me.public].drain():
+                    node.receive(inbound.frame, now, session=inbound.session)
                     delivered += 1
-            for frame in client_listener.drain():
-                mutated_frame = _mutate_frame_to_client(frame, client_kp, server_kp, mutate, now)
-                client.receive(mutated_frame, now)
+            for inbound in client_listener.drain():
+                mutated_frame = _mutate_frame_to_client(
+                    inbound.frame, client_kp, server_kp, mutate, now
+                )
+                client.receive(mutated_frame, now, session=inbound.session)
                 delivered += 1
             if delivered == 0:
                 break

@@ -13,7 +13,7 @@ import unittest
 from dude.consensus.settle_round import SettledBlock
 from dude.core import crypto
 from dude.net.address import Endpoint, Scheme
-from dude.net.transports import InProcClient, InProcListener, address_of, name_of
+from dude.net.transports import InProcDialer, InProcListener, address_of, name_of
 from dude.node import Node
 from dude.store import Store, ops
 
@@ -54,7 +54,7 @@ class TestFreshNodeJoinsClusterAndCatchesUp(unittest.TestCase):
         joiner_store.provision(c.mgr.public)
         joiner_listener = InProcListener(name_of(joiner_kp.public))
         joiner = Node(joiner_kp, joiner_store)
-        joiner.postman.attach_transport(Scheme.INPROC, InProcClient())
+        joiner.postman.attach_transport(Scheme.INPROC, InProcDialer(me=name_of(joiner_kp.public)))
 
         # Bootstrap-outside-the-roster wiring: reconciliation from `mgmt.roster()`
         # doesn't add the joiner to node 0's peers (joiner isn't in the roster yet), and
@@ -88,8 +88,8 @@ class TestFreshNodeJoinsClusterAndCatchesUp(unittest.TestCase):
                 for node in [*c.nodes, joiner]:
                     node.postman.tick(now)
                 for node in [*c.nodes, joiner]:
-                    for frame in listeners_by_node[node.me.public].drain():
-                        node.receive(frame, now)
+                    for inbound in listeners_by_node[node.me.public].drain():
+                        node.receive(inbound.frame, now, session=inbound.session)
                         delivered += 1
                 if delivered == 0:
                     break
