@@ -147,7 +147,7 @@ class TestLightClientBootstrap(unittest.TestCase):
         assert ts is not None
         self.assertEqual(len(ts.roster), 3)
         self.assertEqual(len(ts.managers), 1)
-        self.assertGreater(ts.head[0], 0)
+        self.assertGreater(ts.head.block_num, 0)
 
 
 class TestLightClientRead(unittest.TestCase):

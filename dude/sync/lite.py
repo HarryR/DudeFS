@@ -62,7 +62,7 @@ def serve_get_anchors(  # noqa: PLR0911 -- each early-return maps to a distinct 
     # stale because a stale client on a fork should still learn they're on a fork.
     tb = request.known_trusted_block
     if tb is not None:
-        client_num, client_hash = tb
+        client_num, client_hash = tb.block_num, tb.block_hash
         if client_num <= head_num:
             client_bytes = store.settled_at(client_num)
             if client_bytes is None:
@@ -131,7 +131,7 @@ def serve_get_proof(  # noqa: PLR0911, PLR0912, C901 -- each early-return names 
     # Client-state checks -- same as serve_get_anchors.
     tb = request.known_trusted_block
     if tb is not None:
-        client_num, client_hash = tb
+        client_num, client_hash = tb.block_num, tb.block_hash
         if client_num <= head_num:
             client_bytes = store.settled_at(client_num)
             if client_bytes is None:
@@ -212,7 +212,7 @@ def _headers_since(store: Store, known_trusted_block, head_num: int) -> tuple[Se
     reaching this helper (fork/stale checks refuse first)."""
     if known_trusted_block is None:
         return ()
-    from_num, _ = known_trusted_block
+    from_num = known_trusted_block.block_num
     if from_num >= head_num:
         return ()
     out: list[SettledBlock] = []

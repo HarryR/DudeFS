@@ -163,7 +163,16 @@ class NodeRecord:
     ENDPOINTS, NOT BARE ADDRESSES (#peer-endpoint-in-log). Each entry is a full `Endpoint`
     (address + options). Per-endpoint transport config (TLS material, mixnet profile,
     concurrency limits) travels with the identity through the log; the cert covers row
-    content so a hostile responder cannot fake options without a manager key."""
+    content so a hostile responder cannot fake options without a manager key.
+
+    TWO ENCODING FORMS, both owned here so the layouts cannot drift (CLAUDE.md trap #1):
+      * `encode()` / `decode(raw)` -- WIRE form, 4 fields including `identity` (used by
+        light-client `RosterBundle` and anywhere else a NodeRecord travels standalone).
+      * `encode_row()` / `decode_row(identity, raw)` -- DISK form, 3 fields without
+        `identity` (P_NODE row body; identity is the key suffix). The asymmetry is real,
+        not a bug: identity is the row key on disk, so storing it twice would just be
+        redundancy waiting to disagree with itself.
+    Drift-guard: `test_node_record_wire_and_row_agree_on_field_count` pins both counts."""
 
     identity: crypto.PublicKey
     endpoints: tuple[Endpoint, ...]
@@ -172,6 +181,48 @@ class NodeRecord:
     """Which failure domains this node shares with others. Rack-aware placement, generalised:
     when one
     rack burns, you do not want the replacement in the rack beside it."""
+
+    def encode(self) -> bytes:
+        """Wire form: `[identity, endpoints, domains, cert]`, endpoints/domains sorted by
+        encoded bytes for deterministic on-wire ordering."""
+        return codec.encode(
+            [
+                self.identity,
+                sorted(ep.encode() for ep in self.endpoints),
+                sorted(self.domains),
+                self.cert.encode(),
+            ]
+        )
+
+    @classmethod
+    def decode(cls, raw: bytes) -> NodeRecord:
+        """Parse the wire form. Raises `DudeError` (via codec) on shape mismatch."""
+        f = codec.as_seq(codec.decode(raw), 4)
+        identity = crypto.PublicKey(codec.as_bytes(f[0]))
+        endpoints = tuple(Endpoint.parse(codec.as_bytes(e)) for e in codec.as_seq(f[1]))
+        domains = frozenset(codec.as_bytes(d) for d in codec.as_seq(f[2]))
+        cert = Cert.decode(codec.as_bytes(f[3]))
+        return cls(identity, endpoints, cert, domains)
+
+    def encode_row(self) -> bytes:
+        """Disk form (P_NODE row body): `[endpoints, domains, cert]`. Identity is the key
+        suffix on disk (`P_NODE + identity`), so it's absent from the value."""
+        return codec.encode(
+            [
+                sorted(ep.encode() for ep in self.endpoints),
+                sorted(self.domains),
+                self.cert.encode(),
+            ]
+        )
+
+    @classmethod
+    def decode_row(cls, identity: crypto.PublicKey, raw: bytes) -> NodeRecord:
+        """Parse the disk form, given `identity` from the P_NODE row key."""
+        f = codec.as_seq(codec.decode(raw), 3)
+        endpoints = tuple(Endpoint.parse(codec.as_bytes(e)) for e in codec.as_seq(f[0]))
+        domains = frozenset(codec.as_bytes(d) for d in codec.as_seq(f[1]))
+        cert = Cert.decode(codec.as_bytes(f[2]))
+        return cls(identity, endpoints, cert, domains)
 
 
 @dataclass(frozen=True, slots=True)
@@ -241,15 +292,7 @@ class MgmtReader:
         out: dict[crypto.PublicKey, NodeRecord] = {}
         for name, _prov, value, _ep in self.store.prefix(self.store_id, P_NODE):
             who = crypto.PublicKey(name[len(P_NODE) :])
-            f = codec.as_seq(codec.decode(value), 3)
-            # Each stored bytes entry is the wire form of an Endpoint (address + options),
-            # per #peer-endpoint-in-log. Endpoint.parse tolerates both the encoded-endpoint
-            # shape and a bare-address shape, so a row written before this change still
-            # decodes as `Endpoint(address, options={})`.
-            endpoints = tuple(Endpoint.parse(codec.as_bytes(e)) for e in codec.as_seq(f[0]))
-            doms = frozenset(codec.as_bytes(d) for d in codec.as_seq(f[1]))
-            cert = Cert.decode(codec.as_bytes(f[2]))
-            out[who] = NodeRecord(who, endpoints, cert, doms)
+            out[who] = NodeRecord.decode_row(who, value)
         return out
 
     def roster(self) -> tuple[crypto.PublicKey, ...]:
@@ -721,23 +764,9 @@ class MgmtWriter(MgmtReader):
         for who in remove:
             steps.append(ops.Del(self.store_id, P_NODE + who))
             steps.append(ops.Del(self.store_id, P_POP + who))
-        # Encode each endpoint via `Endpoint.encode` (address + options) so per-endpoint
-        # options travel with the row (#peer-endpoint-in-log). Sorted by encoded bytes for
-        # deterministic on-wire ordering.
-        steps.extend(
-            ops.Set(
-                self.store_id,
-                P_NODE + rec.identity,
-                codec.encode(
-                    [
-                        sorted(ep.encode() for ep in rec.endpoints),
-                        sorted(rec.domains),
-                        rec.cert.encode(),
-                    ]
-                ),
-            )
-            for rec in add
-        )
+        # Row body via NodeRecord.encode_row -- layout owned by the dataclass so wire and
+        # disk cannot silently drift (CLAUDE.md trap #1).
+        steps.extend(ops.Set(self.store_id, P_NODE + rec.identity, rec.encode_row()) for rec in add)
         # Roster commitment (#roster-commitment-cert). Payload binds THREE fields:
         #   1. serial            -- monotone, bumps per change
         #   2. sorted_members    -- pubkeys only (membership fingerprint)

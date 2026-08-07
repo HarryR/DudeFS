@@ -234,7 +234,7 @@ class LightClient:
         req = GetProof(
             store_id=store_id,
             name=name,
-            block_num=self.trusted_state.head[0],
+            block_num=self.trusted_state.head.block_num,
             known_roster_fingerprint=self.trusted_state.roster_fingerprint,
             known_trusted_block=self.trusted_state.head,
         )
@@ -405,7 +405,7 @@ class LightClient:
             managers=tuple(sorted(g.identity for g in bundle.managers)),
             node_endpoints={rec.identity: rec.endpoints for rec in bundle.entries},
             roster_fingerprint=fingerprint,
-            head=(head.anchors.block_num, head.block_hash),
+            head=TrustedBlock(head.anchors.block_num, head.block_hash),
             head_state_root=head.anchors.state_root,
         )
         self.state = State.READY
@@ -493,7 +493,7 @@ class LightClient:
         head). When non-empty, `headers[-1]` typically IS `responder_head` (server ships
         them together); the terminal chain-link + settle_sigs verify establishes trust."""
         assert self.trusted_state is not None  # noqa: S101 -- type narrowing for the checker; contract invariants above make this unreachable
-        prev_hash = self.trusted_state.head[1]
+        prev_hash = self.trusted_state.head.block_hash
         roster = self.trusted_state.roster
         chain: tuple[SettledBlock, ...]
         if headers and headers[-1].block_hash == responder_head.block_hash:
@@ -503,7 +503,7 @@ class LightClient:
         for header in chain:
             if header.anchors.prev_block != prev_hash:
                 # Special case: no headers, no advance -- responder_head IS trusted head.
-                return header.block_hash == self.trusted_state.head[1]
+                return header.block_hash == self.trusted_state.head.block_hash
             payload = _settle_payload(header.block.slice_hash, header.anchors)
             if not _verify_multisig(
                 header.signers, header.settle_sigs, payload, roster, self.anchor
@@ -517,7 +517,7 @@ class LightClient:
             managers=self.trusted_state.managers,
             node_endpoints=self.trusted_state.node_endpoints,
             roster_fingerprint=self.trusted_state.roster_fingerprint,
-            head=(final.anchors.block_num, final.block_hash),
+            head=TrustedBlock(final.anchors.block_num, final.block_hash),
             head_state_root=final.anchors.state_root,
         )
         return True

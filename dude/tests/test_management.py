@@ -19,7 +19,7 @@ import unittest
 from ..consensus.bootstrap import bootstrap, intervene
 from ..consensus.settle_round import _settle_payload
 from ..core import crypto
-from ..core.errors import InvariantError
+from ..core.errors import DudeError, InvariantError
 from ..net.address import Address, Endpoint, Scheme
 from ..store import Store, ops
 from ..store.management import Cert, Management, ManagementError, NodeRecord, Role
@@ -503,6 +503,56 @@ class TestChangeRosterAdvisoryComposition(unittest.TestCase):
         self.assertEqual(commit_after[0], commit_before[0] + 1)
         self.assertNotIn(kps[0].public, commit_after[1])
         self.assertEqual(len(mgmt.nodes()), 3)
+
+
+# --------------------------------------------------------------------------------------------- #
+# Encoding: guard against wire vs disk drift. CLAUDE.md trap #1 -- both halves are self-        #
+# consistent in isolation, so only field-count pins catch a silent divergence.                  #
+# --------------------------------------------------------------------------------------------- #
+
+
+class TestNodeRecordEncoding(unittest.TestCase):
+    """Wire form (4 fields) and disk form (3 fields) both live on `NodeRecord`, both must
+    refuse a wrong-count payload. Round-trip separately proves consistency; the count
+    refusals catch a field added to encode but not decode (or vice versa)."""
+
+    def setUp(self):
+        kp = crypto.Keypair.generate()
+        manager = crypto.Keypair.generate()
+        addr = Address(Scheme.TCP, "127.0.0.1:7001")
+        cert = Cert.sign_roster(manager, kp.public)
+        self.rec = NodeRecord(
+            identity=kp.public,
+            endpoints=(Endpoint(addr),),
+            cert=cert,
+            domains=frozenset({b"provider:x"}),
+        )
+
+    def test_wire_form_round_trips(self):
+        self.assertEqual(NodeRecord.decode(self.rec.encode()), self.rec)
+
+    def test_row_form_round_trips(self):
+        self.assertEqual(NodeRecord.decode_row(self.rec.identity, self.rec.encode_row()), self.rec)
+
+    def test_wire_form_wrong_field_count_raises(self):
+        """`NodeRecord.encode` emits 4 fields; anything else must be a hard decode refusal.
+        Trap #1: a field added to encode without matching decode `as_seq(..., N)` would silently
+        drop; this test pins the count so the drop can't happen unnoticed."""
+        from ..core import codec  # noqa: PLC0415 -- local; only used here
+
+        for wrong in (3, 5):
+            malformed = codec.encode([b""] * wrong)
+            with self.assertRaises(DudeError):
+                NodeRecord.decode(malformed)
+
+    def test_row_form_wrong_field_count_raises(self):
+        """Same trap, for the disk form (3 fields, identity from key)."""
+        from ..core import codec  # noqa: PLC0415 -- local; only used here
+
+        for wrong in (2, 4):
+            malformed = codec.encode([b""] * wrong)
+            with self.assertRaises(DudeError):
+                NodeRecord.decode_row(self.rec.identity, malformed)
 
 
 if __name__ == "__main__":

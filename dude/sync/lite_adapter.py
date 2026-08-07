@@ -30,7 +30,6 @@ from typing import ClassVar
 from ..consensus.settle_round import SettledBlock
 from ..core import codec, crypto
 from ..core.errors import DudeError
-from ..net.address import Endpoint
 from ..net.envelope import Verb
 from ..store.management import Cert, Grant, NodeRecord, Role
 
@@ -127,7 +126,7 @@ class RosterBundle:
                 self.commitment_serial,
                 sorted(bytes(m) for m in self.commitment_members),
                 self.commitment_cert.encode(),
-                [_encode_node_record(rec) for rec in self.entries],
+                [rec.encode() for rec in self.entries],
                 [_encode_grant(g) for g in self.managers],
             ]
         )
@@ -139,35 +138,22 @@ class RosterBundle:
             serial = codec.as_int(p[0])
             members = tuple(crypto.PublicKey(codec.as_bytes(m)) for m in codec.as_seq(p[1]))
             commitment_cert = Cert.decode(codec.as_bytes(p[2]))
-            entries = tuple(_decode_node_record(codec.as_bytes(e)) for e in codec.as_seq(p[3]))
+            entries = tuple(NodeRecord.decode(codec.as_bytes(e)) for e in codec.as_seq(p[3]))
             managers = tuple(_decode_grant(codec.as_bytes(g)) for g in codec.as_seq(p[4]))
         except DudeError as e:
             raise LiteAdapterError(f"malformed RosterBundle: {e}") from e
         return cls(serial, members, commitment_cert, entries, managers)
 
 
-def _encode_node_record(rec: NodeRecord) -> bytes:
-    """Wire form of a P_NODE row content, shipped in a RosterBundle. Same layout as the
-    P_NODE row itself: `[encoded_endpoints, sorted_domains, cert]`, plus the identity
-    pubkey so the client doesn't have to key-match to reconstruct. Endpoints carry
-    per-endpoint options via `Endpoint.encode` (#peer-endpoint-in-log)."""
-    return codec.encode(
-        [
-            rec.identity,
-            sorted(ep.encode() for ep in rec.endpoints),
-            sorted(rec.domains),
-            rec.cert.encode(),
-        ]
-    )
-
-
-def _decode_node_record(raw: bytes) -> NodeRecord:
-    p = codec.as_seq(codec.decode(raw), 4)
-    identity = crypto.PublicKey(codec.as_bytes(p[0]))
-    endpoints = tuple(Endpoint.parse(codec.as_bytes(e)) for e in codec.as_seq(p[1]))
-    domains = frozenset(codec.as_bytes(d) for d in codec.as_seq(p[2]))
-    cert = Cert.decode(codec.as_bytes(p[3]))
-    return NodeRecord(identity, endpoints, cert, domains)
+# --------------------------------------------------------------------------------------------- #
+# Grant wire form -- LEFT LOCAL DELIBERATELY. The disk form (`[role, stores, kinds, cert,      #
+# endpoints]`) has an `endpoints` field the wire form drops -- silent drift. It's honest        #
+# rather than accidental: `Grant.endpoints` is a category error (grants are AUTHORITY, not     #
+# location) and the wire quietly refusing to carry it is the codebase telling us so. Full       #
+# cleanup requires unwinding node-dials-back-to-client through the transport layer -- filed    #
+# as a separate follow-up. Do NOT paper over by adding `.encode()` on Grant that pretends the  #
+# two forms agree.                                                                              #
+# --------------------------------------------------------------------------------------------- #
 
 
 def _encode_grant(g: Grant) -> bytes:
@@ -224,25 +210,38 @@ class LiteMsg(ABC):
         return handler(body)
 
 
-type TrustedBlock = tuple[int, crypto.Digest]
-"""`(block_num, block_hash)` -- what a light client remembers about its last-verified
-block. Carried in every light-client request so the responder can piggyback headers to
-catch the client up (#light-client-piggyback). `None` at bootstrap or after re-bootstrap."""
+@dataclass(frozen=True, slots=True)
+class TrustedBlock:
+    """What a light client remembers about its last-verified block. Carried in every light-
+    client request so the responder can piggyback headers to catch the client up
+    (#light-client-piggyback). `None` (via `encode_optional`/`decode_optional`) at bootstrap
+    or after re-bootstrap -- the request field is nullable, absence-on-wire is empty bytes."""
 
+    block_num: int
+    block_hash: crypto.Digest
 
-def _encode_trusted_block(tb: TrustedBlock | None) -> bytes:
-    """Wire form for the optional `TrustedBlock`. Empty bytes when absent; two-tuple
-    `[block_num, block_hash]` when present. Encoded within the request payload."""
-    if tb is None:
-        return b""
-    return codec.encode([tb[0], tb[1]])
+    def encode(self) -> bytes:
+        """Present form: `[block_num, block_hash]`. Absence uses `encode_optional`."""
+        return codec.encode([self.block_num, self.block_hash])
 
+    @classmethod
+    def decode(cls, raw: bytes) -> TrustedBlock:
+        """Parse the present form. Raises `DudeError` on shape mismatch. For the nullable
+        field, use `decode_optional`."""
+        p = codec.as_seq(codec.decode(raw), 2)
+        return cls(codec.as_int(p[0]), crypto.Digest(codec.as_bytes(p[1])))
 
-def _decode_trusted_block(raw: bytes) -> TrustedBlock | None:
-    if not raw:
-        return None
-    p = codec.as_seq(codec.decode(raw), 2)
-    return codec.as_int(p[0]), crypto.Digest(codec.as_bytes(p[1]))
+    @classmethod
+    def encode_optional(cls, tb: TrustedBlock | None) -> bytes:
+        """Nullable wire form: empty bytes when absent, `encode()` when present. Used as a
+        request field so the responder can distinguish 'first bootstrap' from 'catch me up
+        from here' -- the two mean different things (full bundle vs headers)."""
+        return b"" if tb is None else tb.encode()
+
+    @classmethod
+    def decode_optional(cls, raw: bytes) -> TrustedBlock | None:
+        """Inverse of `encode_optional`. Empty bytes -> None."""
+        return None if not raw else cls.decode(raw)
 
 
 @dataclass(frozen=True, slots=True)
@@ -268,7 +267,7 @@ class GetAnchors(LiteMsg):
         return codec.encode(
             [
                 self.known_roster_fingerprint or b"",
-                _encode_trusted_block(self.known_trusted_block),
+                TrustedBlock.encode_optional(self.known_trusted_block),
             ]
         )
 
@@ -277,7 +276,7 @@ class GetAnchors(LiteMsg):
         try:
             p = codec.as_seq(codec.decode(body), 2)
             fp_raw = codec.as_bytes(p[0])
-            trusted = _decode_trusted_block(codec.as_bytes(p[1]))
+            trusted = TrustedBlock.decode_optional(codec.as_bytes(p[1]))
         except DudeError as e:
             raise LiteAdapterError(f"malformed GET_ANCHORS body: {e}") from e
         return cls(
@@ -363,7 +362,7 @@ class GetProof(LiteMsg):
                 self.name,
                 self.block_num,
                 self.known_roster_fingerprint or b"",
-                _encode_trusted_block(self.known_trusted_block),
+                TrustedBlock.encode_optional(self.known_trusted_block),
             ]
         )
 
@@ -372,7 +371,7 @@ class GetProof(LiteMsg):
         try:
             p = codec.as_seq(codec.decode(body), 5)
             fp_raw = codec.as_bytes(p[3])
-            trusted = _decode_trusted_block(codec.as_bytes(p[4]))
+            trusted = TrustedBlock.decode_optional(codec.as_bytes(p[4]))
             return cls(
                 store_id=codec.as_int(p[0]),
                 name=codec.as_bytes(p[1]),

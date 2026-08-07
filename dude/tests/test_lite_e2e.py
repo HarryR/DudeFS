@@ -28,6 +28,7 @@ from dude.sync.lite_adapter import (
     LiteRefusal,
     LiteRefused,
     ProofReply,
+    TrustedBlock,
 )
 
 from .cluster import DELTA, T0, Cluster
@@ -102,7 +103,7 @@ class TestServeGetAnchors(unittest.TestCase):
         block1 = SettledBlock.decode(block1_bytes)
         req = GetAnchors(
             known_roster_fingerprint=None,
-            known_trusted_block=(1, block1.block_hash),
+            known_trusted_block=TrustedBlock(1, block1.block_hash),
         )
         reply = serve_get_anchors(node.store, node.mgmt, req, liveness_window=2)
         self.assertIsInstance(reply, LiteRefused)
@@ -117,7 +118,7 @@ class TestServeGetAnchors(unittest.TestCase):
         # Client claims block N with a wrong hash.
         req = GetAnchors(
             known_roster_fingerprint=None,
-            known_trusted_block=(head_num, crypto.Digest(b"\x00" * 32)),
+            known_trusted_block=TrustedBlock(head_num, crypto.Digest(b"\x00" * 32)),
         )
         reply = serve_get_anchors(node.store, node.mgmt, req, liveness_window=2)
         self.assertIsInstance(reply, LiteRefused)
@@ -145,7 +146,7 @@ class TestServeGetAnchors(unittest.TestCase):
         # Client at head1, requests anchors; expect headers[1..gap] (within window).
         req = GetAnchors(
             known_roster_fingerprint=None,
-            known_trusted_block=(head1, head1_hash),
+            known_trusted_block=TrustedBlock(head1, head1_hash),
         )
         reply = serve_get_anchors(node.store, node.mgmt, req, liveness_window=max(gap, 2))
         self.assertIsInstance(reply, AnchorsReply)
@@ -249,6 +250,36 @@ class TestNodeDispatchAndAuth(unittest.TestCase):
         after = len(node.postman.mailbox.pending)
         # Successful handler queued the AnchorsReply for the client.
         self.assertGreater(after, before)
+
+
+class TestTrustedBlockEncoding(unittest.TestCase):
+    """Wire-form drift guard for `TrustedBlock` (CLAUDE.md trap #1). Two fields, nullable via
+    `encode_optional`/`decode_optional` (empty bytes -> None). Round-trip proves
+    consistency; field-count refusal proves neither half silently added a field."""
+
+    def test_present_form_round_trips(self):
+        tb = TrustedBlock(block_num=42, block_hash=crypto.Digest(b"\xaa" * 32))
+        self.assertEqual(TrustedBlock.decode(tb.encode()), tb)
+
+    def test_absent_form_round_trips(self):
+        self.assertEqual(TrustedBlock.encode_optional(None), b"")
+        self.assertIsNone(TrustedBlock.decode_optional(b""))
+
+    def test_optional_carries_present_value_unchanged(self):
+        tb = TrustedBlock(block_num=1, block_hash=crypto.Digest(b"\x01" * 32))
+        self.assertEqual(TrustedBlock.decode_optional(TrustedBlock.encode_optional(tb)), tb)
+
+    def test_present_form_wrong_field_count_raises(self):
+        """Two fields is what `encode` emits. Anything else is a hard decode refusal --
+        trap #1: a field added to encode without a matching `as_seq(..., N)` bump would
+        silently drop otherwise."""
+        from dude.core import codec  # noqa: PLC0415 -- local; only used here
+        from dude.core.errors import DudeError  # noqa: PLC0415
+
+        for wrong in (1, 3):
+            malformed = codec.encode([b""] * wrong)
+            with self.assertRaises(DudeError):
+                TrustedBlock.decode(malformed)
 
 
 if __name__ == "__main__":
