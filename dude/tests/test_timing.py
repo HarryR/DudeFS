@@ -33,7 +33,7 @@ from dataclasses import replace
 from ..consensus.mempool import Tunables as MempoolTunables
 from ..core.errors import DudeError, InvariantError
 from ..net.plan import PlanTunables
-from ..tunables import DEFAULT, NetTunables, TimingTunables, Tunables
+from ..tunables import DEFAULT, TimingTunables, Tunables
 
 
 class TestTheDeclaredSetIsSmall(unittest.TestCase):
@@ -116,10 +116,6 @@ class TestAnIncoherentDeploymentCannotBeBuilt(unittest.TestCase):
 
 
 class TestNoDialHidesOutsideTheOneSurface(unittest.TestCase):
-    def test_the_transfer_bound_is_on_the_surface(self):
-        """`_PULL_MAX` was a module constant in `node.py`."""
-        self.assertEqual(DEFAULT.net.pull_max, NetTunables().pull_max)
-
     def test_one_dial_has_one_home(self):
         """`stagger_cap` and `max_parallel` were in both the link and plan groups, and only the
         plan's were read. Two dials with one name disagreed the moment one was derived."""

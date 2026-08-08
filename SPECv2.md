@@ -1635,9 +1635,12 @@ Applies at L3 and L4.
 
 - Every timing value MUST be expressed against a declared quantity. A literal timing figure MUST
   NOT appear anywhere outside a tunable group's field default.
-- The declared quantities are exactly: `RTT_MAX` and `CLOCK_SKEW` (deployment measurements),
-  `CLIENT_CLOCK_TOLERANCE` (a policy whose cost is the replay window), and the protocol counts
-  `HOPS_TO_QUORUM` and `WAVES_TO_SETTLE`. Adding to this set MUST be a decision, not a default.
+- A quantity MAY be declared only if it is a first-principles measurement of the deployment (a
+  round-trip bound, a clock-skew tolerance), a policy whose cost is stated (client clock
+  tolerance, paid for in replay window), or a protocol count (hops, waves, ticks). Anything that
+  is arithmetic over other declared values MUST be derived, never declared. Adding to the set
+  MUST be a decision, not a default — `TimingTunables.__dataclass_fields__` is the register, and
+  `test_declared_quantities_and_nothing_else` is what makes an addition require one.
 - Each dial MUST sit at or above the floor derived from those quantities.
 - The round bucket width MUST be at least dissemination to a quorum: `HOPS_TO_QUORUM·RTT_MAX + CLOCK_SKEW`.
 - The admission window MUST be at least `CLIENT_CLOCK_TOLERANCE + 2·RTT_MAX`, and it is the
