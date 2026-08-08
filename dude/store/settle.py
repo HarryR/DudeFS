@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import NamedTuple, Protocol
+from typing import Any, NamedTuple, Protocol
 
 from ..core import crypto
 from ..core.errors import DudeError
 from . import ops
-from .layer import Layer, Reader, holds
+from .layer import Overlay, Reader, holds
 
 
 class Authoriser(Protocol):
@@ -39,8 +39,10 @@ class Verdict:
 OK = Verdict()
 
 
-def evaluate(reader: Reader, tx: ops.SignedTransaction, auth: Authoriser) -> tuple[Verdict, Layer]:
-    layer = Layer.speculative(reader)
+def evaluate(
+    reader: Reader, tx: ops.SignedTransaction, auth: Authoriser
+) -> tuple[Verdict, Overlay[Reader]]:
+    layer = Overlay(reader)
     if not tx.verify():
         return Verdict(Reason.SIGNATURE), layer
     for i, step in enumerate(tx.steps):
@@ -90,11 +92,11 @@ class Screened(NamedTuple):
 def would_apply(
     reader: Reader, batch: tuple[ops.SignedTransaction, ...], auth: Authoriser
 ) -> Screened:
-    return apply_to(Layer.speculative(reader), batch, auth)
+    return apply_to(Overlay(reader), batch, auth)
 
 
 def apply_to(
-    target: Layer,
+    target: Overlay[Any],
     batch: tuple[ops.SignedTransaction, ...],
     auth: Authoriser,
 ) -> Screened:

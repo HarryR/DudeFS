@@ -16,7 +16,7 @@ import unittest
 from collections.abc import Sequence
 
 from ..core import crypto
-from ..store import Layer, LayerError, Store, ops
+from ..store import Layer, LayerError, Overlay, Store, ops
 from ..store.management import MgmtReader
 
 D = ops.STORE_DATA
@@ -80,12 +80,26 @@ class TestLayerLifecycle(unittest.TestCase):
         outer = Layer(inner)  # no error
         self.assertFalse(outer.is_frozen)
 
-    def test_speculative_layer_has_no_frozen_requirement(self):
-        """settle.evaluate's use case: the base is an open Layer that will absorb survivors."""
+    def test_an_overlay_over_an_open_base_is_allowed(self):
+        """settle.evaluate's use case: the base is an OPEN Layer that will absorb survivors.
+
+        An Overlay computes no roots, so it has nothing to be wrong about -- which is why it
+        is the type allowed to sit on a base that can still move."""
         inner = Layer(self.store)  # OPEN
-        speculative = Layer.speculative(inner)
-        # No frozen check; construction succeeds.
-        speculative.apply(ops.Set(D, crypto.h(b"k"), b"v"), b"cred")
+        overlay = Overlay(inner)
+        overlay.apply(ops.Set(D, crypto.h(b"k"), b"v"), b"cred")
+        self.assertEqual(len(overlay.mutations), 1)
+
+    def test_an_overlay_cannot_be_asked_for_a_root(self):
+        """The half `Layer.speculative` could not express. It built a Layer with the frozen
+        check skipped, so `state_root()` on the result reached a base with no such method and
+        died as an AttributeError -- outside both error trees. There is now no method to call:
+        `make typecheck` refuses it, and this pins it at runtime too."""
+        overlay = Overlay(Layer(self.store))
+        for root in ("state_root", "accumulator", "hash_under"):
+            self.assertFalse(
+                hasattr(overlay, root), f"Overlay must not expose {root}; roots need a frozen base"
+            )
 
 
 class TestAccumulatorProjection(unittest.TestCase):

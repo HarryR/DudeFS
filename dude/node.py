@@ -245,9 +245,7 @@ class Node:
             return
         if not isinstance(req, GetAnchors):
             return
-        reply = serve_get_anchors(
-            self.store, self.mgmt, req, self.tunables.light_client.liveness_window
-        )
+        reply = serve_get_anchors(self.store, req, self.tunables.light_client.liveness_window)
         self.lite_adapter.reply(env, reply, now)
 
     def _on_get_proof(self, env: SignedEnvelope, now: Millis) -> None:
@@ -261,9 +259,7 @@ class Node:
             return
         if not isinstance(req, GetProof):
             return
-        reply = serve_get_proof(
-            self.store, self.mgmt, req, self.tunables.light_client.liveness_window
-        )
+        reply = serve_get_proof(self.store, req, self.tunables.light_client.liveness_window)
         self.lite_adapter.reply(env, reply, now)
 
     def tick(self, now: Millis) -> None:

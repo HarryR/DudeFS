@@ -12,13 +12,16 @@
 
 from __future__ import annotations
 
+import contextlib
+import sqlite3
 import unittest
+from unittest import mock
 
 from dude.consensus.bootstrap import intervene
 from dude.consensus.settle_round import SettledBlock
 from dude.core import crypto
 from dude.net.envelope import Envelope, new_message_id
-from dude.store import ops
+from dude.store import Store, ops
 from dude.store.management import Cert, MgmtWriter, Role
 from dude.sync.lite import serve_get_anchors, serve_get_proof
 from dude.sync.lite_adapter import (
@@ -55,7 +58,7 @@ class TestServeGetAnchors(unittest.TestCase):
         c = Cluster()
         node = c.nodes[0]
         req = GetAnchors(known_roster_fingerprint=None, known_trusted_block=None)
-        reply = serve_get_anchors(node.store, node.mgmt, req, liveness_window=2)
+        reply = serve_get_anchors(node.store, req, liveness_window=2)
         self.assertIsInstance(reply, AnchorsReply)
         assert isinstance(reply, AnchorsReply)
         self.assertIsNotNone(reply.bundle)
@@ -70,7 +73,6 @@ class TestServeGetAnchors(unittest.TestCase):
         # First call: get the fingerprint.
         first = serve_get_anchors(
             node.store,
-            node.mgmt,
             GetAnchors(known_roster_fingerprint=None, known_trusted_block=None),
             liveness_window=2,
         )
@@ -78,7 +80,6 @@ class TestServeGetAnchors(unittest.TestCase):
         # Second call: send that fingerprint back; expect no bundle.
         second = serve_get_anchors(
             node.store,
-            node.mgmt,
             GetAnchors(
                 known_roster_fingerprint=first.roster_fingerprint,
                 known_trusted_block=None,
@@ -105,7 +106,7 @@ class TestServeGetAnchors(unittest.TestCase):
             known_roster_fingerprint=None,
             known_trusted_block=TrustedBlock(1, block1.block_hash),
         )
-        reply = serve_get_anchors(node.store, node.mgmt, req, liveness_window=2)
+        reply = serve_get_anchors(node.store, req, liveness_window=2)
         self.assertIsInstance(reply, LiteRefused)
         assert isinstance(reply, LiteRefused)
         self.assertEqual(reply.reason, LiteRefusal.STALE_CLIENT)
@@ -120,7 +121,7 @@ class TestServeGetAnchors(unittest.TestCase):
             known_roster_fingerprint=None,
             known_trusted_block=TrustedBlock(head_num, crypto.Digest(b"\x00" * 32)),
         )
-        reply = serve_get_anchors(node.store, node.mgmt, req, liveness_window=2)
+        reply = serve_get_anchors(node.store, req, liveness_window=2)
         self.assertIsInstance(reply, LiteRefused)
         assert isinstance(reply, LiteRefused)
         self.assertEqual(reply.reason, LiteRefusal.FORK_DETECTED)
@@ -148,10 +149,69 @@ class TestServeGetAnchors(unittest.TestCase):
             known_roster_fingerprint=None,
             known_trusted_block=TrustedBlock(head1, head1_hash),
         )
-        reply = serve_get_anchors(node.store, node.mgmt, req, liveness_window=max(gap, 2))
+        reply = serve_get_anchors(node.store, req, liveness_window=max(gap, 2))
         self.assertIsInstance(reply, AnchorsReply)
         assert isinstance(reply, AnchorsReply)
         self.assertEqual(len(reply.headers), gap)
+
+
+class TestTheReplyComesFromOneSnapshot(unittest.TestCase):
+    """A light-client reply quotes a head, a value and a proof that MUST agree.
+
+    They are four separate reads. Served off the live store, a commit landing between them
+    yields a proof that does not verify against the state_root quoted beside it -- fails safe
+    (the client drops the reply) but silently, and only under load.
+
+    `Store.db` is the raw-handle escape hatch documented as tests-only, and it was the only
+    way `serve_get_proof` could reach the tree. Making it raise is what pins the production
+    path to `store.snapshot()`: nothing else about the reply would look wrong if this
+    regressed, because a correct-looking proof is exactly what the race produces most of the
+    time.
+    """
+
+    def _cluster_with_a_value(self):
+        c = Cluster()
+        key = crypto.h(b"one-snapshot")
+        tx = ops.writes(ops.Set(ops.STORE_DATA, key, b"present")).sign(c.mgr, T0)
+        c.submit(c.mgr, tx, to=0, now=T0)
+        c.pump(T0)
+        c.pump(T0 + DELTA)
+        return c, key
+
+    def test_serving_a_proof_never_reaches_the_raw_handle(self):
+        c, key = self._cluster_with_a_value()
+        node = c.nodes[0]
+        head = node.store.head_block_num()
+        assert head is not None
+        req = GetProof(
+            store_id=ops.STORE_DATA,
+            name=key,
+            block_num=head,
+            known_roster_fingerprint=None,
+            known_trusted_block=None,
+        )
+        with _raw_handle_is_poisoned():
+            reply = serve_get_proof(node.store, req, liveness_window=2)
+        self.assertIsInstance(reply, ProofReply)
+
+    def test_serving_anchors_never_reaches_the_raw_handle(self):
+        c, _key = self._cluster_with_a_value()
+        node = c.nodes[0]
+        req = GetAnchors(known_roster_fingerprint=None, known_trusted_block=None)
+        with _raw_handle_is_poisoned():
+            reply = serve_get_anchors(node.store, req, liveness_window=2)
+        self.assertIsInstance(reply, AnchorsReply)
+
+
+@contextlib.contextmanager
+def _raw_handle_is_poisoned():
+    """Make `Store.db` raise for the duration. Any production read outside a snapshot trips."""
+
+    def boom(_self: Store) -> sqlite3.Connection:
+        raise AssertionError("production read reached Store.db instead of Store.snapshot()")
+
+    with mock.patch.object(Store, "db", property(boom)):
+        yield
 
 
 class TestServeGetProof(unittest.TestCase):
@@ -176,7 +236,7 @@ class TestServeGetProof(unittest.TestCase):
             known_roster_fingerprint=None,
             known_trusted_block=None,
         )
-        reply = serve_get_proof(node.store, node.mgmt, req, liveness_window=2)
+        reply = serve_get_proof(node.store, req, liveness_window=2)
         self.assertIsInstance(reply, ProofReply)
         assert isinstance(reply, ProofReply)
         self.assertFalse(reply.absent)
@@ -195,7 +255,7 @@ class TestServeGetProof(unittest.TestCase):
             known_roster_fingerprint=None,
             known_trusted_block=None,
         )
-        reply = serve_get_proof(node.store, node.mgmt, req, liveness_window=2)
+        reply = serve_get_proof(node.store, req, liveness_window=2)
         self.assertIsInstance(reply, ProofReply)
         assert isinstance(reply, ProofReply)
         self.assertTrue(reply.absent)
@@ -212,7 +272,7 @@ class TestServeGetProof(unittest.TestCase):
             known_roster_fingerprint=None,
             known_trusted_block=None,
         )
-        reply = serve_get_proof(node.store, node.mgmt, req, liveness_window=2)
+        reply = serve_get_proof(node.store, req, liveness_window=2)
         self.assertIsInstance(reply, LiteRefused)
         assert isinstance(reply, LiteRefused)
         self.assertEqual(reply.reason, LiteRefusal.NOT_YET_SETTLED)

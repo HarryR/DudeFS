@@ -1,5 +1,5 @@
 from . import management, ops, settle
-from .layer import PENDING, Layer, LayerError, Reader, View, holds
+from .layer import PENDING, Layer, LayerError, Overlay, Reader, View, holds
 from .ops import (
     Absent,
     Del,
@@ -26,6 +26,7 @@ __all__ = [
     "Index",
     "Layer",
     "LayerError",
+    "Overlay",
     "Reader",
     "Set",
     "SignedTransaction",

@@ -4,7 +4,7 @@ from ..consensus.settle_round import SettledBlock
 from ..core import crypto
 from ..store import Store
 from ..store.management import MgmtReader
-from ..store.smt import Tree
+from ..store.store import StoreReader
 from .lite_adapter import (
     ABSENT_MARKER,
     AnchorsReply,
@@ -17,20 +17,29 @@ from .lite_adapter import (
 )
 
 
-def serve_get_anchors(  # noqa: PLR0911 -- each early-return maps to a distinct LiteRefusal reason
+def serve_get_anchors(
     store: Store,
-    mgmt: MgmtReader,
     request: GetAnchors,
     liveness_window: int,
 ) -> AnchorsReply | LiteRefused:
-    head_num = store.head_block_num()
+    with store.snapshot() as r:
+        return _anchors(r, request, liveness_window)
+
+
+def _anchors(  # noqa: PLR0911 -- each early-return maps to a distinct LiteRefusal reason
+    r: StoreReader,
+    request: GetAnchors,
+    liveness_window: int,
+) -> AnchorsReply | LiteRefused:
+    mgmt = MgmtReader(r)
+    head_num = r.head_block_num()
     if not head_num:
         return LiteRefused(LiteRefusal.NO_STATE)
     commitment = mgmt.roster_commitment_full()
     if commitment is None:
         return LiteRefused(LiteRefusal.NO_STATE)
 
-    head_bytes = store.settled_at(head_num)
+    head_bytes = r.settled_at(head_num)
     if head_bytes is None:
         return LiteRefused(LiteRefusal.INTERNAL)
     head_block = SettledBlock.decode(head_bytes)
@@ -39,7 +48,7 @@ def serve_get_anchors(  # noqa: PLR0911 -- each early-return maps to a distinct 
     if tb is not None:
         client_num, client_hash = tb.block_num, tb.block_hash
         if client_num <= head_num:
-            client_bytes = store.settled_at(client_num)
+            client_bytes = r.settled_at(client_num)
             if client_bytes is None:
                 return LiteRefused(LiteRefusal.INTERNAL)
             if SettledBlock.decode(client_bytes).block_hash != client_hash:
@@ -54,7 +63,7 @@ def serve_get_anchors(  # noqa: PLR0911 -- each early-return maps to a distinct 
     if request.known_roster_fingerprint is None:
         bundle = _build_bundle(mgmt, commitment)
 
-    headers = _headers_since(store, tb, head_num)
+    headers = _headers_since(r, tb, head_num)
 
     return AnchorsReply(
         head=head_block,
@@ -64,13 +73,25 @@ def serve_get_anchors(  # noqa: PLR0911 -- each early-return maps to a distinct 
     )
 
 
-def serve_get_proof(  # noqa: PLR0911, PLR0912, C901 -- each early-return names a distinct LiteRefusal; branches map 1:1 to reasons in the closed enum
+def serve_get_proof(
     store: Store,
-    mgmt: MgmtReader,
     request: GetProof,
     liveness_window: int,
 ) -> ProofReply | LiteRefused:
-    head_num = store.head_block_num()
+    """THE WHOLE REPLY MUST COME FROM ONE SNAPSHOT. The head, the value and the proof are
+    separate reads; a commit landing between them yields a proof that does not verify against
+    the state_root quoted beside it."""
+    with store.snapshot() as r:
+        return _proof(r, request, liveness_window)
+
+
+def _proof(  # noqa: PLR0911, PLR0912, C901 -- each early-return names a distinct LiteRefusal; branches map 1:1 to reasons in the closed enum
+    r: StoreReader,
+    request: GetProof,
+    liveness_window: int,
+) -> ProofReply | LiteRefused:
+    mgmt = MgmtReader(r)
+    head_num = r.head_block_num()
     if not head_num:
         return LiteRefused(LiteRefusal.NO_STATE)
     if request.block_num > head_num:
@@ -84,7 +105,7 @@ def serve_get_proof(  # noqa: PLR0911, PLR0912, C901 -- each early-return names 
     if commitment is None:
         return LiteRefused(LiteRefusal.NO_STATE)
 
-    head_bytes = store.settled_at(head_num)
+    head_bytes = r.settled_at(head_num)
     if head_bytes is None:
         return LiteRefused(LiteRefusal.INTERNAL)
     head_block = SettledBlock.decode(head_bytes)
@@ -93,7 +114,7 @@ def serve_get_proof(  # noqa: PLR0911, PLR0912, C901 -- each early-return names 
     if tb is not None:
         client_num, client_hash = tb.block_num, tb.block_hash
         if client_num <= head_num:
-            client_bytes = store.settled_at(client_num)
+            client_bytes = r.settled_at(client_num)
             if client_bytes is None:
                 return LiteRefused(LiteRefusal.INTERNAL)
             if SettledBlock.decode(client_bytes).block_hash != client_hash:
@@ -104,7 +125,7 @@ def serve_get_proof(  # noqa: PLR0911, PLR0912, C901 -- each early-return names 
     if request.block_num != head_num:
         return LiteRefused(LiteRefusal.TOO_OLD)
 
-    held = store.get(request.store_id, request.name)
+    held = r.get(request.store_id, request.name)
     if held is None:
         value: bytes = ABSENT_MARKER
         credential: bytes = b""
@@ -113,14 +134,14 @@ def serve_get_proof(  # noqa: PLR0911, PLR0912, C901 -- each early-return names 
         value = held.value
         credential = held.cred
         absent = False
-    proof = Tree(store.db).prove(request.store_id, request.name).encode()
+    proof = r.prove(request.store_id, request.name).encode()
 
     _, _, _, commitment_cert = commitment
     roster_fingerprint = crypto.Digest(commitment_cert.subject)
     bundle: RosterBundle | None = None
     if request.known_roster_fingerprint is None:
         bundle = _build_bundle(mgmt, commitment)
-    headers = _headers_since(store, tb, head_num)
+    headers = _headers_since(r, tb, head_num)
 
     return ProofReply(
         value=value,
@@ -153,7 +174,7 @@ def _build_bundle(mgmt: MgmtReader, commitment) -> RosterBundle:
     )
 
 
-def _headers_since(store: Store, known_trusted_block, head_num: int) -> tuple[SettledBlock, ...]:
+def _headers_since(r: StoreReader, known_trusted_block, head_num: int) -> tuple[SettledBlock, ...]:
     if known_trusted_block is None:
         return ()
     from_num = known_trusted_block.block_num
@@ -161,7 +182,7 @@ def _headers_since(store: Store, known_trusted_block, head_num: int) -> tuple[Se
         return ()
     out: list[SettledBlock] = []
     for n in range(from_num + 1, head_num + 1):
-        b = store.settled_at(n)
+        b = r.settled_at(n)
         if b is None:
             break
         out.append(SettledBlock.decode(b))

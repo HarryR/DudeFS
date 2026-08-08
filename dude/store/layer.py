@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
-from typing import NamedTuple, Protocol, cast
+from typing import Any, NamedTuple, Protocol
 
 from ..core import crypto
 from . import ops, smt
@@ -48,27 +48,21 @@ class View(Reader, Protocol):
     def is_frozen(self) -> bool: ...
 
 
-class Layer:
-    def __init__(self, base: View):
-        if not base.is_frozen:
-            raise LayerError(
-                "Layer base must be frozen (SPECv2 #frozen-base-for-layer); "
-                "call base.freeze() first, or use Layer.speculative for evaluation overlays"
-            )
-        self._init(base)
+class Overlay[B: Reader]:
+    """Buffered mutations over any `Reader`. Reads see the delta, then the base.
 
-    @classmethod
-    def speculative(cls, base: Reader) -> Layer:
-        layer = cls.__new__(cls)
-        layer._init(cast(View, base))  # noqa: SLF001 — factory constructing its own type
-        return layer
+    It computes NO roots, and that is the point: a root is only meaningful once every base
+    beneath it is frozen, and an overlay's base is whatever it was handed. Asking one for a
+    root is a type error rather than a rule a caller has to remember.
+    """
 
-    def _init(self, base: View) -> None:
+    _base: B
+
+    def __init__(self, base: B) -> None:
         self._base = base
         self._delta: dict[tuple[int, bytes], Held | None] = {}
         self._log: list[ops.Mutation] = []
         self._frozen = False
-        self._smt_memo: dict[tuple[int, bytes], crypto.Digest] = {}
 
     def get(self, store: int, name: bytes) -> Held | None:
         key = (store, name)
@@ -94,6 +88,40 @@ class Layer:
 
     def freeze(self) -> None:
         self._frozen = True
+
+    def apply(self, m: ops.Mutation, cred: bytes) -> None:
+        if self._frozen:
+            raise LayerError("frozen; no more mutations")
+        self._delta[(m.store, m.name)] = (
+            Held(PENDING, m.value, m.epoch, cred) if isinstance(m, ops.Set) else None
+        )
+        self._log.append(m)
+
+    @property
+    def mutations(self) -> tuple[ops.Mutation, ...]:
+        return tuple(self._log)
+
+    def absorb(self, child: Overlay[Any]) -> None:
+        if self._frozen:
+            raise LayerError("frozen; cannot absorb")
+        self._delta.update(child._delta)
+        self._log.extend(child._log)
+
+
+class Layer(Overlay[View]):
+    """An `Overlay` that can also compute roots, which is why its base MUST be frozen
+    (#frozen-base-for-layer): a root taken over a base that can still move is a root that
+    lies. Enforced at the constructor, so it is not a rule a caller has to remember.
+    """
+
+    def __init__(self, base: View) -> None:
+        if not base.is_frozen:
+            raise LayerError(
+                "Layer base must be frozen (SPECv2 #frozen-base-for-layer); "
+                "call base.freeze() first, or use an Overlay for speculative evaluation"
+            )
+        super().__init__(base)
+        self._smt_memo: dict[tuple[int, bytes], crypto.Digest] = {}
 
     def accumulator(self) -> crypto.Accumulator:
         from .store import element  # noqa: PLC0415 — store imports layer, so this is deferred
@@ -191,24 +219,6 @@ class Layer:
                 merged[path] = (st, name, held.value, held.cred)
         for path in sorted(merged):
             yield merged[path]
-
-    def apply(self, m: ops.Mutation, cred: bytes) -> None:
-        if self._frozen:
-            raise LayerError("Layer is frozen; no more mutations")
-        self._delta[(m.store, m.name)] = (
-            Held(PENDING, m.value, m.epoch, cred) if isinstance(m, ops.Set) else None
-        )
-        self._log.append(m)
-
-    @property
-    def mutations(self) -> tuple[ops.Mutation, ...]:
-        return tuple(self._log)
-
-    def absorb(self, child: Layer) -> None:
-        if self._frozen:
-            raise LayerError("Layer is frozen; cannot absorb")
-        self._delta.update(child._delta)
-        self._log.extend(child._log)
 
 
 def holds(reader: Reader, pred: ops.Predicate) -> bool:
