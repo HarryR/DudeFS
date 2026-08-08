@@ -20,8 +20,8 @@ import unittest
 
 from dude.consensus.bootstrap import bootstrap
 from dude.core import crypto
-from dude.net.address import Endpoint, Scheme
-from dude.net.transports.tcp import TCPDialer, TCPListener
+from dude.net.address import Endpoint
+from dude.net.transports.tcp import TCPListener
 from dude.node import Node
 from dude.store import Store, management, ops
 from dude.store.management import Cert, MgmtWriter, Role
@@ -30,14 +30,14 @@ from dude.tunables import DEFAULT
 
 def _build_cluster(
     size: int,
-) -> tuple[crypto.Keypair, list[Node], list[TCPDialer], list[TCPListener]]:
+) -> tuple[crypto.Keypair, list[Node], list[TCPListener]]:
     """Same shape as `test_sync_e2e_tcp._build_cluster`: bind listeners first so their
-    addresses are known, then mint genesis with those addresses, then construct nodes
-    with clients attached. Does NOT call `node.start()` -- that's the caller's."""
+    addresses are known, then mint genesis with those addresses, then construct nodes.
+    Does NOT call `node.start()` -- that's the caller's, and it is what starts the
+    dial side (#postman-owns-dialling)."""
     mgr = crypto.Keypair.generate()
     keys = [crypto.Keypair.generate() for _ in range(size)]
     listeners = [TCPListener() for _ in keys]
-    clients = [TCPDialer() for _ in keys]
 
     scratch = Store()
     scratch.provision(mgr.public)
@@ -66,15 +66,13 @@ def _build_cluster(
     genesis = (tx.sign(mgr, 1_700_000_000_000),)
 
     nodes: list[Node] = []
-    for kp, client in zip(keys, clients, strict=True):
+    for kp in keys:
         store = Store()
         store.provision(mgr.public)
         bootstrap(store, mgr, genesis)
-        node = Node(kp, store)
-        node.postman.attach_transport(Scheme.TCP, client)
-        nodes.append(node)
+        nodes.append(Node(kp, store))
 
-    return mgr, nodes, clients, listeners
+    return mgr, nodes, listeners
 
 
 def _wait_until(pred, timeout_sec: float, interval_sec: float = 0.05) -> bool:
@@ -102,11 +100,13 @@ class TestNodeLifecycle(unittest.TestCase):
             its reader thread.
 
         Real wall clock, so this takes seconds -- ~1 s per block at defaults."""
-        _mgr, nodes, clients, listeners = _build_cluster(3)
+        _mgr, nodes, listeners = _build_cluster(3)
         try:
-            # Managed mode: each node gets its listener at start().
-            for node, listener, client in zip(nodes, listeners, clients, strict=True):
-                node.start(listener, client)  # dialer is now bidirectional -- start it too
+            # Managed mode: each node gets its listener at start(). The dial side is not
+            # passed and never was the caller's to pass -- `start` starts the Postman,
+            # which builds and reads its own carriers (#postman-owns-dialling).
+            for node, listener in zip(nodes, listeners, strict=True):
+                node.start(listener)
 
             # Empty blocks: no submits, but Coordinator ticks each bucket and closes
             # what's there (nothing). With a 3-node roster the Round hits quorum
@@ -129,11 +129,10 @@ class TestNodeLifecycle(unittest.TestCase):
                 elapsed = time.monotonic() - start
                 self.assertLess(elapsed, 3.0, f"node.stop() took {elapsed:.2f}s, expected < 3.0s")
         finally:
-            # Best-effort cleanup in case any assertion tripped early.
+            # Best-effort cleanup in case any assertion tripped early. `node.stop()` closes
+            # the dial side too, so there is nothing else for the test to hold.
             for node in nodes:
                 node.stop(timeout=1.0)
-            for client in clients:
-                client.close()
 
     def test_start_is_transactional_on_listener_failure(self):
         """Fail-loud on partial listener failure. If any listener's `start()` raises,
@@ -144,8 +143,10 @@ class TestNodeLifecycle(unittest.TestCase):
         Proven by handing `Node.start` a fake Listener whose `start()` raises AFTER a
         real listener has already been started. Post-conditions: (a) the exception
         propagates, (b) the real listener was stopped (its reader thread is gone),
-        (c) `node._thread` was never spawned."""
-        _mgr, nodes, clients, listeners = _build_cluster(1)
+        (c) the Postman was stopped -- it is started FIRST, so a rollback that only
+        unwound listeners would leave a half-started node whose next `start` raises
+        "already started with a different inbox", (d) `node._thread` was never spawned."""
+        _mgr, nodes, listeners = _build_cluster(1)
         try:
             good_listener = listeners[0]
 
@@ -177,7 +178,10 @@ class TestNodeLifecycle(unittest.TestCase):
             self.assertIsNone(node._thread, "node thread must not have been spawned")
             self.assertEqual(node._listeners, ())
             self.assertFalse(bad.stop_called, "bad listener never started; nothing to roll back")
-            # Idempotent: another start() with a fresh listener should work.
+            self.assertIsNone(node.postman._inbox, "postman must be rolled back too")
+            # Idempotent: another start() with a fresh listener should work. This is the
+            # assertion the postman rollback is load-bearing for -- a Postman still holding
+            # the first inbox refuses the second start outright.
             fresh = TCPListener()
             try:
                 node.start(fresh)
@@ -186,8 +190,6 @@ class TestNodeLifecycle(unittest.TestCase):
                 node.stop(timeout=1.0)
                 fresh.stop()
         finally:
-            for client in clients:
-                client.close()
             for lst in listeners:
                 lst.stop()
 

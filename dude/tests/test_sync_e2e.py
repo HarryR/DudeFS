@@ -12,8 +12,8 @@ import unittest
 
 from dude.consensus.settle_round import SettledBlock
 from dude.core import crypto
-from dude.net.address import Endpoint, Scheme
-from dude.net.transports import InProcDialer, InProcListener, address_of, name_of
+from dude.net.address import Endpoint
+from dude.net.transports import InProcListener, address_of, name_of
 from dude.node import Node
 from dude.store import Store, ops
 
@@ -46,15 +46,13 @@ class TestFreshNodeJoinsClusterAndCatchesUp(unittest.TestCase):
         assert producer_head is not None and producer_head >= 3
 
         # A joiner starting with only the manager pubkey -- no bootstrap, no genesis.
-        # Construct the listener + client explicitly, matching what a production
-        # `main()` would do (client + listener per identity, attach client to Postman,
-        # drain listener via the pump).
+        # Construct the listener explicitly, matching what a production `main()` would do
+        # (one listener per identity, drained via the pump); the send side is Postman's own.
         joiner_kp = crypto.Keypair.generate()
         joiner_store = Store()
         joiner_store.provision(c.mgr.public)
         joiner_listener = InProcListener(name_of(joiner_kp.public))
         joiner = Node(joiner_kp, joiner_store)
-        joiner.postman.attach_transport(Scheme.INPROC, InProcDialer(me=name_of(joiner_kp.public)))
 
         # Bootstrap-outside-the-roster wiring: reconciliation from `mgmt.roster()`
         # doesn't add the joiner to node 0's peers (joiner isn't in the roster yet), and

@@ -12,13 +12,17 @@
 #                 (`sent(..., ts=)`) rather than being able to produce one.
 #   the clock     Everything below takes `now` as a parameter. This is the only place a real clock
 #                 is read, which is why the whole stack under it replays deterministically.
+#   the carriers  Dial-side transports are CONSTRUCTED here (#postman-owns-dialling) from
+#                 `dude.net.transports.dial`, and the ones that also read are started and stopped
+#                 here. A caller never names a concrete carrier class.
 #
 # Sans-I/O core, one impure edge. Effects go out through transports; events come back in through
 # `deliver`.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import contextlib
+import queue
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import NamedTuple
@@ -26,6 +30,7 @@ from typing import NamedTuple
 from ..core import crypto
 from ..core.errors import DudeError
 from ..core.units import Millis
+from . import transports
 from .address import Endpoint, Scheme
 from .envelope import EnvelopeError, Frame, SignedEnvelope
 from .link import (
@@ -33,13 +38,14 @@ from .link import (
     Estimator,
     LinkError,
     LinkTunables,
+    Listener,
     Peer,
     SessionLink,
     Transport,
 )
 from .mailbox import Expired, Mailbox, Reply, Transmit
 from .plan import Decision, GiveUp, Plan, Send, Wait
-from .session import Session
+from .session import Inbound, Session
 
 
 def _no_dial(_endpoint: Endpoint) -> Transport:
@@ -53,34 +59,10 @@ def _no_dial(_endpoint: Endpoint) -> Transport:
 
 
 class PostmanError(DudeError):
-    """A misconfiguration Postman cannot recover from: an `add_peer` for a scheme with no
-    registered dialler, or a transport constructor that itself raised. Not for peer-level
-    failures (link down, breaker open) — those are policy outcomes below Postman."""
-
-
-type Dialler = Callable[[Endpoint, crypto.Keypair], Transport]
-"""How Postman obtains a `Transport` for an endpoint. Takes the whole `Endpoint` (so
-the transport receives its options) plus the caller's identity (so identity-bound
-transports like InProc know who is dialling). Registered per-scheme at module scope
-via `register_dialler`, one entry per scheme this build can dial."""
-
-
-_DIALLERS: dict[Scheme, Dialler] = {}
-"""Module-scope scheme->dialler map (#postman-owns-dialling). A deployment fact, not
-a per-Postman config. Test builds register INPROC; production builds register TCP/UNIX.
-Populated at process startup (or, for tests, at cluster construction) via
-`register_dialler(scheme, dialler)`."""
-
-
-def register_dialler(scheme: Scheme, dialler: Dialler) -> None:
-    """Register (or replace) the dialler for `scheme`. Idempotent — re-registering the
-    same scheme with the same dialler at test setup is fine."""
-    _DIALLERS[scheme] = dialler
-
-
-def _reset_diallers_for_tests() -> None:
-    """Clear the dialler registry. Test-only hook, called by cluster harness setup."""
-    _DIALLERS.clear()
+    """A misconfiguration Postman cannot recover from: a lifecycle call that contradicts an
+    earlier one. Not for peer-level failures (link down, breaker open) — those are policy
+    outcomes below Postman — and not for "no carrier for this scheme", which is a `LinkError`
+    from `transports.dial`, the same failure shape a caller already handles from `send`."""
 
 
 class Recipient(Enum):
@@ -114,9 +96,17 @@ class Received(NamedTuple):
 class Postman:
     """Drives the mailbox and the peers. Holds the keypair, reads the clock, performs the I/O.
 
-    Owns peer lifecycle (#postman-owns-dialling). Callers register endpoints via
-    `add_peer(pubkey, endpoints)`; Postman looks up the scheme→dialler in the module-scope
-    registry and constructs the transport. Nothing outside Postman writes to `peers`."""
+    Owns peer AND dial-side carrier lifecycle (#postman-owns-dialling). Callers register
+    endpoints via `add_peer(pubkey, endpoints)`; Postman asks `transports.dial` for the
+    carrier and constructs it. Nothing outside Postman writes to `peers`, and nothing
+    outside Postman names a concrete transport class.
+
+    THE LIFECYCLE IS HERE BECAUSE THE CARRIER IS. `TCPDialer` reads replies on the sockets
+    it opened, so it needs an inbox and a thread; whoever constructs it must therefore also
+    start it. That used to be the caller, which is why it had to construct it — the whole
+    reason `attach_transport` existed. Owning construction without owning the thread would
+    just move the knot. `start` / `stop` / `drain` mirror the `Listener` protocol on
+    purpose: `Node` starts its listeners and its Postman with the same inbox, in one call."""
 
     me: crypto.Keypair
     mailbox: Mailbox = field(default_factory=Mailbox)
@@ -140,10 +130,18 @@ class Postman:
     reuses them across peers of the same scheme so `add_peer` for two peers on the same
     scheme doesn't duplicate carrier state."""
 
+    _inbox: queue.SimpleQueue[Inbound] | None = field(default=None, init=False)
+    """Where a reading carrier puts what arrives on a socket WE opened, set by `start`.
+    `None` until then — the deterministic test path never calls `start` and uses `drain`.
+
+    Held so that a carrier constructed AFTER `start` is started too. That ordering is the
+    normal one, not an edge case: a node starts before its first tick, and the first tick
+    is what reconciles the roster into peers, which is what dials anything at all."""
+
     def add_peer(self, pubkey: crypto.PublicKey, endpoints: tuple[Endpoint, ...]) -> None:
         """Register or reconfigure a peer with `endpoints` we should try to reach it at.
-        Uses the module-scope scheme→dialler map to construct any transports not already
-        cached. See #postman-owns-dialling.
+        Constructs any carrier not already cached, via `transports.dial`.
+        See #postman-owns-dialling.
 
         Idempotent: adding a peer that already exists reconfigures its endpoints (which
         preserves the surviving links' estimator/breaker state via `Peer.reconfigure`)."""
@@ -239,46 +237,61 @@ class Postman:
             return
         peer.sessions = [sl for sl in peer.sessions if sl is not link]
 
-    def attach_transport(self, scheme: Scheme, transport: Transport) -> None:
-        """Inject a pre-constructed transport for `scheme`, bypassing the module-scope
-        dialler. Idempotent -- re-attaching the same instance is a no-op; replacing
-        with a different instance is an error, because links already built against the
-        first transport would silently keep using it.
+    # -- carrier lifecycle -------------------------------------------------------------------- #
 
-        THE ASYMMETRY BETWEEN INPROC AND TCP LIVES HERE. The `Dialler` contract
-        assumes the endpoint tells the transport how to construct itself: for InProc
-        the endpoint's value IS a stable identity, so `dial(endpoint, me)` can
-        construct a fresh loopback. For TCP the endpoint tells you where a PEER
-        listens, which is unrelated to where WE should listen -- so the caller
-        constructs the `TCP(listen_host=..., listen_port=...)` first, then attaches
-        it here BEFORE any `add_peer`. Not a workaround; the two carrier shapes just
-        genuinely differ."""
-        existing = self._transports_by_scheme.get(scheme)
-        if existing is transport:
+    def start(self, inbox: queue.SimpleQueue[Inbound]) -> None:
+        """Begin reading replies on the sockets we dial. Every carrier that also reads gets
+        `start(inbox)` -- those already built now, those built later in `_dial`.
+
+        Same idempotence rule as `Listener.start`: the same inbox twice is a no-op, a
+        different one raises, because a Postman delivering into two inboxes is a node whose
+        frames arrive on whichever thread got there first."""
+        if self._inbox is inbox:
             return
-        if existing is not None:
-            raise PostmanError(
-                f"transport for scheme {scheme.name} already attached; "
-                f"replacing it would orphan links already built against the old one"
-            )
-        self._transports_by_scheme[scheme] = transport
+        if self._inbox is not None:
+            raise PostmanError("postman already started with a different inbox")
+        self._inbox = inbox
+        for transport in self._transports_by_scheme.values():
+            if isinstance(transport, Listener):
+                transport.start(inbox)
+
+    def stop(self) -> None:
+        """Shut every reading carrier down and forget the inbox. Idempotent, and
+        best-effort per carrier: this runs during shutdown, where there is nothing left to
+        escalate a failure to and stopping the rest still matters.
+
+        The cache is NOT cleared -- links already built hold their transport directly, so
+        dropping our reference would not un-wire them, it would only let a later `_dial`
+        build a second carrier behind their backs."""
+        self._inbox = None
+        for transport in self._transports_by_scheme.values():
+            if isinstance(transport, Listener):
+                with contextlib.suppress(Exception):
+                    transport.stop()
+
+    def drain(self) -> tuple[Inbound, ...]:
+        """Everything our reading carriers have buffered, non-blocking. The deterministic
+        test path: `start` need not have been called, and this is the dial-side twin of
+        pumping a `Listener`. A reply that came back on a socket we opened arrives here,
+        not at any listener (#session-first-reply)."""
+        out: list[Inbound] = []
+        for transport in self._transports_by_scheme.values():
+            if isinstance(transport, Listener):
+                out.extend(transport.drain())
+        return tuple(out)
 
     def _dial(self, endpoint: Endpoint) -> Transport:
-        """Look up (or lazily construct) the transport for `endpoint`'s scheme. Cached
-        per scheme in `_transports_by_scheme`. Raises `PostmanError` if no dialler is
-        registered for the scheme."""
+        """The carrier for `endpoint`'s scheme, constructed on first use and cached per
+        scheme. A carrier that also reads is started immediately if we are already started.
+        Raises `LinkError` (from `transports.dial`) for a scheme this build cannot dial."""
         scheme = endpoint.address.scheme
         transport = self._transports_by_scheme.get(scheme)
         if transport is not None:
             return transport
-        dialler = _DIALLERS.get(scheme)
-        if dialler is None:
-            raise PostmanError(
-                f"no dialler registered for scheme {scheme.name}; "
-                f"call postman.register_dialler(...) at startup"
-            )
-        transport = dialler(endpoint, self.me)
+        transport = transports.dial(endpoint, self.me)
         self._transports_by_scheme[scheme] = transport
+        if self._inbox is not None and isinstance(transport, Listener):
+            transport.start(self._inbox)
         return transport
 
     def tick(self, now: Millis) -> tuple[Expired, ...]:

@@ -15,7 +15,7 @@ from dude.core import codec, crypto
 from dude.net.address import Address, Endpoint, Scheme
 from dude.net.envelope import Envelope, Frame, SignedEnvelope, Verb
 from dude.net.postman import Postman
-from dude.net.transports import InProcDialer, InProcListener, address_of, name_of
+from dude.net.transports import InProcListener, address_of, name_of
 from dude.store import ops
 from dude.store.management import Cert, Grant, MgmtWriter, NodeRecord, Role
 from dude.sync.lite_adapter import LiteMsg, RosterBundle
@@ -25,12 +25,11 @@ from .cluster import DELTA, T0, Cluster
 
 
 def _build_light_client(c: Cluster, kp: crypto.Keypair) -> tuple[LightClient, InProcListener]:
-    """Same shape as production: construct the listener + client explicitly, attach the
-    client to the LightClient's Postman, register bootstrap peers. Returns both so the
-    test pump can drain the listener via `.drain()`."""
+    """Same shape as production: construct the listener explicitly (a bind address is the
+    deployment's to know), let Postman build its own send-side carrier, register bootstrap
+    peers. Returns both so the test pump can drain the listener via `.drain()`."""
     listener = InProcListener(name_of(kp.public))
     postman = Postman(kp)
-    postman.attach_transport(Scheme.INPROC, InProcDialer(me=name_of(kp.public)))
     client = LightClient(me=kp, anchor=c.mgr.public, postman=postman)
     for node in c.nodes:
         client.add_bootstrap_peer(node.me.public, (Endpoint(address_of(node.me.public)),))
@@ -131,8 +130,8 @@ class TestLightClientBootstrap(unittest.TestCase):
         client_kp = crypto.Keypair.generate()
         _provision_client(c, client_kp)
 
-        # Build the LightClient. `_build_light_client` constructs the InProcDialer +
-        # InProcListener explicitly and attaches the client to the Postman -- same
+        # Build the LightClient. `_build_light_client` constructs the InProcListener
+        # explicitly; the send side is Postman's own (#postman-owns-dialling) -- same
         # shape as production. The reverse direction (nodes dialling this client) is
         # set up by each node's `_reconcile_peers` on tick, using the endpoints baked
         # into the P_GRANT row.

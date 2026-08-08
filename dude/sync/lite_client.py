@@ -303,13 +303,15 @@ class LightClient:
     # Same shape as `Node.start` / `Node.stop` / `Node._run` -- one comment there covers both.
 
     def start(self, *listeners: Listener) -> None:
-        """Begin serving. Same transactional shape as `Node.start`: each listener starts
-        pushing into `_inbox`; on any listener raising, previously-started listeners get
-        stopped in reverse order and the exception propagates. Idempotent."""
+        """Begin serving. Same transactional shape as `Node.start`, and the same reason for
+        starting the Postman: a light client typically passes NO listeners at all -- it dials
+        nodes and every reply comes back on the socket it opened, so the dial-side carrier
+        is the only thing reading (#session-first-reply)."""
         if self._thread is not None:
             return
         started: list[Listener] = []
         try:
+            self.postman.start(self._inbox)
             for listener in listeners:
                 listener.start(self._inbox)
                 started.append(listener)
@@ -317,6 +319,8 @@ class LightClient:
             for listener in reversed(started):
                 with contextlib.suppress(Exception):
                     listener.stop()
+            with contextlib.suppress(Exception):
+                self.postman.stop()
             raise
         self._listeners = tuple(started)
         self._thread = threading.Thread(
@@ -327,12 +331,13 @@ class LightClient:
         self._thread.start()
 
     def stop(self, timeout: float = 5.0) -> None:
-        """Signal shutdown; close listeners; join. Idempotent."""
+        """Signal shutdown; close listeners and dial-side carriers; join. Idempotent."""
         self._stopping.set()
         for listener in self._listeners:
             with contextlib.suppress(Exception):
                 listener.stop()
         self._listeners = ()
+        self.postman.stop()
         thread = self._thread
         self._thread = None
         if thread is not None and thread.is_alive():

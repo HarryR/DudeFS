@@ -466,11 +466,19 @@ class Node:
         our shared `_inbox`; the owned node thread drains the inbox and drives `tick()`
         on cadence. Once returned, this Node is running until `stop()` is called.
 
+        STARTING A NODE STARTS ITS POSTMAN, and must: a reply to something we dialled comes
+        back on the socket we opened (#session-first-reply), so the dial-side carrier reads
+        too. The caller does not pass it -- Postman constructs its own carriers
+        (#postman-owns-dialling) and so is the only object that can start them. `listeners`
+        is the LISTEN side only, which is the one part a deployment genuinely owns because
+        only it knows what address to bind.
+
         TRANSACTIONAL over `listeners`: if any listener's `start()` raises (e.g.
         `TCPListener` with a port conflict), every listener already started gets stopped
-        in reverse order and the exception propagates unchanged. A running node with
-        only some of its listeners is not a shape we support -- the caller was told to
-        listen on N addresses; delivering fewer would be silent degradation.
+        in reverse order, the Postman is stopped, and the exception propagates unchanged.
+        A running node with only some of its listeners is not a shape we support -- the
+        caller was told to listen on N addresses; delivering fewer would be silent
+        degradation.
 
         Idempotent: calling `start(...)` on an already-started node is a no-op (the
         listeners argument is ignored). To attach listeners incrementally, stop first."""
@@ -478,6 +486,7 @@ class Node:
             return
         started: list[Listener] = []
         try:
+            self.postman.start(self._inbox)
             for listener in listeners:
                 listener.start(self._inbox)
                 started.append(listener)
@@ -486,6 +495,8 @@ class Node:
                 # Best-effort during rollback; the outer raise names the real problem.
                 with contextlib.suppress(Exception):
                     listener.stop()
+            with contextlib.suppress(Exception):
+                self.postman.stop()
             raise
         self._listeners = tuple(started)
         self._thread = threading.Thread(
@@ -496,15 +507,16 @@ class Node:
         self._thread.start()
 
     def stop(self, timeout: float = 5.0) -> None:
-        """Signal shutdown; close every listener; join the node thread. Bounded by
-        `timeout` on the join -- the loop notices `_stopping` within one tick_interval
-        (10 ms with defaults), so 5 s is generous. Idempotent."""
+        """Signal shutdown; close every listener and every dial-side carrier; join the node
+        thread. Bounded by `timeout` on the join -- the loop notices `_stopping` within one
+        tick_interval (10 ms with defaults), so 5 s is generous. Idempotent."""
         self._stopping.set()
         for listener in self._listeners:
             # Best-effort during shutdown; nothing to escalate to.
             with contextlib.suppress(Exception):
                 listener.stop()
         self._listeners = ()
+        self.postman.stop()
         thread = self._thread
         self._thread = None
         if thread is not None and thread.is_alive():

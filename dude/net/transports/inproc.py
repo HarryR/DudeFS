@@ -9,7 +9,7 @@
 #
 # What's here NOW: TWO CONCRETE TYPES, mirroring the TCP shape:
 #
-#   InProcDialer   outbound only. Held by Postman via `attach_transport(Scheme.INPROC, ...)`.
+#   InProcDialer   outbound only. Constructed by Postman via `transports.dial`, never by a caller.
 #                  `send(address, frame)` looks the target up in the module-scope
 #                  `_INBOXES` registry and appends to that listener's internal buffer.
 #                  No state; construct one per Postman.

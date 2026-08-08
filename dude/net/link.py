@@ -26,7 +26,7 @@ import queue
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import NamedTuple, Protocol
+from typing import NamedTuple, Protocol, runtime_checkable
 
 from ..core import crypto
 from ..core.errors import DudeError
@@ -58,10 +58,16 @@ class Transport(Protocol):
     def send(self, address: Address, frame: Frame) -> None: ...
 
 
+@runtime_checkable
 class Listener(Protocol):
     """A carrier's RECEIVE side. Owns inbound bytes: a listen socket (for TCP/UNIX), or the
     receiving half of a paired loopback (for InProc). Same discipline as `Transport` -- tiny
     contract, no policy.
+
+    RUNTIME-CHECKABLE because one real question is asked of an instance: `Postman` constructs
+    dial-side carriers and must know which of them ALSO read (`TCPDialer` does, on the sockets
+    it opened; `InProcDialer` does not) so it can drive their lifecycle. That is a per-instance
+    fact, not a per-scheme one, so a table would be a second place to keep it in step.
 
     THREE METHODS, two shapes of caller:
 

@@ -6,11 +6,11 @@ Follower verify-and-commit) with actual bytes on 127.0.0.1 sockets, actual lengt
 prefix framing, and actual OS-level connect/accept timing -- the failure modes InProc
 hides by construction (synchronous drain, atomic frame delivery, no port state).
 
-CLIENT/LISTENER SPLIT: every node owns a `TCPDialer` (attached to Postman for send)
-and a `TCPListener` (drained by the test pump for receive). The two are physically
-distinct objects with distinct constructors; the listener's `bound_address` is what
-peers dial, and it's known ONLY after bind, which is why listeners get built before
-the genesis roster.
+CLIENT/LISTENER SPLIT: every node owns a `TCPDialer` (built by its own Postman for
+send, and drained by the test pump for the replies that come back on it) and a
+`TCPListener` (built HERE, and drained by the pump for receive). Only the listener is
+the test's to construct: its `bound_address` is what peers dial, and it's known ONLY
+after bind, which is why listeners get built before the genesis roster.
 """
 
 from __future__ import annotations
@@ -22,9 +22,9 @@ from dude.consensus.bootstrap import bootstrap
 from dude.consensus.settle_round import SettledBlock
 from dude.core import crypto
 from dude.net import Verb
-from dude.net.address import Endpoint, Scheme
+from dude.net.address import Endpoint
 from dude.net.envelope import Envelope
-from dude.net.transports.tcp import TCPDialer, TCPListener
+from dude.net.transports.tcp import TCPListener
 from dude.node import Node
 from dude.store import Store, management, ops
 from dude.store.management import Cert, MgmtWriter, Role
@@ -38,19 +38,17 @@ DELTA = DEFAULT.mempool.delta
 
 def _build_cluster(
     size: int,
-) -> tuple[crypto.Keypair, list[Node], list[TCPDialer], list[TCPListener]]:
-    """Build `size` nodes wired over real TCP. Returns
-    `(manager_kp, nodes, clients, listeners)`.
+) -> tuple[crypto.Keypair, list[Node], list[TCPListener]]:
+    """Build `size` nodes wired over real TCP. Returns `(manager_kp, nodes, listeners)`.
 
     Order matters: LISTENERS bind first so their `bound_address` is known, THEN the
-    genesis roster is minted with those addresses, THEN each node's Postman gets its
-    own `TCPDialer` attached. Reversing any of these three steps produces a stillborn
-    cluster -- reconciliation reads addresses from the roster, so the addresses have to
-    exist before the roster is minted."""
+    genesis roster is minted with those addresses. Reversing the two produces a
+    stillborn cluster -- reconciliation reads addresses from the roster, so the
+    addresses have to exist before the roster is minted. The dial side has no ordering
+    constraint at all, because nothing outside the Postman ever holds it."""
     mgr = crypto.Keypair.generate()
     keys = [crypto.Keypair.generate() for _ in range(size)]
     listeners = [TCPListener() for _ in keys]  # bind first
-    clients = [TCPDialer() for _ in keys]
 
     # Genesis roster with TCP endpoints -- each node's listener.bound_address.
     scratch = Store()
@@ -80,21 +78,20 @@ def _build_cluster(
     genesis = (tx.sign(mgr, T0),)
 
     nodes: list[Node] = []
-    for kp, client in zip(keys, clients, strict=True):
+    for kp in keys:
         store = Store()
         store.provision(mgr.public)
         bootstrap(store, mgr, genesis)
-        node = Node(kp, store)
-        # Send side attaches now; receive side (listener) is drained by the test pump
-        # directly -- no `node.start()` call, since this is the deterministic path.
-        node.postman.attach_transport(Scheme.TCP, client)
-        nodes.append(node)
+        nodes.append(Node(kp, store))
 
     # One tick to trigger reconciliation (each node dials every other roster member).
+    # This is also what builds each Postman's TCPDialer -- no `node.start()` call, since
+    # this is the deterministic path, so nothing is reading a thread; `postman.drain()`
+    # is what the pump uses instead.
     for node in nodes:
         node.tick(T0)
 
-    return mgr, nodes, clients, listeners
+    return mgr, nodes, listeners
 
 
 def _pump_all(
@@ -102,7 +99,6 @@ def _pump_all(
     listeners: dict[crypto.PublicKey, TCPListener],
     now: int,
     rounds: int = 30,
-    dialers: dict[crypto.PublicKey, TCPDialer] | None = None,
 ) -> None:
     """Drive tick + drain across every node until nothing's moved for a round.
 
@@ -113,8 +109,10 @@ def _pump_all(
     and the tests flake.
 
     Wave 2: `TCPDialer` reads replies on its outbound sockets (session-Link path). The
-    deterministic pump drains BOTH listeners (accept-side sessions) AND dialers
-    (dial-side sessions) so no reply is stranded in an un-read socket buffer."""
+    deterministic pump drains BOTH the listener (accept-side sessions) AND the node's
+    own Postman (dial-side sessions) so no reply is stranded in an un-read socket
+    buffer. `postman.drain()` is the dial-side twin of `listener.drain()` -- the test
+    never sees a carrier object, only the two doors."""
     for _ in range(rounds):
         for node in nodes:
             node.tick(now)
@@ -125,13 +123,10 @@ def _pump_all(
             time.sleep(0.002)
             round_delivered = 0
             for node in nodes:
-                for inbound in listeners[node.me.public].drain():
+                inbounds = (*listeners[node.me.public].drain(), *node.postman.drain())
+                for inbound in inbounds:
                     node.receive(inbound.frame, now, session=inbound.session)
                     round_delivered += 1
-                if dialers is not None:
-                    for inbound in dialers[node.me.public].drain():
-                        node.receive(inbound.frame, now, session=inbound.session)
-                        round_delivered += 1
             if round_delivered == 0:
                 break
 
@@ -147,7 +142,6 @@ def _produce_blocks(
     listeners: dict[crypto.PublicKey, TCPListener],
     mgr: crypto.Keypair,
     want: int,
-    dialers: dict[crypto.PublicKey, TCPDialer] | None = None,
 ) -> int:
     """Submit transactions and pump until every node holds at least `want` blocks.
     Returns the final `now`."""
@@ -157,7 +151,7 @@ def _produce_blocks(
         key = crypto.h(f"tcp-e2e-{submissions}".encode())
         tx = ops.writes(ops.Set(D, key, b"v")).sign(mgr, now)
         _submit(nodes[0], tx, mgr, now)
-        _pump_all(nodes, listeners, now, dialers=dialers)
+        _pump_all(nodes, listeners, now)
         submissions += 1
         now += DELTA
         if submissions > 30:
@@ -167,12 +161,11 @@ def _produce_blocks(
 
 class TestJoinerCatchesUpOverTCP(unittest.TestCase):
     def test_joiner_catches_up_via_the_wire(self):
-        mgr, nodes, clients, listener_list = _build_cluster(3)
+        mgr, nodes, listener_list = _build_cluster(3)
         listeners = {n.me.public: t for n, t in zip(nodes, listener_list, strict=True)}
-        dialers = {n.me.public: c for n, c in zip(nodes, clients, strict=True)}
 
         try:
-            _produce_blocks(nodes, listeners, mgr, 3, dialers=dialers)
+            _produce_blocks(nodes, listeners, mgr, 3)
             producer_head = nodes[0].store.head_block_num()
             assert producer_head is not None and producer_head >= 3
 
@@ -180,9 +173,7 @@ class TestJoinerCatchesUpOverTCP(unittest.TestCase):
             joiner_store = Store()
             joiner_store.provision(mgr.public)
             joiner_listener = TCPListener()
-            joiner_client = TCPDialer()
             joiner = Node(joiner_kp, joiner_store)
-            joiner.postman.attach_transport(Scheme.TCP, joiner_client)
 
             # Bootstrap-outside-roster wiring: the joiner isn't in the roster yet, so
             # reconciliation won't wire it. Manual bootstrap peer both directions.
@@ -192,11 +183,10 @@ class TestJoinerCatchesUpOverTCP(unittest.TestCase):
 
             all_nodes = [*nodes, joiner]
             all_listeners = {**listeners, joiner_kp.public: joiner_listener}
-            all_dialers = {**dialers, joiner_kp.public: joiner_client}
 
             now = T0 + DELTA * 10
             for _ in range(20):
-                _pump_all(all_nodes, all_listeners, now, dialers=all_dialers)
+                _pump_all(all_nodes, all_listeners, now)
                 if (joiner_store.head_block_num() or 0) >= producer_head:
                     break
                 now += DELTA
@@ -223,11 +213,11 @@ class TestJoinerCatchesUpOverTCP(unittest.TestCase):
                 set(nodes[0].store.mgmt.roster()),
             )
 
-            joiner_client.close()
+            joiner.postman.stop()
             joiner_listener.stop()
         finally:
-            for c in clients:
-                c.close()
+            for n in nodes:
+                n.postman.stop()
             for lst in listener_list:
                 lst.stop()
 

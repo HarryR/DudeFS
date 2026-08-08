@@ -5,19 +5,19 @@
 # sleeping. Partitions are simulated by `postman.remove_peer(pubkey)` (see
 # #partitions-are-test-only) rather than by a switchboard-level cut/heal.
 #
-# EACH NODE OWNS AN InProcDialer (send side, attached to Postman) AND AN InProcListener
-# (receive side, drained by `_quiesce`). Constructed explicitly per node before `node.tick`
-# fires reconciliation, so the shape is identical to what a production main() does with TCP
-# -- no dialler-per-scheme reach-through, no cast-into-private-state.
+# EACH NODE OWNS AN InProcListener (receive side, drained by `_quiesce`), constructed here
+# because a listen address is the one thing a deployment knows and an endpoint does not. The
+# SEND side is not constructed here at all: per #postman-owns-dialling, Postman builds its own
+# carrier on first dial, so this harness is the same shape a production main() has with TCP.
 
 from __future__ import annotations
 
 from ..consensus.bootstrap import bootstrap
 from ..core import crypto
 from ..net import Verb
-from ..net.address import Endpoint, Scheme
+from ..net.address import Endpoint
 from ..net.envelope import Envelope
-from ..net.transports import InProcDialer, InProcListener, address_of, name_of
+from ..net.transports import InProcListener, address_of, name_of
 from ..net.transports.inproc import _reset_for_tests
 from ..node import Node
 from ..store import Store, management, ops
@@ -64,11 +64,9 @@ class Cluster:
             bootstrap(store, self.mgr, genesis)
             node = Node(kp, store)
             # Listener registers this identity in the module-scope InProc registry so other
-            # nodes' clients can find us. Client is the send-side transport Postman attaches
-            # -- one per node, stateless, all outbound goes through it.
+            # nodes' dialers can find us.
             listener = InProcListener(name_of(kp.public))
             self.listeners[kp.public] = listener
-            node.postman.attach_transport(Scheme.INPROC, InProcDialer(me=name_of(kp.public)))
             self.nodes.append(node)
         # No explicit peer wiring here (#roster-drives-peers). Each Node's first `tick`
         # runs `_reconcile_peers`, which reads `mgmt.roster()` + `mgmt.nodes()` from the

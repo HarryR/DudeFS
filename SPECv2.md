@@ -1772,20 +1772,31 @@ rather than an environment it has to arrange.
 - `LinkTunables` shrinks accordingly. A per-peer field that survives there is a candidate for
   the next audit.
 
-### Postman owns dialling; scheme resolution is module-level {#postman-owns-dialling}
+### Postman owns dialling, and the carriers it dials with {#postman-owns-dialling}
 
 - `Postman` is the sole owner of peer lifecycle. Its public API is `add_peer(pubkey, endpoints)`,
   `remove_peer(pubkey)`, and the outbound-send / inbound-deliver path already there. **Nothing
   outside Postman writes to `postman.peers` directly.** The dict-mutation path was a leak — it
   meant peer wire configuration lived above the transport-owning layer, in every caller.
-- The scheme-to-dialler mapping (`Scheme → Callable[[Endpoint], Transport]`) lives at
-  module scope in `dude.net.postman`. It is a deployment fact ("this build can dial UNIX and TCP,
-  test builds also dial INPROC"), not a per-Postman configuration. Deployments register their
-  diallers at process startup; `add_peer` looks up each endpoint's scheme in the map.
+- **A caller MUST NOT name a concrete dial-side carrier.** Scheme resolution is a CLOSED match
+  in `dude.net.transports`, the package that knows which carriers exist —
+  `dial(endpoint, me) -> Transport`. Not a registry a deployment populates, and not an object a
+  deployment injects: a build that links the package can dial every scheme it implements, the way
+  `curl` resolves `https://` without being told which handler to use. A scheme with no carrier
+  raises `LinkError`, the same failure a caller already handles from `send`.
+- Everything a dial-side carrier needs is the endpoint plus our own identity, which is WHY that
+  can be a closed match. The listen side is the exception and cannot move here: an endpoint names
+  where a PEER listens, which says nothing about where WE should bind. Listeners are therefore
+  constructed by the deployment and handed to `Node.start`; diallers never are.
+- **Postman owns the dial-side lifecycle too, and starting a Node MUST start its Postman.** A
+  reply to something we dialled comes back on the socket we opened (#session-first-reply), so a
+  dial-side carrier reads as well as writes and needs an inbox and a thread. Whoever constructs it
+  must therefore also start it — owning construction without owning the lifecycle would only move
+  the knot back to the caller. `Postman.start(inbox)` / `stop()` / `drain()` mirror `Listener`,
+  and `_dial` starts a carrier built after `start` as well as those built before it.
 - Postman does not know how any transport works internally, and no transport knows about any
   other transport. `add_peer(pubkey, endpoints)` composes: for each endpoint, dispatch on scheme;
-  construct the transport by calling the dialler with the endpoint (options and all); hand the
-  result to `Peer.reconfigure`.
+  construct the carrier via `transports.dial`; hand the result to `Peer.reconfigure`.
 
 ### The Node reconciles its peers from the roster on tick {#roster-drives-peers}
 
@@ -2121,7 +2132,7 @@ visible rather than plausible.
 | a solicited-answer request is registered as awaiting | `Mailbox.post(await_reply=True)` (required parameter) |
 | P_NODE stores endpoints (with options), not bare addresses (#peer-endpoint-in-log) | `NodeRecord.encode_row` / `decode_row` (dude/store/management.py) + `MgmtWriter.change_roster` uses `rec.encode_row()` |
 | endpoint options carry per-peer transport config (#peer-options-are-endpoint-options) | `Endpoint.options` round-tripped through `NodeRecord.encode_row`; per-field audit of `LinkTunables` for candidates to migrate is **OWED** |
-| Postman owns dialling; scheme→dialler is module-level (#postman-owns-dialling) | `Postman.add_peer` / `remove_peer` (dude/net/postman.py), module-scope `_DIALLERS` + `register_dialler`; `Node.connect` deleted |
+| Postman owns dialling and the carriers it dials with (#postman-owns-dialling) | `transports.dial` (dude/net/transports/\_\_init\_\_.py) — closed match, no registry, no injection; `Postman.add_peer` / `remove_peer` / `_dial` / `start` / `stop` / `drain` (dude/net/postman.py); `Node.start` / `Node.stop` drive the Postman's lifecycle. `Node.connect`, `attach_transport` and the `_DIALLERS` registry all deleted |
 | the Node reconciles peers from the roster on tick (#roster-drives-peers) | `Node._reconcile_peers` + `_reconcile_roster` (dude/node.py); serial-gated. **Clients are NOT in it** -- see #grants-are-pure-authority |
 | InProc is a paired loopback, not a routing switchboard (#inproc-is-a-loopback) | `dude/net/transports/inproc.py` -- module-scope `_INBOXES` registry, `InProcDialer` + `InProcListener` with no shared routing object |
 | partitions live in tests, not in transports (#partitions-are-test-only) | `postman.remove_peer` (dude/net/postman.py) used by `test_gestalt`; `Switchboard.cut/heal` retired |

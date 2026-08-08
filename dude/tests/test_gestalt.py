@@ -19,7 +19,7 @@ from ..core import codec, crypto
 from ..core.errors import DudeError, InvariantError
 from ..core.units import now_ms
 from ..net import Verb
-from ..net.address import Endpoint, Scheme
+from ..net.address import Endpoint
 from ..net.envelope import Envelope, Frame
 from ..net.postman import Postman
 from ..net.transports.tcp import TCPDialer, TCPListener
@@ -276,16 +276,14 @@ def _build_node(
     mgr: crypto.Keypair,
     genesis: tuple[ops.SignedTransaction, ...],
     tunables: Tunables,
-) -> tuple[Node, TCPDialer]:
-    """Build a Node with a TCPDialer attached. Listener is constructed and passed
-    separately by the caller (needed before genesis for its bound_address)."""
+) -> Node:
+    """Build a Node on the given genesis. The listener is constructed and passed
+    separately by the caller (needed before genesis for its bound_address); the dial
+    side is the Postman's own (#postman-owns-dialling)."""
     store = Store()
     store.provision(mgr.public)
     bootstrap(store, mgr, genesis)
-    node = Node(kp, store, tunables=tunables)
-    client = TCPDialer()
-    node.postman.attach_transport(Scheme.TCP, client)
-    return node, client
+    return Node(kp, store, tunables=tunables)
 
 
 def _wait_until(pred, timeout_sec: float, interval_sec: float = 0.02) -> bool:
@@ -355,35 +353,30 @@ class TestScenario(unittest.TestCase):
 
         genesis = _genesis(mgr, keys, listeners)
 
-        nodes: list[Node] = []
-        clients: list[TCPDialer] = []
-        for kp in keys:
-            node, tcp_client = _build_node(kp, mgr, genesis, _FAST)
-            nodes.append(node)
-            clients.append(tcp_client)
+        nodes = [_build_node(kp, mgr, genesis, _FAST) for kp in keys]
 
-        # Test's own outbound client, used for external SUBMITs.
+        # Test's own outbound client, used for external SUBMITs. The ONE carrier this
+        # test constructs for sending: it is playing an external party at the raw
+        # transport level, below any Postman.
         test_client = TCPDialer()
 
         # LightClient built later; keep names in scope so the finally block can stop them.
         lc: LightClient | None = None
-        lc_listener: TCPListener | None = None
-        lc_client: TCPDialer | None = None
 
         # Fourth-node placeholders for phase 4/5.
         n4: Node | None = None
         n4_listener: TCPListener | None = None
-        n4_client: TCPDialer | None = None
 
         try:
             # --- PHASE 0: managed-mode start; every node produces empty blocks -------- #
-            # Each node starts BOTH its listener (accepts inbound) AND its dialer (reads
-            # replies on outbound sockets). The dialer is a Listener too from Wave 2 --
-            # its reader-thread feeds the inbox with `Inbound(frame, session)` just like
-            # the listener does. Without starting the dialer, outbound sockets never get
-            # their replies read and consensus stalls.
-            for node, listener, client in zip(nodes, listeners, clients, strict=True):
-                node.start(listener, client)
+            # `start` takes the listener (accepts inbound) and starts the Postman, which
+            # starts the dial side. The dialer is a Listener too from Wave 2 -- its
+            # reader-thread feeds the inbox with `Inbound(frame, session)` just like the
+            # listener does. Without it, outbound sockets never get their replies read
+            # and consensus stalls; that is exactly why starting it cannot be something
+            # a caller has to remember (#postman-owns-dialling).
+            for node, listener in zip(nodes, listeners, strict=True):
+                node.start(listener)
             # Every node should get past block 1 within a few buckets (Coordinator ticks
             # each bucket boundary; empty rounds ratify on quorum trivially at n=3).
             budget = 5 * (_FAST.mempool.delta / 1000)
@@ -423,13 +416,10 @@ class TestScenario(unittest.TestCase):
             # through the wire like any other tx. The endpoint carried in the P_GRANT
             # row is what nodes will reconcile into their postmans on tick.
             lc_kp = crypto.Keypair.generate()
-            lc_listener = TCPListener()
-            lc_client = TCPDialer()
             # Snapshot-scoped tx composition: MgmtWriter's reads are pinned to a
             # consistent moment so the composed cert can't reference a mid-flight
             # writer commit (that's Bug A -- MgmtWriter's docstring names it). No cast:
             # a StoreReader IS a `management.Source`.
-            assert lc_listener is not None
             with nodes[0].store.snapshot() as r:
                 grant_tx = (
                     MgmtWriter(r)
@@ -458,17 +448,16 @@ class TestScenario(unittest.TestCase):
             # dials nodes and replies flow back on the sessions it opened (SessionLink);
             # a node learns about a client only when the client's first frame arrives on
             # a session it accepted, at which point Postman.register_session runs.
-            lc_postman = Postman(lc_kp)
-            lc_postman.attach_transport(Scheme.TCP, lc_client)
-            lc = LightClient(me=lc_kp, anchor=mgr.public, postman=lc_postman, tunables=_FAST)
+            lc = LightClient(me=lc_kp, anchor=mgr.public, postman=Postman(lc_kp), tunables=_FAST)
             for i, listener in enumerate(listeners):
                 lc.add_bootstrap_peer(nodes[i].me.public, (Endpoint(listener.bound_address),))
-            # LC starts its dialer (which reads replies on outbound sockets); no listener
-            # needed. `lc_listener` above is now unused -- keeping the bind for symmetry
-            # with the old test shape while the refactor lands; removable in a follow-up.
-            lc.start(lc_client)
+            # NO LISTENER AT ALL, and this is the point of the shape: a light client never
+            # binds an address. `start()` with no arguments starts its Postman, whose
+            # dialer reads every reply back on the socket the client itself opened, per
+            # #session-first-reply. Before #postman-owns-dialling this line needed a
+            # carrier the test had constructed and passed twice.
+            lc.start()
             lc.bootstrap(now_ms())
-            assert lc is not None  # type narrowing after start
             self.assertTrue(
                 _wait_until(lc.bootstrapped, timeout_sec=2.0),
                 "phase 2: LightClient did not reach READY",
@@ -486,7 +475,6 @@ class TestScenario(unittest.TestCase):
             # --- PHASE 3: add a 4th node via the real change_roster path -------------- #
             n4_kp = crypto.Keypair.generate()
             n4_listener = TCPListener()
-            n4_client = TCPDialer()
             assert n4_listener is not None  # type-narrow for the composition below
             # Snapshot-scoped composition, same reason as phase 2's grant tx.
             with nodes[0].store.snapshot() as r:
@@ -545,13 +533,13 @@ class TestScenario(unittest.TestCase):
             n4_store.provision(mgr.public)
             bootstrap(n4_store, mgr, genesis)
             n4 = Node(n4_kp, n4_store, tunables=_FAST)
-            n4.postman.attach_transport(Scheme.TCP, n4_client)
             # Manual bootstrap peer wiring (joiner not yet in its own roster's postman;
-            # reconciliation will do the rest on tick).
+            # reconciliation will do the rest on tick). This `add_peer` is what builds
+            # n4's dialer -- BEFORE `start`, which is the ordering `Postman.start` has to
+            # cope with (it starts carriers already built as well as later ones).
             n4.postman.add_peer(nodes[0].me.public, (Endpoint(listeners[0].bound_address),))
             n4.follower.add_peer(nodes[0].me.public, now=now_ms())
-            assert n4_client is not None  # phase 3 constructed it above
-            n4.start(n4_listener, n4_client)  # Wave 2: also start the dialer reader
+            n4.start(n4_listener)
             # Catch up: joiner's head reaches the existing cluster's head.
             self.assertTrue(
                 _wait_until(
@@ -592,22 +580,14 @@ class TestScenario(unittest.TestCase):
             if lc is not None:
                 with contextlib.suppress(Exception):
                     lc.stop(timeout=1.0)
-            if lc_client is not None:
-                lc_client.close()
-            if lc_listener is not None:
-                lc_listener.stop()
             if n4 is not None:
                 with contextlib.suppress(Exception):
                     n4.stop(timeout=1.0)
-            if n4_client is not None:
-                n4_client.close()
             if n4_listener is not None:
                 n4_listener.stop()
             for node in nodes:
                 with contextlib.suppress(Exception):
                     node.stop(timeout=1.0)
-            for c in clients:
-                c.close()
             for lst in listeners:
                 lst.stop()
             test_client.close()
