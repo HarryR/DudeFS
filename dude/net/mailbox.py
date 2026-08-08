@@ -1,15 +1,10 @@
 # dude.net.mailbox — what to send, where to try next, when to give up. SPEC.md (#peer-not-path).
 #
-# SANS-I/O, like the mempool and for the same two reasons [H]:
-#
-#   1. the whole protocol can be exercised with NO transports at all — failure, partition, timeout
-#      and retry become values a test constructs rather than an environment it has to arrange;
-#   2. MULTI-HOMING falls out. A peer is a public key with several addresses; if a link errors, the
-#      message goes back in the box and the next address is tried, and the failed one may be tried
-#      again later. That policy lives here, so no transport has to know about it.
-#
-# THE MAILBOX PERFORMS NO I/O AND OWNS NO SOCKET. It emits `Transmit` effects and consumes events
-# (`sent`, `failed`, `arrived`, and the passage of time). A driver joins it to real links.
+# SANS-I/O: it emits `Transmit` effects and consumes events (`sent`, `failed`, `arrived`, time).
+# Two things fall out. Failure, partition, timeout and retry become values a test constructs
+# rather than an environment it arranges; and MULTI-HOMING lives here rather than in any carrier —
+# a link errors, the message goes back in the box, the next address is tried, and the failed one
+# may be tried again later.
 #
 # TWO EXPIRIES, DELIBERATELY NOT ONE (and the second is never transmitted):
 #
@@ -20,11 +15,10 @@
 #                         Putting it on the wire would be a second expiry with no consumer.
 #
 # NO REQUEST/REPLY TYPE, and this is the load-bearing decision. A sender cannot distinguish "it
-# died", "it declined to answer" and "the reply was lost" — so a type that separates them would be
-# fabricating information. Everything is a one-way message; `expect()` registers interest in a reply
-# with a deadline, and the absence of one is an ordinary `Expired` event. "Maybe reply" is not a
-# difficulty this design introduces; it is the only accurate model, and an RPC type would merely
-# hide the same case behind a timeout it still had to implement.
+# died", "it declined to answer" and "the reply was lost", so a type separating them would be
+# fabricating information. Everything is one-way; `expect()` registers interest with a deadline and
+# the absence of a reply is an ordinary `Expired`. An RPC type would hide the same case behind a
+# timeout it still had to implement.
 
 from __future__ import annotations
 

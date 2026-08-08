@@ -1,23 +1,17 @@
 # dude.net.link — one path to one peer, and the policies layered over it. See SPEC.md (#breaker).
 #
-# SKETCH. Not wired into `Mailbox` yet — this is the shape, to see how it smells.
-#
-# THE COMPOSITION [H]: a transport adapter is DUMB (it moves bytes and raises), and everything
-# interesting — measurement, breaking, throttling — is a stack of small policies layered over it.
-# Nothing here needs a transport to exist, and no transport needs to know any of it.
-#
-# The interface that makes that work is four observations, because the useful information arrives at
-# four different moments and a policy that cannot see one of them cannot do its job:
+# A carrier is DUMB (it moves bytes and raises); measurement, breaking and throttling are a stack
+# of small policies over it. Four observations, because the useful information arrives at four
+# moments and a policy that cannot see one of them cannot do its job:
 #
 #   before_send()  veto — the only one that can refuse
 #   on_sent()      the bytes left (which implies nothing about receipt)
 #   on_failed()    the transport raised
 #   on_reply(rtt)  a reply came back; `rtt` is None when it is UNATTRIBUTABLE (#rtt-attribution)
 #
-# `rtt=None` is the load-bearing case, not an edge case. Under multi-homing most replies cannot be
-# attributed to a transmission at all (R2, Karn), and a policy that treats "no sample" as "sample of
-# zero" or ignores the callback entirely will quietly build its estimate from the traffic that
-# happens to be un-retried — i.e. from the easy cases only.
+# `rtt=None` is the load-bearing case, not an edge case: under multi-homing most replies cannot be
+# attributed to a transmission at all (R2, Karn), so a policy that treats "no sample" as a sample
+# of zero builds its estimate from the un-retried traffic alone — the easy cases only.
 
 from __future__ import annotations
 
@@ -87,10 +81,8 @@ class Listener(Protocol):
     def drain(self) -> tuple[Inbound, ...]: ...
 
 
-# --------------------------------------------------------------------------------------------- #
-# Tunables. ONE surface per #timing [H] — these belong in the consolidated management-store    #
-# type, and live here only until that lands. No literal in this module appears anywhere but here.  #
-# --------------------------------------------------------------------------------------------- #
+# Tunables. ONE surface per #timing -- these belong in the management store once that lands. No
+# literal in this module appears outside this group.
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,19 +99,14 @@ class LinkTunables:
     breaker_cooldown: Millis = 5_000
 
     keepalive_interval: Millis | None = None
-    """If set, the link emits a `PING` on itself once it has been idle for this long -- no
-    frames sent OR received in this interval. The reply's RTT feeds the Estimator normally,
-    AND the traffic keeps a session-backed underlying carrier alive across otherwise-quiet
-    periods (a NAT-only node maintaining outbound sessions to its peers is the direct
-    beneficiary; kernel-level TCP keepalive is too coarse and often disabled). `None` means
-    no keepalive -- the sensible default for stateless carriers or when the caller doesn't
-    care about idle liveness. Per-transport defaults belong to the transport's Link-factory,
-    not here."""
+    """If set, the link PINGs itself after this long with no frame sent OR received. Two jobs:
+    the reply's RTT feeds the Estimator, and the traffic holds a session-backed carrier open
+    (a NAT-only node keeping outbound sessions alive -- kernel TCP keepalive is too coarse and
+    often disabled). `None` = off, the default for stateless carriers."""
 
-    # `stagger_cap` and `max_parallel` are NOT here: they live in `PlanTunables`, which is what
-    # reads them. They were declared in both groups with no consumer for this copy, so the two could
-    # disagree — and did, by 50 ms, the moment one of them was derived from `RTT_MAX`. The dial
-    # belongs to the object that decides with it.
+    # `stagger_cap` and `max_parallel` are NOT here -- they live in `PlanTunables`, which reads
+    # them. Declared in both groups with no consumer for this copy, the two disagreed by 50 ms the
+    # moment one was derived from `RTT_MAX`. The dial belongs to the object that decides with it.
 
     budget_max_tokens: int = 10_000
     budget_token_ratio: int = 100
@@ -138,29 +125,18 @@ class LinkTunables:
 
 
 class Refused(Enum):
-    """Why a policy would not let a send happen — a CLOSED set, not a free string.
+    """Why a policy would not let a send happen — a CLOSED set the layer above branches on
+    (#no-exceptions-for-control-flow), so it must be matchable exhaustively and countable
+    without typos.
 
-    A refusal is a decision the layer above branches on, so its domain has to be enumerable: a
-    stringly-typed reason cannot be matched exhaustively, cannot be counted into a metric without
-    typos, and drifts the moment two modules spell the same condition differently. `StrEnum` so it
-    still reads well in a log.
-    Plain `Enum`, deliberately NOT `StrEnum`: these never go on the wire, so the string would be a
-    value nobody marshals, and `StrEnum` members ARE `str`s — which is how a comparison across two
-    unrelated reason enums that happen to share a spelling came out True. Plain members compare
-    False against each other and against bare strings, so a stray `== "guard"` fails loudly instead
-    of silently passing. `StrEnum` is for values that are their own serialised form; `Scheme` and
-    `Role` earn it, this does not.
-    """
+    Plain `Enum`, deliberately NOT `StrEnum`: these never go on the wire, and `StrEnum` members
+    ARE `str`s -- which is how a comparison between two unrelated reason enums that happened to
+    share a spelling came out True. Plain members compare False against bare strings, so a stray
+    `== "guard"` fails loudly. Every closed reason set in this codebase follows suit."""
 
     INVALID = "invalid"
-    """RESERVED, and never returned by this package. Declared FIRST so that a port to Go — where
-    these become integers and a struct field's zero value is whatever member happens to be 0 —
-    lands its zero value on a named invalid rather than on a real one. Without it, a zero-valued
-    field silently means the first member: a bug that does not exist in Python and is very hard to
-    see in review.
-
-    Not dead code: it is load-bearing in the target, and Python's own `Enum(0)` has no meaning to
-    guard. Treat receiving it as a decode fault."""
+    """Reserved ordinal 0, never returned (#no-exceptions-for-control-flow). Load-bearing in a
+    Go port, where the zero value would otherwise silently mean the first real member."""
 
     CIRCUIT_OPEN = "circuit-open"
     CIRCUIT_PROBING = "circuit-probing"
@@ -170,12 +146,10 @@ class Refused(Enum):
 
 
 class Policy(Protocol):
-    """One concern, layered over a link. All four callbacks have defaults in practice — a policy
-    implements only what it cares about.
+    """One concern, layered over a link; an implementation states only what it cares about.
 
-    Parameters are POSITIONAL-ONLY: they are invoked positionally, so their names are not part
-    of the contract, and an implementation may underscore the ones it ignores without breaking
-    override compatibility. Without `/` a renamed parameter is an invalid override."""
+    Parameters are POSITIONAL-ONLY so an implementation may underscore the ones it ignores.
+    Without `/`, a renamed parameter is an invalid override."""
 
     def before_send(self, now: Millis, /) -> Refused | None:
         """`None` to allow, or the reason to refuse. The only veto in the stack."""
@@ -187,11 +161,8 @@ class Policy(Protocol):
 
 
 class _Inert:
-    """Default no-op behaviour, so each policy below states only its own concern.
-
-    Parameters are underscore-prefixed where a policy genuinely ignores them: the signature is fixed
-    by `Policy`, so an unused argument here is protocol conformance rather than the
-    declared-but-unwired shape ruff's ARG family exists to catch."""
+    """Default no-ops, so each policy states only its own concern. Underscored parameters are
+    protocol conformance, not the declared-but-unwired shape ruff's ARG family catches."""
 
     def before_send(self, _now: Millis, /) -> Refused | None:
         return None
@@ -203,14 +174,9 @@ class _Inert:
 
 @dataclass(slots=True)
 class Estimator(_Inert):
-    """R2 + R3. Per-link RTT, and the timeout derived from it.
-
-    Refuses nothing — measurement is not a gate. It exists so `rto()` can be asked.
-
-    Also tracks `last_activity` -- the timestamp of the most recent send or reply observed on
-    this link. `needs_keepalive(now)` uses it to answer "has this link been idle long enough
-    that we should ping to keep the underlying session alive AND refresh the RTT sample". Two
-    jobs from one clock: liveness for the session, freshness for the estimate."""
+    """R2 + R3. Per-link RTT and the timeout derived from it. Refuses nothing -- measurement is
+    not a gate. Also carries `last_activity`, which `needs_keepalive` reads: one clock serving
+    liveness for the session and freshness for the estimate."""
 
     t: LinkTunables = field(default_factory=LinkTunables)
     srtt: float | None = None
@@ -248,10 +214,9 @@ class Estimator(_Inert):
         return max(self.t.rto_floor, int(self.srtt + max(self.t.granularity, 4 * self.rttvar)))
 
     def needs_keepalive(self, now: Millis) -> bool:
-        """True iff `keepalive_interval` is set AND this link has been active at least once AND
-        that activity is older than the interval. The `last_activity > 0` guard is what stops a
-        freshly-constructed link from immediately firing a keepalive against nothing -- keepalive
-        is for links that WERE active and have gone quiet, not for cold ones."""
+        """Set, once-active, and idle longer than the interval. The `last_activity > 0` guard is
+        what stops a fresh link firing a keepalive against nothing: keepalive is for links that
+        WERE active and went quiet, not for cold ones."""
         if self.t.keepalive_interval is None:
             return False
         if self.last_activity == 0:
@@ -354,9 +319,8 @@ class Link:
     def send(self, frame: Frame, now: Millis) -> Refused | None:
         """Attempt one transmission. Returns `None` on success, or the reason it did not happen.
 
-        RETURNS rather than raises for a refusal, because "the circuit is open" is an ordinary
-        scheduling answer the mailbox acts on, not an exceptional condition. A transport failure is
-        still a failure and is reported through `on_failed`."""
+        Returns rather than raises (#no-exceptions-for-control-flow): "the circuit is open" is an
+        ordinary scheduling answer. A transport failure is still reported through `on_failed`."""
         for p in self.policies:
             refusal = p.before_send(now)
             if refusal is not None:
@@ -405,21 +369,16 @@ class SessionLink:
     `available`/`find` shape, same hook order), so `Peer.usable()` can return a mixed list and
     `Plan.next()` treats them uniformly.
 
-    LIFETIME BOUND TO THE SESSION. When `send()` fails at the transport level, the session
-    is presumed dead: we call `_close()`, which closes the session and fires `on_close` so
-    `Postman.unregister_session` runs. The transport can also signal death independently (peer
-    closed the connection, kernel dropped the socket) -- Postman's `_on_session_close` hook
-    finds the SessionLink for the dead session and removes it. Both paths converge on the same
-    removal.
+    LIFETIME BOUND TO THE SESSION: a transport-level send failure presumes the session dead and
+    runs `_close()`. The transport can signal death independently; both paths converge there.
 
-    NOT A `Link` SUBCLASS by choice. Dataclass inheritance with additional fields is finicky;
-    the send-line and the close-lifecycle are the only real differences and duplicating them
-    reads cleaner than either overriding a hook or plumbing a strategy callable through Link."""
+    Not a `Link` subclass by choice -- the send line and the close lifecycle are the only real
+    differences, and duplicating them reads better than a strategy callable threaded through
+    `Link`."""
 
     address: Address
-    """The address of the peer as seen through this session (dialed address for outbound,
-    accepted-from address for inbound). Same field name as `Link.address` so Peer.usable()
-    sorting stays type-agnostic."""
+    """The peer's address through this session. Same field name as `Link.address` so
+    `Peer.usable` sorting stays type-agnostic."""
 
     session: Session
     policies: tuple[Policy, ...] = ()
@@ -473,8 +432,8 @@ class SessionLink:
         return self.session.last_activity
 
     def _close(self) -> None:
-        """Idempotent. Called on transport-side death (Postman._on_session_close) or on
-        send-failure (from `send()`). Whichever fires first wins; the second is a no-op."""
+        """Idempotent -- transport-side death and send-side failure both reach here, and
+        whichever fires first wins."""
         if self._closed:
             return
         self._closed = True
@@ -507,12 +466,9 @@ def standard(
 
 
 class Diff(NamedTuple):
-    """What `Peer.reconfigure` changed.
-
-    A named record rather than a bare pair: the signature used to read
-    `tuple[tuple[Address, ...], ...]`, which says nothing about which side is which and lets a
-    caller unpack them backwards with no error. In Rust or Go a bare pair stays equally anonymous,
-    so naming it here is what makes the translation self-documenting."""
+    """What `Peer.reconfigure` changed. Named rather than a bare
+    `tuple[tuple[Address, ...], ...]`, which says nothing about which side is which and unpacks
+    backwards with no error."""
 
     added: tuple[Address, ...]
     removed: tuple[Address, ...]
@@ -522,20 +478,18 @@ class Diff(NamedTuple):
 class Peer:
     """One participant, and every path currently known to reach it.
 
-    This is where multi-homing lives, and it is a third object rather than a field on either
-    neighbour: a `Link` must not know about its siblings, and a `Mailbox` must not know about paths.
-    The tell that it was missing is that `RetryBudget` is peer-scoped while everything else in this
-    module is link-scoped, so it had nowhere to live but the caller.
+    Multi-homing lives here, in a third object: a `Link` must not know its siblings and a
+    `Mailbox` must not know about paths. The tell that it was missing is that `RetryBudget` is
+    peer-scoped while everything else in this module is link-scoped.
 
-    Three jobs, none of which belongs to a link or to a message: CHOOSE which links to use, STAGGER
-    attempts across them (R7), and decide whether an outcome is ATTRIBUTABLE to any one of them."""
+    Three jobs, none belonging to a link or a message: CHOOSE which links to use, STAGGER attempts
+    across them (R7), and decide whether an outcome is ATTRIBUTABLE to any one of them."""
 
     identity: crypto.PublicKey
     dial: Callable[[Endpoint], Transport]
-    """How to obtain a carrier for an endpoint. Takes the whole `Endpoint`, not just its address, so
-    a transport receives the manager's options for it — TLS material, a proxy, a mixnet profile —
-    without any of that being crammed into the locator string. Injected, so `Peer` needs no
-    transport registry and a test needs no transports at all."""
+    """How to obtain a carrier. Takes the whole `Endpoint` so a transport receives the manager's
+    options for it -- TLS material, a proxy, a mixnet profile -- rather than having them crammed
+    into the locator string. Injected, so a test needs no transports at all."""
 
     t: LinkTunables = field(default_factory=LinkTunables)
     links: dict[Address, Link] = field(default_factory=dict)

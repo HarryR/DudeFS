@@ -1,13 +1,11 @@
 # dude.net.transports.inproc — a paired loopback with the same shape as TCP.
 # See SPEC.md (#inproc-is-a-loopback, #partitions-are-test-only).
 #
-# What was here BEFORE the current split: a `Switchboard` object with shared inboxes and
-# a partition table — a routing table that duplicated what Postman was supposed to do,
-# plus test scaffolding smuggled into the transport. That defeated the point of InProc:
-# **everything above the carrier gets exercised for real**. A routing table on top of
-# the carrier meant Postman's own routing was untested.
+# THE POINT OF InProc is that everything above the carrier gets exercised for real. A
+# `Switchboard` with its own routing table and partition list used to sit here, which meant
+# Postman's routing -- the thing under test -- was the thing being bypassed.
 #
-# What's here NOW: TWO CONCRETE TYPES, mirroring the TCP shape:
+# TWO CONCRETE TYPES, mirroring the TCP shape:
 #
 #   InProcDialer   outbound only. Constructed by Postman via `transports.dial`, never by a caller.
 #                  `send(address, frame)` looks the target up in the module-scope
@@ -19,20 +17,15 @@
 #                  simplest possible way (no threads needed -- appends happen on the
 #                  send-side call), `stop()` unregisters, `drain()` returns buffered.
 #
-# Module-scope registry keyed by string name -- exactly the way TCP delegates to the
-# kernel's socket table. Nothing between InProc instances but the module.
+# Module-scope registry keyed by name -- the way TCP delegates to the kernel's socket table.
 #
-# SESSIONS. InProc is a single-process loopback; there is no persistent socket to wrap.
-# Every `InProcDialer.send()` call synthesises a fresh `InProcSession` on the listener side,
-# tags the delivered `Inbound(frame, session)` with it, and closes it once the frame is
-# consumed. That matches the "each frame arrives on a session" contract without pretending
-# InProc has connections it doesn't. Reply-on-session for InProc still works: the session's
-# `send()` looks the sender up in the registry and delivers back, symmetrically.
+# SESSIONS. There is no persistent socket to wrap, so a session is synthesised per sender on
+# the listener side and cached there. Reply-on-session works symmetrically: the session's
+# `send()` looks the sender up in the registry and delivers back.
 #
-# NO PARTITION LOGIC (#partitions-are-test-only). Tests simulate a partition by removing
-# the target from the sender's `postman.peers` via `Postman.remove_peer(pubkey)`;
-# symmetric partition removes on both sides. That IS what a partition looks like to the
-# protocol — the sender's routing table has no live path.
+# NO PARTITION LOGIC (#partitions-are-test-only). A test partitions by `remove_peer` on both
+# sides, which IS what a partition looks like to the protocol: no live path in the routing
+# table.
 
 from __future__ import annotations
 
@@ -48,18 +41,11 @@ from ..link import LinkError, Listener, Transport
 from ..session import Inbound, Session
 
 _INBOXES: dict[str, InProcListener] = {}
-"""Module-scope registry of live `InProcListener` instances, keyed by the listener's
-own name (from `name_of(identity)`). One entry per identity currently answering in
-this process. Registration happens in `InProcListener.__post_init__`; deregistration
-in `stop()`.
+"""Live `InProcListener` instances by name; one entry per identity answering in this process.
 
-Module-scope deliberately: there is one Python process, one in-process address space.
-Making it an object once created the illusion that multiple "networks" could coexist
-and forced every construction path to plumb the object through — plumbing that ended
-up nowhere near where the transport lived, defeating the point of #inproc-is-a-loopback.
-
-`_reset_for_tests()` clears it — a test-hook, used only in test setup/teardown when
-the registry might carry residual entries from a prior test."""
+Module-scope deliberately. Making it an object created the illusion that several "networks"
+could coexist, and forced every construction path to plumb it through -- plumbing that ended
+up nowhere near the transport, which defeats #inproc-is-a-loopback."""
 
 
 # --------------------------------------------------------------------------------------------- #
@@ -68,14 +54,8 @@ the registry might carry residual entries from a prior test."""
 
 
 class InProcSession(Session):
-    """A per-peer-pair reply channel wrapping an in-process delivery lane. `send()` looks
-    the peer up in `_INBOXES` and delivers a frame back via their `InProcListener`, tagging
-    the delivery with THIS session's owner name so the receiver can establish a reverse
-    session-Link. `close()` is a no-op (nothing to tear down).
-
-    Identity is bound at first inbound frame to the SENDER's public key (the same identity
-    whose `name_of()` matches `_reply_to`). The reply path is symmetric with the forward
-    path: same registry lookup, opposite direction, sender-name flipped."""
+    """A per-peer-pair reply channel over the loopback. The reply path is the forward path
+    with the sender-name flipped: same registry lookup, opposite direction."""
 
     __slots__ = ("_me", "_reply_to")
 
@@ -94,8 +74,8 @@ class InProcSession(Session):
         self.last_activity = now_ms()
 
     def close(self) -> None:
-        """No-op for InProc -- there is no persistent underlying connection to close. Fire
-        `on_close` for symmetry with TCPSession so the Postman.unregister path runs."""
+        """Nothing to tear down, but `on_close` still fires so the unregister path runs the
+        same way it does for a real socket."""
         if self.on_close is not None:
             self.on_close()
             self.on_close = None  # idempotent
@@ -111,15 +91,10 @@ class InProcSession(Session):
 
 @dataclass(slots=True)
 class InProcDialer(Transport):
-    """InProc's send side. Stateless -- `send(address, frame)` looks the target
-    `InProcListener` up in the module-scope `_INBOXES` registry and appends the frame
-    to that listener's buffer directly. No thread, no socket, no delay.
-
-    A `LinkError` from send means the target isn't registered (equivalent to
-    connection-refused on TCP); Postman's link/breaker handles it the same way.
-
-    `me` names the sender's own in-process address -- passed to the listener so a reply
-    on the resulting session goes to the right place (via `InProcSession`)."""
+    """InProc's send side. Stateless: look the target listener up in `_INBOXES` and append.
+    No thread, no socket, no delay. A `LinkError` means the target is not registered --
+    connection-refused, and the breaker treats it as such. `me` is our own in-process address,
+    carried so a reply on the resulting session knows where to go."""
 
     me: str
 
@@ -139,25 +114,12 @@ class InProcDialer(Transport):
 
 @dataclass(slots=True)
 class InProcListener(Listener):
-    """InProc's receive side. Registers itself in `_INBOXES` under `name_of(identity)`
-    at construction; other identities' `InProcDialer.send()` finds us via that key.
+    """InProc's receive side, registered in `_INBOXES` at construction. Two identities
+    colliding raises `LinkError`, the way TCP refuses two servers on one port.
 
-    Two driver paths, one implementation:
-
-      * PRODUCTION -- `start(inbox)` attaches a `SimpleQueue`; every subsequent
-        `_deliver()` push flushes both the internal buffer AND the inbox as
-        `Inbound(frame, session)`.
-      * TESTS -- `drain()` returns whatever's buffered internally right now,
-        non-blocking, no thread.
-
-    Unlike `TCPListener`, InProc has no background thread. Delivery happens on the
-    SENDER's call to `InProcDialer.send()`, in the sender's thread. `start(inbox)`
-    exists to match the `Listener` protocol so `Node.start(*listeners)` treats every
-    carrier uniformly; there's just no thread to spawn.
-
-    Constructing two `InProcListener` instances with the same identity raises
-    `LinkError` -- the registry rejects the collision, same as TCP would reject two
-    servers binding the same port."""
+    Two driver paths, one implementation: `start(inbox)` for production, `drain()` for tests.
+    No background thread either way -- delivery happens on the SENDER's call, in the sender's
+    thread. `start` exists so `Node.start(*listeners)` treats every carrier uniformly."""
 
     me: str
     _inbox_queue: queue.SimpleQueue[Inbound] | None = field(init=False, default=None)

@@ -1,23 +1,13 @@
-# dude.net.postman — the one impure object. See SPEC.md (#peer-not-path).
+# dude.net.postman — the one impure object. See SPEC.md (#peer-not-path, #postman-owns-dialling).
 #
-# WHY THIS EXISTS [H]: `Link`, `Peer` and `Mailbox` are each deliberately ignorant of the others'
-# domain (#peer-not-path), so something composes them — and it cannot be one of them. A mailbox
-# that drove peers would have to know about links and addresses, which is the exact separation the
-# split was drawn to get. So the composer is a fourth object rather than a promotion of a third.
-#
-# IT OWNS THE TWO THINGS NOTHING ELSE MAY:
+# `Link`, `Peer` and `Mailbox` are each ignorant of the others' domain, so the composer has to be
+# a fourth object rather than a promotion of a third. It owns the three things nothing else may:
 #
 #   the keypair   Restamping a retransmission means re-signing it. Keeping the signer here is what
-#                 lets `Mailbox` stay a pure data structure — it is TOLD which stamp was used
-#                 (`sent(..., ts=)`) rather than being able to produce one.
-#   the clock     Everything below takes `now` as a parameter. This is the only place a real clock
-#                 is read, which is why the whole stack under it replays deterministically.
-#   the carriers  Dial-side transports are CONSTRUCTED here (#postman-owns-dialling) from
-#                 `dude.net.transports.dial`, and the ones that also read are started and stopped
-#                 here. A caller never names a concrete carrier class.
-#
-# Sans-I/O core, one impure edge. Effects go out through transports; events come back in through
-# `deliver`.
+#                 lets `Mailbox` stay pure — it is TOLD which stamp was used, not able to make one.
+#   the clock     The only real clock read in the stack, which is why everything under it replays.
+#   the carriers  Dial-side transports are constructed, started and stopped here; a caller never
+#                 names a concrete carrier class.
 
 from __future__ import annotations
 
@@ -49,30 +39,23 @@ from .session import Inbound, Session
 
 
 def _no_dial(_endpoint: Endpoint) -> Transport:
-    """Sentinel `dial` for Peer entries that were only ever reached via inbound sessions.
-    A client with no roster row has no dialable endpoints; if code tries to add a dial-Link
-    via `Peer.reconfigure`, we raise loudly rather than silently returning None. If the peer
-    later becomes dialable (e.g. gets added to the roster), replace with a real dial by
-    calling `add_peer` -- which constructs a fresh Peer, currently; this sentinel only
-    protects the "session-only" invariant during that window."""
+    """`dial` for a peer only ever reached via an inbound session -- a client, which has no
+    roster row and so no dialable endpoint. Raises rather than returning None, so building a
+    dial-Link for one is loud instead of silently absent."""
     raise LinkError("peer is session-only; no dial capability configured")
 
 
 class PostmanError(DudeError):
-    """A misconfiguration Postman cannot recover from: a lifecycle call that contradicts an
-    earlier one. Not for peer-level failures (link down, breaker open) — those are policy
-    outcomes below Postman — and not for "no carrier for this scheme", which is a `LinkError`
-    from `transports.dial`, the same failure shape a caller already handles from `send`."""
+    """A lifecycle call that contradicts an earlier one. NOT peer-level failure (link down,
+    breaker open — policy outcomes below Postman), and NOT "no carrier for this scheme", which
+    is a `LinkError` from `transports.dial`: the shape a caller already handles from `send`."""
 
 
 class Recipient(Enum):
     """Where an outbound message goes. A `crypto.PublicKey` is a directed send; `ALL` is broadcast.
 
-    An enum-plus-union rather than `PublicKey | None` because `None` is exactly the "did you forget
-    a case" trap the codebase's closed enums exist to prevent (#no-exceptions-for-control-flow).
-
-    Lives here because expansion (`ALL` -> every known peer) is `Postman.recipients` -- Postman
-    owns the peer set and is the only object that can turn `ALL` into a concrete address list."""
+    An enum-plus-union rather than `PublicKey | None`: `None` is exactly the "did you forget a
+    case" trap the closed enums exist to prevent (#no-exceptions-for-control-flow)."""
 
     ALL = auto()
 
@@ -84,9 +67,9 @@ class Received(NamedTuple):
     """An accepted inbound envelope, plus the correlation result if it answered something
     outstanding.
 
-    `reply is None` means unsolicited — a request, or an answer to something already reaped. Named
-    rather than a bare pair, because two same-shaped optionals side by side is exactly the signature
-    a caller unpacks backwards."""
+    `reply is None` means unsolicited — a request, or an answer to something already reaped.
+    Named rather than a bare pair: two same-shaped optionals side by side is the signature a
+    caller unpacks backwards."""
 
     envelope: SignedEnvelope
     reply: Reply | None
@@ -96,17 +79,9 @@ class Received(NamedTuple):
 class Postman:
     """Drives the mailbox and the peers. Holds the keypair, reads the clock, performs the I/O.
 
-    Owns peer AND dial-side carrier lifecycle (#postman-owns-dialling). Callers register
-    endpoints via `add_peer(pubkey, endpoints)`; Postman asks `transports.dial` for the
-    carrier and constructs it. Nothing outside Postman writes to `peers`, and nothing
-    outside Postman names a concrete transport class.
-
-    THE LIFECYCLE IS HERE BECAUSE THE CARRIER IS. `TCPDialer` reads replies on the sockets
-    it opened, so it needs an inbox and a thread; whoever constructs it must therefore also
-    start it. That used to be the caller, which is why it had to construct it — the whole
-    reason `attach_transport` existed. Owning construction without owning the thread would
-    just move the knot. `start` / `stop` / `drain` mirror the `Listener` protocol on
-    purpose: `Node` starts its listeners and its Postman with the same inbox, in one call."""
+    Owns peer AND dial-side carrier lifecycle (#postman-owns-dialling): nothing outside writes
+    to `peers`, and nothing outside names a concrete transport class. `start` / `stop` / `drain`
+    mirror `Listener`, so a `Node` starts its listeners and its Postman with one inbox."""
 
     me: crypto.Keypair
     mailbox: Mailbox = field(default_factory=Mailbox)
@@ -125,26 +100,19 @@ class Postman:
     executor, and both now live in `Plan` where they can be tested without a socket."""
 
     _transports_by_scheme: dict[Scheme, Transport] = field(default_factory=dict, init=False)
-    """Cache of transports this Postman has already dialled, keyed by scheme. Some
-    transports (InProc, and typically a single TCP client) are one-per-Postman; the cache
-    reuses them across peers of the same scheme so `add_peer` for two peers on the same
-    scheme doesn't duplicate carrier state."""
+    """One carrier per scheme, reused across every peer on that scheme -- two peers over TCP
+    share one dialer rather than duplicating its socket cache and reader thread."""
 
     _inbox: queue.SimpleQueue[Inbound] | None = field(default=None, init=False)
-    """Where a reading carrier puts what arrives on a socket WE opened, set by `start`.
-    `None` until then — the deterministic test path never calls `start` and uses `drain`.
-
-    Held so that a carrier constructed AFTER `start` is started too. That ordering is the
-    normal one, not an edge case: a node starts before its first tick, and the first tick
-    is what reconciles the roster into peers, which is what dials anything at all."""
+    """Where a reading carrier puts what arrives on a socket WE opened; `None` until `start`
+    (the deterministic test path uses `drain` instead). HELD so a carrier built after `start`
+    is started too -- the normal ordering, since a node starts before its first tick and the
+    first tick is what reconciles the roster into peers, which is what dials anything."""
 
     def add_peer(self, pubkey: crypto.PublicKey, endpoints: tuple[Endpoint, ...]) -> None:
-        """Register or reconfigure a peer with `endpoints` we should try to reach it at.
-        Constructs any carrier not already cached, via `transports.dial`.
-        See #postman-owns-dialling.
-
-        Idempotent: adding a peer that already exists reconfigures its endpoints (which
-        preserves the surviving links' estimator/breaker state via `Peer.reconfigure`)."""
+        """Register or reconfigure a peer, building any carrier not already cached
+        (#postman-owns-dialling). Idempotent, and re-adding preserves surviving links'
+        estimator and breaker state via `Peer.reconfigure`."""
         peer = self.peers.get(pubkey)
         if peer is None:
             peer = Peer(pubkey, self._dial, self.link_tunables)
@@ -152,45 +120,29 @@ class Postman:
         peer.reconfigure(endpoints)
 
     def remove_peer(self, pubkey: crypto.PublicKey) -> None:
-        """Drop a peer from the routing table. Idempotent. Outbound messages already
-        queued for this peer will time out and reap normally — the Postman's tick loop
-        sees `peer = self.peers.get(...) is None` and lets the deadline handle it.
-
-        This is also the mechanism tests use to simulate a partition
-        (#partitions-are-test-only): remove the target from both sides."""
+        """Drop a peer from the routing table. Idempotent; anything already queued for it
+        reaps on its deadline. Removing on both sides is how a test simulates a partition
+        (#partitions-are-test-only)."""
         self.peers.pop(pubkey, None)
 
     def register_session(self, session: Session) -> None:
-        """Wrap `session` in a `SessionLink` and add it to the appropriate peer's session list.
-        Called by the dispatch layer immediately after `session.bind(env.frm)` succeeds on the
-        first inbound frame from a fresh accepted session, OR after a `dial()` succeeds and
-        the session's identity is known at construction time.
+        """Add `session` to its peer as a `SessionLink`. Called by dispatch once
+        `session.bind(env.frm)` has succeeded, so `session.identity` MUST already be set.
 
-        `session.identity` MUST be set before calling. Creates a Peer entry for identities not
-        already in `self.peers` (a client with no roster row still gets a Peer, populated only
-        with session-links -- no dial-Links until it's a roster member).
-
-        `session.on_close` is set to the SessionLink's `_close()`, so a transport-side close
-        (peer disconnected, socket died) fires the same removal path a send-failure would.
-        Idempotent-ish: if the session has already been registered for its current identity,
-        this is a no-op; register-again with a different identity is a bug and raises."""
+        An identity with no Peer gets one -- a client with no roster row is reachable by
+        session-link alone, and gains dial-Links only if it later joins the roster. Wiring
+        `session.on_close` to the link's `_close` is what makes a transport-side death and a
+        send-side failure converge on one removal path. Re-registering the same session is a
+        no-op."""
         if session.identity is None:
             raise PostmanError("register_session called before session.bind()")
         peer = self.peers.get(session.identity)
         if peer is None:
-            # Client (or otherwise not-in-roster identity): fresh Peer with no dial capability.
-            # If it later becomes a roster member, `add_peer` reconfigures endpoints and dial-Links
-            # appear alongside the existing session-Links -- reconfigure preserves state.
             peer = Peer(session.identity, _no_dial, self.link_tunables)
             self.peers[session.identity] = peer
-        # Check if already registered (idempotent path).
         for existing in peer.sessions:
             if existing.session is session:
                 return
-        # Session carries its own peer address (from accept-remote or dial-target); use it so
-        # `Peer.usable()` sorting can name the link. Sort_key isn't the primary axis for
-        # session-links (last_activity is), but consistency with dial-Link's address field
-        # keeps the API uniform.
         link = SessionLink(
             address=session.address,
             session=session,
@@ -227,8 +179,8 @@ class Postman:
         return peer.deliverable(now=0) or bool(peer.sessions) or bool(peer.links)
 
     def _on_session_link_closed(self, link: SessionLink) -> None:
-        """SessionLink hook: called from `SessionLink._close()` (either transport-side death via
-        `session.on_close` or send-side failure). Removes the link from its peer."""
+        """`SessionLink._close` hook -- transport-side death or send-side failure. Drops the
+        link from its peer."""
         identity = link.session.identity
         if identity is None:
             return
@@ -240,12 +192,11 @@ class Postman:
     # -- carrier lifecycle -------------------------------------------------------------------- #
 
     def start(self, inbox: queue.SimpleQueue[Inbound]) -> None:
-        """Begin reading replies on the sockets we dial. Every carrier that also reads gets
-        `start(inbox)` -- those already built now, those built later in `_dial`.
+        """Begin reading replies on the sockets we dial: every carrier that also reads gets
+        `start(inbox)`, those already built and those `_dial` builds later.
 
-        Same idempotence rule as `Listener.start`: the same inbox twice is a no-op, a
-        different one raises, because a Postman delivering into two inboxes is a node whose
-        frames arrive on whichever thread got there first."""
+        Same inbox twice is a no-op; a different one raises. A Postman delivering into two
+        inboxes is a node whose frames arrive on whichever thread got there first."""
         if self._inbox is inbox:
             return
         if self._inbox is not None:
@@ -256,12 +207,11 @@ class Postman:
                 transport.start(inbox)
 
     def stop(self) -> None:
-        """Shut every reading carrier down and forget the inbox. Idempotent, and
-        best-effort per carrier: this runs during shutdown, where there is nothing left to
-        escalate a failure to and stopping the rest still matters.
+        """Shut every reading carrier down and forget the inbox. Idempotent, best-effort per
+        carrier (nothing left to escalate to during shutdown, and stopping the rest matters).
 
-        The cache is NOT cleared -- links already built hold their transport directly, so
-        dropping our reference would not un-wire them, it would only let a later `_dial`
+        The cache is NOT cleared: links already built hold their transport directly, so
+        dropping our reference would not un-wire them -- it would only let a later `_dial`
         build a second carrier behind their backs."""
         self._inbox = None
         for transport in self._transports_by_scheme.values():
@@ -270,10 +220,9 @@ class Postman:
                     transport.stop()
 
     def drain(self) -> tuple[Inbound, ...]:
-        """Everything our reading carriers have buffered, non-blocking. The deterministic
-        test path: `start` need not have been called, and this is the dial-side twin of
-        pumping a `Listener`. A reply that came back on a socket we opened arrives here,
-        not at any listener (#session-first-reply)."""
+        """Everything our reading carriers have buffered, non-blocking; the dial-side twin of
+        pumping a `Listener`, and `start` need not have been called. A reply on a socket we
+        opened arrives HERE, not at any listener (#session-first-reply)."""
         out: list[Inbound] = []
         for transport in self._transports_by_scheme.values():
             if isinstance(transport, Listener):
@@ -328,30 +277,18 @@ class Postman:
 
     def deliver(self, frame: Frame, now: Millis) -> Received:
         """An inbound frame: the envelope to act on, plus the correlation result if it answered
-        something outstanding.
+        something outstanding. Refuses by raising (#be-strict).
 
-        The envelope is never `None` — the old signature said it might be, which was unreachable
-        since a frame that will not unseal or verify RAISES rather than returning.
+        THE SCREEN TAG IS CHECKED HERE, and was checked nowhere: transports never touch it, so
+        every junk frame paid for a full sealed-box attempt and a frame tagged for somebody else
+        was opened. It belongs here rather than in a carrier because this is the one door every
+        carrier comes through -- an obligation that differs per carrier is not an obligation.
 
-        Refuses by raising: strict in what we accept, and loudly (#be-strict).
-
-        THE SCREEN TAG IS CHECKED HERE, and it was checked nowhere `[H]`. `crypto.screen_tag` states
-        the intended flow — *"the sender keys on the target's identity; the receiver keys on its OWN
-        and compares"* — and names what it buys: a non-member knows no identity, so it cannot
-        forge a tag, and **garbage costs one hash** instead of an ECDH against an ephemeral key.
-        No layer performed the comparison: the transports never touch the tag, so every junk frame
-        paid for a full sealed-box attempt, and a frame tagged for somebody else was opened.
-
-        It belongs HERE rather than in a transport, because this is the one door every carrier comes
-        through — a check that lives in `InProc` is a check a socket transport would not have, and
-        an obligation that differs per carrier is not an obligation.
-
-        This is addressing, NOT authentication, and the two must not be confused: a matching tag
-        proves nothing about who sent the frame or what they may ask for (see
-        `test_the_tag_is_a_hint_and_authorises_nothing`), and everything that matters still happens
-        in `accept` after unsealing. Acting on a mismatch costs nothing even though the field is
-        unauthenticated: whoever can rewrite a tag in flight can drop the frame instead, so refusing
-        one grants an attacker no capability it lacked."""
+        It is ADDRESSING, NOT AUTHENTICATION. A matching tag proves nothing about who sent the
+        frame or what they may ask for (`test_the_tag_is_a_hint_and_authorises_nothing`);
+        everything that matters happens in `accept`, after unsealing. Acting on a mismatch is
+        still free despite the field being unauthenticated: whoever can rewrite a tag in flight
+        can drop the frame instead, so refusing one grants no capability it lacked."""
         if not frame.addressed_to(self.me.public):
             raise EnvelopeError("frame is not addressed to us (screen tag does not match)")
         env = frame.unseal(self.me)
@@ -378,10 +315,8 @@ class Postman:
             link.reply(now, reply.rtt)
 
     def recipients(self, target: Target) -> list[crypto.PublicKey]:
-        """Expand a `Target` into concrete peer keys, excluding ourselves. `Recipient.ALL` fans
-        out to every known peer; a specific key resolves to itself (empty if it happens to be
-        our own key). The one place `ALL` is turned into a concrete address list, because peers
-        live here."""
+        """Expand a `Target` into concrete peer keys, excluding ourselves. The one place `ALL`
+        becomes a concrete address list, because the peer set lives here."""
         if target is Recipient.ALL:
             return [p for p in self.peers if p != self.me.public]
         return [target] if target != self.me.public else []

@@ -1,6 +1,6 @@
 # dude.net.envelope — point-to-point message framing. See SPEC.md (#sign-then-seal).
 #
-# THREE LAYERS, and keeping them apart is the whole design [H]:
+# THREE LAYERS, and keeping them apart is the whole design:
 #
 #   inner     a signed transaction (or any authenticated artifact). Authenticates its AUTHOR.
 #             DISTRIBUTABLE — anyone may forward it, anyone may verify it.
@@ -14,12 +14,10 @@
 # layers answering two different questions, which is why the request gate authorises the envelope's
 # `frm` (the requester) and NEVER the artifact's author.
 #
-# THE TIMESTAMP IS GATED, AND THAT IS ITS PURPOSE [H]. Not a pre-signature DoS rung — that argument
-# fails, since an unauthenticated `ts` is forgeable and an authenticated one is read after the
-# crypto is already paid for. It is a PARTICIPATION gate: a node whose clock is outside the window
-# literally cannot hold a conversation, and because both ends check, it self-partitions
-# symmetrically. The door closes on defect. No accommodation exists for a broken clock, by decision
-# -- see #timing.
+# THE TIMESTAMP IS GATED, AND THAT IS ITS PURPOSE. Not a pre-signature DoS rung — an
+# unauthenticated `ts` is forgeable and an authenticated one is read after the crypto is paid for.
+# It is a PARTICIPATION gate: a node whose clock is outside the window cannot hold a conversation,
+# and because both ends check, it self-partitions. No accommodation for a broken clock (#timing).
 #
 # SIGN-THEN-SEAL, never the reverse: sealing after signing means an observer sees no identity at
 # all. Signing a ciphertext would leave the sender's key in the clear and leak the social graph.
@@ -41,25 +39,14 @@ class EnvelopeError(DudeError):
 class Verb(IntEnum):
     """What this message ASKS FOR — a closed enumeration, and one of exactly two in the protocol.
 
-    THE OTHER ONE IS NOT THIS ONE. Operation kinds (what an identity may *author* into the log,
-    `management.Grant.kinds`) are a different axis from request verbs (what an identity may *ask a
-    node to do*). They live at different layers, are gated by different signatures, and conflating
-    them would let "may write the data store" imply "may demand a state transfer". Two enumerations,
-    deliberately **[H]**.
+    THE OTHER ONE IS NOT THIS ONE. Operation kinds -- what an identity may *author* into the log,
+    `management.Grant.kinds` -- are a different axis from request verbs, what an identity may *ask
+    a node to do*. Different layers, different signatures, and conflating them would let "may write
+    the data store" imply "may demand a state transfer".
 
-    Closed rather than an open byte string for three reasons: the request gate must be able to
-    enumerate its domain to be auditable; a Rust or Go port gets exhaustive matching instead of a
-    default branch, and default branches are where two implementations quietly diverge; and it is a
-    small int on every message.
-
-    ADDING A VERB COSTS A CODE CHANGE AND NOTHING ELSE, at present `[H]`: *"there are no versions
-    yet, this is version -1."* There is no deployed peer to stay compatible with, so a new verb is
-    not a migration and needs no ceremony. Once there is one it becomes a version bump, which for a
-    permissioned system with a key-issuing manager is the correct cost — but pricing that in now
-    buys nothing, and has already made one decision look more expensive than it was.
-
-    The SHAPE still deserves care, for the reason above rather than for compatibility: a verb is a
-    closed enumeration two implementations must agree on exhaustively."""
+    Closed rather than an open byte string: the request gate must enumerate its domain to be
+    auditable, and a Rust or Go port gets exhaustive matching instead of a default branch -- which
+    is where two implementations quietly diverge."""
 
     # -- liveness ------------------------------------------------------------------------------- #
     PING = 1
@@ -168,14 +155,11 @@ class Envelope:
 
     Those two live on `SignedEnvelope`, because authorship and time arrive WITH the signature. Not
     tidiness: while `frm` sat here, an envelope could be attributed to anyone and `sign()` had to
-    check the attribution matched the key, raising if not. The check is gone because the state it
-    guarded is gone — you cannot claim to be someone else if there is nowhere to write the claim.
-    `Transaction` / `SignedTransaction` in `dude.store.ops` is the same split; this now matches it.
+    check the attribution matched the key. The check is gone because the state it guarded is gone
+    -- you cannot claim to be someone else if there is nowhere to write the claim.
 
-    POINT-TO-POINT, always. There is no broadcast address and no multicast form, because the
-    carrier may be broadcast while the *message* never is — a transport that reaches many is still
-    delivering a message to one named recipient (#transport-adds-no-trust). `to` is that
-    recipient's identity."""
+    POINT-TO-POINT, always. No broadcast address and no multicast form: the carrier may be
+    broadcast while the *message* never is (#transport-adds-no-trust)."""
 
     to: crypto.PublicKey
     verb: Verb
@@ -190,17 +174,13 @@ class Envelope:
     reply_ts: int = 0
     """The `ts` of the ATTEMPT this answers — TCP's Timestamps option (RFC 7323) in one field.
 
-    Without it, Karn's rule (#rtt-attribution) discards the RTT sample from anything sent more than
-    once,
-    which under multi-homing is most traffic: a reply arriving after attempts on two links tells you
-    nothing about either. Echoing the attempt's `ts` matches the reply to exactly ONE transmission,
-    and since each attempt went out on a known link, that recovers **both** the sample and the link.
+    Without it, Karn's rule (#rtt-attribution) discards the sample from anything sent more than
+    once -- under multi-homing, most traffic. Echoing the attempt's `ts` matches the reply to
+    exactly ONE transmission, and since each attempt went out on a known link, that recovers both
+    the sample and the link. It is what stops R7 being a measurement blind spot: without it, the
+    more paths you use the less you know about any of them.
 
-    So this is what stops R7 being a measurement blind spot — without it, the more paths you use the
-    less you know about any of them.
-
-    Note it lives HERE and not in the header: a value the author chose to carry, an echo of the
-    other party's stamp, not a claim about this hop."""
+    HERE and not in the header: an echo of the other party's stamp, not a claim about this hop."""
 
     def encode(self) -> bytes:
         """The envelope proper, as it appears inside the signed body."""
@@ -230,11 +210,9 @@ class Envelope:
         """Author this envelope, now. Authorship and time arrive together, so there is no window in
         which an envelope has one but not the other.
 
-        A RETRANSMIT IS A NEW MESSAGE: sign the same envelope again with a later `ts` and the frame
-        is freshly stamped and freshly signed. That is why the conversation window need never
-        stretch to cover retries — and why each attempt carries a DISTINCT `ts`, which is exactly
-        what lets a reply's `reply_ts` name one of them. It also replaces the old `at()`, which
-        existed only because `ts` used to sit on the unsigned half."""
+        A RETRANSMIT IS A NEW MESSAGE: sign the same envelope again with a later `ts`. That is why
+        the conversation window need never stretch to cover retries, and why each attempt carries a
+        DISTINCT `ts` -- which is what lets a reply's `reply_ts` name one of them."""
         return SignedEnvelope(kp.public, ts, self, kp.sign(_body_bytes(kp.public, ts, self)))
 
 
@@ -242,15 +220,12 @@ def _body_bytes(frm: crypto.PublicKey, ts: int, env: Envelope) -> bytes:
     """The canonical bytes a sender signs. Mirrors `ops._body_bytes(author, ts, steps)`.
 
     NESTED, so the two levels are visible on the wire as well as in the types: the header is this
-    hop's claim, the inner list is the envelope the author decided.
+    hop's claim, the inner list is what the author decided.
 
-    Everything here is signed, and that is load-bearing. `to` under the signature stops a valid
-    envelope being lifted and re-delivered to a different recipient, who would otherwise see a
-    correctly-signed message never addressed to them; the same argument covers `verb` and
-    `reply_to` — anything an unsigned copy would let an attacker change for free.
-
-    Shared between `Envelope.sign` (before the SignedEnvelope exists) and `SignedEnvelope._body`
-    (after) so the shape lives in one place."""
+    EVERYTHING here is signed, and that is load-bearing: `to` under the signature stops a valid
+    envelope being lifted and re-delivered to someone who would see a correctly-signed message
+    never addressed to them. Same argument for `verb` and `reply_to` -- anything an unsigned copy
+    would let an attacker change for free."""
     return codec.encode([frm, ts, env.encode()])
 
 

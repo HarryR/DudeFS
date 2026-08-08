@@ -1,15 +1,10 @@
 # dude.net.plan — retry, stagger and give-up policy. Pure. See SPEC.md (#retry-budget).
 #
-# THE INVARIANT THIS FILE EXISTS TO KEEP [H]: **no object both holds state and decides policy.**
-#
-# Retry is a decision about a MESSAGE informed by PATH state, so it belongs to neither the mailbox
-# nor the peer — put it in either and that object starts attracting the other's data, which is how
-# the selection logic ended up duplicated in `Mailbox` and `Peer`. Policy in a state-holding object
-# is magnetic.
-#
-# So: this module holds NOTHING. It is handed the facts and returns a decision. Backoff-with-jitter
-# (R5), the budget interaction (R6) and stagger timing (R7) are therefore testable as plain values,
-# with no mailbox, no clock and no sockets anywhere near them.
+# NO OBJECT BOTH HOLDS STATE AND DECIDES POLICY. Retry is a decision about a MESSAGE informed by
+# PATH state, so it belongs to neither the mailbox nor the peer — put it in either and that object
+# starts attracting the other's data, which is how the selection logic once ended up duplicated in
+# both. This module holds NOTHING: handed the facts, it returns a decision, so backoff-with-jitter
+# (R5), the budget interaction (R6) and stagger timing (R7) are testable as plain values.
 
 from __future__ import annotations
 
@@ -22,21 +17,14 @@ from ..core.units import Millis
 from .link import Estimator, Link, Peer, SessionLink
 
 type AnyLink = Link | SessionLink
-"""Either kind of link Peer.usable() may return -- dial-based `Link` or session-backed
-`SessionLink`. Both share the `send / reply / expired / available / find` shape, so `Plan`
-handles them uniformly without knowing which is which."""
+"""Either kind `Peer.usable` may return. Both share the send/reply/expired/available/find shape,
+so `Plan` handles them without knowing which is which."""
 
 
 class Stalled(Enum):
     """Why a message is not going out right now — closed, so the executor's `match` stays
-    exhaustive and a metric counting these cannot drift on a typo.
-    Plain `Enum`, deliberately NOT `StrEnum`: these never go on the wire, so the string would be a
-    value nobody marshals, and `StrEnum` members ARE `str`s — which is how a comparison across two
-    unrelated reason enums that happen to share a spelling came out True. Plain members compare
-    False against each other and against bare strings, so a stray `== "guard"` fails loudly instead
-    of silently passing. `StrEnum` is for values that are their own serialised form; `Scheme` and
-    `Role` earn it, this does not.
-    """
+    exhaustive and a metric counting these cannot drift on a typo. Plain `Enum`, not `StrEnum`,
+    for the reason given at `link.Refused`."""
 
     INVALID = "invalid"
     """RESERVED, and never returned by this package. Declared FIRST so that a port to Go — where

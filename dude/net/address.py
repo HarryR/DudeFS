@@ -1,15 +1,12 @@
 # dude.net.address — where a peer can be reached. See SPEC.md (#peer-not-path).
 #
 # The management store records addresses as opaque `bytes` and this module is the ONLY thing that
-# parses them (#transport-adds-no-trust: transport adds no trust, and carrier vocabulary must not
-# leak into the
-# log). So `store.management` can hold a locator for a carrier it has never heard of, and the log
-# stays free of transport concepts.
+# parses them (#transport-adds-no-trust), so the log can hold a locator for a carrier it has never
+# heard of and stays free of transport concepts.
 #
-# AN ADDRESS IS NOT AN IDENTITY. A peer IS its public key; an address is merely one place that key
-# might currently be answering. Multi-homing is therefore the normal case rather than a feature: a
-# node has several addresses, they change, and none of them authenticates anything. Every security
-# property comes from the envelope inside.
+# AN ADDRESS IS NOT AN IDENTITY. A peer IS its public key; an address is one place that key might
+# currently be answering. Multi-homing is the normal case, not a feature -- addresses change, and
+# none of them authenticates anything. Every security property comes from the envelope inside.
 
 from __future__ import annotations
 
