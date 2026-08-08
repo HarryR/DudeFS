@@ -1,12 +1,3 @@
-# dude.net — the wire. Three layers, kept apart (SPEC.md #transport-adds-no-trust).
-#
-#   inner     authenticated content, DISTRIBUTABLE  (dude.store.ops.SignedTransaction)
-#   envelope  one hop, sender-authenticated, addressed, correlated, timestamped and GATED
-#   sealing   transport confidentiality and nothing else
-#
-# Transports live below all three and add no trust whatsoever: a message is point-to-point even when
-# the carrier is broadcast.
-
 from .address import Address, AddressError, Scheme, parse_all
 from .envelope import (
     MESSAGE_ID_SIZE,

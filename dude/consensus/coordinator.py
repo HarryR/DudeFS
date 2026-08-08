@@ -1,31 +1,3 @@
-# dude.coordinator -- the per-node lifecycle for Mempool, Round, SettleRound and commit.
-#
-# WHAT IT OWNS. The collecting Mempool; the one in-flight Round; the one in-flight SettleRound
-# and the OPEN Layer previewing its slice (#one-of-each-in-flight). Also the bucket-boundary
-# swap, the RATIFIED -> SETTLED -> COMMIT sequencing, and the fall-through re-admission that
-# #endorser-refuses-stale requires.
-#
-# WHAT IT DOES NOT OWN: the Round and SettleRound protocols, the wire encodings, the transports,
-# and the log. This module composes them.
-#
-# THE L5 FLOW:
-#
-#     1. Round ratifies -> Block(bucket, slice_hash, hashes). The Round carries its own bodies,
-#        so no frozen Mempool is retained alongside it.
-#     2. Once the settle slot is free, promote: build the ordered slice, evaluate it into a
-#        Layer over the store, freeze, project Anchors, open a SettleRound.
-#     3. Drive that SettleRound on tick -- flush SETTLE_SIGs, check `settled()`.
-#     4. On SETTLED, commit the applied txs, CHECK the store's resulting anchors against the
-#        ones we signed (a mismatch means our evaluator was non-deterministic between preview
-#        and commit, so it is an InvariantError and not catchable), then re-admit what did not
-#        make it through the mempool's one door.
-#
-# THERE IS NO QUEUE. Only one Round is ever in flight, so a Block that ratifies while the settle
-# slot is busy simply waits in `current_round` until a later tick promotes it. Blocks therefore
-# settle in bucket order, which is a monotone-height requirement rather than a concurrency one.
-# Speculative pipelining over stacked Layers is the SPEC target (#pipelining-via-frozen-layers)
-# and is not built.
-
 from __future__ import annotations
 
 from collections.abc import Callable
@@ -50,162 +22,90 @@ from .settle_round import Anchors, SettleAdapterError, SettleRound, SettleSig, g
 
 @dataclass(slots=True)
 class _Settling:
-    """The one SettleRound currently in flight, along with everything needed to commit it."""
-
     bucket: Bucket
     block: Block
     layer: Layer
     applied: tuple[SignedTransaction, ...]
-    """Slice txs the preview accepted, in the order they will be committed."""
     dropped: tuple[SignedTransaction, ...]
-    """Slice txs the preview rejected (guard/authority failure against the pre-apply state).
-    These re-enter the current mempool on SETTLED, alongside `surviving`."""
     surviving: tuple[SignedTransaction, ...]
-    """Non-slice txs (held by Round but not included in the ratified slice). Re-enter the
-    current mempool on SETTLED via #fall-through-through-the-door, alongside `dropped`."""
     anchors: Anchors
-    """The anchors we signed. Compared to the SETTLED block's anchors -- a mismatch here would
-    mean our own evaluator produced different mutations between preview and commit, which is
-    non-determinism and MUST NOT be catchable as a routine error."""
     first_height: Index
-    """`store.head() + 1` at settle-start -- the log-idx the first tx of this block will land
-    at. Written into the block table so a joiner replaying via `bodies_of_block` fetches the
-    correct entry range without inferring the base offset from prior blocks."""
     settle_round: SettleRound
 
 
 @dataclass(slots=True)
 class Coordinator:
-    """One node's consensus + settlement driver.
-
-    Constructed once per node. Node hands it inbound HELD/SIG envelopes via `on_round_msg`,
-    inbound SETTLE_SIG envelopes via `on_settle_msg`, inbound SUBMITs via `submit`, and a tick
-    every round via `tick`."""
-
     me: crypto.Keypair
     store: Store
     adapter: RoundAdapter
     settle_adapter: SettleAdapter
     tunables: Tunables
     reflood: Callable[[SignedTransaction, Millis], None] | None = None
-    """Re-broadcast a fall-through tx after settlement.
-
-    Local re-admission (#fall-through-through-the-door) does NOT reach peers, and a tx only THIS
-    node holds cannot form a quorum in any future bucket -- so the body goes back out via SUBMIT,
-    restoring the shape re-flood established. Optional for tests; production always passes one."""
 
     mempool: Mempool = field(init=False)
     current_round: Round | None = field(init=False, default=None)
-    """The one in-flight Round (#one-of-each-in-flight). None between buckets. Holds the
-    Round from open through either ratification-and-promotion or abandonment. If a Round
-    ratifies while `settling` is still occupied, it stays here holding the ratified Block
-    until settling clears and promotion happens on the next tick -- no queue."""
     settling: _Settling | None = field(init=False, default=None)
-    """The one in-flight SettleRound (#one-of-each-in-flight). None between blocks. Clears
-    on either SETTLED (commit) or ABANDONED (fall-through)."""
     current_bucket: Bucket = field(init=False, default=-1)
-    """The bucket the currently-collecting mempool is for. `-1` means "no bucket yet"."""
 
     def __post_init__(self) -> None:
         self.mempool = Mempool(self.tunables.mempool)
 
     @property
     def mgmt(self) -> MgmtReader:
-        """Fresh per call: the store may have moved since last time. READ side only -- the
-        Coordinator authorises and reads the roster; it never composes a management tx."""
         return MgmtReader(self.store)
 
     def _bucket_of(self, now: Millis) -> Bucket:
         return self.tunables.mempool.bucket(now)
 
     def _close_by(self, now: Millis) -> Millis:
-        """When the Round opening at `now` should stop collecting and finalize. One bucket width
-        ahead -- enough for HELD to disseminate before finalize triggers on the next tick."""
         return now + self.tunables.mempool.delta
 
     def _abandon_by(self, close_by: Millis) -> Millis:
-        """Deadline for the Round opening now: `close_by + delta` -- one bucket width after
-        `close_by`, so the abandonment beat aligns with the next bucket boundary
-        (#one-of-each-in-flight). If still in FINALIZE at this point, abandon and push
-        everything back through the mempool door (#endorser-refuses-stale +
-        #fall-through-through-the-door)."""
+        """The abandonment beat MUST land on a bucket boundary, or the pipeline stages drift out
+        of phase and blocks queue behind `settling`."""
         return close_by + self.tunables.mempool.delta
 
     def _settle_abandon_by(self, now: Millis) -> Millis:
-        """Deadline for the SettleRound opening now: `now + delta` -- one bucket after the
-        Round ratified. Aligns settlement to the same beat as Round (#one-of-each-in-flight),
-        so the pipeline advances one stage per bucket boundary and no queue forms behind
-        `settling`. If no quorum by then, ABANDONED; slice txs re-enter the mempool via
-        fall-through, block position frees for the next Round's Block."""
         return now + self.tunables.mempool.delta
 
-    # -- inbound ----------------------------------------------------------------------------- #
-
     def submit(self, tx: SignedTransaction, now: Millis) -> Refusal | None:
-        """A client transaction offered to this node. Admits to the currently-live Mempool."""
         return self.mempool.admit(tx, now, self.store, self.mgmt)
 
     def on_round_msg(self, env: SignedEnvelope, now: Millis) -> None:
-        """A HELD or SIG envelope from a peer. Route to the in-flight Round if its bucket
-        matches, drop otherwise. Under #one-of-each-in-flight there is exactly one Round in
-        flight at a time; a message for a different bucket is either a stragler from a
-        past-done bucket or gossip from a peer ahead of us.
-
-        ADVANCES STATE TO `now` FIRST. A peer's message is itself evidence wall-clock has
-        crossed, and dropping consists of dispatching by bucket, so `current_round` must
-        reflect the bucket the driver would have opened at `now`. `_close_current_bucket`
-        alone is not enough here: opening the next Round requires the previous one to have
-        cleared (ratified + promoted, or abandoned), which in turn needs `current_round.tick`
-        and possibly `_on_round_abandoned`. `self.tick(now)` is the full atomic state
-        advancement -- microseconds when nothing needs to change, only invoked for Round
-        messages (not every frame). See CLAUDE.md note 9."""
+        """MUST advance state to `now` before dispatching. Dispatch routes on `current_round`'s
+        bucket, so a peer's HELD/SIG arriving in the gap before our own scheduled tick was
+        dropped as "no matching Round" -- every node signed empty slices on buckets the whole
+        cluster held the same tx for, and it looked like packet loss at every layer."""
         try:
             bucket = RoundMsg.bucket_of(env.env.body)
         except RoundAdapterError:
-            return  # malformed body, dropped
+            return
         self.tick(now)
         r = self.current_round
         if r is None or r.bucket() != bucket:
-            return  # no matching Round: truly past or truly future -- routine
+            return
         try:
             self.adapter.deliver(env, r, now)
         except RoundAdapterError:
-            return  # malformed body, dropped
+            return
 
     def on_settle_msg(self, env: SignedEnvelope, now: Millis) -> None:
-        """A SETTLE_SIG envelope from a peer. Route to the currently-settling block if the
-        slice_hash matches, drop otherwise. If we are behind (peer's slice is for a bucket we
-        have not ratified yet), the sig is dropped -- gossip will catch us up naturally when
-        we ratify our own view of that bucket.
-
-        Same state-advancement contract as `on_round_msg`: `self.tick(now)` before dispatch,
-        so a SettleSig arriving just after our Round B ratified but before our scheduled tick
-        promoted it into the settling slot lands in the block that's now there."""
         try:
             sh = SettleSig.slice_hash_of(env.env.body)
         except SettleAdapterError:
             return
         self.tick(now)
         if self.settling is None or self.settling.block.slice_hash != sh:
-            return  # not for the block we are settling
+            return
         try:
             self.settle_adapter.deliver(env, self.settling.settle_round, now)
         except SettleAdapterError:
             return
 
-    # -- the driver -------------------------------------------------------------------------- #
-
     def tick(self, now: Millis) -> None:
-        """Advance the three-stage pipeline -- Mempool collecting, Round agreeing, Settle
-        settling, one of each (#one-of-each-in-flight). Each stage takes ~one bucket width, and
-        a bucket boundary advances all three: Settle finishes, the ratified Block promotes into
-        the freed slot, the Mempool freezes into a fresh Round, a new Mempool opens."""
         if self.current_bucket < 0:
             self.current_bucket = self._bucket_of(now)
 
-        # Advance the in-flight Settle. Its abandon_by aligns with the next bucket boundary,
-        # so at tick-time it is either SETTLED (commit) or transitions to ABANDONED (fall-
-        # through) exactly when we need the slot for the next promotion.
         if self.settling is not None:
             self.settling.settle_round.tick(now)
             self.settle_adapter.flush(self.settling.settle_round, now)
@@ -214,19 +114,12 @@ class Coordinator:
             elif self.settling.settle_round.abandoned():
                 self._on_settle_abandoned(now)
 
-        # Advance the in-flight Round. Same cadence: abandon_by hits at the next bucket
-        # boundary. On ratification the Block will promote to the (now-cleared) settle slot
-        # below; on abandon its held txs re-enter the mempool.
         if self.current_round is not None:
             self.current_round.tick(now)
             self.adapter.flush(self.current_round, now)
             if self.current_round.abandoned():
                 self._on_round_abandoned(now)
 
-        # Promote a ratified Round to the settling slot if both are available. If the Round
-        # ratified while settling was still busy (early-ratify + slow-settle), promotion
-        # waits until this tick when settling has cleared -- no queue is needed because
-        # only one Round is ever in flight at a time.
         if (
             self.current_round is not None
             and self.current_round.ratified() is not None
@@ -234,35 +127,9 @@ class Coordinator:
         ):
             self._promote_to_settling(now)
 
-        # Freeze mempool + open the next Round. See `_close_current_bucket` for why the
-        # primitive is factored: `on_round_msg` calls it too, so a peer's HELD/SIG that
-        # arrives before our own scheduled tick still lands in an open Round.
         self._close_current_bucket(now)
 
     def _close_current_bucket(self, now: Millis) -> None:
-        """Freeze the current mempool, install a fresh one, open the next Round -- the atomic
-        primitive for advancing `(mempool, current_bucket, current_round)`.
-
-        Callable from any path that has learned wall-clock has crossed `current_bucket + 1`'s
-        start. Two such paths exist:
-          * the scheduled `tick(now_ms())`, and
-          * `on_round_msg` receiving a HELD/SIG for a bucket ahead of ours -- a peer's message
-            is proof at least one node has crossed, and under the clock-skew bound we must
-            have too.
-
-        Naming the primitive is what keeps the two callers from drifting: an unnamed atomic
-        sequence has one caller by accident, a named one has any caller with the same
-        standing (CLAUDE.md trap 9). Before this was factored, HELD/SIG arriving in the
-        ~tick_interval gap before our tick opened the matching Round was silently dropped as
-        "no matching Round" and every node signed empty slices on buckets the whole cluster
-        held the same tx for.
-
-        NO-OP when caught up, or when a Round is still in flight -- #one-of-each-in-flight
-        means Round B+1 waits for Round B to clear (ratify + promote to settling, or abandon).
-        Safe to call speculatively; the guards make repeated calls at the same `now` idempotent.
-
-        ATOMIC by construction: the three steps run inside one method call under Python's GIL,
-        no observer sees a torn intermediate. A threaded port takes one lock around the body."""
         while self.current_bucket < self._bucket_of(now) and self.current_round is None:
             frozen = self.mempool
             self.mempool = Mempool(self.tunables.mempool)
@@ -270,23 +137,10 @@ class Coordinator:
             self.current_bucket += 1
 
     def _open_round(self, bucket: Bucket, frozen: Mempool, now: Millis) -> None:
-        """Instantiate a Round for `bucket`, seed it with the transactions the frozen Mempool
-        held.
-
-        Bodies flow into Round via `add_local(all_bodies)`, not just hashes -- Round carries
-        the SignedTransactions itself so possession is structural and the slice we sign is by
-        construction backed by txs we can produce for settlement.
-
-        SKIPS QUIETLY if we are not in the roster. A follower-only node (a fresh joiner, a
-        node granted read-only membership, a node whose stake in the roster has been removed
-        pending re-onboarding) still ticks the coordinator every cycle but MUST NOT try to
-        open a Round it cannot participate in -- Round refuses `me not in roster` at
-        construction, and the exception would tear down the node's tick. Correct behaviour is
-        to sit out consensus and let the Follower catch us up; if a subsequent block grants
-        us into the roster, the next bucket boundary opens a Round normally."""
         roster = self.mgmt.roster()
         if self.me.public not in roster:
-            return
+            return  # follower-only: Round refuses `me not in roster`, and the raise would tear
+            # down the node's tick. Sit out consensus and let the Follower catch us up.
         close_by = self._close_by(now)
         r = Round(
             bucket=bucket,
@@ -301,13 +155,8 @@ class Coordinator:
         self.adapter.flush(r, now)
 
     def _on_round_abandoned(self, now: Millis) -> None:
-        """The in-flight Round timed out without ratifying. Every tx it held goes back through
-        the mempool door -- some re-enter for a later bucket, some are past-`w_valid` and get
-        refused there (#endorser-refuses-stale + #fall-through-through-the-door). Clears
-        `current_round` so the next bucket boundary can open a fresh Round
-        (#one-of-each-in-flight)."""
         r = self.current_round
-        if r is None:  # unreachable: caller only calls when current_round exists
+        if r is None:
             raise InvariantError("_on_round_abandoned called with no in-flight Round")
         for tx in r.surviving():
             refusal = self.mempool.admit(tx, now, self.store, self.mgmt)
@@ -316,12 +165,8 @@ class Coordinator:
         self.current_round = None
 
     def _promote_to_settling(self, now: Millis) -> None:
-        """Move the ratified Block out of `current_round` and into a fresh SettleRound in the
-        `settling` slot (#one-of-each-in-flight). Clears `current_round` so the next bucket
-        boundary opens a new one. Builds the Layer preview, computes anchors, constructs the
-        SettleRound with its own abandon_by (one bucket ahead), emits our own SettleSig."""
         r = self.current_round
-        if r is None:  # unreachable: caller only calls when current_round exists
+        if r is None:
             raise InvariantError("_promote_to_settling with no in-flight Round")
         block = r.ratified()
         if block is None:
@@ -331,26 +176,16 @@ class Coordinator:
         surviving = r.surviving()
         self.current_round = None
 
-        # Filter already-settled txs. Round does not check log state -- it ratifies over
-        # mempool hashes -- so a slice may contain a tx that has already landed in the log
-        # via an earlier bucket's settlement. `store.apply` drops these at commit time
-        # (op_hash UNIQUE), and if the preview counted them in `applied`, the projected
-        # height would exceed what actually commits -- signing anchors nobody can reproduce.
         already = self.store.settled_hashes(tuple(tx.op_hash for tx in slice_txs))
         slice_txs = tuple(tx for tx in slice_txs if tx.op_hash not in already)
 
-        # Preview the slice into an OPEN Layer over Store.
         layer = Layer(self.store)
         screened = settle.apply_to(layer, slice_txs, self.mgmt)
         applied = screened.survivors
         dropped_from_slice = tuple(rej.tx for rej in screened.rejects)
 
-        # Freeze the layer -- projected anchors are stable now.
         layer.freeze()
 
-        # Compute anchors. `height` = store.head after this block commits (log-idx of last tx).
-        # `block_num` = monotone per-block counter, prior + 1 (or 1 for the first ever block).
-        # A_log projected by adding log_element for each applied tx at its future settled index.
         base_head = self.store.head()
         height = base_head + len(applied)
         prev_block_num = self.store.head_block_num() or 0
@@ -358,10 +193,6 @@ class Coordinator:
         acc_log = self.store.log_accumulator()
         for i, tx in enumerate(applied):
             acc_log = crypto.acc_add(acc_log, log_element(base_head + i + 1, tx.op_hash))
-        # Chain link. `prev_block` is `H(prev_settled_block.encode())` -- the previous SETTLED
-        # block's hash -- or the genesis stamp for block 1 (#genesis-stamp-anchors-the-chain).
-        # `head_block_hash` returns None on the first settlement of an empty store; that is the
-        # only case genesis applies.
         prev = self.store.head_block_hash()
         if prev is None:
             manager = self.store.anchor()
@@ -377,10 +208,6 @@ class Coordinator:
             acc_log=acc_log,
         )
 
-        # Construct SettleRound. It signs its own anchors and queues its own SettleSig.
-        # abandon_by is one bucket ahead of now per _settle_abandon_by; aligns with the
-        # pipeline cadence per SPEC anchor one-of-each-in-flight; if quorum does not
-        # converge in that window the Settle abandons and the slice txs re-enter the mempool.
         sr = SettleRound(
             block,
             self.me,
@@ -400,27 +227,17 @@ class Coordinator:
             first_height=base_head + 1,
             settle_round=sr,
         )
-        # Emit our own SettleSig immediately so peers can start counting toward quorum.
         self.settle_adapter.flush(sr, now)
 
     def _on_settled(self, now: Millis) -> None:
-        """A quorum has agreed on our anchors. Commit the applied slice txs to Store atomically
-        with the SETTLED block bytes, safety-check that Store's post-apply anchors match what we
-        signed, re-admit fall-through txs, clear the settling slot."""
         s = self.settling
         if s is None:
             raise InvariantError("_on_settled called with no settling slot")
 
-        # The SettledBlock is what the quorum agreed on. Its bytes go in the same SQL
-        # transaction as the tx applies (#atomic-write): a crash between the two would leave
-        # entries with no block record and sync could not serve them.
         settled = s.settle_round.settled()
         if settled is None:
             raise InvariantError("_on_settled fired but SettleRound has no SettledBlock")
         block_bytes = settled.encode()
-        # block_hash is SIG-INDEPENDENT (chain identity, not wire-bytes hash) -- see
-        # SettledBlock.block_hash. Two nodes with the same slice + anchors compute the same
-        # hash regardless of which sig subset they hold.
         block_hash = settled.block_hash
         self.store.commit_block(
             s.anchors.block_num,
@@ -431,16 +248,8 @@ class Coordinator:
             auth=self.mgmt,
         )
 
-        # Safety-check: Store's post-apply anchors must match what we signed. If they do not,
-        # our evaluator is non-deterministic between preview and commit -- a bug of ours.
-        # InvariantError, per #failure-domains, so no `except DudeError` can swallow it.
         _expect_anchors(s.anchors, self.store)
 
-        # Re-admit surviving + slice-dropped txs through the one admission door, and re-broadcast
-        # each so peers hold them too -- otherwise a tx that only this node carried after
-        # ratifying an empty slice would stay isolated for every future bucket. Sources: Round's
-        # `surviving()` (bodies held-but-not-included) + the settle preview's own `dropped`
-        # (slice txs whose guards falsified against the pre-apply state).
         for tx in (*s.surviving, *s.dropped):
             refusal = self.mempool.admit(tx, now, self.store, self.mgmt)
             if refusal is None and self.reflood is not None:
@@ -449,20 +258,8 @@ class Coordinator:
         self.settling = None
 
     def _on_settle_abandoned(self, now: Millis) -> None:
-        """The in-flight SettleRound timed out without quorum on anchors (#one-of-each-in-flight
-        + #settlement-may-hang). No block commits. Every tx the Settle previewed goes back
-        through the mempool door -- both `applied` (accepted by the preview evaluator) and
-        `dropped` (rejected by the preview) -- because NONE of them actually landed in the
-        log. Same fall-through as SETTLED, minus the commit.
-
-        Also re-admits `surviving` (Round-held txs that were never in the slice) because the
-        Round handed them to us and we'd otherwise lose them.
-
-        Slot clears; next tick's promotion opens the next Round's Block for a fresh attempt
-        at the same block position (the eventual SETTLED block claims `block_num = head+1`,
-        which does not advance across abandonment)."""
         s = self.settling
-        if s is None:  # unreachable: caller only calls when settling exists
+        if s is None:
             raise InvariantError("_on_settle_abandoned called with no settling slot")
         for tx in (*s.applied, *s.dropped, *s.surviving):
             refusal = self.mempool.admit(tx, now, self.store, self.mgmt)
@@ -472,10 +269,6 @@ class Coordinator:
 
 
 def _expect_anchors(signed: Anchors, store: Store) -> None:
-    """Store's post-apply anchors MUST match what we signed. Any mismatch means our evaluator
-    produced different mutations between preview and commit -- non-determinism we cannot
-    tolerate. InvariantError, so it terminates the process rather than getting caught at the
-    crash-only boundary (#failure-domains)."""
     if store.head() != signed.height:
         raise InvariantError(f"post-settle head {store.head()} != signed height {signed.height}")
     if store.state_root() != signed.state_root:
@@ -483,4 +276,6 @@ def _expect_anchors(signed: Anchors, store: Store) -> None:
     if store.accumulator() != signed.acc_state:
         raise InvariantError("post-settle A_state differs from signed anchors")
     if store.log_accumulator() != signed.acc_log:
+        # NOT catchable: a mismatch means our evaluator produced different mutations between
+        # preview and commit, which is non-determinism, not a peer's fault.
         raise InvariantError("post-settle A_log differs from signed anchors")

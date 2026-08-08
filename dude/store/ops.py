@@ -1,33 +1,3 @@
-# dude — the operation vocabulary. See SPEC.md (#one-write-vocabulary).
-#
-# The whole write surface, and it is deliberately this small (#one-write-vocabulary, RISC not CISC):
-#
-#   mutations   set(name, value) | del(name)                     1.4
-#
-# NAMES ARE ARBITRARY-LENGTH BYTES. A 32-byte derived token (crypto.NameToken) is the DATA-STORE
-# CONVENTION, not a store-level constraint: the management store holds cleartext paths like
-# b"node/<pubkey>" because #management-is-cleartext makes control operations readable, and because a
-# node must be
-# able to ENUMERATE node records by prefix — neither of which works with opaque fixed-width digests.
-#   predicates  absent(store, name) | holds(store, name, digest)  1.6b
-#   the step    Step(guards, mutation) — a write CARRYING its guards    1.4
-#   the unit    Transaction — an ORDERED LOG of steps, composable       1.4a
-#               SignedTransaction — the same, authored and signed
-#
-# Anything compound is a transaction of these, never a new operation kind. There is no add_node,
-# no rotate, no remove_node — each of those is N primitives in one atomic transaction.
-#
-# A PREDICATE CARRIES ITS OWN STORE, so a transaction may read one store while writing another —
-# a data write conditional on management state, for instance. Reads are open; the ACL governs
-# WRITES (#coarse-acl). And a key's identity is the PAIR (store, name): the same name token in two
-# stores is two different keys, which is why `effects` and `reads` are keyed by the pair.
-#
-# WHAT AN AUTHOR SIGNS, and what it cannot: the author signs its content — store, timestamp,
-# predicates, mutations. It does NOT sign its position, because a settled index does not exist
-# until the batch settles (#position-is-not-authored). Chain pointers and the settled index are
-# attached by
-# settlement and live beside the entry, never inside its signature (11.2b).
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -36,31 +6,14 @@ from ..core import codec, crypto
 from ..core.errors import DudeError
 
 
-class OpError(DudeError):
-    """A malformed operation: bad arity, unknown tag, wrong field type. Hostile input at a decode
-    boundary is EXPECTED input (see crashonly.py), so it is typed rather than an untyped crash."""
+class OpError(DudeError): ...
 
-
-# --------------------------------------------------------------------------- #
-# Stores — the coarse ACL domain (#coarse-acl). A small cleartext integer, so a   #
-# node can check `author may write store` without ever seeing a key.           #
-# --------------------------------------------------------------------------- #
 
 STORE_MANAGEMENT = 0
-STORE_DATA = 1  # 1+ are data stores
+STORE_DATA = 1
 
-# There is deliberately NO compaction store (#coarse-acl): compaction is behind-the-scenes storage
-# machinery, not an ACL domain, and no client write can address it. The compactor's grant is over
-# an operation KIND, not a store.
-
-
-# --------------------------------------------------------------------------- #
-# Mutations                                                                    #
-# --------------------------------------------------------------------------- #
 
 EPOCH_NONE = 0
-"""Not encrypted under any keyepoch — management rows, and anything else with no key to retire.
-Epochs are minted from 1, so a zero here is a statement rather than a missing field."""
 
 _SET = b"s"
 _DEL = b"d"
@@ -68,22 +21,10 @@ _DEL = b"d"
 
 @dataclass(frozen=True, slots=True)
 class Set:
-    """Write `value` at `name` in `store`. `value` is ciphertext to everyone below the client
-    (#per-item-key); `store` is cleartext so authority is checkable blind (9.3b)."""
-
     store: int
     name: bytes
     value: bytes
     epoch: int = EPOCH_NONE
-    """Which keyepoch `value` is encrypted under (#conveyor).
-
-    CLEARTEXT, and it has to be: retention is refcounted over live values (#wrapped-masters), and a
-    node that cannot decrypt must still be able to count. Putting it inside the AEAD would make the
-    refcount underivable and key death impossible.
-
-    The leak is therefore forced rather than chosen — which epoch a value sits under is public, so
-    roughly when it was last written or conveyed is public. That belongs on the closed leakage
-    list, not in a footnote."""
 
     def encode(self) -> list:
         return [_SET, self.store, self.name, self.value, self.epoch]
@@ -91,10 +32,6 @@ class Set:
 
 @dataclass(frozen=True, slots=True)
 class Del:
-    """Remove `name`. A DISTINCT primitive, not `set(name, b"")` — #one-write-vocabulary keeps
-    *absent* and
-    *holds empty bytes* different facts, and collapsing them makes the difference unstateable."""
-
     store: int
     name: bytes
 
@@ -119,18 +56,12 @@ def _mutation_from(v: codec.Bencodable) -> Mutation:
     raise OpError(f"unknown mutation tag {tag!r}")
 
 
-# --------------------------------------------------------------------------- #
-# Predicates (#predicates — v1 is these two)                                     #
-# --------------------------------------------------------------------------- #
-
 _ABSENT = b"a"
 _HOLDS = b"h"
 
 
 @dataclass(frozen=True, slots=True)
 class Absent:
-    """`name` has no value in `store`. Distinct from holding empty bytes."""
-
     store: int
     name: bytes
 
@@ -140,12 +71,6 @@ class Absent:
 
 @dataclass(frozen=True, slots=True)
 class Holds:
-    """`name` holds a value whose ciphertext digests to `digest`.
-
-    The author QUOTES a fingerprint of the bytes it read — it never derives what the ciphertext
-    ought to be (#random-nonce). That is what lets the nonce be random, so a key's value cardinality
-    is not observable, while a node still evaluates the predicate by comparison alone."""
-
     store: int
     name: bytes
     digest: crypto.Digest
@@ -174,27 +99,11 @@ def _predicate_from(v: codec.Bencodable) -> Predicate:
 
 
 def value_digest(ciphertext: bytes) -> crypto.Digest:
-    """The fingerprint a `Holds` predicate quotes. One place, so a predicate written by a client
-    and evaluated by a node cannot disagree about what was digested."""
     return crypto.h(ciphertext)
-
-
-# --------------------------------------------------------------------------- #
-# Transaction — the atomic unit (#last-write-wins)                                    #
-# --------------------------------------------------------------------------- #
 
 
 @dataclass(frozen=True, slots=True)
 class Step:
-    """One mutation and the guards that must hold **immediately before it**.
-
-    #one-write-vocabulary says a write *carries* its predicates, and the attachment is the point. A
-    transaction is a LOG of steps, evaluated in sequence exactly as if each were applied
-    directly to the store, so step N's guards see steps 1..N-1. Hoisting every guard up to
-    the transaction gives a second model with different behaviour from the store's — which
-    is how "set A, then act on what A now is" becomes inexpressible, and two models with
-    different behaviour is one model too many."""
-
     guards: tuple[Predicate, ...]
     mutation: Mutation
 
@@ -209,18 +118,6 @@ class Step:
 
 @dataclass(frozen=True, slots=True)
 class Transaction:
-    """An **ordered log of guarded steps**. Unsigned, store-agnostic, composable.
-
-    Atomic (#last-write-wins): invalidated if any constituent cannot be applied — for any
-    reason, authority
-    included — so it lands whole or not at all, across however many stores it touches.
-
-    Evaluated with in-transaction read-uncommitted isolation, against a `store.Layer`. That is what
-    makes *authorise → use the authorisation → revoke it* expressible as ONE atomic unit.
-
-    **Composable**: `a + b` concatenates the logs. Only defined on UNSIGNED transactions — signing
-    yields a different type, so adding to a signed one is a type error rather than a warning."""
-
     steps: tuple[Step, ...] = ()
 
     def __add__(self, other: Transaction) -> Transaction:
@@ -229,12 +126,9 @@ class Transaction:
         return Transaction(self.steps + other.steps)
 
     def then(self, mutation: Mutation, *guards: Predicate) -> Transaction:
-        """Append one guarded step; reads left-to-right in order of application."""
         return Transaction((*self.steps, Step(tuple(guards), mutation)))
 
     def sign(self, kp: crypto.Keypair, ts: int) -> SignedTransaction:
-        """Bind an identity and a clock, and sign. `ts` is the author's own clock (#buckets) — the
-        bucket follows from it, so it is signed content."""
         return SignedTransaction(
             kp.public, ts, self, kp.sign(_body_bytes(kp.public, ts, self.steps))
         )
@@ -248,27 +142,21 @@ class Transaction:
         return tuple(g for st in self.steps for g in st.guards)
 
     def writes(self) -> tuple[tuple[int, bytes], ...]:
-        """Every `(store, key)` written, in order."""
         seen: dict[tuple[int, bytes], None] = {}
         for m in self.mutations:
             seen.setdefault((m.store, m.name), None)
         return tuple(seen)
 
     def reads(self) -> tuple[tuple[int, bytes], ...]:
-        """Every `(store, key)` a guard depends on."""
         seen: dict[tuple[int, bytes], None] = {}
         for g in self.guards:
             seen.setdefault((g.store, g.name), None)
         return tuple(seen)
 
     def stores(self) -> frozenset[int]:
-        """Every store written. Authority is per-step against the evolving state, not once against
-        this set — but the set is what a mempool screens on cheaply (#coarse-acl)."""
         return frozenset(st for st, _ in self.writes())
 
     def effects(self) -> dict[tuple[int, bytes], crypto.Digest | None]:
-        """Post-state per `(store, key)`: a digest if present, `None` if absent. Later steps win,
-        because the log is ordered (#last-write-wins)."""
         out: dict[tuple[int, bytes], crypto.Digest | None] = {}
         for m in self.mutations:
             out[(m.store, m.name)] = value_digest(m.value) if isinstance(m, Set) else None
@@ -276,27 +164,15 @@ class Transaction:
 
 
 def writes(*mutations: Mutation) -> Transaction:
-    """A transaction of unguarded writes — the common shape for an API emitting a fragment."""
     return Transaction(tuple(Step((), m) for m in mutations))
 
 
 def _body_bytes(author: crypto.PublicKey, ts: int, steps: tuple[Step, ...]) -> bytes:
-    """The canonical bytes an author signs. Position is absent by construction: a settled index does
-    not exist yet, and reaching for one is #position-is-not-authored's bug.
-
-    Shared between `Transaction.sign` (before the SignedTransaction exists) and
-    `SignedTransaction._body` (after) so the shape lives in one place."""
     return codec.encode([author, ts, [st.encode() for st in steps]])
 
 
 @dataclass(frozen=True, slots=True)
 class SignedTransaction:
-    """A transaction bound to an author and a clock, and signed. The wire and log form.
-
-    A different type from `Transaction` rather than the same type with an optional signature:
-    "maybe signed" is an ambiguous `None` standing in for two states, the shape that produced the
-    previous package's worst safety bug. An unsigned value cannot reach `Store.apply`."""
-
     author: crypto.PublicKey
     ts: int
     txn: Transaction
@@ -308,8 +184,6 @@ class SignedTransaction:
 
     @property
     def _body(self) -> bytes:
-        """The canonical bytes THIS signature covers -- what `verify` checks and what `raw` wraps
-        with the sig for the wire form."""
         return _body_bytes(self.author, self.ts, self.steps)
 
     @property
@@ -318,9 +192,6 @@ class SignedTransaction:
 
     @property
     def op_hash(self) -> crypto.Digest:
-        """Content address — over the bytes as received (#content-address). This is also the
-        mempool's dedup key: identity IS shared with the store's log, so a transaction cannot be a
-        duplicate in one and a fresh entry in the other."""
         return crypto.h(self.raw)
 
     def verify(self) -> bool:
@@ -328,8 +199,6 @@ class SignedTransaction:
 
     @classmethod
     def decode(cls, raw: bytes) -> SignedTransaction:
-        """Decode and TYPE-CHECK. The signature is the caller's to verify: the two failures mean
-        different things and a caller may want only one."""
         outer = codec.as_seq(codec.decode(raw), 2)
         body = codec.as_seq(codec.decode(codec.as_bytes(outer[0])), 3)
         return cls(
@@ -353,15 +222,12 @@ class SignedTransaction:
 
 
 def _satisfied_by(pred: Absent | Holds, post: crypto.Digest | None) -> bool:
-    """Would `pred` hold against a key left in state `post`?"""
     if isinstance(pred, Absent):
         return post is None
     return post is not None and post == pred.digest
 
 
 def falsifies(a: SignedTransaction, b: SignedTransaction) -> bool:
-    """Would `a`'s effects invalidate any of `b`'s predicates? Compared per `(store, key)`, so a
-    name in one store never falsifies a predicate about the same name in another."""
     eff = a.effects()
     for p in b.txn.guards:
         key = (p.store, p.name)
@@ -371,21 +237,7 @@ def falsifies(a: SignedTransaction, b: SignedTransaction) -> bool:
 
 
 type LogEntry = SignedTransaction
-"""What a log entry may be. Compaction was struck (rip 2/3); a log entry is a transaction."""
 
 
 def conflicts(a: SignedTransaction, b: SignedTransaction) -> bool:
-    """Are `a` and `b` mutually exclusive? **Only if one would invalidate the other's predicates.**
-
-    A pure function of the two envelopes (#settlement), so two honest nodes holding different
-    mempools always agree — it consults no state, because at endorsement time there is none (2.9).
-    But it IS value-dependent, and two cases show why "touches the same key" is the wrong rule:
-
-    * **Two unconditional writes to one key do NOT conflict.** Neither carries a predicate, so
-      nothing is invalidated; both settle and the deterministic order decides the final value.
-      That is a race, not an exclusion, and dropping one of them would be losing a write nobody
-      asked to be protected.
-    * **A write establishing exactly what the other expects does NOT conflict.** If `a` sets K to
-      a value digesting to `d` and `b` requires `holds(K, d)`, then `b`'s predicate holds *after*
-      `a` — they compose rather than exclude."""
     return falsifies(a, b) or falsifies(b, a)

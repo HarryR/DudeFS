@@ -1,25 +1,3 @@
-# dude.node — the gestalt: one storage node, with all the pieces joined.
-#
-# This is the first place the layers meet, and it exists to find out whether the seams are right.
-# Everything below it has been built and tested in isolation; a node is what says whether isolation
-# was the correct decomposition.
-#
-# WHAT IT OWNS, and nothing else:
-#
-#   store        the log                                      (dude.store)
-#   coordinator  the consensus driver + the current mempool   (dude.coordinator)
-#   postman      the wire, and the only clock                 (dude.net.postman)
-#
-# It contributes exactly one thing of its own: a `handle` mapping an inbound verb to an action, and
-# a `tick` that advances the round. Anything more belongs in one of the parts.
-#
-# THE CONSENSUS ROUND LIVES IN `dude.round` and is DRIVEN by `dude.coordinator`. `Node.tick` calls
-# `Coordinator.tick`; inbound `HELD`/`SIG` envelopes are handed to `Coordinator.on_round_msg`;
-# client SUBMITs are handed to `Coordinator.submit`. The placeholder "everyone proposes their own
-# batch, count endorsements, first-to-quorum wins" round that used to live here (methods `_propose`,
-# `_count`, `_settle`, verbs `PROPOSE`/`ENDORSE`) has been deleted -- SPECv2 #round-lifecycle is
-# now the settled shape.
-
 from __future__ import annotations
 
 import contextlib
@@ -61,11 +39,6 @@ from .sync.lite_adapter import (
 from .tunables import DEFAULT, Tunables
 
 REPLIES = frozenset({Verb.PONG, Verb.BODIES, Verb.REFUSED})
-"""Verbs that ANSWER something we sent. They need no handler: `Postman.deliver` has already
-correlated them and retired the pending entry, so reaching `_handle` means the useful work is done.
-
-Named so "no handler" is a statement rather than an omission — otherwise a reply looks exactly
-like a verb somebody forgot."""
 
 HANDLED = frozenset(
     {
@@ -82,34 +55,14 @@ HANDLED = frozenset(
         Verb.GET_PROOF,
     }
 )
-"""Verbs this node acts on.
-
-`HELD` and `SIG` are the Round protocol's own vocabulary (SPECv2 #round-lifecycle); handled by
-delegating to `Coordinator.on_round_msg`. `PROPOSE` and `ENDORSE` were the placeholder round's
-verbs; deleted as part of the Round pivot (Phase 6).
-
-`HEIGHT`/`GETBLOCK` are inbound sync REQUESTS -- Node answers via `serve_*` (stateless). The
-answers themselves (`HEIGHT_REPLY`/`SETTLED_BLOCK`) are correlated by Postman as replies but
-ALSO carry state the Follower needs -- so they land in `HANDLED` too, and their handlers route
-to `Follower.receive`. Different from `BODIES`/`PONG` where correlation IS the useful work."""
 
 SOLICITED: frozenset[Verb] = frozenset()
-"""Verbs that are only ever an ANSWER to something this node asked for.
-
-An unsolicited one is dropped before dispatch. Without that, anyone at all could hand a node a run
-of log entries and have them applied — which was demonstrable: a stranger holding no grant and no
-roster seat added itself to a catching-up node's roster with one frame."""
 
 UNIMPLEMENTED = frozenset(Verb) - HANDLED - REPLIES
-"""Specified, not yet built. Derived rather than listed, so it cannot drift from the other two, and
-so adding a `Verb` puts it here automatically instead of into a silent default branch."""
 
 
 @dataclass(slots=True)
 class Node:
-    """A storage node. Sans-I/O apart from its postman: `tick(now)` is the only entry point that
-    advances time, and inbound frames arrive by being handed to `receive`."""
-
     me: crypto.Keypair
     store: Store
     tunables: Tunables = DEFAULT
@@ -119,46 +72,19 @@ class Node:
     sync_adapter: SyncAdapter = field(init=False)
     lite_adapter: LiteAdapter = field(init=False)
     coordinator: Coordinator = field(init=False)
-    """Owns the current Mempool, the in-flight Rounds, and drives them on tick. See
-    `dude.coordinator`. Node's role in consensus is: hand SUBMIT bodies to
-    `coordinator.submit`, HELD/SIG envelopes to `coordinator.on_round_msg`, SETTLE_SIG
-    envelopes to `coordinator.on_settle_msg`, and call `coordinator.tick(now)` from `tick`."""
     follower: Follower = field(init=False)
-    """Owns the L6 catch-up state machine (`dude.sync`). Consumes SETTLED blocks pulled from
-    peers; commits via `store.commit_block`, same durable path Coordinator uses. Coordinator
-    and Follower share the Store as their only meeting point (#sync-in-its-own-module) --
-    Coordinator PRODUCES blocks, Follower CONSUMES them, they never talk to each other."""
 
     _last_reconciled_serial: int = field(default=-1, init=False)
-    """The last roster commitment serial `_reconcile_peers` acted on. -1 means never
-    reconciled. Serial-gate for #roster-drives-peers: skip the full pass on tick unless the
-    serial has advanced (roster has actually changed)."""
 
     _managed_peers: set[crypto.PublicKey] = field(default_factory=set, init=False)
-    """Peers `_reconcile_peers` itself added -- roster members and CLIENT / COMPACTOR
-    authors. The removal pass only revokes membership from THIS set, so manually-added
-    peers (bootstrap-outside-the-roster, e.g. a joining node not yet in the roster --
-    see `test_sync_e2e`) survive reconciliation."""
 
     _inbox: queue.SimpleQueue[Inbound] = field(default_factory=queue.SimpleQueue, init=False)
-    """The one door for inbound frames. Every attached `Listener` pushes into this queue
-    from its own thread (production path via `start(*listeners)`); the owned Node thread
-    consumes from it via `queue.get(timeout=tick_interval)`. Thread-safety primitive, not
-    delivery policy -- correlation and freshness happen after `queue.get`, in
-    `postman.deliver` on the node thread."""
 
     _stopping: threading.Event = field(default_factory=threading.Event, init=False)
-    """Signalled by `stop()`. The `_run` loop checks it at the top of every iteration
-    and exits when set. `queue.get(timeout=...)` doesn't wake early on set; worst-case
-    stop-to-exit lag is one `tick_interval`."""
 
     _thread: threading.Thread | None = field(default=None, init=False)
-    """The owned thread running `_run`. `None` when not started; a live `Thread` between
-    `start()` and `stop()`. Never accessed by callers -- kept only so `stop()` can join."""
 
     _listeners: tuple[Listener, ...] = field(default=(), init=False)
-    """The listeners attached in `start(*listeners)`, kept so `stop()` can shut each one.
-    Empty tuple when not started."""
 
     def __post_init__(self) -> None:
         self.postman = Postman(
@@ -187,33 +113,13 @@ class Node:
 
     @property
     def mempool(self) -> Mempool:
-        """The currently-collecting Mempool. Kept as a `Node` property so tests and diagnostics
-        that reach for `node.mempool` still work; the authoritative owner is `self.coordinator`,
-        which swaps this instance at every bucket boundary."""
         return self.coordinator.mempool
-
-    # -- membership ---------------------------------------------------------------------------- #
 
     @property
     def mgmt(self) -> MgmtReader:
-        """READ side only. A node reads authority; it never authors a management tx -- that
-        is the manager's job, and the type says so (#nodes-are-not-authors)."""
         return MgmtReader(self.store)
 
     def _reconcile_peers(self, now: Millis) -> None:
-        """Sync `postman.peers` against the current roster (#roster-drives-peers).
-
-        Roster members get dial-Links so this node can reach them. CLIENT / COMPACTOR
-        grants are AUTHORITY, not location -- they no longer show up in `postman.peers`
-        as dialable peers. Nodes never dial back to clients; when a client wants to hear
-        from us, it opens a connection and we reply on the session it established (see
-        `SessionLink` in `dude.net.link`). Removed: the old `_reconcile_grants` pass and
-        `Grant.endpoints`, both of which existed only to prop up the dial-back-to-client
-        model that this refactor rules out.
-
-        REMOVALS at the end: any `_managed_peers` pubkey that this reconciler added on a
-        prior tick and is no longer in the roster gets dropped. Peers added outside
-        reconciliation (bootstrap-out-of-roster wiring in `test_sync_e2e`) are left alone."""
         commitment = self.mgmt.roster_commitment()
         if commitment is None:
             return
@@ -226,8 +132,6 @@ class Node:
                 self._managed_peers.discard(pubkey)
 
     def _reconcile_roster(self, serial: int, roster: set[crypto.PublicKey], now: Millis) -> None:
-        """Add any roster member missing from `postman.peers`, register with the Follower
-        for sync polls. Gated: skip when the commitment serial hasn't advanced."""
         if serial == self._last_reconciled_serial:
             return
         self._last_reconciled_serial = serial
@@ -239,50 +143,26 @@ class Node:
                 continue
             rec = nodes.get(pubkey)
             if rec is None or not rec.endpoints:
-                continue  # roster listed a member with no endpoints; skip until they show up
+                continue
             self.postman.add_peer(pubkey, rec.endpoints)
             self.follower.add_peer(pubkey, now=now)
             self._managed_peers.add(pubkey)
 
     def roster(self) -> tuple[crypto.PublicKey, ...]:
-        """MANAGEMENT'S ANSWER, and nowhere else. `MgmtReader` owns everything about who is
-        authorised; the roster is one such question. `Store.roster` used to shadow this call;
-        deleted -- Store does not touch the roster. `store.mgmt.roster()` is the one path."""
         return self.store.mgmt.roster()
 
-    # -- inbound ------------------------------------------------------------------------------- #
-
     def receive(self, frame: Frame, now: Millis, session: Session | None = None) -> None:
-        """One inbound frame, fully handled.
-
-        CATCHES `DudeError` DELIBERATELY. This is the crash-only boundary the error review flagged:
-        hostile bytes are an EXPECTED outcome at a decode boundary, so one peer sending garbage must
-        cost it its frame and nothing else. Anything outside the tree still escapes and takes the
-        process down, which is the contract `crashonly` relies on.
-
-        THE HANDLER IS INSIDE THE CATCH, and it was not `[H]`. Only `deliver` used to be, so any
-        typed error a handler raised escaped `receive` — and a handler's first act is usually to
-        DECODE a peer-supplied body. A stranger with no grant and no roster seat could send `SUBMIT`
-        with twelve bytes of non-bencode and the `CodecError` went straight past this boundary; with
-        `crashonly` installed that is `os._exit`, i.e. the unauthenticated remote kill switch
-        crashonly.py names as the one thing its precondition exists to prevent. Typed parsing was
-        already right; the catch was in the wrong place. `InvariantError` is deliberately not a
-        `DudeError`, so OUR bugs still take the process down (core/errors.py)."""
         try:
             got = self.postman.deliver(frame, now)
             if session is not None:
                 self._bind_session(session, got.envelope.frm)
             if got.envelope.env.verb in SOLICITED and got.reply is None:
-                return  # nobody asked; see `SOLICITED`
+                return
             self._handle(got.envelope, now)
         except DudeError:
-            return  # their fault: drop the frame, keep serving
+            return
 
     def _bind_session(self, session: Session, frm: crypto.PublicKey) -> None:
-        """Bind the session's identity to the envelope's `frm` on first sight; verify on
-        subsequent frames. Register with Postman when identity is newly-bound so the session
-        becomes reachable as a SessionLink on Peer(frm). Identity mismatch closes the session
-        via the transport hook and drops the frame."""
         was_unbound = session.identity is None
         try:
             session.bind(frm)
@@ -293,12 +173,6 @@ class Node:
             self.postman.register_session(session)
 
     def _handle(self, env: SignedEnvelope, now: Millis) -> None:
-        """Dispatch by verb.
-
-        A TABLE rather than a chain of cases: it is the same statement `HANDLED` already makes, and
-        keeping the two in one place means a verb cannot be listed as handled while having nowhere
-        to go. A missing entry is not a silent default — see `REPLIES` and `UNIMPLEMENTED`, which
-        say which of the two kinds of nothing it is."""
         fn = _DISPATCH.get(env.env.verb)
         if fn is not None:
             fn(self, env, now)
@@ -307,94 +181,52 @@ class Node:
         self._reply(env, Verb.PONG, b"", now)
 
     def _on_submit(self, env: SignedEnvelope, now: Millis) -> None:
-        """A transaction offered by a client, or relayed by a peer.
-
-        The author is the INNER signature; `env.frm` is merely who asked us to take it. That is the
-        gate ruling in one line — a node carries an op it did not author, and authorises the
-        requester, never the author."""
         tx = ops.SignedTransaction.decode(env.env.body)
         refusal = self.coordinator.submit(tx, now)
         if refusal is not None:
             self._reply(env, Verb.REFUSED, refusal.value.encode(), now)
             return
         self._reply(env, Verb.BODIES, tx.op_hash, now)
-        # Re-flood the body so peers admit it too. Until gossip-by-hash + FETCH lands (SPECv2
-        # #gossip-by-hash), this is what makes every node's mempool converge on the same set --
-        # which is the input a Round's largest-intersection-over-quorum then acts on.
         self._flood(Verb.SUBMIT, env.env.body, now, skip=env.frm)
 
     def _on_held(self, env: SignedEnvelope, now: Millis) -> None:
-        """A peer's HELD advertisement -- what transactions they claim to hold for some bucket.
-        Round's own protocol vocabulary (SPECv2 #round-lifecycle); Coordinator routes by bucket
-        to the right Round instance."""
         self.coordinator.on_round_msg(env, now)
 
     def _on_sig(self, env: SignedEnvelope, now: Millis) -> None:
-        """A peer's signature over a slice they believe this bucket ratifies. Same handling as
-        HELD -- routed to the Round for its bucket via the Coordinator."""
         self.coordinator.on_round_msg(env, now)
 
     def _on_settle_sig(self, env: SignedEnvelope, now: Millis) -> None:
-        """A peer's signature over the post-apply anchors of a ratified block -- SettleRound's
-        one message (SPECv2 #settlement-signs-post-anchors). Routed to the currently-settling
-        block via the Coordinator, dropped if it does not match."""
         self.coordinator.on_settle_msg(env, now)
 
     def _on_height(self, env: SignedEnvelope, now: Millis) -> None:
-        """A peer is asking for our current head. Answer with `HeightReply(block_num, tip_hash)`
-        via the stateless `serve_height` helper (SPECv2 #height-poll-is-the-trigger)."""
         self.sync_adapter.reply(env, serve_height(self.store), now)
 
     def _on_height_reply(self, env: SignedEnvelope, now: Millis) -> None:
-        """A peer's answer to our own HEIGHT poll. Decode, route to the Follower, which updates
-        its `_heads` map and may fire fork detection or start a pull on the next tick."""
         try:
             msg = SyncMsg.decode(env.env.verb, env.env.body)
         except SyncAdapterError:
-            return  # XXX: dropped -- malformed HEIGHT_REPLY body from this peer.
+            return
         self.follower.receive(msg, env.frm, now)
 
     def _on_getblock(self, env: SignedEnvelope, now: Millis) -> None:
-        """A peer is asking for a SETTLED block. Answer via `serve_getblock` -- returns either
-        `SettledBlockReply` (block + bodies) or `Refused` with a `SyncRefusal` reason. A
-        malformed `GetBlock` body earns `Refused(UNKNOWN)` -- the requester's next-peer path
-        is uniform regardless of failure mode."""
         try:
             req = SyncMsg.decode(env.env.verb, env.env.body)
         except SyncAdapterError:
             self.sync_adapter.reply(env, Refused(reason=SyncRefusal.UNKNOWN), now)
             return
-        # verb-routed here, decode returns GetBlock; guard for the type checker.
         if not isinstance(req, GetBlock):
             return
         self.sync_adapter.reply(env, serve_getblock(self.store, req), now)
 
     def _on_settled_block(self, env: SignedEnvelope, now: Millis) -> None:
-        """A peer's answer to our GETBLOCK. Decode, route to the Follower, which runs the full
-        verify pipeline (chain link + settle_sigs + body-sig + preview-anchors-match) and
-        commits on success -- or clears the in-flight pull on any failure
-        (#sync-is-log-replay + #no-shun-only-priority). A decode failure means the peer served
-        garbage; cancel the pull so next tick picks another peer."""
         try:
             msg = SyncMsg.decode(env.env.verb, env.env.body)
         except (SyncAdapterError, DudeError):
-            # SettleError (from SettledBlockWithBodies.decode) is a DudeError; either shape of
-            # decode failure means the pulling peer served garbage.
             self.follower.cancel_pull(env.frm)
             return
         self.follower.receive(msg, env.frm, now)
 
     def _lite_authorised(self, requester: crypto.PublicKey) -> bool:
-        """Auth gate for light-client verbs (#light-client-verify, Harry's ruling that the
-        cluster is strictly permissioned). `requester` MUST be one of:
-          * The anchor (#anchor-is-the-axiom, always authorised).
-          * A currently-attested Role.MANAGER (blanket authorship).
-          * A currently-attested Role.CLIENT (the light client's own grant).
-          * A currently-attested Role.COMPACTOR (for future compactor-side reads).
-          * A currently-attested roster member (nodes reading each other, e.g. for sync).
-
-        Uses `MgmtReader.may_send`(requester, 0)` for grant checks -- MANAGER blanket
-        makes it True; other roles fall back to the store roster membership check."""
         if requester == self.store.anchor():
             return True
         if requester in self.mgmt.roster():
@@ -403,10 +235,6 @@ class Node:
         return grant is not None
 
     def _on_get_anchors(self, env: SignedEnvelope, now: Millis) -> None:
-        """A light client (or another node) asks for our current anchors + optionally
-        the identity chain (#light-client-piggyback). Auth: sender must be a known
-        identity per #light-client-verify. Decode failure earns a LITE_REFUSED with
-        MALFORMED_QUERY."""
         if not self._lite_authorised(env.frm):
             self.lite_adapter.reply(env, LiteRefused(LiteRefusal.MALFORMED_QUERY), now)
             return
@@ -416,15 +244,13 @@ class Node:
             self.lite_adapter.reply(env, LiteRefused(LiteRefusal.MALFORMED_QUERY), now)
             return
         if not isinstance(req, GetAnchors):
-            return  # verb-routed here; type guard
+            return
         reply = serve_get_anchors(
             self.store, self.mgmt, req, self.tunables.light_client.liveness_window
         )
         self.lite_adapter.reply(env, reply, now)
 
     def _on_get_proof(self, env: SignedEnvelope, now: Millis) -> None:
-        """A light client asks for a value + SMT proof at some block_num
-        (#light-client-get). Same auth + decode shape as _on_get_anchors."""
         if not self._lite_authorised(env.frm):
             self.lite_adapter.reply(env, LiteRefused(LiteRefusal.MALFORMED_QUERY), now)
             return
@@ -440,48 +266,14 @@ class Node:
         )
         self.lite_adapter.reply(env, reply, now)
 
-    # -- the round ----------------------------------------------------------------------------- #
-
     def tick(self, now: Millis) -> None:
-        """Advance the consensus round, the sync loop, and the wire.
-
-        Reconciles peers against the current roster first (#roster-drives-peers), so any
-        `change_roster` that settled since our last tick flows to the transport layer
-        before consensus tries to use it. The reconcile is serial-gated: a single roster-
-        commitment read per tick, full pass only when the serial has advanced.
-
-        Coordinator drives Round + SettleRound + commit. Follower drives sync polls, pull
-        timeouts, and pull initiation; its outbox contains the HEIGHT / GETBLOCK envelopes to
-        post via the mailbox."""
         self._reconcile_peers(now)
         self.coordinator.tick(now)
         self.follower.tick(now)
         self._flush_follower(now)
         self.postman.tick(now)
 
-    # -- lifecycle ----------------------------------------------------------------------------- #
-
     def start(self, *listeners: Listener) -> None:
-        """Begin serving. Each listener starts pushing every complete inbound frame into
-        our shared `_inbox`; the owned node thread drains the inbox and drives `tick()`
-        on cadence. Once returned, this Node is running until `stop()` is called.
-
-        STARTING A NODE STARTS ITS POSTMAN, and must: a reply to something we dialled comes
-        back on the socket we opened (#session-first-reply), so the dial-side carrier reads
-        too. The caller does not pass it -- Postman constructs its own carriers
-        (#postman-owns-dialling) and so is the only object that can start them. `listeners`
-        is the LISTEN side only, which is the one part a deployment genuinely owns because
-        only it knows what address to bind.
-
-        TRANSACTIONAL over `listeners`: if any listener's `start()` raises (e.g.
-        `TCPListener` with a port conflict), every listener already started gets stopped
-        in reverse order, the Postman is stopped, and the exception propagates unchanged.
-        A running node with only some of its listeners is not a shape we support -- the
-        caller was told to listen on N addresses; delivering fewer would be silent
-        degradation.
-
-        Idempotent: calling `start(...)` on an already-started node is a no-op (the
-        listeners argument is ignored). To attach listeners incrementally, stop first."""
         if self._thread is not None:
             return
         started: list[Listener] = []
@@ -492,7 +284,6 @@ class Node:
                 started.append(listener)
         except Exception:
             for listener in reversed(started):
-                # Best-effort during rollback; the outer raise names the real problem.
                 with contextlib.suppress(Exception):
                     listener.stop()
             with contextlib.suppress(Exception):
@@ -507,12 +298,8 @@ class Node:
         self._thread.start()
 
     def stop(self, timeout: float = 5.0) -> None:
-        """Signal shutdown; close every listener and every dial-side carrier; join the node
-        thread. Bounded by `timeout` on the join -- the loop notices `_stopping` within one
-        tick_interval (10 ms with defaults), so 5 s is generous. Idempotent."""
         self._stopping.set()
         for listener in self._listeners:
-            # Best-effort during shutdown; nothing to escalate to.
             with contextlib.suppress(Exception):
                 listener.stop()
         self._listeners = ()
@@ -523,23 +310,6 @@ class Node:
             thread.join(timeout=timeout)
 
     def _run(self) -> None:
-        """Owned-thread body. Two jobs:
-
-          1. Drain `_inbox` (with a timeout matching `tunables.tick_interval`) and call
-             `receive(frame, now_ms())` for each frame.
-          2. When the tick interval has elapsed since the last tick, call `tick(now_ms())`.
-
-        `queue.get(timeout=...)` is the whole rate-limiting mechanism -- the loop wakes
-        immediately when a frame arrives OR after `tick_interval` when quiet. No sleep,
-        no spin. Standard Python producer/consumer shape, mechanical Tokio translation
-        (channel + select! + interval).
-
-        Frame dispatch does NOT depend on tick having fired first. The consensus path that
-        cares about wall-clock advancement -- `Coordinator.on_round_msg` -- calls
-        `_close_current_bucket(now)` itself, so a HELD/SIG arriving before our tick still
-        lands in an open Round. That belongs in Coordinator, not here (a driver loop
-        ticking on frame arrival was the shape that hid the real bug -- see CLAUDE.md
-        note 9)."""
         tick_interval_ms = self.tunables.tick_interval
         last_tick = now_ms()
         while not self._stopping.is_set():
@@ -554,37 +324,18 @@ class Node:
                 last_tick = now
 
     def _flush_follower(self, now: Millis) -> None:
-        """Post the Follower's outbox to the mailbox. Follower emits `(peer, SyncMsg)` pairs for
-        outbound `HeightAsk` / `GetBlock` requests; the sync-adapter wraps them in signed
-        envelopes and posts with `await_reply=True` so the mailbox correlates the answer
-        (`HeightReply`, `SettledBlockReply`, `Refused`)."""
         for peer, msg in self.follower.outbox():
             if peer not in self.postman.peers:
-                continue  # peer not reachable; drop rather than raise
+                continue
             self.sync_adapter.send(peer, msg, now, await_reply=True)
-
-    # -- outbound ------------------------------------------------------------------------------ #
 
     def _flood(
         self, verb: Verb, body: bytes, now: Millis, skip: crypto.PublicKey | None = None
     ) -> None:
-        """Send to every roster member. Flood announcements, pull bodies (#mempool) -- at
-        this size the announcement term is small and reconciliation would buy bandwidth at
-        the cost of latency, which is the wrong trade when wave latency IS finality latency.
-
-        ITERATES `mgmt.roster()`, NOT `postman.peers`. Consensus gossip is a roster concept
-        (nodes talk to nodes about consensus), not a connection-liveness concept. The old
-        code iterated `postman.peers` -- which under the pre-refactor model included CLIENT
-        grants because `_reconcile_grants` added them there for reply-by-dial. That meant
-        SUBMITs relayed peer-to-peer got flooded to every registered client too, an
-        unintended broadcast. Fixed as a side effect of moving grants out of the peer
-        table."""
         for who in self.mgmt.roster():
             if who in (self.me.public, skip):
                 continue
             env = Envelope(who, verb, new_message_id(), body).sign(self.me, now)
-            # An announcement, so no answer is awaited: `BODIES` and `REFUSED` are `REPLIES`, which
-            # `deliver` retires without needing a registered question.
             self.postman.mailbox.post(env, now, self.tunables.net.ttl, await_reply=False)
 
     def _reply(self, to: SignedEnvelope, verb: Verb, body: bytes, now: Millis) -> None:
@@ -598,8 +349,3 @@ class Node:
 _DISPATCH: dict[Verb, Callable[[Node, SignedEnvelope, Millis], None]] = {
     v: getattr(Node, f"_on_{v.name.lower()}") for v in HANDLED
 }
-"""Verb to handler, DERIVED from `HANDLED` rather than listed beside it.
-
-So the two cannot drift: a verb added to `HANDLED` without a matching `_on_<verb>` fails at import,
-and a handler with no verb is unreachable and obvious. The convention is load-bearing, which is the
-only kind worth having."""

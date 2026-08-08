@@ -1,27 +1,3 @@
-# dude.net.envelope — point-to-point message framing. See SPEC.md (#sign-then-seal).
-#
-# THREE LAYERS, and keeping them apart is the whole design:
-#
-#   inner     a signed transaction (or any authenticated artifact). Authenticates its AUTHOR.
-#             DISTRIBUTABLE — anyone may forward it, anyone may verify it.
-#   envelope  "this node (me) sends a message to that node (you), with a distinct message id."
-#             Authenticates the SENDER of this hop. NOT distributable: it is a conversation
-#             artifact, and forwarding its contents means RE-ENVELOPING them.
-#   sealing   transport confidentiality, and literally nothing else. Authenticates nobody.
-#
-# The envelope DOES NOT KNOW what it carries. `body` is opaque bytes here. A client submitting a
-# transaction signs the transaction, then signs the envelope that submits it — two signatures at two
-# layers answering two different questions, which is why the request gate authorises the envelope's
-# `frm` (the requester) and NEVER the artifact's author.
-#
-# THE TIMESTAMP IS GATED, AND THAT IS ITS PURPOSE. Not a pre-signature DoS rung — an
-# unauthenticated `ts` is forgeable and an authenticated one is read after the crypto is paid for.
-# It is a PARTICIPATION gate: a node whose clock is outside the window cannot hold a conversation,
-# and because both ends check, it self-partitions. No accommodation for a broken clock (#timing).
-#
-# SIGN-THEN-SEAL, never the reverse: sealing after signing means an observer sees no identity at
-# all. Signing a ciphertext would leave the sender's key in the clear and leak the social graph.
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -32,158 +8,65 @@ from ..core import codec, crypto
 from ..core.errors import DudeError
 
 
-class EnvelopeError(DudeError):
-    """A frame that is malformed, misaddressed, stale, or not signed by whom it claims."""
+class EnvelopeError(DudeError): ...
 
 
 class Verb(IntEnum):
-    """What this message ASKS FOR — a closed enumeration, and one of exactly two in the protocol.
-
-    THE OTHER ONE IS NOT THIS ONE. Operation kinds -- what an identity may *author* into the log,
-    `management.Grant.kinds` -- are a different axis from request verbs, what an identity may *ask
-    a node to do*. Different layers, different signatures, and conflating them would let "may write
-    the data store" imply "may demand a state transfer".
-
-    Closed rather than an open byte string: the request gate must enumerate its domain to be
-    auditable, and a Rust or Go port gets exhaustive matching instead of a default branch -- which
-    is where two implementations quietly diverge."""
-
-    # -- liveness ------------------------------------------------------------------------------- #
     PING = 1
     PONG = 2
 
-    # -- mempool dissemination (#mempool) -------------------------------------------------- #
     SUBMIT = 10
-    """A client offers a transaction. The only verb a client needs to write."""
     BODIES = 13
-    """The reply to a SUBMIT that was accepted -- carries the op_hash of the settled tx.
-    Naming is legacy from the gossip-by-hash design (which had ANNOUNCE/FETCH/BODIES); the verb
-    survived because it is the only channel that currently returns a digest to an authoring
-    client."""
 
-    # -- slice agreement (#buckets) -------------------------------------------------------- #
     PROPOSE = 20
     ENDORSE = 21
     HELD = 22
-    """"I hold these transaction hashes for this bucket" -- Round's advertisement (SPECv2
-    #gossip-by-hash). The Round protocol's own vocabulary, distinct from `SUBMIT`'s "here is a
-    body for you to admit"."""
     SIG = 23
-    """A signature over the slice this node believes this bucket ratifies -- Round's second
-    message (SPECv2 #slice-meta-agreement). A quorum of matching `SIG`s is what turns a
-    candidate slice into a ratified block."""
 
-    # -- settlement (#ratified-is-not-settled, #settlement-signs-post-anchors) ------------------ #
     SETTLE_SIG = 24
-    """A signature over `(slice_hash, block_num, height, prev_block, state_root, A_state, A_log)`
-    -- SettleRound's single message. A quorum of matching `SETTLE_SIG`s turns a ratified block
-    into a SETTLED block, at which point the Coordinator commits the slice to the durable Store."""
 
-    # -- sync (#sync-is-log-replay, #height-poll-is-the-trigger) ------------------------------- #
     HEIGHT = 30
-    """"What is your current SETTLED head?" -- solicited height poll. The Follower's periodic
-    trigger for "am I behind?". No body."""
     HEIGHT_REPLY = 31
-    """`(block_num, tip_hash)` -- the reply to HEIGHT. `tip_hash` is `SettledBlock.block_hash`
-    at the responder's current head, enabling fork detection at poll time
-    (#poll-detects-divergent-tips)."""
     GETBLOCK = 32
-    """`GETBLOCK n` -- fetch the SETTLED block at `block_num == n`. Body is a single integer.
-    A joiner walks `my_head+1, my_head+2, ...` (#sync-is-log-replay)."""
     SETTLED_BLOCK = 33
-    """The reply to GETBLOCK. Body is `SettledBlock.encode()`. Peers serve from `store.settled_at`
-    (persisted at commit time, #block-shape-settled)."""
 
-    # -- light-client retrieval (#light-client, #light-client-get, #light-client-cert-chain) --- #
     GET_ANCHORS = 40
-    """A light client asks: what is your current head, and (optionally) the current identity
-    chain? Body carries `known_roster_fingerprint | None` -- the responder omits the roster
-    bundle when the client already has the current one cached."""
     ANCHORS_REPLY = 41
-    """`(anchors, signers, settle_sigs, roster_fingerprint, roster_bundle | None)`. A light
-    client uses this for `f+1` corroboration of the head (#light-client-freshness) plus
-    first-time or fingerprint-mismatch identity-chain fetch (#light-client-cert-chain)."""
     GET_PROOF = 42
-    """A light client asks for `(store_id, name, block_num)` and receives a value or
-    non-membership proof against `anchors.state_root` at that block_num
-    (#light-client-get, #light-client-nonmembership). Any one responder that holds the state
-    can serve; the client verifies the proof against a state_root it already trusts."""
     PROOF_REPLY = 43
-    """`(value | ABSENT, proof, state_root)`. Verified by the client against its trusted
-    state_root; failure to match is drop-and-retry, not a fault against the responder."""
     LITE_REFUSED = 44
-    """A refusal to serve a light-client request. Distinct verb from `REFUSED` so
-    `_DECODERS` can dispatch unambiguously by verb without conflating sync-refusal and
-    lite-refusal enums. Carries a `LiteRefusal` reason."""
 
-    # -- diagnostics ---------------------------------------------------------------------------- #
     REFUSED = 90
-    """A refusal, carrying a reason. Never silence: a client can only correct a clock fault if it is
-    told which way it is wrong (#mempool)."""
 
 
 type MessageId = bytes
 MESSAGE_ID_SIZE = 16
 
 MAX_FRAME_BYTES = 1 << 24
-"""Cap on the wire size of one `Frame`. Every stream carrier (TCP, UNIX, any future
-byte-stream) must refuse to send anything larger and must refuse to allocate on receive
-anything larger. 16 MiB is far above any well-formed envelope in this codebase (an
-envelope carries one op, one settled block, one sync reply — none approach this) and
-small enough that a hostile stream advertising "the next frame is 4 GiB" costs one
-length-word read and a connection close, not a 4 GiB allocation.
-
-CLUSTER-WIDE INVARIANT, not a tunable. Two peers with different caps see well-formed
-frames from each other as refusals; a per-carrier or per-node value would silently
-desync. Living beside `Frame`, imported by every carrier that has framing, is what
-keeps the number one number."""
+"""CLUSTER-WIDE INVARIANT, not a tunable: two peers with different caps see each other's
+well-formed frames as refusals. Big enough for any envelope here, small enough that a stream
+advertising "the next frame is 4 GiB" costs a length-word read, not a 4 GiB allocation."""
 
 
 def new_message_id() -> MessageId:
-    """A fresh correlation id.
-
-    THIS EXISTS FOR A BUG, not for tidiness. Without a request-response binding there is no
-    relationship between an answer and the question it claims to answer, which is message-order
-    malleability: an attacker reorders replies and a client attributes one request's answer to
-    another. A reply MUST echo the id it answers."""
     return crypto.random_bytes(MESSAGE_ID_SIZE)
 
 
 @dataclass(frozen=True, slots=True)
 class Envelope:
-    """What the author DECIDED, before anyone signed it. No `frm`, and no `ts`.
-
-    Those two live on `SignedEnvelope`, because authorship and time arrive WITH the signature. Not
-    tidiness: while `frm` sat here, an envelope could be attributed to anyone and `sign()` had to
-    check the attribution matched the key. The check is gone because the state it guarded is gone
-    -- you cannot claim to be someone else if there is nowhere to write the claim.
-
-    POINT-TO-POINT, always. No broadcast address and no multicast form: the carrier may be
-    broadcast while the *message* never is (#transport-adds-no-trust)."""
-
     to: crypto.PublicKey
     verb: Verb
     mid: MessageId
     body: bytes = b""
-    """Opaque. This layer never parses it: it may hold a signed transaction, a batch of ids, or
-    nothing. Keeping it opaque is what stops carrier vocabulary leaking into the log."""
 
     reply_to: MessageId = b""
-    """The id this answers, empty for a request. A reply that fails to echo is not a reply."""
 
     reply_ts: int = 0
-    """The `ts` of the ATTEMPT this answers — TCP's Timestamps option (RFC 7323) in one field.
-
-    Without it, Karn's rule (#rtt-attribution) discards the sample from anything sent more than
-    once -- under multi-homing, most traffic. Echoing the attempt's `ts` matches the reply to
-    exactly ONE transmission, and since each attempt went out on a known link, that recovers both
-    the sample and the link. It is what stops R7 being a measurement blind spot: without it, the
-    more paths you use the less you know about any of them.
-
-    HERE and not in the header: an echo of the other party's stamp, not a claim about this hop."""
+    """The `ts` of the ATTEMPT this answers. Without it Karn's rule discards the RTT sample from
+    anything sent more than once, which under multi-homing is most traffic -- the more paths you
+    use, the less you know about any of them (#rtt-attribution)."""
 
     def encode(self) -> bytes:
-        """The envelope proper, as it appears inside the signed body."""
         return codec.encode(
             [self.to, int(self.verb), self.mid, self.body, self.reply_to, self.reply_ts]
         )
@@ -207,36 +90,17 @@ class Envelope:
         return cls(to, verb, mid, body, reply_to, reply_ts)
 
     def sign(self, kp: crypto.Keypair, ts: int) -> SignedEnvelope:
-        """Author this envelope, now. Authorship and time arrive together, so there is no window in
-        which an envelope has one but not the other.
-
-        A RETRANSMIT IS A NEW MESSAGE: sign the same envelope again with a later `ts`. That is why
-        the conversation window need never stretch to cover retries, and why each attempt carries a
-        DISTINCT `ts` -- which is what lets a reply's `reply_ts` name one of them."""
         return SignedEnvelope(kp.public, ts, self, kp.sign(_body_bytes(kp.public, ts, self)))
 
 
 def _body_bytes(frm: crypto.PublicKey, ts: int, env: Envelope) -> bytes:
-    """The canonical bytes a sender signs. Mirrors `ops._body_bytes(author, ts, steps)`.
-
-    NESTED, so the two levels are visible on the wire as well as in the types: the header is this
-    hop's claim, the inner list is what the author decided.
-
-    EVERYTHING here is signed, and that is load-bearing: `to` under the signature stops a valid
-    envelope being lifted and re-delivered to someone who would see a correctly-signed message
-    never addressed to them. Same argument for `verb` and `reply_to` -- anything an unsigned copy
-    would let an attacker change for free."""
+    """EVERY field is signed, and `to` especially: without it under the signature, a valid
+    envelope can be lifted and re-delivered to someone who never was its recipient."""
     return codec.encode([frm, ts, env.encode()])
 
 
 @dataclass(frozen=True, slots=True)
 class SignedEnvelope:
-    """The authenticated header — who sent this hop, when — plus the envelope it carries.
-
-    A separate type from `Envelope` so that "maybe signed" is not an ambiguous `None`, the same
-    reason `SignedTransaction` is distinct. `frm` and `ts` live here rather than on `Envelope`
-    because they are claims this signature makes; an unsigned envelope has no author and no time."""
-
     frm: crypto.PublicKey
     ts: int
     env: Envelope
@@ -244,8 +108,6 @@ class SignedEnvelope:
 
     @property
     def _body(self) -> bytes:
-        """The canonical bytes THIS signature covers -- what `verify` checks and what `raw` wraps
-        with the sig for the wire form."""
         return _body_bytes(self.frm, self.ts, self.env)
 
     @property
@@ -256,42 +118,18 @@ class SignedEnvelope:
         return self.frm.verify(self._body, self.sig)
 
     def seal(self) -> Frame:
-        """Sign-then-seal (the envelope is already signed) and tag for the recipient.
-
-        Note what is NOT here: no epoch, no version, no sender hint, no length prefix beyond
-        the codec's. Every one of those would be an unauthenticated field outside the sealed
-        box, and an unauthenticated field on the wire is either ignorable or forgeable."""
         sealed = self.env.to.seal(self.raw)
         return Frame(crypto.screen_tag(self.env.to, sealed), sealed)
 
     def fresh(self, now: int, window: int) -> bool:
-        """Is this envelope inside the conversation window?
-
-        Measures *"are we in sync right now"*, not *"how old is the content"* — the stamp is fresh
-        per message, so this window is tight while a transaction's admission window is loose. The
-        two are independent, and neither substitutes for the other."""
         return abs(now - self.ts) <= window
 
     def answer(self, verb: Verb, body: bytes = b"") -> Envelope:
-        """The reply to this message: addresses reverse, `reply_to` and `reply_ts` echo.
-
-        Lives on the SIGNED half because it needs both — `frm` to address the reply back, and `ts`
-        for the echo — and both are claims of this hop. Returns an unsigned `Envelope`, so the
-        reply's own time arrives when the caller signs it. There is no `ts` to inherit or forget,
-        which is what retires the zero-sentinel trap the old version needed."""
         return Envelope(self.frm, verb, new_message_id(), body, self.env.mid, self.ts)
 
     def accept(
         self, me: crypto.PublicKey, now: int, window: int, in_reply_to: MessageId | None = None
     ) -> None:
-        """Every check a receiver owes, in one place, raising on the first failure.
-
-        ORDER IS DELIBERATE — addressing and freshness before the signature, so a misdelivered or
-        stale frame costs no verification. That is not the argument *for* the timestamp (see the
-        module header) but it is a free consequence of having it.
-
-        A caller that wants only some of these should not exist: forgetting one is precisely how the
-        previous package shipped an unbound request id."""
         if self.env.to != me:
             raise EnvelopeError(f"addressed to {self.env.to.hex()[:8]}, not us")
         if not self.fresh(now, window):
@@ -305,8 +143,6 @@ class SignedEnvelope:
 
     @classmethod
     def decode(cls, raw: bytes) -> Self:
-        """Decode and TYPE-CHECK. Signature verification is the caller's, via `accept`: a malformed
-        frame and a forged one are different failures."""
         outer = codec.as_seq(codec.decode(raw), 2)
         f = codec.as_seq(codec.decode(codec.as_bytes(outer[0])), 3)
         return cls(
@@ -320,25 +156,11 @@ class SignedEnvelope:
 def request(
     kp: crypto.Keypair, to: crypto.PublicKey, verb: Verb, ts: int, body: bytes = b""
 ) -> SignedEnvelope:
-    """Author a request. The message id is generated here so it cannot be forgotten."""
     return Envelope(to, verb, new_message_id(), body).sign(kp, ts)
-
-
-# --------------------------------------------------------------------------------------------- #
-# Sealing — transport confidentiality, and nothing else.                                        #
-# --------------------------------------------------------------------------------------------- #
 
 
 @dataclass(frozen=True, slots=True)
 class Frame:
-    """What actually goes on the wire: a screen tag and a sealed envelope.
-
-    The tag lets a recipient on a MULTIPLEXED carrier recognise its own traffic without trial
-    decryption. It is `HMAC(key = destination identity, message = sealed bytes)` — and including the
-    sealed bytes is essential, not incidental: keyed only on the identity it would be a constant,
-    i.e. a permanent per-node fingerprint an observer could use to link every frame ever sent to
-    that node. Per-message input makes it unlinkable to anyone without the key."""
-
     tag: crypto.ScreenTag
     sealed: crypto.SealedBlob
 
@@ -352,19 +174,9 @@ class Frame:
         return cls(crypto.ScreenTag(codec.as_bytes(f[0])), crypto.SealedBlob(codec.as_bytes(f[1])))
 
     def addressed_to(self, me: crypto.PublicKey) -> bool:
-        """Cheap pre-filter on a shared carrier: recompute the tag and compare.
-
-        A HINT, NEVER A DECISION. A match means the frame is probably ours; everything that matters
-        is still established by `SignedEnvelope.accept` after unsealing. Using this to authorise
-        anything would be trusting an unauthenticated field."""
         return crypto.screen_tag(me, self.sealed) == self.tag
 
     def unseal(self, kp: crypto.Keypair) -> SignedEnvelope:
-        """Open the frame and decode the envelope inside. Verification is `accept`'s job.
-
-        Raises `EnvelopeError` for a box that will not open — a frame not meant for us and a
-        tampered one are indistinguishable by design in an anonymous sealed box, so they are
-        one error."""
         try:
             raw = kp.open_sealed_raw(self.sealed)
         except crypto.SealedBoxError as e:

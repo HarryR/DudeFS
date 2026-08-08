@@ -1,20 +1,3 @@
-# dude.sync.lite_client -- the LightClient state machine. See SPEC
-# (light-client-verify anchors, light-client-piggyback, light-client-cert-chain).
-#
-# A light client that trusts only the anchor pubkey, corroborates the roster from `f+1`
-# nodes at bootstrap, and then reads keys via `GET_PROOF` against any single roster
-# member. Every reply piggybacks catch-up headers so the client stays live within the
-# `liveness_window` bound (#light-client-liveness).
-#
-# SANS-I/O. Same discipline as `Follower`: `tick(now)` and `receive(frame, now)` are the
-# only entry points that touch time or bytes. Postman is the impure edge. Nothing here
-# opens sockets or spawns anything.
-#
-# WHAT THIS IS NOT. Not a full-node Follower (which drives block-by-block replay into a
-# local Store; this client has no store). Not the WP2 worker daemon (which drives quorums
-# and holds a mempool). The light client's whole model is: no local durable state, just an
-# in-memory `TrustedState` refreshed via `GET_ANCHORS` on a schedule the caller drives.
-
 from __future__ import annotations
 
 import contextlib
@@ -51,71 +34,37 @@ from .lite_adapter import (
 )
 
 
-class LightClientError(DudeError):
-    """A misuse of the LightClient API (out-of-order call, contradictory input). Not for
-    per-peer misbehaviour (silent drop) and not for refusals (returned as a result)."""
+class LightClientError(DudeError): ...
 
 
 class State(Enum):
-    """LightClient lifecycle. See SPEC #light-client-verify."""
-
     UNBOOTSTRAPPED = auto()
-    """No trusted state. `bootstrap(now)` moves us to BOOTSTRAPPING."""
 
     BOOTSTRAPPING = auto()
-    """Sent `GET_ANCHORS(None, None)` to every bootstrap peer; awaiting `f+1` corroborated
-    replies. Once we have them: state -> READY."""
 
     READY = auto()
-    """`trusted_state` is set. Can serve reads via `request_get()`."""
 
     FAILED = auto()
-    """Bootstrap failed (not enough corroborating replies within retry budget). Caller
-    should re-bootstrap with a fresh peer set. Not automatically retried."""
 
 
 @dataclass(frozen=True, slots=True)
 class TrustedState:
-    """What a bootstrapped client trusts. All fields are anchor-verifiable OR quorum-
-    corroborated at establishment time; subsequent reads may advance `head`, but the roster
-    itself is NEVER swapped in place -- a moved fingerprint invalidates this whole object and
-    the client re-bootstraps (#light-client-header-chain,
-    #light-client-roster-is-corroborated-only).
-
-    Trust boundary: fields derived from `f+1` corroboration + cert-chain-from-anchor."""
-
     roster: tuple[crypto.PublicKey, ...]
-    """Currently-authorised roster members. Used to verify `settle_sigs` on any anchors
-    the client receives -- consensus quorum multisig against this exact ordered set."""
 
     managers: tuple[crypto.PublicKey, ...]
-    """Currently-attested Role.MANAGER identities. Used to verify roster-entry certs
-    whose signer is a manager rather than the anchor directly."""
 
     node_endpoints: dict[crypto.PublicKey, tuple[Endpoint, ...]]
-    """Where to reach each roster member. Populated from bundle P_NODE rows."""
 
     roster_fingerprint: crypto.Digest
-    """The commitment cert's subject. Sent in every subsequent request, and compared against
-    every reply: a mismatch means this trusted state is stale and the client re-bootstraps
-    (#light-client-roster-is-corroborated-only)."""
 
     head: TrustedBlock
-    """`(block_num, block_hash)` -- the most recent block whose `settle_sigs` we've
-    verified. Advances on chain-linked headers received in piggyback."""
 
     head_state_root: crypto.Digest
-    """`state_root` at `head`. Cached so `GET_PROOF` replies can be verified against it
-    (once the SMT verifier lands)."""
 
 
 @dataclass(slots=True)
 class GetResult:
-    """A completed read. `absent=True` iff the key was proven absent at the responder's
-    state (non-membership proof, #light-client-nonmembership). `value` is the raw bytes
-    otherwise."""
-
-    value: bytes  # ABSENT_MARKER when absent
+    value: bytes
     absent: bool
     block_num: int
     state_root: crypto.Digest
@@ -123,15 +72,10 @@ class GetResult:
 
 @dataclass(slots=True)
 class Failed:
-    """A completed-but-failed request. `reason` names why -- refusal from responder,
-    stale, fork, or client-side verify failure."""
-
-    reason: str  # LiteRefusal.value or a client-side description
+    reason: str
 
 
-# Sentinel used by `poll` to say "not yet complete".
-class _Pending:
-    """Singleton pending marker. Not a dataclass -- one shared instance is fine."""
+class _Pending: ...
 
 
 PENDING = _Pending()
@@ -139,9 +83,6 @@ PENDING = _Pending()
 
 @dataclass(slots=True)
 class _PendingRead:
-    """Outstanding GET_PROOF. Keyed by mid in `_pending_reads`; the caller polls via
-    `request_id` which is the same value."""
-
     store_id: int
     name: bytes
     peer: crypto.PublicKey
@@ -151,24 +92,16 @@ class _PendingRead:
 
 @dataclass(slots=True)
 class _BootstrapReply:
-    """Per-peer state during BOOTSTRAPPING: the reply we got from this peer (if any).
-    Corroboration is on `roster_fingerprint` across `f+1` replies."""
-
     fingerprint: crypto.Digest | None = None
     bundle: RosterBundle | None = None
     anchors_reply: AnchorsReply | None = None
 
 
-type OutboxItem = tuple[crypto.PublicKey, bytes]  # (target_peer, message_id)
+type OutboxItem = tuple[crypto.PublicKey, bytes]
 
 
 @dataclass(slots=True)
 class LightClient:
-    """A light client: anchor pubkey + in-memory TrustedState + Postman. See
-    #light-client-verify.
-
-    Not thread-safe. Follows the same tick/receive shape as `Follower` and `Node`."""
-
     me: crypto.Keypair
     anchor: crypto.PublicKey
     postman: Postman
@@ -181,12 +114,8 @@ class LightClient:
     _bootstrap_peers: dict[crypto.PublicKey, _BootstrapReply] = field(default_factory=dict)
     _pending_reads: dict[bytes, _PendingRead] = field(default_factory=dict)
     _pending_bootstrap_mids: dict[bytes, crypto.PublicKey] = field(default_factory=dict)
-    """mid -> peer, so an incoming AnchorsReply during BOOTSTRAPPING routes to the right
-    peer's _BootstrapReply."""
 
     _inbox: queue.SimpleQueue[Inbound] = field(default_factory=queue.SimpleQueue, init=False)
-    """See `Node._inbox` -- same shape. One door for inbound frames from any attached
-    Listener; the owned client thread drains it in `_run`."""
 
     _stopping: threading.Event = field(default_factory=threading.Event, init=False)
     _thread: threading.Thread | None = field(default=None, init=False)
@@ -195,22 +124,11 @@ class LightClient:
     def __post_init__(self) -> None:
         self.adapter = LiteAdapter(self.me, self.postman, self.tunables.net.ttl)
 
-    # -- lifecycle ---------------------------------------------------------------------------- #
-
     def add_bootstrap_peer(self, peer: crypto.PublicKey, endpoints: tuple[Endpoint, ...]) -> None:
-        """Register a bootstrap peer so `bootstrap()` can send GET_ANCHORS to it. Adds to
-        `postman.peers` via the usual dialler path; also tracks the peer as part of the
-        bootstrap set until corroboration completes."""
         self.postman.add_peer(peer, endpoints)
         self._bootstrap_peers[peer] = _BootstrapReply()
 
     def bootstrap(self, now: Millis) -> None:
-        """Kick off bootstrap: send GET_ANCHORS(None, None) to every registered
-        bootstrap peer. Transitions state UNBOOTSTRAPPED -> BOOTSTRAPPING.
-
-        Requires `add_bootstrap_peer` to have been called at least once. Ideally called
-        with `>= f+1` peers -- otherwise corroboration cannot succeed and bootstrap
-        will time out (moving to FAILED, caller re-tries)."""
         if self.state is not State.UNBOOTSTRAPPED:
             raise LightClientError(f"bootstrap in state {self.state.name}; expected UNBOOTSTRAPPED")
         if not self._bootstrap_peers:
@@ -224,14 +142,7 @@ class LightClient:
     def bootstrapped(self) -> bool:
         return self.state is State.READY
 
-    # -- reads -------------------------------------------------------------------------------- #
-
     def request_get(self, store_id: int, name: bytes, peer: crypto.PublicKey, now: Millis) -> bytes:
-        """Send a GET_PROOF for `(store_id, name)` at the current trusted head. Returns
-        the request-id (message-id); caller polls with `poll(request_id)`.
-
-        `peer` is the responder to send to; caller picks (any one of the trusted roster
-        members). This keeps peer-selection policy out of LightClient."""
         if self.state is not State.READY or self.trusted_state is None:
             raise LightClientError(f"request_get in state {self.state.name}; not READY")
         req = GetProof(
@@ -248,10 +159,6 @@ class LightClient:
         return mid
 
     def poll(self, request_id: bytes) -> GetResult | Failed | _Pending:
-        """Check on a pending read. Returns `PENDING` while awaiting the reply,
-        `GetResult` on success, `Failed` on refusal or verify failure. The entry is
-        removed on completion, so a second `poll` for the same request_id returns
-        PENDING (fresh) or raises."""
         entry = self._pending_reads.get(request_id)
         if entry is None:
             raise LightClientError(f"unknown request_id {request_id.hex()[:8]}")
@@ -261,16 +168,7 @@ class LightClient:
         del self._pending_reads[request_id]
         return result
 
-    # -- I/O boundary ------------------------------------------------------------------------- #
-
     def receive(self, frame: Frame, now: Millis, session: Session | None = None) -> None:
-        """One inbound frame -- same crash-only shape as Node.receive. Postman unseals
-        and correlates; if the reply matches an outstanding request, dispatch to the
-        right state-machine handler. Bad frames drop silently.
-
-        `session` is present when the frame arrived via a real transport (see `_run`),
-        None when injected directly by tests. When present, binds identity + registers
-        the session with Postman on first sight, mirroring `Node._bind_session`."""
         try:
             got = self.postman.deliver(frame, now)
             if session is not None:
@@ -283,7 +181,6 @@ class LightClient:
         except (LiteAdapterError, DudeError):
             return
         reply_to = env.env.reply_to
-        # Route by which state we're in and what the reply correlates to.
         if reply_to in self._pending_bootstrap_mids:
             peer = self._pending_bootstrap_mids.pop(reply_to)
             self._on_bootstrap_reply(peer, msg, now)
@@ -291,22 +188,11 @@ class LightClient:
         if reply_to in self._pending_reads:
             self._on_read_reply(reply_to, msg, now)
             return
-        # Unsolicited or already-reaped: drop.
 
     def tick(self, now: Millis) -> None:
-        """Advance postman (drives retransmission, timeouts). LightClient itself has no
-        time-driven state machine right now -- bootstrap and reads are event-driven off
-        replies. Retry / bootstrap-timeout policy is OWED (would live here)."""
         self.postman.tick(now)
 
-    # -- lifecycle ---------------------------------------------------------------------------- #
-    # Same shape as `Node.start` / `Node.stop` / `Node._run` -- one comment there covers both.
-
     def start(self, *listeners: Listener) -> None:
-        """Begin serving. Same transactional shape as `Node.start`, and the same reason for
-        starting the Postman: a light client typically passes NO listeners at all -- it dials
-        nodes and every reply comes back on the socket it opened, so the dial-side carrier
-        is the only thing reading (#session-first-reply)."""
         if self._thread is not None:
             return
         started: list[Listener] = []
@@ -331,7 +217,6 @@ class LightClient:
         self._thread.start()
 
     def stop(self, timeout: float = 5.0) -> None:
-        """Signal shutdown; close listeners and dial-side carriers; join. Idempotent."""
         self._stopping.set()
         for listener in self._listeners:
             with contextlib.suppress(Exception):
@@ -344,8 +229,6 @@ class LightClient:
             thread.join(timeout=timeout)
 
     def _run(self) -> None:
-        """Owned-thread body: drain `_inbox`, drive `tick()` on cadence. Same shape as
-        `Node._run`."""
         tick_interval_ms = self.tunables.tick_interval
         last_tick = now_ms()
         while not self._stopping.is_set():
@@ -360,8 +243,6 @@ class LightClient:
                 last_tick = now
 
     def _bind_session(self, session: Session, frm: crypto.PublicKey) -> None:
-        """Same shape as `Node._bind_session`. First inbound frame on this session sets
-        `session.identity = frm` and registers a SessionLink on Peer(frm)."""
         was_unbound = session.identity is None
         try:
             session.bind(frm)
@@ -371,27 +252,20 @@ class LightClient:
         if was_unbound:
             self.postman.register_session(session)
 
-    # -- internals ---------------------------------------------------------------------------- #
-
     def _on_bootstrap_reply(self, peer: crypto.PublicKey, msg: LiteMsg, now: Millis) -> None:
-        """One bootstrap peer replied. If it's an AnchorsReply with a valid bundle we
-        can verify from the anchor, record it. Once `f+1` peers agree on the same
-        `roster_fingerprint`, promote to READY."""
         if self.state is not State.BOOTSTRAPPING:
             return
         if isinstance(msg, LiteRefused):
-            # Peer refused; leave them out of corroboration. If not enough peers left
-            # to reach f+1 agreement, move to FAILED.
             self._check_bootstrap_convergence(now)
             return
         if not isinstance(msg, AnchorsReply):
-            return  # unexpected verb for this correlation; drop
+            return
         if msg.bundle is None:
-            return  # bootstrap request sent fingerprint=None; every reply should include bundle
+            return
         if not _verify_bundle(self.anchor, msg.bundle):
-            return  # bad bundle; treat peer as untrustworthy for corroboration
+            return
         if not _verify_settle_sigs_against_bundle(self.anchor, msg, msg.bundle):
-            return  # settle_sigs don't match the freshly-verified roster
+            return
         entry = self._bootstrap_peers.setdefault(peer, _BootstrapReply())
         entry.fingerprint = msg.roster_fingerprint
         entry.bundle = msg.bundle
@@ -399,18 +273,11 @@ class LightClient:
         self._check_bootstrap_convergence(now)
 
     def _check_bootstrap_convergence(self, now: Millis) -> None:  # noqa: ARG002 -- `now` for future retry-timeout hook
-        """Have `f+1` peers agreed on the same `roster_fingerprint`? If so, promote to
-        READY. If enough peers have failed that reaching f+1 is impossible, move to
-        FAILED (caller re-tries with a fresh peer set)."""
-        # Collect (fingerprint, entry) for peers that have replied.
         agreed: dict[crypto.Digest, list[_BootstrapReply]] = {}
         for entry in self._bootstrap_peers.values():
             if entry.fingerprint is None:
                 continue
             agreed.setdefault(entry.fingerprint, []).append(entry)
-        # `f+1` -- assuming the perceived roster size in the reply is what we use.
-        # Bootstrap-time approximation: use bundle roster size, since we're establishing
-        # who the roster IS. Pick the majority reply for that.
         for fingerprint, entries in agreed.items():
             first = entries[0]
             assert first.bundle is not None and first.anchors_reply is not None  # noqa: S101 -- type narrowing for the checker; contract invariants above make this unreachable
@@ -420,9 +287,6 @@ class LightClient:
                 return
 
     def _promote_to_ready(self, fingerprint: crypto.Digest, corroborated: _BootstrapReply) -> None:
-        """Set the trusted state from a corroborated bootstrap reply. Any one of the
-        agreeing replies works -- their bundles are byte-equal for the same fingerprint,
-        and we've already verified settle_sigs on this one's head."""
         assert corroborated.bundle is not None and corroborated.anchors_reply is not None  # noqa: S101 -- type narrowing for the checker; contract invariants above make this unreachable
         bundle = corroborated.bundle
         head = corroborated.anchors_reply.head
@@ -437,14 +301,10 @@ class LightClient:
         self.state = State.READY
 
     def _on_read_reply(self, reply_to: bytes, msg: LiteMsg, now: Millis) -> None:  # noqa: ARG002
-        """Reply to an outstanding GET_PROOF. Verify the header chain + settle_sigs to
-        establish `head_state_root`, then verify the SMT proof against that root,
-        record the result, advance trusted head."""
         entry = self._pending_reads[reply_to]
         if isinstance(msg, LiteRefused):
             entry.result = Failed(reason=msg.reason.value)
             if msg.reason in (LiteRefusal.STALE_CLIENT, LiteRefusal.FORK_DETECTED):
-                # Client's trusted state is unusable; caller should re-bootstrap.
                 self.state = State.UNBOOTSTRAPPED
                 self.trusted_state = None
             return
@@ -452,33 +312,17 @@ class LightClient:
             entry.result = Failed(reason="unexpected reply verb")
             return
         assert self.trusted_state is not None  # noqa: S101 -- type narrowing for the checker; contract invariants above make this unreachable
-        # THE ROSTER FINGERPRINT IS THE TRIPWIRE (#light-client-roster-is-corroborated-only).
-        # It is threaded through every reply precisely so a client can tell whether the
-        # assumptions its cached roster rests on still hold. If it moved, they do not: this
-        # client is by definition working on stale trust, and stale trust is re-established
-        # by `f+1` corroboration, never adopted from whoever happened to answer.
-        #
-        # This branch used to verify a piggybacked bundle and swap the roster in place. A
-        # #cert carries no serial, so a light client holding no log cannot tell a current
-        # manager from a revoked one -- a revoked manager's anchor-signed grant cert verifies
-        # forever. One responder could therefore hand a client a roster of its own keys and
-        # have it adopted, with no collusion. Pinned by
-        # `test_lite_client.TestRevokedManagerCannotForgeARoster`.
+        # A MOVED FINGERPRINT MEANS RE-BOOTSTRAP, never adopt-in-place. Adopting a roster from
+        # one responder let a granted-then-revoked manager hand a client a roster of its own keys,
+        # proven end-to-end. Corroboration is f+1 at bootstrap or it is nothing.
         if msg.roster_fingerprint != self.trusted_state.roster_fingerprint:
             entry.result = Failed(reason="roster changed; re-bootstrap")
             self.state = State.UNBOOTSTRAPPED
             self.trusted_state = None
             return
-        # Chain-verify headers[] against current trusted head + roster, then advance
-        # to responder's head (which is `msg.head`, a full SettledBlock). `_advance_head`
-        # updates `trusted_state.head_state_root` on success -- that's the root the SMT
-        # proof must verify against.
         if not self._advance_head(msg.headers, msg.head):
             entry.result = Failed(reason="header chain-link or settle_sigs verify failed")
             return
-        # Verify the SMT proof against the freshly-verified head_state_root -- see SPEC
-        # anchor light-client-nonmembership. A responder serving a wrong value or a
-        # fabricated proof fails here.
         try:
             proof = smt.Proof.decode(msg.proof)
         except DudeError:
@@ -505,15 +349,6 @@ class LightClient:
     def _advance_head(
         self, headers: tuple[SettledBlock, ...], responder_head: SettledBlock
     ) -> bool:
-        """Chain-verify `headers[]` from the client's current trusted_block, then verify
-        the responder's head SettledBlock as the final step. Advances
-        `trusted_state.head` + `head_state_root` on success. Returns False on any check
-        failure (caller drops the whole reply).
-
-        `headers[]` MAY be empty when the client is already at the responder's head; in
-        that case, verifying `responder_head` itself is redundant (it IS the trusted
-        head). When non-empty, `headers[-1]` typically IS `responder_head` (server ships
-        them together); the terminal chain-link + settle_sigs verify establishes trust."""
         assert self.trusted_state is not None  # noqa: S101 -- type narrowing for the checker; contract invariants above make this unreachable
         prev_hash = self.trusted_state.head.block_hash
         roster = self.trusted_state.roster
@@ -524,13 +359,11 @@ class LightClient:
             chain = (*headers, responder_head)
         for header in chain:
             if header.anchors.prev_block != prev_hash:
-                # Special case: no headers, no advance -- responder_head IS trusted head.
                 return header.block_hash == self.trusted_state.head.block_hash
             payload = _settle_payload(header.block.slice_hash, header.anchors)
             if not Authorization(header.multisig, payload, roster, self.anchor).verify():
                 return False
             prev_hash = header.block_hash
-        # Advance to the last verified block.
         final = chain[-1]
         self.trusted_state = TrustedState(
             roster=self.trusted_state.roster,
@@ -543,29 +376,14 @@ class LightClient:
         return True
 
 
-# --------------------------------------------------------------------------------------------- #
-# Verify helpers -- pure, no state                                                              #
-# --------------------------------------------------------------------------------------------- #
-
-
 def _verify_bundle(  # noqa: C901, PLR0911 -- verification pipeline; each early-return names a distinct failure mode
     anchor: crypto.PublicKey, bundle: RosterBundle
 ) -> bool:
-    """Verify a RosterBundle against the anchor pubkey alone (#light-client-cert-chain).
-    Signature-chain only: no state_root, no SMT proofs. Confirms:
-      * Commitment cert signature valid, subject binds serial+members+state_fingerprint,
-        signer is anchor or a manager appearing in bundle.managers.
-      * Manager certs each signed by anchor, purpose == 'manager'.
-      * Roster entry certs each signed by anchor OR by a manager in the bundle,
-        purpose == 'roster'.
-      * Recomputed state_fingerprint from bundle entries matches commitment binding."""
-    # Verify manager certs first, they're the trust anchors for other-signed entry certs.
     manager_pubkeys: set[crypto.PublicKey] = set()
     for grant in bundle.managers:
         if not _verify_grant_cert(grant, anchor, expected_role=Role.MANAGER):
             return False
         manager_pubkeys.add(grant.identity)
-    # Verify commitment cert.
     signer = bundle.commitment_cert.signer
     if signer != anchor and signer not in manager_pubkeys:
         return False
@@ -573,7 +391,6 @@ def _verify_bundle(  # noqa: C901, PLR0911 -- verification pipeline; each early-
         return False
     if not bundle.commitment_cert.verify():
         return False
-    # Recompute state_fingerprint from bundle entries.
     state_fingerprint = crypto.h(
         codec.encode(
             [
@@ -597,7 +414,6 @@ def _verify_bundle(  # noqa: C901, PLR0911 -- verification pipeline; each early-
     )
     if bundle.commitment_cert.subject != expected_subject:
         return False
-    # Verify each entry cert.
     for rec in bundle.entries:
         if rec.cert.subject != rec.identity:
             return False
@@ -612,8 +428,6 @@ def _verify_bundle(  # noqa: C901, PLR0911 -- verification pipeline; each early-
 
 
 def _verify_grant_cert(grant: Grant, anchor: crypto.PublicKey, expected_role: Role) -> bool:
-    """Verify a grant's #cert against `anchor` for `expected_role`. MANAGER + COMPACTOR
-    must be anchor-signed; the caller vouches for `expected_role` matching the grant."""
     if grant.role is not expected_role:
         return False
     cert = grant.cert
@@ -629,13 +443,6 @@ def _verify_grant_cert(grant: Grant, anchor: crypto.PublicKey, expected_role: Ro
 def _verify_settle_sigs_against_bundle(
     anchor: crypto.PublicKey, reply: AnchorsReply, bundle: RosterBundle
 ) -> bool:
-    """Verify the AnchorsReply's head quorum proof against the roster derived from the
-    bundle. Used at bootstrap time before trusted_state exists. The reply carries a full
-    `SettledBlock`, so slice_hash is directly available.
-
-    `Authorization` is the SAME type a node uses via `MgmtReader.authorises`; the only
-    difference is where the roster came from -- a cert-verified bundle here, the log
-    there."""
     roster = tuple(sorted(bundle.commitment_members))
     head = reply.head
     payload = _settle_payload(head.block.slice_hash, head.anchors)

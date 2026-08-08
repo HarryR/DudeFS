@@ -1,11 +1,3 @@
-# dude.store — the log and the derived store. See SPEC.md (#settlement).
-#
-# THE BOTTOM LAYER. Everything above hands it input that has ALREADY BEEN DECIDED: an ordered batch
-# to settle, a set of entries to compact. It decides nothing about ordering, membership or quorums —
-# it applies, records, derives and collects. That is the whole abstraction boundary (#coarse-acl),
-# and
-# it is why this layer can be built and tested while the layers above are still open questions.
-
 from . import management, ops, settle
 from .layer import PENDING, Layer, LayerError, Reader, View, holds
 from .ops import (
