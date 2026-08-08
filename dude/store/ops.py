@@ -221,23 +221,4 @@ class SignedTransaction:
         return self.txn.effects()
 
 
-def _satisfied_by(pred: Absent | Holds, post: crypto.Digest | None) -> bool:
-    if isinstance(pred, Absent):
-        return post is None
-    return post is not None and post == pred.digest
-
-
-def falsifies(a: SignedTransaction, b: SignedTransaction) -> bool:
-    eff = a.effects()
-    for p in b.txn.guards:
-        key = (p.store, p.name)
-        if key in eff and not _satisfied_by(p, eff[key]):
-            return True
-    return False
-
-
 type LogEntry = SignedTransaction
-
-
-def conflicts(a: SignedTransaction, b: SignedTransaction) -> bool:
-    return falsifies(a, b) or falsifies(b, a)

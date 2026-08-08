@@ -14,11 +14,14 @@ type Bucket = int
 
 @dataclass(frozen=True, slots=True)
 class Tunables:
-    delta: Millis = 1_000
+    delta: Millis = 30_000
+    """THE BLOCK TIME: how long a client waits before it can prove its write is final. The only
+    operating dial in the timing surface -- everything else derives from it and the measurements.
+    It is not a floor to be parked on; the floors are what `Tunables.__post_init__` checks."""
 
     w_admit: Millis = 30_000
 
-    w_valid_margin: Millis = 3_250
+    w_valid_margin: Millis = 60_250
 
     @property
     def w_valid(self) -> Millis:

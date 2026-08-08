@@ -6,7 +6,8 @@ import random
 import unittest
 
 from dude import quorum
-from dude.core import crypto
+from dude.core import codec, crypto
+from dude.core.errors import DudeError
 from dude.net.address import Address, Endpoint, Scheme
 from dude.store import management, ops, settle, store
 
@@ -326,20 +327,6 @@ class TestCrossStorePredicates(unittest.TestCase):
         r = self.s.apply((bad,), auth=self.mgmt)
         self.assertEqual(r.dropped, ((bad.op_hash, settle.Reason.GUARD),))
 
-    def test_conflict_is_per_store_pair(self):
-        """The same name in two stores is two keys, so one cannot falsify the other."""
-        writer_mgmt = tx(self.kp, (), (ops.Set(0, self.flag, b"x"),), st=ops.STORE_MANAGEMENT)
-        reader_data = tx(self.kp, (ops.Holds(D, self.flag, ops.value_digest(b"y")),), (), st=D)
-        self.assertFalse(ops.conflicts(writer_mgmt, reader_data))
-        # ...but the same store DOES conflict
-        reader_mgmt = tx(
-            self.kp,
-            (ops.Holds(ops.STORE_MANAGEMENT, self.flag, ops.value_digest(b"y")),),
-            (),
-            st=ops.STORE_MANAGEMENT,
-        )
-        self.assertTrue(ops.conflicts(writer_mgmt, reader_mgmt))
-
     def test_predicate_store_survives_encoding(self):
         t = tx(
             self.kp,
@@ -531,3 +518,40 @@ class TestTransferAndSettlementRace(unittest.TestCase):
         self.assertEqual(len(got.settled), 1)
         self.assertEqual([d.why for d in got.dropped], [settle.Reason.SETTLED])
         self.assertIsNotNone(self.s.get(ops.STORE_DATA, b"j"))
+
+
+class TestTransactionEncoding(unittest.TestCase):
+    """`op_hash` is `h(raw)` and `raw` is REBUILT from the decoded fields, so the content address
+    of a relayed transaction is only stable if decode-then-encode is the identity. That rests on
+    the codec being canonical; this pins the dependency rather than assuming it."""
+
+    def setUp(self):
+        self.kp = crypto.Keypair.generate()
+
+    def test_decode_then_encode_reproduces_the_received_bytes(self):
+        signed = tx(
+            self.kp,
+            muts=(ops.Set(ops.STORE_DATA, b"k", b"v", 7), ops.Del(ops.STORE_DATA, b"j")),
+            preds=(ops.Absent(ops.STORE_DATA, b"j"),),
+        )
+        raw = signed.raw
+        self.assertEqual(ops.SignedTransaction.decode(raw).raw, raw)
+        self.assertEqual(ops.SignedTransaction.decode(raw).op_hash, signed.op_hash)
+
+    def test_a_non_canonical_re_encoding_is_refused_rather_than_normalised(self):
+        """A liberal decoder would accept these and silently re-address the transaction."""
+        signed = tx(self.kp, muts=(ops.Set(ops.STORE_DATA, b"k", b"v"),))
+        for bad in (signed.raw + b"e", b"li00ee", b"l" + signed.raw):
+            with self.assertRaises(DudeError):
+                ops.SignedTransaction.decode(bad)
+
+    def test_wrong_field_count_raises_at_both_nesting_levels(self):
+        """2 outer fields wrapping a 3-field body. A field added to one half without the other
+        changes what is signed or what is hashed, in silence (CLAUDE.md trap 1)."""
+        for wrong in (1, 3):
+            with self.assertRaises(DudeError):
+                ops.SignedTransaction.decode(codec.encode([b""] * wrong))
+        for wrong in (2, 4):
+            body = codec.encode([b""] * wrong)
+            with self.assertRaises(DudeError):
+                ops.SignedTransaction.decode(codec.encode([body, b"\x00" * 64]))

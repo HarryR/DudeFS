@@ -3,7 +3,7 @@ from __future__ import annotations
 from ..consensus.settle_round import SettledBlock
 from ..core import crypto
 from ..store import Store
-from ..store.management import MgmtReader
+from ..store.management import MgmtReader, RosterCommitment
 from ..store.store import StoreReader
 from .lite_adapter import (
     ABSENT_MARKER,
@@ -35,7 +35,7 @@ def _anchors(  # noqa: PLR0911 -- each early-return maps to a distinct LiteRefus
     head_num = r.head_block_num()
     if not head_num:
         return LiteRefused(LiteRefusal.NO_STATE)
-    commitment = mgmt.roster_commitment_full()
+    commitment = mgmt.roster_commitment()
     if commitment is None:
         return LiteRefused(LiteRefusal.NO_STATE)
 
@@ -56,8 +56,7 @@ def _anchors(  # noqa: PLR0911 -- each early-return maps to a distinct LiteRefus
         if head_num - client_num > liveness_window:
             return LiteRefused(LiteRefusal.STALE_CLIENT)
 
-    _, _, _, commitment_cert = commitment
-    roster_fingerprint = crypto.Digest(commitment_cert.subject)
+    roster_fingerprint = crypto.Digest(commitment.cert.subject)
 
     bundle: RosterBundle | None = None
     if request.known_roster_fingerprint is None:
@@ -101,7 +100,7 @@ def _proof(  # noqa: PLR0911, PLR0912, C901 -- each early-return names a distinc
     if not request.name:
         return LiteRefused(LiteRefusal.MALFORMED_QUERY)
 
-    commitment = mgmt.roster_commitment_full()
+    commitment = mgmt.roster_commitment()
     if commitment is None:
         return LiteRefused(LiteRefusal.NO_STATE)
 
@@ -136,8 +135,7 @@ def _proof(  # noqa: PLR0911, PLR0912, C901 -- each early-return names a distinc
         absent = False
     proof = r.prove(request.store_id, request.name).encode()
 
-    _, _, _, commitment_cert = commitment
-    roster_fingerprint = crypto.Digest(commitment_cert.subject)
+    roster_fingerprint = crypto.Digest(commitment.cert.subject)
     bundle: RosterBundle | None = None
     if request.known_roster_fingerprint is None:
         bundle = _build_bundle(mgmt, commitment)
@@ -155,22 +153,20 @@ def _proof(  # noqa: PLR0911, PLR0912, C901 -- each early-return names a distinc
     )
 
 
-def _build_bundle(mgmt: MgmtReader, commitment) -> RosterBundle:
-    serial, members, _state_fingerprint, cert = commitment
+def _build_bundle(mgmt: MgmtReader, commitment: RosterCommitment) -> RosterBundle:
     nodes = mgmt.nodes()
     entries = tuple(
         sorted(
-            (nodes[m] for m in members if m in nodes),
+            (nodes[m] for m in commitment.members if m in nodes),
             key=lambda rec: bytes(rec.identity),
         )
     )
-    managers = mgmt.manager_grants()
     return RosterBundle(
-        commitment_serial=serial,
-        commitment_members=members,
-        commitment_cert=cert,
+        commitment_serial=commitment.serial,
+        commitment_members=commitment.members,
+        commitment_cert=commitment.cert,
         entries=entries,
-        managers=managers,
+        managers=mgmt.manager_grants(),
     )
 
 

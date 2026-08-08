@@ -25,8 +25,8 @@ class Role(Enum):
 type Domain = bytes
 
 _CERT_DOMAIN = b"dude.management.cert:"
-_CERT_PURPOSE_ROSTER = b"roster"
-_CERT_PURPOSE_ROSTER_COMMITMENT = b"roster_commitment"
+CERT_PURPOSE_ROSTER = b"roster"
+CERT_PURPOSE_ROSTER_COMMITMENT = b"roster_commitment"
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,11 +51,11 @@ class Cert:
 
     @classmethod
     def sign_roster(cls, signer: crypto.Keypair, subject: crypto.PublicKey) -> Cert:
-        return cls.sign(signer, bytes(subject), _CERT_PURPOSE_ROSTER)
+        return cls.sign(signer, bytes(subject), CERT_PURPOSE_ROSTER)
 
     @classmethod
     def sign_roster_commitment(cls, signer: crypto.Keypair, commitment_bytes: bytes) -> Cert:
-        return cls.sign(signer, crypto.h(commitment_bytes), _CERT_PURPOSE_ROSTER_COMMITMENT)
+        return cls.sign(signer, crypto.h(commitment_bytes), CERT_PURPOSE_ROSTER_COMMITMENT)
 
     def verify(self) -> bool:
         return self.signer.verify(_CERT_DOMAIN + self.purpose + b":" + self.subject, self.sig)
@@ -138,6 +138,71 @@ class NodeRecord:
         domains = frozenset(codec.as_bytes(d) for d in codec.as_seq(f[1]))
         cert = Cert.decode(codec.as_bytes(f[2]))
         return cls(identity, endpoints, cert, domains)
+
+
+@dataclass(frozen=True, slots=True)
+class RosterCommitment:
+    """The P_ROSTER row: its layout and the fingerprints derived from it, in one place. Hand-
+    decoded at each call site instead, the read and write halves drifted into disagreeing about
+    whether a malformed row raises or reads as absent."""
+
+    serial: int
+    members: tuple[crypto.PublicKey, ...]
+    state_fingerprint: crypto.Digest
+    cert: Cert
+
+    @staticmethod
+    def fingerprint(records: Iterable[NodeRecord]) -> crypto.Digest:
+        return crypto.h(
+            codec.encode(
+                [
+                    [
+                        bytes(rec.identity),
+                        sorted(ep.encode() for ep in rec.endpoints),
+                        sorted(rec.domains),
+                    ]
+                    for rec in sorted(records, key=lambda r: bytes(r.identity))
+                ]
+            )
+        )
+
+    @staticmethod
+    def content(
+        serial: int, members: Iterable[crypto.PublicKey], state_fingerprint: crypto.Digest
+    ) -> bytes:
+        return codec.encode([serial, sorted(bytes(m) for m in members), state_fingerprint])
+
+    @property
+    def subject(self) -> crypto.Digest:
+        return crypto.h(self.content(self.serial, self.members, self.state_fingerprint))
+
+    def attests(self) -> bool:
+        return self.cert.purpose == CERT_PURPOSE_ROSTER_COMMITMENT and self.cert.subject == (
+            self.subject
+        )
+
+    def encode_row(self) -> bytes:
+        return codec.encode(
+            [
+                self.serial,
+                sorted(bytes(m) for m in self.members),
+                self.state_fingerprint,
+                self.cert.encode(),
+            ]
+        )
+
+    @classmethod
+    def decode_row(cls, raw: bytes) -> RosterCommitment:
+        try:
+            f = codec.as_seq(codec.decode(raw), 4)
+            return cls(
+                serial=codec.as_int(f[0]),
+                members=tuple(crypto.PublicKey(codec.as_bytes(m)) for m in codec.as_seq(f[1])),
+                state_fingerprint=crypto.Digest(codec.as_bytes(f[2])),
+                cert=Cert.decode(codec.as_bytes(f[3])),
+            )
+        except DudeError as e:
+            raise ManagementError(f"malformed RosterCommitment: {e}") from e
 
 
 @dataclass(frozen=True, slots=True)
@@ -230,7 +295,7 @@ def attestations_by(
         except DudeError:
             continue
         if rec.cert.signer == signer:
-            out.append(Attestation(name, _CERT_PURPOSE_ROSTER, bytes(who)))
+            out.append(Attestation(name, CERT_PURPOSE_ROSTER, bytes(who)))
     for name, _prov, value, _ep in src.prefix(store_id, P_GRANT):
         who = crypto.PublicKey(name[len(P_GRANT) :])
         try:
@@ -242,13 +307,11 @@ def attestations_by(
     raw = src.get(store_id, P_ROSTER)
     if raw is not None:
         try:
-            f = codec.as_seq(codec.decode(raw[1]), 4)
-            content = codec.encode([codec.as_int(f[0]), codec.as_seq(f[1]), f[2]])
-            cert = Cert.decode(codec.as_bytes(f[3]))
+            rc = RosterCommitment.decode_row(raw[1])
         except DudeError:
             return tuple(sorted(out, key=lambda a: a.key))
-        if cert.signer == signer:
-            out.append(Attestation(P_ROSTER, _CERT_PURPOSE_ROSTER_COMMITMENT, crypto.h(content)))
+        if rc.cert.signer == signer:
+            out.append(Attestation(P_ROSTER, CERT_PURPOSE_ROSTER_COMMITMENT, rc.subject))
     return tuple(sorted(out, key=lambda a: a.key))
 
 
@@ -269,14 +332,16 @@ class MgmtReader:
         for who, rec in self.nodes().items():
             if rec.cert.subject != who:
                 continue
-            if rec.cert.purpose != _CERT_PURPOSE_ROSTER:
+            if rec.cert.purpose != CERT_PURPOSE_ROSTER:
                 continue
-            if not self.verify_cert(rec.cert):
+            if not self.verify_cert(rec.cert, self.src):
                 continue
             out.append(who)
         return tuple(sorted(out))
 
-    def verify_cert(self, cert: Cert) -> bool:  # noqa: PLR0911 -- each early-return names a distinct refusal reason; collapsing them into one `and`-chain hides which check failed
+    def verify_cert(self, cert: Cert, reader: Reader) -> bool:  # noqa: PLR0911 -- each early-return names a distinct refusal reason; collapsing them into one `and`-chain hides which check failed
+        """The signer's grant MUST resolve against the SAME `reader` as the row it attests.
+        Split across two views, no authority chain established inside a block works inside it."""
         anchor = self.src.anchor()
         if anchor is None:
             return False
@@ -285,15 +350,15 @@ class MgmtReader:
         anchor_only_purposes = (Role.MANAGER.value, Role.COMPACTOR.value)
         anchor_or_manager_purposes = (
             Role.CLIENT.value,
-            _CERT_PURPOSE_ROSTER,
-            _CERT_PURPOSE_ROSTER_COMMITMENT,
+            CERT_PURPOSE_ROSTER,
+            CERT_PURPOSE_ROSTER_COMMITMENT,
         )
         if cert.purpose in anchor_only_purposes:
             return cert.signer == anchor
         if cert.purpose in anchor_or_manager_purposes:
             if cert.signer == anchor:
                 return True
-            grant = self._read_grant(self.src, cert.signer)
+            grant = self._read_grant(reader, cert.signer)
             if grant is None or grant.role is not Role.MANAGER:
                 return False
             return (
@@ -304,37 +369,6 @@ class MgmtReader:
             )
         return False
 
-    def unauthorised_certs(self) -> str | None:
-        for prefix, decode in (
-            (P_NODE, lambda who, raw: NodeRecord.decode_row(who, raw).cert),
-            (P_GRANT, lambda who, raw: Grant.decode_row(who, raw).cert),
-        ):
-            for name, _prov, value, _ep in self.src.prefix(self.store_id, prefix):
-                who = crypto.PublicKey(name[len(prefix) :])
-                try:
-                    cert = decode(who, value)
-                except DudeError as e:
-                    return f"row {name!r} will not decode: {e}"
-                if not self.verify_cert(cert):
-                    return (
-                        f"row {name!r} carries a cert signed by "
-                        f"{cert.signer.hex()[:8]}, which is not authorised for "
-                        f"purpose {cert.purpose!r}"
-                    )
-        raw = self.src.get(self.store_id, P_ROSTER)
-        if raw is None:
-            return None
-        try:
-            cert = Cert.decode(codec.as_bytes(codec.as_seq(codec.decode(raw[1]), 4)[3]))
-        except DudeError as e:
-            return f"roster commitment will not decode: {e}"
-        if not self.verify_cert(cert):
-            return (
-                f"the roster commitment is attested by {cert.signer.hex()[:8]}, "
-                f"which is not currently authorised to sign one"
-            )
-        return None
-
     def manager_grants(self) -> tuple[Grant, ...]:
         out: list[Grant] = []
         for name, _prov, _value, _ep in self.src.prefix(self.store_id, P_GRANT):
@@ -342,92 +376,33 @@ class MgmtReader:
             grant = self._read_grant(self.src, who)
             if grant is None or grant.role is not Role.MANAGER:
                 continue
-            if not self._grant_cert_ok(grant):
+            if not self._grant_cert_ok(grant, self.src):
                 continue
             out.append(grant)
         out.sort(key=lambda g: bytes(g.identity))
         return tuple(out)
 
-    def roster_commitment_full(  # noqa: PLR0911 -- each early-return names a distinct refusal reason; collapsing hides which check failed
-        self,
-    ) -> tuple[int, tuple[crypto.PublicKey, ...], crypto.Digest, Cert] | None:
+    def roster_commitment(self) -> RosterCommitment | None:
         raw = self.src.get(self.store_id, P_ROSTER)
         if raw is None:
             return None
         try:
-            f = codec.as_seq(codec.decode(raw[1]), 4)
-            serial = codec.as_int(f[0])
-            members_seq = codec.as_seq(f[1])
-            members = tuple(crypto.PublicKey(codec.as_bytes(m)) for m in members_seq)
-            state_fingerprint = crypto.Digest(codec.as_bytes(f[2]))
-            cert = Cert.decode(codec.as_bytes(f[3]))
+            rc = RosterCommitment.decode_row(raw[1])
         except DudeError:
             return None
-        content_bytes = codec.encode([serial, sorted(bytes(m) for m in members), state_fingerprint])
-        if cert.subject != crypto.h(content_bytes):
+        if not rc.attests():
             return None
-        if cert.purpose != _CERT_PURPOSE_ROSTER_COMMITMENT:
+        if not self.verify_cert(rc.cert, self.src):
             return None
-        if not self.verify_cert(cert):
+        member_set = set(rc.members)
+        held = [rec for rec in self.nodes().values() if rec.identity in member_set]
+        if RosterCommitment.fingerprint(held) != rc.state_fingerprint:
             return None
-        member_set = set(members)
-        current_nodes = self.nodes()
-        expected_state = crypto.h(
-            codec.encode(
-                [
-                    [
-                        bytes(rec.identity),
-                        sorted(ep.encode() for ep in rec.endpoints),
-                        sorted(rec.domains),
-                    ]
-                    for rec in sorted(current_nodes.values(), key=lambda r: bytes(r.identity))
-                    if rec.identity in member_set
-                ]
-            )
-        )
-        if expected_state != state_fingerprint:
-            return None
-        return serial, members, state_fingerprint, cert
+        return rc
 
     def endpoints_of(self, who: crypto.PublicKey) -> tuple[Endpoint, ...]:
         rec = self.nodes().get(who)
         return rec.endpoints if rec else ()
-
-    def roster_commitment(self) -> tuple[int, tuple[crypto.PublicKey, ...]] | None:
-        raw = self.src.get(self.store_id, P_ROSTER)
-        if raw is None:
-            return None
-        f = codec.as_seq(codec.decode(raw[1]), 4)
-        serial = codec.as_int(f[0])
-        members_seq = codec.as_seq(f[1])
-        members = tuple(crypto.PublicKey(codec.as_bytes(m)) for m in members_seq)
-        state_fingerprint = crypto.Digest(codec.as_bytes(f[2]))
-        cert = Cert.decode(codec.as_bytes(f[3]))
-        content_bytes = codec.encode([serial, sorted(bytes(m) for m in members), state_fingerprint])
-        if cert.subject != crypto.h(content_bytes):
-            return None
-        if cert.purpose != _CERT_PURPOSE_ROSTER_COMMITMENT:
-            return None
-        if not self.verify_cert(cert):
-            return None
-        member_set = set(members)
-        current_nodes = self.nodes()
-        expected_state = crypto.h(
-            codec.encode(
-                [
-                    [
-                        bytes(rec.identity),
-                        sorted(ep.encode() for ep in rec.endpoints),
-                        sorted(rec.domains),
-                    ]
-                    for rec in sorted(current_nodes.values(), key=lambda r: bytes(r.identity))
-                    if rec.identity in member_set
-                ]
-            )
-        )
-        if expected_state != state_fingerprint:
-            return None
-        return serial, members
 
     def _read_grant(self, reader: Reader, who: crypto.PublicKey) -> Grant | None:
         raw = reader.get(self.store_id, P_GRANT + who)
@@ -442,7 +417,7 @@ class MgmtReader:
         if who == self.src.anchor():
             return True
         g = self._read_grant(reader, who)
-        if g is None or not self._grant_cert_ok(g):
+        if g is None or not self._grant_cert_ok(g, reader):
             return False
         if g.role is Role.MANAGER:
             return True
@@ -452,18 +427,18 @@ class MgmtReader:
         if who == self.src.anchor():
             return True
         g = self.grant_of(who)
-        if g is None or not self._grant_cert_ok(g):
+        if g is None or not self._grant_cert_ok(g, self.src):
             return False
         if g.role is Role.MANAGER:
             return True
         return kind in g.kinds
 
-    def _grant_cert_ok(self, g: Grant) -> bool:
+    def _grant_cert_ok(self, g: Grant, reader: Reader) -> bool:
         if g.cert.subject != g.identity:
             return False
         if g.cert.purpose != g.role.value:
             return False
-        return self.verify_cert(g.cert)
+        return self.verify_cert(g.cert, reader)
 
     def authorises(self, multisig: crypto.MultiSig, payload: bytes) -> bool:
         anchor = self.src.anchor()
@@ -523,11 +498,11 @@ class MgmtWriter(MgmtReader):
                     f"cert.subject {rec.cert.subject.hex()[:8]} does not match node "
                     f"identity {rec.identity.hex()[:8]}"
                 )
-            if rec.cert.purpose != _CERT_PURPOSE_ROSTER:
+            if rec.cert.purpose != CERT_PURPOSE_ROSTER:
                 raise ManagementError(
                     f"cert.purpose {rec.cert.purpose!r} is not the roster purpose"
                 )
-            if not self.verify_cert(rec.cert):
+            if not self.verify_cert(rec.cert, self.src):
                 raise ManagementError(
                     f"cert for node {rec.identity.hex()[:8]} does not verify or signer "
                     f"is not authorised"
@@ -538,30 +513,19 @@ class MgmtWriter(MgmtReader):
             steps.append(ops.Del(self.store_id, P_POP + who))
         steps.extend(ops.Set(self.store_id, P_NODE + rec.identity, rec.encode_row()) for rec in add)
         current = self.roster_commitment()
-        next_serial = (current[0] + 1) if current is not None else 1
-        sorted_members = sorted(bytes(m) for m in after)
-        state_content = codec.encode(
-            [
-                [
-                    bytes(rec.identity),
-                    sorted(ep.encode() for ep in rec.endpoints),
-                    sorted(rec.domains),
-                ]
-                for rec in sorted(after.values(), key=lambda r: bytes(r.identity))
-            ]
+        next_serial = (current.serial + 1) if current is not None else 1
+        members = tuple(after)
+        state_fingerprint = RosterCommitment.fingerprint(after.values())
+        commitment_cert = Cert.sign_roster_commitment(
+            commitment_signer, RosterCommitment.content(next_serial, members, state_fingerprint)
         )
-        state_fingerprint = crypto.h(state_content)
-        commitment_content = codec.encode([next_serial, sorted_members, state_fingerprint])
-        commitment_cert = Cert.sign_roster_commitment(commitment_signer, commitment_content)
-        if not self.verify_cert(commitment_cert):
+        if not self.verify_cert(commitment_cert, self.src):
             raise ManagementError(
                 f"commitment_signer {commitment_signer.public.hex()[:8]} is not authorised "
                 f"to sign the roster commitment (must be anchor or a valid manager)"
             )
-        commitment_row = codec.encode(
-            [next_serial, sorted_members, state_fingerprint, commitment_cert.encode()]
-        )
-        steps.append(ops.Set(self.store_id, P_ROSTER, commitment_row))
+        commitment = RosterCommitment(next_serial, members, state_fingerprint, commitment_cert)
+        steps.append(ops.Set(self.store_id, P_ROSTER, commitment.encode_row()))
         return ops.writes(*steps)
 
     def add_node(
@@ -603,7 +567,7 @@ class MgmtWriter(MgmtReader):
             )
         if cert.purpose != role.value:
             raise ManagementError(f"cert.purpose {cert.purpose!r} does not match role {role.name}")
-        if not self.verify_cert(cert):
+        if not self.verify_cert(cert, self.src):
             raise ManagementError(
                 f"cert does not verify or signer is not authorised for role {role.name}"
             )
@@ -620,7 +584,7 @@ class MgmtWriter(MgmtReader):
         and looked like a network fault.
 
         `reissue_signer` has no default even when nothing needs re-issuing: a default here is a
-        caller silently leaving the invariant (`unauthorised_certs`) false."""
+        caller silently leaving live rows attested by a signer that is no longer authorised."""
         anchor = self.src.anchor()
         if anchor is None:
             raise ManagementError("cannot revoke: store has no manager anchor")
@@ -645,11 +609,12 @@ class MgmtWriter(MgmtReader):
         if raw is None:
             raise ManagementError(f"row {att.key!r} vanished while composing a revocation")
         if att.key == P_ROSTER:
-            f = codec.as_seq(codec.decode(raw[1]), 4)
-            content = codec.encode([codec.as_int(f[0]), codec.as_seq(f[1]), f[2]])
-            cert = Cert.sign_roster_commitment(signer, content)
+            rc = RosterCommitment.decode_row(raw[1])
+            cert = Cert.sign_roster_commitment(
+                signer, RosterCommitment.content(rc.serial, rc.members, rc.state_fingerprint)
+            )
             self._require_signer(cert)
-            return ops.Set(self.store_id, P_ROSTER, codec.encode([f[0], f[1], f[2], cert.encode()]))
+            return ops.Set(self.store_id, P_ROSTER, replace(rc, cert=cert).encode_row())
         identity = crypto.PublicKey(att.subject)
         if att.key.startswith(P_NODE):
             rec = NodeRecord.decode_row(identity, raw[1])
@@ -662,7 +627,7 @@ class MgmtWriter(MgmtReader):
         return ops.Set(self.store_id, att.key, replace(grant, cert=cert).encode_row())
 
     def _require_signer(self, cert: Cert) -> None:
-        if not self.verify_cert(cert):
+        if not self.verify_cert(cert, self.src):
             raise ManagementError(
                 f"reissue_signer {cert.signer.hex()[:8]} is not authorised to sign a "
                 f"{cert.purpose!r} cert (must be anchor or a currently-valid manager)"

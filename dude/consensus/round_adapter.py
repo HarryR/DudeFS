@@ -3,7 +3,7 @@ from __future__ import annotations
 from ..core import crypto
 from ..core.units import Millis
 from ..net.envelope import Envelope, MessageId, SignedEnvelope, new_message_id
-from ..net.postman import Postman
+from ..net.postman import Postman, recipients
 from .round import Round, RoundAdapterError, RoundMsg
 
 
@@ -16,7 +16,7 @@ class RoundAdapter:
     def flush(self, round_: Round, now: Millis) -> None:
         for target, msg in round_.outbox():
             verb, body = msg.encode()
-            for peer in self.postman.recipients(target):
+            for peer in recipients(target, round_.roster(), self.me.public):
                 env = Envelope(peer, verb, new_message_id(), body).sign(self.me, now)
                 self.postman.mailbox.post(env, now, self.ttl, await_reply=False)
 

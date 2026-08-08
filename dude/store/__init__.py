@@ -8,7 +8,6 @@ from .ops import (
     SignedTransaction,
     Step,
     Transaction,
-    conflicts,
     value_digest,
     writes,
 )
@@ -36,7 +35,6 @@ __all__ = [
     "Transaction",
     "Verdict",
     "View",
-    "conflicts",
     "element",
     "evaluate",
     "holds",

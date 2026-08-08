@@ -48,10 +48,10 @@ class TestTheDeclaredSetIsSmall(unittest.TestCase):
             [
                 "client_clock_tolerance",
                 "clock_skew",
-                "hops_to_quorum",
                 "rtt_max",
                 "ticks_per_cadence",
-                "waves_to_settle",
+                "waves_per_round",
+                "windows_to_settle",
             ],
         )
 
@@ -104,10 +104,10 @@ class TestAnIncoherentDeploymentCannotBeBuilt(unittest.TestCase):
         self.assertIn("never bind", str(cm.exception))
 
     def test_raising_a_declared_quantity_moves_every_floor(self):
-        """The point of declaring them: a mixnet deployment with a 5 s round trip does not get to
-        keep a 1 s bucket, and finds out at construction rather than in production."""
+        """The point of declaring them: a mixnet deployment whose waves cost 15 s does not get to
+        keep a 30 s block time, and finds out at construction rather than in production."""
         with self.assertRaises(InvariantError) as cm:
-            Tunables(timing=replace(DEFAULT.timing, rtt_max=5_000))
+            Tunables(timing=replace(DEFAULT.timing, rtt_max=15_000))
         self.assertIn("mempool.delta", str(cm.exception))
 
     def test_the_refusal_is_ours_and_therefore_fatal(self):

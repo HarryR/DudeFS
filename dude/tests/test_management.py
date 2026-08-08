@@ -18,21 +18,54 @@ import unittest
 
 from ..consensus.bootstrap import bootstrap, intervene
 from ..consensus.settle_round import _settle_payload
-from ..core import crypto
+from ..core import codec, crypto
 from ..core.errors import DudeError, InvariantError
 from ..net.address import Address, Endpoint, Scheme
-from ..store import Store, ops
+from ..store import Store, ops, settle
 from ..store.management import (
     P_GRANT,
+    P_NODE,
     P_POP,
+    P_ROSTER,
     Cert,
+    Grant,
     ManagementError,
     MgmtWriter,
     NodeRecord,
     Role,
+    RosterCommitment,
 )
 
 T0 = 1_700_000_000_000
+
+
+def unauthorised_certs(mgmt: MgmtWriter) -> str | None:
+    """The #revocation-is-compound invariant, quantified: no live row carries a cert whose signer
+    is not authorised NOW. A TEST helper, not a production check -- the state it reports is
+    reachable by a hand-composed `ops.Del` and refusing it after settlement would brick on
+    exactly the input it means to catch. `verify_cert` is what production consults, per row."""
+    for prefix, decode in (
+        (P_NODE, lambda who, raw: NodeRecord.decode_row(who, raw).cert),
+        (P_GRANT, lambda who, raw: Grant.decode_row(who, raw).cert),
+    ):
+        for name, _prov, value, _ep in mgmt.src.prefix(mgmt.store_id, prefix):
+            who = crypto.PublicKey(name[len(prefix) :])
+            try:
+                cert = decode(who, value)
+            except DudeError as e:
+                return f"row {name!r} will not decode: {e}"
+            if not mgmt.verify_cert(cert, mgmt.src):
+                return f"row {name!r} carries a cert signed by {cert.signer.hex()[:8]}"
+    raw = mgmt.src.get(mgmt.store_id, P_ROSTER)
+    if raw is None:
+        return None
+    try:
+        rc = RosterCommitment.decode_row(raw[1])
+    except DudeError as e:
+        return f"roster commitment will not decode: {e}"
+    if not mgmt.verify_cert(rc.cert, mgmt.src):
+        return f"the roster commitment is attested by {rc.cert.signer.hex()[:8]}"
+    return None
 
 
 def _sign(kp: crypto.Keypair, tx: ops.Transaction) -> ops.SignedTransaction:
@@ -239,8 +272,8 @@ class TestRevocationIsCompound(unittest.TestCase):
     manager, and `roster()` returned ZERO members -- with all three P_NODE rows still present
     and no error raised anywhere. `verify_cert` asks whether a cert's signer is authorised NOW,
     so deleting one P_GRANT row silently un-attested every row that manager had signed. A node
-    in that state sits out consensus (`_open_round` refuses `me not in roster`) and floods
-    nothing (`_flood` iterates the roster), which reads as a network fault.
+    in that state sits out consensus (`_open_round` refuses `me not in roster`) and gossips to
+    nobody, since round messages address the roster, which reads as a network fault.
 
     #absence-is-revocation is unharmed: what gets replaced is the standing ATTESTATION on live
     rows, not the validity of anything the revoked identity authored."""
@@ -297,10 +330,10 @@ class TestRevocationIsCompound(unittest.TestCase):
         """`unauthorised_certs` is the quantified form of the per-row check the read side
         already runs. It reports the violation the roster silently absorbed."""
         anchor, warm, s, mgmt, _kps = self._cluster_admitted_by_a_warm_manager()
-        self.assertIsNone(mgmt.unauthorised_certs())
+        self.assertIsNone(unauthorised_certs(mgmt))
 
         s.apply((_sign(anchor, mgmt.revoke(warm.public, reissue_signer=anchor)),), auth=mgmt)
-        self.assertIsNone(mgmt.unauthorised_certs(), mgmt.unauthorised_certs())
+        self.assertIsNone(unauthorised_certs(mgmt), unauthorised_certs(mgmt))
 
     def test_a_bare_del_leaves_the_invariant_violated(self):
         """The accepted intermediate state (#typed-management-ops-owed): a caller who bypasses
@@ -315,7 +348,7 @@ class TestRevocationIsCompound(unittest.TestCase):
         s.apply((_sign(anchor, bare),), auth=mgmt)
 
         self.assertEqual(mgmt.roster(), (), "the roster-collapse precondition changed")
-        self.assertIsNotNone(mgmt.unauthorised_certs(), "invariant did not report the violation")
+        self.assertIsNotNone(unauthorised_certs(mgmt), "invariant did not report the violation")
 
     def test_only_the_anchor_may_revoke_a_manager(self):
         """#role-manager-grant: "Only the anchor grants or revokes Role.MANAGER." Refused at
@@ -330,17 +363,19 @@ class TestRevocationIsCompound(unittest.TestCase):
         put. Otherwise every revocation would churn light-client bundles and trip
         `Node._reconcile_peers`' serial gate for no state change."""
         anchor, warm, s, mgmt, _kps = self._cluster_admitted_by_a_warm_manager()
-        before = mgmt.roster_commitment_full()
+        before = mgmt.roster_commitment()
         assert before is not None
 
         s.apply((_sign(anchor, mgmt.revoke(warm.public, reissue_signer=anchor)),), auth=mgmt)
 
-        after = mgmt.roster_commitment_full()
+        after = mgmt.roster_commitment()
         assert after is not None
-        self.assertEqual(after[0], before[0], "serial bumped on a re-issue")
-        self.assertEqual(after[2], before[2], "state_fingerprint moved on a re-issue")
-        self.assertEqual(after[3].subject, before[3].subject, "roster_fingerprint moved")
-        self.assertEqual(after[3].signer, anchor.public, "cert was not re-signed by the anchor")
+        self.assertEqual(after.serial, before.serial, "serial bumped on a re-issue")
+        self.assertEqual(
+            after.state_fingerprint, before.state_fingerprint, "state_fingerprint moved"
+        )
+        self.assertEqual(after.cert.subject, before.cert.subject, "roster_fingerprint moved")
+        self.assertEqual(after.cert.signer, anchor.public, "cert was not re-signed by the anchor")
 
 
 class TestEmergencyIntervention(unittest.TestCase):
@@ -496,9 +531,8 @@ class TestChangeRosterBatched(unittest.TestCase):
         kps = _seed_cluster(s, mgmt, anchor, 3)
         commit = mgmt.roster_commitment()
         assert commit is not None
-        serial, members = commit
-        self.assertEqual(serial, 1)  # first commitment after provisioning
-        self.assertEqual(set(members), {kp.public for kp in kps})
+        self.assertEqual(commit.serial, 1)  # first commitment after provisioning
+        self.assertEqual(set(commit.members), {kp.public for kp in kps})
 
 
 class TestChangeRosterBrickRefusal(unittest.TestCase):
@@ -601,8 +635,8 @@ class TestChangeRosterAdvisoryComposition(unittest.TestCase):
 
         commit_after = mgmt.roster_commitment()
         assert commit_after is not None
-        self.assertEqual(commit_after[0], commit_before[0] + 1)
-        self.assertIn(kp_new.public, commit_after[1])
+        self.assertEqual(commit_after.serial, commit_before.serial + 1)
+        self.assertIn(kp_new.public, commit_after.members)
         self.assertEqual(len(mgmt.nodes()), 4)
 
     def test_remove_node_wrapper_updates_commitment(self):
@@ -620,8 +654,8 @@ class TestChangeRosterAdvisoryComposition(unittest.TestCase):
 
         commit_after = mgmt.roster_commitment()
         assert commit_after is not None
-        self.assertEqual(commit_after[0], commit_before[0] + 1)
-        self.assertNotIn(kps[0].public, commit_after[1])
+        self.assertEqual(commit_after.serial, commit_before.serial + 1)
+        self.assertNotIn(kps[0].public, commit_after.members)
         self.assertEqual(len(mgmt.nodes()), 3)
 
 
@@ -658,8 +692,6 @@ class TestNodeRecordEncoding(unittest.TestCase):
         """`NodeRecord.encode` emits 4 fields; anything else must be a hard decode refusal.
         Trap #1: a field added to encode without matching decode `as_seq(..., N)` would silently
         drop; this test pins the count so the drop can't happen unnoticed."""
-        from ..core import codec  # noqa: PLC0415 -- local; only used here
-
         for wrong in (3, 5):
             malformed = codec.encode([b""] * wrong)
             with self.assertRaises(DudeError):
@@ -667,12 +699,102 @@ class TestNodeRecordEncoding(unittest.TestCase):
 
     def test_row_form_wrong_field_count_raises(self):
         """Same trap, for the disk form (3 fields, identity from key)."""
-        from ..core import codec  # noqa: PLC0415 -- local; only used here
-
         for wrong in (2, 4):
             malformed = codec.encode([b""] * wrong)
             with self.assertRaises(DudeError):
                 NodeRecord.decode_row(self.rec.identity, malformed)
+
+
+class TestAuthorityIsResolvedOverOneView(unittest.TestCase):
+    """`may_write` reads the author's grant from the view it is handed and MUST resolve that
+    grant's SIGNER against the same view. It read the row from the settlement overlay and the
+    signer's authority from the durable Store, so no authority chain established inside a single
+    block could be used inside it -- a manager granted at step 1 could not admit a client at
+    step 2, and the refusal looked like an ordinary AUTHORITY verdict."""
+
+    def test_a_manager_granted_in_the_same_batch_can_authorise_a_client(self):
+        anchor = crypto.Keypair.generate()
+        mgr = crypto.Keypair.generate()
+        client = crypto.Keypair.generate()
+
+        # The manager composes offline against a store where its own grant has landed -- the
+        # authoring path a warm delegate really has.
+        scratch, scratch_mgmt = _provisioned(anchor)
+        tx1 = _sign(
+            anchor,
+            scratch_mgmt.authorise(
+                mgr.public,
+                Role.MANAGER,
+                pop=mgr.prove_possession(),
+                cert=Cert.sign_grant(anchor, mgr.public, Role.MANAGER),
+            ),
+        )
+        scratch.apply((tx1,), auth=scratch_mgmt)
+        tx2 = _sign(
+            mgr,
+            scratch_mgmt.authorise(
+                client.public,
+                Role.CLIENT,
+                frozenset({ops.STORE_DATA}),
+                pop=client.prove_possession(),
+                cert=Cert.sign_grant(mgr, client.public, Role.CLIENT),
+            ),
+        )
+        tx3 = ops.writes(ops.Set(ops.STORE_DATA, b"k", b"v")).sign(client, T0)
+
+        s, mgmt = _provisioned(anchor)
+        screened = settle.would_apply(s, (tx1, tx2, tx3), mgmt)
+        self.assertEqual(
+            [(r.verdict.why, r.verdict.step) for r in screened.rejects],
+            [],
+            "an authority chain established inside the batch was not visible inside it",
+        )
+
+
+class TestAuthorityRowEncoding(unittest.TestCase):
+    """The remaining authority-carrying layouts. `NodeRecord` was pinned and these were not, so
+    a field added to one half of a Cert, a Grant or the roster commitment would have gone in
+    silently -- the halves stay self-consistent alone, which is what defeats round-trip tests."""
+
+    def setUp(self):
+        self.anchor = crypto.Keypair.generate()
+        self.who = crypto.Keypair.generate().public
+
+    def test_cert_wrong_field_count_raises(self):
+        cert = Cert.sign_grant(self.anchor, self.who, Role.CLIENT)
+        self.assertEqual(Cert.decode(cert.encode()), cert)
+        for wrong in (3, 5):
+            with self.assertRaises(ManagementError):
+                Cert.decode(codec.encode([b""] * wrong))
+
+    def test_grant_wrong_field_count_raises_on_both_forms(self):
+        grant = Grant(
+            self.who,
+            Role.CLIENT,
+            frozenset({1}),
+            frozenset({2}),
+            Cert.sign_grant(self.anchor, self.who, Role.CLIENT),
+        )
+        self.assertEqual(Grant.decode(grant.encode()), grant)
+        self.assertEqual(Grant.decode_row(self.who, grant.encode_row()), grant)
+        for wrong in (4, 6):
+            with self.assertRaises(DudeError):
+                Grant.decode(codec.encode([b""] * wrong))
+        for wrong in (3, 5):
+            with self.assertRaises(DudeError):
+                Grant.decode_row(self.who, codec.encode([b""] * wrong))
+
+    def test_roster_commitment_wrong_field_count_raises(self):
+        rc = RosterCommitment(
+            serial=1,
+            members=(self.who,),
+            state_fingerprint=crypto.h(b"fp"),
+            cert=Cert.sign_roster_commitment(self.anchor, b"content"),
+        )
+        self.assertEqual(RosterCommitment.decode_row(rc.encode_row()), rc)
+        for wrong in (3, 5):
+            with self.assertRaises(ManagementError):
+                RosterCommitment.decode_row(codec.encode([b""] * wrong))
 
 
 if __name__ == "__main__":

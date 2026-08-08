@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import queue
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import NamedTuple
@@ -39,6 +40,16 @@ class Recipient(Enum):
 
 
 type Target = crypto.PublicKey | Recipient
+
+
+def recipients(
+    target: Target, roster: Iterable[crypto.PublicKey], me: crypto.PublicKey
+) -> list[crypto.PublicKey]:
+    """The roster is an ARGUMENT: consensus gossip goes to consensus peers. Resolved against
+    `postman.peers`, HELD/SIG/SETTLE_SIG reach every identity with a live session, clients too."""
+    if target is Recipient.ALL:
+        return [p for p in roster if p != me]
+    return [target] if target != me else []
 
 
 class Received(NamedTuple):
@@ -204,11 +215,6 @@ class Postman:
         link = peer.links.get(reply.address)
         if link is not None:
             link.reply(now, reply.rtt)
-
-    def recipients(self, target: Target) -> list[crypto.PublicKey]:
-        if target is Recipient.ALL:
-            return [p for p in self.peers if p != self.me.public]
-        return [target] if target != self.me.public else []
 
     def _reap(self, now: Millis) -> tuple[Expired, ...]:
         done = self.mailbox.expired(now)

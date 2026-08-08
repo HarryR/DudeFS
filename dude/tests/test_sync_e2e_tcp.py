@@ -151,7 +151,10 @@ def _produce_blocks(
         key = crypto.h(f"tcp-e2e-{submissions}".encode())
         tx = ops.writes(ops.Set(D, key, b"v")).sign(mgr, now)
         _submit(nodes[0], tx, mgr, now)
+        # Twice per bucket, as a real node ticks: a Round's HELD wave and the SIG wave that
+        # answers it both belong to its own bucket (see `Cluster.pump_without`).
         _pump_all(nodes, listeners, now)
+        _pump_all(nodes, listeners, now + DELTA // 2)
         submissions += 1
         now += DELTA
         if submissions > 30:

@@ -22,12 +22,28 @@ from ..net.transports.inproc import _reset_for_tests
 from ..node import Node
 from ..store import Store, management, ops
 from ..store.management import Cert, MgmtWriter, Role
-from ..tunables import DEFAULT
+from ..tunables import MempoolTunables, TimingTunables, Tunables
 
 D = ops.STORE_DATA
 M = ops.STORE_MANAGEMENT
 T0 = 1_700_000_000_000
-DELTA = DEFAULT.mempool.delta
+
+_TIMING = TimingTunables(rtt_max=30, clock_skew=25)
+_BLOCK_TIME = 500
+
+TUNABLES = Tunables(
+    timing=_TIMING,
+    mempool=MempoolTunables(
+        delta=_BLOCK_TIME,
+        w_valid_margin=_TIMING.endorse_margin(_BLOCK_TIME),
+    ),
+)
+"""A fast deployment, not the production one: at a 30 s block time a pump step exceeds `net.ttl`
+and every message expires before it is sent. Declares only what production declares -- two
+measurements and the block time -- so `w_valid_margin` derives here as it does there."""
+
+DELTA = TUNABLES.mempool.delta
+CUT_RESERVE = TUNABLES.timing.cut_reserve
 
 
 class Cluster:
@@ -62,7 +78,7 @@ class Cluster:
             # Manager signs block 1 containing the roster grants (bootstrap runs once per node
             # at init; every node produces byte-equal block 1 because the inputs are identical).
             bootstrap(store, self.mgr, genesis)
-            node = Node(kp, store)
+            node = Node(kp, store, TUNABLES)
             # Listener registers this identity in the module-scope InProc registry so other
             # nodes' dialers can find us.
             listener = InProcListener(name_of(kp.public))
@@ -143,25 +159,24 @@ class Cluster:
         a bucket boundary on the far end -- the tx lands in a different bucket on C than on
         A, and neither node's Round opens with a quorum of holders. `_quiesce` lets every
         hop that fits inside one moment happen inside one moment."""
-        now = max(now, self._clock)
-        for _ in range(rounds):
-            for node in self.nodes:
-                node.tick(now)
-            self._quiesce(now, away=set())
-            now += DELTA
-        self._clock = now
-        return now
+        return self.pump_without(now, away=set(), rounds=rounds)
 
     def pump_without(self, now: int, away: set[int], rounds: int = 10) -> int:
         """`pump`, with some nodes switched OFF — not ticked, and their traffic lost rather than
         queued. A node that was down did not receive what was sent to it while it was down, and
-        letting the switchboard hold it would make the backlog do the catching up."""
+        letting the switchboard hold it would make the backlog do the catching up.
+
+        TICKS AT A WINDOW'S TWO DECISION POINTS -- the boundary, and `delta - cut_reserve` where
+        the slice is cut. On boundaries alone, `_finalize` and `_abandon` fire in the same tick
+        and nothing ever ratifies."""
         now = max(now, self._clock)
         for _ in range(rounds):
-            for i, node in enumerate(self.nodes):
-                if i not in away:
-                    node.tick(now)
-            self._quiesce(now, away)
+            for offset in (0, DELTA - CUT_RESERVE):
+                at = now + offset
+                for i, node in enumerate(self.nodes):
+                    if i not in away:
+                        node.tick(at)
+                self._quiesce(at, away)
             now += DELTA
         self._clock = now
         return now

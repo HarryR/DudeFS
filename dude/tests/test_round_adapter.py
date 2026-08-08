@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import unittest
 
-from ..consensus.round import Held, Round, RoundAdapterError, RoundMsg, Sig
+from ..consensus.round import Bodies, Held, Round, RoundAdapterError, RoundMsg, Sig
 from ..consensus.round_adapter import RoundAdapter
 from ..core import codec, crypto
 from ..net import Verb
@@ -29,14 +29,14 @@ class TestEncodeDecodeRoundtrip(unittest.TestCase):
 
     def test_held_roundtrips(self):
         hashes = frozenset({crypto.h(b"a"), crypto.h(b"b"), crypto.h(b"c")})
-        original = Held(bucket=7, hashes=hashes)
+        original = Held(bucket=7, prev_block=crypto.h(b"prev"), hashes=hashes)
         verb, body = original.encode()
         self.assertIs(verb, Verb.HELD)
         self.assertEqual(RoundMsg.decode(verb, body), original)
 
     def test_sig_roundtrips(self):
         kp = crypto.Keypair.generate()
-        original = Sig.sign(kp, 3, crypto.h(b"a-slice"))
+        original = Sig.sign(kp, 3, crypto.h(b"prev"), crypto.h(b"a-slice"))
         verb, body = original.encode()
         self.assertIs(verb, Verb.SIG)
         self.assertEqual(RoundMsg.decode(verb, body), original)
@@ -44,7 +44,7 @@ class TestEncodeDecodeRoundtrip(unittest.TestCase):
     def test_empty_held_roundtrips(self):
         """An empty bucket produces a `Held` with an empty hash set. Must not become a decode
         failure."""
-        original = Held(bucket=1, hashes=frozenset())
+        original = Held(bucket=1, prev_block=crypto.h(b"prev"), hashes=frozenset())
         verb, body = original.encode()
         self.assertEqual(RoundMsg.decode(verb, body), original)
 
@@ -54,12 +54,14 @@ class TestBucketOf(unittest.TestCase):
     `RoundMsg.bucket_of` reads just the leading field."""
 
     def test_reads_the_bucket_from_a_held_body(self):
-        _, body = Held(bucket=42, hashes=frozenset({crypto.h(b"x")})).encode()
+        _, body = Held(
+            bucket=42, prev_block=crypto.h(b"prev"), hashes=frozenset({crypto.h(b"x")})
+        ).encode()
         self.assertEqual(RoundMsg.bucket_of(body), 42)
 
     def test_reads_the_bucket_from_a_sig_body(self):
         kp = crypto.Keypair.generate()
-        _, body = Sig.sign(kp, 99, crypto.h(b"s")).encode()
+        _, body = Sig.sign(kp, 99, crypto.h(b"prev"), crypto.h(b"s")).encode()
         self.assertEqual(RoundMsg.bucket_of(body), 99)
 
     def test_malformed_body_raises(self):
@@ -80,13 +82,63 @@ class TestDecodeFailures(unittest.TestCase):
             RoundMsg.decode(Verb.SIG, b"garbage")
 
     def test_wrong_field_count_raises(self):
-        # Held expects [bucket, [hashes]]; give it three fields.
-        with self.assertRaises(RoundAdapterError):
-            RoundMsg.decode(Verb.HELD, codec.encode([1, [], b"extra"]))
+        # Held emits [bucket, prev_block, [hashes]] -- three fields. Anything else is refused.
+        for wrong in ([1, []], [1, b"p", [], b"extra"]):
+            with self.assertRaises(RoundAdapterError):
+                RoundMsg.decode(Verb.HELD, codec.encode(wrong))
+
+    def test_bodies_roundtrips_and_pins_its_field_count(self):
+        original = Bodies(bucket=5, prev_block=crypto.h(b"prev"), txs=_stubs("a", "b"))
+        verb, body = original.encode()
+        self.assertIs(verb, Verb.BODIES)
+        self.assertEqual(RoundMsg.decode(verb, body), original)
+        for wrong in ([5, b"p"], [5, b"p", [], b"extra"]):
+            with self.assertRaises(RoundAdapterError):
+                RoundMsg.decode(Verb.BODIES, codec.encode(wrong))
+
+    def test_sig_wrong_field_count_raises(self):
+        # Sig emits [bucket, prev_block, slice_hash, sig] -- and prev_block is inside what the
+        # signature covers, so a half added to one side is a signature nobody can check.
+        for wrong in ([1, b"p", b"s"], [1, b"p", b"s", b"sig", b"extra"]):
+            with self.assertRaises(RoundAdapterError):
+                RoundMsg.decode(Verb.SIG, codec.encode(wrong))
 
     def test_non_round_verb_raises(self):
         with self.assertRaises(RoundAdapterError):
             RoundMsg.decode(Verb.PING, b"")
+
+
+class TestGossipGoesToTheRosterNotThePeerTable(unittest.TestCase):
+    """`Recipient.ALL` on a Round message means the consensus peers, which are exactly the roster.
+    It was resolved against `postman.peers`, which gains an entry for every identity that opens a
+    session -- so every connected client was sent HELD and SIG."""
+
+    def test_a_non_roster_peer_is_not_sent_held(self):
+        keys = [crypto.Keypair.generate() for _ in range(3)]
+        roster = tuple(sorted(k.public for k in keys))
+        client = crypto.Keypair.generate()
+
+        postman = Postman(keys[0])
+        for k in keys[1:]:
+            postman.add_peer(k.public, (Endpoint(Address(Scheme.INPROC, "peer")),))
+        postman.add_peer(client.public, (Endpoint(Address(Scheme.INPROC, "client")),))
+        self.assertIn(client.public, postman.peers)
+
+        r = Round(
+            bucket=1,
+            me=keys[0],
+            roster=roster,
+            prev_block=crypto.h(b"prev"),
+            now=T0,
+            close_by=T0 + 1000,
+            abandon_by=T0 + 2000,
+        )
+        r.add_local(())
+        RoundAdapter(keys[0], postman, ttl=5_000).flush(r, T0)
+
+        addressed = {postman.mailbox.pending[m].to for m in postman.mailbox.outstanding()}
+        self.assertEqual(addressed, set(roster) - {keys[0].public})
+        self.assertNotIn(client.public, addressed)
 
 
 class TestRoundMsgIsAbstract(unittest.TestCase):
@@ -124,6 +176,7 @@ class TestFlushToMailbox(unittest.TestCase):
             bucket=1,
             me=self.me,
             roster=self.roster,
+            prev_block=crypto.h(b"prev"),
             now=T0,
             close_by=T0 + 5 * DELTA,
             abandon_by=T0 + 1_000 * DELTA,
@@ -150,6 +203,7 @@ class TestFlushToMailbox(unittest.TestCase):
             bucket=1,
             me=self.me,
             roster=self.roster,
+            prev_block=crypto.h(b"prev"),
             now=T0,
             close_by=T0 + 5 * DELTA,
             abandon_by=T0 + 1_000 * DELTA,
@@ -176,6 +230,7 @@ class TestDeliverToRound(unittest.TestCase):
             bucket=1,
             me=me,
             roster=roster,
+            prev_block=crypto.h(b"prev"),
             now=T0,
             close_by=T0 + 5 * DELTA,
             abandon_by=T0 + 1_000 * DELTA,
@@ -183,7 +238,7 @@ class TestDeliverToRound(unittest.TestCase):
         r.add_local(_stubs("local"))
 
         peer_hashes = frozenset({crypto.h(b"peer-a"), crypto.h(b"peer-b")})
-        verb, body = Held(bucket=1, hashes=peer_hashes).encode()
+        verb, body = Held(bucket=1, prev_block=crypto.h(b"prev"), hashes=peer_hashes).encode()
         env = Envelope(me.public, verb, b"m" * 16, body).sign(peer, T0)
 
         # Adapter needs a Postman to construct, but `deliver` does not use it.

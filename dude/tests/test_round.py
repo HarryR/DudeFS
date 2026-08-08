@@ -21,7 +21,7 @@ import random
 import unittest
 
 from .. import quorum
-from ..consensus.round import Block, Round, RoundMsg, Sig, State, _slice_hash
+from ..consensus.round import Block, Bodies, Round, RoundMsg, Sig, State, _slice_hash
 from ..core import crypto
 from ..net.postman import Recipient
 from ..store import ops
@@ -65,13 +65,23 @@ def _wire(nodes: dict[crypto.PublicKey, Round], now: int) -> None:
 
     A message addressed to `Recipient.ALL` goes to every OTHER node (never back to sender).
     A message addressed to a specific PublicKey goes only to that node. Nothing here retries,
-    reorders, or drops -- those are what the pipelining / partition scenarios will construct."""
+    reorders, or drops -- those are what the pipelining / partition scenarios will construct.
+
+    `Bodies` goes to `absorb`, mirroring the Coordinator, which screens phase-2 bodies through
+    the admission door before handing them over. There is no door here -- no store, no grants --
+    so this harness passes them straight through and tests the PROTOCOL: who spots a gap, who
+    sends, what the slice becomes. Whether an absorbed body was admissible is the Coordinator's
+    question and `test_gestalt`'s."""
     for src_id, src in nodes.items():
         for target, msg in src.outbox():
             for dst_id, dst in nodes.items():
                 if dst_id == src_id:
                     continue
-                if target is Recipient.ALL or target == dst_id:
+                if target is not Recipient.ALL and target != dst_id:
+                    continue
+                if isinstance(msg, Bodies):
+                    dst.absorb(msg, src_id, msg.txs)
+                else:
                     dst.receive(msg, from_=src_id, now=now)
 
 
@@ -83,7 +93,13 @@ def _setup(
     roster = tuple(k.public for k in keys)
     rounds = {
         k.public: Round(
-            bucket=bucket, me=k, roster=roster, now=T0, close_by=close_by, abandon_by=abandon_by
+            bucket=bucket,
+            me=k,
+            roster=roster,
+            prev_block=crypto.h(b"prev"),
+            now=T0,
+            close_by=close_by,
+            abandon_by=abandon_by,
         )
         for k in keys
     }
@@ -143,10 +159,12 @@ class TestAllNodesAgree(unittest.TestCase):
 
 
 class TestDisagreementAtTheEdge(unittest.TestCase):
-    """One node holds an extra transaction nobody else does. The slice is the intersection
-    (what a quorum can attest to); the extra is `surviving`, returned to the current mempool."""
+    """One node holds an extra nobody else does AND repair does not reach them before the cut
+    (`repair=False`) -- the only way holdings still differ at `_finalize`. The slice is the
+    intersection; the extra is `surviving`. Reachable, phase 2 repairs it instead: see
+    `TestPhaseTwoRepairsGaps`."""
 
-    def test_the_extra_is_not_in_the_slice_and_is_returned_as_surviving(self):
+    def test_an_unrepaired_extra_is_not_in_the_slice_and_is_returned_as_surviving(self):
         _keys, nodes = _setup(3)
         shared = _stubs("a", "b", "c")
         extra = _stub_tx("only-c")
@@ -156,7 +174,7 @@ class TestDisagreementAtTheEdge(unittest.TestCase):
             nodes[nid].add_local(shared)
         nodes[node_ids[2]].add_local((*shared, extra))
 
-        _run(nodes)
+        _run_fabric(nodes, Fabric(nodes, repair=False))
 
         blocks = [r.ratified() for r in nodes.values()]
         rats: list[Block] = [b for b in blocks if b is not None]
@@ -181,9 +199,18 @@ class Fabric:
     The default configuration is: no partition, no delay -- functionally identical to `_wire`.
     Every fault is a value the test constructs; nothing here reads a clock or sleeps."""
 
-    def __init__(self, nodes: dict[crypto.PublicKey, Round], delay_ticks: int = 0) -> None:
+    def __init__(
+        self,
+        nodes: dict[crypto.PublicKey, Round],
+        delay_ticks: int = 0,
+        repair: bool = True,
+    ) -> None:
         self.nodes = nodes
         self.delay = delay_ticks * DELTA
+        self.repair = repair
+        """`repair=False` drops phase-2 `Bodies`, modelling repair that did not finish before
+        the cut. That is the only condition under which holdings still differ at `_finalize`,
+        and therefore the only one under which slice selection has anything to select."""
         self.partition: set[tuple[crypto.PublicKey, crypto.PublicKey]] = set()
         self.pending: list[tuple[crypto.PublicKey, crypto.PublicKey, RoundMsg, int]] = []
 
@@ -202,21 +229,34 @@ class Fabric:
         """One round: drain every Round's outbox into `pending`, then deliver anything due."""
         for src_id, src in self.nodes.items():
             for target, msg in src.outbox():
-                for dst_id in self.nodes:
-                    if dst_id == src_id:
-                        continue
-                    if target is not Recipient.ALL and target != dst_id:
-                        continue
-                    if (src_id, dst_id) in self.partition:
-                        continue
-                    self.pending.append((src_id, dst_id, msg, now + self.delay))
+                self._enqueue(src_id, target, msg, now)
         remaining = []
         for src_id, dst_id, msg, deliver_at in self.pending:
             if deliver_at <= now:
-                self.nodes[dst_id].receive(msg, from_=src_id, now=now)
+                self._deliver(src_id, dst_id, msg, now)
             else:
                 remaining.append((src_id, dst_id, msg, deliver_at))
         self.pending = remaining
+
+    def _enqueue(self, src_id: crypto.PublicKey, target: object, msg: RoundMsg, now: int) -> None:
+        for dst_id in self.nodes:
+            if dst_id == src_id:
+                continue
+            if target is not Recipient.ALL and target != dst_id:
+                continue
+            if (src_id, dst_id) in self.partition:
+                continue
+            if isinstance(msg, Bodies) and not self.repair:
+                continue
+            self.pending.append((src_id, dst_id, msg, now + self.delay))
+
+    def _deliver(
+        self, src_id: crypto.PublicKey, dst_id: crypto.PublicKey, msg: RoundMsg, now: int
+    ) -> None:
+        if isinstance(msg, Bodies):
+            self.nodes[dst_id].absorb(msg, src_id, msg.txs)
+        else:
+            self.nodes[dst_id].receive(msg, from_=src_id, now=now)
 
 
 def _run_fabric(
@@ -337,7 +377,7 @@ class TestByzantineEquivocation(unittest.TestCase):
         # node 0 BEFORE the real round produces the honest Sig. The bogus slice is a raw hash
         # (no body needed -- Sig only carries the slice_hash, not the tx set).
         bogus_slice = frozenset({crypto.h(b"nope")})
-        bogus_sig = Sig.sign(keys[2], 1, _slice_hash(1, bogus_slice))
+        bogus_sig = Sig.sign(keys[2], 1, crypto.h(b"prev"), _slice_hash(1, bogus_slice))
         fabric.inject(bogus_sig, from_=keys[2].public, to=keys[0].public, now=T0 + DELTA)
 
         # Now let the round complete normally.
@@ -360,6 +400,152 @@ class TestByzantineEquivocation(unittest.TestCase):
         self.assertNotEqual(first.slice_hash, second.slice_hash)
 
 
+class TestTheDeadlineIsATimeoutNotASchedule(unittest.TestCase):
+    """A Round that has heard from every roster member, all holding the same set, cuts
+    immediately: nothing further can arrive and nothing can change the answer. `_finalize` used
+    to fire only on `now >= close_by`, so a round that converged in the first millisecond still
+    sat out its whole window."""
+
+    def test_a_converged_round_cuts_without_reaching_close_by(self):
+        keys, rounds = _setup(3)
+        txs = _stubs("a", "b")
+        for r in rounds.values():
+            r.add_local(txs)
+        _wire(rounds, T0)  # every HELD delivered, no clock advance at all
+
+        for k in keys:
+            self.assertIsNot(
+                rounds[k.public].state(),
+                State.COLLECT,
+                "converged before close_by and still waited for the clock",
+            )
+        # Those that also received a quorum of SIGs in the same pass are already ratified --
+        # the whole round completed at T0, with close_by five ticks away.
+        self.assertTrue(any(r.ratified() is not None for r in rounds.values()))
+
+    def test_a_round_whose_peers_disagree_waits_for_the_deadline(self):
+        """Disagreement is not a reason to cut -- the rest of the window is what repairs it."""
+        keys, rounds = _setup(3)
+        rounds[keys[0].public].add_local(_stubs("a", "b"))
+        rounds[keys[1].public].add_local(_stubs("a"))
+        rounds[keys[2].public].add_local(_stubs("a"))
+        _wire(rounds, T0)
+
+        self.assertIs(rounds[keys[0].public].state(), State.COLLECT)
+
+    def test_a_round_still_missing_an_advertisement_waits(self):
+        keys, rounds = _setup(3)
+        txs = _stubs("a")
+        for k in keys[:2]:  # the third never advertises
+            rounds[k.public].add_local(txs)
+        _wire(rounds, T0)
+
+        self.assertIs(rounds[keys[0].public].state(), State.COLLECT)
+
+
+class TestPhaseTwoRepairsGaps(unittest.TestCase):
+    """The window between collecting and cutting exists to PROPAGATE, not merely to agree.
+
+    `_compute_slice` intersects with `local`, so anything a node lacks is removed from every
+    quorum subset it is in: one dropped packet costs the transaction its place in the block, and
+    the same gap recurs next bucket."""
+
+    def test_a_transaction_only_one_node_holds_still_reaches_the_slice(self):
+        _keys, nodes = _setup(3)
+        shared = _stubs("a", "b")
+        only_mine = _stub_tx("gap")
+        ids = list(nodes)
+        nodes[ids[0]].add_local((*shared, only_mine))
+        for nid in ids[1:]:
+            nodes[nid].add_local(shared)
+
+        _run(nodes)
+
+        blocks = [r.ratified() for r in nodes.values()]
+        rats: list[Block] = [b for b in blocks if b is not None]
+        self.assertEqual(len(rats), 3, "not all nodes ratified")
+        self.assertEqual(
+            {b.hashes for b in rats},
+            {_hashes((*shared, only_mine))},
+            "the gap was dropped from the slice instead of being repaired",
+        )
+        for r in nodes.values():
+            self.assertEqual(list(r.surviving()), [], "a repaired tx was left behind")
+
+    def test_exactly_one_holder_sends_each_missing_body(self):
+        """The rejoining case: one node holds nothing, everyone else holds everything. Without
+        the election it is handed n copies of the lot, at the moment the network can least
+        carry it."""
+        _keys, nodes = _setup(4)
+        shared = _stubs("a", "b", "c")
+        ids = list(nodes)
+        for nid in ids[:3]:
+            nodes[nid].add_local(shared)
+        nodes[ids[3]].add_local(())
+
+        # Wave one: advertisements cross, so all three holders learn node 3 has nothing. Drained
+        # before any delivery, so this captures only the HELDs.
+        for src_id, items in {sid: list(s.outbox()) for sid, s in nodes.items()}.items():
+            for target, msg in items:
+                for dst_id, dst in nodes.items():
+                    if dst_id != src_id and (target is Recipient.ALL or target == dst_id):
+                        dst.receive(msg, from_=src_id, now=T0)
+
+        # Wave two: the pushes each holder decided to make.
+        sent: dict[crypto.Digest, int] = {}
+        for src in nodes.values():
+            for target, msg in src.outbox():
+                if isinstance(msg, Bodies) and target == ids[3]:
+                    for tx in msg.txs:
+                        sent[tx.op_hash] = sent.get(tx.op_hash, 0) + 1
+
+        self.assertEqual(
+            sorted(sent), sorted(tx.op_hash for tx in shared), "not every gap was served"
+        )
+        self.assertEqual(
+            set(sent.values()), {1}, f"a body was sent by more than one holder: {sent}"
+        )
+
+
+class TestARoundIsKeyedOnTheChain(unittest.TestCase):
+    """A node building on a different predecessor must not be counted into our quorum. Keyed on
+    `(bucket, slice_hash)` alone, nodes at different heights ratify together and the disagreement
+    surfaces two stages later as a divergent-anchors SettleSig, dropped without a reason."""
+
+    def _split(self):
+        keys = [crypto.Keypair.generate() for _ in range(3)]
+        roster = tuple(k.public for k in keys)
+        ours, theirs = crypto.h(b"chain-a"), crypto.h(b"chain-b")
+        nodes = {
+            k.public: Round(1, k, roster, prev, T0, CLOSE_BY, ABANDON_BY)
+            for k, prev in zip(keys, (ours, ours, theirs), strict=True)
+        }
+        for r in nodes.values():
+            r.add_local(_stubs("a", "b"))
+        _run(nodes)
+        return keys, nodes, theirs
+
+    def test_the_in_sync_majority_ratifies_without_the_odd_one_out(self):
+        keys, nodes, _ = self._split()
+        for k in keys[:2]:
+            self.assertIsNotNone(nodes[k.public].ratified(), "an in-sync node failed to ratify")
+        self.assertIsNone(
+            nodes[keys[2].public].ratified(),
+            "a node on another chain point was counted into a quorum it cannot settle with",
+        )
+
+    def test_both_sides_can_see_that_they_disagree(self):
+        """The payoff: neither side is silently dropped. Each records who, and what they built
+        on -- which is how a node that is behind finds out, from traffic already arriving."""
+        keys, nodes, theirs = self._split()
+        for k in keys[:2]:
+            seen = dict(nodes[k.public].divergences())
+            self.assertEqual(set(seen), {keys[2].public})
+            self.assertEqual(seen[keys[2].public], theirs)
+        behind = dict(nodes[keys[2].public].divergences())
+        self.assertEqual(set(behind), {keys[0].public, keys[1].public})
+
+
 class TestPipelining(unittest.TestCase):
     """Two Rounds for two buckets, running concurrently on the same nodes. Round instances are
     scoped by bucket; messages for a foreign bucket are silently dropped, so buckets do not
@@ -368,8 +554,12 @@ class TestPipelining(unittest.TestCase):
     def test_two_buckets_ratify_independently(self):
         keys = [crypto.Keypair.generate() for _ in range(3)]
         roster = tuple(k.public for k in keys)
-        rounds_b1 = {k.public: Round(1, k, roster, T0, CLOSE_BY, ABANDON_BY) for k in keys}
-        rounds_b2 = {k.public: Round(2, k, roster, T0, CLOSE_BY, ABANDON_BY) for k in keys}
+        rounds_b1 = {
+            k.public: Round(1, k, roster, crypto.h(b"prev"), T0, CLOSE_BY, ABANDON_BY) for k in keys
+        }
+        rounds_b2 = {
+            k.public: Round(2, k, roster, crypto.h(b"prev"), T0, CLOSE_BY, ABANDON_BY) for k in keys
+        }
         set_b1 = _stubs("b1-a", "b1-b")
         set_b2 = _stubs("b2-x", "b2-y", "b2-z")
         for r in rounds_b1.values():
@@ -411,7 +601,8 @@ class TestRandomisedBuckets(unittest.TestCase):
         rounds_by_bucket: dict[int, dict[crypto.PublicKey, Round]] = {}
         for b in buckets:
             rounds_by_bucket[b] = {
-                k.public: Round(b, k, roster, T0, CLOSE_BY, ABANDON_BY) for k in keys
+                k.public: Round(b, k, roster, crypto.h(b"prev"), T0, CLOSE_BY, ABANDON_BY)
+                for k in keys
             }
             for r in rounds_by_bucket[b].values():
                 r.add_local(contents[b])
@@ -457,7 +648,7 @@ class TestTieBreak(unittest.TestCase):
         nodes[node_ids[1]].add_local((t1, t2, t4))
         nodes[node_ids[2]].add_local((t1, t2, t3, t4))
 
-        _run(nodes)
+        _run_fabric(nodes, Fabric(nodes, repair=False))
 
         blocks = [r.ratified() for r in nodes.values()]
         rats: list[Block] = [b for b in blocks if b is not None]
@@ -487,7 +678,7 @@ class TestTieBreak(unittest.TestCase):
             nodes[node_ids[0]].add_local((t1, t2, t3))
             nodes[node_ids[1]].add_local((t1, t2, t4))
             nodes[node_ids[2]].add_local((t1, t2, t3, t4))
-            _run(nodes)
+            _run_fabric(nodes, Fabric(nodes, repair=False))
             rats = [b for r in nodes.values() if (b := r.ratified()) is not None]
             self.assertGreaterEqual(len(rats), 2, f"bucket {bucket}: fewer than a quorum ratified")
             distinct = {b.hashes for b in rats}
@@ -660,7 +851,10 @@ class TestPropertyConvergence(unittest.TestCase):
                 close_by = T0 + 30 * DELTA
                 keys = [crypto.Keypair.generate() for _ in range(n)]
                 roster = tuple(k.public for k in keys)
-                nodes = {k.public: Round(1, k, roster, T0, close_by, ABANDON_BY) for k in keys}
+                nodes = {
+                    k.public: Round(1, k, roster, crypto.h(b"prev"), T0, close_by, ABANDON_BY)
+                    for k in keys
+                }
                 for k in keys:
                     size = rng.randint(0, len(_UNIVERSE))
                     nodes[k.public].add_local(rng.sample(_UNIVERSE, size))
@@ -731,7 +925,7 @@ class TestPropertySafetyUnderByzantine(unittest.TestCase):
                 bogus_hashes = frozenset(
                     tx.op_hash for tx in rng.sample(_UNIVERSE, rng.randint(1, 5))
                 )
-                bogus_sig = Sig.sign(byz, 1, _slice_hash(1, bogus_hashes))
+                bogus_sig = Sig.sign(byz, 1, crypto.h(b"prev"), _slice_hash(1, bogus_hashes))
                 fabric.inject(bogus_sig, from_=byz.public, to=victim.public, now=T0 + DELTA)
 
                 _run_fabric(nodes, fabric, rounds=30, start=T0 + 2 * DELTA)

@@ -268,6 +268,9 @@ class SettleRound:
     def state(self) -> SettleState:
         return self._state
 
+    def roster(self) -> tuple[crypto.PublicKey, ...]:
+        return self._roster
+
     def settled(self) -> SettledBlock | None:
         return self._settled
 

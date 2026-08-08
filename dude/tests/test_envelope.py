@@ -212,7 +212,7 @@ class TestSealing(unittest.TestCase):
         self.a = crypto.Keypair.generate()
         self.b = crypto.Keypair.generate()
         self.eve = crypto.Keypair.generate()
-        self.env = request(self.a, self.b.public, Verb.PROPOSE, T0, b"slice")
+        self.env = request(self.a, self.b.public, Verb.SUBMIT, T0, b"slice")
         self.frame = self.env.seal()
 
     def test_roundtrip(self):
@@ -235,7 +235,7 @@ class TestSealing(unittest.TestCase):
         """The reason the tag is not keyed on identity alone: it would then be a constant, i.e. a
         permanent per-node fingerprint linking every frame ever sent to that node. Two frames to the
         same recipient must carry different tags."""
-        other = request(self.a, self.b.public, Verb.PROPOSE, T0, b"different").seal()
+        other = request(self.a, self.b.public, Verb.SUBMIT, T0, b"different").seal()
         self.assertNotEqual(self.frame.tag, other.tag)
         self.assertTrue(self.frame.addressed_to(self.b.public))
         self.assertTrue(other.addressed_to(self.b.public))

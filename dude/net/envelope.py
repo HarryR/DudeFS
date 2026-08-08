@@ -16,10 +16,11 @@ class Verb(IntEnum):
     PONG = 2
 
     SUBMIT = 10
+    ACCEPTED = 11
+    """Admitted to my mempool, and NOTHING more -- not included, not settled, not durable."""
+
     BODIES = 13
 
-    PROPOSE = 20
-    ENDORSE = 21
     HELD = 22
     SIG = 23
 

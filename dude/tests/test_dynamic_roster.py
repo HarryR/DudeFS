@@ -13,7 +13,8 @@ from dude.consensus.bootstrap import intervene
 from dude.core import crypto
 from dude.net.address import Endpoint
 from dude.net.transports import address_of
-from dude.store.management import Cert, MgmtWriter, NodeRecord
+from dude.store import ops
+from dude.store.management import P_ROSTER, Cert, MgmtWriter, NodeRecord
 
 from .cluster import DELTA, T0, Cluster
 
@@ -30,7 +31,7 @@ class TestRosterAdditionReachesPostman(unittest.TestCase):
             self.assertEqual(len(node.postman.peers), 2, f"node {node.me.public.hex()[:6]}")
         baseline_commitment = c.nodes[0].mgmt.roster_commitment()
         assert baseline_commitment is not None
-        old_serial = baseline_commitment[0]
+        old_serial = baseline_commitment.serial
 
         # Manager authors a change_roster that adds a fourth identity. Applied via
         # intervene so the roster advances immediately on every node's store without
@@ -57,7 +58,7 @@ class TestRosterAdditionReachesPostman(unittest.TestCase):
             self.assertIn(new_kp.public, node.mgmt.roster())
             after = node.mgmt.roster_commitment()
             assert after is not None
-            self.assertGreater(after[0], old_serial)
+            self.assertGreater(after.serial, old_serial)
             # But peers still stale until tick reconciles.
             self.assertNotIn(new_kp.public, node.postman.peers)
 
@@ -144,6 +145,25 @@ class TestRosterRemovalDropsPeer(unittest.TestCase):
                 node.postman.peers,
                 f"reconcile did not drop {victim.hex()[:6]} from node[{i}]",
             )
+
+
+class TestAGarbageRosterRowDoesNotStopTheNode(unittest.TestCase):
+    """A manager has blanket authorship of the management store, so a hand-composed
+    `ops.Set(P_ROSTER, garbage)` can land. The read side must treat the row as absent, not raise:
+    `roster_commitment` had two implementations, one catching the decode error and one not, and
+    the one on the tick path let a single bad row take down every node's tick thread."""
+
+    def test_tick_survives_and_the_commitment_reads_as_absent(self):
+        c = Cluster(size=3)
+        node = c.nodes[0]
+        poison = ops.writes(ops.Set(ops.STORE_MANAGEMENT, P_ROSTER, b"not bencode at all")).sign(
+            c.mgr, T0
+        )
+        intervene(node.store, c.mgr, bodies=(poison,), bucket=555)
+
+        self.assertIsNone(node.mgmt.roster_commitment())
+        node.tick(T0 + DELTA)  # must not raise
+        self.assertIsNotNone(node.store.roster_incomplete())
 
 
 if __name__ == "__main__":

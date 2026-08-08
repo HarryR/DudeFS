@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from ..core import crypto
 from ..core.errors import InvariantError
 from ..core.units import Millis
-from ..net.envelope import SignedEnvelope
+from ..net.envelope import SignedEnvelope, Verb
 from ..store import Layer, Store, settle
 from ..store.layer import Index
 from ..store.management import MgmtReader
@@ -14,7 +13,7 @@ from ..store.ops import SignedTransaction
 from ..store.store import log_element
 from ..tunables import Tunables
 from .mempool import Bucket, Mempool, Refusal
-from .round import Block, Round, RoundAdapterError, RoundMsg
+from .round import Block, Bodies, Round, RoundAdapterError, RoundMsg
 from .round_adapter import RoundAdapter
 from .settle_adapter import SettleAdapter
 from .settle_round import Anchors, SettleAdapterError, SettleRound, SettleSig, genesis_stamp
@@ -40,8 +39,9 @@ class Coordinator:
     adapter: RoundAdapter
     settle_adapter: SettleAdapter
     tunables: Tunables
-    reflood: Callable[[SignedTransaction, Millis], None] | None = None
 
+    # ONE OF EACH, NEVER A QUEUE. Turning any of these three into a collection is a different
+    # protocol, not an optimisation.
     mempool: Mempool = field(init=False)
     current_round: Round | None = field(init=False, default=None)
     settling: _Settling | None = field(init=False, default=None)
@@ -57,16 +57,31 @@ class Coordinator:
     def _bucket_of(self, now: Millis) -> Bucket:
         return self.tunables.mempool.bucket(now)
 
-    def _close_by(self, now: Millis) -> Millis:
-        return now + self.tunables.mempool.delta
+    def _prev_block(self) -> crypto.Digest:
+        """The Round is keyed on this and the anchors carry it; they MUST be the same value, or
+        the block's own quorum did not agree what it follows."""
+        prev = self.store.head_block_hash()
+        if prev is not None:
+            return prev
+        manager = self.store.anchor()
+        if manager is None:
+            raise InvariantError("store has no manager anchor; cannot compute genesis stamp")
+        return genesis_stamp(manager)
 
-    def _abandon_by(self, close_by: Millis) -> Millis:
-        """The abandonment beat MUST land on a bucket boundary, or the pipeline stages drift out
-        of phase and blocks queue behind `settling`."""
-        return close_by + self.tunables.mempool.delta
+    # THE CADENCE GRID. During window W:
+    #
+    #     Mempool(W) collects | Round(W-1) converges holdings, cuts a slice, settles it
+    #
+    # Round(B) opens at W=B+1 and lives entirely inside that window; phase 2 gets whatever
+    # `cut_reserve` leaves. Every deadline is bucket arithmetic and NONE is measured from `now`:
+    # measured from `now`, each node runs on its own phase, and nodes that fall out of step never
+    # share a bucket again.
 
-    def _settle_abandon_by(self, now: Millis) -> Millis:
-        return now + self.tunables.mempool.delta
+    def _close_by(self, bucket: Bucket) -> Millis:
+        return self._abandon_by(bucket) - self.tunables.timing.cut_reserve
+
+    def _abandon_by(self, bucket: Bucket) -> Millis:
+        return self.tunables.mempool.bucket_start(bucket + 2)
 
     def submit(self, tx: SignedTransaction, now: Millis) -> Refusal | None:
         return self.mempool.admit(tx, now, self.store, self.mgmt)
@@ -85,9 +100,23 @@ class Coordinator:
         if r is None or r.bucket() != bucket:
             return
         try:
-            self.adapter.deliver(env, r, now)
+            if env.env.verb is Verb.BODIES:
+                self._absorb_bodies(env, r, now)
+            else:
+                self.adapter.deliver(env, r, now)
         except RoundAdapterError:
             return
+
+    def _absorb_bodies(self, env: SignedEnvelope, r: Round, now: Millis) -> None:
+        """Unsolicited bodies go through the SAME door a client submission does, or a peer can
+        push us holdings our own predicate would never have admitted."""
+        msg = RoundMsg.decode(env.env.verb, env.env.body)
+        if not isinstance(msg, Bodies):
+            return
+        good = tuple(
+            tx for tx in msg.txs if self.mempool.valid(tx, now, self.store, self.mgmt) is None
+        )
+        r.absorb(msg, env.frm, good)
 
     def on_settle_msg(self, env: SignedEnvelope, now: Millis) -> None:
         try:
@@ -130,25 +159,34 @@ class Coordinator:
         self._close_current_bucket(now)
 
     def _close_current_bucket(self, now: Millis) -> None:
-        while self.current_bucket < self._bucket_of(now) and self.current_round is None:
-            frozen = self.mempool
-            self.mempool = Mempool(self.tunables.mempool)
-            self._open_round(self.current_bucket, frozen, now)
-            self.current_bucket += 1
+        """Always the bucket the clock has just closed; missed ones are SKIPPED, never queued.
+        A per-Round counter drifts off `floor(t/delta)`, and a node one bucket behind has its
+        HELD/SIG dropped by every peer as "no matching Round"."""
+        closed = self._bucket_of(now) - 1
+        if closed < self.current_bucket or self.current_round is not None:
+            return
+        if now >= self._close_by(closed):
+            # Past this window's HELD wave: sit it out rather than open a Round nobody is on.
+            self.current_bucket = closed + 1
+            return
+        frozen = self.mempool
+        self.mempool = Mempool(self.tunables.mempool)
+        self._open_round(closed, frozen, now)
+        self.current_bucket = closed + 1
 
     def _open_round(self, bucket: Bucket, frozen: Mempool, now: Millis) -> None:
         roster = self.mgmt.roster()
         if self.me.public not in roster:
             return  # follower-only: Round refuses `me not in roster`, and the raise would tear
             # down the node's tick. Sit out consensus and let the Follower catch us up.
-        close_by = self._close_by(now)
         r = Round(
             bucket=bucket,
             me=self.me,
             roster=roster,
+            prev_block=self._prev_block(),
             now=now,
-            close_by=close_by,
-            abandon_by=self._abandon_by(close_by),
+            close_by=self._close_by(bucket),
+            abandon_by=self._abandon_by(bucket),
         )
         r.add_local(frozen.all_bodies().values())
         self.current_round = r
@@ -159,9 +197,7 @@ class Coordinator:
         if r is None:
             raise InvariantError("_on_round_abandoned called with no in-flight Round")
         for tx in r.surviving():
-            refusal = self.mempool.admit(tx, now, self.store, self.mgmt)
-            if refusal is None and self.reflood is not None:
-                self.reflood(tx, now)
+            self.mempool.admit(tx, now, self.store, self.mgmt)
         self.current_round = None
 
     def _promote_to_settling(self, now: Millis) -> None:
@@ -193,16 +229,10 @@ class Coordinator:
         acc_log = self.store.log_accumulator()
         for i, tx in enumerate(applied):
             acc_log = crypto.acc_add(acc_log, log_element(base_head + i + 1, tx.op_hash))
-        prev = self.store.head_block_hash()
-        if prev is None:
-            manager = self.store.anchor()
-            if manager is None:
-                raise InvariantError("store has no manager anchor; cannot compute genesis stamp")
-            prev = genesis_stamp(manager)
         anchors = Anchors(
             block_num=block_num,
             height=height,
-            prev_block=prev,
+            prev_block=self._prev_block(),
             state_root=layer.state_root(),
             acc_state=layer.accumulator(),
             acc_log=acc_log,
@@ -214,7 +244,7 @@ class Coordinator:
             self.mgmt.roster(),
             anchors,
             now,
-            abandon_by=self._settle_abandon_by(now),
+            abandon_by=self._abandon_by(bucket),
         )
         self.settling = _Settling(
             bucket=bucket,
@@ -251,9 +281,7 @@ class Coordinator:
         _expect_anchors(s.anchors, self.store)
 
         for tx in (*s.surviving, *s.dropped):
-            refusal = self.mempool.admit(tx, now, self.store, self.mgmt)
-            if refusal is None and self.reflood is not None:
-                self.reflood(tx, now)
+            self.mempool.admit(tx, now, self.store, self.mgmt)
 
         self.settling = None
 
@@ -262,9 +290,7 @@ class Coordinator:
         if s is None:
             raise InvariantError("_on_settle_abandoned called with no settling slot")
         for tx in (*s.applied, *s.dropped, *s.surviving):
-            refusal = self.mempool.admit(tx, now, self.store, self.mgmt)
-            if refusal is None and self.reflood is not None:
-                self.reflood(tx, now)
+            self.mempool.admit(tx, now, self.store, self.mgmt)
         self.settling = None
 
 

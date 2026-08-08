@@ -25,7 +25,8 @@ from dude.net.transports.tcp import TCPListener
 from dude.node import Node
 from dude.store import Store, management, ops
 from dude.store.management import Cert, MgmtWriter, Role
-from dude.tunables import DEFAULT
+
+from .cluster import TUNABLES
 
 
 def _build_cluster(
@@ -70,7 +71,7 @@ def _build_cluster(
         store = Store()
         store.provision(mgr.public)
         bootstrap(store, mgr, genesis)
-        nodes.append(Node(kp, store))
+        nodes.append(Node(kp, store, TUNABLES))
 
     return mgr, nodes, listeners
 
@@ -99,7 +100,9 @@ class TestNodeLifecycle(unittest.TestCase):
             `_stopping` flag actually breaks the loop and `TCPListener.stop()` joins
             its reader thread.
 
-        Real wall clock, so this takes seconds -- ~1 s per block at defaults."""
+        Real wall clock, so this takes seconds -- one block per `TUNABLES.mempool.delta`. It runs
+        on the harness's fast profile, not the production block time: at 30 s a block this would
+        be a two-minute test."""
         _mgr, nodes, listeners = _build_cluster(3)
         try:
             # Managed mode: each node gets its listener at start(). The dial side is not
@@ -112,7 +115,7 @@ class TestNodeLifecycle(unittest.TestCase):
             # what's there (nothing). With a 3-node roster the Round hits quorum
             # trivially. Give it a few delta intervals to advance.
             target_block = 2
-            budget_sec = (target_block + 2) * (DEFAULT.mempool.delta / 1000)
+            budget_sec = (target_block + 2) * (TUNABLES.mempool.delta / 1000)
             got = _wait_until(
                 lambda: all((n.store.head_block_num() or 0) >= target_block for n in nodes),
                 timeout_sec=budget_sec,

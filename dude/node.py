@@ -11,7 +11,7 @@ from .core import crypto
 from .core.errors import DudeError
 from .core.units import Millis, now_ms
 from .net import Verb
-from .net.envelope import Envelope, Frame, SignedEnvelope, new_message_id
+from .net.envelope import Frame, SignedEnvelope
 from .net.link import Listener
 from .net.postman import Postman
 from .net.session import Inbound, Session, SessionBindError
@@ -38,13 +38,24 @@ from .sync.lite_adapter import (
 )
 from .tunables import DEFAULT, Tunables
 
-REPLIES = frozenset({Verb.PONG, Verb.BODIES, Verb.REFUSED})
+REPLIES = frozenset(
+    {
+        Verb.PONG,
+        Verb.ACCEPTED,
+        Verb.REFUSED,
+        Verb.ANCHORS_REPLY,
+        Verb.PROOF_REPLY,
+        Verb.LITE_REFUSED,
+    }
+)
+"""Answers, correlated by whoever asked -- the last three by a `LightClient`, not by a Node."""
 
 HANDLED = frozenset(
     {
         Verb.SUBMIT,
         Verb.HELD,
         Verb.SIG,
+        Verb.BODIES,
         Verb.SETTLE_SIG,
         Verb.HEIGHT,
         Verb.HEIGHT_REPLY,
@@ -55,10 +66,6 @@ HANDLED = frozenset(
         Verb.GET_PROOF,
     }
 )
-
-SOLICITED: frozenset[Verb] = frozenset()
-
-UNIMPLEMENTED = frozenset(Verb) - HANDLED - REPLIES
 
 
 @dataclass(slots=True)
@@ -102,7 +109,6 @@ class Node:
             self.adapter,
             self.settle_adapter,
             self.tunables,
-            reflood=lambda tx, now: self._flood(Verb.SUBMIT, tx.raw, now),
         )
         self.follower = Follower(
             me=self.me,
@@ -124,7 +130,7 @@ class Node:
         if commitment is None:
             return
         roster = set(self.mgmt.roster())
-        self._reconcile_roster(commitment[0], roster, now)
+        self._reconcile_roster(commitment.serial, roster, now)
         for pubkey in list(self._managed_peers):
             if pubkey not in roster:
                 if pubkey in self.postman.peers:
@@ -156,8 +162,6 @@ class Node:
             got = self.postman.deliver(frame, now)
             if session is not None:
                 self._bind_session(session, got.envelope.frm)
-            if got.envelope.env.verb in SOLICITED and got.reply is None:
-                return
             self._handle(got.envelope, now)
         except DudeError:
             return
@@ -186,13 +190,15 @@ class Node:
         if refusal is not None:
             self._reply(env, Verb.REFUSED, refusal.value.encode(), now)
             return
-        self._reply(env, Verb.BODIES, tx.op_hash, now)
-        self._flood(Verb.SUBMIT, env.env.body, now, skip=env.frm)
+        self._reply(env, Verb.ACCEPTED, tx.op_hash, now)
 
     def _on_held(self, env: SignedEnvelope, now: Millis) -> None:
         self.coordinator.on_round_msg(env, now)
 
     def _on_sig(self, env: SignedEnvelope, now: Millis) -> None:
+        self.coordinator.on_round_msg(env, now)
+
+    def _on_bodies(self, env: SignedEnvelope, now: Millis) -> None:
         self.coordinator.on_round_msg(env, now)
 
     def _on_settle_sig(self, env: SignedEnvelope, now: Millis) -> None:
@@ -316,7 +322,10 @@ class Node:
                 pass
             now = now_ms()
             if now - last_tick >= tick_interval_ms:
-                self.tick(now)
+                # A backwards wall-clock step raises out of tick. Unguarded, that is
+                # `threading.excepthook` -> `os._exit(70)`.
+                with contextlib.suppress(DudeError):
+                    self.tick(now)
                 last_tick = now
 
     def _flush_follower(self, now: Millis) -> None:
@@ -324,15 +333,6 @@ class Node:
             if peer not in self.postman.peers:
                 continue
             self.sync_adapter.send(peer, msg, now, await_reply=True)
-
-    def _flood(
-        self, verb: Verb, body: bytes, now: Millis, skip: crypto.PublicKey | None = None
-    ) -> None:
-        for who in self.mgmt.roster():
-            if who in (self.me.public, skip):
-                continue
-            env = Envelope(who, verb, new_message_id(), body).sign(self.me, now)
-            self.postman.mailbox.post(env, now, self.tunables.net.ttl, await_reply=False)
 
     def _reply(self, to: SignedEnvelope, verb: Verb, body: bytes, now: Millis) -> None:
         if not self.postman.can_reply(to.frm):

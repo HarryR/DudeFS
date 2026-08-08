@@ -66,24 +66,7 @@ WIRED = {
 Keyed by the callable's name — `smt.verify`-style qualified names work too, for a name that is
 ambiguous on its own."""
 
-OWED = {
-    "unauthorised_certs": (
-        "The #revocation-is-compound invariant -- no live row carries a cert whose signer is no "
-        "longer authorised. Asserted by `test_management.TestRevocationIsCompound`, consulted by "
-        "no production decision, and DELIBERATELY so: the state it reports is reachable today by "
-        "a hand-composed `ops.Del` and is an accepted intermediate until management writes become "
-        "typed opcodes (#typed-management-ops-owed). Its consumer is that opcode's apply-time "
-        "check. Wiring it into `Store._unacceptable` before then would refuse, on replay, a log "
-        "the cluster itself settled -- fine live, unadoptable on transfer, which is a worse "
-        "inconsistency than the gap. Do not invent a caller for it in the meantime."
-    ),
-    "conflicts": (
-        "RULING PENDING: wire the exclusion rule into batch selection, or strike it. Sound either "
-        "way -- settlement re-evaluates every guard, which is the backstop `falsifies` names -- so "
-        "the cost today is a wasted slot and a GUARD refusal where an exclusion was meant, never "
-        "wrong state. Do not leave this entry here indefinitely."
-    ),
-}
+OWED: dict[str, str] = {}
 """Checks with no consumer YET, each with the reason and who will consume it.
 
 An entry here is a DEBT, stated where it cannot be mistaken for a delivered capability — which is

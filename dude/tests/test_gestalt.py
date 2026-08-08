@@ -13,6 +13,7 @@ from __future__ import annotations
 import time
 import unittest
 from collections.abc import Callable
+from dataclasses import replace
 
 from ..consensus.bootstrap import bootstrap
 from ..core import codec, crypto
@@ -27,20 +28,14 @@ from ..node import (
     _DISPATCH,
     HANDLED,
     REPLIES,
-    UNIMPLEMENTED,
     Node,
 )
 from ..store import Store, management, ops
 from ..store.management import Cert, MgmtWriter, NodeRecord, Role
 from ..store.store import StoreError
 from ..sync.lite_client import LightClient
-from ..tunables import (
-    MempoolTunables,
-    SyncTunables,
-    TimingTunables,
-    Tunables,
-)
-from .cluster import DELTA, T0, Cluster, D
+from ..tunables import SyncTunables, Tunables
+from .cluster import DELTA, T0, TUNABLES, Cluster, D
 
 
 class TestGestalt(unittest.TestCase):
@@ -134,8 +129,7 @@ class TestGestalt(unittest.TestCase):
         A STRANGER -- no grant, no roster seat, signature proving only *who* -- sends `SUBMIT` with
         twelve bytes of non-bencode. With `crashonly` installed, the escaping `CodecError` is
         `os._exit`: the unauthenticated remote kill switch that crashonly.py names as the one thing
-        its typed-parsing precondition exists to prevent. `SOLICITED` is no help, since `SUBMIT` is
-        not an answer to anything."""
+        its typed-parsing precondition exists to prevent."""
         node = self.c.nodes[0]
         stranger = crypto.Keypair.generate()
         for body in (b"\xff\x00not-bencode", codec.encode([1, 2, 3])):  # bad tag, then bad arity
@@ -163,51 +157,101 @@ class TestGestalt(unittest.TestCase):
         )
 
 
+class TestBucketDrift(unittest.TestCase):
+    """The bucket a Round runs for MUST be `floor(now/delta)`, so two nodes derive the same one
+    for the same instant. It was a counter incremented once per opened Round: a node that missed
+    six buckets opened its next Round six behind its peers, who dropped its HELD/SIG as "no
+    matching Round", and it fell further behind on every cycle -- while its Follower kept its
+    store current, so it looked healthy from every angle."""
+
+    def test_nodes_that_sat_out_buckets_rejoin_the_quorum(self):
+        # n=4 so quorum is 3: with two nodes away the remaining two CANNOT settle, so no head
+        # moves while 2 and 3 are out and nothing has to be synced afterwards. What is left
+        # under test is purely which bucket each node comes back on.
+        c = Cluster(size=4)
+        now = c.pump(T0, rounds=4)
+
+        stalled = c.nodes[0].store.head_block_num() or 0
+        now = c.pump_without(now, away={2, 3}, rounds=6)
+        self.assertEqual(
+            [n.store.head_block_num() or 0 for n in c.nodes],
+            [stalled] * 4,
+            "no quorum was available, so no block should have settled",
+        )
+
+        now = c.pump(now, rounds=6)
+        self.assertGreater(
+            c.nodes[0].store.head_block_num() or 0,
+            stalled,
+            "nodes 2 and 3 came back on a stale bucket, so no three nodes shared a Round",
+        )
+        self.assertEqual(
+            len({n.store.head_block_hash() for n in c.nodes}),
+            1,
+            "the cluster settled but did not converge on one chain",
+        )
+
+
+class TestSubmitDoesNotCascade(unittest.TestCase):
+    """A client's SUBMIT goes to the nodes the client chooses and stops there. Re-flooding it to
+    the roster, and re-flooding again on receipt, is ~100 transmissions of every transaction on an
+    11-node cluster. Phase 2 moves each body once, to the nodes that lack it."""
+
+    def setUp(self):
+        self.c = Cluster()
+
+    def test_no_node_rebroadcasts_a_submission(self):
+        tx = ops.writes(ops.Set(D, crypto.h(b"no-cascade"), b"v")).sign(self.c.mgr, T0)
+        self.c.submit(self.c.mgr, tx, to=0, now=T0)
+
+        queued = [
+            p.envelope.env.verb
+            for node in self.c.nodes
+            for p in node.postman.mailbox.pending.values()
+            if p.envelope is not None
+        ]
+        self.assertNotIn(Verb.SUBMIT, queued, "a node re-flooded the submission")
+
+    def test_it_still_reaches_every_log_by_being_gossiped(self):
+        key = crypto.h(b"gossiped")
+        tx = ops.writes(ops.Set(D, key, b"v")).sign(self.c.mgr, T0)
+        self.c.submit(self.c.mgr, tx, to=0, now=T0)
+        self.c.pump(T0)
+        self.c.pump(T0 + DELTA)
+
+        for i, node in enumerate(self.c.nodes):
+            got = node.store.get(D, key)
+            assert got is not None, f"node {i} never got it -- phase 2 did not carry it"
+            self.assertEqual(got.value, b"v")
+
+
 class TestVerbCoverage(unittest.TestCase):
     """What the node does and does not answer, pinned.
 
     A test rather than a comment because the interesting property is that the set does not drift:
-    add a `Verb` and it lands in `UNIMPLEMENTED` and this fails, instead of falling through a
-    default branch and being discovered when a peer sends it."""
+    add a `Verb` and it belongs to one of the two buckets or this fails, instead of falling
+    through a default branch and being discovered when a peer sends it."""
 
-    def test_every_verb_is_accounted_for(self):
-        self.assertEqual(HANDLED | REPLIES | UNIMPLEMENTED, frozenset(Verb))
+    def test_every_verb_is_either_handled_or_a_reply(self):
+        """TWO buckets, no third. A bucket for not-done-yet is where dead verbs and
+        fully-working ones both go to stop being asked about."""
+        self.assertEqual(HANDLED | REPLIES, frozenset(Verb))
         self.assertFalse(HANDLED & REPLIES)
-
-    def test_the_unimplemented_set_is_exactly_the_known_todo(self):
-        """`PROPOSE`/`ENDORSE` were the placeholder round's verbs. `Node` no longer dispatches
-        them -- Round's own `HELD`/`SIG` do the job now (SPECv2 #round-lifecycle). They stay in
-        the enum's retired range so a stale peer sending one is unimplemented-and-ignored rather
-        than crashing on an unknown verb; the enum entries should be moved to a retired section
-        in a follow-up cleanup.
-
-        `ANCHORS_REPLY` / `PROOF_REPLY` / `LITE_REFUSED` are the light-client REPLY verbs --
-        the client's own concern. They're routed by the Postman correlation path, so Node
-        doesn't dispatch them; they show up in UNIMPLEMENTED until the LightClient state
-        machine that consumes them lands."""
-        self.assertEqual(
-            UNIMPLEMENTED,
-            {
-                Verb.PROPOSE,
-                Verb.ENDORSE,
-                Verb.ANCHORS_REPLY,
-                Verb.PROOF_REPLY,
-                Verb.LITE_REFUSED,
-            },
-        )
 
     def test_every_handled_verb_has_a_handler(self):
         """Derived, not listed: `_DISPATCH` is built from `HANDLED`, so a verb claimed as handled
         with no `_on_<verb>` fails at import rather than falling into a silent default."""
         self.assertEqual(set(_DISPATCH), HANDLED)
 
-    def test_an_unimplemented_verb_is_ignored_not_fatal(self):
-        """A peer sending a verb we have not built must cost its message and nothing more."""
+    def test_a_verb_we_do_not_know_is_refused_at_decode(self):
+        """A number outside the enum is refused by `Envelope.decode` and costs its frame."""
         node, other = self.c.nodes[0], self.c.nodes[1]
-        env = Envelope(node.me.public, Verb.PROPOSE, b"z" * 16).sign(other.me, T0)
-        node.receive(env.seal(), T0)  # must not raise
+        body = codec.encode([node.me.public, 20, b"z" * 16, b"", b"", 0])  # 20: not in the enum
+        signed = codec.encode([other.me.public, T0, body])
+        raw = codec.encode([signed, other.me.sign(signed)])
+        node.receive(Frame(crypto.screen_tag(node.me.public, raw), node.me.public.seal(raw)), T0)
 
-        key = crypto.h(b"after-unimplemented")
+        key = crypto.h(b"after-unknown-verb")
         tx = ops.writes(ops.Set(D, key, b"fine")).sign(self.client, T0)
         self.c.submit(self.client, tx, to=0, now=T0)
         self.c.pump(T0)
@@ -229,11 +273,7 @@ class TestVerbCoverage(unittest.TestCase):
 # microseconds, so a much tighter rtt/skew is honest here. The invariants
 # (`Tunables.__post_init__`) still verify at construction, so nothing is skipped -- just
 # faster ceremonies.
-_FAST = Tunables(
-    timing=TimingTunables(rtt_max=30, clock_skew=25),
-    mempool=MempoolTunables(delta=500, w_admit=30_000, w_valid_margin=2_000),
-    sync=SyncTunables(poll_interval=500, pull_timeout=3_000, freshness_window=5_000),
-)
+_FAST = replace(TUNABLES, sync=SyncTunables(poll_interval=500))
 
 
 def _genesis(

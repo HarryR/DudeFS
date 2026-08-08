@@ -13,6 +13,7 @@ import unittest
 from dude.consensus.round import Block
 from dude.consensus.settle_round import (
     Anchors,
+    SettleAdapterError,
     SettledBlock,
     SettleError,
     SettleRound,
@@ -20,7 +21,8 @@ from dude.consensus.settle_round import (
     SettleState,
     genesis_stamp,
 )
-from dude.core import crypto
+from dude.core import codec, crypto
+from dude.net.envelope import Verb
 from dude.net.postman import Recipient
 
 T0 = 1_700_000_000_000
@@ -372,6 +374,24 @@ class TestSettledBlockEncoding(unittest.TestCase):
         crash-only boundary catches -- not InvariantError, which would terminate."""
         with self.assertRaises(SettleError):
             SettledBlock.decode(b"not bencode at all")
+
+    def test_wrong_field_count_raises_at_both_nesting_levels(self):
+        """`encode` emits 3 outer fields wrapping an 8-field identity, and the identity is what
+        `block_hash` commits to. A field added to one half without the other would leave two
+        nodes chaining different digests off byte-equal-looking blocks (CLAUDE.md trap 1)."""
+        for wrong in (2, 4):
+            with self.assertRaises(SettleError):
+                SettledBlock.decode(codec.encode([b""] * wrong))
+        for wrong in (7, 9):
+            identity = codec.encode([0] * wrong)
+            with self.assertRaises(SettleError):
+                SettledBlock.decode(codec.encode([identity, b"", []]))
+
+    def test_settle_sig_wrong_field_count_raises(self):
+        """`SettleSig._encode` emits 8 fields; six of them are the anchors the quorum agrees on."""
+        for wrong in (7, 9):
+            with self.assertRaises(SettleAdapterError):
+                SettleSig.decode(Verb.SETTLE_SIG, codec.encode([b""] * wrong))
 
 
 class TestChainLinkIsSigned(unittest.TestCase):

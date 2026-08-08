@@ -570,7 +570,10 @@ class TestPickPullSourcePriority(unittest.TestCase):
     peer that reports a head above ours is a candidate every time."""
 
     def test_recent_success_wins_over_older_success(self):
-        """Two peers above our head, one answered a poll more recently -- it gets picked."""
+        """Two peers above our head, one SERVED US A BLOCK more recently -- it gets picked.
+
+        Answering a height poll does not count. Credited for that, a peer keeps top priority by
+        replying while failing every pull, and the joiner retries it forever."""
         c = Cluster()
         _run_cluster_producing_n_blocks(c, 2)
         joiner_store = c.provisioned()
@@ -580,11 +583,14 @@ class TestPickPullSourcePriority(unittest.TestCase):
         follower.add_peer(older.public, now=T0)
         follower.add_peer(newer.public, now=T0)
 
-        # Both report the same head; older's HeightReply arrives at T0, newer's at T0 + 1.
         follower.receive(HeightReply(block_num=2, tip_hash=crypto.h(b"tip")), older.public, T0)
-        follower.receive(HeightReply(block_num=2, tip_hash=crypto.h(b"tip")), newer.public, T0 + 1)
+        follower.receive(HeightReply(block_num=2, tip_hash=crypto.h(b"tip")), newer.public, T0)
+        self.assertEqual(follower._last_ok_at, {}, "a height reply credited pull-source priority")
 
-        # Priority: newer's _last_ok_at is more recent, so newer is picked.
+        # What a committed block records, which is the only thing that does.
+        follower._last_ok_at[older.public] = T0
+        follower._last_ok_at[newer.public] = T0 + 1
+
         self.assertEqual(follower._pick_pull_source(), newer.public)
 
     def test_no_success_history_still_picked_when_only_candidate(self):

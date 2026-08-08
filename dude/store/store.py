@@ -269,13 +269,16 @@ class StoreReader:
         author = settle.vouched(self, ops.STORE_MANAGEMENT, P_ROSTER, self.credential(0, P_ROSTER))
         if author != held:
             return f"the roster commitment is vouched by {author.hex()[:8] if author else 'nobody'}"
-        serial, members = commitment
-        if members != mgmt.roster():
+        if commitment.members != mgmt.roster():
             return (
-                f"the roster commitment names {len(members)} members, the log holds a different set"
+                f"the roster commitment names {len(commitment.members)} members, "
+                f"the log holds a different set"
             )
-        if serial < self.roster_serial():
-            return f"roster serial {serial} is older than the {self.roster_serial()} already seen"
+        if commitment.serial < self.roster_serial():
+            return (
+                f"roster serial {commitment.serial} is older than the "
+                f"{self.roster_serial()} already seen"
+            )
         return None
 
     def _get_meta(self, k: str, default: bytes) -> bytes:
@@ -320,8 +323,8 @@ class StoreWriter(StoreReader):
 
     def _remember_roster_serial(self) -> None:
         commitment = self._mgmt().roster_commitment()
-        if commitment is not None and commitment[0] > self.roster_serial():
-            self._set_meta("roster_serial", commitment[0].to_bytes(8))
+        if commitment is not None and commitment.serial > self.roster_serial():
+            self._set_meta("roster_serial", commitment.serial.to_bytes(8))
 
     def provision(self, manager: crypto.PublicKey, seeds: Iterable[bytes] = ()) -> None:
         held = self.anchor()

@@ -13,34 +13,50 @@ from .net.plan import PlanTunables
 class TimingTunables:
     """Adding a field here MUST be a decision: everything else is derived from these, and
     declaring an answer is how a derivation gets bypassed silently.
-    `test_declared_quantities_and_nothing_else` is what forces the decision."""
+    `test_declared_quantities_and_nothing_else` is what forces the decision.
+
+    THE GLOBAL CLOCK IS LOAD-BEARING. Every node and client runs NTP; `clock_skew` is the
+    assumed bound. Buckets are `floor(t/delta)` so agreement needs no coordination, and freshness
+    is a WALL-CLOCK bound -- an old quorum-signed block verifies perfectly, so the clock is the
+    only local oracle for currency."""
 
     rtt_max: Millis = 300
+    """One wave, PROCESSING INCLUDED: getting a message to every peer and handling what comes
+    back. Measured per deployment, so roster size shows up here."""
 
     clock_skew: Millis = 250
 
     client_clock_tolerance: Millis = 25_000
 
-    hops_to_quorum: int = 2
+    waves_per_round: int = 3
+    """HELD, SIG, SETTLE_SIG -- all three inside the round's own window."""
 
-    waves_to_settle: int = 3
+    windows_to_settle: int = 2
+    """Collect in W, agree and apply in W+1. Counts WINDOWS; `waves_per_round` counts round
+    trips. Two counters, two units."""
 
     ticks_per_cadence: int = 10
 
     @property
     def dissemination(self) -> Millis:
-        return self.hops_to_quorum * self.rtt_max + self.clock_skew
+        return self.waves_per_round * self.rtt_max + self.clock_skew
 
     @property
     def conversation_floor(self) -> Millis:
         return self.clock_skew + self.rtt_max
 
     @property
+    def cut_reserve(self) -> Millis:
+        """What a window keeps back for the waves after phase 2: the SIG that cuts the slice and
+        the SETTLE_SIG that agrees the anchors. Phase 2 gets the remainder."""
+        return (self.waves_per_round - 1) * self.rtt_max
+
+    @property
     def admission_floor(self) -> Millis:
         return self.client_clock_tolerance + 2 * self.rtt_max
 
     def endorse_margin(self, bucket_width: Millis) -> Millis:
-        return self.waves_to_settle * bucket_width + self.clock_skew
+        return self.windows_to_settle * bucket_width + self.clock_skew
 
 
 @dataclass(frozen=True, slots=True)

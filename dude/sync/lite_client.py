@@ -8,7 +8,7 @@ from enum import Enum, auto
 
 from .. import quorum
 from ..consensus.settle_round import SettledBlock, _settle_payload
-from ..core import codec, crypto
+from ..core import crypto
 from ..core.errors import DudeError
 from ..core.units import Millis, now_ms
 from ..net.address import Endpoint
@@ -17,7 +17,14 @@ from ..net.link import Listener
 from ..net.postman import Postman
 from ..net.session import Inbound, Session, SessionBindError
 from ..store import smt
-from ..store.management import Authorization, Grant, Role
+from ..store.management import (
+    CERT_PURPOSE_ROSTER,
+    CERT_PURPOSE_ROSTER_COMMITMENT,
+    Authorization,
+    Grant,
+    Role,
+    RosterCommitment,
+)
 from ..tunables import DEFAULT, Tunables
 from .lite_adapter import (
     AnchorsReply,
@@ -387,29 +394,15 @@ def _verify_bundle(  # noqa: C901, PLR0911 -- verification pipeline; each early-
     signer = bundle.commitment_cert.signer
     if signer != anchor and signer not in manager_pubkeys:
         return False
-    if bundle.commitment_cert.purpose != b"roster_commitment":
+    if bundle.commitment_cert.purpose != CERT_PURPOSE_ROSTER_COMMITMENT:
         return False
     if not bundle.commitment_cert.verify():
         return False
-    state_fingerprint = crypto.h(
-        codec.encode(
-            [
-                [
-                    bytes(rec.identity),
-                    sorted(ep.encode() for ep in rec.endpoints),
-                    sorted(rec.domains),
-                ]
-                for rec in sorted(bundle.entries, key=lambda r: bytes(r.identity))
-            ]
-        )
-    )
     expected_subject = crypto.h(
-        codec.encode(
-            [
-                bundle.commitment_serial,
-                sorted(bytes(m) for m in bundle.commitment_members),
-                state_fingerprint,
-            ]
+        RosterCommitment.content(
+            bundle.commitment_serial,
+            bundle.commitment_members,
+            RosterCommitment.fingerprint(bundle.entries),
         )
     )
     if bundle.commitment_cert.subject != expected_subject:
@@ -417,7 +410,7 @@ def _verify_bundle(  # noqa: C901, PLR0911 -- verification pipeline; each early-
     for rec in bundle.entries:
         if rec.cert.subject != rec.identity:
             return False
-        if rec.cert.purpose != b"roster":
+        if rec.cert.purpose != CERT_PURPOSE_ROSTER:
             return False
         if not rec.cert.verify():
             return False

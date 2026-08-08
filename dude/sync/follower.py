@@ -121,8 +121,10 @@ class Follower:
         return matches >= threshold
 
     def _on_height_reply(self, msg: HeightReply, from_: crypto.PublicKey, now: Millis) -> None:
+        # NOT credited to `_last_ok_at`: that is the pull-source priority, and answering a poll
+        # is not serving a block. Credited here, a peer keeps top priority by replying while
+        # failing every pull, and a joiner retries it forever.
         self._heads[from_] = HeightReport(msg.block_num, msg.tip_hash, now)
-        self._last_ok_at[from_] = now
 
     def _on_settled_block(  # noqa: PLR0911 -- verification pipeline is intentionally linear
         self,
@@ -130,6 +132,9 @@ class Follower:
         from_: crypto.PublicKey,
         now: Millis,
     ) -> None:
+        # Only from the peer we asked. An unsolicited run of state, applied, was a real break:
+        # a stranger with no grant and no roster seat added itself to a catching-up node's
+        # roster with one frame.
         p = self._pulling
         if p is None or from_ != p.peer:
             return

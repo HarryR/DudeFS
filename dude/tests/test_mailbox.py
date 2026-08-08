@@ -319,7 +319,7 @@ class TestOnlyThePeerWeAskedMayAnswer(unittest.TestCase):
 
     Correlation popped on the id alone, so any identity that learned an outstanding id had its
     answer taken as solicited. Frames are sealed so an id is not observable — but the peer we asked
-    knows it, and `SOLICITED` is all that stands between a `HASHES` reply and a stranger."""
+    knows it, and `p.to != envelope.frm` is what refuses everyone else."""
 
     def setUp(self):
         self.me = crypto.Keypair.generate()
