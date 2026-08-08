@@ -426,8 +426,18 @@ class StoreReader:
         for st, name, value, cred in rows:
             yield int(st), name, value, cred
 
-    def _settled_hashes(self, want: tuple[crypto.Digest, ...]) -> set[bytes]:
-        """Which of these op hashes the log already holds. One query, not one per transaction."""
+    def has_settled(self, op_hash: crypto.Digest) -> bool:
+        """Is this content address already in the log? The mempool door's question
+        (#dedup-content-address) -- singular because the door screens one tx at a time."""
+        return bool(self.settled_hashes((op_hash,)))
+
+    def settled_hashes(self, want: tuple[crypto.Digest, ...]) -> set[bytes]:
+        """Which of these op hashes the log already holds. One query, not one per transaction.
+
+        PUBLIC. Two callers outside this class ask it: the admission door
+        (#dedup-content-address, via `has_settled`) and the Coordinator's pre-preview filter
+        (#already-settled-filtering). Both are legitimate consumers of a log fact, and the
+        Coordinator was reaching through `_settled_hashes` with a `# noqa: SLF001` to get it."""
         if not want:
             return set()
         marks = ",".join("?" * len(want))
@@ -547,7 +557,7 @@ class StoreWriter(StoreReader):
         """Settle the batch inside the current writer transaction (caller owns BEGIN/COMMIT)."""
         settled: list[tuple[Index, crypto.Digest]] = []
         dropped: list[Dropped] = []
-        already = self._settled_hashes(tuple(tx.op_hash for tx in batch))
+        already = self.settled_hashes(tuple(tx.op_hash for tx in batch))
         acc = self.accumulator()
         idx = self.head()
         for tx in batch:
@@ -875,10 +885,15 @@ class Store:
         with self.snapshot() as r:
             yield from list(r._rows_in_path_range(lo, hi))  # noqa: SLF001
 
-    def _settled_hashes(self, want: tuple[crypto.Digest, ...]) -> set[bytes]:
-        # Called by Coordinator when previewing a slice.
+    def has_settled(self, op_hash: crypto.Digest) -> bool:
+        # The admission door's dedup check (#dedup-content-address).
         with self.snapshot() as r:
-            return r._settled_hashes(want)  # noqa: SLF001
+            return r.has_settled(op_hash)
+
+    def settled_hashes(self, want: tuple[crypto.Digest, ...]) -> set[bytes]:
+        # Called by Coordinator when previewing a slice (#already-settled-filtering).
+        with self.snapshot() as r:
+            return r.settled_hashes(want)
 
     @property
     def is_frozen(self) -> bool:

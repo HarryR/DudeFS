@@ -354,7 +354,7 @@ class Coordinator:
         # via an earlier bucket's settlement. `store.apply` drops these at commit time
         # (op_hash UNIQUE), and if the preview counted them in `applied`, the projected
         # height would exceed what actually commits -- signing anchors nobody can reproduce.
-        already = self.store._settled_hashes(tuple(tx.op_hash for tx in slice_txs))  # noqa: SLF001
+        already = self.store.settled_hashes(tuple(tx.op_hash for tx in slice_txs))
         slice_txs = tuple(tx for tx in slice_txs if tx.op_hash not in already)
 
         # Preview the slice into an OPEN Layer over Store.

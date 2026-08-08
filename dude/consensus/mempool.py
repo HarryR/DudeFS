@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Protocol
 
 from ..core import crypto
 from ..core.units import Millis
@@ -141,6 +142,23 @@ UNSIGNED = Refusal.UNSIGNED
 CANNOT_APPLY = Refusal.CANNOT_APPLY
 
 
+class Ledger(Reader, Protocol):
+    """What the admission door reads: live state, plus whether a content address has already
+    settled.
+
+    `Reader` alone is not enough — #dedup-content-address puts log membership at the door, and
+    a log is not a state view. Defined HERE, by the consumer, in the same shape as
+    `settle.Authoriser`: the door states what it needs and `StoreReader` satisfies it
+    structurally, rather than the store exporting a surface for it.
+
+    IT ALSO MAKES THE WRONG THING UNSAYABLE. A `Layer` implements `Reader` for speculative
+    evaluation and holds no log, so it cannot satisfy this. Admitting against an overlay —
+    screening a transaction with no way to see what has already landed — stops being an
+    argument the caller has to remember and becomes a type error."""
+
+    def has_settled(self, op_hash: crypto.Digest) -> bool: ...
+
+
 @dataclass(slots=True)
 class Mempool:
     """Currently-collecting mempool: one bucket window's worth of candidate transactions,
@@ -162,7 +180,7 @@ class Mempool:
         self,
         tx: ops.SignedTransaction,
         now: Millis,
-        reader: Reader,
+        reader: Ledger,
         auth: settle.Authoriser,
     ) -> Refusal | None:
         """MAY THIS BE IN THE MEMPOOL? `None` means yes; anything else is the reason.
@@ -190,6 +208,8 @@ class Mempool:
             return Refusal.TOO_NEW
         if not tx.verify():
             return Refusal.UNSIGNED
+        if reader.has_settled(tx.op_hash):
+            return Refusal.DUPLICATE
         if settle.would_apply(reader, (tx,), auth).rejects:
             return Refusal.CANNOT_APPLY
         return None
@@ -198,7 +218,7 @@ class Mempool:
         self,
         tx: ops.SignedTransaction,
         now: Millis,
-        reader: Reader,
+        reader: Ledger,
         auth: settle.Authoriser,
     ) -> Refusal | None:
         """The door a CLIENT knocks on: `valid`, plus "do we hold it already", plus the insert.

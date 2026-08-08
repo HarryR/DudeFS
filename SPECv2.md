@@ -562,6 +562,16 @@ via the same one door as any other submission.
 
 - A transaction already in the log MUST NOT enter the mempool. The content address is unique, so
   it cannot land again — this is a property of the door, not something a later stage catches.
+- The door therefore reads log membership, not just live state. A `Reader` cannot answer it; the
+  admission surface MUST require a log-backed reader, which also makes admitting against a
+  speculative overlay unsayable rather than merely wrong.
+- #already-settled-filtering is NOT this rule and does not replace it. The door screens what is
+  offered; the Coordinator's pre-preview filter closes a race the door cannot see, because a Round
+  ratifies over a FROZEN mempool and a transaction may settle via another node's slice between
+  admission and promotion. Two checks, two windows, both required.
+- The door cannot evict retroactively either: a transaction admitted before its block landed stays
+  in the mempool until the bucket boundary swaps it. Log membership is checked when something is
+  OFFERED, which is the only moment the door exists at.
 
 ### Rejects return through the same door {#rejects-through-same-door}
 
@@ -1074,8 +1084,8 @@ turns that into a SETTLED block.
   failure mode is recovered via L6 sync (#sync-is-log-replay). The stragglers pull the
   SETTLED block from a peer that did settle it, chain-verify, and continue -- the local
   SettleRound they had going for that block position is abandoned by cadence and its txs
-  re-enter their mempool (mostly duplicates against the just-synced block, refused for free
-  via the `_settled_hashes` check).
+  re-enter their mempool, where the door refuses any that the just-synced block already
+  contains (#dedup-content-address).
 - Both cases -- cluster-wide hang and one-node-fell-behind -- resolve via the same
   abandon-then-retry-or-sync loop. No new mechanism.
 
@@ -1998,7 +2008,7 @@ visible rather than plausible.
 |---|---|
 | one door, one predicate | `Mempool.valid` |
 | admission consults currently-settled state | `Mempool.valid` via `settle.would_apply` |
-| duplicates never enter | `Store._settled_hashes` and `Mempool.valid` |
+| duplicates never enter (#dedup-content-address) | `Mempool.valid` calls `reader.has_settled(tx.op_hash)` and returns `Refusal.DUPLICATE`. The reader is typed `mempool.Ledger` (`Reader` + `has_settled`), which `StoreReader` satisfies and a `Layer` cannot — so the door cannot be handed an overlay with no log. Held by `test_mempool.test_a_transaction_already_in_the_log_is_refused` and `test_the_door_refuses_a_settled_tx_that_would_still_apply`, the second pinning the unguarded case the evaluator cannot catch |
 | one evaluator across admission, slice construction, settlement | `settle.evaluate` called from `Store.apply` and `Mempool.valid` |
 | a mempool is not retained past its window's close | `dude.coordinator.Coordinator` swaps the whole `Mempool` at each bucket boundary — the frozen one goes with the Round, a fresh one starts admitting |
 | rejects re-enter through the same door | `Coordinator._settle` calls `self.mempool.admit(tx, ...)` for surviving-but-not-included transactions — the same one door any submission uses |
@@ -2046,7 +2056,7 @@ visible rather than plausible.
 | settlement converges by quorum on anchors (#settlement-quorum-on-anchors) | `SettleRound._try_settle` — quorum of matching `SettleSig` messages agreeing on our anchors |
 | peer divergent anchors are evidence (#settlement-peer-divergence-is-evidence) | `SettleRound._divergences` accumulator; `SettleRound.divergences()` accessor |
 | our own state disagreeing is InvariantError (#settlement-self-divergence-is-invariant) | `Coordinator._on_settled` calls `_expect_anchors` which raises `InvariantError` on any mismatch of head / state_root / A_state / A_log |
-| Coordinator filters already-settled before preview (#already-settled-filtering) | `Coordinator._start_settling` — `store._settled_hashes(...)` drops slice txs already in the log before feeding `settle.apply_to` |
+| Coordinator filters already-settled before preview (#already-settled-filtering) | `Coordinator._promote_to_settling` — `store.settled_hashes(...)` drops slice txs already in the log before feeding `settle.apply_to`. Distinct from the door (#dedup-content-address): this closes the admission-to-promotion race over a frozen mempool, and remains required |
 | fall-through re-admission re-broadcasts (#fall-through-re-broadcasts) | `Coordinator._on_settled` and `_on_abandoned` call `self.reflood(tx, now)` for every re-admitted tx (Node wires it to `lambda tx, now: self._flood(Verb.SUBMIT, tx.raw, now)`) |
 | every ratified bucket runs settlement, even empty (#empty-bucket-still-settles) | `SettleRound` accepts empty slice (empty `hashes` tuple); `Coordinator._start_settling` promotes empty ratifications unchanged; `Anchors.block_num` increments regardless |
 | settlement does not cross Mempool (#settlement-does-not-cross-mempool) | **structural** — `dude/consensus/settle_round.py` imports neither `Mempool` nor `Coordinator`; enforced by CI review |
