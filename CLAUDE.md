@@ -38,8 +38,8 @@ justification is worse than none because it reads as authority.
 
 `make check` — lint, format-check, typecheck, test. Green before a commit.
 
-**The flake loop is occasional and it is Harry's call to spend it.** Six runs is about eight
-minutes — **ask first**, and say what in the change makes it worth the time.
+**The flake loop is occasional and it is not yours to spend.** Six runs is about eight minutes —
+**ask first**, and say what in the change makes it worth the time.
 
 ```sh
 for i in 1 2 3 4 5 6; do .venv/bin/python -m unittest discover -s dude/tests -t . -q 2>&1 | tail -2; done
@@ -65,11 +65,11 @@ something. A fix whose test passes either way is not held by anything.
 mutated, branches actually reached. An exploit test once passed while mutating zero frames, because
 the client had lagged and never made the request.
 
-## Working with Harry
+## Working agreements
 
-- Ask decisions as **plain-text options in the reply**. He dislikes the popup — it is copy-hostile.
-- He rules, then expects the work built and tested. Give a recommendation, not a survey.
-- A review request means **reading only**. Do not run the gate on his behalf during a review.
+- Ask decisions as **plain-text options in the reply**, never the popup — it is copy-hostile.
+- Give a recommendation, not a survey. Once it is ruled on, build it and test it.
+- A review request means **reading only**. Do not run the gate during a review.
 - **Smallest-correct, no option-keeping.** Do not preserve alternatives "in case".
 - Commit whole subjects. Granular commits that leave the tree half-working corrupt the history.
 
