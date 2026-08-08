@@ -1,40 +1,30 @@
-# dude.coordinator -- the per-node lifecycle for Rounds, SettleRounds, Mempools, and commit.
+# dude.coordinator -- the per-node lifecycle for Mempool, Round, SettleRound and commit.
 #
-# WHAT IT OWNS. The currently-collecting Mempool. Rounds in flight (bucket -> Round; the Round
-# carries its own bodies so no Mempool sidecar is retained). A queue of ratified blocks awaiting
-# settlement, in bucket order. At most one live SettleRound at a time, plus the OPEN Layer
-# previewing its slice. Also owns the bucket-boundary swap, the RATIFIED -> SETTLED -> COMMIT
-# sequencing, and the ABANDONED-round fall-through re-admission (#endorser-refuses-stale).
+# WHAT IT OWNS. The collecting Mempool; the one in-flight Round; the one in-flight SettleRound
+# and the OPEN Layer previewing its slice (#one-of-each-in-flight). Also the bucket-boundary
+# swap, the RATIFIED -> SETTLED -> COMMIT sequencing, and the fall-through re-admission that
+# #endorser-refuses-stale requires.
 #
-# WHAT IT DOES NOT OWN. The Round protocol (`dude.round`), the SettleRound protocol
-# (`dude.settle_round`), the wire encodings (`dude.net.round_adapter`,
-# `dude.net.settle_adapter`), transports (`dude.net.postman`), and the log (`dude.store`). This
-# module composes them.
+# WHAT IT DOES NOT OWN: the Round and SettleRound protocols, the wire encodings, the transports,
+# and the log. This module composes them.
 #
-# THE L5 FLOW, top to bottom:
+# THE L5 FLOW:
 #
-#     1. Round(N) ratifies -> Block(bucket=N, slice_hash, hashes).
-#     2. Enqueue (bucket=N, block, frozen_mempool) in `pending`.
-#     3. If no SettleRound is currently running AND pending has an item, promote the smallest-
-#        bucket entry to `settling`:
-#          a. Build ordered slice txs by looking up bodies from the frozen mempool.
-#          b. Layer(base=store), evaluate the slice into it via settle.apply_to, freeze it.
-#          c. Compute Anchors: height = store.head + len(applied), state_root = layer.state_root,
-#             acc_state = layer.accumulator, acc_log projected from Store + applied op_hashes.
-#          d. Construct SettleRound(block, me, roster, anchors, now).
-#     4. Drive open SettleRound on tick: flush outbound SETTLE_SIGs, check `settled()`.
-#     5. On SETTLED:
-#          a. Commit the applied slice txs via store.apply -- deterministic re-evaluation
-#             produces the same effects, so the projected anchors match Store's post-apply state.
-#          b. Safety-check: Store's new anchors match the SETTLED anchors (InvariantError if not
-#             -- that would mean our evaluator is non-deterministic between preview and commit).
-#          c. Re-admit non-slice-and-non-applying txs through the mempool's one door.
-#          d. Clear `settling`; the next tick starts the next pending entry (if any).
+#     1. Round ratifies -> Block(bucket, slice_hash, hashes). The Round carries its own bodies,
+#        so no frozen Mempool is retained alongside it.
+#     2. Once the settle slot is free, promote: build the ordered slice, evaluate it into a
+#        Layer over the store, freeze, project Anchors, open a SettleRound.
+#     3. Drive that SettleRound on tick -- flush SETTLE_SIGs, check `settled()`.
+#     4. On SETTLED, commit the applied txs, CHECK the store's resulting anchors against the
+#        ones we signed (a mismatch means our evaluator was non-deterministic between preview
+#        and commit, so it is an InvariantError and not catchable), then re-admit what did not
+#        make it through the mempool's one door.
 #
-# SETTLEMENT IS SERIAL PER BUCKET. Per SPECv2 #pipelining: blocks settle in bucket order. If
-# Round(N+1) ratifies before Round(N) has SETTLED, N+1's block waits in `pending`. Not a
-# concurrency requirement -- a monotone-height requirement. Speculative pipelining via stacked
-# Layers is the SPEC target (#pipelining-via-frozen-layers) but not implemented in Stage 3.
+# THERE IS NO QUEUE. Only one Round is ever in flight, so a Block that ratifies while the settle
+# slot is busy simply waits in `current_round` until a later tick promotes it. Blocks therefore
+# settle in bucket order, which is a monotone-height requirement rather than a concurrency one.
+# Speculative pipelining over stacked Layers is the SPEC target (#pipelining-via-frozen-layers)
+# and is not built.
 
 from __future__ import annotations
 
@@ -98,15 +88,11 @@ class Coordinator:
     settle_adapter: SettleAdapter
     tunables: Tunables
     reflood: Callable[[SignedTransaction, Millis], None] | None = None
-    """Callback the Coordinator invokes to re-broadcast a fall-through tx after settlement.
+    """Re-broadcast a fall-through tx after settlement.
 
-    A tx that was in the ratified slice but dropped in the preview (guard falsified by a
-    bucket-mate that settled first), or a non-slice tx in the frozen mempool, re-enters this
-    node's current mempool via #fall-through-through-the-door. But local re-admission does NOT
-    reach peers: a tx that only THIS node holds cannot form a quorum in any future bucket. So
-    the Coordinator asks Node to re-broadcast the body via SUBMIT, restoring the shape SUBMIT
-    re-flood originally established (peers hold what the author gave one of us). Optional
-    because tests may not need it; production always passes one."""
+    Local re-admission (#fall-through-through-the-door) does NOT reach peers, and a tx only THIS
+    node holds cannot form a quorum in any future bucket -- so the body goes back out via SUBMIT,
+    restoring the shape re-flood established. Optional for tests; production always passes one."""
 
     mempool: Mempool = field(init=False)
     current_round: Round | None = field(init=False, default=None)
@@ -210,14 +196,10 @@ class Coordinator:
     # -- the driver -------------------------------------------------------------------------- #
 
     def tick(self, now: Millis) -> None:
-        """Advance the three-stage pipeline (#one-of-each-in-flight):
-          1. Mempool -- collecting (always).
-          2. Round -- agreeing (one at a time).
-          3. Settle -- settling (one at a time).
-
-        Each stage takes ~one bucket width. At bucket boundaries the pipeline advances:
-        Settle finishes (commit or fall-through), Round's ratified Block promotes into the
-        just-freed Settle slot, Mempool freezes into a fresh Round, new Mempool opens."""
+        """Advance the three-stage pipeline -- Mempool collecting, Round agreeing, Settle
+        settling, one of each (#one-of-each-in-flight). Each stage takes ~one bucket width, and
+        a bucket boundary advances all three: Settle finishes, the ratified Block promotes into
+        the freed slot, the Mempool freezes into a fresh Round, a new Mempool opens."""
         if self.current_bucket < 0:
             self.current_bucket = self._bucket_of(now)
 
@@ -270,7 +252,7 @@ class Coordinator:
 
         Naming the primitive is what keeps the two callers from drifting: an unnamed atomic
         sequence has one caller by accident, a named one has any caller with the same
-        standing (#failure-modes note 9). Before this was factored, HELD/SIG arriving in the
+        standing (CLAUDE.md trap 9). Before this was factored, HELD/SIG arriving in the
         ~tick_interval gap before our tick opened the matching Round was silently dropped as
         "no matching Round" and every node signed empty slices on buckets the whole cluster
         held the same tx for.

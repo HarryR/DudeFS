@@ -309,7 +309,7 @@ class SettledBlockWithBodies:
     replays). Kept as separate types so the CHAIN concern (block_hash, prev_block linking) never
     accidentally depends on the PAYLOAD concern (which txs make it up) -- their shapes differ,
     their durability differs (proof persists in the block table; bodies come from the entry
-    table), and conflating them was the source of the sig-inclusion race Stage 1 caught.
+    table), and conflating them was the source of a sig-inclusion race.
 
     `bodies` correspond to the APPLIED set on the producer -- the subset of `block.hashes` that
     actually made it through the evaluator (some may have fallen through per

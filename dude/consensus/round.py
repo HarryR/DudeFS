@@ -6,17 +6,8 @@
 # no system clock -- `now` is a parameter, driven by tests or by the Coordinator.
 #
 # WHAT ROUND OWNS. Its own protocol messages (`Held`, `Sig`), its state machine, its ratification
-# rule. The message set may grow to three during implementation if meta-agreement needs an
-# observability step, or shrink if two suffice; any change is a proposal for SPECv2 (#mempool /
-# L4) to ratify. What Round does NOT own: envelopes, seals, mailboxes, links, storage, the log,
-# admission (Mempool), the wire encoding (`RoundAdapter`), and lifecycle across buckets
-# (`Coordinator`).
-#
-# WHY THE INTERFACE IS HERE FIRST, WITH NO IMPLEMENTATION. The whole reason this module exists is
-# that the previous round mechanism was placeholder code with a comment admitting it was
-# placeholder. Writing the interface header first, with the tests driving the implementation into
-# it, makes it obvious when a scenario reveals a gap -- rather than a comment claiming a gap.
-# See `dude/tests/test_round.py`.
+# rule. NOT: envelopes, seals, mailboxes, links, storage, the log, admission (Mempool), the wire
+# encoding (`RoundAdapter`), or lifecycle across buckets (`Coordinator`).
 
 from __future__ import annotations
 
@@ -41,9 +32,7 @@ _SLICE_DOMAIN = b"dude.round.slice"
 
 class RoundError(DudeError):
     """A misuse of the Round API: called out of order, given contradictory input, or handed a
-    clock that went backwards. Not for peer misbehaviour -- that is a silent drop with an `#XXX:`
-    comment. Not for genuine invariant violation -- that is `InvariantError`, and Round has none
-    at the moment because there is nothing here whose arithmetic could go wrong internally."""
+    clock that went backwards. NOT peer misbehaviour, which is a silent drop."""
 
 
 # --------------------------------------------------------------------------------------------- #
@@ -124,9 +113,6 @@ class RoundMsg(ABC):
 @dataclass(frozen=True, slots=True)
 class Held(RoundMsg):
     """Advertisement: I hold these transaction hashes in my bucket for `bucket`.
-
-    Encoding is per-hash for now; a future optimisation MAY compress via ECMH or set-reconciliation
-    (minisketch), which is a wire concern that does not change Round's semantics.
 
     A node MAY re-advertise the same or a superset (holdings only grow within a round -- there is
     no `unheld`). Peers accumulate; the latest advertisement wins per (peer, bucket)."""

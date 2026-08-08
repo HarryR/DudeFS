@@ -16,20 +16,9 @@
 #   coordinator    the driver -- swaps mempools at bucket boundaries, drives rounds, promotes
 #                  ratified blocks to settlement, commits on SETTLED
 #
-# QUORUM LIVES AT dude.quorum, NOT HERE. It is pure arithmetic and is consumed by both
-# consensus and by `store.management` (for failure-domain checks on the roster). Keeping it
-# outside the consensus package removes the cycle that would otherwise exist between store
-# and consensus during package loading. Cite via `from dude import quorum`.
-#
-# WHAT IT DEPENDS ON:
-#   dude.quorum    the quorum rule (shared with dude.store.management)
-#   dude.core      crypto primitives, codec
-#   dude.store     Store (the committed log + state), settle.evaluate, Layer, ops
-#   dude.net       envelope, postman, transports (the adapters use these)
-#   dude.tunables  Tunables (composed at the top level, threaded through)
-#
-# WHAT DEPENDS ON IT:
-#   dude.node      composes Coordinator + Postman + adapters into a running node
+# QUORUM LIVES AT dude.quorum, NOT HERE. It is pure arithmetic, consumed by consensus AND by
+# `store.management` for failure-domain checks on the roster. Keeping it outside this package is
+# what removes the store<->consensus cycle at import time.
 
 from .coordinator import Coordinator
 from .mempool import CANNOT_APPLY, DUPLICATE, TOO_NEW, TOO_OLD, UNSIGNED, Mempool, Refusal
