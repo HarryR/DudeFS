@@ -445,7 +445,7 @@ class TestANonMemberRefusesSubmissions(unittest.TestCase):
     def test_submit_to_a_non_member_is_refused_not_swallowed(self):
         c = Cluster(size=3)
         outsider = Node(crypto.Keypair.generate(), c.provisioned(), TUNABLES)
-        tx = ops.writes(ops.Set(ops.STORE_DATA, crypto.h(b"k"), b"v")).sign(c.mgr, T0)
+        tx = c.client().put("k", b"v").sign(c.mgr, T0)
         self.assertIs(outsider.coordinator.submit(tx, T0), Refusal.NOT_IN_ROSTER)
 
         # Driven the way production drives it: the SUBMIT frame must leave no trace in the

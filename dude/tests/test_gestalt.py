@@ -15,6 +15,7 @@ import unittest
 from collections.abc import Callable
 from dataclasses import replace
 
+from ..client import Client, Keys, mint_first_keyepoch
 from ..consensus.bootstrap import bootstrap
 from ..core import codec, crypto
 from ..core.errors import DudeError, InvariantError
@@ -45,8 +46,8 @@ class TestGestalt(unittest.TestCase):
 
     def test_one_transaction_reaches_every_log(self):
         """The whole system, end to end. Submitted to node 0 only; settled on all three."""
-        key = crypto.h(b"hello")
-        tx = ops.writes(ops.Set(D, key, b"world")).sign(self.client, T0)
+        key = self.c.token("hello")
+        tx = self.c.client().put("hello", b"world").sign(self.client, T0)
 
         self.c.submit(self.client, tx, to=0, now=T0)
         self.c.pump(T0)  # disseminate within the bucket
@@ -55,16 +56,18 @@ class TestGestalt(unittest.TestCase):
         for i, node in enumerate(self.c.nodes):
             got = node.store.get(D, key)
             assert got is not None, f"node {i} did not settle it"
-            self.assertEqual(got.value, b"world", f"node {i} settled the wrong value")
+            self.assertEqual(
+                self.c.client().open("hello", got.value, got.epoch),
+                b"world",
+                f"node {i} settled the wrong value",
+            )
 
     def test_every_node_settles_the_same_log(self):
         """Not merely "all have the value" — the same operations at the same indices, which is what
         the accumulator is for. Two nodes agreeing on a value while disagreeing on history is the
         failure this catches and a value check does not."""
         for n in range(3):
-            tx = ops.writes(ops.Set(D, crypto.h(f"k{n}".encode()), f"v{n}".encode())).sign(
-                self.client, T0 + n
-            )
+            tx = self.c.client().put(f"k{n}", f"v{n}".encode()).sign(self.client, T0 + n)
             self.c.submit(self.client, tx, to=n, now=T0)
         self.c.pump(T0)
         self.c.pump(T0 + DELTA)
@@ -86,8 +89,8 @@ class TestGestalt(unittest.TestCase):
         self.c.nodes[0].postman.peers.pop(c_pk, None)
         self.c.nodes[2].postman.peers.pop(a_pk, None)
 
-        key = crypto.h(b"partitioned")
-        tx = ops.writes(ops.Set(D, key, b"relayed")).sign(self.client, T0)
+        key = self.c.token("partitioned")
+        tx = self.c.client().put("partitioned", b"relayed").sign(self.client, T0)
         self.c.submit(self.client, tx, to=0, now=T0)
         self.c.pump(T0)
         self.c.pump(T0 + DELTA)
@@ -99,8 +102,8 @@ class TestGestalt(unittest.TestCase):
         """Authority is log state, so a stranger is refused by every node without any of them
         conferring about it."""
         stranger = crypto.Keypair.generate()
-        key = crypto.h(b"nope")
-        tx = ops.writes(ops.Set(D, key, b"x")).sign(stranger, T0)
+        key = self.c.token("nope")
+        tx = self.c.client().put("nope", b"x").sign(stranger, T0)
         self.c.submit(stranger, tx, to=0, now=T0)
         self.c.pump(T0)
         self.c.pump(T0 + DELTA)
@@ -115,8 +118,8 @@ class TestGestalt(unittest.TestCase):
         junk = Frame(crypto.screen_tag(node.me.public, b"junk"), crypto.SealedBlob(b"junk"))
         node.receive(junk, T0)  # must not raise
 
-        key = crypto.h(b"after-junk")
-        tx = ops.writes(ops.Set(D, key, b"still-alive")).sign(self.client, T0)
+        key = self.c.token("after-junk")
+        tx = self.c.client().put("after-junk", b"still-alive").sign(self.client, T0)
         self.c.submit(self.client, tx, to=0, now=T0)
         self.c.pump(T0)
         self.c.pump(T0 + DELTA)
@@ -136,8 +139,8 @@ class TestGestalt(unittest.TestCase):
             env = Envelope(node.me.public, Verb.SUBMIT, b"c" * 16, body).sign(stranger, T0)
             node.receive(env.seal(), T0)  # must not raise
 
-        key = crypto.h(b"after-garbage-body")
-        tx = ops.writes(ops.Set(D, key, b"still-alive")).sign(self.client, T0)
+        key = self.c.token("after-garbage-body")
+        tx = self.c.client().put("after-garbage-body", b"still-alive").sign(self.client, T0)
         self.c.submit(self.client, tx, to=0, now=T0)
         self.c.pump(T0)
         self.c.pump(T0 + DELTA)
@@ -201,7 +204,7 @@ class TestSubmitDoesNotCascade(unittest.TestCase):
         self.c = Cluster()
 
     def test_no_node_rebroadcasts_a_submission(self):
-        tx = ops.writes(ops.Set(D, crypto.h(b"no-cascade"), b"v")).sign(self.c.mgr, T0)
+        tx = self.c.client().put("no-cascade", b"v").sign(self.c.mgr, T0)
         self.c.submit(self.c.mgr, tx, to=0, now=T0)
 
         queued = [
@@ -213,8 +216,8 @@ class TestSubmitDoesNotCascade(unittest.TestCase):
         self.assertNotIn(Verb.SUBMIT, queued, "a node re-flooded the submission")
 
     def test_it_still_reaches_every_log_by_being_gossiped(self):
-        key = crypto.h(b"gossiped")
-        tx = ops.writes(ops.Set(D, key, b"v")).sign(self.c.mgr, T0)
+        key = self.c.token("gossiped")
+        tx = self.c.client().put("gossiped", b"v").sign(self.c.mgr, T0)
         self.c.submit(self.c.mgr, tx, to=0, now=T0)
         self.c.pump(T0)
         self.c.pump(T0 + DELTA)
@@ -222,7 +225,7 @@ class TestSubmitDoesNotCascade(unittest.TestCase):
         for i, node in enumerate(self.c.nodes):
             got = node.store.get(D, key)
             assert got is not None, f"node {i} never got it -- phase 2 did not carry it"
-            self.assertEqual(got.value, b"v")
+            self.assertEqual(self.c.client().open("gossiped", got.value, got.epoch), b"v")
 
 
 class TestVerbCoverage(unittest.TestCase):
@@ -251,8 +254,8 @@ class TestVerbCoverage(unittest.TestCase):
         raw = codec.encode([signed, other.me.sign(signed)])
         node.receive(Frame(crypto.screen_tag(node.me.public, raw), node.me.public.seal(raw)), T0)
 
-        key = crypto.h(b"after-unknown-verb")
-        tx = ops.writes(ops.Set(D, key, b"fine")).sign(self.client, T0)
+        key = self.c.token("after-unknown-verb")
+        tx = self.c.client().put("after-unknown-verb", b"fine").sign(self.client, T0)
         self.c.submit(self.client, tx, to=0, now=T0)
         self.c.pump(T0)
         self.c.pump(T0 + DELTA)
@@ -308,6 +311,9 @@ def _genesis(
             for i, kp in enumerate(keys)
         ),
     )
+    # The first keyepoch, in genesis so encryption is live from block 1 and every node's
+    # block 1 is byte-equal -- minting it per node would make each one random.
+    tx = tx + mint_first_keyepoch(mgmt, mgr)[0]
     return (tx.sign(mgr, T0),)
 
 
@@ -430,8 +436,11 @@ class TestScenario(unittest.TestCase):
             )
 
             # --- PHASE 1: external client SUBMITs a tx; it settles on every node ------ #
-            key = crypto.h(b"scenario/phase-1")
-            tx = ops.writes(ops.Set(D, key, b"phase-one-value")).sign(mgr, now_ms())
+            # This scenario builds its own nodes, so its client comes from their store rather
+            # than from a Cluster.
+            writer = Client(Keys.unwrap(nodes[0].store, mgr))
+            key = writer.token("scenario/phase-1")
+            tx = writer.put("scenario/phase-1", b"phase-one-value").sign(mgr, now_ms())
             self.assertTrue(
                 _submit_and_wait(
                     test_client,
@@ -448,7 +457,9 @@ class TestScenario(unittest.TestCase):
                 held = n.store.get(D, key)
                 assert held is not None
                 self.assertEqual(
-                    held.value, b"phase-one-value", f"phase 1: wrong value on node {i}"
+                    writer.open("scenario/phase-1", held.value, held.epoch),
+                    b"phase-one-value",
+                    f"phase 1: wrong value on node {i}",
                 )
 
             # --- PHASE 2: a LightClient bootstraps + reads via TCP -------------------- #

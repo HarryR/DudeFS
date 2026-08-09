@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+from ..client import Client, Keys, mint_first_keyepoch
 from ..consensus.bootstrap import bootstrap
 from ..core import crypto
 from ..net import Verb
@@ -68,7 +69,11 @@ class Cluster:
         # therefore agrees byte-for-byte on the chain from block 1 onward, and a fresh joiner
         # arriving later can pull block 1 from any peer and chain-verify it against the
         # manager pubkey alone.
-        genesis = self._genesis()
+        self._genesis_bodies = self._genesis()
+        """COMPUTED ONCE. It mints the first keyepoch, which is random, so calling it again for a
+        joiner handed that joiner a different block 1 -- a chain nobody else was on, and a sync
+        that could never converge."""
+        genesis = self._genesis_bodies
         for kp in self.keys:
             store = Store()
             # PROVISIONED with the manager key before anything else: it is the axiom the rest of
@@ -118,6 +123,10 @@ class Cluster:
             pop=self.mgr.prove_possession(),
             cert=mgr_cert,
         )
+        # The first keyepoch, composed HERE so every node's block 1 is byte-equal. Minted inside
+        # `bootstrap` it was random per node, so no two nodes agreed what their round followed.
+        keyepoch, _ = mint_first_keyepoch(mgmt, self.mgr)
+        tx = tx + keyepoch
         # Nodes are not authors (#nodes-are-not-authors) — no P_GRANT for them. The
         # roster entries below establish them as consensus signers via P_NODE, each with
         # an anchor-signed roster #cert.
@@ -143,7 +152,7 @@ class Cluster:
         that check not existing."""
         s = Store()
         s.provision(self.mgr.public)
-        bootstrap(s, self.mgr, self._genesis(), bucket=TUNABLES.mempool.bucket(T0))
+        bootstrap(s, self.mgr, self._genesis_bodies, bucket=TUNABLES.mempool.bucket(T0))
         return s
 
     @property
@@ -212,6 +221,35 @@ class Cluster:
                     delivered += 1
             if delivered == 0:
                 return
+
+    def client(self, kp: crypto.Keypair | None = None) -> Client:
+        """A data client for `kp`, default the manager, with its keys unwrapped from this
+        cluster's own management rows -- which is where they live. Bootstrap seals epoch 1 to the
+        anchor, so the manager is a working client from block 1 with nothing else to arrange."""
+        who = self.mgr if kp is None else kp
+        return Client(Keys.unwrap(self.nodes[0].store, who))
+
+    def token(self, name: str, kp: crypto.Keypair | None = None) -> crypto.NameToken:
+        """Where a name lands in the store. A test that wrote through `put` reads back through
+        this -- the row is at a blinded token, not at the name."""
+        return self.client(kp).token(name)
+
+    def put(
+        self,
+        name: str,
+        value: bytes,
+        *,
+        kp: crypto.Keypair | None = None,
+        to: int = 0,
+        now: int = T0,
+    ) -> ops.SignedTransaction:
+        """Write the way a client does: blind the name, seal the value under the current keyepoch,
+        sign, hand to ONE node. A test about consensus or sync has no business composing an
+        `ops.Set` by hand -- that is how fifty-one of them came to know what a keyepoch is."""
+        who = self.mgr if kp is None else kp
+        tx = self.client(who).put(name, value).sign(who, now)
+        self.submit(who, tx, to=to, now=now)
+        return tx
 
     def submit(self, client: crypto.Keypair, tx: ops.SignedTransaction, to: int, now: int) -> None:
         """A client hands a transaction to ONE node — the whole point of the protocol being that it

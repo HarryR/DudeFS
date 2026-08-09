@@ -40,14 +40,24 @@ from .cluster import DELTA, T0, TUNABLES, Cluster
 
 
 def _provision_client(c: Cluster, kp: crypto.Keypair) -> None:
-    """Grant Role.CLIENT_RW to `kp`, applied via intervene so every store sees it."""
+    """Grant Role.CLIENT_RW via intervene on every store, with the client's InProc endpoint
+    baked into the P_GRANT row so nodes can dial back via `_reconcile_peers`
+    (#roster-drives-peers).
+
+    Mints its KEYS in the same transaction. A grant without them addresses rows it cannot read,
+    which looks like corruption rather than a missing step -- and the manager can mint them
+    because it holds every master itself."""
     mgmt = MgmtWriter(c.nodes[0].store)
-    grant_tx = mgmt.authorise(
-        kp.public,
-        Role.CLIENT_RW,
-        stores=frozenset({ops.STORE_DATA}),  # scoped: reads are refused outside it
-        pop=kp.prove_possession(),
-        cert=Cert.sign_grant(c.mgr, kp.public, Role.CLIENT_RW),
+    wraps, blinding = c.client().keys.wraps_for(kp.public)
+    grant_tx = (
+        mgmt.authorise(
+            kp.public,
+            Role.CLIENT_RW,
+            stores=frozenset({ops.STORE_DATA}),  # scoped: reads are refused outside it
+            pop=kp.prove_possession(),
+            cert=Cert.sign_grant(c.mgr, kp.public, Role.CLIENT_RW),
+        )
+        + mgmt.admit_reader(kp.public, wraps, blinding)
     ).sign(c.mgr, T0)
     for node in c.nodes:
         intervene(node.store, c.mgr, bodies=(grant_tx,), bucket=TUNABLES.mempool.bucket(c.clock))
@@ -228,9 +238,8 @@ class TestServeGetProof(unittest.TestCase):
 
     def test_get_proof_returns_head_value(self):
         c = Cluster()
-        key = crypto.h(b"lite-proof")
-        tx = ops.writes(ops.Set(ops.STORE_DATA, key, b"present")).sign(c.mgr, T0)
-        c.submit(c.mgr, tx, to=0, now=T0)
+        c.put("lite-proof", b"present", now=T0)
+        key = c.token("lite-proof")
         c.pump(T0)
         c.pump(T0 + DELTA)
 
@@ -249,7 +258,12 @@ class TestServeGetProof(unittest.TestCase):
         self.assertIsInstance(reply, ProofReply)
         assert isinstance(reply, ProofReply)
         self.assertFalse(reply.absent)
-        self.assertEqual(reply.value, b"present")
+        self.assertNotEqual(reply.value, b"present", "the node served plaintext")
+        self.assertEqual(
+            c.client().open("lite-proof", reply.value, reply.epoch),
+            b"present",
+            "what the node serves must open under the epoch it serves it with",
+        )
 
     def test_get_proof_absent_key_returns_absent(self):
         c = Cluster()

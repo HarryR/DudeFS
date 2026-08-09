@@ -21,6 +21,7 @@ import textwrap
 import time
 import unittest
 
+from dude.client import mint_first_keyepoch
 from dude.consensus.bootstrap import bootstrap
 from dude.core import crypto
 from dude.net.address import Endpoint
@@ -67,6 +68,9 @@ def _build_cluster(
             for i, kp in enumerate(keys)
         ),
     )
+    # The first keyepoch, in genesis so encryption is live from block 1 and every node's
+    # block 1 is byte-equal -- minting it per node would make each one random.
+    tx = tx + mint_first_keyepoch(mgmt, mgr)[0]
     genesis = (tx.sign(mgr, 1_700_000_000_000),)
 
     nodes: list[Node] = []

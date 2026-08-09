@@ -512,6 +512,11 @@ class MgmtReader:
         raw = self.src.get(self.store_id, P_POP + who)
         return crypto.Signature(raw[1]) if raw else None
 
+    def epoch_row(self) -> tuple[int, bytes]:
+        """Which row carries the current keyepoch, so `settle.evaluate` can recognise a write to
+        it without importing the management module."""
+        return self.store_id, P_EPOCH
+
     def current_epoch(self, reader: Reader | None = None) -> int:
         """`EPOCH_NONE` until a manager mints the first one, which is what makes plaintext the
         default rather than a special case. Read against the SAME reader the write is evaluated
@@ -519,6 +524,18 @@ class MgmtReader:
         src = self.src if reader is None else reader
         raw = src.get(self.store_id, P_EPOCH)
         return codec.as_int(codec.decode(raw.value)) if raw else ops.EPOCH_NONE
+
+    def wraps_for(self, who: crypto.PublicKey) -> dict[int, crypto.SealedBlob]:
+        """Every keyepoch this identity was minted a wrap for. Scans by prefix and filters on the
+        trailing pubkey, because the row key is `P_WRAP + epoch + who` -- epoch first, so one
+        epoch's wraps for every holder sit together and a rotation writes a contiguous run."""
+        out: dict[int, crypto.SealedBlob] = {}
+        for row in self.src.prefix(self.store_id, P_WRAP):
+            body = row.name[len(P_WRAP) :]
+            if len(body) != 8 + len(who) or body[8:] != who:
+                continue
+            out[int.from_bytes(body[:8], "big")] = crypto.SealedBlob(row.value)
+        return out
 
     def blinding_wrap(self, who: crypto.PublicKey) -> crypto.SealedBlob | None:
         raw = self.src.get(self.store_id, P_BLIND + who)
@@ -707,9 +724,48 @@ class MgmtWriter(MgmtReader):
                 f"{cert.purpose!r} cert (must be anchor or a currently-valid manager)"
             )
 
-    def distribute(
-        self, epoch: int, wraps: dict[crypto.PublicKey, crypto.SealedBlob]
+    def admit_reader(
+        self,
+        who: crypto.PublicKey,
+        wraps: dict[int, crypto.SealedBlob],
+        blinding: crypto.SealedBlob,
     ) -> ops.Transaction:
+        """The key half of admitting a reader. Composes with `authorise` (`a + b`) so a grant and
+        the keys that make it useful land in ONE transaction -- granted without keys, an identity
+        can address rows it cannot read, which looks like corruption rather than a missing step."""
         return ops.writes(
-            *(ops.Set(self.store_id, _wrap_key(epoch, who), wraps[who]) for who in sorted(wraps))
+            ops.Set(self.store_id, P_BLIND + who, blinding),
+            *(ops.Set(self.store_id, _wrap_key(e, who), wraps[e]) for e in sorted(wraps)),
         )
+
+    def rotate(
+        self,
+        from_epoch: int,
+        wraps: dict[crypto.PublicKey, crypto.SealedBlob],
+        blinding: dict[crypto.PublicKey, crypto.SealedBlob] | None = None,
+    ) -> ops.Transaction:
+        """ONE transaction: the bump and every wrap, or neither. `evaluate` verdicts a whole
+        transaction, so there is never a live epoch nobody holds the master for.
+
+        NO GUARD. A `Holds(P_EPOCH, from_epoch)` was equivalent to the forward-only rule
+        `evaluate` already applies -- both say `from_epoch == current`, since the target is derived
+        from `from_epoch` too -- and the evaluator's version is strictly stronger, because it binds
+        every writer rather than only transactions this method built. Two managers rotating at once
+        are serialised by it: the loser's target is no longer `current + 1` and drops as
+        EPOCH_JUMP.
+
+        A manager MUST be among `wraps`: managers recover any master by unwrapping their own copy
+        from the cluster, so an epoch minted without one can never be re-wrapped for a newcomer.
+        `blinding` is written at the first mint only -- the blinding secret never rotates, since
+        name tokens are SMT paths."""
+        to = from_epoch + 1
+        steps = [ops.Step((), ops.Set(self.store_id, P_EPOCH, codec.encode(to)))]
+        steps += [
+            ops.Step((), ops.Set(self.store_id, _wrap_key(to, who), wraps[who]))
+            for who in sorted(wraps)
+        ]
+        blind = blinding or {}
+        steps += [
+            ops.Step((), ops.Set(self.store_id, P_BLIND + who, blind[who])) for who in sorted(blind)
+        ]
+        return ops.Transaction(tuple(steps))

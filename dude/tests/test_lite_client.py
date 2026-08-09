@@ -10,6 +10,7 @@ import unittest
 from dataclasses import replace
 from unittest import mock
 
+from dude.client import Client, Keys
 from dude.consensus.bootstrap import intervene
 from dude.consensus.settle_round import SettledBlock
 from dude.core import codec, crypto
@@ -52,14 +53,22 @@ def _one_bucket_after_head(c: Cluster) -> int:
 def _provision_client(c: Cluster, kp: crypto.Keypair) -> None:
     """Grant Role.CLIENT_RW via intervene on every store, with the client's InProc endpoint
     baked into the P_GRANT row so nodes can dial back via `_reconcile_peers`
-    (#roster-drives-peers)."""
+    (#roster-drives-peers).
+
+    Mints its KEYS in the same transaction. A grant without them addresses rows it cannot read,
+    which looks like corruption rather than a missing step -- and the manager can mint them
+    because it holds every master itself."""
     mgmt = MgmtWriter(c.nodes[0].store)
-    grant_tx = mgmt.authorise(
-        kp.public,
-        Role.CLIENT_RW,
-        stores=frozenset({ops.STORE_DATA}),  # scoped: reads are refused outside it
-        pop=kp.prove_possession(),
-        cert=Cert.sign_grant(c.mgr, kp.public, Role.CLIENT_RW),
+    wraps, blinding = c.client().keys.wraps_for(kp.public)
+    grant_tx = (
+        mgmt.authorise(
+            kp.public,
+            Role.CLIENT_RW,
+            stores=frozenset({ops.STORE_DATA}),  # scoped: reads are refused outside it
+            pop=kp.prove_possession(),
+            cert=Cert.sign_grant(c.mgr, kp.public, Role.CLIENT_RW),
+        )
+        + mgmt.admit_reader(kp.public, wraps, blinding)
     ).sign(c.mgr, T0)
     for node in c.nodes:
         intervene(node.store, c.mgr, bodies=(grant_tx,), bucket=TUNABLES.mempool.bucket(c.clock))
@@ -229,9 +238,8 @@ class TestLightClientRead(unittest.TestCase):
     def test_get_proof_returns_head_value(self):
         c = Cluster()
         # Land a value.
-        key = crypto.h(b"lite-client-e2e")
-        tx = ops.writes(ops.Set(ops.STORE_DATA, key, b"present")).sign(c.mgr, T0)
-        c.submit(c.mgr, tx, to=0, now=T0)
+        c.put("lite-client-e2e", b"present", now=T0)
+        key = c.token("lite-client-e2e")
         c.pump(T0)
         c.pump(c.clock + DELTA)
 
@@ -259,7 +267,13 @@ class TestLightClientRead(unittest.TestCase):
         self.assertIsInstance(result, GetResult, f"got {result!r}")
         assert isinstance(result, GetResult)
         self.assertFalse(result.absent)
-        self.assertEqual(result.value, b"present")
+        self.assertNotEqual(result.value, b"present", "the light client was served plaintext")
+        reader = Client(Keys.unwrap(c.nodes[0].store, client_kp))
+        self.assertEqual(
+            reader.open("lite-client-e2e", result.value, result.epoch),
+            b"present",
+            "a granted client must open what the manager wrote",
+        )
 
     def test_byzantine_value_fails_proof_verify(self):
         """A responder signs an honest envelope (real settle_sigs, real head, real SMT
@@ -273,9 +287,8 @@ class TestLightClientRead(unittest.TestCase):
         that trap was that verification WASN'T happening. If this test ever passes with
         an empty/placeholder proof pipeline, verification has been silently disabled again."""
         c = Cluster()
-        key = crypto.h(b"lite-client-byz")
-        tx = ops.writes(ops.Set(ops.STORE_DATA, key, b"present")).sign(c.mgr, T0)
-        c.submit(c.mgr, tx, to=0, now=T0)
+        c.put("lite-client-byz", b"present", now=T0)
+        key = c.token("lite-client-byz")
         c.pump(T0)
         c.pump(c.clock + DELTA)
 
@@ -339,9 +352,8 @@ class TestLightClientRead(unittest.TestCase):
         It now gets answered at the responder's head with the headers to reach it, capped per
         reply, and walks up over as many round trips as the gap needs."""
         c = Cluster()
-        key = crypto.h(b"lite-client-catchup")
-        tx = ops.writes(ops.Set(ops.STORE_DATA, key, b"present")).sign(c.mgr, T0)
-        c.submit(c.mgr, tx, to=0, now=T0)
+        c.put("lite-client-catchup", b"present", now=T0)
+        key = c.token("lite-client-catchup")
         c.pump(T0)
 
         client_kp = crypto.Keypair.generate()
@@ -390,7 +402,8 @@ class TestLightClientRead(unittest.TestCase):
         self.assertGreater(heads[1], heads[0], "one reply advanced the client by nothing")
         self.assertIsInstance(result, GetResult, f"never caught up: heads={heads}")
         assert isinstance(result, GetResult)
-        self.assertEqual(result.value, b"present")
+        reader = Client(Keys.unwrap(c.nodes[0].store, client_kp))
+        self.assertEqual(reader.open("lite-client-catchup", result.value, result.epoch), b"present")
 
 
 class TestRevokedManagerCannotForgeARoster(unittest.TestCase):
@@ -540,9 +553,8 @@ class TestAByzantineResponderCannotKillTheClient(unittest.TestCase):
 
     def test_a_wrong_width_signer_bitmap_fails_the_read_and_nothing_else(self):
         c = Cluster()
-        key = crypto.h(b"byz-bitmap")
-        tx = ops.writes(ops.Set(ops.STORE_DATA, key, b"present")).sign(c.mgr, T0)
-        c.submit(c.mgr, tx, to=0, now=T0)
+        c.put("byz-bitmap", b"present", now=T0)
+        key = c.token("byz-bitmap")
         c.pump(T0)
 
         client_kp = crypto.Keypair.generate()

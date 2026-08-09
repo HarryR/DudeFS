@@ -18,6 +18,7 @@ from __future__ import annotations
 import time
 import unittest
 
+from dude.client import mint_first_keyepoch
 from dude.consensus.bootstrap import bootstrap, intervene
 from dude.consensus.settle_round import SettledBlock
 from dude.core import crypto
@@ -75,6 +76,9 @@ def _build_cluster(
             for i, kp in enumerate(keys)
         ),
     )
+    # The first keyepoch, in genesis so encryption is live from block 1 and every node's
+    # block 1 is byte-equal -- minting it per node would make each one random.
+    tx = tx + mint_first_keyepoch(mgmt, mgr)[0]
     genesis = (tx.sign(mgr, T0),)
 
     nodes: list[Node] = []

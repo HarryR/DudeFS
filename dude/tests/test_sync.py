@@ -19,7 +19,7 @@ from dataclasses import replace
 from dude.consensus.settle_round import Anchors, SettledBlock, SettledBlockWithBodies
 from dude.core import crypto
 from dude.node import Node
-from dude.store import Store, ops
+from dude.store import Store
 from dude.store.management import MgmtReader
 from dude.sync.adapter import (
     GetBlocks,
@@ -32,7 +32,7 @@ from dude.sync.adapter import (
 from dude.sync.follower import Follower, HeightReport, serve_getblocks, serve_height
 from dude.tunables import DEFAULT, SyncTunables, Tunables
 
-from .cluster import DELTA, T0, TUNABLES, Cluster, D
+from .cluster import DELTA, T0, TUNABLES, Cluster
 
 POLL = DEFAULT.sync.poll_interval
 PULL_TIMEOUT = DEFAULT.sync.pull_timeout
@@ -105,8 +105,7 @@ def _run_cluster_producing_n_blocks(c: Cluster, n: int) -> None:
         if all((node.store.head_block_num() or 0) >= n for node in c.nodes):
             return
         # One tx per bucket, submitted to node 0.
-        tx = ops.writes(ops.Set(D, crypto.h(f"tx-{submissions}".encode()), b"v")).sign(c.mgr, now)
-        c.submit(c.mgr, tx, to=0, now=now)
+        c.put(f"tx-{submissions}", b"v", now=now)
         c.pump(now)
         submissions += 1
         now += DELTA
@@ -412,8 +411,7 @@ class TestByzantinePeerIsHandled(unittest.TestCase):
         """
         # Ensure block 2 has multiple bodies to have something to omit.
         for i in range(3):
-            tx = ops.writes(ops.Set(D, crypto.h(f"multi-{i}".encode()), b"v")).sign(self.c.mgr, T0)
-            self.c.submit(self.c.mgr, tx, to=0, now=T0)
+            self.c.put(f"multi-{i}", b"v", now=T0)
         self.c.pump(T0)
         self.c.pump(T0 + DELTA)
         self.c.pump(T0 + 2 * DELTA)

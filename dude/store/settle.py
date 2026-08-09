@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, NamedTuple, Protocol
 
-from ..core import crypto
+from ..core import codec, crypto
 from ..core.errors import DudeError
 from . import ops
 from .layer import Overlay, Reader, holds
@@ -14,6 +14,8 @@ class Authoriser(Protocol):
     def may_write(self, reader: Reader, who: crypto.PublicKey, store_id: int) -> bool: ...
 
     def current_epoch(self, reader: Reader) -> int: ...
+
+    def epoch_row(self) -> tuple[int, bytes]: ...
 
 
 class Reason(Enum):
@@ -25,6 +27,7 @@ class Reason(Enum):
     SETTLED = "settled"
     EPOCH = "epoch"
     NAME_SHAPE = "name-shape"
+    EPOCH_JUMP = "epoch-jump"
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,7 +72,11 @@ def _data_row_shape(layer: Reader, auth: Authoriser, m: ops.Mutation) -> Reason 
 
     Management rows are exempt: nodes enforce authorisation out of store 0, so it is never
     encrypted and its names are structured (`grant/` + pubkey), not tokens."""
-    if m.store == ops.STORE_MANAGEMENT or not isinstance(m, ops.Set):
+    if not isinstance(m, ops.Set):
+        return None
+    if (m.store, m.name) == auth.epoch_row():
+        return _epoch_step(layer, auth, m)
+    if m.store == ops.STORE_MANAGEMENT:
         return None
     if len(m.name) != crypto.DIGEST_SIZE:
         # A name a node can read is a name it can correlate. The client API types this as a
@@ -80,6 +87,17 @@ def _data_row_shape(layer: Reader, auth: Authoriser, m: ops.Mutation) -> Reason 
         # than stored, so a stale ciphertext never becomes the current value of a row.
         return Reason.EPOCH
     return None
+
+
+def _epoch_step(layer: Reader, auth: Authoriser, m: ops.Set) -> Reason | None:
+    """One at a time and forwards only. The rotation's guard proves the author knew the old value;
+    it does not stop them naming a value five behind it, and a keyepoch that goes backwards asks
+    every client to encrypt under a key readers have already moved off."""
+    try:
+        want = codec.as_int(codec.decode(m.value))
+    except DudeError:
+        return Reason.EPOCH_JUMP
+    return None if want == auth.current_epoch(layer) + 1 else Reason.EPOCH_JUMP
 
 
 def vouched(reader: Reader, store: int, name: bytes, credential: bytes) -> crypto.PublicKey | None:

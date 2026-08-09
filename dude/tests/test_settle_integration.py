@@ -31,9 +31,8 @@ class TestSettlementIsStaged(unittest.TestCase):
         The `settling` slot is not asserted here -- subsequent empty buckets also ratify and
         settle empty slices, so the slot may be transiently occupied by an empty SettleRound
         long after our tx has landed. What we care about is: the tx is on every store."""
-        key = crypto.h(b"hello-l5")
-        tx = ops.writes(ops.Set(D, key, b"world")).sign(self.client, T0)
-        self.c.submit(self.client, tx, to=0, now=T0)
+        self.c.put("hello-l5", b"world", kp=self.client, now=T0)
+        key = self.c.token("hello-l5")
         self.c.pump(T0)
         self.c.pump(T0 + DELTA)
         self.c.pump(T0 + 2 * DELTA)
@@ -42,12 +41,15 @@ class TestSettlementIsStaged(unittest.TestCase):
             self.assertEqual(node.store.head(), 2, f"node {i} did not commit")
             got = node.store.get(D, key)
             assert got is not None, f"node {i} lost the tx"
-            self.assertEqual(got.value, b"world")
+            self.assertNotEqual(got.value, b"world", "the node is holding plaintext")
+            self.assertEqual(
+                self.c.client(self.client).open("hello-l5", got.value, got.epoch), b"world"
+            )
 
     def test_anchors_agree_across_nodes(self):
         """The load-bearing property: every node's post-apply anchors match. If they did not,
         SettleRound would not converge (quorum-on-matching-anchors). Since it did, they agree."""
-        tx = ops.writes(ops.Set(D, crypto.h(b"a"), b"1")).sign(self.client, T0)
+        tx = self.c.client(self.client).put("a", b"1").sign(self.client, T0)
         self.c.submit(self.client, tx, to=0, now=T0)
         self.c.pump(T0)
         self.c.pump(T0 + DELTA)
@@ -70,8 +72,9 @@ class TestSettlementIsStaged(unittest.TestCase):
         recover a lagging node's Store (once nodes' stores diverge on a settled block, peers
         refuse the tx as DUPLICATE against their log and the laggard cannot rejoin). L6 is
         deferred; this test therefore covers the same-bucket case, which is the common one."""
-        first = ops.writes(ops.Set(D, crypto.h(b"first"), b"one")).sign(self.client, T0)
-        second = ops.writes(ops.Set(D, crypto.h(b"second"), b"two")).sign(self.client, T0)
+        cl = self.c.client(self.client)
+        first = cl.put("first", b"one").sign(self.client, T0)
+        second = cl.put("second", b"two").sign(self.client, T0)
         self.c.submit(self.client, first, to=0, now=T0)
         self.c.submit(self.client, second, to=1, now=T0)
 
@@ -80,8 +83,8 @@ class TestSettlementIsStaged(unittest.TestCase):
         self.c.pump(T0 + 2 * DELTA)
 
         for i, node in enumerate(self.c.nodes):
-            self.assertIsNotNone(node.store.get(D, crypto.h(b"first")), f"node {i} lost first")
-            self.assertIsNotNone(node.store.get(D, crypto.h(b"second")), f"node {i} lost second")
+            self.assertIsNotNone(node.store.get(D, cl.token("first")), f"node {i} lost first")
+            self.assertIsNotNone(node.store.get(D, cl.token("second")), f"node {i} lost second")
             self.assertEqual(node.store.head(), 3, f"node {i} head={node.store.head()}")
 
 
@@ -96,8 +99,8 @@ class TestSettleRoundLifecycle(unittest.TestCase):
         """When a node is settling our tx's bucket, its `settling` slot holds a _Settling
         entry whose applied txs include ours. This proves the staged path went through
         SettleRound rather than jumping directly from Round.ratified to Store.apply."""
-        key = crypto.h(b"observe-settling")
-        tx = ops.writes(ops.Set(D, key, b"v")).sign(self.client, T0)
+        key = self.c.token("observe-settling", self.client)
+        tx = self.c.client(self.client).put("observe-settling", b"v").sign(self.client, T0)
         self.c.submit(self.client, tx, to=0, now=T0)
         self.c.pump(T0)
         # After this pump, all three Rounds for the tx's bucket ratify. The first pending
@@ -116,7 +119,7 @@ class TestSettleRoundLifecycle(unittest.TestCase):
     def test_settle_round_reaches_settled_state(self):
         """End-to-end proof that our tx traversed the two-signature-round path: after enough
         pumps, every node's store carries the tx AND its head advanced."""
-        tx = ops.writes(ops.Set(D, crypto.h(b"observe"), b"v")).sign(self.client, T0)
+        tx = self.c.client(self.client).put("observe", b"v").sign(self.client, T0)
         self.c.submit(self.client, tx, to=0, now=T0)
 
         self.c.pump(T0)
@@ -124,7 +127,7 @@ class TestSettleRoundLifecycle(unittest.TestCase):
         self.c.pump(T0 + 2 * DELTA)
 
         for node in self.c.nodes:
-            self.assertIsNotNone(node.store.get(D, crypto.h(b"observe")))
+            self.assertIsNotNone(node.store.get(D, self.c.token("observe", self.client)))
             self.assertGreaterEqual(node.store.head(), 2)
 
     def test_no_settlement_when_no_txs_submitted(self):

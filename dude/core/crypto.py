@@ -339,10 +339,26 @@ def derive_value_key(epoch_master: Master) -> ValueKey:
 
 
 PERSON_NAME = b"dude.name"
+PERSON_NAME_TOKEN = b"dude.nametok"
 
 
 def derive_name_key(permanent_master: Master) -> NameKey:
     return NameKey(_subkey(permanent_master, PERSON_NAME))
+
+
+def derive_name_token(name_key: NameKey, name: bytes) -> NameToken:
+    """The opaque name a storage node indexes by. Its own personalisation, not `PERSON_NAME`:
+    that one already derives the key this is keyed WITH, and these are two functions rather than
+    one function over two tagged messages.
+
+    Takes bytes. Whether a caller's string becomes these bytes -- encoding, and Unicode
+    normalisation above all -- is a decision `crypto` is not positioned to make, and is fixed once
+    at the client boundary instead."""
+    return NameToken(
+        hashlib.blake2b(
+            name, key=name_key, person=PERSON_NAME_TOKEN, digest_size=DIGEST_SIZE
+        ).digest()
+    )
 
 
 def derive_item_key(value_key: ValueKey, name_token: NameToken) -> ItemKey:
