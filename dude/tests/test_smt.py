@@ -290,19 +290,24 @@ class TestThroughTheStore(unittest.TestCase):
         self.s.provision(self.kp.public)
         self.mgmt = management.MgmtReader(self.s)
 
+    def _tok(self, name: bytes) -> crypto.NameToken:
+        """A data-store name is a 32-byte token, and `evaluate` refuses any other width."""
+        return crypto.NameToken(crypto.h(name))
+
     def _write(self, name: bytes, value: bytes) -> None:
-        self.s.apply((tx(self.kp, muts=(ops.Set(D, name, value),)),), auth=self.mgmt)
+        self.s.apply((tx(self.kp, muts=(ops.Set(D, self._tok(name), value),)),), auth=self.mgmt)
 
     def test_settlement_maintains_the_root(self):
         self.assertEqual(self.s.state_root(), smt.EMPTY)
         self._write(b"k", b"v")
+        k = self._tok(b"k")
         self.assertTrue(
             smt.verify(
                 self.s.state_root(),
                 D,
-                b"k",
-                (b"v", self.s.credential(D, b"k"), ops.EPOCH_NONE),
-                self.s.prove(D, b"k"),
+                k,
+                (b"v", self.s.credential(D, k), ops.EPOCH_NONE),
+                self.s.prove(D, k),
             )
         )
 
@@ -314,10 +319,6 @@ class TestThroughTheStore(unittest.TestCase):
         fresh = self.s.rebuild()
         self.assertEqual(fresh.state_root(), self.s.state_root())
         self.assertEqual(fresh.accumulator(), self.s.accumulator())
-
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class TestDomains(unittest.TestCase):
@@ -419,3 +420,7 @@ class TestTheCredentialIsInTheLeaf(_Fixture):
         for proof in occupied:
             assert proof.occupant is not None
             self.assertNotIn(b"cred:", proof.occupant[1])
+
+
+if __name__ == "__main__":
+    unittest.main()

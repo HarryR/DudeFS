@@ -13,6 +13,10 @@ from dude.store import layer as layer_mod
 from dude.store import management, ops, settle, store
 
 D = ops.STORE_DATA
+DK = crypto.NameToken(crypto.h(b"k"))
+DJ = crypto.NameToken(crypto.h(b"j"))
+"""Data-store names are 32-byte tokens: a node must not be able to read a key name, and
+`evaluate` refuses any other width."""
 
 
 def tx(kp, preds=(), muts=(), st=ops.STORE_DATA, ts=1):
@@ -536,7 +540,7 @@ class TestTransferAndSettlementRace(unittest.TestCase):
     def test_a_transaction_already_in_the_log_is_dropped_not_raised(self):
         """`entry.op_hash UNIQUE` is what makes a settled transaction unrepeatable, and it used to
         enforce that by throwing out of a frame handler — a routine race reported as corruption."""
-        t = tx(self.kp, muts=(ops.Set(ops.STORE_DATA, b"k", b"v"),))
+        t = tx(self.kp, muts=(ops.Set(ops.STORE_DATA, DK, b"v"),))
         first = self.s.apply((t,), auth=self.mgmt)
         self.assertEqual(len(first.settled), 1)
 
@@ -551,7 +555,7 @@ class TestTransferAndSettlementRace(unittest.TestCase):
         Byzantine proposer's ratified block used to crash every honest applier identically with
         sqlite3.IntegrityError through commit_block -- and again after restart, since the block
         re-arrives on sync. Driven through commit_block because that is the boundary it escaped."""
-        t = tx(self.kp, muts=(ops.Set(ops.STORE_DATA, b"k", b"v"),))
+        t = tx(self.kp, muts=(ops.Set(ops.STORE_DATA, DK, b"v"),))
         got = self.s.commit_block(
             1,
             first_height=1,
@@ -571,7 +575,7 @@ class TestTransferAndSettlementRace(unittest.TestCase):
         out of `_expect_anchors` -- fatal, not a peer's fault -- and the follower's `_adopt`, which
         has no such check, would commit a block whose signed height and A_log describe a state no
         node holds. Same shape as an encode/decode pair, and pinned the same way."""
-        t = tx(self.kp, muts=(ops.Set(ops.STORE_DATA, b"k", b"v"),))
+        t = tx(self.kp, muts=(ops.Set(ops.STORE_DATA, DK, b"v"),))
         batch = (t, t)
 
         layer = layer_mod.Layer(self.s)
@@ -594,14 +598,79 @@ class TestTransferAndSettlementRace(unittest.TestCase):
 
     def test_the_survivors_of_a_mixed_batch_still_land(self):
         """One duplicate must not take the batch down with it."""
-        old = tx(self.kp, muts=(ops.Set(ops.STORE_DATA, b"k", b"v"),))
+        old = tx(self.kp, muts=(ops.Set(ops.STORE_DATA, DK, b"v"),))
         self.s.apply((old,), auth=self.mgmt)
-        fresh = tx(self.kp, muts=(ops.Set(ops.STORE_DATA, b"j", b"w"),), ts=2)
+        fresh = tx(self.kp, muts=(ops.Set(ops.STORE_DATA, DJ, b"w"),), ts=2)
 
         got = self.s.apply((old, fresh), auth=self.mgmt)
         self.assertEqual(len(got.settled), 1)
         self.assertEqual([d.why for d in got.dropped], [settle.Reason.SETTLED])
-        self.assertIsNotNone(self.s.get(ops.STORE_DATA, b"j"))
+        self.assertIsNotNone(self.s.get(ops.STORE_DATA, DJ))
+
+
+class TestADataRowMustBeShapedForEncryption(unittest.TestCase):
+    """Two rules, both in `evaluate` and nowhere else -- it serves the admission door AND
+    settlement, so one check binds both. A copy in `Mempool.valid` alone is how the two halves came
+    apart over duplicate transactions.
+
+    Built with `ops.writes`, NOT the local `tx()` helper: `_at` re-homes every mutation onto one
+    store, so a management write handed to it silently becomes a data write -- the same shape as
+    the epoch it already records dropping."""
+
+    def setUp(self):
+        self.kp = crypto.Keypair.generate()
+        self.s = store.Store()
+        self.s.provision(self.kp.public)
+        self.mgmt = management.MgmtReader(self.s)
+        self.ts = 0
+
+    def _apply(self, *muts: ops.Mutation) -> settle.Reason | None:
+        self.ts += 1
+        got = self.s.apply((ops.writes(*muts).sign(self.kp, self.ts),), auth=self.mgmt)
+        return got.dropped[0].why if got.dropped else None
+
+    def test_a_plaintext_name_is_refused_because_a_node_could_read_it(self):
+        self.assertIs(
+            self._apply(ops.Set(ops.STORE_DATA, b"config/thing", b"v")),
+            settle.Reason.NAME_SHAPE,
+        )
+        self.assertIsNone(self._apply(ops.Set(ops.STORE_DATA, DK, b"v")), "a token is fine")
+
+    def test_management_names_are_exempt_because_nodes_must_read_them(self):
+        """Store 0 carries `grant/` + pubkey and friends; nodes enforce authorisation out of it,
+        so it is never encrypted and its names are structured rather than blinded."""
+        self.assertIsNone(self._apply(ops.Set(ops.STORE_MANAGEMENT, b"anything at all", b"v")))
+
+    def test_a_write_at_the_wrong_epoch_is_refused(self):
+        """`EPOCH_NONE` while no epoch has been minted, so plaintext is the default rather than a
+        special case. Once one exists, a write under the old key is refused rather than stored --
+        a stale ciphertext must never become the current value of a row."""
+        self.assertIsNone(self._apply(ops.Set(ops.STORE_DATA, DK, b"v")))
+        self.assertIs(self._apply(ops.Set(ops.STORE_DATA, DK, b"v", 1)), settle.Reason.EPOCH)
+
+        self._apply(ops.Set(ops.STORE_MANAGEMENT, management.P_EPOCH, codec.encode(1)))
+        self.assertEqual(self.mgmt.current_epoch(), 1, "the mint did not land")
+
+        self.assertIs(
+            self._apply(ops.Set(ops.STORE_DATA, DK, b"v")),
+            settle.Reason.EPOCH,
+            "epoch 0 stayed writable after a rotation",
+        )
+        self.assertIsNone(self._apply(ops.Set(ops.STORE_DATA, DK, b"v", 1)))
+
+    def test_the_epoch_is_read_from_the_same_view_the_write_is_evaluated_against(self):
+        """A rotation and a write in ONE transaction: the write must see the bump its own
+        transaction made, or no rotation could ever carry data with it."""
+        self.assertIsNone(
+            self._apply(
+                ops.Set(ops.STORE_MANAGEMENT, management.P_EPOCH, codec.encode(1)),
+                ops.Set(ops.STORE_DATA, DK, b"v", 1),
+            ),
+            "the write could not see its own rotation",
+        )
+        row = self.s.get(ops.STORE_DATA, DK)
+        assert row is not None
+        self.assertEqual(row.epoch, 1)
 
 
 class TestTransactionEncoding(unittest.TestCase):
@@ -615,8 +684,8 @@ class TestTransactionEncoding(unittest.TestCase):
     def test_decode_then_encode_reproduces_the_received_bytes(self):
         signed = tx(
             self.kp,
-            muts=(ops.Set(ops.STORE_DATA, b"k", b"v", 7), ops.Del(ops.STORE_DATA, b"j")),
-            preds=(ops.Absent(ops.STORE_DATA, b"j"),),
+            muts=(ops.Set(ops.STORE_DATA, DK, b"v", 7), ops.Del(ops.STORE_DATA, DJ)),
+            preds=(ops.Absent(ops.STORE_DATA, DJ),),
         )
         raw = signed.raw
         self.assertEqual(ops.SignedTransaction.decode(raw).raw, raw)
@@ -624,7 +693,7 @@ class TestTransactionEncoding(unittest.TestCase):
 
     def test_a_non_canonical_re_encoding_is_refused_rather_than_normalised(self):
         """A liberal decoder would accept these and silently re-address the transaction."""
-        signed = tx(self.kp, muts=(ops.Set(ops.STORE_DATA, b"k", b"v"),))
+        signed = tx(self.kp, muts=(ops.Set(ops.STORE_DATA, DK, b"v"),))
         for bad in (signed.raw + b"e", b"li00ee", b"l" + signed.raw):
             with self.assertRaises(DudeError):
                 ops.SignedTransaction.decode(bad)

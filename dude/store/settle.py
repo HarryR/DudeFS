@@ -13,6 +13,8 @@ from .layer import Overlay, Reader, holds
 class Authoriser(Protocol):
     def may_write(self, reader: Reader, who: crypto.PublicKey, store_id: int) -> bool: ...
 
+    def current_epoch(self, reader: Reader) -> int: ...
+
 
 class Reason(Enum):
     INVALID = "invalid"
@@ -21,6 +23,8 @@ class Reason(Enum):
     AUTHORITY = "authority"
     GUARD = "guard"
     SETTLED = "settled"
+    EPOCH = "epoch"
+    NAME_SHAPE = "name-shape"
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,11 +53,33 @@ def evaluate(
         m = step.mutation
         if not auth.may_write(layer, tx.author, m.store):
             return Verdict(Reason.AUTHORITY, i), layer
+        if (why := _data_row_shape(layer, auth, m)) is not None:
+            return Verdict(why, i), layer
         for g in step.guards:
             if not holds(layer, g):
                 return Verdict(Reason.GUARD, i), layer
         layer.apply(m, tx.raw)
     return OK, layer
+
+
+def _data_row_shape(layer: Reader, auth: Authoriser, m: ops.Mutation) -> Reason | None:
+    """HERE AND NOWHERE ELSE. `evaluate` serves both the admission door and settlement, so one
+    check binds both; a copy in `Mempool.valid` alone is how the two halves came apart over
+    duplicate transactions.
+
+    Management rows are exempt: nodes enforce authorisation out of store 0, so it is never
+    encrypted and its names are structured (`grant/` + pubkey), not tokens."""
+    if m.store == ops.STORE_MANAGEMENT or not isinstance(m, ops.Set):
+        return None
+    if len(m.name) != crypto.DIGEST_SIZE:
+        # A name a node can read is a name it can correlate. The client API types this as a
+        # `NameToken`; the width is what stops a plaintext name arriving by accident.
+        return Reason.NAME_SHAPE
+    if m.epoch != auth.current_epoch(layer):
+        # Written under a key that is no longer the one readers will reach for. Refused rather
+        # than stored, so a stale ciphertext never becomes the current value of a row.
+        return Reason.EPOCH
+    return None
 
 
 def vouched(reader: Reader, store: int, name: bytes, credential: bytes) -> crypto.PublicKey | None:

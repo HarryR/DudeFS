@@ -273,7 +273,14 @@ P_NODE = b"node/"
 P_GRANT = b"grant/"
 P_POP = b"pop/"
 P_WRAP = b"wrap/"
+P_BLIND = b"blind/"
+"""Per-grant wrap of the blinding secret. ITS OWN PREFIX, not `P_WRAP` at a reserved epoch: the
+blinding secret never rotates -- name tokens are SMT paths, and rotating it would relocate every
+row in the store -- so filing it under an epoch sentinel would read fine and mislead later."""
 P_ROSTER = b"roster"
+P_EPOCH = b"epoch"
+"""Singleton: the keyepoch data writes must currently carry. Lives in state rather than the block
+header, which would restate what state already decides."""
 
 
 def _wrap_key(epoch: int, who: crypto.PublicKey) -> bytes:
@@ -504,6 +511,18 @@ class MgmtReader:
     def possession_proof(self, who: crypto.PublicKey) -> crypto.Signature | None:
         raw = self.src.get(self.store_id, P_POP + who)
         return crypto.Signature(raw[1]) if raw else None
+
+    def current_epoch(self, reader: Reader | None = None) -> int:
+        """`EPOCH_NONE` until a manager mints the first one, which is what makes plaintext the
+        default rather than a special case. Read against the SAME reader the write is evaluated
+        against, or a rotation landing inside a block would be invisible to the rows in it."""
+        src = self.src if reader is None else reader
+        raw = src.get(self.store_id, P_EPOCH)
+        return codec.as_int(codec.decode(raw.value)) if raw else ops.EPOCH_NONE
+
+    def blinding_wrap(self, who: crypto.PublicKey) -> crypto.SealedBlob | None:
+        raw = self.src.get(self.store_id, P_BLIND + who)
+        return crypto.SealedBlob(raw.value) if raw else None
 
     def wrapped_master(self, epoch: int, who: crypto.PublicKey) -> crypto.SealedBlob | None:
         raw = self.src.get(self.store_id, _wrap_key(epoch, who))

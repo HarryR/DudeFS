@@ -9,6 +9,7 @@ from __future__ import annotations
 import unittest
 
 from ..consensus.mempool import (
+    CANNOT_APPLY,
     DUPLICATE,
     TOO_NEW,
     TOO_OLD,
@@ -33,6 +34,10 @@ from ..store import Store, ops, settle
 from ..store.management import MgmtReader
 
 D = ops.STORE_DATA
+DK = crypto.NameToken(crypto.h(b"k"))
+DJ = crypto.NameToken(crypto.h(b"j"))
+"""Data-store names are 32-byte tokens: a node must not be able to read a key name, and
+`evaluate` refuses any other width."""
 M = ops.STORE_MANAGEMENT
 T0 = 1_700_000_000_000  # a fixed epoch, so bucket ids in assertions are stable
 
@@ -125,10 +130,24 @@ class TestAdmission(unittest.TestCase):
         what a block is signed for and what it settles. Both halves dedup, so this is not what
         holds that -- it refuses the shape at the door rather than letting every later stage carry
         the question."""
-        m = ops.Set(ops.STORE_DATA, b"k", b"v")
+        m = ops.Set(ops.STORE_DATA, DK, b"v")
         doubled = ops.writes(m, m).sign(self.kp, T0)
         self.assertEqual(self._admit(doubled), Refusal.REPEATED_OP)
         self.assertIsNone(self._admit(ops.writes(m).sign(self.kp, T0)), "the single op is fine")
+
+    def test_a_badly_shaped_data_row_is_refused_at_the_door_too(self):
+        """The rules live in `settle.evaluate`, which serves BOTH this door and settlement -- so
+        one check binds both and they cannot come apart the way the duplicate rules did. Admission
+        reports `CANNOT_APPLY`, since it forwards the evaluator's refusal rather than restating
+        which of its rules fired."""
+        plaintext = ops.writes(ops.Set(ops.STORE_DATA, b"config/thing", b"v")).sign(self.kp, T0)
+        self.assertEqual(self._admit(plaintext), CANNOT_APPLY)
+
+        wrong_epoch = ops.writes(ops.Set(ops.STORE_DATA, DK, b"v", 3)).sign(self.kp, T0)
+        self.assertEqual(self._admit(wrong_epoch), CANNOT_APPLY)
+
+        ok = ops.writes(ops.Set(ops.STORE_DATA, DK, b"v")).sign(self.kp, T0)
+        self.assertIsNone(self._admit(ok), "a token at the current epoch must pass the door")
 
     def test_clock_faults_are_named_not_merely_refused(self):
         """A client self-corrects only if the refusal says WHICH way its clock is wrong (§1.1)."""

@@ -40,6 +40,10 @@ from ..store.management import (
 from .cluster import TUNABLES, Cluster
 
 T0 = 1_700_000_000_000
+DK = crypto.NameToken(crypto.h(b"k"))
+DJ = crypto.NameToken(crypto.h(b"j"))
+"""Data-store names are 32-byte tokens: a node must not be able to read a key name, and
+`evaluate` refuses any other width."""
 
 
 def unauthorised_certs(mgmt: MgmtWriter) -> str | None:
@@ -759,7 +763,7 @@ class TestAuthorityIsResolvedOverOneView(unittest.TestCase):
                 cert=Cert.sign_grant(mgr, client.public, Role.CLIENT_RW),
             ),
         )
-        tx3 = ops.writes(ops.Set(ops.STORE_DATA, b"k", b"v")).sign(client, T0)
+        tx3 = ops.writes(ops.Set(ops.STORE_DATA, DK, b"v")).sign(client, T0)
 
         s, mgmt = _provisioned(anchor)
         screened = settle.would_apply(s, (tx1, tx2, tx3), mgmt)
@@ -841,7 +845,7 @@ class TestMalformedRowsDoNotPoison(unittest.TestCase):
         self.assertNotIn(stranger, self.mgmt.nodes())
         self.assertIsNotNone(self.mgmt.roster_commitment())
         after = self.s.apply(
-            (ops.writes(ops.Set(ops.STORE_DATA, b"k", b"v")).sign(self.anchor, T0 + 2),),
+            (ops.writes(ops.Set(ops.STORE_DATA, DK, b"v")).sign(self.anchor, T0 + 2),),
             auth=self.mgmt,
         )
         self.assertEqual(len(after.settled), 1, "settlement itself must survive the garbage row")
@@ -850,7 +854,7 @@ class TestMalformedRowsDoNotPoison(unittest.TestCase):
         writer = crypto.Keypair.generate()
         self._settle_garbage(P_GRANT + writer.public)
         self.assertIsNone(self.mgmt.grant_of(writer.public))
-        attempt = ops.writes(ops.Set(ops.STORE_DATA, b"k", b"v")).sign(writer, T0 + 2)
+        attempt = ops.writes(ops.Set(ops.STORE_DATA, DK, b"v")).sign(writer, T0 + 2)
         applied = self.s.apply((attempt,), auth=self.mgmt)
         self.assertEqual(applied.settled, ())
         self.assertEqual([d.why for d in applied.dropped], [settle.Reason.AUTHORITY])
