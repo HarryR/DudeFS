@@ -68,7 +68,7 @@ def _provision_client(c: Cluster, kp: crypto.Keypair) -> None:
             pop=kp.prove_possession(),
             cert=Cert.sign_grant(c.mgr, kp.public, Role.CLIENT_RW),
         )
-        + mgmt.admit_reader(kp.public, wraps, blinding)
+        + mgmt.admit_reader(kp.public, ops.STORE_DATA, wraps, blinding)
     ).sign(c.mgr, T0)
     for node in c.nodes:
         intervene(node.store, c.mgr, bodies=(grant_tx,), bucket=TUNABLES.mempool.bucket(c.clock))

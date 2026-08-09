@@ -274,17 +274,34 @@ P_GRANT = b"grant/"
 P_POP = b"pop/"
 P_WRAP = b"wrap/"
 P_BLIND = b"blind/"
-"""Per-grant wrap of the blinding secret. ITS OWN PREFIX, not `P_WRAP` at a reserved epoch: the
-blinding secret never rotates -- name tokens are SMT paths, and rotating it would relocate every
-row in the store -- so filing it under an epoch sentinel would read fine and mislead later."""
+"""Per-grant wrap of a store's blinding secret. ITS OWN PREFIX, not `P_WRAP` at a reserved epoch:
+a blinding secret never rotates -- name tokens are SMT paths, and rotating one would relocate
+every row in its store -- so filing it under an epoch sentinel would read fine and mislead later."""
 P_ROSTER = b"roster"
-P_EPOCH = b"epoch"
-"""Singleton: the keyepoch data writes must currently carry. Lives in state rather than the block
-header, which would restate what state already decides."""
+P_EPOCH = b"epoch/"
+"""Per store, not one counter. EVERY KEY IS PER-STORE: a grant naming store 2 mints that store's
+blinding secret and its epoch masters and nothing else, so a client with no grant for a store
+cannot read it even holding its bytes. Cluster-wide keys would make `stores` an access rule
+standing in for a key boundary -- the weaker of the two, and the one a stale replica ignores.
+
+Each store therefore rotates independently: re-keying store 2 does not re-wrap everyone on
+store 1."""
 
 
-def _wrap_key(epoch: int, who: crypto.PublicKey) -> bytes:
-    return P_WRAP + epoch.to_bytes(8, "big") + who
+def _store_key(store_id: int) -> bytes:
+    return store_id.to_bytes(8, "big")
+
+
+def epoch_key(store_id: int) -> bytes:
+    return P_EPOCH + _store_key(store_id)
+
+
+def blind_key(store_id: int, who: crypto.PublicKey) -> bytes:
+    return P_BLIND + _store_key(store_id) + who
+
+
+def _wrap_key(store_id: int, epoch: int, who: crypto.PublicKey) -> bytes:
+    return P_WRAP + _store_key(store_id) + epoch.to_bytes(8, "big") + who
 
 
 class Source(Reader, Protocol):
@@ -476,10 +493,18 @@ class MgmtReader:
         return g.role is Role.CLIENT_RW and store_id in g.stores
 
     def may_read(self, reader: Reader, who: crypto.PublicKey, store_id: int) -> bool:
-        """Scoped the same way writing is. The lite read path asked only whether a grant EXISTED,
-        so a grant for one store read every store -- including store 0, which holds grants, roster
-        rows, possession proofs and wrapped keys -- and a grant from a revoked manager kept reading
-        after it had stopped writing."""
+        """THE MANAGEMENT STORE IS READABLE BY ANY PRINCIPAL, and must be: it is the trust chain.
+        A light client cannot verify a quorum proof without knowing who the quorum is, which is
+        why `RosterBundle` already ships the roster and every manager grant to anyone who
+        bootstraps. Its wraps are sealed boxes, so they are encrypted rather than withheld, and
+        its possession proofs are public signatures. Scoping it withheld nothing and broke the
+        thing it exists for -- a client could not fetch the keys its own grant depends on.
+
+        Data stores ARE scoped, and the keys agree with the scope: a grant naming store 2 mints
+        store 2's blinding secret and epoch masters and nothing else, so this rule is defence in
+        depth over a key boundary rather than an access rule standing in for one."""
+        if store_id == ops.STORE_MANAGEMENT:
+            return self.has_standing(reader, who)
         if who == self.src.anchor():
             return True
         if self.is_member(who):
@@ -490,6 +515,14 @@ class MgmtReader:
         if g.role is Role.MANAGER:
             return True
         return store_id in g.stores
+
+    def has_standing(self, reader: Reader, who: crypto.PublicKey) -> bool:
+        """Any principal this cluster recognises: the anchor, a roster seat, or a live grant."""
+        return (
+            who == self.src.anchor()
+            or self.is_member(who)
+            or self.valid_grant(reader, who) is not None
+        )
 
     def may_send(self, who: crypto.PublicKey, kind: int) -> bool:
         if who == self.src.anchor():
@@ -512,38 +545,38 @@ class MgmtReader:
         raw = self.src.get(self.store_id, P_POP + who)
         return crypto.Signature(raw[1]) if raw else None
 
-    def epoch_row(self) -> tuple[int, bytes]:
-        """Which row carries the current keyepoch, so `settle.evaluate` can recognise a write to
-        it without importing the management module."""
-        return self.store_id, P_EPOCH
+    def epoch_target(self, name: bytes) -> int | None:
+        """Which store's keyepoch this management row carries, or None if it carries none. Lets
+        `settle.evaluate` recognise a rotation without importing this module."""
+        if not name.startswith(P_EPOCH) or len(name) != len(P_EPOCH) + 8:
+            return None
+        return int.from_bytes(name[len(P_EPOCH) :], "big")
 
-    def current_epoch(self, reader: Reader | None = None) -> int:
-        """`EPOCH_NONE` until a manager mints the first one, which is what makes plaintext the
-        default rather than a special case. Read against the SAME reader the write is evaluated
+    def current_epoch(self, store_id: int, reader: Reader | None = None) -> int:
+        """`EPOCH_NONE` until a manager mints the first one for THAT store, which is what makes
+        plaintext the default rather than a special case -- and what keeps store 0 plaintext for
+        ever, since it is never minted one. Read against the SAME reader the write is evaluated
         against, or a rotation landing inside a block would be invisible to the rows in it."""
         src = self.src if reader is None else reader
-        raw = src.get(self.store_id, P_EPOCH)
+        raw = src.get(self.store_id, epoch_key(store_id))
         return codec.as_int(codec.decode(raw.value)) if raw else ops.EPOCH_NONE
 
-    def wraps_for(self, who: crypto.PublicKey) -> dict[int, crypto.SealedBlob]:
-        """Every keyepoch this identity was minted a wrap for. Scans by prefix and filters on the
-        trailing pubkey, because the row key is `P_WRAP + epoch + who` -- epoch first, so one
-        epoch's wraps for every holder sit together and a rotation writes a contiguous run."""
+    def wraps_for(self, store_id: int, who: crypto.PublicKey) -> dict[int, crypto.SealedBlob]:
+        """Every keyepoch of ONE store this identity was minted a wrap for. Scans the store's
+        prefix and filters on the trailing pubkey: the row key is `P_WRAP + store + epoch + who`,
+        so one store's wraps sit together and one rotation writes a contiguous run."""
         out: dict[int, crypto.SealedBlob] = {}
-        for row in self.src.prefix(self.store_id, P_WRAP):
-            body = row.name[len(P_WRAP) :]
+        pre = P_WRAP + _store_key(store_id)
+        for row in self.src.prefix(self.store_id, pre):
+            body = row.name[len(pre) :]
             if len(body) != 8 + len(who) or body[8:] != who:
                 continue
             out[int.from_bytes(body[:8], "big")] = crypto.SealedBlob(row.value)
         return out
 
-    def blinding_wrap(self, who: crypto.PublicKey) -> crypto.SealedBlob | None:
-        raw = self.src.get(self.store_id, P_BLIND + who)
+    def blinding_wrap(self, store_id: int, who: crypto.PublicKey) -> crypto.SealedBlob | None:
+        raw = self.src.get(self.store_id, blind_key(store_id, who))
         return crypto.SealedBlob(raw.value) if raw else None
-
-    def wrapped_master(self, epoch: int, who: crypto.PublicKey) -> crypto.SealedBlob | None:
-        raw = self.src.get(self.store_id, _wrap_key(epoch, who))
-        return crypto.SealedBlob(raw[1]) if raw else None
 
     def domain_groups(self) -> dict[Domain, frozenset[crypto.PublicKey]]:
         groups: dict[Domain, set[crypto.PublicKey]] = {}
@@ -727,19 +760,23 @@ class MgmtWriter(MgmtReader):
     def admit_reader(
         self,
         who: crypto.PublicKey,
+        store_id: int,
         wraps: dict[int, crypto.SealedBlob],
         blinding: crypto.SealedBlob,
     ) -> ops.Transaction:
-        """The key half of admitting a reader. Composes with `authorise` (`a + b`) so a grant and
-        the keys that make it useful land in ONE transaction -- granted without keys, an identity
-        can address rows it cannot read, which looks like corruption rather than a missing step."""
+        """The key half of admitting a reader TO ONE STORE. Composes with `authorise` (`a + b`) so
+        a grant and the keys that make it useful land in ONE transaction -- granted without keys,
+        an identity can address rows it cannot read, which looks like corruption rather than a
+        missing step. A grant naming several stores needs one of these per store, which is the
+        point: the keys and the grant say the same thing."""
         return ops.writes(
-            ops.Set(self.store_id, P_BLIND + who, blinding),
-            *(ops.Set(self.store_id, _wrap_key(e, who), wraps[e]) for e in sorted(wraps)),
+            ops.Set(self.store_id, blind_key(store_id, who), blinding),
+            *(ops.Set(self.store_id, _wrap_key(store_id, e, who), wraps[e]) for e in sorted(wraps)),
         )
 
     def rotate(
         self,
+        store_id: int,
         from_epoch: int,
         wraps: dict[crypto.PublicKey, crypto.SealedBlob],
         blinding: dict[crypto.PublicKey, crypto.SealedBlob] | None = None,
@@ -747,7 +784,9 @@ class MgmtWriter(MgmtReader):
         """ONE transaction: the bump and every wrap, or neither. `evaluate` verdicts a whole
         transaction, so there is never a live epoch nobody holds the master for.
 
-        NO GUARD. A `Holds(P_EPOCH, from_epoch)` was equivalent to the forward-only rule
+        ONE STORE, so re-keying store 2 does not re-wrap everyone on store 1.
+
+        NO GUARD. A `Holds` on the epoch row was equivalent to the forward-only rule
         `evaluate` already applies -- both say `from_epoch == current`, since the target is derived
         from `from_epoch` too -- and the evaluator's version is strictly stronger, because it binds
         every writer rather than only transactions this method built. Two managers rotating at once
@@ -756,16 +795,17 @@ class MgmtWriter(MgmtReader):
 
         A manager MUST be among `wraps`: managers recover any master by unwrapping their own copy
         from the cluster, so an epoch minted without one can never be re-wrapped for a newcomer.
-        `blinding` is written at the first mint only -- the blinding secret never rotates, since
-        name tokens are SMT paths."""
+        `blinding` is written at the first mint only -- a blinding secret never rotates, since
+        name tokens are SMT paths and rotating one would relocate every row in its store."""
         to = from_epoch + 1
-        steps = [ops.Step((), ops.Set(self.store_id, P_EPOCH, codec.encode(to)))]
+        steps = [ops.Step((), ops.Set(self.store_id, epoch_key(store_id), codec.encode(to)))]
         steps += [
-            ops.Step((), ops.Set(self.store_id, _wrap_key(to, who), wraps[who]))
+            ops.Step((), ops.Set(self.store_id, _wrap_key(store_id, to, who), wraps[who]))
             for who in sorted(wraps)
         ]
         blind = blinding or {}
         steps += [
-            ops.Step((), ops.Set(self.store_id, P_BLIND + who, blind[who])) for who in sorted(blind)
+            ops.Step((), ops.Set(self.store_id, blind_key(store_id, who), blind[who]))
+            for who in sorted(blind)
         ]
         return ops.Transaction(tuple(steps))

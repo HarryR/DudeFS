@@ -57,7 +57,7 @@ def _provision_client(c: Cluster, kp: crypto.Keypair) -> None:
             pop=kp.prove_possession(),
             cert=Cert.sign_grant(c.mgr, kp.public, Role.CLIENT_RW),
         )
-        + mgmt.admit_reader(kp.public, wraps, blinding)
+        + mgmt.admit_reader(kp.public, ops.STORE_DATA, wraps, blinding)
     ).sign(c.mgr, T0)
     for node in c.nodes:
         intervene(node.store, c.mgr, bodies=(grant_tx,), bucket=TUNABLES.mempool.bucket(c.clock))
@@ -336,14 +336,39 @@ class TestNodeDispatchAndAuth(unittest.TestCase):
         self.assertIsInstance(replied.call_args.args[1], AnchorsReply)
 
     def test_a_client_is_refused_a_store_its_grant_does_not_name(self):
-        """The grant names STORE_DATA. Store 0 holds grants, roster rows, possession proofs and
-        wrapped keys, and the gate used to ask only whether a grant EXISTED -- so every granted
-        identity read every store."""
+        """The grant names STORE_DATA and nothing else. The keys agree with the scope -- store 2
+        has its own blinding secret and masters -- so this rule is defence in depth over a key
+        boundary rather than the only thing standing between them."""
         c = Cluster()
         client_kp = crypto.Keypair.generate()
         _provision_client(c, client_kp)
         node = c.nodes[0]
         self.assertTrue(node.mgmt.may_read(node.store, client_kp.public, ops.STORE_DATA))
+
+        req = GetProof(
+            store_id=ops.STORE_DATA + 1,
+            name=bytes(32),
+            block_num=node.store.head_block_num() or 1,
+            known_roster_fingerprint=None,
+            known_trusted_block=None,
+        )
+        verb, body = req.encode()
+        env = Envelope(node.me.public, verb, new_message_id(), body).sign(client_kp, T0 + DELTA)
+        with mock.patch.object(node.lite_adapter, "reply") as replied:
+            node.receive(env.seal(), T0 + DELTA)
+        replied.assert_called_once()
+        sent = replied.call_args.args[1]
+        self.assertIsInstance(sent, LiteRefused, f"an ungranted store was served: {sent!r}")
+        self.assertIs(sent.reason, SyncRefusal.UNAUTHORISED)
+
+    def test_the_management_store_is_served_to_any_principal(self):
+        """It IS the trust chain, and a client cannot verify a quorum proof without it -- nor
+        fetch the wraps its own grant depends on, which live there. Scoping it was a restriction
+        the design does not have; its secrets are encrypted, not withheld."""
+        c = Cluster()
+        client_kp = crypto.Keypair.generate()
+        _provision_client(c, client_kp)
+        node = c.nodes[0]
 
         req = GetProof(
             store_id=ops.STORE_MANAGEMENT,
@@ -357,9 +382,7 @@ class TestNodeDispatchAndAuth(unittest.TestCase):
         with mock.patch.object(node.lite_adapter, "reply") as replied:
             node.receive(env.seal(), T0 + DELTA)
         replied.assert_called_once()
-        sent = replied.call_args.args[1]
-        self.assertIsInstance(sent, LiteRefused, f"store 0 was served: {sent!r}")
-        self.assertIs(sent.reason, SyncRefusal.UNAUTHORISED)
+        self.assertIsInstance(replied.call_args.args[1], ProofReply)
 
 
 class TestTrustedBlockEncoding(unittest.TestCase):

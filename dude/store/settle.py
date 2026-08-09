@@ -13,9 +13,9 @@ from .layer import Overlay, Reader, holds
 class Authoriser(Protocol):
     def may_write(self, reader: Reader, who: crypto.PublicKey, store_id: int) -> bool: ...
 
-    def current_epoch(self, reader: Reader) -> int: ...
+    def current_epoch(self, store_id: int, reader: Reader) -> int: ...
 
-    def epoch_row(self) -> tuple[int, bytes]: ...
+    def epoch_target(self, name: bytes) -> int | None: ...
 
 
 class Reason(Enum):
@@ -70,34 +70,34 @@ def _data_row_shape(layer: Reader, auth: Authoriser, m: ops.Mutation) -> Reason 
     check binds both; a copy in `Mempool.valid` alone is how the two halves came apart over
     duplicate transactions.
 
-    Management rows are exempt: nodes enforce authorisation out of store 0, so it is never
-    encrypted and its names are structured (`grant/` + pubkey), not tokens."""
+    Management rows are exempt from both, and must be: nodes enforce authorisation out of store 0,
+    so it is never encrypted and its names are structured (`grant/` + pubkey) rather than blinded.
+    The one management row with a rule of its own is a store's epoch counter."""
     if not isinstance(m, ops.Set):
         return None
-    if (m.store, m.name) == auth.epoch_row():
-        return _epoch_step(layer, auth, m)
     if m.store == ops.STORE_MANAGEMENT:
-        return None
+        target = auth.epoch_target(m.name)
+        return None if target is None else _epoch_step(layer, auth, m, target)
     if len(m.name) != crypto.DIGEST_SIZE:
         # A name a node can read is a name it can correlate. The client API types this as a
         # `NameToken`; the width is what stops a plaintext name arriving by accident.
         return Reason.NAME_SHAPE
-    if m.epoch != auth.current_epoch(layer):
+    if m.epoch != auth.current_epoch(m.store, layer):
         # Written under a key that is no longer the one readers will reach for. Refused rather
         # than stored, so a stale ciphertext never becomes the current value of a row.
         return Reason.EPOCH
     return None
 
 
-def _epoch_step(layer: Reader, auth: Authoriser, m: ops.Set) -> Reason | None:
-    """One at a time and forwards only. The rotation's guard proves the author knew the old value;
-    it does not stop them naming a value five behind it, and a keyepoch that goes backwards asks
-    every client to encrypt under a key readers have already moved off."""
+def _epoch_step(layer: Reader, auth: Authoriser, m: ops.Set, target: int) -> Reason | None:
+    """One at a time and forwards only, PER STORE -- `target` is the store whose epoch this row
+    carries, so rotating store 2 says nothing about store 1's counter. A keyepoch that goes
+    backwards asks every client to encrypt under a key readers have already moved off."""
     try:
         want = codec.as_int(codec.decode(m.value))
     except DudeError:
         return Reason.EPOCH_JUMP
-    return None if want == auth.current_epoch(layer) + 1 else Reason.EPOCH_JUMP
+    return None if want == auth.current_epoch(target, layer) + 1 else Reason.EPOCH_JUMP
 
 
 def vouched(reader: Reader, store: int, name: bytes, credential: bytes) -> crypto.PublicKey | None:

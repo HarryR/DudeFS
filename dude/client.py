@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import unicodedata
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from .core import codec, crypto
 from .core.errors import DudeError
@@ -25,10 +25,17 @@ def name_bytes(name: str) -> bytes:
 class Keys:
     """What one identity can read and write, unwrapped from the cluster's own management rows.
 
+    Per store, because that is where the boundary is: a grant naming store 2 mints store 2's
+    blinding secret and its epoch masters and nothing else, so an identity with no grant for a
+    store cannot read it even holding its bytes. Cluster-wide keys would leave `stores` an access
+    rule standing in for a key boundary -- the weaker of the two, and the one a stale replica or a
+    misbehaving node ignores.
+
     A SNAPSHOT. Rotation mints a new epoch and a new wrap, so a `Keys` built before one does not
     know about it -- rebuild after a rotation rather than mutating this, which keeps "which keys do
     I hold" a question with one answer."""
 
+    store_id: int
     blinding: crypto.Master
     masters: dict[int, crypto.Master]
     current: int
@@ -38,29 +45,31 @@ class Keys:
     manager admits one, out of the wraps it holds itself."""
 
     @classmethod
-    def unwrap(cls, src: Source, me: crypto.Keypair) -> Keys:
+    def unwrap(cls, src: Source, me: crypto.Keypair, store_id: int = ops.STORE_DATA) -> Keys:
         """Every wrap this identity can open, plus the epoch writes must currently carry.
 
         The cluster IS the key store: a holder recovers its masters by unsealing its own rows, so
         nothing durable is kept outside it. Storage nodes replicate these blobs and cannot open
         one -- they are sealed to the holder's long-term key."""
         mgmt = MgmtReader(src)
-        blind = mgmt.blinding_wrap(me.public)
+        blind = mgmt.blinding_wrap(store_id, me.public)
         if blind is None:
             raise ClientError(
-                f"{me.public.hex()[:8]} holds no blinding secret; it was never minted a reader"
+                f"{me.public.hex()[:8]} holds no blinding secret for store {store_id}; "
+                f"it was never minted a reader there"
             )
         masters: dict[int, crypto.Master] = {}
-        for epoch, sealed in mgmt.wraps_for(me.public).items():
+        for epoch, sealed in mgmt.wraps_for(store_id, me.public).items():
             try:
                 masters[epoch] = crypto.Master(me.open_sealed_raw(sealed))
             except DudeError as e:
                 # WHICH epoch, out of a keyring that may hold dozens.
                 raise ClientError(f"wrap for epoch {epoch} would not open: {e}") from e
         return cls(
+            store_id=store_id,
             blinding=crypto.Master(me.open_sealed_raw(blind)),
             masters=masters,
-            current=mgmt.current_epoch(),
+            current=mgmt.current_epoch(store_id),
         )
 
     @property
@@ -70,7 +79,9 @@ class Keys:
     def value_key(self, epoch: int) -> crypto.ValueKey:
         master = self.masters.get(epoch)
         if master is None:
-            raise ClientError(f"no key for epoch {epoch}; it was minted before this grant")
+            raise ClientError(
+                f"no key for store {self.store_id} epoch {epoch}; minted before this grant"
+            )
         return crypto.EpochKeys.derive(master).value_key
 
     def wraps_for(
@@ -95,7 +106,12 @@ class Client:
     composing several of these into one dependent transaction sits on top of this, not inside it."""
 
     keys: Keys
-    store_id: int = field(default=ops.STORE_DATA)
+
+    @property
+    def store_id(self) -> int:
+        """The store the keys are for. Not a separate setting: a client pointed at one store with
+        another store's keys would blind and seal correctly and address nothing."""
+        return self.keys.store_id
 
     def token(self, name: str) -> crypto.NameToken:
         return crypto.derive_name_token(self.keys.name_key, name_bytes(name))
@@ -138,7 +154,9 @@ class Client:
         return ops.Transaction((ops.Step((guard,), ops.Set(self.store_id, token, sealed, epoch)),))
 
 
-def mint_first_keyepoch(mgmt: MgmtWriter, manager: crypto.Keypair) -> tuple[ops.Transaction, Keys]:
+def mint_first_keyepoch(
+    mgmt: MgmtWriter, manager: crypto.Keypair, store_id: int = ops.STORE_DATA
+) -> tuple[ops.Transaction, Keys]:
     """Epoch 1 and the blinding secret, for the GENESIS bodies, sealed to the anchor.
 
     Composed by whoever builds genesis and shared by every node, NOT minted inside `bootstrap`:
@@ -150,8 +168,9 @@ def mint_first_keyepoch(mgmt: MgmtWriter, manager: crypto.Keypair) -> tuple[ops.
     master = crypto.Master(crypto.random_bytes(crypto.Master.WIDTH))
     blinding = crypto.Master(crypto.random_bytes(crypto.Master.WIDTH))
     tx = mgmt.rotate(
+        store_id,
         ops.EPOCH_NONE,
         wraps={manager.public: manager.public.seal(master)},
         blinding={manager.public: manager.public.seal(blinding)},
     )
-    return tx, Keys(blinding=blinding, masters={1: master}, current=1)
+    return tx, Keys(store_id=store_id, blinding=blinding, masters={1: master}, current=1)

@@ -648,8 +648,10 @@ class TestADataRowMustBeShapedForEncryption(unittest.TestCase):
         self.assertIsNone(self._apply(ops.Set(ops.STORE_DATA, DK, b"v")))
         self.assertIs(self._apply(ops.Set(ops.STORE_DATA, DK, b"v", 1)), settle.Reason.EPOCH)
 
-        self._apply(ops.Set(ops.STORE_MANAGEMENT, management.P_EPOCH, codec.encode(1)))
-        self.assertEqual(self.mgmt.current_epoch(), 1, "the mint did not land")
+        self._apply(
+            ops.Set(ops.STORE_MANAGEMENT, management.epoch_key(ops.STORE_DATA), codec.encode(1))
+        )
+        self.assertEqual(self.mgmt.current_epoch(ops.STORE_DATA), 1, "the mint did not land")
 
         self.assertIs(
             self._apply(ops.Set(ops.STORE_DATA, DK, b"v")),
@@ -663,7 +665,9 @@ class TestADataRowMustBeShapedForEncryption(unittest.TestCase):
         transaction made, or no rotation could ever carry data with it."""
         self.assertIsNone(
             self._apply(
-                ops.Set(ops.STORE_MANAGEMENT, management.P_EPOCH, codec.encode(1)),
+                ops.Set(
+                    ops.STORE_MANAGEMENT, management.epoch_key(ops.STORE_DATA), codec.encode(1)
+                ),
                 ops.Set(ops.STORE_DATA, DK, b"v", 1),
             ),
             "the write could not see its own rotation",

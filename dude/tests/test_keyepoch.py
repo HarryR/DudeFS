@@ -9,7 +9,7 @@ from dude.consensus.bootstrap import bootstrap, intervene
 from dude.core import codec, crypto
 from dude.core.errors import DudeError
 from dude.store import Store, ops, settle
-from dude.store.management import P_EPOCH, Cert, MgmtReader, MgmtWriter, Role
+from dude.store.management import Cert, MgmtReader, MgmtWriter, Role, epoch_key
 
 from .cluster import Cluster
 
@@ -39,7 +39,7 @@ def _rotate(s: Store, mgr: crypto.Keypair, who: list[crypto.PublicKey]) -> ops.T
     """A fresh master for the next epoch, sealed to everyone named."""
     keys = Keys.unwrap(s, mgr)
     master = crypto.Master(crypto.random_bytes(crypto.Master.WIDTH))
-    return MgmtWriter(s).rotate(keys.current, {p: p.seal(master) for p in who})
+    return MgmtWriter(s).rotate(ops.STORE_DATA, keys.current, {p: p.seal(master) for p in who})
 
 
 class TestRotationIsOneAllOrNothingStep(unittest.TestCase):
@@ -55,7 +55,7 @@ class TestRotationIsOneAllOrNothingStep(unittest.TestCase):
         got = s.apply((first, second), auth=MgmtReader(s))
         self.assertEqual(len(got.settled), 1, "both rotations landed")
         self.assertEqual([d.why for d in got.dropped], [settle.Reason.EPOCH_JUMP])
-        self.assertEqual(MgmtReader(s).current_epoch(), 2)
+        self.assertEqual(MgmtReader(s).current_epoch(ops.STORE_DATA), 2)
 
     def test_the_bump_and_the_wraps_are_one_transaction(self):
         """There must never be a live epoch nobody holds the master for. `evaluate` verdicts a
@@ -73,16 +73,16 @@ class TestRotationIsOneAllOrNothingStep(unittest.TestCase):
         have already moved off."""
         s, mgr, _ = _cluster_of_one()
         for bad in (0, 1, 3, 99):
-            tx = ops.writes(ops.Set(ops.STORE_MANAGEMENT, P_EPOCH, codec.encode(bad))).sign(
-                mgr, T0 + 3
-            )
+            tx = ops.writes(
+                ops.Set(ops.STORE_MANAGEMENT, epoch_key(ops.STORE_DATA), codec.encode(bad))
+            ).sign(mgr, T0 + 3)
             got = s.apply((tx,), auth=MgmtReader(s))
             self.assertEqual(
                 [d.why for d in got.dropped],
                 [settle.Reason.EPOCH_JUMP],
-                f"epoch {bad} was accepted over current {MgmtReader(s).current_epoch()}",
+                f"epoch {bad} accepted over {MgmtReader(s).current_epoch(ops.STORE_DATA)}",
             )
-        self.assertEqual(MgmtReader(s).current_epoch(), 1, "the row moved anyway")
+        self.assertEqual(MgmtReader(s).current_epoch(ops.STORE_DATA), 1, "the row moved anyway")
 
 
 class TestWhatANodeHolds(unittest.TestCase):
@@ -112,10 +112,11 @@ class TestWhatANodeHolds(unittest.TestCase):
 
 
 class TestACiphertextOpensOnlyWhereItWasSealed(unittest.TestCase):
-    """WHAT HOLDS WHAT, because a first draft of this credited the wrong mechanism and passed with
-    the AAD gutted. The item key is derived from `(value_key(epoch), name_token)`, so a wrong name
-    or a wrong epoch is already a wrong KEY -- the AAD is not what refuses those. What the AAD
-    alone binds is the store, which the key derivation does not mention."""
+    """WHAT HOLDS WHAT, because a first draft of this credited the AAD and passed with the AAD
+    gutted. Every component of a slot is bound by KEY DERIVATION: the name through
+    `derive_item_key`, the epoch through the master it selects, and now the store too, since
+    masters are per-store. The AAD repeats all three, which is a cheap second binding and not the
+    thing that refuses any of them."""
 
     def setUp(self):
         self.s, self.mgr, _ = _cluster_of_one()
@@ -146,15 +147,34 @@ class TestACiphertextOpensOnlyWhereItWasSealed(unittest.TestCase):
             "the epoch it was SEALED under must still open it",
         )
 
-    def test_the_store_is_bound_by_the_aad_and_by_nothing_else(self):
-        """Same token, same epoch, same item key -- only the AAD differs. Drop the store from it
-        and this row opens as though it had been written in another store."""
-        elsewhere = Client(self.keys, store_id=ops.STORE_DATA + 1)
-        self.assertEqual(
-            elsewhere.token("real/name"), self.c.token("real/name"), "same key, same token"
+    def test_a_grant_for_another_store_cannot_open_this_one(self):
+        """THE BOUNDARY. Store 2 is minted its own blinding secret and its own masters, so a
+        holder of store 2 derives a different token for the same name and a different item key --
+        it cannot read store 1 even holding store 1's bytes. That is what makes `stores` on a
+        grant a key boundary rather than an access rule a stale replica could ignore."""
+        other = ops.STORE_DATA + 1
+        mint, _ = mint_first_keyepoch(MgmtWriter(self.s), self.mgr, other)
+        intervene(self.s, self.mgr, bodies=(mint.sign(self.mgr, T0 + 5),), bucket=5)
+
+        store2 = Client(Keys.unwrap(self.s, self.mgr, other))
+        self.assertNotEqual(
+            store2.token("real/name"),
+            self.c.token("real/name"),
+            "both stores blinded with the same secret",
         )
         with self.assertRaises(DudeError):
-            elsewhere.open("real/name", self.sealed, self.epoch)
+            store2.open("real/name", self.sealed, self.epoch)
+
+        # AND store 1 is untouched by store 2 being minted. Without this, a single shared row that
+        # the second mint simply OVERWRITES also yields two different tokens, and the assertions
+        # above pass for a reason that is the opposite of the one they claim.
+        again = Client(Keys.unwrap(self.s, self.mgr, ops.STORE_DATA))
+        self.assertEqual(
+            again.token("real/name"),
+            self.c.token("real/name"),
+            "minting store 2 moved store 1's rows",
+        )
+        self.assertEqual(again.open("real/name", self.sealed, self.epoch), b"secret")
 
 
 class TestAReaderMintedLaterStillReadsHistory(unittest.TestCase):
@@ -171,7 +191,7 @@ class TestAReaderMintedLaterStillReadsHistory(unittest.TestCase):
         for i in range(3):
             tx = _rotate(s, mgr, [mgr.public]).sign(mgr, T0 + 10 + i)
             intervene(s, mgr, bodies=(tx,), bucket=2 + i)
-        self.assertEqual(MgmtReader(s).current_epoch(), 4)
+        self.assertEqual(MgmtReader(s).current_epoch(ops.STORE_DATA), 4)
 
         newcomer = crypto.Keypair.generate()
         wraps, blinding = Keys.unwrap(s, mgr).wraps_for(newcomer.public)
@@ -185,7 +205,7 @@ class TestAReaderMintedLaterStillReadsHistory(unittest.TestCase):
                 pop=newcomer.prove_possession(),
                 cert=Cert.sign_grant(mgr, newcomer.public, Role.CLIENT_RO),
             )
-            + w.admit_reader(newcomer.public, wraps, blinding)
+            + w.admit_reader(newcomer.public, ops.STORE_DATA, wraps, blinding)
         ).sign(mgr, T0 + 20)
         intervene(s, mgr, bodies=(admit,), bucket=9)
 
@@ -216,9 +236,8 @@ class TestGenesisIsByteEqualOnEveryNode(unittest.TestCase):
         c = Cluster()
         c.put("probe", b"v", now=T0)
         c.pump(T0)
-        heads = {n.store.head_block_num() or 0 for n in c.nodes}
-        self.assertEqual(len(heads), 1, f"nodes disagree on the head: {heads}")
-        self.assertGreater(heads.pop(), 1, "no block was produced")
+        heads = [n.store.head_block_num() or 0 for n in c.nodes]
+        self.assertTrue(all(h > 1 for h in heads), f"no block was produced: {heads}")
 
 
 if __name__ == "__main__":

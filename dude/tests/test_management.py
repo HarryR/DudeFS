@@ -967,12 +967,32 @@ class TestReadAndWriteAreScopedTheSameWay(unittest.TestCase):
         self.assertTrue(m.may_read(s, who.public, ops.STORE_DATA))
         self.assertFalse(m.may_write(s, who.public, ops.STORE_DATA), "CLIENT_RO wrote")
 
-    def test_a_read_write_grant_does_both_but_only_where_it_is_scoped(self):
+    def test_a_grant_for_one_store_does_not_reach_another(self):
         s, who = self._granted(Role.CLIENT_RW, frozenset({ops.STORE_DATA}))
         m = MgmtReader(s)
         self.assertTrue(m.may_write(s, who.public, ops.STORE_DATA))
-        self.assertFalse(m.may_read(s, who.public, ops.STORE_MANAGEMENT), "read store 0")
-        self.assertFalse(m.may_write(s, who.public, ops.STORE_MANAGEMENT))
+        self.assertFalse(m.may_read(s, who.public, ops.STORE_DATA + 1), "read another store")
+        self.assertFalse(m.may_write(s, who.public, ops.STORE_DATA + 1))
+
+    def test_the_management_store_is_readable_by_any_principal(self):
+        """It IS the trust chain -- roster, node records, grants, commitment certs -- and a light
+        client cannot verify a quorum proof without it. `RosterBundle` already ships the roster and
+        every manager grant to anyone who bootstraps. Its wraps are sealed boxes, so they are
+        encrypted rather than withheld. Scoping it withheld nothing and broke the thing it exists
+        for: a client could not fetch the keys its own grant depends on."""
+        s, who = self._granted(Role.CLIENT_RO, frozenset({ops.STORE_DATA}))
+        m = MgmtReader(s)
+        self.assertTrue(
+            m.may_read(s, who.public, ops.STORE_MANAGEMENT),
+            "a granted client was refused the trust chain",
+        )
+        self.assertFalse(
+            m.may_write(s, who.public, ops.STORE_MANAGEMENT), "readable is not writable"
+        )
+        self.assertFalse(
+            m.may_read(s, crypto.Keypair.generate().public, ops.STORE_MANAGEMENT),
+            "a stranger with no standing is still refused",
+        )
 
     def test_a_compactor_reads_its_store_and_writes_nothing(self):
         """It authorises nothing more until compaction returns with its own verbs."""
