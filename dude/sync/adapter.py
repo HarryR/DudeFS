@@ -3,7 +3,6 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
-from enum import Enum
 from typing import ClassVar
 
 from ..consensus.settle_round import SettledBlockWithBodies
@@ -12,17 +11,10 @@ from ..core.errors import DudeError
 from ..core.units import Millis
 from ..net.envelope import Envelope, SignedEnvelope, Verb, new_message_id
 from ..net.postman import Postman
+from .refusal import SyncRefusal
 
 
 class SyncAdapterError(DudeError): ...
-
-
-class SyncRefusal(Enum):
-    INVALID = "invalid"
-
-    NOT_YET_SETTLED = "not-yet-settled"
-
-    UNKNOWN = "unknown"
 
 
 class SyncMsg(ABC):
@@ -80,18 +72,20 @@ class HeightReply(SyncMsg):
 
 
 @dataclass(frozen=True, slots=True)
-class GetBlock(SyncMsg):
+class GetBlocks(SyncMsg):
     verb: ClassVar[Verb] = Verb.GETBLOCK
 
-    n: int
+    frm: int
+    count: int
 
     def _encode(self) -> bytes:
-        return codec.encode(self.n)
+        return codec.encode([self.frm, self.count])
 
     @classmethod
-    def _decode(cls, body: bytes) -> GetBlock:
+    def _decode(cls, body: bytes) -> GetBlocks:
         try:
-            return cls(n=codec.as_int(codec.decode(body)))
+            p = codec.as_seq(codec.decode(body), 2)
+            return cls(frm=codec.as_int(p[0]), count=codec.as_int(p[1]))
         except DudeError as e:
             raise SyncAdapterError(f"malformed GETBLOCK body: {e}") from e
 
@@ -100,14 +94,18 @@ class GetBlock(SyncMsg):
 class SettledBlockReply(SyncMsg):
     verb: ClassVar[Verb] = Verb.SETTLED_BLOCK
 
-    payload: SettledBlockWithBodies
+    payload: tuple[SettledBlockWithBodies, ...]
 
     def _encode(self) -> bytes:
-        return self.payload.encode()
+        return codec.encode([b.encode() for b in self.payload])
 
     @classmethod
     def _decode(cls, body: bytes) -> SettledBlockReply:
-        return cls(payload=SettledBlockWithBodies.decode(body))
+        try:
+            raw = codec.as_seq(codec.decode(body))
+        except DudeError as e:
+            raise SyncAdapterError(f"malformed SETTLED_BLOCK body: {e}") from e
+        return cls(payload=tuple(SettledBlockWithBodies.decode(codec.as_bytes(b)) for b in raw))
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,7 +129,7 @@ class Refused(SyncMsg):
 _SYNC_MSG_CLASSES: tuple[type[SyncMsg], ...] = (
     HeightAsk,
     HeightReply,
-    GetBlock,
+    GetBlocks,
     SettledBlockReply,
     Refused,
 )
@@ -162,7 +160,7 @@ class SyncAdapter:
 
 
 __all__ = [
-    "GetBlock",
+    "GetBlocks",
     "HeightAsk",
     "HeightReply",
     "Refused",
@@ -170,5 +168,4 @@ __all__ = [
     "SyncAdapter",
     "SyncAdapterError",
     "SyncMsg",
-    "SyncRefusal",
 ]

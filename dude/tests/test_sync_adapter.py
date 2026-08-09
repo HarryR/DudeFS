@@ -18,15 +18,15 @@ from ..core import crypto
 from ..net import Verb
 from ..store import ops
 from ..sync.adapter import (
-    GetBlock,
+    GetBlocks,
     HeightAsk,
     HeightReply,
     Refused,
     SettledBlockReply,
     SyncAdapterError,
     SyncMsg,
-    SyncRefusal,
 )
+from ..sync.refusal import SyncRefusal
 
 
 class TestHeightPoll(unittest.TestCase):
@@ -58,11 +58,13 @@ class TestHeightPoll(unittest.TestCase):
             SyncMsg.decode(Verb.HEIGHT_REPLY, b"not bencode")
 
 
-class TestGetBlock(unittest.TestCase):
-    """`GetBlock` carries a single integer; `SettledBlockReply` carries the block bytes."""
+class TestGetBlocks(unittest.TestCase):
+    """`GetBlocks` names a range; `SettledBlockReply` carries as many blocks as the server
+    served, which is how a follower behind a live cluster closes the gap instead of widening
+    it one round trip at a time."""
 
-    def test_getblock_roundtrips(self):
-        msg = GetBlock(n=7)
+    def test_getblocks_roundtrips(self):
+        msg = GetBlocks(frm=7, count=32)
         verb, body = msg.encode()
         self.assertIs(verb, Verb.GETBLOCK)
         self.assertEqual(SyncMsg.decode(verb, body), msg)
@@ -83,17 +85,17 @@ class TestGetBlock(unittest.TestCase):
         )
         block = Block(bucket=42, hashes=(tx.op_hash,), multisig=crypto.UNSIGNED)
         sb = SettledBlock(block=block, anchors=anchors, multisig=crypto.UNSIGNED)
-        msg = SettledBlockReply(payload=SettledBlockWithBodies(block=sb, bodies=(tx,)))
+        msg = SettledBlockReply(payload=(SettledBlockWithBodies(block=sb, bodies=(tx,)),))
 
         verb, body = msg.encode()
         self.assertIs(verb, Verb.SETTLED_BLOCK)
         got = SyncMsg.decode(verb, body)
         self.assertIsInstance(got, SettledBlockReply)
         assert isinstance(got, SettledBlockReply)  # for the type checker
-        self.assertEqual(got.payload.block.anchors, sb.anchors)
-        self.assertEqual(got.payload.block.block.hashes, sb.block.hashes)
-        self.assertEqual(len(got.payload.bodies), 1)
-        self.assertEqual(got.payload.bodies[0].op_hash, tx.op_hash)
+        self.assertEqual(got.payload[0].block.anchors, sb.anchors)
+        self.assertEqual(got.payload[0].block.block.hashes, sb.block.hashes)
+        self.assertEqual(len(got.payload[0].bodies), 1)
+        self.assertEqual(got.payload[0].bodies[0].op_hash, tx.op_hash)
 
     def test_malformed_getblock_raises(self):
         with self.assertRaises(SyncAdapterError):
@@ -147,6 +149,35 @@ class TestSyncMsgIsAbstract(unittest.TestCase):
     def test_syncmsg_cannot_be_instantiated_directly(self):
         with self.assertRaises(TypeError):
             SyncMsg()
+
+
+class TestTheRefusalVocabularyIsOneClosedSet(unittest.TestCase):
+    """Both sync paths share `SyncRefusal`, and both are expected to match it EXHAUSTIVELY --
+    `Follower._on_refused` and `LightClient._on_read_reply`. Nothing at runtime notices a member
+    with no case: a `match` without a wildcard just falls through. This pins the set so adding
+    one is a decision that visits both handlers, the same reason encode/decode pairs are pinned
+    by field count."""
+
+    def test_the_members_and_their_wire_strings(self):
+        self.assertEqual(
+            [(r.name, r.value) for r in SyncRefusal],
+            [
+                ("INVALID", "invalid"),
+                ("NOT_YET_SETTLED", "not-yet-settled"),
+                ("UNKNOWN", "unknown"),
+                ("NO_STATE", "no-state"),
+                ("UNKNOWN_STORE", "unknown-store"),
+                ("MALFORMED_QUERY", "malformed-query"),
+                ("FORK_DETECTED", "fork-detected"),
+                ("INTERNAL", "internal"),
+            ],
+            "add a member -> give it a case in Follower._on_refused AND the light client",
+        )
+
+    def test_every_member_survives_the_wire(self):
+        for reason in SyncRefusal:
+            verb, body = Refused(reason=reason).encode()
+            self.assertEqual(SyncMsg.decode(verb, body), Refused(reason=reason))
 
 
 if __name__ == "__main__":

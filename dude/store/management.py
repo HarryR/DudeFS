@@ -440,12 +440,6 @@ class MgmtReader:
             return False
         return self.verify_cert(g.cert, reader)
 
-    def authorises(self, multisig: crypto.MultiSig, payload: bytes) -> bool:
-        anchor = self.src.anchor()
-        if anchor is None:
-            raise ManagementError("cannot authorize: store has no manager anchor")
-        return Authorization(multisig, payload, self.roster(), anchor).verify()
-
     def possession_proof(self, who: crypto.PublicKey) -> crypto.Signature | None:
         raw = self.src.get(self.store_id, P_POP + who)
         return crypto.Signature(raw[1]) if raw else None

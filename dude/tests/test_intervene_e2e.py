@@ -3,7 +3,7 @@
 The scenario: the manager holds the anchor cold-key. They call `intervene()` against ONE node's
 store, which commits a manager-signed block directly (bypassing consensus). The rest of the
 cluster sees that node's head advance via routine HEIGHT polls, pulls the new block via
-GETBLOCK, verifies it against the anchor slot in `MgmtReader.authorises`, and commits.
+GETBLOCK, verifies it against the anchor slot in `Authorization.verify`, and commits.
 
 This is the load-bearing property: an operator holding the anchor key can push a block into
 one node, and normal sync propagates it to every other node with no special path -- no
@@ -87,7 +87,7 @@ class TestIntervenePropagatesViaSync(unittest.TestCase):
         self.assertEqual(c.nodes[2].store.head_block_num(), 1)
 
         # Drive sync only (no Coordinator). Nodes 1 and 2 poll HEIGHT; node 0 replies "I'm
-        # at 2"; nodes 1 and 2 pull block 2 via GETBLOCK; verify via MgmtReader.authorises
+        # at 2"; nodes 1 and 2 pull block 2 via GETBLOCK; verify via the shared chain walk
         # (which accepts the manager slot); commit. No special wire path, no special verifier.
         _sync_only_pump(c, c._clock, iterations=30)
 

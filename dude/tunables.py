@@ -55,6 +55,11 @@ class TimingTunables:
     def admission_floor(self) -> Millis:
         return self.client_clock_tolerance + 2 * self.rtt_max
 
+    def skew_buckets(self, bucket_width: Millis) -> int:
+        """Clock skew expressed in buckets: the tolerance on freshness, since a peer whose clock
+        sits behind ours reports a head we would otherwise call stale."""
+        return -(-self.clock_skew // bucket_width)
+
     def endorse_margin(self, bucket_width: Millis) -> Millis:
         return self.windows_to_settle * bucket_width + self.clock_skew
 
@@ -74,10 +79,17 @@ class SyncTunables:
 
     freshness_window: Millis = 5_000
 
+    pull_batch: int = 32
+    """Blocks one GETBLOCK may carry. A message-size bound, not a rate: it trades reply size
+    against round trips, and the server caps at its own value regardless of what is asked."""
+
 
 @dataclass(frozen=True, slots=True)
 class LightClientTunables:
     liveness_window: int = 2
+    """How many headers a reply will carry. A MESSAGE-SIZE bound, not a trust one -- whether a
+    head is current is `chain.is_stale`, judged by the client against its own clock, because a
+    responder cannot be asked to certify its own freshness."""
 
 
 @dataclass(frozen=True, slots=True)

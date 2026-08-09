@@ -58,7 +58,8 @@ WIRED = {
     "roster_incomplete": "a roster that is a subset, unstated, or older than one already seen",
     "vouched": "a credential that does not vouch for the value a row currently holds",
     "attestations_by": "a revocation that leaves rows attested by the key it just removed",
-    "authorises": "a block whose quorum proof is neither a roster quorum nor the anchor override",
+    "chain.advance": "a block that does not link to our head, or whose quorum proof is "
+    "neither a roster quorum nor the anchor override",
     "verify_cert": "a row whose #cert signer is not authorised for that cert's purpose",
 }
 """Checks that must have a live consumer in production code.

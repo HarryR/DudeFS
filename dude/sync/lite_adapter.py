@@ -3,7 +3,6 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
-from enum import Enum
 from typing import ClassVar
 
 from ..consensus.settle_round import SettledBlock
@@ -11,29 +10,10 @@ from ..core import codec, crypto
 from ..core.errors import DudeError
 from ..net.envelope import Verb
 from ..store.management import Cert, Grant, NodeRecord
+from .refusal import SyncRefusal
 
 
 class LiteAdapterError(DudeError): ...
-
-
-class LiteRefusal(Enum):
-    INVALID = "invalid"
-
-    NO_STATE = "no-state"
-
-    NOT_YET_SETTLED = "not-yet-settled"
-
-    TOO_OLD = "too-old"
-
-    UNKNOWN_STORE = "unknown-store"
-
-    MALFORMED_QUERY = "malformed-query"
-
-    STALE_CLIENT = "stale-client"
-
-    FORK_DETECTED = "fork-detected"
-
-    INTERNAL = "internal"
 
 
 @dataclass(frozen=True, slots=True)
@@ -266,7 +246,7 @@ class ProofReply(LiteMsg):
 class LiteRefused(LiteMsg):
     verb: ClassVar[Verb] = Verb.LITE_REFUSED
 
-    reason: LiteRefusal
+    reason: SyncRefusal
 
     def _encode(self) -> bytes:
         return self.reason.value.encode()
@@ -274,7 +254,7 @@ class LiteRefused(LiteMsg):
     @classmethod
     def _decode(cls, body: bytes) -> LiteRefused:
         try:
-            reason = LiteRefusal(body.decode("utf-8"))
+            reason = SyncRefusal(body.decode("utf-8"))
         except (ValueError, UnicodeDecodeError) as e:
             raise LiteAdapterError(f"unknown LITE_REFUSED reason: {body!r}") from e
         return cls(reason=reason)
@@ -325,7 +305,6 @@ __all__ = [
     "LiteAdapter",
     "LiteAdapterError",
     "LiteMsg",
-    "LiteRefusal",
     "LiteRefused",
     "ProofReply",
     "RosterBundle",

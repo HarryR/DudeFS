@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from ..core import crypto
@@ -39,6 +40,11 @@ class Coordinator:
     adapter: RoundAdapter
     settle_adapter: SettleAdapter
     tunables: Tunables
+
+    behind: Callable[[Millis], bool]
+    """`Follower.behind`. REQUIRED, never defaulted: a default is wrong for whichever caller
+    forgets it, and the symptom -- a node leading a bucket over a chain it does not hold, or a
+    cluster silently producing nothing -- is invisible from inside this class."""
 
     # ONE OF EACH, NEVER A QUEUE. Turning any of these three into a collection is a different
     # protocol, not an optimisation.
@@ -167,6 +173,12 @@ class Coordinator:
             return
         if now >= self._close_by(closed):
             # Past this window's HELD wave: sit it out rather than open a Round nobody is on.
+            self.current_bucket = closed + 1
+            return
+        if self.behind(now):
+            # Demonstrably behind: we would be leading a bucket over a chain we do not hold. Sit
+            # the window out and keep syncing. The mempool is deliberately NOT rotated -- what was
+            # admitted stays admitted, and `evict_after` bounds it.
             self.current_bucket = closed + 1
             return
         frozen = self.mempool

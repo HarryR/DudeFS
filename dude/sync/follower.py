@@ -1,14 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from .. import quorum
 from ..consensus.settle_round import (
     Anchors,
     SettledBlock,
     SettledBlockWithBodies,
-    _settle_payload,
-    genesis_stamp,
 )
 from ..core import crypto
 from ..core.errors import DudeError, InvariantError
@@ -18,9 +16,10 @@ from ..store.layer import Index
 from ..store.management import MgmtReader
 from ..store.ops import SignedTransaction
 from ..store.store import log_element
-from ..tunables import SyncTunables
+from ..tunables import Tunables
+from . import chain
 from .adapter import (
-    GetBlock,
+    GetBlocks,
     HeightAsk,
     HeightReply,
     Refused,
@@ -43,7 +42,8 @@ class HeightReport:
 @dataclass(frozen=True, slots=True)
 class PullInFlight:
     peer: crypto.PublicKey
-    block_num: Index
+    frm: Index
+    count: int
     sent_at: Millis
 
 
@@ -55,7 +55,7 @@ class Follower:
     me: crypto.Keypair
     store: Store
     mgmt: MgmtReader
-    tunables: SyncTunables
+    tunables: Tunables
     _heads: dict[crypto.PublicKey, HeightReport] = field(default_factory=dict)
     _poll_at: dict[crypto.PublicKey, Millis] = field(default_factory=dict)
     _pulling: PullInFlight | None = None
@@ -73,7 +73,7 @@ class Follower:
         if isinstance(msg, HeightReply):
             self._on_height_reply(msg, from_, now)
         elif isinstance(msg, SettledBlockReply):
-            self._on_settled_block(msg, from_, now)
+            self._on_settled_blocks(msg, from_, now)
         elif isinstance(msg, Refused):
             self._on_refused(msg, from_, now)
 
@@ -85,40 +85,63 @@ class Follower:
         for peer, deadline in list(self._poll_at.items()):
             if now >= deadline:
                 self._enqueue(peer, HeightAsk())
-                self._poll_at[peer] = now + self.tunables.poll_interval
+                self._poll_at[peer] = now + self.tunables.sync.poll_interval
         p = self._pulling
-        if p is not None and now - p.sent_at > self.tunables.pull_timeout:
+        if p is not None and now - p.sent_at > self.tunables.sync.pull_timeout:
             self._pulling = None
         if self._pulling is None:
             source = self._pick_pull_source()
             if source is not None:
-                target_num = (self.store.head_block_num() or 0) + 1
-                self._enqueue(source, GetBlock(n=target_num))
-                self._pulling = PullInFlight(source, target_num, now)
+                self._pull_from(source, now)
+
+    def _pull_from(self, peer: crypto.PublicKey, now: Millis) -> None:
+        frm = (self.store.head_block_num() or 0) + 1
+        count = self.tunables.sync.pull_batch
+        self._enqueue(peer, GetBlocks(frm=frm, count=count))
+        self._pulling = PullInFlight(peer, frm, count, now)
 
     def outbox(self) -> tuple[OutboxItem, ...]:
         drained = tuple(self._outbox)
         self._outbox.clear()
         return drained
 
-    def caught_up(self) -> bool:
+    def behind(self, now: Millis) -> bool:
+        """`f+1` LIVE witnesses reporting a head ABOVE ours. POSITIVE EVIDENCE, and the direction
+        is the whole point: silence, an empty roster and reports too old to trust all answer
+        False, so a node that knows nothing keeps working.
+
+        Asked the other way round -- `f+1` witnesses AGREEING with our tip -- it reads almost the
+        same and fails the opposite way. Gating block production on that couples the cluster's
+        liveness to the height-poll loop: reports age out between buckets and every node quietly
+        stops leading, which is how it was first written and what made a 3-node cluster produce
+        nothing at all.
+
+        Freshness is the clock's, not the newest report's: measured against the reports we happen
+        to hold, a peer that fell silent kept vouching for its own last word forever.
+
+        NOT `chain.is_stale`, which asks whether the CHAIN is advancing -- a different fact, and
+        one this must not carry: a stopped chain keeps every node's head stale, so gating on it
+        would stop every node from restarting the chain."""
         roster = self.mgmt.roster()
-        n = len(roster)
-        if n == 0:
+        if not roster:
             return False
-        threshold = quorum.corroboration(n)
         my_num = self.store.head_block_num() or 0
-        my_tip = self.store.head_block_hash() or genesis_stamp(self._require_anchor())
-        matches = 0
-        latest_now = self._last_now()
+        ahead = 0
         for peer, hr in self._heads.items():
             if peer not in roster:
                 continue
-            if latest_now - hr.at > self.tunables.freshness_window:
+            if now - hr.at > self.tunables.sync.freshness_window:
                 continue
-            if hr.block_num == my_num and hr.tip_hash == my_tip:
-                matches += 1
-        return matches >= threshold
+            if hr.block_num > my_num:
+                ahead += 1
+        return ahead >= quorum.corroboration(len(roster))
+
+    def _head_bucket(self) -> int:
+        n = self.store.head_block_num()
+        raw = self.store.settled_at(n) if n is not None else None
+        if raw is None:
+            return chain.TrustedHead.genesis(self._require_anchor()).bucket
+        return SettledBlock.decode(raw).block.bucket
 
     def _on_height_reply(self, msg: HeightReply, from_: crypto.PublicKey, now: Millis) -> None:
         # NOT credited to `_last_ok_at`: that is the pull-source priority, and answering a poll
@@ -126,11 +149,8 @@ class Follower:
         # failing every pull, and a joiner retries it forever.
         self._heads[from_] = HeightReport(msg.block_num, msg.tip_hash, now)
 
-    def _on_settled_block(  # noqa: PLR0911 -- verification pipeline is intentionally linear
-        self,
-        msg: SettledBlockReply,
-        from_: crypto.PublicKey,
-        now: Millis,
+    def _on_settled_blocks(
+        self, msg: SettledBlockReply, from_: crypto.PublicKey, now: Millis
     ) -> None:
         # Only from the peer we asked. An unsolicited run of state, applied, was a real break:
         # a stranger with no grant and no roster seat added itself to a catching-up node's
@@ -138,56 +158,71 @@ class Follower:
         p = self._pulling
         if p is None or from_ != p.peer:
             return
-        sbwb = msg.payload
-        sb = sbwb.block
-        if sb.anchors.block_num != p.block_num:
-            self._pulling = None
-            return
-        expected_prev = self.store.head_block_hash()
-        if expected_prev is None:
-            expected_prev = genesis_stamp(self._require_anchor())
-        if sb.anchors.prev_block != expected_prev:
-            self._pulling = None
-            return
-        body_hashes = frozenset(tx.op_hash for tx in sbwb.bodies)
-        slice_hashes = frozenset(sb.block.hashes)
-        if not body_hashes.issubset(slice_hashes):
-            self._pulling = None
-            return
-        for tx in sbwb.bodies:
-            if not tx.verify():
-                self._pulling = None
+        self._pulling = None
+        served = 0
+        for offer in msg.payload:
+            if offer.block.anchors.block_num != p.frm + served or not self._adopt(offer):
                 return
-        if not self.mgmt.authorises(sb.multisig, _settle_payload(sb.block.slice_hash, sb.anchors)):
-            self._pulling = None
+            served += 1
+        if served == 0:
             return
-        bodies_ordered = tuple(sorted(sbwb.bodies, key=lambda tx: tx.op_hash))
-        if not self._preview_matches_signed_anchors(bodies_ordered, sb.anchors):
-            self._pulling = None
-            return
-        first_height = self.store.head() + 1
-        block_bytes = sb.encode()
+        self._last_ok_at[from_] = now
+
+    def _adopt(self, offer: SettledBlockWithBodies) -> bool:
+        """One block: link, quorum proof, bodies, replay, commit. Per block rather than per
+        range, because the roster comes from the log and only committing the previous block
+        makes its roster change visible (#roster-at-ratification)."""
+        sb = offer.block
+        walked = chain.advance(self._tip(), (sb,), self.mgmt.roster(), self._require_anchor())
+        if isinstance(walked, chain.ChainRefusal):
+            return False
+        if not frozenset(tx.op_hash for tx in offer.bodies).issubset(frozenset(sb.block.hashes)):
+            return False
+        for tx in offer.bodies:
+            if not tx.verify():
+                return False
+        ordered = tuple(sorted(offer.bodies, key=lambda tx: tx.op_hash))
+        if not self._preview_matches_signed_anchors(ordered, sb.anchors):
+            return False
         self.store.commit_block(
             sb.anchors.block_num,
-            first_height=first_height,
-            block_bytes=block_bytes,
+            first_height=self.store.head() + 1,
+            block_bytes=sb.encode(),
             block_hash=sb.block_hash,
-            batch=bodies_ordered,
+            batch=ordered,
             auth=self.mgmt,
         )
-        self._last_ok_at[from_] = now
-        self._pulling = None
+        return True
 
-    def _on_refused(
-        self,
-        msg: Refused,  # noqa: ARG002 -- reason kept for future per-reason handling
-        from_: crypto.PublicKey,
-        now: Millis,  # noqa: ARG002 -- reserved for refusal-latency telemetry
-    ) -> None:
+    def _on_refused(self, msg: Refused, from_: crypto.PublicKey, now: Millis) -> None:
+        """EVERY member gets a case, and there is no wildcard: the reason used to be discarded
+        outright, which made the refusal a round trip that bought nothing."""
         p = self._pulling
         if p is None or from_ != p.peer:
             return
         self._pulling = None
+        match msg.reason:
+            case SyncRefusal.NOT_YET_SETTLED:
+                # They reported a head above ours and do not have the block. Correct the claim
+                # rather than shun them (#no-shun-only-priority) -- which also takes them out of
+                # the candidate set, so the immediate retry cannot pick the same peer -- and
+                # spend this tick on someone else instead of waiting for the next one.
+                hr = self._heads.get(from_)
+                if hr is not None:
+                    self._heads[from_] = replace(hr, block_num=p.frm - 1)
+                source = self._pick_pull_source()
+                if source is not None:
+                    self._pull_from(source, now)
+            case (
+                SyncRefusal.INVALID
+                | SyncRefusal.UNKNOWN
+                | SyncRefusal.NO_STATE
+                | SyncRefusal.UNKNOWN_STORE
+                | SyncRefusal.MALFORMED_QUERY
+                | SyncRefusal.FORK_DETECTED
+                | SyncRefusal.INTERNAL
+            ):
+                pass  # nothing this peer can do for us now; the next tick picks a source
 
     def _enqueue(self, peer: crypto.PublicKey, msg: SyncMsg) -> None:
         self._outbox.append((peer, msg))
@@ -200,17 +235,19 @@ class Follower:
         candidates.sort(key=lambda p_hr: (-self._last_ok_at.get(p_hr[0], 0), -p_hr[1].block_num))
         return candidates[0][0]
 
+    def _tip(self) -> crypto.Digest:
+        """The hash our next block must chain to. ONE spelling of "no block yet" -- this and
+        `serve_height` disagreed, so two fresh nodes read each other as forked."""
+        return (
+            self.store.head_block_hash()
+            or chain.TrustedHead.genesis(self._require_anchor()).block_hash
+        )
+
     def _require_anchor(self) -> crypto.PublicKey:
         anchor = self.store.anchor()
         if anchor is None:
             raise InvariantError("store has no manager anchor; cannot compute genesis stamp")
         return anchor
-
-    def _last_now(self) -> Millis:
-        return max(
-            (hr.at for hr in self._heads.values()),
-            default=0,
-        )
 
     def _preview_matches_signed_anchors(
         self,
@@ -238,15 +275,24 @@ class Follower:
 
 
 def serve_height(store: Store) -> HeightReply:
-    block_num = store.head_block_num() or 0
-    tip_hash = store.head_block_hash() or crypto.Digest(bytes(32))
-    return HeightReply(block_num=block_num, tip_hash=tip_hash)
+    tip = store.head_block_hash()
+    if tip is None:
+        anchor = store.anchor()
+        if anchor is None:
+            raise InvariantError("serving HEIGHT from a store that was never provisioned")
+        tip = chain.TrustedHead.genesis(anchor).block_hash
+    return HeightReply(block_num=store.head_block_num() or 0, tip_hash=tip)
 
 
-def serve_getblock(store: Store, req: GetBlock) -> SyncMsg:
-    block_bytes = store.settled_at(req.n)
-    if block_bytes is None:
+def serve_getblocks(store: Store, req: GetBlocks, cap: int) -> SyncMsg:
+    out: list[SettledBlockWithBodies] = []
+    for n in range(req.frm, req.frm + max(0, min(req.count, cap))):
+        raw = store.settled_at(n)
+        if raw is None:
+            break
+        out.append(
+            SettledBlockWithBodies(block=SettledBlock.decode(raw), bodies=store.bodies_of_block(n))
+        )
+    if not out:
         return Refused(reason=SyncRefusal.NOT_YET_SETTLED)
-    sb = SettledBlock.decode(block_bytes)
-    bodies = store.bodies_of_block(req.n)
-    return SettledBlockReply(payload=SettledBlockWithBodies(block=sb, bodies=bodies))
+    return SettledBlockReply(payload=tuple(out))

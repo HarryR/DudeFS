@@ -18,14 +18,14 @@ from .net.session import Inbound, Session, SessionBindError
 from .store import Store, ops
 from .store.management import MgmtReader
 from .sync.adapter import (
-    GetBlock,
+    GetBlocks,
     Refused,
     SyncAdapter,
     SyncAdapterError,
     SyncMsg,
     SyncRefusal,
 )
-from .sync.follower import Follower, serve_getblock, serve_height
+from .sync.follower import Follower, serve_getblocks, serve_height
 from .sync.lite import serve_get_anchors, serve_get_proof
 from .sync.lite_adapter import (
     GetAnchors,
@@ -33,7 +33,6 @@ from .sync.lite_adapter import (
     LiteAdapter,
     LiteAdapterError,
     LiteMsg,
-    LiteRefusal,
     LiteRefused,
 )
 from .tunables import DEFAULT, Tunables
@@ -103,18 +102,20 @@ class Node:
         self.settle_adapter = SettleAdapter(self.me, self.postman, self.tunables.net.ttl)
         self.sync_adapter = SyncAdapter(self.me, self.postman, self.tunables.net.ttl)
         self.lite_adapter = LiteAdapter(self.me, self.postman, self.tunables.net.ttl)
+        # Follower first: the Coordinator asks it whether we are too far behind to lead.
+        self.follower = Follower(
+            me=self.me,
+            store=self.store,
+            mgmt=MgmtReader(self.store),
+            tunables=self.tunables,
+        )
         self.coordinator = Coordinator(
             self.me,
             self.store,
             self.adapter,
             self.settle_adapter,
             self.tunables,
-        )
-        self.follower = Follower(
-            me=self.me,
-            store=self.store,
-            mgmt=MgmtReader(self.store),
-            tunables=self.tunables.sync,
+            self.follower.behind,
         )
 
     @property
@@ -220,9 +221,11 @@ class Node:
         except SyncAdapterError:
             self.sync_adapter.reply(env, Refused(reason=SyncRefusal.UNKNOWN), now)
             return
-        if not isinstance(req, GetBlock):
+        if not isinstance(req, GetBlocks):
             return
-        self.sync_adapter.reply(env, serve_getblock(self.store, req), now)
+        self.sync_adapter.reply(
+            env, serve_getblocks(self.store, req, self.tunables.sync.pull_batch), now
+        )
 
     def _on_settled_block(self, env: SignedEnvelope, now: Millis) -> None:
         try:
@@ -242,12 +245,12 @@ class Node:
 
     def _on_get_anchors(self, env: SignedEnvelope, now: Millis) -> None:
         if not self._lite_authorised(env.frm):
-            self.lite_adapter.reply(env, LiteRefused(LiteRefusal.MALFORMED_QUERY), now)
+            self.lite_adapter.reply(env, LiteRefused(SyncRefusal.MALFORMED_QUERY), now)
             return
         try:
             req = LiteMsg.decode(env.env.verb, env.env.body)
         except (LiteAdapterError, DudeError):
-            self.lite_adapter.reply(env, LiteRefused(LiteRefusal.MALFORMED_QUERY), now)
+            self.lite_adapter.reply(env, LiteRefused(SyncRefusal.MALFORMED_QUERY), now)
             return
         if not isinstance(req, GetAnchors):
             return
@@ -256,12 +259,12 @@ class Node:
 
     def _on_get_proof(self, env: SignedEnvelope, now: Millis) -> None:
         if not self._lite_authorised(env.frm):
-            self.lite_adapter.reply(env, LiteRefused(LiteRefusal.MALFORMED_QUERY), now)
+            self.lite_adapter.reply(env, LiteRefused(SyncRefusal.MALFORMED_QUERY), now)
             return
         try:
             req = LiteMsg.decode(env.env.verb, env.env.body)
         except (LiteAdapterError, DudeError):
-            self.lite_adapter.reply(env, LiteRefused(LiteRefusal.MALFORMED_QUERY), now)
+            self.lite_adapter.reply(env, LiteRefused(SyncRefusal.MALFORMED_QUERY), now)
             return
         if not isinstance(req, GetProof):
             return

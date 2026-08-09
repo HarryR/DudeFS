@@ -81,7 +81,7 @@ def _build_cluster(
     for kp in keys:
         store = Store()
         store.provision(mgr.public)
-        bootstrap(store, mgr, genesis)
+        bootstrap(store, mgr, genesis, bucket=DEFAULT.mempool.bucket(T0))
         nodes.append(Node(kp, store))
 
     # One tick to trigger reconciliation (each node dials every other roster member).

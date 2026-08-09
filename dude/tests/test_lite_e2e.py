@@ -2,8 +2,8 @@
 #
 # Two layers:
 #   * `serve_get_anchors` / `serve_get_proof` (`dude.sync.lite`) directly, with a real
-#     Cluster's stores + MgmtWriter. Verifies bundle shape, piggyback headers, refusal
-#     paths (STALE_CLIENT, FORK_DETECTED).
+#     Cluster's stores + MgmtWriter. Verifies bundle shape, piggyback headers, and the
+#     one refusal a responder can honestly make about a client's head: FORK_DETECTED.
 #   * Node dispatch (`_on_get_anchors` / `_on_get_proof`) via a signed envelope handed
 #     to `node.receive`. Verifies auth gate and that a reply is queued on the postman.
 #
@@ -28,13 +28,13 @@ from dude.sync.lite_adapter import (
     AnchorsReply,
     GetAnchors,
     GetProof,
-    LiteRefusal,
     LiteRefused,
     ProofReply,
+    SyncRefusal,
     TrustedBlock,
 )
 
-from .cluster import DELTA, T0, Cluster
+from .cluster import DELTA, T0, TUNABLES, Cluster
 
 
 def _provision_client(c: Cluster, kp: crypto.Keypair) -> None:
@@ -48,7 +48,7 @@ def _provision_client(c: Cluster, kp: crypto.Keypair) -> None:
         cert=Cert.sign_grant(c.mgr, kp.public, Role.CLIENT),
     ).sign(c.mgr, T0)
     for node in c.nodes:
-        intervene(node.store, c.mgr, bodies=(grant_tx,), bucket=444)
+        intervene(node.store, c.mgr, bodies=(grant_tx,), bucket=TUNABLES.mempool.bucket(c.clock))
 
 
 class TestServeGetAnchors(unittest.TestCase):
@@ -89,16 +89,18 @@ class TestServeGetAnchors(unittest.TestCase):
         assert isinstance(second, AnchorsReply)
         self.assertIsNone(second.bundle)
 
-    def test_stale_client_refused(self):
+    def test_a_far_behind_client_is_answered_with_capped_headers(self):
+        """It used to be refused STALE_CLIENT. A responder cannot judge whether the client is
+        current -- only the client's clock can -- and refusing withheld the very headers that
+        would have caught it up. It answers, capped, and the client walks up over more trips."""
         c = Cluster()
-        # Produce enough blocks that client is way behind.
         for _ in range(6):
             c.pump(T0 + DELTA)
         node = c.nodes[0]
         head_num = node.store.head_block_num()
         assert head_num is not None
-        self.assertGreater(head_num, 3)
-        # Client claims trusted_block at 1 (behind by liveness_window + more).
+        cap = 2
+        self.assertGreater(head_num - 1, cap, "client is not actually far behind")
         block1_bytes = node.store.settled_at(1)
         assert block1_bytes is not None
         block1 = SettledBlock.decode(block1_bytes)
@@ -106,10 +108,15 @@ class TestServeGetAnchors(unittest.TestCase):
             known_roster_fingerprint=None,
             known_trusted_block=TrustedBlock(1, block1.block_hash),
         )
-        reply = serve_get_anchors(node.store, req, liveness_window=2)
-        self.assertIsInstance(reply, LiteRefused)
-        assert isinstance(reply, LiteRefused)
-        self.assertEqual(reply.reason, LiteRefusal.STALE_CLIENT)
+        reply = serve_get_anchors(node.store, req, liveness_window=cap)
+        assert isinstance(reply, AnchorsReply), reply
+        self.assertEqual(len(reply.headers), cap)
+        self.assertEqual(
+            [b.anchors.block_num for b in reply.headers],
+            [2, 3],
+            "headers must be the contiguous run from the client's head, not a suffix",
+        )
+        self.assertEqual(reply.head.anchors.block_num, head_num)
 
     def test_fork_detected_refused(self):
         c = Cluster()
@@ -124,7 +131,7 @@ class TestServeGetAnchors(unittest.TestCase):
         reply = serve_get_anchors(node.store, req, liveness_window=2)
         self.assertIsInstance(reply, LiteRefused)
         assert isinstance(reply, LiteRefused)
-        self.assertEqual(reply.reason, LiteRefusal.FORK_DETECTED)
+        self.assertEqual(reply.reason, SyncRefusal.FORK_DETECTED)
 
     def test_headers_piggybacked_within_window(self):
         c = Cluster()
@@ -275,7 +282,7 @@ class TestServeGetProof(unittest.TestCase):
         reply = serve_get_proof(node.store, req, liveness_window=2)
         self.assertIsInstance(reply, LiteRefused)
         assert isinstance(reply, LiteRefused)
-        self.assertEqual(reply.reason, LiteRefusal.NOT_YET_SETTLED)
+        self.assertEqual(reply.reason, SyncRefusal.NOT_YET_SETTLED)
 
 
 class TestNodeDispatchAndAuth(unittest.TestCase):

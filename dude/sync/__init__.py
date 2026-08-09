@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from .adapter import (
-    GetBlock,
+    GetBlocks,
     HeightAsk,
     HeightReply,
     Refused,
@@ -9,11 +9,11 @@ from .adapter import (
     SyncAdapter,
     SyncAdapterError,
     SyncMsg,
-    SyncRefusal,
 )
+from .refusal import SyncRefusal
 
 __all__ = [
-    "GetBlock",
+    "GetBlocks",
     "HeightAsk",
     "HeightReply",
     "Refused",

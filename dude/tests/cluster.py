@@ -77,7 +77,7 @@ class Cluster:
             store.provision(self.mgr.public)
             # Manager signs block 1 containing the roster grants (bootstrap runs once per node
             # at init; every node produces byte-equal block 1 because the inputs are identical).
-            bootstrap(store, self.mgr, genesis)
+            bootstrap(store, self.mgr, genesis, bucket=TUNABLES.mempool.bucket(T0))
             node = Node(kp, store, TUNABLES)
             # Listener registers this identity in the module-scope InProc registry so other
             # nodes' dialers can find us.
@@ -143,8 +143,16 @@ class Cluster:
         that check not existing."""
         s = Store()
         s.provision(self.mgr.public)
-        bootstrap(s, self.mgr, self._genesis())
+        bootstrap(s, self.mgr, self._genesis(), bucket=TUNABLES.mempool.bucket(T0))
         return s
+
+    @property
+    def clock(self) -> int:
+        """How far the cluster's own time has actually run. `pump` advances it `rounds * delta`
+        per call and treats its argument as a floor, so a test that keeps its own `T0 + k*delta`
+        counter drifts buckets behind the blocks it is reading -- and freshness is bucket
+        arithmetic."""
+        return self._clock
 
     def pump(self, now: int, rounds: int = 10) -> int:
         """Advance every node `rounds` times, ADVANCING TIME by δ per outer round, and

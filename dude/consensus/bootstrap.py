@@ -83,8 +83,10 @@ def bootstrap(
     manager: crypto.Keypair,
     bodies: tuple[SignedTransaction, ...],
     *,
-    bucket: int = 0,
+    bucket: int,
 ) -> SettledBlockWithBodies:
+    """`bucket` is REQUIRED. Defaulted to 0, every genesis block claimed 1970, and freshness is
+    judged from the head's bucket -- a freshly bootstrapped cluster read as infinitely stale."""
     if store.head_block_num() is not None:
         raise InvariantError(
             f"bootstrap() called on store that already holds block "

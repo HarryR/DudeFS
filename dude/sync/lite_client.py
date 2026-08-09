@@ -3,7 +3,7 @@ from __future__ import annotations
 import contextlib
 import queue
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum, auto
 
 from .. import quorum
@@ -26,6 +26,7 @@ from ..store.management import (
     RosterCommitment,
 )
 from ..tunables import DEFAULT, Tunables
+from . import chain
 from .lite_adapter import (
     AnchorsReply,
     GetAnchors,
@@ -33,10 +34,10 @@ from .lite_adapter import (
     LiteAdapter,
     LiteAdapterError,
     LiteMsg,
-    LiteRefusal,
     LiteRefused,
     ProofReply,
     RosterBundle,
+    SyncRefusal,
     TrustedBlock,
 )
 
@@ -64,9 +65,7 @@ class TrustedState:
 
     roster_fingerprint: crypto.Digest
 
-    head: TrustedBlock
-
-    head_state_root: crypto.Digest
+    head: chain.TrustedHead
 
 
 @dataclass(slots=True)
@@ -157,7 +156,9 @@ class LightClient:
             name=name,
             block_num=self.trusted_state.head.block_num,
             known_roster_fingerprint=self.trusted_state.roster_fingerprint,
-            known_trusted_block=self.trusted_state.head,
+            known_trusted_block=TrustedBlock(
+                self.trusted_state.head.block_num, self.trusted_state.head.block_hash
+            ),
         )
         mid = self.adapter.send(peer, req, now)
         self._pending_reads[mid] = _PendingRead(
@@ -279,10 +280,14 @@ class LightClient:
         entry.anchors_reply = msg
         self._check_bootstrap_convergence(now)
 
-    def _check_bootstrap_convergence(self, now: Millis) -> None:  # noqa: ARG002 -- `now` for future retry-timeout hook
+    def _check_bootstrap_convergence(self, now: Millis) -> None:
+        """`f+1` agreeing AND LIVE. Agreement alone corroborates what the roster WAS; a set of
+        stale responders can all agree perfectly about a cluster that has moved on."""
         agreed: dict[crypto.Digest, list[_BootstrapReply]] = {}
         for entry in self._bootstrap_peers.values():
-            if entry.fingerprint is None:
+            if entry.fingerprint is None or entry.anchors_reply is None:
+                continue
+            if chain.is_stale(entry.anchors_reply.head.block.bucket, now, self.tunables):
                 continue
             agreed.setdefault(entry.fingerprint, []).append(entry)
         for fingerprint, entries in agreed.items():
@@ -302,16 +307,17 @@ class LightClient:
             managers=tuple(sorted(g.identity for g in bundle.managers)),
             node_endpoints={rec.identity: rec.endpoints for rec in bundle.entries},
             roster_fingerprint=fingerprint,
-            head=TrustedBlock(head.anchors.block_num, head.block_hash),
-            head_state_root=head.anchors.state_root,
+            head=chain.TrustedHead(
+                head.anchors.block_num, head.block_hash, head.anchors.state_root, head.block.bucket
+            ),
         )
         self.state = State.READY
 
-    def _on_read_reply(self, reply_to: bytes, msg: LiteMsg, now: Millis) -> None:  # noqa: ARG002
+    def _on_read_reply(self, reply_to: bytes, msg: LiteMsg, now: Millis) -> None:  # noqa: PLR0911 -- each return names a distinct way a reply fails to be a trustworthy answer
         entry = self._pending_reads[reply_to]
         if isinstance(msg, LiteRefused):
             entry.result = Failed(reason=msg.reason.value)
-            if msg.reason in (LiteRefusal.STALE_CLIENT, LiteRefusal.FORK_DETECTED):
+            if msg.reason is SyncRefusal.FORK_DETECTED:
                 self.state = State.UNBOOTSTRAPPED
                 self.trusted_state = None
             return
@@ -330,6 +336,18 @@ class LightClient:
         if not self._advance_head(msg.headers, msg.head):
             entry.result = Failed(reason="header chain-link or settle_sigs verify failed")
             return
+        assert self.trusted_state is not None  # noqa: S101 -- _advance_head keeps it non-None
+        if self.trusted_state.head.block_hash != msg.head.block_hash:
+            # More blocks behind than one reply carries headers for. We ADVANCED by what it did
+            # carry, so a retry closes the gap; verifying this proof against a root we have not
+            # walked to would be trusting the responder for the very thing the proof is for.
+            entry.result = Failed(reason="behind the responder; retry")
+            return
+        if chain.is_stale(self.trusted_state.head.bucket, now, self.tunables):
+            # Everything about this reply verifies. It is simply not CURRENT, and no signature
+            # can say so -- an old quorum-signed head is a valid one.
+            entry.result = Failed(reason="responder head is stale")
+            return
         try:
             proof = smt.Proof.decode(msg.proof)
         except DudeError:
@@ -338,7 +356,7 @@ class LightClient:
         held = None if msg.absent else (msg.value, msg.credential)
         assert self.trusted_state is not None  # noqa: S101 -- narrowing; _advance_head keeps it non-None on success
         if not smt.verify(
-            self.trusted_state.head_state_root,
+            self.trusted_state.head.state_root,
             entry.store_id,
             entry.name,
             held,
@@ -357,30 +375,29 @@ class LightClient:
         self, headers: tuple[SettledBlock, ...], responder_head: SettledBlock
     ) -> bool:
         assert self.trusted_state is not None  # noqa: S101 -- type narrowing for the checker; contract invariants above make this unreachable
-        prev_hash = self.trusted_state.head.block_hash
-        roster = self.trusted_state.roster
-        chain: tuple[SettledBlock, ...]
-        if headers and headers[-1].block_hash == responder_head.block_hash:
-            chain = headers
-        else:
-            chain = (*headers, responder_head)
-        for header in chain:
-            if header.anchors.prev_block != prev_hash:
-                return header.block_hash == self.trusted_state.head.block_hash
-            payload = _settle_payload(header.block.slice_hash, header.anchors)
-            if not Authorization(header.multisig, payload, roster, self.anchor).verify():
-                return False
-            prev_hash = header.block_hash
-        final = chain[-1]
-        self.trusted_state = TrustedState(
-            roster=self.trusted_state.roster,
-            managers=self.trusted_state.managers,
-            node_endpoints=self.trusted_state.node_endpoints,
-            roster_fingerprint=self.trusted_state.roster_fingerprint,
-            head=TrustedBlock(final.anchors.block_num, final.block_hash),
-            head_state_root=final.anchors.state_root,
-        )
+        ts = self.trusted_state
+        above = _contiguous_from(ts.head.block_num, (*headers, responder_head))
+        if not above:
+            return True  # the responder is at our head or behind it; nothing to walk
+        walked = chain.advance(ts.head.block_hash, above, ts.roster, self.anchor)
+        if isinstance(walked, chain.ChainRefusal):
+            return False
+        self.trusted_state = replace(ts, head=walked)
         return True
+
+
+def _contiguous_from(head_num: int, offered: tuple[SettledBlock, ...]) -> tuple[SettledBlock, ...]:
+    """The unbroken run starting at `head_num + 1`, and nothing past the first gap. `headers` is
+    capped, so on a far-behind client the responder's own head arrives detached from the run --
+    walking it anyway is a BROKEN_LINK that fails the whole read instead of advancing by what
+    actually arrived."""
+    by_num = {b.anchors.block_num: b for b in offered}
+    run: list[SettledBlock] = []
+    n = head_num + 1
+    while (b := by_num.get(n)) is not None:
+        run.append(b)
+        n += 1
+    return tuple(run)
 
 
 def _verify_bundle(  # noqa: C901, PLR0911 -- verification pipeline; each early-return names a distinct failure mode

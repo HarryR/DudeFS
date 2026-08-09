@@ -21,7 +21,7 @@ from dude.store.management import Cert, Grant, MgmtWriter, NodeRecord, Role
 from dude.sync.lite_adapter import LiteMsg, RosterBundle
 from dude.sync.lite_client import PENDING, Failed, GetResult, LightClient, State
 
-from .cluster import DELTA, T0, Cluster
+from .cluster import DELTA, T0, TUNABLES, Cluster
 
 
 def _build_light_client(c: Cluster, kp: crypto.Keypair) -> tuple[LightClient, InProcListener]:
@@ -30,10 +30,20 @@ def _build_light_client(c: Cluster, kp: crypto.Keypair) -> tuple[LightClient, In
     peers. Returns both so the test pump can drain the listener via `.drain()`."""
     listener = InProcListener(name_of(kp.public))
     postman = Postman(kp)
-    client = LightClient(me=kp, anchor=c.mgr.public, postman=postman)
+    client = LightClient(me=kp, anchor=c.mgr.public, postman=postman, tunables=TUNABLES)
     for node in c.nodes:
         client.add_bootstrap_peer(node.me.public, (Endpoint(address_of(node.me.public)),))
     return client, listener
+
+
+def _one_bucket_after_head(c: Cluster) -> int:
+    """A wall-clock reading consistent with the last block the cluster actually settled."""
+    head_num = c.nodes[0].store.head_block_num()
+    assert head_num is not None
+    raw = c.nodes[0].store.settled_at(head_num)
+    assert raw is not None
+    head_bucket = SettledBlock.decode(raw).block.bucket
+    return TUNABLES.mempool.bucket_start(head_bucket + 1)
 
 
 def _provision_client(c: Cluster, kp: crypto.Keypair) -> None:
@@ -49,7 +59,7 @@ def _provision_client(c: Cluster, kp: crypto.Keypair) -> None:
         cert=Cert.sign_grant(c.mgr, kp.public, Role.CLIENT),
     ).sign(c.mgr, T0)
     for node in c.nodes:
-        intervene(node.store, c.mgr, bodies=(grant_tx,), bucket=444)
+        intervene(node.store, c.mgr, bodies=(grant_tx,), bucket=TUNABLES.mempool.bucket(c.clock))
 
 
 def _mutate_frame_to_client(  # noqa: PLR0913, PLR0917 -- a byzantine-responder harness needs both identities, the verb it targets, the swap, and the clock; bundling any of them hides what the attack changes
@@ -138,9 +148,9 @@ class TestLightClientBootstrap(unittest.TestCase):
         client, client_listener = _build_light_client(c, client_kp)
 
         # Kick off bootstrap.
-        client.bootstrap(T0 + DELTA)
-        _pump(c, client, client_listener, T0 + DELTA)
-        _pump(c, client, client_listener, T0 + 2 * DELTA)
+        client.bootstrap(c.clock + DELTA)
+        _pump(c, client, client_listener, c.clock + DELTA)
+        _pump(c, client, client_listener, c.clock + DELTA)
 
         self.assertTrue(client.bootstrapped(), f"state {client.state.name}")
         ts = client.trusted_state
@@ -183,8 +193,8 @@ class TestLightClientBootstrap(unittest.TestCase):
                 ),
             )
 
-        client.bootstrap(T0 + DELTA)
-        for now in (T0 + DELTA, T0 + 2 * DELTA):
+        client.bootstrap(c.clock + DELTA)
+        for now in (c.clock + DELTA, c.clock + DELTA):
             for _ in range(5):
                 for node in c.nodes:
                     node._reconcile_peers(now)
@@ -220,16 +230,16 @@ class TestLightClientRead(unittest.TestCase):
         tx = ops.writes(ops.Set(ops.STORE_DATA, key, b"present")).sign(c.mgr, T0)
         c.submit(c.mgr, tx, to=0, now=T0)
         c.pump(T0)
-        c.pump(T0 + DELTA)
+        c.pump(c.clock + DELTA)
 
         client_kp = crypto.Keypair.generate()
         _provision_client(c, client_kp)
 
         client, client_listener = _build_light_client(c, client_kp)
 
-        client.bootstrap(T0 + 2 * DELTA)
-        _pump(c, client, client_listener, T0 + 2 * DELTA)
-        _pump(c, client, client_listener, T0 + 3 * DELTA)
+        client.bootstrap(c.clock + DELTA)
+        _pump(c, client, client_listener, c.clock + DELTA)
+        _pump(c, client, client_listener, c.clock + DELTA)
         self.assertTrue(client.bootstrapped())
 
         # Now do a read.
@@ -237,9 +247,9 @@ class TestLightClientRead(unittest.TestCase):
             store_id=ops.STORE_DATA,
             name=key,
             peer=c.nodes[0].me.public,
-            now=T0 + 4 * DELTA,
+            now=c.clock + DELTA,
         )
-        _pump(c, client, client_listener, T0 + 4 * DELTA)
+        _pump(c, client, client_listener, c.clock + DELTA)
 
         result = client.poll(rid)
         self.assertNotIsInstance(result, type(PENDING), "read still pending")
@@ -264,29 +274,29 @@ class TestLightClientRead(unittest.TestCase):
         tx = ops.writes(ops.Set(ops.STORE_DATA, key, b"present")).sign(c.mgr, T0)
         c.submit(c.mgr, tx, to=0, now=T0)
         c.pump(T0)
-        c.pump(T0 + DELTA)
+        c.pump(c.clock + DELTA)
 
         client_kp = crypto.Keypair.generate()
         _provision_client(c, client_kp)
 
         client, client_listener = _build_light_client(c, client_kp)
 
-        client.bootstrap(T0 + 2 * DELTA)
-        _pump(c, client, client_listener, T0 + 2 * DELTA)
-        _pump(c, client, client_listener, T0 + 3 * DELTA)
+        client.bootstrap(c.clock + DELTA)
+        _pump(c, client, client_listener, c.clock + DELTA)
+        _pump(c, client, client_listener, c.clock + DELTA)
         self.assertTrue(client.bootstrapped())
 
         rid = client.request_get(
             store_id=ops.STORE_DATA,
             name=key,
             peer=c.nodes[0].me.public,
-            now=T0 + 4 * DELTA,
+            now=c.clock + DELTA,
         )
 
         # Custom pump: intercept the client's listener and swap the value on any PROOF_REPLY.
         # Everything else (bootstrap replies, sync noise) passes through untouched.
         server_kp = c.nodes[0].me
-        now = T0 + 4 * DELTA
+        now = c.clock + DELTA
         rounds = 5
 
         def mutate(reply):
@@ -317,40 +327,67 @@ class TestLightClientRead(unittest.TestCase):
         assert isinstance(result, Failed)
         self.assertEqual(result.reason, "proof-verify-failed")
 
-    def test_stale_client_gets_refusal_and_drops_trusted_state(self):
+    def test_a_far_behind_client_walks_up_instead_of_being_refused(self):
+        """The server used to refuse a lagging client -- STALE_CLIENT, then TOO_OLD after that
+        one went -- and tell it to re-bootstrap. Both refusals were emitted ABOVE the line that
+        builds the headers, so the client had no way to stop lagging; against a live cluster,
+        whose head moves every bucket, a light client could not complete a read at all.
+
+        It now gets answered at the responder's head with the headers to reach it, capped per
+        reply, and walks up over as many round trips as the gap needs."""
         c = Cluster()
+        key = crypto.h(b"lite-client-catchup")
+        tx = ops.writes(ops.Set(ops.STORE_DATA, key, b"present")).sign(c.mgr, T0)
+        c.submit(c.mgr, tx, to=0, now=T0)
+        c.pump(T0)
+
         client_kp = crypto.Keypair.generate()
         _provision_client(c, client_kp)
-
         client, client_listener = _build_light_client(c, client_kp)
 
-        client.bootstrap(T0 + DELTA)
-        _pump(c, client, client_listener, T0 + DELTA)
-        _pump(c, client, client_listener, T0 + 2 * DELTA)
+        client.bootstrap(c.clock + DELTA)
+        _pump(c, client, client_listener, c.clock + DELTA)
+        _pump(c, client, client_listener, c.clock + DELTA)
         self.assertTrue(client.bootstrapped())
 
-        # Move cluster far ahead so client's trusted head is stale.
-        for i in range(6):
-            c.pump(T0 + (3 + i) * DELTA)
+        # Floor above the client's last `_pump`: `receive` advances a node's round, so the
+        # cluster's own `clock` trails the nodes and pumping from it ticks time backwards.
+        c.pump(c.clock + 2 * DELTA)  # the cluster runs on; the client falls behind
+        assert client.trusted_state is not None
+        started_at = client.trusted_state.head.block_num
+        head_num = c.nodes[0].store.head_block_num() or 0
+        self.assertGreater(head_num - started_at, TUNABLES.light_client.liveness_window)
 
-        rid = client.request_get(
-            store_id=ops.STORE_DATA,
-            name=b"anything",
-            peer=c.nodes[0].me.public,
-            now=T0 + 20 * DELTA,
-        )
-        _pump(c, client, client_listener, T0 + 20 * DELTA)
+        heads = [started_at]
+        result = None
+        for _ in range(30):
+            # The clock the CLUSTER is on, not one the test invented: a `now` that runs past the
+            # last block produced makes the head legitimately stale, which is a different failure
+            # wearing this test's name.
+            now = _one_bucket_after_head(c)
+            rid = client.request_get(
+                store_id=ops.STORE_DATA, name=key, peer=c.nodes[0].me.public, now=now
+            )
+            _pump(c, client, client_listener, now)
+            result = client.poll(rid)
+            assert client.trusted_state is not None
+            heads.append(client.trusted_state.head.block_num)
+            if not isinstance(result, Failed):
+                break
+            self.assertEqual(
+                result.reason,
+                "behind the responder; retry",
+                f"heads={heads} server={c.nodes[0].store.head_block_num()} "
+                f"head_bucket={client.trusted_state.head.bucket} "
+                f"now_bucket={TUNABLES.mempool.bucket(now)}",
+            )
+            self.assertIs(client.state, State.READY, "a lagging client must not lose its roster")
 
-        result = client.poll(rid)
-        self.assertIsInstance(result, Failed)
-        assert isinstance(result, Failed)
-        self.assertEqual(result.reason, "stale-client")
-        # Client dropped trusted state; re-bootstrap needed.
-        self.assertIs(client.state, State.UNBOOTSTRAPPED)
-
-
-if __name__ == "__main__":
-    unittest.main()
+        self.assertEqual(heads, sorted(heads), f"the head went backwards: {heads}")
+        self.assertGreater(heads[1], heads[0], "one reply advanced the client by nothing")
+        self.assertIsInstance(result, GetResult, f"never caught up: heads={heads}")
+        assert isinstance(result, GetResult)
+        self.assertEqual(result.value, b"present")
 
 
 class TestRevokedManagerCannotForgeARoster(unittest.TestCase):
@@ -393,17 +430,18 @@ class TestRevokedManagerCannotForgeARoster(unittest.TestCase):
             grant = mgmt.authorise(
                 warm.public, Role.MANAGER, pop=warm.prove_possession(), cert=warm_cert
             )
-            intervene(node.store, c.mgr, bodies=(grant.sign(c.mgr, T0),), bucket=555)
+            at = TUNABLES.mempool.bucket(c.clock)
+            intervene(node.store, c.mgr, bodies=(grant.sign(c.mgr, T0),), bucket=at)
             revoke = mgmt.revoke(warm.public, reissue_signer=c.mgr)
-            intervene(node.store, c.mgr, bodies=(revoke.sign(c.mgr, T0),), bucket=556)
+            intervene(node.store, c.mgr, bodies=(revoke.sign(c.mgr, T0),), bucket=at + 1)
             self.assertIsNone(MgmtWriter(node.store).grant_of(warm.public), "revocation failed")
 
         client, client_listener = _build_light_client(c, client_kp)
 
         # Bootstrap honestly: f+1 corroboration on the real roster.
-        client.bootstrap(T0 + DELTA)
-        _pump(c, client, client_listener, T0 + DELTA)
-        _pump(c, client, client_listener, T0 + 2 * DELTA)
+        client.bootstrap(c.clock + DELTA)
+        _pump(c, client, client_listener, c.clock + DELTA)
+        _pump(c, client, client_listener, c.clock + DELTA)
         self.assertTrue(client.bootstrapped())
         ts = client.trusted_state
         assert ts is not None
@@ -447,7 +485,7 @@ class TestRevokedManagerCannotForgeARoster(unittest.TestCase):
             store_id=ops.STORE_DATA,
             name=crypto.h(b"anything"),
             peer=c.nodes[0].me.public,
-            now=T0 + 3 * DELTA,
+            now=c.clock + DELTA,
         )
         self.assertIsNotNone(rid)
 
@@ -456,7 +494,7 @@ class TestRevokedManagerCannotForgeARoster(unittest.TestCase):
                 msg, bundle=forged, roster_fingerprint=crypto.Digest(forged.commitment_cert.subject)
             )
 
-        now = T0 + 3 * DELTA
+        now = c.clock + DELTA
         for _ in range(5):
             for node in c.nodes:
                 node._reconcile_peers(now)
@@ -487,3 +525,7 @@ class TestRevokedManagerCannotForgeARoster(unittest.TestCase):
         self.assertIsNone(after, "client kept trusting a roster it can no longer verify")
         self.assertIs(client.state, State.UNBOOTSTRAPPED)
         self.assertEqual(client.poll(rid), Failed(reason="roster changed; re-bootstrap"))
+
+
+if __name__ == "__main__":
+    unittest.main()

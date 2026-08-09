@@ -26,7 +26,7 @@ from dude.node import Node
 from dude.store import Store, management, ops
 from dude.store.management import Cert, MgmtWriter, Role
 
-from .cluster import TUNABLES
+from .cluster import T0, TUNABLES
 
 
 def _build_cluster(
@@ -70,7 +70,7 @@ def _build_cluster(
     for kp in keys:
         store = Store()
         store.provision(mgr.public)
-        bootstrap(store, mgr, genesis)
+        bootstrap(store, mgr, genesis, bucket=TUNABLES.mempool.bucket(T0))
         nodes.append(Node(kp, store, TUNABLES))
 
     return mgr, nodes, listeners

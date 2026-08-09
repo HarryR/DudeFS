@@ -322,7 +322,7 @@ def _build_node(
     side is the Postman's own (#postman-owns-dialling)."""
     store = Store()
     store.provision(mgr.public)
-    bootstrap(store, mgr, genesis)
+    bootstrap(store, mgr, genesis, bucket=_FAST.mempool.bucket(T0))
     return Node(kp, store, tunables=tunables)
 
 
@@ -571,7 +571,7 @@ class TestScenario(unittest.TestCase):
             # as the others so it can chain-verify from block 1.
             n4_store = Store()
             n4_store.provision(mgr.public)
-            bootstrap(n4_store, mgr, genesis)
+            bootstrap(n4_store, mgr, genesis, bucket=_FAST.mempool.bucket(T0))
             n4 = Node(n4_kp, n4_store, tunables=_FAST)
             # Manual bootstrap peer wiring (joiner not yet in its own roster's postman;
             # reconciliation will do the rest on tick). This `add_peer` is what builds

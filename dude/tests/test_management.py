@@ -4,7 +4,7 @@ emergency-intervention path.
 Two distinct "manager" concepts (#anchor-is-the-axiom + #role-manager-grant):
   * The **anchor** — one immutable pubkey per store, provisioned at `store.provision()`.
     `may_write` and `may_send` return True unconditionally for it. Holds bitmap slot N in
-    `MgmtWriter.authorises` (inherited) for the block-level override.
+    `Authorization.verify`'s manager slot for the block-level override.
   * A **Role.MANAGER grant** — any number of runtime-granted identities. Blanket authorship
     via `may_write`/`may_send`. Does NOT get the block override.
 
@@ -27,6 +27,7 @@ from ..store.management import (
     P_NODE,
     P_POP,
     P_ROSTER,
+    Authorization,
     Cert,
     Grant,
     ManagementError,
@@ -66,6 +67,15 @@ def unauthorised_certs(mgmt: MgmtWriter) -> str | None:
     if not mgmt.verify_cert(rc.cert, mgmt.src):
         return f"the roster commitment is attested by {rc.cert.signer.hex()[:8]}"
     return None
+
+
+def log_authorises_proof(mgmt: MgmtWriter, multisig: crypto.MultiSig, payload: bytes) -> bool:
+    """The log's own answer to "does this quorum proof pass" -- roster and anchor read from state.
+    A TEST helper: production reaches the same rule through `chain.advance`, which takes both
+    explicitly because a light client has no log to read them from."""
+    anchor = mgmt.src.anchor()
+    assert anchor is not None, "store has no manager anchor"
+    return Authorization(multisig, payload, mgmt.roster(), anchor).verify()
 
 
 def _sign(kp: crypto.Keypair, tx: ops.Transaction) -> ops.SignedTransaction:
@@ -178,9 +188,9 @@ class TestRoleManagerGrant(unittest.TestCase):
 
     def test_role_manager_does_not_get_block_override(self):
         """A Role.MANAGER grant may author operations blanket, but its signature does NOT
-        satisfy `MgmtReader.authorises`' manager-slot -- that slot is anchor-only
+        satisfy `Authorization.verify`'s manager slot -- that slot is anchor-only
         (#anchor-is-the-axiom). Wire this by fabricating a bitmap that names the manager
-        slot with a warm-manager sig; `authorises` returns False."""
+        slot with a warm-manager sig; the check returns False."""
         anchor = crypto.Keypair.generate()
         warm_mgr = crypto.Keypair.generate()
         s, mgmt = _provisioned(anchor)
@@ -197,12 +207,16 @@ class TestRoleManagerGrant(unittest.TestCase):
         # the manager slot with warm_mgr's sig.
         payload = b"any payload"
         warm_sig = warm_mgr.sign(payload)
-        # `authorises` checks the anchor slot against `store.anchor()`, which is anchor's
+        # The check tests the anchor slot against `store.anchor()`, which is anchor's
         # pubkey -- NOT warm_mgr's. warm_sig doesn't verify against anchor's pubkey.
-        self.assertFalse(mgmt.authorises(crypto.MultiSig.combine({0: warm_sig}, 1), payload))
+        self.assertFalse(
+            log_authorises_proof(mgmt, crypto.MultiSig.combine({0: warm_sig}, 1), payload)
+        )
         # And the anchor's own sig at the same slot DOES verify.
         anchor_sig = anchor.sign(payload)
-        self.assertTrue(mgmt.authorises(crypto.MultiSig.combine({0: anchor_sig}, 1), payload))
+        self.assertTrue(
+            log_authorises_proof(mgmt, crypto.MultiSig.combine({0: anchor_sig}, 1), payload)
+        )
 
 
 class TestRoleManagerRotation(unittest.TestCase):
@@ -256,7 +270,9 @@ class TestRoleManagerRotation(unittest.TestCase):
         # Neither reaches the block override -- that stays anchor-only.
         payload = b"payload"
         m1_sig = m1.sign(payload)
-        self.assertFalse(mgmt.authorises(crypto.MultiSig.combine({0: m1_sig}, 1), payload))
+        self.assertFalse(
+            log_authorises_proof(mgmt, crypto.MultiSig.combine({0: m1_sig}, 1), payload)
+        )
 
 
 # --------------------------------------------------------------------------------------------- #
@@ -387,7 +403,7 @@ class TestEmergencyIntervention(unittest.TestCase):
         anchor = crypto.Keypair.generate()
         s, mgmt = _provisioned(anchor)
         # Bootstrap first with an empty body set.
-        bootstrap(s, anchor, bodies=())
+        bootstrap(s, anchor, bodies=(), bucket=0)
         self.assertEqual(s.head_block_num(), 1)
         pre_head_hash = s.head_block_hash()
         assert pre_head_hash is not None
@@ -410,9 +426,10 @@ class TestEmergencyIntervention(unittest.TestCase):
         self.assertEqual(sbwb.block.anchors.block_num, 2)
         self.assertEqual(sbwb.block.anchors.prev_block, pre_head_hash)
 
-        # Verifies via the same MgmtReader.authorises path as any other block.
+        # Verifies via the same quorum-proof rule as any other block.
         self.assertTrue(
-            mgmt.authorises(
+            log_authorises_proof(
+                mgmt,
                 sbwb.block.multisig,
                 _settle_payload(sbwb.block.block.slice_hash, sbwb.block.anchors),
             )
@@ -431,7 +448,7 @@ class TestEmergencyIntervention(unittest.TestCase):
         anchor = crypto.Keypair.generate()
         wrong = crypto.Keypair.generate()
         s, _mgmt = _provisioned(anchor)
-        bootstrap(s, anchor, bodies=())
+        bootstrap(s, anchor, bodies=(), bucket=0)
         with self.assertRaises(InvariantError):
             intervene(s, wrong, bodies=(), bucket=1)
 
@@ -439,16 +456,16 @@ class TestEmergencyIntervention(unittest.TestCase):
         """The bitmap layout, signed payload, and SettledBlock shape are IDENTICAL between
         bootstrap and intervene -- there is no separate emergency wire form
         (#anchor-is-the-axiom's shared code path). Assert by checking that both blocks
-        verify via the same `MgmtReader.authorises` call with the same construction."""
+        verify via the same quorum-proof rule with the same construction."""
         anchor = crypto.Keypair.generate()
         s, mgmt = _provisioned(anchor)
-        bs = bootstrap(s, anchor, bodies=())
+        bs = bootstrap(s, anchor, bodies=(), bucket=0)
         iv = intervene(s, anchor, bodies=(), bucket=1)
 
         for sbwb in (bs, iv):
             payload = _settle_payload(sbwb.block.block.slice_hash, sbwb.block.anchors)
             self.assertTrue(
-                mgmt.authorises(sbwb.block.multisig, payload),
+                log_authorises_proof(mgmt, sbwb.block.multisig, payload),
                 f"block {sbwb.block.anchors.block_num} failed uniform authorization",
             )
         # Both have the manager slot set at bitmap position N (the last).

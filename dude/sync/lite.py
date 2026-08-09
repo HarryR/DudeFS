@@ -10,10 +10,10 @@ from .lite_adapter import (
     AnchorsReply,
     GetAnchors,
     GetProof,
-    LiteRefusal,
     LiteRefused,
     ProofReply,
     RosterBundle,
+    SyncRefusal,
 )
 
 
@@ -26,7 +26,7 @@ def serve_get_anchors(
         return _anchors(r, request, liveness_window)
 
 
-def _anchors(  # noqa: PLR0911 -- each early-return maps to a distinct LiteRefusal reason
+def _anchors(
     r: StoreReader,
     request: GetAnchors,
     liveness_window: int,
@@ -34,14 +34,14 @@ def _anchors(  # noqa: PLR0911 -- each early-return maps to a distinct LiteRefus
     mgmt = MgmtReader(r)
     head_num = r.head_block_num()
     if not head_num:
-        return LiteRefused(LiteRefusal.NO_STATE)
+        return LiteRefused(SyncRefusal.NO_STATE)
     commitment = mgmt.roster_commitment()
     if commitment is None:
-        return LiteRefused(LiteRefusal.NO_STATE)
+        return LiteRefused(SyncRefusal.NO_STATE)
 
     head_bytes = r.settled_at(head_num)
     if head_bytes is None:
-        return LiteRefused(LiteRefusal.INTERNAL)
+        return LiteRefused(SyncRefusal.INTERNAL)
     head_block = SettledBlock.decode(head_bytes)
 
     tb = request.known_trusted_block
@@ -50,11 +50,9 @@ def _anchors(  # noqa: PLR0911 -- each early-return maps to a distinct LiteRefus
         if client_num <= head_num:
             client_bytes = r.settled_at(client_num)
             if client_bytes is None:
-                return LiteRefused(LiteRefusal.INTERNAL)
+                return LiteRefused(SyncRefusal.INTERNAL)
             if SettledBlock.decode(client_bytes).block_hash != client_hash:
-                return LiteRefused(LiteRefusal.FORK_DETECTED)
-        if head_num - client_num > liveness_window:
-            return LiteRefused(LiteRefusal.STALE_CLIENT)
+                return LiteRefused(SyncRefusal.FORK_DETECTED)
 
     roster_fingerprint = crypto.Digest(commitment.cert.subject)
 
@@ -62,7 +60,7 @@ def _anchors(  # noqa: PLR0911 -- each early-return maps to a distinct LiteRefus
     if request.known_roster_fingerprint is None:
         bundle = _build_bundle(mgmt, commitment)
 
-    headers = _headers_since(r, tb, head_num)
+    headers = _headers_since(r, tb, head_num, liveness_window)
 
     return AnchorsReply(
         head=head_block,
@@ -84,29 +82,34 @@ def serve_get_proof(
         return _proof(r, request, liveness_window)
 
 
-def _proof(  # noqa: PLR0911, PLR0912, C901 -- each early-return names a distinct LiteRefusal; branches map 1:1 to reasons in the closed enum
+def _proof(  # noqa: PLR0911, PLR0912, C901 -- each early-return names a distinct SyncRefusal; branches map 1:1 to reasons in the closed enum
     r: StoreReader,
     request: GetProof,
     liveness_window: int,
 ) -> ProofReply | LiteRefused:
+    """ALWAYS ANSWERS AT OUR OWN HEAD, with the headers to reach it. Refusing a client whose
+    head lags ours -- as STALE_CLIENT and then TOO_OLD both did -- refuses the only party who
+    needs the answer, and does it on the line above the one that would have built the headers.
+    A live cluster moves the head every bucket, so that made a light client unable to read at
+    all. Whether the walked head is CURRENT is the client's clock's call, not ours."""
     mgmt = MgmtReader(r)
     head_num = r.head_block_num()
     if not head_num:
-        return LiteRefused(LiteRefusal.NO_STATE)
+        return LiteRefused(SyncRefusal.NO_STATE)
     if request.block_num > head_num:
-        return LiteRefused(LiteRefusal.NOT_YET_SETTLED)
+        return LiteRefused(SyncRefusal.NOT_YET_SETTLED)
     if request.block_num < 1:
-        return LiteRefused(LiteRefusal.MALFORMED_QUERY)
+        return LiteRefused(SyncRefusal.MALFORMED_QUERY)
     if not request.name:
-        return LiteRefused(LiteRefusal.MALFORMED_QUERY)
+        return LiteRefused(SyncRefusal.MALFORMED_QUERY)
 
     commitment = mgmt.roster_commitment()
     if commitment is None:
-        return LiteRefused(LiteRefusal.NO_STATE)
+        return LiteRefused(SyncRefusal.NO_STATE)
 
     head_bytes = r.settled_at(head_num)
     if head_bytes is None:
-        return LiteRefused(LiteRefusal.INTERNAL)
+        return LiteRefused(SyncRefusal.INTERNAL)
     head_block = SettledBlock.decode(head_bytes)
 
     tb = request.known_trusted_block
@@ -115,14 +118,9 @@ def _proof(  # noqa: PLR0911, PLR0912, C901 -- each early-return names a distinc
         if client_num <= head_num:
             client_bytes = r.settled_at(client_num)
             if client_bytes is None:
-                return LiteRefused(LiteRefusal.INTERNAL)
+                return LiteRefused(SyncRefusal.INTERNAL)
             if SettledBlock.decode(client_bytes).block_hash != client_hash:
-                return LiteRefused(LiteRefusal.FORK_DETECTED)
-        if head_num - client_num > liveness_window:
-            return LiteRefused(LiteRefusal.STALE_CLIENT)
-
-    if request.block_num != head_num:
-        return LiteRefused(LiteRefusal.TOO_OLD)
+                return LiteRefused(SyncRefusal.FORK_DETECTED)
 
     held = r.get(request.store_id, request.name)
     if held is None:
@@ -139,7 +137,7 @@ def _proof(  # noqa: PLR0911, PLR0912, C901 -- each early-return names a distinc
     bundle: RosterBundle | None = None
     if request.known_roster_fingerprint is None:
         bundle = _build_bundle(mgmt, commitment)
-    headers = _headers_since(r, tb, head_num)
+    headers = _headers_since(r, tb, head_num, liveness_window)
 
     return ProofReply(
         value=value,
@@ -170,14 +168,19 @@ def _build_bundle(mgmt: MgmtReader, commitment: RosterCommitment) -> RosterBundl
     )
 
 
-def _headers_since(r: StoreReader, known_trusted_block, head_num: int) -> tuple[SettledBlock, ...]:
+def _headers_since(
+    r: StoreReader, known_trusted_block, head_num: int, cap: int
+) -> tuple[SettledBlock, ...]:
+    """`cap` bounds the REPLY, not the client. A far-behind client used to be refused
+    STALE_CLIENT -- the server judging a freshness only the client's own clock can judge, and
+    refusing the one party who needed the headers to catch up. It walks in capped steps instead."""
     if known_trusted_block is None:
         return ()
     from_num = known_trusted_block.block_num
     if from_num >= head_num:
         return ()
     out: list[SettledBlock] = []
-    for n in range(from_num + 1, head_num + 1):
+    for n in range(from_num + 1, min(head_num, from_num + cap) + 1):
         b = r.settled_at(n)
         if b is None:
             break

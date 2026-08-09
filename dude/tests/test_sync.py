@@ -14,23 +14,25 @@ property from #height-poll-is-the-trigger.
 from __future__ import annotations
 
 import unittest
+from dataclasses import replace
 
 from dude.consensus.settle_round import Anchors, SettledBlock, SettledBlockWithBodies
 from dude.core import crypto
+from dude.node import Node
 from dude.store import Store, ops
 from dude.store.management import MgmtReader
 from dude.sync.adapter import (
-    GetBlock,
+    GetBlocks,
     HeightAsk,
     HeightReply,
     Refused,
     SettledBlockReply,
     SyncRefusal,
 )
-from dude.sync.follower import Follower, HeightReport, serve_getblock, serve_height
-from dude.tunables import DEFAULT
+from dude.sync.follower import Follower, HeightReport, serve_getblocks, serve_height
+from dude.tunables import DEFAULT, SyncTunables, Tunables
 
-from .cluster import DELTA, T0, Cluster, D
+from .cluster import DELTA, T0, TUNABLES, Cluster, D
 
 POLL = DEFAULT.sync.poll_interval
 PULL_TIMEOUT = DEFAULT.sync.pull_timeout
@@ -41,13 +43,15 @@ PULL_TIMEOUT = DEFAULT.sync.pull_timeout
 # --------------------------------------------------------------------------------------------- #
 
 
-def _make_follower(store: Store) -> Follower:
-    """Follower over an existing store, no peers added yet."""
+def _make_follower(store: Store, tunables: Tunables = TUNABLES) -> Follower:
+    """Follower over an existing store, no peers added yet. TUNABLES, not DEFAULT: freshness is
+    bucket arithmetic, so a follower reading a fast-profile store under the production block time
+    computes head buckets on a different scale entirely and never finds anything stale."""
     return Follower(
         me=crypto.Keypair.generate(),
         store=store,
         mgmt=MgmtReader(store),
-        tunables=DEFAULT.sync,
+        tunables=tunables,
     )
 
 
@@ -58,7 +62,7 @@ def _pump(
     now: int,
 ) -> None:
     """One pump: tick the follower, then translate every outbox message into a reply from
-    `producer` (if the message is a HeightAsk/GetBlock addressed at `producer_key`) and deliver
+    `producer` (if the message is a HeightAsk/GetBlocks addressed at `producer_key`) and deliver
     it back. Mirrors what Node's dispatcher will do end-to-end, but in-process."""
     follower.tick(now)
     for peer, msg in follower.outbox():
@@ -66,8 +70,10 @@ def _pump(
             continue  # message directed at a peer that isn't our producer stub
         if isinstance(msg, HeightAsk):
             follower.receive(serve_height(producer), producer_key, now)
-        elif isinstance(msg, GetBlock):
-            follower.receive(serve_getblock(producer, msg), producer_key, now)
+        elif isinstance(msg, GetBlocks):
+            follower.receive(
+                serve_getblocks(producer, msg, DEFAULT.sync.pull_batch), producer_key, now
+            )
 
 
 def _catch_up(
@@ -186,7 +192,7 @@ class TestFreshJoinerFromAnchor(unittest.TestCase):
 
     def test_fresh_joiner_pulls_block_1_via_manager_sig(self):
         """The load-bearing property: block 1 is manager-signed, joiner has no roster to
-        verify against, but `MgmtReader.authorises` accepts the manager-slot sig."""
+        verify against, but the quorum-proof rule accepts the manager-slot sig."""
         _catch_up(self.follower, self.producer.store, self.producer.me.public)
         self.assertEqual(
             self.joiner_store.head_block_num(),
@@ -208,6 +214,32 @@ class TestFreshJoinerFromAnchor(unittest.TestCase):
 # --------------------------------------------------------------------------------------------- #
 
 
+class TestAFollowerBehindConverges(unittest.TestCase):
+    """A node that falls behind must CLOSE the gap, not widen it.
+
+    `_pick_pull_source` gated every pull on a `_heads` entry that refreshes once per
+    `poll_interval`, so after each block the follower believed itself level and idled. Measured
+    against a live cluster it gained ~0.8 blocks per bucket against 1.0 produced: the gap grew
+    without bound and a node that fell behind never recovered."""
+
+    def test_the_gap_closes_rather_than_grows(self):
+        c = Cluster()
+        now = c.pump(T0, rounds=3)
+        now = c.pump_without(now, away={2}, rounds=6)
+
+        def gap() -> int:
+            return (c.nodes[0].store.head_block_num() or 0) - (
+                c.nodes[2].store.head_block_num() or 0
+            )
+
+        behind = gap()
+        self.assertGreater(behind, 1, "the outage did not put node 2 meaningfully behind")
+
+        now = c.pump(now, rounds=10)
+        self.assertLess(gap(), behind, f"the gap grew: {behind} -> {gap()}")
+        self.assertLessEqual(gap(), 2, f"still {gap()} blocks behind after 10 buckets")
+
+
 class TestByzantinePeerIsHandled(unittest.TestCase):
     """A peer serving bad data must cost its message and nothing more -- and the Follower
     must not touch Store on any failed verification path."""
@@ -221,7 +253,7 @@ class TestByzantinePeerIsHandled(unittest.TestCase):
         self.byz = crypto.Keypair.generate()  # not on the cluster; just a fake pubkey
 
     def test_lied_higher_height_wastes_one_getblock_then_pull_clears(self):
-        """Byzantine peer says head=999, we ask GetBlock(2), they refuse -- pull clears, state
+        """Byzantine peer says head=999, we ask GetBlocks from 2, they refuse -- pull clears, state
         unchanged. Per #no-shun-only-priority, byz is NOT blacklisted: they remain a valid
         pull candidate and would be tried again if they were the only source above us. The
         cost of the lie is one round-trip, not permanent exclusion."""
@@ -235,23 +267,57 @@ class TestByzantinePeerIsHandled(unittest.TestCase):
             self.byz.public,
             T0,
         )
-        # Next tick: follower sees byz is above us, sends GetBlock(2) to byz.
+        # Next tick: follower sees byz is above us, sends GetBlocks from 2 to byz.
         now = T0 + POLL
         self.follower.tick(now)
         drained = self.follower.outbox()
-        self.assertTrue(any(isinstance(m, GetBlock) for _, m in drained))
+        self.assertTrue(any(isinstance(m, GetBlocks) for _, m in drained))
         # Byz has no such block -- respond with Refused.
         self.follower.receive(
             Refused(reason=SyncRefusal.NOT_YET_SETTLED),
             self.byz.public,
             now,
         )
-        # Pull cleared, state unchanged. Byz remains an eligible candidate -- picking again
-        # next tick returns byz because they're the only peer above us.
+        # Pull cleared, state unchanged, and their claim corrected DOWN to what they actually
+        # demonstrated -- so they are not picked again on the strength of the lie they just told.
         self.assertIsNone(self.follower._pulling)
         self.assertEqual(self.joiner_store.head_block_num(), 1)
-        # Prove no exclusion: byz is still the pick.
+        self.assertIsNone(self.follower._pick_pull_source())
+        # NOT a blacklist (#no-shun-only-priority): the moment they claim height again they are
+        # a candidate again, and the lie costs one more round trip. Correcting the claim bounds
+        # the cost at one round trip PER LIE; leaving it standing let one lie cost every tick.
+        self.follower.receive(
+            HeightReply(block_num=999, tip_hash=crypto.h(b"pretend")), self.byz.public, now
+        )
         self.assertEqual(self.follower._pick_pull_source(), self.byz.public)
+
+    def test_a_refusal_costs_a_round_trip_not_a_tick(self):
+        """The reason used to be discarded and the pull simply cleared, so the next source was
+        tried a whole tick later. With two peers claiming height, the refusal from one must put
+        a GetBlocks on the wire to the other before `tick` is called again."""
+        other = crypto.Keypair.generate()
+        for peer in (self.byz.public, other.public):
+            self.follower.add_peer(peer, now=T0)
+        self.follower.tick(T0)
+        self.follower.outbox()
+        for peer in (self.byz.public, other.public):
+            self.follower.receive(
+                HeightReply(block_num=999, tip_hash=crypto.h(b"pretend")), peer, T0
+            )
+        now = T0 + POLL
+        self.follower.tick(now)
+        self.follower.outbox()
+        asked = self.follower._pulling
+        assert asked is not None, "no pull was in flight to refuse"
+
+        self.follower.receive(Refused(reason=SyncRefusal.NOT_YET_SETTLED), asked.peer, now)
+
+        retried = self.follower._pulling
+        assert retried is not None, "the refusal did not start another pull"
+        self.assertNotEqual(retried.peer, asked.peer, "retried the peer that just refused")
+        self.assertTrue(
+            any(isinstance(m, GetBlocks) and to == retried.peer for to, m in self.follower.outbox())
+        )
 
     def test_bad_settle_sig_dropped(self):
         """A peer serves a block whose settle_sigs don't verify. Follower drops without touching
@@ -265,12 +331,12 @@ class TestByzantinePeerIsHandled(unittest.TestCase):
             self.byz.public,
             T0,
         )
-        # Follower asks for GetBlock(2). Craft a garbage block: real shape but a sig that
+        # Follower asks for blocks from 2. Craft a garbage block: real shape but a sig that
         # verifies against nobody. We can build one from the honest producer's block 2 with
         # the settle_sigs replaced.
         now = T0 + POLL
         self.follower.tick(now)
-        self.follower.outbox()  # drain the GetBlock
+        self.follower.outbox()  # drain the GetBlocks
         real_bytes = self.honest.store.settled_at(2)
         assert real_bytes is not None
         real_sb = SettledBlock.decode(real_bytes)
@@ -285,7 +351,7 @@ class TestByzantinePeerIsHandled(unittest.TestCase):
         )
         bad_bodies = self.honest.store.bodies_of_block(2)
         self.follower.receive(
-            SettledBlockReply(payload=SettledBlockWithBodies(block=bad_sb, bodies=bad_bodies)),
+            SettledBlockReply(payload=(SettledBlockWithBodies(block=bad_sb, bodies=bad_bodies),)),
             self.byz.public,
             now,
         )
@@ -328,7 +394,7 @@ class TestByzantinePeerIsHandled(unittest.TestCase):
         )
         bad_bodies = self.honest.store.bodies_of_block(2)
         self.follower.receive(
-            SettledBlockReply(payload=SettledBlockWithBodies(block=bad_sb, bodies=bad_bodies)),
+            SettledBlockReply(payload=(SettledBlockWithBodies(block=bad_sb, bodies=bad_bodies),)),
             self.byz.public,
             now,
         )
@@ -392,10 +458,10 @@ class TestByzantinePeerIsHandled(unittest.TestCase):
                 auth=MgmtReader(fresh_joiner),
             )
 
-        # Follower ticks: sees byz above (target_num > our target_num - 1), issues GetBlock.
+        # Follower ticks: sees byz above (target_num > our target_num - 1), issues GetBlocks.
         follower.tick(T0 + POLL)
         outbox = follower.outbox()
-        assert any(isinstance(m, GetBlock) for _, m in outbox), f"expected GetBlock, got {outbox}"
+        assert any(isinstance(m, GetBlocks) for _, m in outbox), f"expected GetBlocks, got {outbox}"
         # Craft the bad block: real block target_num but with the last body omitted.
         real_bytes = self.honest.store.settled_at(target_num)
         assert real_bytes is not None
@@ -403,7 +469,7 @@ class TestByzantinePeerIsHandled(unittest.TestCase):
         real_bodies = self.honest.store.bodies_of_block(target_num)
         truncated = real_bodies[:-1]
         follower.receive(
-            SettledBlockReply(payload=SettledBlockWithBodies(block=real_sb, bodies=truncated)),
+            SettledBlockReply(payload=(SettledBlockWithBodies(block=real_sb, bodies=truncated),)),
             self.byz.public,
             T0 + POLL,
         )
@@ -453,70 +519,95 @@ class TestForkDetectionAtPollTime(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------------------------- #
-# f+1 fresh witnesses for `caught_up()`.                                                        #
+# f+1 fresh witnesses for `behind()`, and the Round it gates.                                    #
 # --------------------------------------------------------------------------------------------- #
 
 
-class TestCaughtUpRequiresFreshWitnesses(unittest.TestCase):
-    """SPECv2 #height-poll-is-the-trigger, #freshness-needs-many: declaring caught-up MUST
-    rest on f+1 fresh peers agreeing on `(my_block_num, my_tip_hash)`. A single peer's
-    silence or agreement is not enough."""
+class TestBehindRequiresFreshWitnessesAboveUs(unittest.TestCase):
+    """`behind` gates whether a node leads a bucket, so EVERY way of knowing nothing must answer
+    False. Read the other way -- `f+1` witnesses agreeing with our tip -- it looks equivalent and
+    fails the opposite way, and a cluster whose reports age out between buckets stops producing."""
 
-    def test_caught_up_false_with_no_reports(self):
-        """No peers heard from yet -- not caught up regardless of local state."""
+    def _joiner(self, tunables: Tunables = TUNABLES) -> tuple[Cluster, Follower]:
         c = Cluster()
         _run_cluster_producing_n_blocks(c, 1)  # just the bootstrap block 1
-        joiner_store = c.provisioned()
-        follower = _make_follower(joiner_store)
-        self.assertFalse(follower.caught_up())
+        return c, _make_follower(c.provisioned(), tunables)
 
-    def test_caught_up_with_quorum_of_matching_reports(self):
-        """Fresh HEIGHT_REPLYs from f+1 roster peers all agreeing with our tip → caught_up."""
+    def _report(self, c: Cluster, f: Follower, now: int, at: int, count: int = 2) -> None:
+        for node in c.nodes[:count]:
+            f.receive(HeightReply(block_num=at, tip_hash=crypto.h(b"theirs")), node.me.public, now)
+
+    def test_no_reports_is_not_behind(self):
+        """Knowing nothing is not evidence of being behind. Answering True here is how the gate
+        stops a cluster that has simply not polled yet."""
+        _, follower = self._joiner()
+        self.assertFalse(follower.behind(T0))
+
+    def test_an_empty_roster_is_not_behind(self):
         c = Cluster()
         _run_cluster_producing_n_blocks(c, 1)
-        joiner_store = c.provisioned()
-        follower = _make_follower(joiner_store)
-        my_num = joiner_store.head_block_num() or 0
-        my_tip = joiner_store.head_block_hash()
-        assert my_tip is not None
-        # corroboration(3) = tolerates(3) + 1 = 0 + 1 = 1. One matching report suffices, but
-        # deliver two -- higher-than-threshold is still a valid "caught up" state.
-        for node in c.nodes[:2]:
-            follower.receive(
-                HeightReply(block_num=my_num, tip_hash=my_tip),
-                node.me.public,
-                T0,
-            )
-        self.assertTrue(follower.caught_up())
+        fresh = Store()
+        fresh.provision(c.mgr.public)  # provisioned, not bootstrapped: no roster yet
+        self.assertFalse(_make_follower(fresh).behind(T0))
 
-    def test_caught_up_false_when_reports_are_stale(self):
-        """Reports older than freshness_window don't count."""
+    def test_f_plus_one_fresh_witnesses_above_us_is_behind(self):
+        """corroboration(3) = tolerates(3) + 1 = 1, so one suffices; two is still behind."""
+        c, follower = self._joiner()
+        mine = follower.store.head_block_num() or 0
+        self._report(c, follower, T0, at=mine + 5)
+        self.assertTrue(follower.behind(T0))
+
+    def test_witnesses_at_our_own_head_is_not_behind(self):
+        c, follower = self._joiner()
+        self._report(c, follower, T0, at=follower.store.head_block_num() or 0)
+        self.assertFalse(follower.behind(T0))
+
+    def test_reports_age_against_the_clock_not_against_each_other(self):
+        """Freshness was measured against the newest report held, so the window was satisfied by
+        the reports themselves and a peer that fell silent vouched for its last word forever."""
+        tight = replace(TUNABLES, sync=SyncTunables(freshness_window=2 * DELTA))
+        c, follower = self._joiner(tight)
+        mine = follower.store.head_block_num() or 0
+        self._report(c, follower, T0, at=mine + 5)
+        self.assertTrue(follower.behind(T0))
+        self.assertFalse(follower.behind(T0 + 2 * DELTA + 1))
+
+
+class TestABehindNodeDoesNotLeadABucket(unittest.TestCase):
+    """Driven through the node's own `tick`, because the point is not that the predicate computes
+    -- it did, for a long time, with nothing calling it -- but that the Round path consults it."""
+
+    def _node_and_peers(self) -> tuple[Cluster, Node, list[crypto.PublicKey]]:
+        """A ROSTER MEMBER on a fresh store -- a node that lost its disk. `_open_round` refuses
+        a non-member outright, so a stranger would prove nothing about the gate."""
         c = Cluster()
         _run_cluster_producing_n_blocks(c, 1)
-        joiner_store = c.provisioned()
-        follower = _make_follower(joiner_store)
-        my_num = joiner_store.head_block_num() or 0
-        my_tip = joiner_store.head_block_hash()
-        assert my_tip is not None
-        # Deliver two reports at T0; freshness_window is fixed; the "latest now" advances
-        # past freshness_window by receiving a THIRD (stale-counter) report far in the future.
-        for node in c.nodes[:2]:
-            follower.receive(
-                HeightReply(block_num=my_num, tip_hash=my_tip),
-                node.me.public,
-                T0,
+        node = Node(c.keys[0], c.provisioned(), TUNABLES)
+        return c, node, [n.me.public for n in c.nodes[1:3]]
+
+    def _tick_into_a_leadable_window(self, node: Node) -> int:
+        """The first tick only adopts the current bucket; a Round can open once a whole bucket
+        has closed under us."""
+        node.tick(T0)
+        return T0 + 2 * DELTA
+
+    def test_a_node_nobody_reports_above_opens_its_round(self):
+        """The control. Without it, the test below passes for any reason at all."""
+        _, node, _ = self._node_and_peers()
+        node.tick(self._tick_into_a_leadable_window(node))
+        self.assertIsNotNone(node.coordinator.current_round)
+
+    def test_a_node_with_witnesses_above_it_opens_no_round(self):
+        _, node, peers = self._node_and_peers()
+        now = self._tick_into_a_leadable_window(node)
+        mine = node.store.head_block_num() or 0
+        for peer in peers:
+            node.follower.receive(
+                HeightReply(block_num=mine + 5, tip_hash=crypto.h(b"theirs")), peer, now
             )
-        # Third report from an out-of-roster peer far in the future: this advances _last_now(),
-        # making the first two reports stale.
-        far_future = T0 + DEFAULT.sync.freshness_window * 2 + 1
-        stranger = crypto.Keypair.generate()
-        follower.receive(
-            HeightReply(block_num=my_num, tip_hash=my_tip),
-            stranger.public,
-            far_future,
-        )
-        # Now `_last_now()` is far_future; the two roster reports at T0 are stale.
-        self.assertFalse(follower.caught_up())
+        self.assertTrue(node.follower.behind(now), "the setup did not make the node behind")
+        node.tick(now)
+        self.assertIsNone(node.coordinator.current_round, "a behind node led a bucket")
 
 
 # --------------------------------------------------------------------------------------------- #
@@ -537,7 +628,7 @@ class TestPullTimeout(unittest.TestCase):
         follower = _make_follower(joiner_store)
         silent = crypto.Keypair.generate()
         follower.add_peer(silent.public, now=T0)
-        # Silent peer answers HeightAsk (says they're ahead of us) but never replies to GetBlock.
+        # Silent peer answers HeightAsk (says they're ahead of us) but never replies to GetBlocks.
         follower.tick(T0)
         follower.outbox()  # drain HeightAsk
         follower.receive(
@@ -547,7 +638,7 @@ class TestPullTimeout(unittest.TestCase):
         )
         # Tick advances past pull_timeout without a reply.
         follower.tick(T0 + POLL)
-        # A GetBlock went out; drain it.
+        # A GetBlocks went out; drain it.
         follower.outbox()
         # Now advance beyond pull_timeout. Tick clears the stale pull AND (in the same tick)
         # the picker immediately re-picks silent because they're the only source above us --
