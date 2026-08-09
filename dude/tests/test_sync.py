@@ -722,6 +722,85 @@ class TestPickPullSourcePriority(unittest.TestCase):
 
         self.assertEqual(follower._pick_pull_source(), higher.public)
 
+    def test_a_garbage_serving_peer_loses_the_pick_to_an_honest_source(self):
+        """A peer that SERVES unverifiable blocks -- unlike one that refuses -- got no claim
+        correct-down, so on a fresh joiner (no ok-history anywhere) its inflated claim won the
+        pick on height every tick: honest sources were never asked and the joiner never
+        converged. A failed pull now orders the peer behind peers that have not failed; still
+        no exclusion (#no-shun-only-priority)."""
+        c = Cluster()
+        _run_cluster_producing_n_blocks(c, 2)
+        joiner_store = c.provisioned()
+        follower = _make_follower(joiner_store)
+        honest = c.nodes[0]
+        byz = crypto.Keypair.generate()
+        follower.add_peer(byz.public, now=T0)
+        follower.add_peer(honest.me.public, now=T0)
+        follower.receive(HeightReply(block_num=999, tip_hash=crypto.h(b"lie")), byz.public, T0)
+        follower.receive(serve_height(honest.store), honest.me.public, T0)
+
+        follower.tick(T0)
+        follower.outbox()
+        pull = follower._pulling
+        assert pull is not None and pull.peer == byz.public, "setup: byz's claim must win first"
+
+        real_bytes = honest.store.settled_at(2)
+        assert real_bytes is not None
+        real_sb = SettledBlock.decode(real_bytes)
+        bad_sb = SettledBlock(
+            block=real_sb.block,
+            anchors=Anchors(
+                block_num=real_sb.anchors.block_num,
+                height=real_sb.anchors.height,
+                prev_block=crypto.h(b"wrong-parent"),
+                state_root=real_sb.anchors.state_root,
+                acc_state=real_sb.anchors.acc_state,
+                acc_log=real_sb.anchors.acc_log,
+            ),
+            multisig=real_sb.multisig,
+        )
+        follower.receive(
+            SettledBlockReply(
+                payload=(
+                    SettledBlockWithBodies(block=bad_sb, bodies=honest.store.bodies_of_block(2)),
+                )
+            ),
+            byz.public,
+            T0,
+        )
+        self.assertIsNone(follower._pulling)
+
+        follower.tick(T0 + 1)
+        pull = follower._pulling
+        assert pull is not None, "no new pull opened"
+        self.assertEqual(pull.peer, honest.me.public, "the garbage server won the pick again")
+
+    def test_a_timed_out_pull_deprioritises_the_silent_peer_given_an_alternative(self):
+        """`test_silent_peer_pull_clears_after_timeout` blesses retrying the ONLY candidate;
+        with an honest alternative present, the silent peer's claim used to keep winning on
+        height, so the honest source was never asked and every cycle spent a full
+        pull_timeout for nothing."""
+        c = Cluster()
+        _run_cluster_producing_n_blocks(c, 2)
+        joiner_store = c.provisioned()
+        follower = _make_follower(joiner_store)
+        honest = c.nodes[0]
+        silent = crypto.Keypair.generate()
+        follower.add_peer(silent.public, now=T0)
+        follower.add_peer(honest.me.public, now=T0)
+        follower.receive(HeightReply(block_num=999, tip_hash=crypto.h(b"claim")), silent.public, T0)
+        follower.receive(serve_height(honest.store), honest.me.public, T0)
+
+        follower.tick(T0)
+        follower.outbox()
+        pull = follower._pulling
+        assert pull is not None and pull.peer == silent.public, "setup: silent's claim must win"
+
+        follower.tick(T0 + PULL_TIMEOUT + 1)
+        pull = follower._pulling
+        assert pull is not None, "the timeout must immediately re-pick"
+        self.assertEqual(pull.peer, honest.me.public, "the silent peer won the pick again")
+
     def test_failed_peer_stays_eligible_when_alone(self):
         """A peer whose pull failed (bad block) has `_pulling` cleared but is NOT excluded.
         When they're the only source above us, next tick picks them again."""

@@ -247,7 +247,7 @@ class Node:
         try:
             msg = SyncMsg.decode(env.env.verb, env.env.body)
         except (SyncAdapterError, DudeError):
-            self.follower.cancel_pull(env.frm)
+            self.follower.cancel_pull(env.frm, now)
             return
         self.follower.receive(msg, env.frm, now)
 

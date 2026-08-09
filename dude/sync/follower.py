@@ -60,6 +60,7 @@ class Follower:
     _poll_at: dict[crypto.PublicKey, Millis] = field(default_factory=dict)
     _pulling: PullInFlight | None = None
     _last_ok_at: dict[crypto.PublicKey, Millis] = field(default_factory=dict)
+    _last_fail_at: dict[crypto.PublicKey, Millis] = field(default_factory=dict)
     _outbox: list[OutboxItem] = field(default_factory=list)
 
     def add_peer(self, peer: crypto.PublicKey, now: Millis) -> None:
@@ -77,9 +78,10 @@ class Follower:
         elif isinstance(msg, Refused):
             self._on_refused(msg, from_, now)
 
-    def cancel_pull(self, from_: crypto.PublicKey) -> None:
+    def cancel_pull(self, from_: crypto.PublicKey, now: Millis) -> None:
         if self._pulling is not None and self._pulling.peer == from_:
             self._pulling = None
+            self._last_fail_at[from_] = now
 
     def tick(self, now: Millis) -> None:
         for peer, deadline in list(self._poll_at.items()):
@@ -88,6 +90,7 @@ class Follower:
                 self._poll_at[peer] = now + self.tunables.sync.poll_interval
         p = self._pulling
         if p is not None and now - p.sent_at > self.tunables.sync.pull_timeout:
+            self._last_fail_at[p.peer] = now
             self._pulling = None
         if self._pulling is None:
             source = self._pick_pull_source()
@@ -162,6 +165,12 @@ class Follower:
         served = 0
         for offer in msg.payload:
             if offer.block.anchors.block_num != p.frm + served or not self._adopt(offer):
+                # A fail mark, NOT a shun (#no-shun-only-priority): the peer stays a candidate
+                # and this only orders it behind peers that have not failed. Without it, a
+                # peer that SERVES unverifiable blocks -- unlike one that refuses -- kept its
+                # claimed head and kept winning the pick, and a fresh joiner with one such
+                # peer above it never asked the honest sources at all.
+                self._last_fail_at[from_] = now
                 return
             served += 1
         if served == 0:
@@ -232,7 +241,17 @@ class Follower:
         candidates = [(peer, hr) for peer, hr in self._heads.items() if hr.block_num > my_num]
         if not candidates:
             return None
-        candidates.sort(key=lambda p_hr: (-self._last_ok_at.get(p_hr[0], 0), -p_hr[1].block_num))
+        # Fail-recency sits between success-recency and claimed height: a fresh joiner has no
+        # ok-history, so height decided alone, and one peer whose pulls always fail -- silent
+        # after claiming, or serving garbage -- outbid every honest source forever on the
+        # strength of its claim.
+        candidates.sort(
+            key=lambda p_hr: (
+                -self._last_ok_at.get(p_hr[0], 0),
+                self._last_fail_at.get(p_hr[0], 0),
+                -p_hr[1].block_num,
+            )
+        )
         return candidates[0][0]
 
     def _tip(self) -> crypto.Digest:
