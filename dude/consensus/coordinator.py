@@ -4,7 +4,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from ..core import crypto
-from ..core.errors import InvariantError
+from ..core.errors import DudeError, InvariantError
 from ..core.units import Millis
 from ..net.envelope import SignedEnvelope, Verb
 from ..store import Layer, Store, settle
@@ -89,8 +89,14 @@ class Coordinator:
     def _abandon_by(self, bucket: Bucket) -> Millis:
         return self.tunables.mempool.bucket_start(bucket + 2)
 
+    @property
+    def in_roster(self) -> bool:
+        """Whether we hold a seat RIGHT NOW. The Follower can adopt a roster change at any tick,
+        so this is read at each decision rather than cached at construction."""
+        return self.mgmt.is_member(self.me.public)
+
     def submit(self, tx: SignedTransaction, now: Millis) -> Refusal | None:
-        if self.me.public not in self.mgmt.roster():
+        if not self.in_roster:
             # A non-member ACCEPTED submissions and then discarded its whole mempool at the
             # bucket boundary -- rotation happens before _open_round declines -- so the
             # client held an ACCEPTED for a tx that vanished without a trace. Refused here,
@@ -166,7 +172,16 @@ class Coordinator:
             and self.current_round.ratified() is not None
             and self.settling is None
         ):
-            self._promote_to_settling(now)
+            try:
+                self._promote_to_settling(now)
+            except DudeError as e:
+                # NOT CATCHABLE. Promote refuses by returning; anything that RAISES past that
+                # point is the evaluator, the SMT or an accumulator failing, which is corruption
+                # or non-determinism rather than a peer's fault. Left as a DudeError it was
+                # swallowed at the crash-only boundary and the bucket's agreed work disappeared
+                # in silence. Fatal means the supervisor respawns us and the Follower resyncs --
+                # which is the only way to actually rely on core machinery not failing.
+                raise InvariantError(f"promote to settling raised mid-transition: {e}") from e
 
         self._close_current_bucket(now)
 
@@ -193,10 +208,10 @@ class Coordinator:
         self.current_bucket = closed + 1
 
     def _open_round(self, bucket: Bucket, frozen: Mempool, now: Millis) -> None:
-        roster = self.mgmt.roster()
-        if self.me.public not in roster:
+        if not self.in_roster:
             return  # follower-only: Round refuses `me not in roster`, and the raise would tear
             # down the node's tick. Sit out consensus and let the Follower catch us up.
+        roster = self.mgmt.roster()
         r = Round(
             bucket=bucket,
             me=self.me,
@@ -219,29 +234,34 @@ class Coordinator:
         self.current_round = None
 
     def _promote_to_settling(self, now: Millis) -> None:
+        """REFUSE FIRST, THEN COMMIT TO IT. Everything that can decline sits above the first
+        mutation; everything below it is core machinery whose failure is not a peer's fault.
+
+        The two used to be interleaved: `current_round` was cleared, and `SettleRound` then
+        refused a roster we had just been removed from with a DudeError -- swallowed at the
+        crash-only boundary with `settling` never assigned. The ratified slice was neither
+        committed nor re-admitted and the whole bucket's agreed work vanished, no error
+        anywhere. Losing a seat was one way in; every raise between those two lines was another.
+        """
         r = self.current_round
         if r is None:
             raise InvariantError("_promote_to_settling with no in-flight Round")
         block = r.ratified()
         if block is None:
             raise InvariantError("_promote_to_settling with unratified Round")
-        roster = self.mgmt.roster()
-        if self.me.public not in roster:
-            # The follower adopted a roster change removing us between round open and
-            # promote. Unguarded, SettleRound's raise (a DudeError) unwound AFTER
-            # current_round was cleared and BEFORE settling was assigned -- swallowed at
-            # the frame boundary, the ratified slice neither committed nor re-admitted,
-            # gone without a trace. Sit out like _open_round does: the remaining quorum
-            # settles this block and the Follower adopts it; what the round held beyond
-            # the slice goes back to the mempool, as abandonment does.
-            for tx in r.surviving():
-                self.mempool.admit(tx, now, self.store, self.mgmt)
+        if not self.in_roster:
+            # The Follower adopted a roster change removing us between open and promote. The
+            # round is void: the remaining quorum settles this block and we adopt it as any
+            # follower does. What the round held is NOT re-admitted -- a node without a seat
+            # cannot open a round, is refused at `submit`, and has no way to hand its mempool
+            # to anyone, so re-admitting only reads as a recovery it cannot perform. Clients
+            # holding an ACCEPTED from us lose it; that is what losing the seat means.
             self.current_round = None
             return
+        roster = self.mgmt.roster()
         bucket = r.bucket()
         slice_txs = r.slice_bodies()
         surviving = r.surviving()
-        self.current_round = None
 
         already = self.store.settled_hashes(tuple(tx.op_hash for tx in slice_txs))
         slice_txs = tuple(tx for tx in slice_txs if tx.op_hash not in already)
@@ -288,6 +308,7 @@ class Coordinator:
             first_height=base_head + 1,
             settle_round=sr,
         )
+        self.current_round = None  # released only now that `settling` holds the ratified block
         self.settle_adapter.flush(sr, now)
 
     def _on_settled(self, now: Millis) -> None:

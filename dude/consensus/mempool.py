@@ -47,6 +47,7 @@ class Refusal(Enum):
     UNSIGNED = "signature"
     CANNOT_APPLY = "cannot-apply"
     NOT_IN_ROSTER = "not-in-roster"
+    REPEATED_OP = "repeated-op"
 
 
 TOO_OLD = Refusal.TOO_OLD
@@ -65,7 +66,9 @@ class Mempool:
     tunables: Tunables = field(default_factory=Tunables)
     pending: dict[Bucket, dict[crypto.Digest, ops.SignedTransaction]] = field(default_factory=dict)
 
-    def valid(  # THE CLOCK MAY CHOOSE, IT MAY NOT JUDGE: `now` is read here and in `propose`,
+    def valid(  # noqa: PLR0911 -- each early-return names a distinct refusal a client can act
+        # on; collapsing them hides which door it was turned away at.
+        # THE CLOCK MAY CHOOSE, IT MAY NOT JUDGE: `now` is read here and in `propose`,
         # never in verifying a proposal. A clock read anywhere else turns skew from a throughput
         # cost into a liveness or safety failure.
         self,
@@ -81,6 +84,14 @@ class Mempool:
             return Refusal.TOO_NEW
         if not tx.verify():
             return Refusal.UNSIGNED
+        # One operation, once. A tx carrying the same mutation twice applies it twice in the
+        # preview that computes a block's anchors and once in the store, which is a log position
+        # of disagreement between what a block is signed for and what it settles. `apply_to` and
+        # `_apply_within` both dedup now, so this is not what holds that -- it refuses the shape
+        # at the door instead of letting every later stage carry the question.
+        mutations = [step.mutation for step in tx.steps]
+        if len(set(mutations)) != len(mutations):
+            return Refusal.REPEATED_OP
         # A settled tx MUST NOT re-enter (#dedup-content-address). This is why the parameter is
         # `Ledger` and not `Reader`: an overlay has no log, so admitting against one cannot compile.
         if reader.has_settled(tx.op_hash):

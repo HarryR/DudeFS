@@ -102,10 +102,21 @@ def apply_to(
 ) -> Screened:
     keep: list[ops.SignedTransaction] = []
     drop: list[Reject] = []
+    seen: set[crypto.Digest] = set()
     for tx in batch:
+        # SAME DEDUP AS `StoreWriter._apply_within`, and it must stay the same: this half
+        # computes the anchors a block is signed with, that half decides what the block actually
+        # settles. Dropping a within-batch duplicate in only one of them made the two disagree by
+        # a whole log position -- `_expect_anchors` raises InvariantError on the settle path, and
+        # the follower's `_adopt` has no such check and would commit a block whose signed height
+        # and A_log describe a state no node holds.
+        if tx.op_hash in seen:
+            drop.append(Reject(tx, Verdict(Reason.SETTLED)))
+            continue
         verdict, layer = evaluate(target, tx, auth)
         if verdict:
             target.absorb(layer)
+            seen.add(tx.op_hash)
             keep.append(tx)
         else:
             drop.append(Reject(tx, verdict))

@@ -334,17 +334,31 @@ class MgmtReader:
                 continue
         return out
 
+    def _seats(self, who: crypto.PublicKey, rec: NodeRecord) -> bool:
+        """Whether one row is a roster seat. PER-ROW, with no cross-member condition, which is
+        what lets `is_member` answer from a single read -- and ONE implementation, so it and
+        `roster()` cannot come to disagree about who is in the cluster."""
+        return (
+            rec.cert.subject == who
+            and rec.cert.purpose == CERT_PURPOSE_ROSTER
+            and self.verify_cert(rec.cert, self.src)
+        )
+
     def roster(self) -> tuple[crypto.PublicKey, ...]:
-        out: list[crypto.PublicKey] = []
-        for who, rec in self.nodes().items():
-            if rec.cert.subject != who:
-                continue
-            if rec.cert.purpose != CERT_PURPOSE_ROSTER:
-                continue
-            if not self.verify_cert(rec.cert, self.src):
-                continue
-            out.append(who)
-        return tuple(sorted(out))
+        return tuple(sorted(who for who, rec in self.nodes().items() if self._seats(who, rec)))
+
+    def is_member(self, who: crypto.PublicKey) -> bool:
+        """One row read and ONE signature verified, against `roster()`'s one per member. This
+        runs on the submit path for every transaction a client offers, where walking the whole
+        roster made each submission cost a verification per node."""
+        raw = self.src.get(self.store_id, P_NODE + who)
+        if raw is None:
+            return False
+        try:
+            rec = NodeRecord.decode_row(who, raw.value)
+        except DudeError:
+            return False
+        return self._seats(who, rec)
 
     def verify_cert(self, cert: Cert, reader: Reader) -> bool:  # noqa: PLR0911 -- each early-return names a distinct refusal reason; collapsing them into one `and`-chain hides which check failed
         """The signer's grant MUST resolve against the SAME `reader` as the row it attests.

@@ -9,6 +9,7 @@ from dude import quorum
 from dude.core import codec, crypto
 from dude.core.errors import DudeError
 from dude.net.address import Address, Endpoint, Scheme
+from dude.store import layer as layer_mod
 from dude.store import management, ops, settle, store
 
 D = ops.STORE_DATA
@@ -526,6 +527,34 @@ class TestTransferAndSettlementRace(unittest.TestCase):
         self.assertEqual(len(got.settled), 1)
         self.assertEqual([d.why for d in got.dropped], [settle.Reason.SETTLED])
         self.assertEqual(self.s.head(), 1, "the duplicate must not take a log position")
+
+    def test_the_preview_and_the_applier_agree_on_what_a_batch_settles(self):
+        """THE PIN. `settle.apply_to` computes the anchors a block is SIGNED with; `_apply_within`
+        decides what the block SETTLES. Dedup landed in the applier alone, and the two disagreed by
+        a whole log position on a batch carrying a duplicate: the settle path raises InvariantError
+        out of `_expect_anchors` -- fatal, not a peer's fault -- and the follower's `_adopt`, which
+        has no such check, would commit a block whose signed height and A_log describe a state no
+        node holds. Same shape as an encode/decode pair, and pinned the same way."""
+        t = tx(self.kp, muts=(ops.Set(ops.STORE_DATA, b"k", b"v"),))
+        batch = (t, t)
+
+        layer = layer_mod.Layer(self.s)
+        screened = settle.apply_to(layer, batch, self.mgmt)
+
+        got = self.s.commit_block(
+            1,
+            first_height=1,
+            block_bytes=b"b1",
+            block_hash=crypto.h(b"b1"),
+            batch=batch,
+            auth=self.mgmt,
+        )
+        self.assertEqual(
+            len(screened.survivors),
+            len(got.settled),
+            "the anchors would be signed for a height the store does not reach",
+        )
+        self.assertEqual(self.s.head(), len(screened.survivors))
 
     def test_the_survivors_of_a_mixed_batch_still_land(self):
         """One duplicate must not take the batch down with it."""

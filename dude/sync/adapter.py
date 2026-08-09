@@ -110,7 +110,7 @@ class SettledBlockReply(SyncMsg):
 
 @dataclass(frozen=True, slots=True)
 class Refused(SyncMsg):
-    verb: ClassVar[Verb] = Verb.REFUSED
+    verb: ClassVar[Verb] = Verb.SYNC_REFUSED
 
     reason: SyncRefusal
 
@@ -122,7 +122,7 @@ class Refused(SyncMsg):
         try:
             reason = SyncRefusal(body.decode("utf-8"))
         except (ValueError, UnicodeDecodeError) as e:
-            raise SyncAdapterError(f"unknown REFUSED reason: {body!r}") from e
+            raise SyncAdapterError(f"unknown SYNC_REFUSED reason: {body!r}") from e
         return cls(reason=reason)
 
 

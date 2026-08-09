@@ -7,7 +7,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from .consensus import Coordinator, Mempool, RoundAdapter, SettleAdapter
-from .core import crashonly, crypto
+from .core import crypto
 from .core.errors import DudeError
 from .core.units import Millis, now_ms
 from .net import Verb
@@ -41,14 +41,15 @@ REPLIES = frozenset(
     {
         Verb.PONG,
         Verb.ACCEPTED,
+        Verb.REFUSED,
         Verb.ANCHORS_REPLY,
         Verb.PROOF_REPLY,
         Verb.LITE_REFUSED,
     }
 )
-"""Answers a Node never consumes -- ACCEPTED by a submitting client, the last three by a
-`LightClient`. REFUSED is NOT here: like HEIGHT_REPLY and SETTLED_BLOCK it answers a Node's own
-request, and a reply the Node consumes must be in HANDLED or the dispatch table discards it."""
+"""Answers a Node never consumes -- ACCEPTED and REFUSED by a submitting client, the last three
+by a `LightClient`. A reply the Node DOES consume must be in HANDLED or the dispatch table
+discards it: HEIGHT_REPLY, SETTLED_BLOCK and SYNC_REFUSED all answer a Node's own request."""
 
 HANDLED = frozenset(
     {
@@ -61,7 +62,7 @@ HANDLED = frozenset(
         Verb.HEIGHT_REPLY,
         Verb.GETBLOCK,
         Verb.SETTLED_BLOCK,
-        Verb.REFUSED,
+        Verb.SYNC_REFUSED,
         Verb.PING,
         Verb.GET_ANCHORS,
         Verb.GET_PROOF,
@@ -229,7 +230,7 @@ class Node:
             env, serve_getblocks(self.store, req, self.tunables.sync.pull_batch), now
         )
 
-    def _on_refused(self, env: SignedEnvelope, now: Millis) -> None:
+    def _on_sync_refused(self, env: SignedEnvelope, now: Millis) -> None:
         # A peer's answer to our own GETBLOCK. It had no dispatch entry, so every sync
         # refusal was discarded at the door: the follower's refusal handling ran only in
         # tests that called it directly, each refusal cost a full pull_timeout instead of
@@ -297,12 +298,6 @@ class Node:
     def start(self, *listeners: Listener) -> None:
         if self._thread is not None:
             return
-        # _run's contract is that a non-DudeError escaping a node thread is fatal:
-        # excepthook -> os._exit(70), supervisor respawns. That held only if someone
-        # installed the hook, and nobody did -- the thread died, the listeners kept
-        # accepting frames into an inbox nobody drained, and the process lived on
-        # indistinguishable from a healthy node.
-        crashonly.install()
         started: list[Listener] = []
         try:
             self.postman.start(self._inbox)

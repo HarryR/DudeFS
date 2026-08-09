@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import unittest
 
+from ..consensus.mempool import Refusal
 from ..consensus.round import Block
 from ..consensus.settle_round import (
     Anchors,
@@ -109,18 +110,18 @@ class TestRefusal(unittest.TestCase):
         for reason in (SyncRefusal.NOT_YET_SETTLED, SyncRefusal.UNKNOWN):
             msg = Refused(reason=reason)
             verb, body = msg.encode()
-            self.assertIs(verb, Verb.REFUSED)
+            self.assertIs(verb, Verb.SYNC_REFUSED)
             self.assertEqual(SyncMsg.decode(verb, body), msg)
 
     def test_unknown_reason_string_raises(self):
         """An honest peer's `Refused` body MUST name a known reason; a stringly-typed unknown
         value means protocol mismatch, not a routine drop."""
         with self.assertRaises(SyncAdapterError):
-            SyncMsg.decode(Verb.REFUSED, b"some-reason-we-do-not-know")
+            SyncMsg.decode(Verb.SYNC_REFUSED, b"some-reason-we-do-not-know")
 
     def test_non_utf8_body_raises(self):
         with self.assertRaises(SyncAdapterError):
-            SyncMsg.decode(Verb.REFUSED, b"\xff\xfe")
+            SyncMsg.decode(Verb.SYNC_REFUSED, b"\xff\xfe")
 
     def test_invalid_is_not_a_valid_wire_reason(self):
         """`INVALID` is the port-safety zero -- MUST NOT be sent. `SyncMsg.decode(REFUSED,
@@ -130,7 +131,25 @@ class TestRefusal(unittest.TestCase):
         branch as any other `Refused` reason. The port-safety property is what stops a Go
         zero-valued field silently meaning NOT_YET_SETTLED."""
         _, body = Refused(reason=SyncRefusal.INVALID).encode()
-        self.assertEqual(SyncMsg.decode(Verb.REFUSED, body), Refused(reason=SyncRefusal.INVALID))
+        self.assertEqual(
+            SyncMsg.decode(Verb.SYNC_REFUSED, body), Refused(reason=SyncRefusal.INVALID)
+        )
+
+
+class TestSubmitRefusalsAreNotSyncRefusals(unittest.TestCase):
+    """One verb used to carry both vocabularies: `REFUSED` answered a client's SUBMIT with a
+    `mempool.Refusal` value AND a peer's GETBLOCK with a `SyncRefusal` value, and the body said
+    nothing about which. Decoding was unambiguous only because the two value sets happened not to
+    overlap, while both kept growing -- the first collision would have had a submit refusal
+    correcting down a peer's claimed head."""
+
+    def test_the_two_verbs_are_distinct(self):
+        self.assertIsNot(Verb.REFUSED, Verb.SYNC_REFUSED)
+
+    def test_a_submit_refusal_body_is_not_decodable_as_a_sync_message(self):
+        for refusal in Refusal:
+            with self.assertRaises(SyncAdapterError):
+                SyncMsg.decode(Verb.REFUSED, refusal.value.encode())
 
 
 class TestDecodeVerbGuard(unittest.TestCase):

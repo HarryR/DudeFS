@@ -14,6 +14,7 @@ from ..consensus.mempool import (
     TOO_OLD,
     UNSIGNED,
     Mempool,
+    Refusal,
     Tunables,
 )
 from ..core import crypto
@@ -117,6 +118,17 @@ class TestAdmission(unittest.TestCase):
 
     def _admit(self, tx, now=T0):
         return self.mp.admit(tx, now, self.store, self.mgmt)
+
+    def test_a_transaction_repeating_one_operation_is_refused_at_the_door(self):
+        """One operation, once. A repeated mutation applies twice in the preview that computes a
+        block's anchors and once in the store, so it costs a log position of disagreement between
+        what a block is signed for and what it settles. Both halves dedup, so this is not what
+        holds that -- it refuses the shape at the door rather than letting every later stage carry
+        the question."""
+        m = ops.Set(ops.STORE_DATA, b"k", b"v")
+        doubled = ops.writes(m, m).sign(self.kp, T0)
+        self.assertEqual(self._admit(doubled), Refusal.REPEATED_OP)
+        self.assertIsNone(self._admit(ops.writes(m).sign(self.kp, T0)), "the single op is fine")
 
     def test_clock_faults_are_named_not_merely_refused(self):
         """A client self-corrects only if the refusal says WHICH way its clock is wrong (§1.1)."""

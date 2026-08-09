@@ -31,11 +31,13 @@ from ..store.management import (
     Cert,
     Grant,
     ManagementError,
+    MgmtReader,
     MgmtWriter,
     NodeRecord,
     Role,
     RosterCommitment,
 )
+from .cluster import TUNABLES, Cluster
 
 T0 = 1_700_000_000_000
 
@@ -852,6 +854,62 @@ class TestMalformedRowsDoNotPoison(unittest.TestCase):
         applied = self.s.apply((attempt,), auth=self.mgmt)
         self.assertEqual(applied.settled, ())
         self.assertEqual([d.why for d in applied.dropped], [settle.Reason.AUTHORITY])
+
+
+class TestIsMemberAndRosterCannotDisagree(unittest.TestCase):
+    """`is_member` reads ONE row and verifies ONE signature; `roster()` does it per member. Two
+    implementations of who is in the cluster is the shape that has cost this codebase most, so
+    they SHARE the per-row predicate rather than restating it -- this pins that they answer alike
+    on real cluster state, and `_seats` is why they cannot come apart."""
+
+    def test_they_agree_on_every_member_and_on_a_stranger(self):
+        mgmt = MgmtReader(Cluster().nodes[0].store)
+        roster = mgmt.roster()
+        self.assertTrue(roster, "no roster to compare against")
+        for who in roster:
+            self.assertTrue(mgmt.is_member(who), "a seat roster() grants, is_member refuses")
+        self.assertFalse(mgmt.is_member(crypto.Keypair.generate().public))
+
+    def test_a_row_that_is_not_a_seat_is_refused_by_both(self):
+        """THE STATE THAT DISTINGUISHES THEM. Removal deletes the row, so on every other path
+        "a row exists" and "the row is a seat" coincide and an `is_member` that skipped the
+        predicate would pass every other test here. A row whose roster cert does not verify is
+        the one shape where they can disagree."""
+        c = Cluster(size=4)
+        s = c.nodes[0].store
+        victim = c.keys[3].public
+        raw = s.get(ops.STORE_MANAGEMENT, P_NODE + victim)
+        assert raw is not None
+        rec = NodeRecord.decode_row(victim, raw.value)
+        forged = NodeRecord(
+            identity=rec.identity,
+            endpoints=rec.endpoints,
+            cert=Cert(
+                rec.cert.signer, rec.cert.subject, rec.cert.purpose, crypto.Signature(bytes(64))
+            ),
+            domains=rec.domains,
+        )
+        plant = ops.writes(
+            ops.Set(ops.STORE_MANAGEMENT, P_NODE + victim, forged.encode_row())
+        ).sign(c.mgr, T0)
+        intervene(s, c.mgr, bodies=(plant,), bucket=TUNABLES.mempool.bucket(c.clock))
+
+        mgmt = MgmtReader(s)
+        self.assertIsNotNone(s.get(ops.STORE_MANAGEMENT, P_NODE + victim), "the row must exist")
+        self.assertNotIn(victim, mgmt.roster())
+        self.assertFalse(mgmt.is_member(victim), "is_member took a row's existence for a seat")
+
+    def test_a_removed_node_stops_being_a_member_by_both_readings(self):
+        c = Cluster(size=4)
+        s = c.nodes[0].store
+        victim = c.keys[3].public
+        self.assertTrue(MgmtReader(s).is_member(victim))
+        remove = (
+            MgmtWriter(s).change_roster(commitment_signer=c.mgr, remove=(victim,)).sign(c.mgr, T0)
+        )
+        intervene(s, c.mgr, bodies=(remove,), bucket=TUNABLES.mempool.bucket(c.clock))
+        self.assertNotIn(victim, MgmtReader(s).roster())
+        self.assertFalse(MgmtReader(s).is_member(victim))
 
 
 if __name__ == "__main__":

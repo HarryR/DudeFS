@@ -201,24 +201,21 @@ class TestNodeLifecycle(unittest.TestCase):
 
 
 class TestCrashOnly(unittest.TestCase):
-    def test_start_installs_the_crash_only_excepthook(self):
-        """`_run` suppresses DudeError only, on the contract that anything else reaching the
-        excepthook is `os._exit(70)` and a supervisor respawn. Nothing installed that hook: the
-        node thread died, the listeners kept accepting frames into an inbox nobody drained, and
-        the process lived on indistinguishable from a healthy node. Driven through Node.start()
-        in a subprocess; the raising thread stands in for any node-side thread."""
+    def test_the_installed_hook_takes_the_process_down_with_the_thread(self):
+        """`Node._run` suppresses DudeError only, on the contract that anything else reaching the
+        excepthook is `os._exit(70)` and a supervisor respawn. This pins the MECHANISM; who calls
+        `install()` is a process entrypoint's job, and there is no entrypoint yet -- so nothing
+        installs it, and a node thread dying of a non-DudeError still leaves a zombie whose
+        listeners accept frames into an inbox nobody drains. It was briefly called from
+        `Node.start()`, which put a process-wide `os._exit` hook inside a library constructor --
+        every importer of Node inherits that, this suite included. Subprocess, because a passing
+        run of this test ends in `os._exit`."""
         code = textwrap.dedent(
             """
             import threading
-            from dude.core import crypto
-            from dude.node import Node
-            from dude.store import Store
+            from dude.core import crashonly
 
-            kp = crypto.Keypair.generate()
-            s = Store()
-            s.provision(kp.public)
-            node = Node(kp, s)
-            node.start()
+            crashonly.install()
 
             def boom():
                 raise RuntimeError("unguarded escape from a node-side thread")

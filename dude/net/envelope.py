@@ -30,6 +30,11 @@ class Verb(IntEnum):
     HEIGHT_REPLY = 31
     GETBLOCK = 32
     SETTLED_BLOCK = 33
+    SYNC_REFUSED = 34
+    """A Node's answer to a Node's GETBLOCK. SEPARATE FROM `REFUSED`, which answers a client's
+    SUBMIT: one verb carried both, so the body was a `SyncRefusal` value or a `mempool.Refusal`
+    value depending on who sent it and nothing said which. The two value sets merely happened not
+    to overlap; both are still growing."""
 
     GET_ANCHORS = 40
     ANCHORS_REPLY = 41
@@ -38,6 +43,8 @@ class Verb(IntEnum):
     LITE_REFUSED = 44
 
     REFUSED = 90
+    """A node's answer to a client's SUBMIT, body a `mempool.Refusal` value. Sync refusals are
+    `SYNC_REFUSED`."""
 
 
 type MessageId = bytes

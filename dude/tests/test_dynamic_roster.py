@@ -8,17 +8,19 @@
 from __future__ import annotations
 
 import unittest
+from unittest import mock
 
 from dude.consensus.bootstrap import intervene
 from dude.consensus.mempool import Refusal
 from dude.consensus.round import Bodies, Round
 from dude.core import crypto
+from dude.core.errors import DudeError, InvariantError
 from dude.net.address import Endpoint
 from dude.net.envelope import Envelope, Verb
 from dude.net.postman import Recipient
 from dude.net.transports import address_of
 from dude.node import Node
-from dude.store import ops
+from dude.store import ops, settle
 from dude.store.management import P_ROSTER, Cert, MgmtWriter, NodeRecord
 
 from .cluster import DELTA, T0, TUNABLES, Cluster
@@ -171,8 +173,14 @@ class TestAGarbageRosterRowDoesNotStopTheNode(unittest.TestCase):
         self.assertIsNotNone(node.store.roster_incomplete())
 
 
-def _wire_rounds(rounds: dict[crypto.PublicKey, Round], now: int) -> None:
-    """Drain every Round's outbox and deliver to targets -- test_round's `_wire` shape."""
+def _wire_rounds(
+    rounds: dict[crypto.PublicKey, Round], now: int, drop_bodies: frozenset | None = None
+) -> None:
+    """Drain every Round's outbox and deliver to targets -- test_round's `_wire` shape.
+
+    `drop_bodies` loses the phase-2 push of those op_hashes. That is the ONLY way a holding ends
+    up in `surviving()`: phase 2 exists to close exactly this gap, so a tx one node holds alone
+    otherwise reaches the others and joins the intersection slice."""
     for src_id, src in rounds.items():
         for target, msg in src.outbox():
             for dst_id, dst in rounds.items():
@@ -181,7 +189,11 @@ def _wire_rounds(rounds: dict[crypto.PublicKey, Round], now: int) -> None:
                 if target is not Recipient.ALL and target != dst_id:
                     continue
                 if isinstance(msg, Bodies):
-                    dst.absorb(msg, src_id, msg.txs)
+                    keep = msg.txs
+                    if drop_bodies:
+                        keep = tuple(t for t in msg.txs if t.op_hash not in drop_bodies)
+                    if keep:
+                        dst.absorb(msg, src_id, keep)
                 else:
                     dst.receive(msg, from_=src_id, now=now)
 
@@ -194,10 +206,17 @@ class TestRosterRemovalRacingAnInFlightRound(unittest.TestCase):
     committed nor re-admitted, and the tick simply moved on."""
 
     def _ratified_round_for(
-        self, c: Cluster, tx: ops.SignedTransaction
+        self,
+        c: Cluster,
+        tx: ops.SignedTransaction,
+        only_ours: ops.SignedTransaction | None = None,
     ) -> dict[crypto.PublicKey, Round]:
         """One Round per roster member, all holding `tx`, HELD/SIG exchanged for real until
-        every member ratifies -- over the cluster's actual roster and chain tip."""
+        every member ratifies -- over the cluster's actual roster and chain tip.
+
+        `only_ours` is held by `c.keys[0]` alone, so the intersection slice cannot carry it and
+        it lands in that node's `surviving()`. Without one, `surviving()` is empty and anything
+        asserted about it holds vacuously."""
         roster = c.nodes[0].mgmt.roster()
         prev = c.nodes[0].store.head_block_hash()
         assert prev is not None
@@ -213,13 +232,16 @@ class TestRosterRemovalRacingAnInFlightRound(unittest.TestCase):
             )
             for kp in c.keys
         }
-        for r in rounds.values():
-            r.add_local([tx])
+        for who, r in rounds.items():
+            mine = [tx, only_ours] if only_ours is not None and who == c.keys[0].public else [tx]
+            r.add_local(mine)
         now = T0
         for _ in range(30):
             for r in rounds.values():
                 r.tick(now)
-            _wire_rounds(rounds, now)
+            _wire_rounds(
+                rounds, now, frozenset({only_ours.op_hash}) if only_ours is not None else None
+            )
             if all(r.ratified() is not None for r in rounds.values()):
                 return rounds
             now += 20
@@ -246,6 +268,70 @@ class TestRosterRemovalRacingAnInFlightRound(unittest.TestCase):
         self.assertIsNone(node.coordinator.current_round, "the round must be released")
         self.assertIsNone(node.coordinator.settling, "a non-member must not settle")
         node.tick(T0 + DELTA)  # and the node keeps ticking
+
+    def test_what_the_lost_round_held_is_not_re_admitted(self):
+        """Losing the seat is the end of it. A node without one cannot open a round, is refused
+        at `submit`, and has no way to hand its mempool to anybody -- so putting the round's
+        holdings back reads as a recovery it cannot perform, and they would sit there until
+        `evict_after`. Clients holding an ACCEPTED from us lose it; that is what removal means."""
+        c = Cluster(size=4)
+        node = c.nodes[0]
+        tx = ops.writes(ops.Set(ops.STORE_DATA, crypto.h(b"race"), b"v")).sign(c.mgr, T0)
+        mine = ops.writes(ops.Set(ops.STORE_DATA, crypto.h(b"mine-alone"), b"v")).sign(c.mgr, T0)
+        rounds = self._ratified_round_for(c, tx, only_ours=mine)
+        r = rounds[node.me.public]
+        self.assertIn(
+            mine.op_hash,
+            {t.op_hash for t in r.surviving()},
+            "the harness did not leave anything surviving; the assertion below would be vacuous",
+        )
+        node.coordinator.current_round = r
+
+        remove_tx = (
+            MgmtWriter(node.store)
+            .change_roster(commitment_signer=c.mgr, remove=(node.me.public,))
+            .sign(c.mgr, T0)
+        )
+        intervene(node.store, c.mgr, bodies=(remove_tx,), bucket=665)
+        self.assertNotIn(node.me.public, node.mgmt.roster())
+
+        node.coordinator.tick(T0 + 200)
+        self.assertNotIn(
+            mine.op_hash,
+            node.coordinator.mempool.all_bodies(),
+            "a seatless node re-admitted work it can never propose",
+        )
+
+
+class TestPromoteFailingIsFatalNotSilent(unittest.TestCase):
+    """Promote REFUSES by returning. Anything that RAISES past that point is the evaluator, the
+    SMT or an accumulator failing -- corruption or non-determinism, not a peer's fault. As a
+    DudeError it was swallowed at the crash-only boundary with the round already released and
+    `settling` never assigned, so a whole bucket's agreed work vanished without an error
+    anywhere. There is no transaction to roll back in Python; making the failure fatal is how
+    the core is relied upon."""
+
+    def test_a_dude_error_from_the_core_is_fatal_and_keeps_the_round(self):
+        c = Cluster(size=4)
+        node = c.nodes[0]
+        tx = ops.writes(ops.Set(ops.STORE_DATA, crypto.h(b"boom"), b"v")).sign(c.mgr, T0)
+        rounds = TestRosterRemovalRacingAnInFlightRound()._ratified_round_for(c, tx)
+        node.coordinator.current_round = rounds[node.me.public]
+        self.assertIn(node.me.public, node.mgmt.roster(), "must be a member, or it sits out")
+
+        with (
+            mock.patch.object(settle, "apply_to", side_effect=DudeError("evaluator exploded")),
+            self.assertRaises(InvariantError) as cm,
+        ):
+            node.coordinator.tick(T0 + 200)
+
+        self.assertIn("mid-transition", str(cm.exception), "some OTHER InvariantError fired")
+        self.assertFalse(isinstance(cm.exception, DudeError), "a swallowed failure is the bug")
+        self.assertIsNotNone(
+            node.coordinator.current_round,
+            "the ratified round was released before the work that failed",
+        )
+        self.assertIsNone(node.coordinator.settling)
 
 
 class TestANonMemberRefusesSubmissions(unittest.TestCase):
