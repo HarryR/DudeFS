@@ -10,13 +10,18 @@ from __future__ import annotations
 import unittest
 
 from dude.consensus.bootstrap import intervene
+from dude.consensus.mempool import Refusal
+from dude.consensus.round import Bodies, Round
 from dude.core import crypto
 from dude.net.address import Endpoint
+from dude.net.envelope import Envelope, Verb
+from dude.net.postman import Recipient
 from dude.net.transports import address_of
+from dude.node import Node
 from dude.store import ops
 from dude.store.management import P_ROSTER, Cert, MgmtWriter, NodeRecord
 
-from .cluster import DELTA, T0, Cluster
+from .cluster import DELTA, T0, TUNABLES, Cluster
 
 
 class TestRosterAdditionReachesPostman(unittest.TestCase):
@@ -164,6 +169,104 @@ class TestAGarbageRosterRowDoesNotStopTheNode(unittest.TestCase):
         self.assertIsNone(node.mgmt.roster_commitment())
         node.tick(T0 + DELTA)  # must not raise
         self.assertIsNotNone(node.store.roster_incomplete())
+
+
+def _wire_rounds(rounds: dict[crypto.PublicKey, Round], now: int) -> None:
+    """Drain every Round's outbox and deliver to targets -- test_round's `_wire` shape."""
+    for src_id, src in rounds.items():
+        for target, msg in src.outbox():
+            for dst_id, dst in rounds.items():
+                if dst_id == src_id:
+                    continue
+                if target is not Recipient.ALL and target != dst_id:
+                    continue
+                if isinstance(msg, Bodies):
+                    dst.absorb(msg, src_id, msg.txs)
+                else:
+                    dst.receive(msg, from_=src_id, now=now)
+
+
+class TestRosterRemovalRacingAnInFlightRound(unittest.TestCase):
+    """The follower can adopt a roster change that removes this node between a Round's
+    ratification and its promote tick. `_open_round` guards membership; promote did not:
+    SettleRound's raise (a DudeError) unwound AFTER current_round was cleared and BEFORE
+    settling was assigned -- swallowed at the frame boundary, the ratified slice neither
+    committed nor re-admitted, and the tick simply moved on."""
+
+    def _ratified_round_for(
+        self, c: Cluster, tx: ops.SignedTransaction
+    ) -> dict[crypto.PublicKey, Round]:
+        """One Round per roster member, all holding `tx`, HELD/SIG exchanged for real until
+        every member ratifies -- over the cluster's actual roster and chain tip."""
+        roster = c.nodes[0].mgmt.roster()
+        prev = c.nodes[0].store.head_block_hash()
+        assert prev is not None
+        rounds = {
+            kp.public: Round(
+                bucket=TUNABLES.mempool.bucket(T0),
+                me=kp,
+                roster=roster,
+                prev_block=prev,
+                now=T0,
+                close_by=T0 + 100,
+                abandon_by=T0 + 10_000,
+            )
+            for kp in c.keys
+        }
+        for r in rounds.values():
+            r.add_local([tx])
+        now = T0
+        for _ in range(30):
+            for r in rounds.values():
+                r.tick(now)
+            _wire_rounds(rounds, now)
+            if all(r.ratified() is not None for r in rounds.values()):
+                return rounds
+            now += 20
+        raise AssertionError("rounds failed to ratify in the harness")
+
+    def test_promote_sits_out_when_we_were_removed_mid_round(self):
+        c = Cluster(size=4)
+        node = c.nodes[0]
+        tx = ops.writes(ops.Set(ops.STORE_DATA, crypto.h(b"race"), b"v")).sign(c.mgr, T0)
+        rounds = self._ratified_round_for(c, tx)
+        node.coordinator.current_round = rounds[node.me.public]
+
+        # The removal lands (adopted the way this file lands roster changes) BEFORE the
+        # tick that would promote the ratified round.
+        remove_tx = (
+            MgmtWriter(node.store)
+            .change_roster(commitment_signer=c.mgr, remove=(node.me.public,))
+            .sign(c.mgr, T0)
+        )
+        intervene(node.store, c.mgr, bodies=(remove_tx,), bucket=666)
+        self.assertNotIn(node.me.public, node.mgmt.roster())
+
+        node.coordinator.tick(T0 + 200)  # must not raise
+        self.assertIsNone(node.coordinator.current_round, "the round must be released")
+        self.assertIsNone(node.coordinator.settling, "a non-member must not settle")
+        node.tick(T0 + DELTA)  # and the node keeps ticking
+
+
+class TestANonMemberRefusesSubmissions(unittest.TestCase):
+    """A node outside the roster ACCEPTED submissions, then discarded its whole mempool at
+    the next bucket boundary -- rotation happens before _open_round declines -- so the
+    client held an ACCEPTED for a tx that vanished with no trace, no error anywhere."""
+
+    def test_submit_to_a_non_member_is_refused_not_swallowed(self):
+        c = Cluster(size=3)
+        outsider = Node(crypto.Keypair.generate(), c.provisioned(), TUNABLES)
+        tx = ops.writes(ops.Set(ops.STORE_DATA, crypto.h(b"k"), b"v")).sign(c.mgr, T0)
+        self.assertIs(outsider.coordinator.submit(tx, T0), Refusal.NOT_IN_ROSTER)
+
+        # Driven the way production drives it: the SUBMIT frame must leave no trace in the
+        # mempool (it used to sit there until the rotation silently dropped it).
+        env = Envelope(outsider.me.public, Verb.SUBMIT, b"s" * 16, tx.raw).sign(c.mgr, T0)
+        outsider.receive(env.seal(), T0)
+        self.assertEqual(len(outsider.mempool), 0)
+
+        # The control: a roster member admits the same tx.
+        self.assertIsNone(c.nodes[0].coordinator.submit(tx, T0))
 
 
 if __name__ == "__main__":

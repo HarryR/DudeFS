@@ -90,6 +90,12 @@ class Coordinator:
         return self.tunables.mempool.bucket_start(bucket + 2)
 
     def submit(self, tx: SignedTransaction, now: Millis) -> Refusal | None:
+        if self.me.public not in self.mgmt.roster():
+            # A non-member ACCEPTED submissions and then discarded its whole mempool at the
+            # bucket boundary -- rotation happens before _open_round declines -- so the
+            # client held an ACCEPTED for a tx that vanished without a trace. Refused here,
+            # the client knows to try a roster member instead.
+            return Refusal.NOT_IN_ROSTER
         return self.mempool.admit(tx, now, self.store, self.mgmt)
 
     def on_round_msg(self, env: SignedEnvelope, now: Millis) -> None:
@@ -219,6 +225,19 @@ class Coordinator:
         block = r.ratified()
         if block is None:
             raise InvariantError("_promote_to_settling with unratified Round")
+        roster = self.mgmt.roster()
+        if self.me.public not in roster:
+            # The follower adopted a roster change removing us between round open and
+            # promote. Unguarded, SettleRound's raise (a DudeError) unwound AFTER
+            # current_round was cleared and BEFORE settling was assigned -- swallowed at
+            # the frame boundary, the ratified slice neither committed nor re-admitted,
+            # gone without a trace. Sit out like _open_round does: the remaining quorum
+            # settles this block and the Follower adopts it; what the round held beyond
+            # the slice goes back to the mempool, as abandonment does.
+            for tx in r.surviving():
+                self.mempool.admit(tx, now, self.store, self.mgmt)
+            self.current_round = None
+            return
         bucket = r.bucket()
         slice_txs = r.slice_bodies()
         surviving = r.surviving()
@@ -253,7 +272,7 @@ class Coordinator:
         sr = SettleRound(
             block,
             self.me,
-            self.mgmt.roster(),
+            roster,
             anchors,
             now,
             abandon_by=self._abandon_by(bucket),

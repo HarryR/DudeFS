@@ -46,6 +46,7 @@ class Refusal(Enum):
     DUPLICATE = "duplicate"
     UNSIGNED = "signature"
     CANNOT_APPLY = "cannot-apply"
+    NOT_IN_ROSTER = "not-in-roster"
 
 
 TOO_OLD = Refusal.TOO_OLD
