@@ -13,7 +13,7 @@ from typing import NamedTuple
 from ..core import codec, crypto
 from ..core.errors import DudeError, InvariantError
 from . import ops, settle, smt
-from .layer import Held, Index, Row, _prefix_upper, holds
+from .layer import Held, Index, PathRow, Row, _prefix_upper, holds
 from .management import P_NODE, P_ROSTER, MgmtReader, Role
 
 _SCHEMA = """
@@ -115,8 +115,12 @@ def log_element(idx: int, op_hash: crypto.Digest) -> crypto.Accumulator:
     return crypto.acc_element(codec.encode([b"log", idx, op_hash]))
 
 
-def element(store: int, name: bytes, value: bytes) -> crypto.Accumulator:
-    return crypto.acc_element(codec.encode([store, name, value]))
+def element(store: int, name: bytes, value: bytes, epoch: int) -> crypto.Accumulator:
+    """SUBTRACT WITH THE OLD ROW'S EPOCH AND ADD WITH THE NEW ONE. The accumulator cancels a row
+    by subtracting the exact element it added, so a subtraction carrying the wrong epoch removes
+    something that was never there -- and every node corrupts `A_state` identically, which is why
+    nothing would notice."""
+    return crypto.acc_element(codec.encode([store, name, value, epoch]))
 
 
 def _unverified(e: Entry) -> str | None:
@@ -285,15 +289,14 @@ class StoreReader:
         row = self._conn.execute("SELECT v FROM meta WHERE k=?", (k,)).fetchone()
         return row[0] if row else default
 
-    def _rows_in_path_range(
-        self, lo: bytes, hi: bytes
-    ) -> Iterator[tuple[int, bytes, bytes, bytes]]:
+    def _rows_in_path_range(self, lo: bytes, hi: bytes) -> Iterator[PathRow]:
         rows = self._conn.execute(
-            "SELECT store, name, value, cred FROM live WHERE path BETWEEN ? AND ? ORDER BY path",
+            "SELECT store, name, value, cred, epoch FROM live"
+            " WHERE path BETWEEN ? AND ? ORDER BY path",
             (lo, hi),
         ).fetchall()
-        for st, name, value, cred in rows:
-            yield int(st), name, value, cred
+        for st, name, value, cred, epoch in rows:
+            yield int(st), name, value, cred, int(epoch)
 
     def has_settled(self, op_hash: crypto.Digest) -> bool:
         return bool(self.settled_hashes((op_hash,)))
@@ -451,7 +454,7 @@ class StoreWriter(StoreReader):
         for m in mutations:
             cur = self.get(m.store, m.name)
             if cur:
-                acc = crypto.acc_sub(acc, element(m.store, m.name, cur[1]))
+                acc = crypto.acc_sub(acc, element(m.store, m.name, cur.value, cur.epoch))
             path = smt.path_of(m.store, m.name)
             self._tree.invalidate(path)
             if isinstance(m, ops.Set):
@@ -460,7 +463,7 @@ class StoreWriter(StoreReader):
                     " VALUES (?,?,?,?,?,?,?)",
                     (m.store, m.name, idx, m.value, path, m.epoch, cred),
                 )
-                acc = crypto.acc_add(acc, element(m.store, m.name, m.value))
+                acc = crypto.acc_add(acc, element(m.store, m.name, m.value, m.epoch))
             else:
                 self._conn.execute("DELETE FROM live WHERE store=? AND name=?", (m.store, m.name))
         return acc
@@ -629,9 +632,7 @@ class Store:
         with self.snapshot() as r:
             return r.holds(pred)
 
-    def _rows_in_path_range(
-        self, lo: bytes, hi: bytes
-    ) -> Iterator[tuple[int, bytes, bytes, bytes]]:
+    def _rows_in_path_range(self, lo: bytes, hi: bytes) -> Iterator[PathRow]:
         with self.snapshot() as r:
             yield from list(r._rows_in_path_range(lo, hi))  # noqa: SLF001
 

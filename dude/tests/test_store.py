@@ -158,13 +158,49 @@ class TestAccumulator(unittest.TestCase):
         for i in range(12):
             n = crypto.NameToken(crypto.h(bytes([i % 5])))
             self.s.apply((tx(self.kp, (), (ops.Set(0, n, b"v%d" % i),)),), auth=self.mgmt)
-        rows = self.s.db.execute("SELECT store, name, value FROM live").fetchall()
+        rows = self.s.db.execute("SELECT store, name, value, epoch FROM live").fetchall()
         want = functools.reduce(
             crypto.acc_add,
-            (store.element(st, crypto.NameToken(n), v) for st, n, v in rows),
+            (store.element(st, crypto.NameToken(n), v, e) for st, n, v, e in rows),
             crypto.ACC_IDENTITY,
         )
         self.assertEqual(self.s.accumulator(), want)
+
+
+class TestTheAccumulatorCancelsByEpoch(unittest.TestCase):
+    """THE SUBTRACTION TRAP. `acc_sub` must remove the element the row was ADDED with, so it has to
+    carry the OLD row's epoch. Carrying the new one removes something that was never there, leaves
+    the old element behind for ever, and does it identically on every node -- so `A_state` agrees
+    across the cluster while describing a state none of them holds."""
+
+    def setUp(self):
+        self.kp = crypto.Keypair.generate()
+        self.s = store.Store()
+        self.s.provision(self.kp.public)
+        self.mgmt = management.MgmtReader(self.s)
+
+    def _write(self, name: bytes, value: bytes, epoch: int) -> None:
+        self.s.apply(
+            (tx(self.kp, (), (ops.Set(0, name, value, epoch),)),),
+            auth=self.mgmt,
+        )
+
+    def test_rewriting_a_row_at_a_new_epoch_leaves_no_residue(self):
+        n = crypto.NameToken(crypto.h(b"rotated"))
+        self._write(n, b"v", epoch=1)
+        self._write(n, b"v", epoch=2)  # same bytes, new keyepoch
+
+        rows = self.s.db.execute("SELECT store, name, value, epoch FROM live").fetchall()
+        want = functools.reduce(
+            crypto.acc_add,
+            (store.element(st, crypto.NameToken(nm), val, e) for st, nm, val, e in rows),
+            crypto.ACC_IDENTITY,
+        )
+        self.assertEqual(self.s.accumulator(), want, "the epoch-1 element was never subtracted")
+
+    def test_the_element_distinguishes_epochs(self):
+        n = crypto.NameToken(crypto.h(b"k"))
+        self.assertNotEqual(store.element(0, n, b"v", 1), store.element(0, n, b"v", 2))
 
 
 class TestReplayEquivalence(unittest.TestCase):

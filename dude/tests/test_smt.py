@@ -23,7 +23,7 @@ def _bare() -> sqlite3.Connection:
     db = sqlite3.connect(":memory:", isolation_level=None)
     db.executescript(
         "CREATE TABLE live (store INTEGER, name BLOB, head INTEGER, value BLOB, path BLOB,"
-        " cred BLOB NOT NULL, PRIMARY KEY (store, name));"
+        " cred BLOB NOT NULL, epoch INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (store, name));"
         "CREATE UNIQUE INDEX live_by_path ON live(path);"
         "CREATE TABLE smt_memo (depth INTEGER, prefix BLOB, hash BLOB,"
         " PRIMARY KEY (depth, prefix));"
@@ -43,18 +43,25 @@ class _Fixture(unittest.TestCase):
         everywhere would let a leaf that ignored the credential pass every test here."""
         return b"cred:" + bytes([st]) + name
 
-    def held(self, name: bytes, value: bytes, st: int = D) -> tuple[bytes, bytes]:
-        """What `verify` asks about — a value and the credential that authorised it, never one
-        without the other."""
-        return value, self.cred(name, st)
+    def held(self, name: bytes, value: bytes, st: int = D, epoch: int = ops.EPOCH_NONE) -> smt.Held:
+        """What `verify` asks about — value, the credential that authorised it, and the keyepoch
+        it is encrypted under, never one without the others."""
+        return value, self.cred(name, st), epoch
 
-    def put(self, name: bytes, value: bytes, st: int = D, cred: bytes | None = None) -> None:
+    def put(
+        self,
+        name: bytes,
+        value: bytes,
+        st: int = D,
+        cred: bytes | None = None,
+        epoch: int = ops.EPOCH_NONE,
+    ) -> None:
         path = smt.path_of(st, name)
         self.t.invalidate(path)
         self.db.execute(
-            "INSERT OR REPLACE INTO live (store, name, head, value, path, cred)"
-            " VALUES (?,?,0,?,?,?)",
-            (st, name, value, path, self.cred(name, st) if cred is None else cred),
+            "INSERT OR REPLACE INTO live (store, name, head, value, path, cred, epoch)"
+            " VALUES (?,?,0,?,?,?,?)",
+            (st, name, value, path, self.cred(name, st) if cred is None else cred, epoch),
         )
 
     def drop(self, name: bytes, st: int = D) -> None:
@@ -294,7 +301,7 @@ class TestThroughTheStore(unittest.TestCase):
                 self.s.state_root(),
                 D,
                 b"k",
-                (b"v", self.s.credential(D, b"k")),
+                (b"v", self.s.credential(D, b"k"), ops.EPOCH_NONE),
                 self.s.prove(D, b"k"),
             )
         )
@@ -347,6 +354,29 @@ class TestDomains(unittest.TestCase):
         )
 
 
+class TestTheEpochIsInTheLeaf(_Fixture):
+    """A row is (value, credential, KEYEPOCH). Left out of the leaf, the root cannot tell two rows
+    apart that differ only in which key opens them -- so a responder could serve any epoch it liked
+    beside a valid proof, steering a reader onto a key that opens nothing, and two honest nodes
+    could disagree about it with identical roots."""
+
+    def test_the_same_bytes_under_a_different_epoch_is_a_different_root(self):
+        self.put(b"k", b"v", epoch=1)
+        at_one = self.t.root()
+        self.put(b"k", b"v", epoch=2)
+        self.assertNotEqual(self.t.root(), at_one, "the root ignores the keyepoch")
+
+    def test_a_proof_does_not_verify_under_a_neighbouring_epoch(self):
+        self.put(b"k", b"v", epoch=7)
+        proof = self.t.prove(D, b"k")
+        root = self.t.root()
+        self.assertTrue(smt.verify(root, D, b"k", self.held(b"k", b"v", epoch=7), proof))
+        self.assertFalse(
+            smt.verify(root, D, b"k", self.held(b"k", b"v", epoch=8), proof),
+            "a responder could name any epoch it liked beside a real proof",
+        )
+
+
 class TestTheCredentialIsInTheLeaf(_Fixture):
     """`[H]` *"why not just put it in all leaves? It's an authenticated data store."*
 
@@ -372,10 +402,10 @@ class TestTheCredentialIsInTheLeaf(_Fixture):
 
         self.assertTrue(smt.verify(self.t.root(), D, b"k7", self.held(b"k7", b"v7"), proof))
         self.assertFalse(
-            smt.verify(self.t.root(), D, b"k7", (b"v7", self.cred(b"k9")), proof),
+            smt.verify(self.t.root(), D, b"k7", (b"v7", self.cred(b"k9"), ops.EPOCH_NONE), proof),
             "another key's valid credential vouched for this row",
         )
-        self.assertFalse(smt.verify(self.t.root(), D, b"k7", (b"v7", b""), proof))
+        self.assertFalse(smt.verify(self.t.root(), D, b"k7", (b"v7", b"", ops.EPOCH_NONE), proof))
 
     def test_a_neighbours_credential_is_not_disclosed_by_an_absence_proof(self):
         """The occupant quotes a LEAF HASH, so proving our key absent tells the asker where someone

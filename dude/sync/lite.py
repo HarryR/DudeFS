@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from ..consensus.settle_round import SettledBlock
 from ..core import crypto
-from ..store import Store
+from ..store import Store, ops
 from ..store.management import MgmtReader, RosterCommitment
 from ..store.store import StoreReader
 from .lite_adapter import (
@@ -126,10 +126,12 @@ def _proof(  # noqa: PLR0911, PLR0912, C901 -- each early-return names a distinc
     if held is None:
         value: bytes = ABSENT_MARKER
         credential: bytes = b""
+        epoch = ops.EPOCH_NONE
         absent = True
     else:
         value = held.value
         credential = held.cred
+        epoch = held.epoch
         absent = False
     proof = r.prove(request.store_id, request.name).encode()
 
@@ -144,6 +146,7 @@ def _proof(  # noqa: PLR0911, PLR0912, C901 -- each early-return names a distinc
         credential=credential,
         absent=absent,
         proof=proof,
+        epoch=epoch,
         head=head_block,
         roster_fingerprint=roster_fingerprint,
         bundle=bundle,

@@ -72,6 +72,8 @@ class TrustedState:
 class GetResult:
     value: bytes
     absent: bool
+    epoch: int
+    """Which keyepoch opens `value`, carried under the proof rather than beside it."""
     block_num: int
     state_root: crypto.Digest
 
@@ -369,7 +371,7 @@ class LightClient:
         except DudeError:
             entry.result = Failed(reason="malformed proof")
             return
-        held = None if msg.absent else (msg.value, msg.credential)
+        held = None if msg.absent else (msg.value, msg.credential, msg.epoch)
         assert self.trusted_state is not None  # noqa: S101 -- narrowing; _advance_head keeps it non-None on success
         if not smt.verify(
             self.trusted_state.head.state_root,
@@ -383,6 +385,7 @@ class LightClient:
         entry.result = GetResult(
             value=msg.value,
             absent=msg.absent,
+            epoch=msg.epoch,
             block_num=msg.head.anchors.block_num,
             state_root=msg.head.anchors.state_root,
         )

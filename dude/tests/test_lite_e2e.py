@@ -19,8 +19,8 @@ from unittest import mock
 
 from dude.consensus.bootstrap import intervene
 from dude.consensus.settle_round import SettledBlock
-from dude.core import crypto
-from dude.net.envelope import Envelope, new_message_id
+from dude.core import codec, crypto
+from dude.net.envelope import Envelope, Verb, new_message_id
 from dude.store import Store, ops
 from dude.store.management import Cert, MgmtWriter, Role
 from dude.sync.lite import serve_get_anchors, serve_get_proof
@@ -28,6 +28,8 @@ from dude.sync.lite_adapter import (
     AnchorsReply,
     GetAnchors,
     GetProof,
+    LiteAdapterError,
+    LiteMsg,
     LiteRefused,
     ProofReply,
     SyncRefusal,
@@ -374,6 +376,47 @@ class TestTrustedBlockEncoding(unittest.TestCase):
             malformed = codec.encode([b""] * wrong)
             with self.assertRaises(DudeError):
                 TrustedBlock.decode(malformed)
+
+
+class TestProofReplyPinsItsFieldCount(unittest.TestCase):
+    """Encode and decode are two halves of one fact, and a field added to one and not the other
+    drifts in silence -- both halves stay self-consistent alone, so a round-trip cannot see it.
+    The epoch is the field that made this urgent: a decoder still reading eight fields would drop
+    it and every value would read as unencrypted."""
+
+    def _reply(self, head: SettledBlock) -> ProofReply:
+        return ProofReply(
+            value=b"v",
+            credential=b"c",
+            absent=False,
+            proof=b"p",
+            epoch=7,
+            head=head,
+            roster_fingerprint=crypto.Digest(bytes(32)),
+            bundle=None,
+            headers=(),
+        )
+
+    def test_round_trip_carries_the_epoch(self):
+        c = Cluster()
+        raw = c.nodes[0].store.settled_at(1)
+        assert raw is not None
+        reply = self._reply(SettledBlock.decode(raw))
+        verb, body = reply.encode()
+        back = LiteMsg.decode(verb, body)
+        assert isinstance(back, ProofReply)
+        self.assertEqual(back.epoch, 7)
+        self.assertEqual(back, reply)
+
+    def test_a_body_of_the_wrong_field_count_is_refused(self):
+        c = Cluster()
+        raw = c.nodes[0].store.settled_at(1)
+        assert raw is not None
+        _, body = self._reply(SettledBlock.decode(raw)).encode()
+        fields = codec.as_seq(codec.decode(body), 9)
+        self.assertEqual(len(fields), 9, "field count moved; both halves must move together")
+        with self.assertRaises(LiteAdapterError):
+            LiteMsg.decode(Verb.PROOF_REPLY, codec.encode(list(fields[:-1])))
 
 
 if __name__ == "__main__":

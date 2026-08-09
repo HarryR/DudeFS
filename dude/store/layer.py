@@ -12,6 +12,11 @@ class LayerError(Exception): ...
 
 type Index = int
 
+type PathRow = tuple[int, bytes, bytes, bytes, int]
+"""(store, name, value, credential, epoch) -- one row of a path-range scan. Every leaf builder
+needs all five: the SMT leaf commits to the epoch, so a scan that drops it silently stops the root
+committing to it."""
+
 
 PENDING: Index = -1
 
@@ -130,9 +135,9 @@ class Layer(Overlay[View]):
         for (st, name), held in self._delta.items():
             was = self._base.get(st, name)
             if was is not None:
-                acc = crypto.acc_sub(acc, element(st, name, was.value))
+                acc = crypto.acc_sub(acc, element(st, name, was.value, was.epoch))
             if held is not None:
-                acc = crypto.acc_add(acc, element(st, name, held.value))
+                acc = crypto.acc_add(acc, element(st, name, held.value, held.epoch))
         return acc
 
     def state_root(self) -> crypto.Digest:
@@ -174,24 +179,25 @@ class Layer(Overlay[View]):
             if lo <= smt.path_of(st, name) <= hi
         }
         base_leaves: list[tuple[bytes, crypto.Digest]] = []
-        for st, name, value, cred in self._base_rows_in_range(lo, hi):
+        for st, name, value, cred, epoch in self._base_rows_in_range(lo, hi):
             path = smt.path_of(st, name)
             if path in delta_paths:
                 continue
-            base_leaves.append((path, smt.leaf_hash(path, crypto.h(value), crypto.h(cred))))
+            base_leaves.append((path, smt.leaf_hash(path, crypto.h(value), crypto.h(cred), epoch)))
         delta_leaves: list[tuple[bytes, crypto.Digest]] = []
         for path, entry in delta_paths.items():
             held = entry[2]
             if held is not None:
                 delta_leaves.append(
-                    (path, smt.leaf_hash(path, crypto.h(held.value), crypto.h(held.cred)))
+                    (
+                        path,
+                        smt.leaf_hash(path, crypto.h(held.value), crypto.h(held.cred), held.epoch),
+                    )
                 )
         merged = sorted(base_leaves + delta_leaves, key=lambda pl: pl[0])
         return merged[:at_most]
 
-    def _base_rows_in_range(
-        self, lo: bytes, hi: bytes
-    ) -> Iterator[tuple[int, bytes, bytes, bytes]]:
+    def _base_rows_in_range(self, lo: bytes, hi: bytes) -> Iterator[PathRow]:
         rows_fn = getattr(self._base, "_rows_in_path_range", None)
         if rows_fn is None:
             raise LayerError(
@@ -200,23 +206,21 @@ class Layer(Overlay[View]):
             )
         yield from rows_fn(lo, hi)
 
-    def _rows_in_path_range(
-        self, lo: bytes, hi: bytes
-    ) -> Iterator[tuple[int, bytes, bytes, bytes]]:
+    def _rows_in_path_range(self, lo: bytes, hi: bytes) -> Iterator[PathRow]:
         delta_by_path = {
             smt.path_of(st, name): (st, name, held)
             for (st, name), held in self._delta.items()
             if lo <= smt.path_of(st, name) <= hi
         }
-        merged: dict[bytes, tuple[int, bytes, bytes, bytes]] = {}
-        for st, name, value, cred in self._base_rows_in_range(lo, hi):
+        merged: dict[bytes, PathRow] = {}
+        for st, name, value, cred, epoch in self._base_rows_in_range(lo, hi):
             path = smt.path_of(st, name)
             if path in delta_by_path:
                 continue
-            merged[path] = (st, name, value, cred)
+            merged[path] = (st, name, value, cred, epoch)
         for path, (st, name, held) in delta_by_path.items():
             if held is not None:
-                merged[path] = (st, name, held.value, held.cred)
+                merged[path] = (st, name, held.value, held.cred, held.epoch)
         for path in sorted(merged):
             yield merged[path]
 

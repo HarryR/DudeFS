@@ -200,6 +200,10 @@ class ProofReply(LiteMsg):
     credential: bytes
     absent: bool
     proof: bytes
+    epoch: int
+    """Which keyepoch opens `value`. Under the SMT leaf, so the proof covers it -- a responder
+    that names a different epoch fails verification instead of steering the reader to a key that
+    will not open anything."""
     head: SettledBlock
     roster_fingerprint: crypto.Digest
     bundle: RosterBundle | None
@@ -212,6 +216,7 @@ class ProofReply(LiteMsg):
                 self.credential,
                 1 if self.absent else 0,
                 self.proof,
+                self.epoch,
                 self.head.encode(),
                 self.roster_fingerprint,
                 self.bundle._encode() if self.bundle is not None else b"",  # noqa: SLF001
@@ -222,17 +227,18 @@ class ProofReply(LiteMsg):
     @classmethod
     def _decode(cls, body: bytes) -> ProofReply:
         try:
-            p = codec.as_seq(codec.decode(body), 8)
-            head = SettledBlock.decode(codec.as_bytes(p[4]))
-            roster_fingerprint = crypto.Digest(codec.as_bytes(p[5]))
-            bundle_bytes = codec.as_bytes(p[6])
+            p = codec.as_seq(codec.decode(body), 9)
+            head = SettledBlock.decode(codec.as_bytes(p[5]))
+            roster_fingerprint = crypto.Digest(codec.as_bytes(p[6]))
+            bundle_bytes = codec.as_bytes(p[7])
             bundle = RosterBundle._decode(bundle_bytes) if bundle_bytes else None  # noqa: SLF001
-            headers = tuple(SettledBlock.decode(codec.as_bytes(h)) for h in codec.as_seq(p[7]))
+            headers = tuple(SettledBlock.decode(codec.as_bytes(h)) for h in codec.as_seq(p[8]))
             return cls(
                 value=codec.as_bytes(p[0]),
                 credential=codec.as_bytes(p[1]),
                 absent=codec.as_int(p[2]) == 1,
                 proof=codec.as_bytes(p[3]),
+                epoch=codec.as_int(p[4]),
                 head=head,
                 roster_fingerprint=roster_fingerprint,
                 bundle=bundle,

@@ -7,6 +7,11 @@ from dude.core import codec, crypto
 
 MAX_DEPTH = 256
 
+type Held = tuple[bytes, bytes, int]
+"""Everything the leaf commits to besides the path: value, credential, keyepoch. A TRIPLE so the
+epoch cannot be forgotten -- as a separate argument it was one defaulted parameter away from being
+left out of a root again."""
+
 EMPTY = crypto.Digest(bytes(crypto.DIGEST_SIZE))
 
 _PATH = b"dude.smt.path"
@@ -18,8 +23,12 @@ def path_of(store: int, name: bytes) -> bytes:
     return bytes(crypto.h_domain(_PATH, codec.encode([store, name])))
 
 
-def leaf_hash(path: bytes, vhash: crypto.Digest, chash: crypto.Digest) -> crypto.Digest:
-    return crypto.h_domain(_LEAF, path + vhash + chash)
+def leaf_hash(path: bytes, vhash: crypto.Digest, chash: crypto.Digest, epoch: int) -> crypto.Digest:
+    """THE EPOCH IS PART OF THE ROW, not a note beside it. Left out, two honest nodes could hold
+    the same value under different keyepochs with identical roots, and a responder could serve any
+    epoch it liked next to a valid proof -- steering a reader to the wrong key after a rotation.
+    Fixed eight bytes, the same width `P_WRAP` keys use."""
+    return crypto.h_domain(_LEAF, path + vhash + chash + epoch.to_bytes(8, "big"))
 
 
 def branch_hash(
@@ -86,11 +95,11 @@ def _fold(
     return node
 
 
-def _present(root: crypto.Digest, path: bytes, held: tuple[bytes, bytes], proof: Proof) -> bool:
+def _present(root: crypto.Digest, path: bytes, held: Held, proof: Proof) -> bool:
     if proof.occupant is None or proof.occupant[0] != path:
         return False
-    value, credential = held
-    term = leaf_hash(path, crypto.h(value), crypto.h(credential))
+    value, credential, epoch = held
+    term = leaf_hash(path, crypto.h(value), crypto.h(credential), epoch)
     if proof.occupant[1] != term:
         return False
     return _fold(path, term, proof.siblings) == root
@@ -111,7 +120,7 @@ def verify(
     root: crypto.Digest,
     store: int,
     name: bytes,
-    held: tuple[bytes, bytes] | None,
+    held: Held | None,
     proof: Proof,
 ) -> bool:
     if len(proof.siblings) > MAX_DEPTH:
@@ -130,10 +139,11 @@ class Tree:
     def _leaves(self, path: bytes, depth: int) -> list[tuple[bytes, crypto.Digest]]:
         lo, hi = bounds(path, depth)
         rows = self.db.execute(
-            "SELECT path, value, cred FROM live WHERE path>=? AND path<=? ORDER BY path LIMIT 2",
+            "SELECT path, value, cred, epoch FROM live"
+            " WHERE path>=? AND path<=? ORDER BY path LIMIT 2",
             (lo, hi),
         ).fetchall()
-        return [(r[0], leaf_hash(r[0], crypto.h(r[1]), crypto.h(r[2]))) for r in rows]
+        return [(r[0], leaf_hash(r[0], crypto.h(r[1]), crypto.h(r[2]), int(r[3]))) for r in rows]
 
     def hash_under(self, path: bytes, depth: int) -> crypto.Digest:
         lo, _ = bounds(path, depth)
