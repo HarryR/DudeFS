@@ -321,10 +321,17 @@ class MgmtReader:
         self.store_id = store_id
 
     def nodes(self) -> dict[crypto.PublicKey, NodeRecord]:
+        """A row that will not decode is a row this reader does not have. Raising here instead
+        made one garbage settled row a poison pill: every roster() caller -- coordinator,
+        follower, peer reconcile -- raised on every read, restart replayed the row, and the
+        repair needed the consensus it had killed."""
         out: dict[crypto.PublicKey, NodeRecord] = {}
         for name, _prov, value, _ep in self.src.prefix(self.store_id, P_NODE):
             who = crypto.PublicKey(name[len(P_NODE) :])
-            out[who] = NodeRecord.decode_row(who, value)
+            try:
+                out[who] = NodeRecord.decode_row(who, value)
+            except DudeError:
+                continue
         return out
 
     def roster(self) -> tuple[crypto.PublicKey, ...]:
@@ -408,7 +415,12 @@ class MgmtReader:
         raw = reader.get(self.store_id, P_GRANT + who)
         if raw is None:
             return None
-        return Grant.decode_row(who, raw[1])
+        try:
+            return Grant.decode_row(who, raw[1])
+        except DudeError:
+            # A garbage grant row must read as "no grant" (AUTHORITY refusal), not raise out of
+            # `may_write` mid-settlement and take commit_block down with it.
+            return None
 
     def grant_of(self, who: crypto.PublicKey) -> Grant | None:
         return self._read_grant(self.src, who)

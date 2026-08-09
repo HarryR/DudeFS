@@ -814,5 +814,45 @@ class TestAuthorityRowEncoding(unittest.TestCase):
                 RosterCommitment.decode_row(codec.encode([b""] * wrong))
 
 
+class TestMalformedRowsDoNotPoison(unittest.TestCase):
+    """A garbage value in store 0 is reachable by any store-0-authorised author (a buggy manager
+    tool suffices): settlement checks signature/authority/guards, never that a row parses, and
+    the row then lives in the replicated log so restart replays it. It must degrade to "that
+    identity is absent" -- raising instead poisoned every roster()/may_write call on the hot
+    path of the coordinator, follower, and peer reconcile, and the repair needed a consensus
+    round that could no longer run."""
+
+    def setUp(self):
+        self.anchor = crypto.Keypair.generate()
+        self.s, self.mgmt = _provisioned(self.anchor)
+        self.kps = _seed_cluster(self.s, self.mgmt, self.anchor, 3)
+
+    def _settle_garbage(self, name: bytes) -> None:
+        t = ops.writes(ops.Set(self.mgmt.store_id, name, b"\x00not-bencode"))
+        applied = self.s.apply((t.sign(self.anchor, T0 + 1),), auth=self.mgmt)
+        self.assertEqual(len(applied.settled), 1, "the garbage row must land for the test to bite")
+
+    def test_garbage_node_row_reads_as_absent_and_roster_survives(self):
+        stranger = crypto.Keypair.generate().public
+        self._settle_garbage(P_NODE + stranger)
+        self.assertEqual(set(self.mgmt.roster()), {kp.public for kp in self.kps})
+        self.assertNotIn(stranger, self.mgmt.nodes())
+        self.assertIsNotNone(self.mgmt.roster_commitment())
+        after = self.s.apply(
+            (ops.writes(ops.Set(ops.STORE_DATA, b"k", b"v")).sign(self.anchor, T0 + 2),),
+            auth=self.mgmt,
+        )
+        self.assertEqual(len(after.settled), 1, "settlement itself must survive the garbage row")
+
+    def test_garbage_grant_row_refuses_authority_not_raising(self):
+        writer = crypto.Keypair.generate()
+        self._settle_garbage(P_GRANT + writer.public)
+        self.assertIsNone(self.mgmt.grant_of(writer.public))
+        attempt = ops.writes(ops.Set(ops.STORE_DATA, b"k", b"v")).sign(writer, T0 + 2)
+        applied = self.s.apply((attempt,), auth=self.mgmt)
+        self.assertEqual(applied.settled, ())
+        self.assertEqual([d.why for d in applied.dropped], [settle.Reason.AUTHORITY])
+
+
 if __name__ == "__main__":
     unittest.main()
