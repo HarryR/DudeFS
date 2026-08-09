@@ -61,27 +61,30 @@ class TestIntervenePropagatesViaSync(unittest.TestCase):
         assert c.nodes[1].store.head_block_num() == 1
         assert c.nodes[2].store.head_block_num() == 1
 
-        # A fresh client identity that the manager will grant into the cluster via
-        # intervention. Any deterministic tx would do; a grant makes the effect observable
-        # in MgmtReader.grant_of() after propagation.
-        new_client = crypto.Keypair.generate()
-        pop = new_client.prove_possession()
-        grant_tx = (
+        # TWO fresh client identities, granted in one intervention. Two, and passed in
+        # REVERSE hash order, deliberately: the follower replays a block's bodies sorted by
+        # op_hash, so an intervene() that applied caller order produced anchors no peer's
+        # preview reproduced -- the block propagated to nobody, and a single-tx test could
+        # never see it. A grant makes the effect observable in grant_of() after propagation.
+        new_clients = [crypto.Keypair.generate() for _ in range(2)]
+        grant_txs = tuple(
             MgmtWriter(c.nodes[0].store)
             .authorise(
-                new_client.public,
+                kp.public,
                 Role.CLIENT,
                 stores=frozenset({D}),
-                pop=pop,
-                cert=Cert.sign_grant(c.mgr, new_client.public, Role.CLIENT),
+                pop=kp.prove_possession(),
+                cert=Cert.sign_grant(c.mgr, kp.public, Role.CLIENT),
             )
             .sign(c.mgr, c._clock)
+            for kp in new_clients
         )
+        misordered = tuple(sorted(grant_txs, key=lambda t: t.op_hash, reverse=True))
 
         # Manager pushes a block onto node 0 via intervene(). This commits directly; node 0's
         # head advances to block_num=2 immediately, bypassing consensus. Its store now has a
         # block the other two nodes have never heard of.
-        intervene(c.nodes[0].store, c.mgr, bodies=(grant_tx,), bucket=999)
+        intervene(c.nodes[0].store, c.mgr, bodies=misordered, bucket=999)
         self.assertEqual(c.nodes[0].store.head_block_num(), 2)
         self.assertEqual(c.nodes[1].store.head_block_num(), 1)
         self.assertEqual(c.nodes[2].store.head_block_num(), 1)
@@ -108,13 +111,14 @@ class TestIntervenePropagatesViaSync(unittest.TestCase):
             block_hashes.add(SettledBlock.decode(raw).block_hash)
         self.assertEqual(len(block_hashes), 1, "nodes disagree on block 2 identity")
 
-        # And the grant is visible in every node's management view -- proves the tx applied,
-        # not just that the block bytes were stored.
+        # And both grants are visible in every node's management view -- proves the txs
+        # applied, not just that the block bytes were stored.
         for i, node in enumerate(c.nodes):
-            grant = node.mgmt.grant_of(new_client.public)
-            self.assertIsNotNone(grant, f"node {i} did not apply the intervene grant")
-            assert grant is not None
-            self.assertIs(grant.role, Role.CLIENT)
+            for kp in new_clients:
+                grant = node.mgmt.grant_of(kp.public)
+                self.assertIsNotNone(grant, f"node {i} did not apply the intervene grant")
+                assert grant is not None
+                self.assertIs(grant.role, Role.CLIENT)
 
 
 if __name__ == "__main__":

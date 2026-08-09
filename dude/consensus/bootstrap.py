@@ -25,6 +25,12 @@ def _apply_manager_signed_block(  # noqa: PLR0913 -- construction inputs, all re
     prev_block: crypto.Digest,
     bucket: int,
 ) -> SettledBlockWithBodies:
+    # The follower replays a block's bodies sorted by op_hash (Follower._adopt), and the
+    # consensus path slices sorted too. Applied here in caller order instead, a multi-tx
+    # manager block carried an acc_log and state_root no peer's preview could reproduce:
+    # every honest node refused it, and the intervened node was stranded on a chain nobody
+    # would walk, with no reorg to heal it.
+    bodies = tuple(sorted(bodies, key=lambda tx: tx.op_hash))
     mgmt = MgmtReader(store)
     layer = Layer(store)
     screened = settle.apply_to(layer, bodies, mgmt)
