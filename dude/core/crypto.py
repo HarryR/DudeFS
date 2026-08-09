@@ -300,6 +300,13 @@ class MultiSig:
         return len(self.indices(n))
 
     def verify(self, msg: bytes, signers: Sequence[PublicKey]) -> bool:
+        # A REFUSAL, NEVER A RAISE. The bitmap arrives from a peer, so a width that does not match
+        # the roster is that peer's claim being wrong, not our invariant being broken. Raising
+        # `CryptoError` here reached a light client through `Authorization.verify` and killed its
+        # run thread, because nothing on the lite read path catches. `bitmap_indices` stays strict
+        # for callers building a bitmap of their own, where a bad width IS a local bug.
+        if len(self.bitmap) != bitmap_size(len(signers)):
+            return False
         indices = self.indices(len(signers))
         if len(indices) != len(self.sigs):
             return False

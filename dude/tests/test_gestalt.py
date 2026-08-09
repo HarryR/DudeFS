@@ -465,10 +465,10 @@ class TestScenario(unittest.TestCase):
                     MgmtWriter(r)
                     .authorise(
                         lc_kp.public,
-                        Role.CLIENT,
-                        stores=frozenset(),
+                        Role.CLIENT_RW,
+                        stores=frozenset({ops.STORE_DATA}),  # scoped: reads are refused outside it
                         pop=lc_kp.prove_possession(),
-                        cert=Cert.sign_grant(mgr, lc_kp.public, Role.CLIENT),
+                        cert=Cert.sign_grant(mgr, lc_kp.public, Role.CLIENT_RW),
                     )
                     .sign(mgr, now_ms())
                 )

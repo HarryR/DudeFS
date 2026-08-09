@@ -28,3 +28,7 @@ class SyncRefusal(Enum):
     FORK_DETECTED = "fork-detected"
 
     INTERNAL = "internal"
+
+    UNAUTHORISED = "unauthorised"
+    """The requester holds no standing for what they asked. Answered MALFORMED_QUERY before,
+    which told an honest caller their request was malformed when it was their grant that was."""

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import unittest
 
+from dude.consensus.bootstrap import intervene
 from dude.consensus.settle_round import SettledBlock
 from dude.core import crypto
 from dude.net.address import Endpoint
@@ -17,6 +18,7 @@ from dude.net.envelope import Envelope
 from dude.net.transports import InProcListener, address_of, name_of
 from dude.node import Node
 from dude.store import Store, ops
+from dude.store.management import Cert, MgmtWriter, NodeRecord
 from dude.sync.adapter import HeightReply
 
 from .cluster import DELTA, T0, Cluster, D
@@ -37,6 +39,23 @@ def _produce_blocks(c: Cluster, n: int) -> int:
     return now
 
 
+def _seat(c: Cluster, who: crypto.PublicKey, endpoint: Endpoint, bucket: int) -> None:
+    """Give `who` a roster seat on every cluster store. GETBLOCK and HEIGHT are node verbs, so a
+    joiner syncs on the strength of the seat the manager gave it -- which is the real order of
+    events: `change_roster` settles, then the new node catches up. Syncing first and being added
+    later only ever worked because the door was open to anyone holding our public key."""
+    add = (
+        MgmtWriter(c.nodes[0].store)
+        .change_roster(
+            commitment_signer=c.mgr,
+            add=(NodeRecord(who, (endpoint,), Cert.sign_roster(c.mgr, who), frozenset()),),
+        )
+        .sign(c.mgr, T0)
+    )
+    for node in c.nodes:
+        intervene(node.store, c.mgr, bodies=(add,), bucket=bucket)
+
+
 class TestFreshNodeJoinsClusterAndCatchesUp(unittest.TestCase):
     """The core L6 promise end-to-end: a node arriving with only the manager pubkey attaches
     to the cluster, polls HEIGHT, pulls blocks via GETBLOCK, and lands at the head."""
@@ -55,6 +74,7 @@ class TestFreshNodeJoinsClusterAndCatchesUp(unittest.TestCase):
         joiner_store.provision(c.mgr.public)
         joiner_listener = InProcListener(name_of(joiner_kp.public))
         joiner = Node(joiner_kp, joiner_store)
+        _seat(c, joiner_kp.public, Endpoint(address_of(joiner_kp.public)), bucket=999)
 
         # Bootstrap-outside-the-roster wiring: reconciliation from `mgmt.roster()`
         # doesn't add the joiner to node 0's peers (joiner isn't in the roster yet), and

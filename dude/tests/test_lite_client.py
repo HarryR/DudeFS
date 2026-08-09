@@ -8,16 +8,19 @@ from __future__ import annotations
 
 import unittest
 from dataclasses import replace
+from unittest import mock
 
 from dude.consensus.bootstrap import intervene
 from dude.consensus.settle_round import SettledBlock
 from dude.core import codec, crypto
+from dude.core.errors import DudeError
 from dude.net.address import Address, Endpoint, Scheme
 from dude.net.envelope import Envelope, Frame, SignedEnvelope, Verb
 from dude.net.postman import Postman
 from dude.net.transports import InProcListener, address_of, name_of
 from dude.store import ops
 from dude.store.management import Cert, Grant, MgmtWriter, NodeRecord, Role
+from dude.sync import chain
 from dude.sync.lite_adapter import LiteMsg, RosterBundle
 from dude.sync.lite_client import PENDING, Failed, GetResult, LightClient, State
 
@@ -47,16 +50,16 @@ def _one_bucket_after_head(c: Cluster) -> int:
 
 
 def _provision_client(c: Cluster, kp: crypto.Keypair) -> None:
-    """Grant Role.CLIENT via intervene on every store, with the client's InProc endpoint
+    """Grant Role.CLIENT_RW via intervene on every store, with the client's InProc endpoint
     baked into the P_GRANT row so nodes can dial back via `_reconcile_peers`
     (#roster-drives-peers)."""
     mgmt = MgmtWriter(c.nodes[0].store)
     grant_tx = mgmt.authorise(
         kp.public,
-        Role.CLIENT,
-        stores=frozenset(),
+        Role.CLIENT_RW,
+        stores=frozenset({ops.STORE_DATA}),  # scoped: reads are refused outside it
         pop=kp.prove_possession(),
-        cert=Cert.sign_grant(c.mgr, kp.public, Role.CLIENT),
+        cert=Cert.sign_grant(c.mgr, kp.public, Role.CLIENT_RW),
     ).sign(c.mgr, T0)
     for node in c.nodes:
         intervene(node.store, c.mgr, bodies=(grant_tx,), bucket=TUNABLES.mempool.bucket(c.clock))
@@ -525,6 +528,114 @@ class TestRevokedManagerCannotForgeARoster(unittest.TestCase):
         self.assertIsNone(after, "client kept trusting a roster it can no longer verify")
         self.assertIs(client.state, State.UNBOOTSTRAPPED)
         self.assertEqual(client.poll(rid), Failed(reason="roster changed; re-bootstrap"))
+
+
+class TestAByzantineResponderCannotKillTheClient(unittest.TestCase):
+    """A responder is not trusted, so nothing it sends may raise past the frame boundary. A
+    multisig bitmap of the wrong width for the roster was enough: `MultiSig.verify` raised
+    `CryptoError` out of `Authorization.verify`, `chain.advance`, `_advance_head` and
+    `_on_read_reply`, and `_run` catches only `queue.Empty` -- the thread died while the listener
+    kept accepting into an inbox nobody drained, so the client looked alive and every read hung
+    for ever. `SettledBlock.decode` wraps whatever bitmap bytes arrive, so it comes off the wire."""
+
+    def test_a_wrong_width_signer_bitmap_fails_the_read_and_nothing_else(self):
+        c = Cluster()
+        key = crypto.h(b"byz-bitmap")
+        tx = ops.writes(ops.Set(ops.STORE_DATA, key, b"present")).sign(c.mgr, T0)
+        c.submit(c.mgr, tx, to=0, now=T0)
+        c.pump(T0)
+
+        client_kp = crypto.Keypair.generate()
+        _provision_client(c, client_kp)
+        client, client_listener = _build_light_client(c, client_kp)
+        client.bootstrap(c.clock + DELTA)
+        _pump(c, client, client_listener, c.clock + DELTA)
+        _pump(c, client, client_listener, c.clock + DELTA)
+        self.assertTrue(client.bootstrapped())
+
+        # ONE block on, so the reply carries the responder's head as a link we must WALK. At our
+        # own head `_advance_head` returns early and never checks the head's multisig at all --
+        # correctly, since the proof is verified against the root we already walked to -- and the
+        # mutation below is then a no-op. Written without this the test passed 1 run in 3.
+        c.pump(c.clock + 2 * DELTA, rounds=1)
+        assert client.trusted_state is not None
+        gap = (c.nodes[0].store.head_block_num() or 0) - client.trusted_state.head.block_num
+        self.assertTrue(
+            0 < gap <= TUNABLES.light_client.liveness_window,
+            f"gap is {gap}: at 0 the head is not walked, past the cap it is not offered",
+        )
+
+        now = _one_bucket_after_head(c)
+        rid = client.request_get(
+            store_id=ops.STORE_DATA, name=key, peer=c.nodes[0].me.public, now=now
+        )
+
+        def widen(reply):
+            head = reply.head
+            wrecked = replace(
+                head, multisig=replace(head.multisig, bitmap=crypto.SignerBitmap(bytes(5)))
+            )
+            return replace(reply, head=wrecked)
+
+        server_kp = c.nodes[0].me
+        for _ in range(5):
+            for node in c.nodes:
+                node._reconcile_peers(now)
+            client.tick(now)
+            for node in c.nodes:
+                node.postman.tick(now)
+            for node in c.nodes:
+                for inbound in c.listeners[node.me.public].drain():
+                    node.receive(inbound.frame, now, session=inbound.session)
+            for inbound in client_listener.drain():
+                client.receive(  # must not raise
+                    _mutate_frame_to_client(
+                        inbound.frame, client_kp, server_kp, Verb.PROOF_REPLY, widen, now
+                    ),
+                    now,
+                    session=inbound.session,
+                )
+
+        result = client.poll(rid)
+        self.assertIsInstance(result, Failed, f"got {result!r}")
+        assert isinstance(result, Failed)
+        self.assertIn(
+            "verify failed",
+            result.reason,
+            "the read failed for some other reason; this proves nothing about the bitmap",
+        )
+        self.assertIs(client.state, State.READY, "one bad reply tore down the trusted state")
+        self.assertIsNotNone(client.trusted_state)
+
+    def test_any_dude_error_from_a_reply_resolves_the_read_instead_of_unwinding(self):
+        """The BOUNDARY, not the bitmap. With the primitive refusing rather than raising, the
+        test above no longer reaches this guard -- and a boundary that only holds for the failures
+        we have already fixed is not a boundary. A read left PENDING is as bad as a dead thread,
+        because nothing times a pending read out."""
+        c = Cluster()
+        client_kp = crypto.Keypair.generate()
+        _provision_client(c, client_kp)
+        client, client_listener = _build_light_client(c, client_kp)
+        client.bootstrap(c.clock + DELTA)
+        _pump(c, client, client_listener, c.clock + DELTA)
+        _pump(c, client, client_listener, c.clock + DELTA)
+        self.assertTrue(client.bootstrapped())
+
+        # The cluster runs on, so the reply carries headers and `_advance_head` actually walks --
+        # at our own head it returns early and `chain.advance` is never reached.
+        c.pump(c.clock + 2 * DELTA)
+        now = _one_bucket_after_head(c)
+        rid = client.request_get(
+            store_id=ops.STORE_DATA, name=b"anything", peer=c.nodes[0].me.public, now=now
+        )
+        with mock.patch.object(chain, "advance", side_effect=DudeError("header check exploded")):
+            _pump(c, client, client_listener, now)
+
+        result = client.poll(rid)
+        self.assertIsInstance(result, Failed, f"read left unresolved: {result!r}")
+        assert isinstance(result, Failed)
+        self.assertIn("header check exploded", result.reason)
+        self.assertIs(client.state, State.READY)
 
 
 if __name__ == "__main__":

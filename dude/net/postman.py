@@ -80,7 +80,9 @@ class Postman:
         peer.reconfigure(endpoints)
 
     def remove_peer(self, pubkey: crypto.PublicKey) -> None:
-        self.peers.pop(pubkey, None)
+        peer = self.peers.pop(pubkey, None)
+        if peer is not None:
+            peer.disconnect()
 
     def register_session(self, session: Session) -> None:
         if session.identity is None:

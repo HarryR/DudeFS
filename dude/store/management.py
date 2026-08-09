@@ -18,8 +18,10 @@ class ManagementError(DudeError): ...
 
 class Role(Enum):
     MANAGER = b"manager"
-    CLIENT = b"client"
+    CLIENT_RO = b"client_ro"
+    CLIENT_RW = b"client_rw"
     COMPACTOR = b"compactor"
+    """COMPACTOR reads and nothing else until compaction returns. Its own verbs land with it."""
 
 
 type Domain = bytes
@@ -92,6 +94,11 @@ class Authorization:
         set_indices = self.multisig.indices(len(signers))
         if manager_slot in set_indices:
             return True
+        if not self.roster:
+            # No roster is no quorum. Reached while verifying a claim about block 1, where the
+            # anchor override above is the only authorisation there can be -- `quorum.size(0)`
+            # raises, and that raise is a peer's malformed claim escaping as our error.
+            return False
         roster_signers = sum(1 for i in set_indices if i < manager_slot)
         return roster_signers >= quorum.size(len(self.roster))
 
@@ -370,7 +377,8 @@ class MgmtReader:
             return False
         anchor_only_purposes = (Role.MANAGER.value, Role.COMPACTOR.value)
         anchor_or_manager_purposes = (
-            Role.CLIENT.value,
+            Role.CLIENT_RO.value,
+            Role.CLIENT_RW.value,
             CERT_PURPOSE_ROSTER,
             CERT_PURPOSE_ROSTER_COMMITMENT,
         )
@@ -439,11 +447,38 @@ class MgmtReader:
     def grant_of(self, who: crypto.PublicKey) -> Grant | None:
         return self._read_grant(self.src, who)
 
+    def valid_grant(self, reader: Reader, who: crypto.PublicKey) -> Grant | None:
+        """A grant whose cert still traces to an authorised signer. Read on EVERY request against
+        current state: a grant issued by a manager since revoked has no standing, and caching it
+        at connect time is how a revoked identity keeps working."""
+        g = self._read_grant(reader, who)
+        if g is None or not self._grant_cert_ok(g, reader):
+            return None
+        return g
+
     def may_write(self, reader: Reader, who: crypto.PublicKey, store_id: int) -> bool:
         if who == self.src.anchor():
             return True
-        g = self._read_grant(reader, who)
-        if g is None or not self._grant_cert_ok(g, reader):
+        g = self.valid_grant(reader, who)
+        if g is None:
+            return False
+        if g.role is Role.MANAGER:
+            return True
+        # CLIENT_RO and COMPACTOR hold `stores` for READING. Before the roles were split, any
+        # grant naming a store could write it.
+        return g.role is Role.CLIENT_RW and store_id in g.stores
+
+    def may_read(self, reader: Reader, who: crypto.PublicKey, store_id: int) -> bool:
+        """Scoped the same way writing is. The lite read path asked only whether a grant EXISTED,
+        so a grant for one store read every store -- including store 0, which holds grants, roster
+        rows, possession proofs and wrapped keys -- and a grant from a revoked manager kept reading
+        after it had stopped writing."""
+        if who == self.src.anchor():
+            return True
+        if self.is_member(who):
+            return True  # a node holds every block already
+        g = self.valid_grant(reader, who)
+        if g is None:
             return False
         if g.role is Role.MANAGER:
             return True
@@ -452,8 +487,8 @@ class MgmtReader:
     def may_send(self, who: crypto.PublicKey, kind: int) -> bool:
         if who == self.src.anchor():
             return True
-        g = self.grant_of(who)
-        if g is None or not self._grant_cert_ok(g, self.src):
+        g = self.valid_grant(self.src, who)
+        if g is None:
             return False
         if g.role is Role.MANAGER:
             return True

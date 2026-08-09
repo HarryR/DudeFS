@@ -18,7 +18,7 @@ from __future__ import annotations
 import time
 import unittest
 
-from dude.consensus.bootstrap import bootstrap
+from dude.consensus.bootstrap import bootstrap, intervene
 from dude.consensus.settle_round import SettledBlock
 from dude.core import crypto
 from dude.net import Verb
@@ -27,7 +27,7 @@ from dude.net.envelope import Envelope
 from dude.net.transports.tcp import TCPListener
 from dude.node import Node
 from dude.store import Store, management, ops
-from dude.store.management import Cert, MgmtWriter, Role
+from dude.store.management import Cert, MgmtWriter, NodeRecord, Role
 from dude.tunables import DEFAULT
 
 D = ops.STORE_DATA
@@ -162,6 +162,26 @@ def _produce_blocks(
     return now
 
 
+def _seat(
+    mgr: crypto.Keypair,
+    nodes: list[Node],
+    who: crypto.PublicKey,
+    endpoint: Endpoint,
+    bucket: int,
+) -> None:
+    """A seat before a sync: GETBLOCK and HEIGHT are node verbs. See `test_sync_e2e._seat`."""
+    add = (
+        MgmtWriter(nodes[0].store)
+        .change_roster(
+            commitment_signer=mgr,
+            add=(NodeRecord(who, (endpoint,), Cert.sign_roster(mgr, who), frozenset()),),
+        )
+        .sign(mgr, T0)
+    )
+    for node in nodes:
+        intervene(node.store, mgr, bodies=(add,), bucket=bucket)
+
+
 class TestJoinerCatchesUpOverTCP(unittest.TestCase):
     def test_joiner_catches_up_via_the_wire(self):
         mgr, nodes, listener_list = _build_cluster(3)
@@ -177,6 +197,7 @@ class TestJoinerCatchesUpOverTCP(unittest.TestCase):
             joiner_store.provision(mgr.public)
             joiner_listener = TCPListener()
             joiner = Node(joiner_kp, joiner_store)
+            _seat(mgr, nodes, joiner_kp.public, Endpoint(joiner_listener.bound_address), 999)
 
             # Bootstrap-outside-roster wiring: the joiner isn't in the roster yet, so
             # reconciliation won't wire it. Manual bootstrap peer both directions.

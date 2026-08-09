@@ -51,6 +51,24 @@ REPLIES = frozenset(
 by a `LightClient`. A reply the Node DOES consume must be in HANDLED or the dispatch table
 discards it: HEIGHT_REPLY, SETTLED_BLOCK and SYNC_REFUSED all answer a Node's own request."""
 
+NODE_ONLY = frozenset(
+    {
+        Verb.BODIES,
+        Verb.HELD,
+        Verb.SIG,
+        Verb.SETTLE_SIG,
+        Verb.HEIGHT,
+        Verb.HEIGHT_REPLY,
+        Verb.GETBLOCK,
+        Verb.SETTLED_BLOCK,
+        Verb.SYNC_REFUSED,
+    }
+)
+"""Verbs only a roster seat (or the anchor) may speak. A CLIENT grant does not make you a node,
+and a manager is not a node either -- it reads the chain through GET_ANCHORS/GET_PROOF like any
+other principal. The Round and SettleRound already refuse a non-member, but they refuse it after
+we have decoded and dispatched for them, and a refusal nobody can see is not a boundary."""
+
 HANDLED = frozenset(
     {
         Verb.SUBMIT,
@@ -164,11 +182,35 @@ class Node:
     def receive(self, frame: Frame, now: Millis, session: Session | None = None) -> None:
         try:
             got = self.postman.deliver(frame, now)
+            # WE GATE WHO MAY INITIATE. An answer correlated to a request WE sent is admitted
+            # on the strength of our having chosen the correspondent -- the mailbox only matches
+            # a 16-byte mid we issued. Gating replies too deadlocks a joiner: its store is empty,
+            # so it recognises nobody, so it may not accept the very blocks that would teach it
+            # who the cluster is.
+            is_node = self._is_node(got.envelope.frm)
+            solicited = got.reply is not None
+            if not solicited and not is_node and not self._granted(got.envelope.frm):
+                # CUT OFF, not merely ignored. Sealing a frame needs only our public key, so a
+                # stranger can spend our unseal and our signature verify on every frame they send
+                # -- and a revoked identity kept a live socket, because dropping a peer entry only
+                # stopped us dialling it. The first frame is unavoidable; this is what stops the
+                # second. Before this, an inbound session also MINTED a Peer for whatever pubkey
+                # bound it, so an attacker grew that table one invented key at a time.
+                self._cut_off(got.envelope.frm, session)
+                return
             if session is not None:
                 self._bind_session(session, got.envelope.frm)
-            self._handle(got.envelope, now)
+            self._handle(got.envelope, now, is_node or solicited)
         except DudeError:
             return
+
+    def _cut_off(self, who: crypto.PublicKey, session: Session | None) -> None:
+        if session is not None:
+            with contextlib.suppress(Exception):
+                session.close()
+        if who in self.postman.peers:
+            self.postman.remove_peer(who)
+        self._managed_peers.discard(who)
 
     def _bind_session(self, session: Session, frm: crypto.PublicKey) -> None:
         was_unbound = session.identity is None
@@ -180,10 +222,20 @@ class Node:
         if was_unbound:
             self.postman.register_session(session)
 
-    def _handle(self, env: SignedEnvelope, now: Millis) -> None:
-        fn = _DISPATCH.get(env.env.verb)
-        if fn is not None:
-            fn(self, env, now)
+    def _handle(self, env: SignedEnvelope, now: Millis, is_node: bool) -> None:
+        verb = env.env.verb
+        fn = _DISPATCH.get(verb)
+        if fn is None:
+            return
+        if verb in NODE_ONLY and not is_node:
+            return  # silently: answering tells an unauthorised sender what we run
+        fn(self, env, now)
+
+    def _is_node(self, who: crypto.PublicKey) -> bool:
+        return who == self.store.anchor() or self.mgmt.is_member(who)
+
+    def _granted(self, who: crypto.PublicKey) -> bool:
+        return self.mgmt.valid_grant(self.store, who) is not None
 
     def _on_ping(self, env: SignedEnvelope, now: Millis) -> None:
         self._reply(env, Verb.PONG, b"", now)
@@ -253,16 +305,18 @@ class Node:
         self.follower.receive(msg, env.frm, now)
 
     def _lite_authorised(self, requester: crypto.PublicKey) -> bool:
+        """May this identity ask us for chain metadata at all. It asked only whether a grant row
+        EXISTED -- so a grant issued by a since-revoked manager still read, long after the same
+        grant had stopped writing. Per request against current state, never cached."""
         if requester == self.store.anchor():
             return True
-        if requester in self.mgmt.roster():
+        if self.mgmt.is_member(requester):
             return True
-        grant = self.mgmt.grant_of(requester)
-        return grant is not None
+        return self.mgmt.valid_grant(self.store, requester) is not None
 
     def _on_get_anchors(self, env: SignedEnvelope, now: Millis) -> None:
         if not self._lite_authorised(env.frm):
-            self.lite_adapter.reply(env, LiteRefused(SyncRefusal.MALFORMED_QUERY), now)
+            self.lite_adapter.reply(env, LiteRefused(SyncRefusal.UNAUTHORISED), now)
             return
         try:
             req = LiteMsg.decode(env.env.verb, env.env.body)
@@ -276,7 +330,7 @@ class Node:
 
     def _on_get_proof(self, env: SignedEnvelope, now: Millis) -> None:
         if not self._lite_authorised(env.frm):
-            self.lite_adapter.reply(env, LiteRefused(SyncRefusal.MALFORMED_QUERY), now)
+            self.lite_adapter.reply(env, LiteRefused(SyncRefusal.UNAUTHORISED), now)
             return
         try:
             req = LiteMsg.decode(env.env.verb, env.env.body)
@@ -284,6 +338,11 @@ class Node:
             self.lite_adapter.reply(env, LiteRefused(SyncRefusal.MALFORMED_QUERY), now)
             return
         if not isinstance(req, GetProof):
+            return
+        if not self.mgmt.may_read(self.store, env.frm, req.store_id):
+            # SCOPED THE SAME WAY WRITING IS. Unscoped, a grant for one store read every store,
+            # store 0 included -- grants, roster rows, possession proofs, wrapped keys.
+            self.lite_adapter.reply(env, LiteRefused(SyncRefusal.UNAUTHORISED), now)
             return
         reply = serve_get_proof(self.store, req, self.tunables.light_client.liveness_window)
         self.lite_adapter.reply(env, reply, now)

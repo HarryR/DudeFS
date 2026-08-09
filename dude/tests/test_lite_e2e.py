@@ -38,14 +38,14 @@ from .cluster import DELTA, T0, TUNABLES, Cluster
 
 
 def _provision_client(c: Cluster, kp: crypto.Keypair) -> None:
-    """Grant Role.CLIENT to `kp`, applied via intervene so every store sees it."""
+    """Grant Role.CLIENT_RW to `kp`, applied via intervene so every store sees it."""
     mgmt = MgmtWriter(c.nodes[0].store)
     grant_tx = mgmt.authorise(
         kp.public,
-        Role.CLIENT,
-        stores=frozenset(),
+        Role.CLIENT_RW,
+        stores=frozenset({ops.STORE_DATA}),  # scoped: reads are refused outside it
         pop=kp.prove_possession(),
-        cert=Cert.sign_grant(c.mgr, kp.public, Role.CLIENT),
+        cert=Cert.sign_grant(c.mgr, kp.public, Role.CLIENT_RW),
     ).sign(c.mgr, T0)
     for node in c.nodes:
         intervene(node.store, c.mgr, bodies=(grant_tx,), bucket=TUNABLES.mempool.bucket(c.clock))
@@ -296,12 +296,14 @@ class TestNodeDispatchAndAuth(unittest.TestCase):
         req = GetAnchors(known_roster_fingerprint=None, known_trusted_block=None)
         verb, body = req.encode()
         env = Envelope(node.me.public, verb, new_message_id(), body).sign(stranger, T0)
-        # Deliver via node.receive; expect the refusal to be queued in the mailbox.
-        before = len(node.postman.mailbox.pending)
-        node.receive(env.seal(), T0)
-        after = len(node.postman.mailbox.pending)
-        # The auth-refusal reply was queued (MALFORMED_QUERY per _lite_authorised gate).
-        self.assertGreater(after, before)
+        # SILENCE, not a refusal. A principal we recognise but have not scoped for the store it
+        # asked about is told UNAUTHORISED, because it can act on that; an identity we do not
+        # recognise at all is cut off at `receive` and told nothing. Counting the mailbox, as
+        # this did, could not tell either outcome from being served.
+        with mock.patch.object(node.lite_adapter, "reply") as replied:
+            node.receive(env.seal(), T0)
+        replied.assert_not_called()
+        self.assertNotIn(stranger.public, node.postman.peers)
 
     def test_authorised_client_reaches_serve_handler(self):
         c = Cluster()
@@ -312,11 +314,36 @@ class TestNodeDispatchAndAuth(unittest.TestCase):
         req = GetAnchors(known_roster_fingerprint=None, known_trusted_block=None)
         verb, body = req.encode()
         env = Envelope(node.me.public, verb, new_message_id(), body).sign(client_kp, T0 + DELTA)
-        before = len(node.postman.mailbox.pending)
-        node.receive(env.seal(), T0 + DELTA)
-        after = len(node.postman.mailbox.pending)
-        # Successful handler queued the AnchorsReply for the client.
-        self.assertGreater(after, before)
+        with mock.patch.object(node.lite_adapter, "reply") as replied:
+            node.receive(env.seal(), T0 + DELTA)
+        replied.assert_called_once()
+        self.assertIsInstance(replied.call_args.args[1], AnchorsReply)
+
+    def test_a_client_is_refused_a_store_its_grant_does_not_name(self):
+        """The grant names STORE_DATA. Store 0 holds grants, roster rows, possession proofs and
+        wrapped keys, and the gate used to ask only whether a grant EXISTED -- so every granted
+        identity read every store."""
+        c = Cluster()
+        client_kp = crypto.Keypair.generate()
+        _provision_client(c, client_kp)
+        node = c.nodes[0]
+        self.assertTrue(node.mgmt.may_read(node.store, client_kp.public, ops.STORE_DATA))
+
+        req = GetProof(
+            store_id=ops.STORE_MANAGEMENT,
+            name=b"node/",
+            block_num=node.store.head_block_num() or 1,
+            known_roster_fingerprint=None,
+            known_trusted_block=None,
+        )
+        verb, body = req.encode()
+        env = Envelope(node.me.public, verb, new_message_id(), body).sign(client_kp, T0 + DELTA)
+        with mock.patch.object(node.lite_adapter, "reply") as replied:
+            node.receive(env.seal(), T0 + DELTA)
+        replied.assert_called_once()
+        sent = replied.call_args.args[1]
+        self.assertIsInstance(sent, LiteRefused, f"store 0 was served: {sent!r}")
+        self.assertIs(sent.reason, SyncRefusal.UNAUTHORISED)
 
 
 class TestTrustedBlockEncoding(unittest.TestCase):

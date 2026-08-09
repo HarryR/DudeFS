@@ -71,10 +71,10 @@ class TestIntervenePropagatesViaSync(unittest.TestCase):
             MgmtWriter(c.nodes[0].store)
             .authorise(
                 kp.public,
-                Role.CLIENT,
+                Role.CLIENT_RW,
                 stores=frozenset({D}),
                 pop=kp.prove_possession(),
-                cert=Cert.sign_grant(c.mgr, kp.public, Role.CLIENT),
+                cert=Cert.sign_grant(c.mgr, kp.public, Role.CLIENT_RW),
             )
             .sign(c.mgr, c._clock)
             for kp in new_clients
@@ -118,7 +118,7 @@ class TestIntervenePropagatesViaSync(unittest.TestCase):
                 grant = node.mgmt.grant_of(kp.public)
                 self.assertIsNotNone(grant, f"node {i} did not apply the intervene grant")
                 assert grant is not None
-                self.assertIs(grant.role, Role.CLIENT)
+                self.assertIs(grant.role, Role.CLIENT_RW)
 
 
 if __name__ == "__main__":

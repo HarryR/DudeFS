@@ -313,6 +313,15 @@ class Peer:
         self.endpoints.update(by_address)
         return Diff(added, removed)
 
+    def disconnect(self) -> None:
+        """Close every live pipe to this identity. Dropping the peer entry alone only stopped us
+        DIALLING them: an accepted socket stayed in the listener, stayed registered with the
+        selector and kept feeding frames in, so a revoked node went on being served."""
+        for sl in tuple(self.sessions):
+            sl._close()  # noqa: SLF001 -- same-module cooperative teardown, as `on_close` wiring is
+        self.sessions.clear()
+        self.links.clear()
+
     def usable(self, now: Millis) -> tuple[Link | SessionLink, ...]:
         session_out = [sl for sl in self.sessions if sl.available(now)]
         session_out.sort(key=lambda sl: -sl.last_activity)

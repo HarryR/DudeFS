@@ -189,6 +189,7 @@ class TestTheRefusalVocabularyIsOneClosedSet(unittest.TestCase):
                 ("MALFORMED_QUERY", "malformed-query"),
                 ("FORK_DETECTED", "fork-detected"),
                 ("INTERNAL", "internal"),
+                ("UNAUTHORISED", "unauthorised"),
             ],
             "add a member -> give it a case in Follower._on_refused AND the light client",
         )

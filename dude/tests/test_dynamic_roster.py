@@ -15,13 +15,14 @@ from dude.consensus.mempool import Refusal
 from dude.consensus.round import Bodies, Round
 from dude.core import crypto
 from dude.core.errors import DudeError, InvariantError
-from dude.net.address import Endpoint
+from dude.net.address import Address, Endpoint, Scheme
 from dude.net.envelope import Envelope, Verb
 from dude.net.postman import Recipient
+from dude.net.session import Session
 from dude.net.transports import address_of
 from dude.node import Node
 from dude.store import ops, settle
-from dude.store.management import P_ROSTER, Cert, MgmtWriter, NodeRecord
+from dude.store.management import P_ROSTER, Cert, MgmtWriter, NodeRecord, Role
 
 from .cluster import DELTA, T0, TUNABLES, Cluster
 
@@ -152,6 +153,108 @@ class TestRosterRemovalDropsPeer(unittest.TestCase):
                 node.postman.peers,
                 f"reconcile did not drop {victim.hex()[:6]} from node[{i}]",
             )
+
+    def test_removal_closes_the_pipe_not_just_the_dial_route(self):
+        """`remove_peer` popped the dict and stopped there, so we no longer CALLED a revoked node
+        while its accepted socket stayed open, registered with the selector and feeding frames in.
+        Being cut off is the point of being removed."""
+        c = Cluster(size=4)
+        victim = c.keys[3].public
+        c.pump(T0, rounds=1)  # real traffic, so there are live sessions to close
+        holder = next((n for n in c.nodes[:3] if c.nodes[0].postman.peers.get(victim)), c.nodes[0])
+        peer = holder.postman.peers.get(victim)
+        assert peer is not None, "victim was never a peer; nothing to close"
+        links = tuple(peer.sessions)
+
+        remove_tx = (
+            MgmtWriter(holder.store)
+            .change_roster(commitment_signer=c.mgr, remove=(victim,))
+            .sign(c.mgr, T0)
+        )
+        for node in c.nodes:
+            intervene(node.store, c.mgr, bodies=(remove_tx,), bucket=778)
+        holder.tick(T0 + DELTA)
+
+        self.assertNotIn(victim, holder.postman.peers)
+        for sl in links:
+            self.assertTrue(sl._closed, "a session to a removed node was left open")
+
+
+class _RecordingSession(Session):
+    """A session that remembers being closed, so a test can see the cut-off happen."""
+
+    def __init__(self, address: Address) -> None:
+        super().__init__(None, address)
+        self.closed = False
+
+    def send(self, frame) -> None:  # noqa: ARG002 -- Session's signature; a cut-off pipe is never sent to
+        raise AssertionError("a cut-off session must never be sent to")
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class TestAClientCannotActAsANode(unittest.TestCase):
+    """A grant is not a seat. The Round already refuses a non-member, but only after we have
+    unsealed, verified and dispatched for them -- and a refusal nobody can see is not a boundary.
+    A stranger gets less again: no reply at all, and the pipe closed."""
+
+    def _client(self, c: Cluster) -> crypto.Keypair:
+        kp = crypto.Keypair.generate()
+        grant = MgmtWriter(c.nodes[0].store).authorise(
+            kp.public,
+            Role.CLIENT_RW,
+            stores=frozenset({ops.STORE_DATA}),
+            pop=kp.prove_possession(),
+            cert=Cert.sign_grant(c.mgr, kp.public, Role.CLIENT_RW),
+        )
+        for node in c.nodes:
+            intervene(node.store, c.mgr, bodies=(grant.sign(c.mgr, T0),), bucket=779)
+        return kp
+
+    def test_a_granted_client_speaking_a_node_verb_is_not_dispatched(self):
+        c = Cluster()
+        node = c.nodes[0]
+        client = self._client(c)
+        self.assertTrue(node.mgmt.valid_grant(node.store, client.public), "setup: needs standing")
+
+        env = Envelope(node.me.public, Verb.HEIGHT, b"m" * 16, b"").sign(client, T0)
+        with mock.patch.object(node.sync_adapter, "reply") as served:
+            node.receive(env.seal(), T0)
+        served.assert_not_called()
+
+        # THE CONTROL. Without it this passes for any reason the frame failed to arrive at all.
+        peer_env = Envelope(node.me.public, Verb.HEIGHT, b"n" * 16, b"").sign(c.keys[1], T0)
+        with mock.patch.object(node.sync_adapter, "reply") as served:
+            node.receive(peer_env.seal(), T0)
+        served.assert_called_once()
+
+    def test_a_stranger_is_cut_off_rather_than_answered(self):
+        """WITH A SESSION, because that is the path that mints the `Peer`: an inbound session
+        registered whatever pubkey bound it, so the table grew one invented key at a time. Passing
+        `session=None`, as a first draft of this did, never reaches that code at all."""
+        c = Cluster()
+        node = c.nodes[0]
+        stranger = crypto.Keypair.generate()
+        session = _RecordingSession(Address(Scheme.INPROC, "stranger"))
+
+        env = Envelope(node.me.public, Verb.HEIGHT, b"m" * 16, b"").sign(stranger, T0)
+        with mock.patch.object(node.sync_adapter, "reply") as served:
+            node.receive(env.seal(), T0, session=session)
+        served.assert_not_called()
+        self.assertNotIn(
+            stranger.public, node.postman.peers, "a stranger minted a Peer by sending one frame"
+        )
+        self.assertTrue(session.closed, "the pipe was left open to a stranger")
+
+    def test_a_seated_node_keeps_its_session(self):
+        """The control: the cut-off must not close pipes to identities that DO have standing."""
+        c = Cluster()
+        node = c.nodes[0]
+        session = _RecordingSession(Address(Scheme.INPROC, "peer"))
+        env = Envelope(node.me.public, Verb.HEIGHT, b"m" * 16, b"").sign(c.keys[1], T0)
+        node.receive(env.seal(), T0, session=session)
+        self.assertFalse(session.closed, "a roster member was cut off")
 
 
 class TestAGarbageRosterRowDoesNotStopTheNode(unittest.TestCase):

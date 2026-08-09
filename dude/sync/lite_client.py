@@ -189,12 +189,26 @@ class LightClient:
         except (LiteAdapterError, DudeError):
             return
         reply_to = env.env.reply_to
+        # A RESPONDER'S FRAME IS NOT ALLOWED TO RAISE PAST HERE. `Node.receive` puts its dispatch
+        # inside this guard; this one did not, so a `DudeError` from verifying a header -- a
+        # multisig bitmap of the wrong width was enough -- unwound through `_run`, which catches
+        # only `queue.Empty`, and killed the thread. The listener kept accepting into an inbox
+        # nobody drained, so the client looked alive and every read hung for ever.
         if reply_to in self._pending_bootstrap_mids:
             peer = self._pending_bootstrap_mids.pop(reply_to)
-            self._on_bootstrap_reply(peer, msg, now)
+            try:
+                self._on_bootstrap_reply(peer, msg, now)
+            except DudeError:
+                self._bootstrap_peers.pop(peer, None)
             return
         if reply_to in self._pending_reads:
-            self._on_read_reply(reply_to, msg, now)
+            try:
+                self._on_read_reply(reply_to, msg, now)
+            except DudeError as e:
+                # Resolved, not dropped: a read left PENDING never resolves, because nothing
+                # times a pending read out.
+                entry = self._pending_reads[reply_to]
+                entry.result = Failed(reason=f"responder reply refused: {e}")
             return
 
     def tick(self, now: Millis) -> None:
@@ -242,12 +256,14 @@ class LightClient:
         while not self._stopping.is_set():
             try:
                 inbound = self._inbox.get(timeout=tick_interval_ms / 1000)
-                self.receive(inbound.frame, now_ms(), session=inbound.session)
+                with contextlib.suppress(DudeError):
+                    self.receive(inbound.frame, now_ms(), session=inbound.session)
             except queue.Empty:
                 pass
             now = now_ms()
             if now - last_tick >= tick_interval_ms:
-                self.tick(now)
+                with contextlib.suppress(DudeError):
+                    self.tick(now)
                 last_tick = now
 
     def _bind_session(self, session: Session, frm: crypto.PublicKey) -> None:

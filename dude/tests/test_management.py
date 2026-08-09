@@ -176,10 +176,10 @@ class TestRoleManagerGrant(unittest.TestCase):
         pop = client.prove_possession()
         grant = mgmt.authorise(
             client.public,
-            Role.CLIENT,
+            Role.CLIENT_RW,
             stores=frozenset({ops.STORE_DATA}),
             pop=pop,
-            cert=Cert.sign_grant(anchor, client.public, Role.CLIENT),
+            cert=Cert.sign_grant(anchor, client.public, Role.CLIENT_RW),
         )
         s.apply((_sign(anchor, grant),), auth=mgmt)
 
@@ -410,15 +410,15 @@ class TestEmergencyIntervention(unittest.TestCase):
         pre_head_hash = s.head_block_hash()
         assert pre_head_hash is not None
 
-        # Now intervene with a manager-authored op. Grant a Role.CLIENT to some identity.
+        # Now intervene with a manager-authored op. Grant a Role.CLIENT_RW to some identity.
         client = crypto.Keypair.generate()
         pop = client.prove_possession()
         grant = mgmt.authorise(
             client.public,
-            Role.CLIENT,
+            Role.CLIENT_RW,
             stores=frozenset({ops.STORE_DATA}),
             pop=pop,
-            cert=Cert.sign_grant(anchor, client.public, Role.CLIENT),
+            cert=Cert.sign_grant(anchor, client.public, Role.CLIENT_RW),
         )
         grant_tx = _sign(anchor, grant)
         sbwb = intervene(s, anchor, bodies=(grant_tx,), bucket=1)
@@ -753,10 +753,10 @@ class TestAuthorityIsResolvedOverOneView(unittest.TestCase):
             mgr,
             scratch_mgmt.authorise(
                 client.public,
-                Role.CLIENT,
+                Role.CLIENT_RW,
                 frozenset({ops.STORE_DATA}),
                 pop=client.prove_possession(),
-                cert=Cert.sign_grant(mgr, client.public, Role.CLIENT),
+                cert=Cert.sign_grant(mgr, client.public, Role.CLIENT_RW),
             ),
         )
         tx3 = ops.writes(ops.Set(ops.STORE_DATA, b"k", b"v")).sign(client, T0)
@@ -780,7 +780,7 @@ class TestAuthorityRowEncoding(unittest.TestCase):
         self.who = crypto.Keypair.generate().public
 
     def test_cert_wrong_field_count_raises(self):
-        cert = Cert.sign_grant(self.anchor, self.who, Role.CLIENT)
+        cert = Cert.sign_grant(self.anchor, self.who, Role.CLIENT_RW)
         self.assertEqual(Cert.decode(cert.encode()), cert)
         for wrong in (3, 5):
             with self.assertRaises(ManagementError):
@@ -789,10 +789,10 @@ class TestAuthorityRowEncoding(unittest.TestCase):
     def test_grant_wrong_field_count_raises_on_both_forms(self):
         grant = Grant(
             self.who,
-            Role.CLIENT,
+            Role.CLIENT_RW,
             frozenset({1}),
             frozenset({2}),
-            Cert.sign_grant(self.anchor, self.who, Role.CLIENT),
+            Cert.sign_grant(self.anchor, self.who, Role.CLIENT_RW),
         )
         self.assertEqual(Grant.decode(grant.encode()), grant)
         self.assertEqual(Grant.decode_row(self.who, grant.encode_row()), grant)
@@ -910,6 +910,102 @@ class TestIsMemberAndRosterCannotDisagree(unittest.TestCase):
         intervene(s, c.mgr, bodies=(remove,), bucket=TUNABLES.mempool.bucket(c.clock))
         self.assertNotIn(victim, MgmtReader(s).roster())
         self.assertFalse(MgmtReader(s).is_member(victim))
+
+
+class TestAuthorizationRefusesRatherThanRaises(unittest.TestCase):
+    """Every field of a multisig arrives from a peer, so a shape we cannot make sense of is that
+    peer's claim being wrong -- a refusal. Raised instead, it escapes as OUR error: `CryptoError`
+    from an unindexable bitmap and `QuorumError` from `quorum.size(0)` both unwound through
+    `chain.advance` into the light client, which catches neither on its read path."""
+
+    def test_a_bitmap_of_the_wrong_width_is_refused(self):
+        anchor = crypto.Keypair.generate()
+        roster = tuple(crypto.Keypair.generate().public for _ in range(3))
+        wrong = crypto.MultiSig(crypto.SignerBitmap(bytes(5)), (crypto.Signature(bytes(64)),))
+        self.assertFalse(Authorization(wrong, b"payload", roster, anchor.public).verify())
+
+    def test_an_empty_roster_without_the_anchor_is_refused(self):
+        """No roster is no quorum. Reached verifying a claim about block 1."""
+        anchor = crypto.Keypair.generate()
+        none_set = crypto.MultiSig(crypto.SignerBitmap(bytes(1)), ())
+        self.assertFalse(Authorization(none_set, b"payload", (), anchor.public).verify())
+
+    def test_the_anchor_still_overrides_an_empty_roster(self):
+        """The control: refusing an empty roster must not refuse the bootstrap block itself."""
+        anchor = crypto.Keypair.generate()
+        payload = b"block-one"
+        sig = crypto.MultiSig.combine({0: anchor.sign(payload)}, 1)
+        self.assertTrue(Authorization(sig, payload, (), anchor.public).verify())
+
+
+class TestReadAndWriteAreScopedTheSameWay(unittest.TestCase):
+    """`stores` is the set a grant covers; the ROLE says what may be done to it. Before the split
+    there was one CLIENT role and reads consulted neither -- any grant read any store."""
+
+    def _granted(self, role: Role, stores: frozenset[int]) -> tuple[Store, crypto.Keypair]:
+        anchor = crypto.Keypair.generate()
+        s = Store()
+        s.provision(anchor.public)
+        who = crypto.Keypair.generate()
+        tx = MgmtWriter(s).authorise(
+            who.public,
+            role,
+            stores=stores,
+            pop=who.prove_possession(),
+            cert=Cert.sign_grant(anchor, who.public, role),
+        )
+        bootstrap(s, anchor, bodies=(tx.sign(anchor, T0),), bucket=0)
+        return s, who
+
+    def test_a_read_only_grant_reads_its_store_and_writes_nothing(self):
+        s, who = self._granted(Role.CLIENT_RO, frozenset({ops.STORE_DATA}))
+        m = MgmtReader(s)
+        self.assertTrue(m.may_read(s, who.public, ops.STORE_DATA))
+        self.assertFalse(m.may_write(s, who.public, ops.STORE_DATA), "CLIENT_RO wrote")
+
+    def test_a_read_write_grant_does_both_but_only_where_it_is_scoped(self):
+        s, who = self._granted(Role.CLIENT_RW, frozenset({ops.STORE_DATA}))
+        m = MgmtReader(s)
+        self.assertTrue(m.may_write(s, who.public, ops.STORE_DATA))
+        self.assertFalse(m.may_read(s, who.public, ops.STORE_MANAGEMENT), "read store 0")
+        self.assertFalse(m.may_write(s, who.public, ops.STORE_MANAGEMENT))
+
+    def test_a_compactor_reads_its_store_and_writes_nothing(self):
+        """It authorises nothing more until compaction returns with its own verbs."""
+        s, who = self._granted(Role.COMPACTOR, frozenset({ops.STORE_DATA}))
+        m = MgmtReader(s)
+        self.assertTrue(m.may_read(s, who.public, ops.STORE_DATA))
+        self.assertFalse(m.may_write(s, who.public, ops.STORE_DATA))
+
+    def test_a_grant_whose_signer_holds_no_grant_is_refused_for_reads_too(self):
+        """#revocation-is-compound. `revoke` re-issues what a key attested, so it never orphans a
+        chain -- but a row planted around `authorise` can, which is exactly what
+        `TestRevokedManagerCannotForgeARoster` models: the cert stays a genuine artefact and only
+        the signer's own grant is gone. `may_write` re-walked the chain and the read path did not,
+        so such a grant kept reading after it had stopped writing."""
+        anchor = crypto.Keypair.generate()
+        s = Store()
+        s.provision(anchor.public)
+        bootstrap(s, anchor, bodies=(), bucket=0)
+
+        stranger = crypto.Keypair.generate()  # never held a MANAGER grant
+        who = crypto.Keypair.generate()
+        forged = Grant(
+            identity=who.public,
+            role=Role.CLIENT_RW,
+            stores=frozenset({ops.STORE_DATA}),
+            kinds=frozenset(),
+            cert=Cert.sign_grant(stranger, who.public, Role.CLIENT_RW),
+        )
+        plant = ops.writes(
+            ops.Set(ops.STORE_MANAGEMENT, P_GRANT + who.public, forged.encode_row())
+        ).sign(anchor, T0)
+        intervene(s, anchor, bodies=(plant,), bucket=1)
+
+        m = MgmtReader(s)
+        self.assertIsNotNone(m.grant_of(who.public), "the row must exist, or this is vacuous")
+        self.assertFalse(m.may_write(s, who.public, ops.STORE_DATA))
+        self.assertFalse(m.may_read(s, who.public, ops.STORE_DATA), "unchained grant still read")
 
 
 if __name__ == "__main__":
