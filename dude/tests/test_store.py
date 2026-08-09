@@ -508,6 +508,25 @@ class TestTransferAndSettlementRace(unittest.TestCase):
         self.assertEqual([d.why for d in again.dropped], [settle.Reason.SETTLED])
         self.assertEqual(self.s.head(), 1, "the duplicate took a log position")
 
+    def test_a_duplicate_within_one_batch_is_dropped_not_raised(self):
+        """The cross-batch case above is held by the pre-loop settled_hashes snapshot; a duplicate
+        WITHIN one block's batch is not in that snapshot, and acceptors cannot screen bodies, so a
+        Byzantine proposer's ratified block used to crash every honest applier identically with
+        sqlite3.IntegrityError through commit_block -- and again after restart, since the block
+        re-arrives on sync. Driven through commit_block because that is the boundary it escaped."""
+        t = tx(self.kp, muts=(ops.Set(ops.STORE_DATA, b"k", b"v"),))
+        got = self.s.commit_block(
+            1,
+            first_height=1,
+            block_bytes=b"b1",
+            block_hash=crypto.h(b"b1"),
+            batch=(t, t),
+            auth=self.mgmt,
+        )
+        self.assertEqual(len(got.settled), 1)
+        self.assertEqual([d.why for d in got.dropped], [settle.Reason.SETTLED])
+        self.assertEqual(self.s.head(), 1, "the duplicate must not take a log position")
+
     def test_the_survivors_of_a_mixed_batch_still_land(self):
         """One duplicate must not take the batch down with it."""
         old = tx(self.kp, muts=(ops.Set(ops.STORE_DATA, b"k", b"v"),))

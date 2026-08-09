@@ -387,6 +387,12 @@ class StoreWriter(StoreReader):
             idx += 1
             acc = self._commit(idx, tx, layer.mutations, acc)
             settled.append((idx, tx.op_hash))
+            # Into the dedup set NOW, not just the pre-loop snapshot: acceptors cannot screen
+            # bodies, so a proposer duplicating a tx WITHIN one block otherwise reached
+            # `entry.op_hash UNIQUE` and crashed every honest applier with the same
+            # sqlite3.IntegrityError -- not a DudeError -- in a restart loop, since the block
+            # re-arrives on sync.
+            already.add(tx.op_hash)
         self._set_meta("acc", acc)
         return Applied(tuple(settled), tuple(dropped))
 
