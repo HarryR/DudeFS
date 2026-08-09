@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import queue
+import socket
 import threading
 import time
 import unittest
@@ -18,7 +19,14 @@ from dude.net.address import Address, Scheme
 from dude.net.envelope import Envelope, Frame, Verb
 from dude.net.link import LinkError
 from dude.net.session import Inbound
-from dude.net.transports.tcp import TCPDialer, TCPListener
+from dude.net.transports.tcp import (
+    _CONNECT_TIMEOUT_SEC,
+    _LEN,
+    _SEND_TIMEOUT_SEC,
+    TCPDialer,
+    TCPListener,
+    TCPSession,
+)
 
 
 def _make_frame(sender: crypto.Keypair, recipient: crypto.PublicKey, body: bytes = b"hi") -> Frame:
@@ -236,6 +244,87 @@ class TestReaderThreadShape(unittest.TestCase):
         self.assertNotEqual(thread.ident, threading.get_ident())  # NOT the test thread
         listener.stop()
         self.assertFalse(thread.is_alive())
+
+
+def _big_frame(size: int) -> Frame:
+    """A structurally valid frame around an opaque sealed blob -- the carrier never opens it."""
+    kp = crypto.Keypair.generate()
+    return Frame(crypto.screen_tag(kp.public, b"big"), crypto.SealedBlob(bytes(size)))
+
+
+def _backpressured_session(sndbuf: int = 8192) -> tuple[TCPSession, socket.socket]:
+    left, right = socket.socketpair()
+    left.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, sndbuf)
+    left.setblocking(False)
+    return TCPSession(left, Address(Scheme.TCP, "pair:0")), right
+
+
+class TestConnectIsBounded(unittest.TestCase):
+    def test_a_blackholed_address_fails_within_the_bound(self):
+        """`_connect` ran a blocking connect() with no timeout -- and it runs on the node's
+        single tick thread, so one firewalled peer stalled ALL consensus and sync for the OS
+        SYN timeout (minutes). 192.0.2.1 is TEST-NET-1 (RFC 5737): never routable, so the SYN
+        goes unanswered -- exactly the firewalled-peer shape."""
+        client = TCPDialer()
+        kp = crypto.Keypair.generate()
+        start = time.monotonic()
+        try:
+            with self.assertRaises(LinkError):
+                client.send(Address(Scheme.TCP, "192.0.2.1:9"), _make_frame(kp, kp.public))
+        finally:
+            client.close()
+        elapsed = time.monotonic() - start
+        self.assertLess(
+            elapsed,
+            _CONNECT_TIMEOUT_SEC + 7.0,
+            f"connect blocked {elapsed:.1f}s: the tick thread was stalled unbounded",
+        )
+
+
+class TestBackpressureIsBoundedNotDropped(unittest.TestCase):
+    """`sendall` on the non-blocking socket raised BlockingIOError the moment the kernel
+    buffer filled: session torn down, consensus frame dropped, indistinguishable from packet
+    loss. A blocked send must wait for writability up to the bound."""
+
+    def test_a_send_the_reader_catches_up_on_completes_intact(self):
+        session, right = _backpressured_session()
+        frame = _big_frame(4_000_000)  # far above any socketpair buffer: EAGAIN guaranteed
+        expected = _LEN.pack(len(frame.raw)) + frame.raw
+        received = bytearray()
+
+        def _reader() -> None:
+            time.sleep(0.05)  # let the writer hit the full buffer first
+            while len(received) < len(expected):
+                chunk = right.recv(65536)
+                if not chunk:
+                    return
+                received.extend(chunk)
+
+        t = threading.Thread(target=_reader)
+        t.start()
+        try:
+            session.send(frame)  # must not raise: the momentary EAGAIN is not a failure
+            t.join(timeout=10.0)
+            self.assertEqual(bytes(received), expected, "the frame did not arrive intact")
+        finally:
+            session.close()
+            right.close()
+
+    def test_a_send_nobody_drains_fails_at_the_bound_not_instantly(self):
+        session, right = _backpressured_session()
+        start = time.monotonic()
+        try:
+            with self.assertRaises(LinkError):
+                session.send(_big_frame(4_000_000))
+        finally:
+            elapsed = time.monotonic() - start
+            session.close()
+            right.close()
+        self.assertGreaterEqual(
+            elapsed,
+            _SEND_TIMEOUT_SEC * 0.9,
+            "the send failed instantly: backpressure was dropped, not waited out",
+        )
 
 
 if __name__ == "__main__":

@@ -3,10 +3,12 @@ from __future__ import annotations
 import contextlib
 import errno
 import queue
+import select
 import selectors
 import socket
 import struct
 import threading
+import time
 from dataclasses import dataclass, field
 
 from ...core.errors import DudeError
@@ -19,6 +21,11 @@ from ..session import Inbound, Session
 _LEN = struct.Struct(">I")
 
 _SELECT_TIMEOUT_SEC = 0.5
+
+# Both bounds are spent on the CALLER's thread, and the caller is the node's single tick
+# thread: whatever value sits here is how long one bad peer can stall all consensus and sync.
+_CONNECT_TIMEOUT_SEC = 3.0
+_SEND_TIMEOUT_SEC = 2.0
 
 
 class TCPSession(Session):
@@ -37,11 +44,36 @@ class TCPSession(Session):
             raise LinkError(f"frame too large: {len(payload)} > {MAX_FRAME_BYTES}")
         blob = _LEN.pack(len(payload)) + payload
         try:
-            self._sock.sendall(blob)
+            self._send_bounded(blob)
+        except LinkError:
+            self._mark_closed()
+            raise
         except OSError as e:
             self._mark_closed()
             raise LinkError(f"tcp session send failed: {e}") from e
         self.last_activity = now_ms()
+
+    def _send_bounded(self, blob: bytes) -> None:
+        """`sendall` on the non-blocking socket raised BlockingIOError the moment the kernel
+        buffer filled -- backpressure became a torn-down session and a dropped consensus
+        frame, indistinguishable from packet loss. A blocked send instead waits for
+        writability up to _SEND_TIMEOUT_SEC, then fails as a LinkError the breaker can
+        price. A partial write followed by the timeout leaves the peer mid-frame, which is
+        why the caller closes the session on ANY failure here."""
+        deadline = time.monotonic() + _SEND_TIMEOUT_SEC
+        view = memoryview(blob)
+        while view:
+            try:
+                sent = self._sock.send(view)
+            except (BlockingIOError, InterruptedError):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise LinkError("tcp session send timed out under backpressure") from None
+                _, writable, _ = select.select([], [self._sock], [], remaining)
+                if not writable:
+                    raise LinkError("tcp session send timed out under backpressure") from None
+                continue
+            view = view[sent:]
 
     def close(self) -> None:
         self._mark_closed()
@@ -165,6 +197,9 @@ class TCPDialer(Transport, Listener):
         except ValueError as e:
             raise LinkError(f"tcp address has non-integer port: {address.value}") from e
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        # Unbounded, this blocking connect ran on the node's tick thread with the OS SYN
+        # timeout (minutes): one firewalled peer address stalled all consensus and sync.
+        sock.settimeout(_CONNECT_TIMEOUT_SEC)
         try:
             sock.connect((host, port))
         except OSError as e:
