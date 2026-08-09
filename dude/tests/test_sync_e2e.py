@@ -13,9 +13,11 @@ import unittest
 from dude.consensus.settle_round import SettledBlock
 from dude.core import crypto
 from dude.net.address import Endpoint
+from dude.net.envelope import Envelope
 from dude.net.transports import InProcListener, address_of, name_of
 from dude.node import Node
 from dude.store import Store, ops
+from dude.sync.adapter import HeightReply
 
 from .cluster import DELTA, T0, Cluster, D
 
@@ -121,6 +123,39 @@ class TestFreshNodeJoinsClusterAndCatchesUp(unittest.TestCase):
         joiner_roster = joiner_store.mgmt.roster()
         producer_roster = c.nodes[0].store.mgmt.roster()
         self.assertEqual(set(joiner_roster), set(producer_roster))
+
+
+class TestRefusalIsDispatchedToTheFollower(unittest.TestCase):
+    """A REFUSED reply must reach `Follower._on_refused` THROUGH Node dispatch. It did not:
+    the handler existed and was tested by direct `follower.receive(Refused(...))` calls only,
+    while `_DISPATCH` had no REFUSED entry -- so in production every sync refusal was
+    discarded at the door, each one costing a full pull_timeout instead of a same-tick
+    retry, and the correct-down of a liar's claimed head never ran."""
+
+    def test_a_refusal_arriving_on_the_wire_clears_the_pull(self):
+        c = Cluster()
+        liar, victim = c.nodes[0], c.nodes[1]
+        now = c.clock
+
+        # Node 0's own key signs a HEIGHT_REPLY claiming block 5 it does not have; delivered
+        # through the victim's real receive path, exactly as a lying peer would.
+        verb, body = HeightReply(block_num=5, tip_hash=crypto.h(b"lie")).encode()
+        env = Envelope(victim.me.public, verb, b"h" * 16, body).sign(liar.me, now)
+        victim.receive(env.seal(), now)
+        self.assertEqual(victim.follower._heads[liar.me.public].block_num, 5)
+
+        # The victim's own tick opens a pull for block 2 against the liar.
+        victim.tick(now)
+        self.assertIsNotNone(victim.follower._pulling)
+
+        # The liar genuinely has no block 2, so its serve_getblocks answers
+        # Refused(NOT_YET_SETTLED). Quiescing delivers that refusal back over the wire; it
+        # must be DISPATCHED: the pull clears within this same `now`, no timeout spent.
+        c._quiesce(now, away=set())
+        self.assertIsNone(
+            victim.follower._pulling,
+            "the REFUSED reply was discarded at the door; the pull is stuck until timeout",
+        )
 
 
 if __name__ == "__main__":

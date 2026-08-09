@@ -41,13 +41,14 @@ REPLIES = frozenset(
     {
         Verb.PONG,
         Verb.ACCEPTED,
-        Verb.REFUSED,
         Verb.ANCHORS_REPLY,
         Verb.PROOF_REPLY,
         Verb.LITE_REFUSED,
     }
 )
-"""Answers, correlated by whoever asked -- the last three by a `LightClient`, not by a Node."""
+"""Answers a Node never consumes -- ACCEPTED by a submitting client, the last three by a
+`LightClient`. REFUSED is NOT here: like HEIGHT_REPLY and SETTLED_BLOCK it answers a Node's own
+request, and a reply the Node consumes must be in HANDLED or the dispatch table discards it."""
 
 HANDLED = frozenset(
     {
@@ -60,6 +61,7 @@ HANDLED = frozenset(
         Verb.HEIGHT_REPLY,
         Verb.GETBLOCK,
         Verb.SETTLED_BLOCK,
+        Verb.REFUSED,
         Verb.PING,
         Verb.GET_ANCHORS,
         Verb.GET_PROOF,
@@ -226,6 +228,20 @@ class Node:
         self.sync_adapter.reply(
             env, serve_getblocks(self.store, req, self.tunables.sync.pull_batch), now
         )
+
+    def _on_refused(self, env: SignedEnvelope, now: Millis) -> None:
+        # A peer's answer to our own GETBLOCK. It had no dispatch entry, so every sync
+        # refusal was discarded at the door: the follower's refusal handling ran only in
+        # tests that called it directly, each refusal cost a full pull_timeout instead of
+        # a same-tick retry, and the correct-down of a liar's claimed head never ran.
+        try:
+            msg = SyncMsg.decode(env.env.verb, env.env.body)
+        except SyncAdapterError:
+            return
+        self.follower.receive(msg, env.frm, now)
+        # The refusal path may retry against another source in the same tick; that retry
+        # sits in the follower's outbox and must not wait for the next tick to be sent.
+        self._flush_follower(now)
 
     def _on_settled_block(self, env: SignedEnvelope, now: Millis) -> None:
         try:
