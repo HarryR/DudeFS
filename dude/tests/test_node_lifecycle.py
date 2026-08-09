@@ -15,6 +15,9 @@ Small on purpose: one 3-node cluster, prove that
 
 from __future__ import annotations
 
+import subprocess
+import sys
+import textwrap
 import time
 import unittest
 
@@ -195,6 +198,42 @@ class TestNodeLifecycle(unittest.TestCase):
         finally:
             for lst in listeners:
                 lst.stop()
+
+
+class TestCrashOnly(unittest.TestCase):
+    def test_start_installs_the_crash_only_excepthook(self):
+        """`_run` suppresses DudeError only, on the contract that anything else reaching the
+        excepthook is `os._exit(70)` and a supervisor respawn. Nothing installed that hook: the
+        node thread died, the listeners kept accepting frames into an inbox nobody drained, and
+        the process lived on indistinguishable from a healthy node. Driven through Node.start()
+        in a subprocess; the raising thread stands in for any node-side thread."""
+        code = textwrap.dedent(
+            """
+            import threading
+            from dude.core import crypto
+            from dude.node import Node
+            from dude.store import Store
+
+            kp = crypto.Keypair.generate()
+            s = Store()
+            s.provision(kp.public)
+            node = Node(kp, s)
+            node.start()
+
+            def boom():
+                raise RuntimeError("unguarded escape from a node-side thread")
+
+            t = threading.Thread(target=boom)
+            t.start()
+            t.join()
+            print("still alive", flush=True)
+            """
+        )
+        proc = subprocess.run(  # noqa: S603 -- our own interpreter, fixed argv, no outside input
+            [sys.executable, "-c", code], capture_output=True, timeout=60, check=False
+        )
+        self.assertEqual(proc.returncode, 70, proc.stderr.decode())
+        self.assertNotIn(b"still alive", proc.stdout, "the zombie survived its thread's death")
 
 
 if __name__ == "__main__":

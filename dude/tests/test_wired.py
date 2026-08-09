@@ -117,6 +117,8 @@ def _production_calls() -> set[str]:
 
 DRIVEN = {
     # the duty                what performs it, each round
+    "crashonly.install": "a node thread dying of a non-DudeError exits the process (70), "
+    "instead of leaving a zombie whose listeners still accept frames",
     "mempool.admit": "screens what a client offers (also from Coordinator on reject re-entry)",
     "coordinator.tick": "swap mempool on bucket boundary, drive open Rounds, settle any ratified",
     "coordinator.submit": "hands a client's tx to the currently-live mempool",

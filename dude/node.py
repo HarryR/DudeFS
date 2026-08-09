@@ -7,7 +7,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from .consensus import Coordinator, Mempool, RoundAdapter, SettleAdapter
-from .core import crypto
+from .core import crashonly, crypto
 from .core.errors import DudeError
 from .core.units import Millis, now_ms
 from .net import Verb
@@ -281,6 +281,12 @@ class Node:
     def start(self, *listeners: Listener) -> None:
         if self._thread is not None:
             return
+        # _run's contract is that a non-DudeError escaping a node thread is fatal:
+        # excepthook -> os._exit(70), supervisor respawns. That held only if someone
+        # installed the hook, and nobody did -- the thread died, the listeners kept
+        # accepting frames into an inbox nobody drained, and the process lived on
+        # indistinguishable from a healthy node.
+        crashonly.install()
         started: list[Listener] = []
         try:
             self.postman.start(self._inbox)
