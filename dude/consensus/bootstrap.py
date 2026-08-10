@@ -6,6 +6,7 @@ from ..store import Layer, Store, settle
 from ..store.management import MgmtReader
 from ..store.ops import SignedTransaction
 from ..store.store import log_element
+from .canonical import bodies_canonical, hashes_canonical
 from .round import Block
 from .settle_round import (
     Anchors,
@@ -30,7 +31,7 @@ def _apply_manager_signed_block(  # noqa: PLR0913 -- construction inputs, all re
     # manager block carried an acc_log and state_root no peer's preview could reproduce:
     # every honest node refused it, and the intervened node was stranded on a chain nobody
     # would walk, with no reorg to heal it.
-    bodies = tuple(sorted(bodies, key=lambda tx: tx.op_hash))
+    bodies = bodies_canonical(bodies).txs
     mgmt = MgmtReader(store)
     layer = Layer(store)
     screened = settle.apply_to(layer, bodies, mgmt)
@@ -56,7 +57,7 @@ def _apply_manager_signed_block(  # noqa: PLR0913 -- construction inputs, all re
         acc_log=acc_log,
     )
 
-    slice_hashes = tuple(sorted(tx.op_hash for tx in bodies))
+    slice_hashes = hashes_canonical(tx.op_hash for tx in bodies)
     block = Block(bucket=bucket, hashes=slice_hashes)
     manager_sig = manager.sign(_settle_payload(block.slice_hash, anchors))
 

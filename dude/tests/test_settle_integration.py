@@ -10,7 +10,7 @@ from __future__ import annotations
 import unittest
 from dataclasses import replace
 
-from dude.consensus.coordinator import _DIVERGENT_STALL_LIMIT, _Settling
+from dude.consensus.coordinator import _Settling
 from dude.consensus.round import Block
 from dude.consensus.settle_round import (
     Anchors,
@@ -21,7 +21,6 @@ from dude.consensus.settle_round import (
     genesis_stamp,
 )
 from dude.core import crypto
-from dude.core.errors import InvariantError
 from dude.store import Layer, ops
 
 from .cluster import DELTA, T0, Cluster, D
@@ -161,17 +160,19 @@ class TestABlockNamesOnlyWhatItApplied(unittest.TestCase):
             )
 
 
-class TestASilentSettlementStallBecomesLoud(unittest.TestCase):
+class TestDivergentSettlementIsLoggedNotFatal(unittest.TestCase):
     """Safety was never the problem: a peer signing different anchors has its signature dropped at
     the equality check and never enters the bitmap, and a light client re-verifies the payload
     itself. A LONE divergent node also heals -- the others reach quorum without it and it adopts
     their block through the Follower.
 
-    The problem is the case where no camp reaches quorum. Every node abandons, re-admits, and
-    tries again forever. `SettleRound.divergences()` computed exactly the evidence that would name
-    who disagreed and about what, and had no production consumer anywhere: no log, no counter, no
-    metric. A chain in this state was indistinguishable from an idle one -- blocks simply stopped,
-    with no error, and the mempool grew for ever."""
+    What used to be silent is the case where no camp reaches quorum: every node abandons,
+    re-admits, and tries again forever. `SettleRound.divergences()` computed exactly the evidence
+    that would name who disagreed and about what, and had no production consumer -- no log, no
+    counter. Overreacting the other way and CRASHING on divergence would take honest nodes down
+    for a peer's byzantine or skewed state, and restarting resets nothing that needs resetting.
+    So: log it, name who disagreed and what they signed, and let an operator decide what to roll
+    back. Absence -- no quorum, no disagreement -- is silent because it heals on its own."""
 
     def _stall(self, c: Cluster, bucket: int, now: int, *, diverge: bool) -> None:
         """One abandoned settlement on node 0, with or without a peer disagreeing about the
@@ -210,53 +211,24 @@ class TestASilentSettlementStallBecomesLoud(unittest.TestCase):
         node.coordinator.tick(now + 2)
         assert node.coordinator.settling is None, "the settling slot was not released"
 
-    def test_repeated_divergent_stalls_raise_instead_of_hanging_quietly(self):
+    def test_divergence_logs_who_disagreed_and_never_raises(self):
         c = Cluster()
-        now = T0
-        for i in range(_DIVERGENT_STALL_LIMIT - 1):
-            self._stall(c, bucket=100 + i, now=now, diverge=True)
-            now += DELTA
-        with self.assertRaises(InvariantError) as cm:
-            self._stall(c, bucket=200, now=now, diverge=True)
-        self.assertIn("divergent anchors", str(cm.exception))
+        with self.assertLogs("dude.consensus.coordinator", level="WARNING") as logs:
+            self._stall(c, bucket=100, now=T0, diverge=True)
+        line = "\n".join(r.getMessage() for r in logs.records)
+        self.assertIn("divergent anchors", line, f"the log did not name the failure mode: {line!r}")
         self.assertIn(
-            c.keys[1].public.hex()[:8], str(cm.exception), "the error does not name who disagreed"
+            c.keys[1].public.hex()[:8], line, f"the log did not name who disagreed: {line!r}"
         )
+        self.assertIn(str(100), line, f"the log did not name the bucket: {line!r}")
 
-    def test_absence_is_not_divergence_and_never_raises(self):
+    def test_absence_of_quorum_is_silent(self):
         """A quorum that simply was not there in time is a liveness matter and heals on its own.
-        Counting it would crash-loop every node through an ordinary partition."""
+        Logging it would drown the operator in noise every partition, so `_on_settle_abandoned`
+        skips the log line when there are no divergences to report."""
         c = Cluster()
-        now = T0
-        for i in range(_DIVERGENT_STALL_LIMIT + 2):
-            self._stall(c, bucket=300 + i, now=now, diverge=False)
-            now += DELTA
-
-    def test_a_settlement_that_lands_clears_the_count(self):
-        """Otherwise divergences separated by weeks of healthy operation eventually add up to a
-        crash, and the threshold stops meaning "consecutive". The reset is driven by settling a
-        real block, not by writing the counter: the point is that `_on_settled` does it."""
-        c = Cluster()
-        coord = c.nodes[0].coordinator
-        now = T0
-        for i in range(_DIVERGENT_STALL_LIMIT - 1):
-            self._stall(c, bucket=400 + i, now=now, diverge=True)
-            now += DELTA
-        self.assertEqual(coord._settle_stalls, _DIVERGENT_STALL_LIMIT - 1, "the count did not move")
-
-        head_before = c.nodes[0].store.head_block_num() or 0
-        c.put("healthy", b"v", kp=c.mgr, now=now)
-        c.pump(now)
-        c.pump(now + DELTA)
-        self.assertGreater(
-            c.nodes[0].store.head_block_num() or 0, head_before, "no block actually settled"
-        )
-        self.assertEqual(coord._settle_stalls, 0, "a settled block did not clear the count")
-
-        now = c.clock + DELTA
-        for i in range(_DIVERGENT_STALL_LIMIT - 1):
-            self._stall(c, bucket=500 + i, now=now, diverge=True)
-            now += DELTA
+        with self.assertNoLogs("dude.consensus.coordinator", level="WARNING"):
+            self._stall(c, bucket=200, now=T0, diverge=False)
 
 
 class TestSettleRoundLifecycle(unittest.TestCase):

@@ -13,6 +13,7 @@ from ..net.envelope import Verb
 from ..net.postman import Recipient, Target
 from ..store.layer import Index
 from ..store.ops import SignedTransaction
+from .canonical import hashes_canonical
 from .round import Block
 
 
@@ -127,7 +128,7 @@ class SettledBlock:
         return codec.encode(
             [
                 self.block.bucket,
-                sorted(self.block.hashes),
+                hashes_canonical(self.block.hashes),
                 self.anchors.block_num,
                 self.anchors.height,
                 self.anchors.prev_block,
@@ -152,7 +153,15 @@ class SettledBlock:
             outer = codec.as_seq(codec.decode(raw), 3)
             identity = codec.as_seq(codec.decode(codec.as_bytes(outer[0])), 8)
             bucket = codec.as_int(identity[0])
-            hashes = tuple(crypto.Digest(codec.as_bytes(h)) for h in codec.as_seq(identity[1]))
+            # Canonicalise on the way in. `_identity_bytes` canonicalises on the way out, so a
+            # decoded block whose `.hashes` disagreed with its encoded form (the wire order was
+            # not canonical) failed safe -- re-encoding produced a different `block_hash` and it
+            # would not chain -- but the asymmetry left a `Block` instance in memory whose field
+            # disagreed with what any consumer that ran `hashes_canonical` on it would see. Close
+            # the loop here so the field is canonical by construction, not by convention.
+            hashes = hashes_canonical(
+                crypto.Digest(codec.as_bytes(h)) for h in codec.as_seq(identity[1])
+            )
             anchors = Anchors(
                 block_num=codec.as_int(identity[2]),
                 height=codec.as_int(identity[3]),

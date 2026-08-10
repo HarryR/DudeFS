@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 
 from .. import quorum
+from ..consensus.canonical import bodies_canonical
 from ..consensus.settle_round import (
     Anchors,
     SettledBlock,
@@ -193,7 +194,7 @@ class Follower:
         for tx in offer.bodies:
             if not tx.verify():
                 return False
-        ordered = tuple(sorted(offer.bodies, key=lambda tx: tx.op_hash))
+        ordered = bodies_canonical(offer.bodies).txs
         if not self._preview_matches_signed_anchors(ordered, sb.anchors):
             return False
         self.store.commit_block(

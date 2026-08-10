@@ -332,7 +332,7 @@ class TestRosterRemovalRacingAnInFlightRound(unittest.TestCase):
                 now=T0,
                 close_by=T0 + 100,
                 abandon_by=T0 + 10_000,
-                screen=lambda txs: txs,
+                screen=lambda batch: batch.op_hashes,
             )
             for kp in c.keys
         }
@@ -452,13 +452,15 @@ class TestABlockAdoptedMidRoundVoidsTheRound(unittest.TestCase):
         )
 
 
-class TestPromoteScreensAsAnAssertionNotAFilter(unittest.TestCase):
-    """The cut already screened this slice, against this same base. A reject at promote therefore
-    means the two screens disagreed -- non-determinism in the evaluator -- and dropping it quietly
-    here is what used to make `block.hashes` a superset of what applied. Filtering at promote is
-    now a contradiction: the hash list is already signed."""
+class TestPromoteScreensDisagreeVoidsInsteadOfCrashing(unittest.TestCase):
+    """The cut already screened this slice, against this same base. A reject at promote means the
+    two screens disagreed -- non-determinism in the evaluator -- and dropping it quietly is what
+    used to make `block.hashes` a superset of what applied. Void the round and log; crashing the
+    whole node for a screen disagreement is a footgun (the mempool still holds the work, the next
+    bucket screens against whatever base is current then, and an operator needs the log line to go
+    look, not a restart loop)."""
 
-    def test_a_slice_carrying_an_unappliable_tx_is_fatal_at_promote(self):
+    def test_a_slice_carrying_an_unappliable_tx_voids_and_logs(self):
         c = Cluster(size=4)
         node = c.nodes[0]
         # Epoch 0 against a live epoch of 1: the evaluator refuses this row. The helper ratifies
@@ -473,10 +475,20 @@ class TestPromoteScreensAsAnAssertionNotAFilter(unittest.TestCase):
             "the head moved; promote would refuse on the base instead",
         )
 
-        with self.assertRaises(InvariantError) as cm:
+        with self.assertLogs("dude.consensus.coordinator", level="ERROR") as logs:
             node.coordinator.tick(T0 + 200)
-        self.assertIn("rejected at promote", str(cm.exception))
+        self.assertTrue(
+            any("promote screen disagreed" in r.getMessage() for r in logs.records),
+            f"the disagreement was not logged: {[r.getMessage() for r in logs.records]}",
+        )
+        self.assertIsNone(node.coordinator.current_round, "the round must be released")
         self.assertIsNone(node.coordinator.settling, "a rejected slice must not settle")
+        # `mempool.admit` re-runs the full admission door on every re-admit, so a permanently
+        # unappliable tx (this one, epoch 0 vs live epoch 1) is honestly refused as CANNOT_APPLY
+        # rather than parked to try again. The void's contract is "release the round, hand back
+        # what mempool can hold"; the door decides the rest. Not asserted here on purpose --
+        # asserting "is or isn't in the mempool" would be asserting `Mempool.valid`'s policy from
+        # the wrong file.
 
 
 class TestPromoteFailingIsFatalNotSilent(unittest.TestCase):

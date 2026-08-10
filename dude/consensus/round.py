@@ -14,6 +14,7 @@ from ..core.units import Millis
 from ..net.envelope import Verb
 from ..net.postman import Recipient, Target
 from ..store.ops import SignedTransaction
+from .canonical import CanonicalBatch, bodies_canonical, hashes_canonical
 from .mempool import Bucket
 
 _SLICE_DOMAIN = b"dude.round.slice"
@@ -65,7 +66,7 @@ class Held(RoundMsg):
     hashes: frozenset[crypto.Digest]
 
     def _encode(self) -> bytes:
-        return codec.encode([self.bucket, self.prev_block, sorted(self.hashes)])
+        return codec.encode([self.bucket, self.prev_block, hashes_canonical(self.hashes)])
 
     @classmethod
     def _decode(cls, body: bytes) -> Held:
@@ -182,7 +183,7 @@ class Block:
 def _slice_hash(
     bucket: Bucket, hashes: tuple[crypto.Digest, ...] | frozenset[crypto.Digest]
 ) -> crypto.Digest:
-    return crypto.h(codec.encode([bucket, sorted(hashes)]))
+    return crypto.h(codec.encode([bucket, hashes_canonical(hashes)]))
 
 
 class State(Enum):
@@ -203,14 +204,16 @@ class Round:
         close_by: Millis,
         abandon_by: Millis,
         *,
-        screen: Callable[[tuple[SignedTransaction, ...]], tuple[SignedTransaction, ...]],
+        screen: Callable[[CanonicalBatch], frozenset[crypto.Digest]],
     ) -> None:
-        """`screen` narrows a candidate slice to what actually applies to committed state, in
-        apply order. REQUIRED, never defaulted: the only available default is identity, which is
-        precisely the defect -- a block naming transactions it did not apply.
+        """`screen` decides WHICH op_hashes of a canonical candidate stay -- membership only, not
+        bodies. Round applies the membership to the candidate via `CanonicalBatch.filter`, so
+        "narrow" and "in apply order" are structural: extras in the frozenset name hashes not in
+        the candidate and are dropped by filter, and order comes from the candidate's canonical
+        sort. Nothing to assert, nothing for a screen to widen or shuffle.
 
-        A callable rather than a reader, because the rule below still holds: Round decides WHAT
-        the cluster agrees on, and knows nothing about state to decide it with."""
+        REQUIRED, never defaulted: the only available default is `batch.op_hashes` -- identity --
+        which is precisely the defect. A block would name transactions it did not apply."""
         if me.public not in roster:
             raise RoundError("my public key is not in the roster")
         if close_by <= now:
@@ -441,20 +444,22 @@ class Round:
         bodies = self._local_bodies
         if bodies is None:
             return
-        candidate = self._compute_slice(frozenset(bodies))
+        candidate = bodies_canonical(bodies[h] for h in self._compute_slice(frozenset(bodies)))
         # THE CUT. Screen before signing, so what the quorum ratifies is what it applies. Screened
         # after, a block named transactions that never touched state: they got no log entry, so
         # `has_settled` stayed false and they were re-admitted and could settle again later -- the
         # same op_hash legitimately in two blocks, and inclusion proving nothing to anyone.
-        applicable = self._screen(tuple(bodies[h] for h in sorted(candidate)))
-        self._slice_bodies = applicable
-        slice_hashes = frozenset(tx.op_hash for tx in applicable)
+        applicable = candidate.filter(self._screen(candidate))
+        self._slice_bodies = applicable.txs
+        slice_hashes = applicable.op_hashes
         my_sig = Sig.sign(
             self._me, self._bucket, self._prev_block, _slice_hash(self._bucket, slice_hashes)
         )
         self._my_sig = my_sig
         self._peer_sigs[self._me.public] = my_sig
-        self._surviving = tuple(bodies[h] for h in sorted(bodies) if h not in slice_hashes)
+        self._surviving = bodies_canonical(
+            tx for tx in bodies.values() if tx.op_hash not in slice_hashes
+        ).txs
         self._pending_slice_hashes = slice_hashes
         self._state = State.FINALIZE
         self._outbox.append((Recipient.ALL, my_sig))
@@ -471,7 +476,7 @@ class Round:
             return
         self._ratified = Block(
             bucket=self._bucket,
-            hashes=tuple(sorted(self._pending_slice_hashes)),
+            hashes=hashes_canonical(self._pending_slice_hashes),
         )
         self._state = State.GONE
 
@@ -479,5 +484,5 @@ class Round:
         bodies = self._local_bodies
         if bodies is None:
             return
-        self._surviving = tuple(bodies[h] for h in sorted(bodies))
+        self._surviving = bodies_canonical(bodies.values()).txs
         self._state = State.ABANDONED

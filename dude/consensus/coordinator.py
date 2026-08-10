@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -13,17 +14,14 @@ from ..store.management import MgmtReader
 from ..store.ops import SignedTransaction
 from ..store.store import log_element
 from ..tunables import Tunables
+from .canonical import CanonicalBatch
 from .mempool import Bucket, Mempool, Refusal
 from .round import Block, Bodies, Round, RoundAdapterError, RoundMsg
 from .round_adapter import RoundAdapter
 from .settle_adapter import SettleAdapter
 from .settle_round import Anchors, SettleAdapterError, SettleRound, SettleSig, genesis_stamp
 
-_DIVERGENT_STALL_LIMIT = 3
-"""Consecutive buckets that may abandon settlement while peers sign different anchors, before this
-node stops treating it as weather. One is routine -- a peer mid-adoption answers about a base it is
-about to leave. Three running is the cluster unable to agree what its own ratified slice did, which
-waiting does not fix."""
+_log = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -232,22 +230,22 @@ class Coordinator:
         self.current_round = r
         self.adapter.flush(r, now)
 
-    def _screen_slice(
-        self, candidate: tuple[SignedTransaction, ...]
-    ) -> tuple[SignedTransaction, ...]:
-        """What of `candidate` this node can actually apply, in the order it would apply it. The
-        Round signs the result, so the ratified slice IS the applied set.
+    def _screen_slice(self, candidate: CanonicalBatch) -> frozenset[crypto.Digest]:
+        """Which of `candidate`'s op_hashes this node can actually apply. Returns membership, not
+        bodies -- Round filters the canonical candidate by this set, so "narrow" and "in apply
+        order" are structural rather than asserted.
 
         The already-settled filter is a LOG read and has to happen here: `apply_to` works over an
         Overlay, which has no log, so a transaction settled in an earlier block would re-apply and
         surface only at commit as an anchors mismatch.
 
-        Deterministic across the quorum because every member screens the same ordered set against
-        the same committed base -- a node on a different base is not a participant, it is a node
-        that needs to catch up."""
+        Deterministic across the quorum because every member screens the same canonical batch
+        against the same committed base -- a node on a different base is not a participant, it is
+        a node that needs to catch up."""
         already = self.store.settled_hashes(tuple(tx.op_hash for tx in candidate))
         fresh = tuple(tx for tx in candidate if tx.op_hash not in already)
-        return settle.apply_to(Layer(self.store), fresh, self.mgmt).survivors
+        survivors = settle.apply_to(Layer(self.store), fresh, self.mgmt).survivors
+        return frozenset(tx.op_hash for tx in survivors)
 
     def _on_round_abandoned(self, now: Millis) -> None:
         r = self.current_round
@@ -300,9 +298,23 @@ class Coordinator:
         screened = settle.apply_to(layer, slice_txs, self.mgmt)
         if screened.rejects:
             # The slice was screened against this same base before it was signed, so a reject here
-            # means the two screens disagreed: non-determinism in the evaluator, not a peer's
-            # fault. Settling anyway would sign anchors for a set the block does not name.
-            raise InvariantError(f"ratified slice rejected at promote: {screened.rejects!r}")
+            # means THIS NODE's two screens disagreed -- non-determinism in the evaluator, local
+            # to us. The other ratifiers ran their own cut screens against the same base, agreed
+            # on the same `slice_hash`, and their promotes will agree with those cuts too: they
+            # settle without us, and we adopt their block through the Follower. Voiding
+            # self-heals; crashing didn't -- it would take an honest node down for its own local
+            # anomaly while the cluster progresses without noticing. Log so an operator learns
+            # to go look at WHY the evaluator disagreed with itself; the chain does not need to
+            # wait on that answer.
+            _log.error(
+                "promote screen disagreed with cut screen at bucket %d: %r",
+                bucket,
+                screened.rejects,
+            )
+            for tx in (*slice_txs, *surviving):
+                self.mempool.admit(tx, now, self.store, self.mgmt)
+            self.current_round = None
+            return
         applied = screened.survivors
 
         layer.freeze()
@@ -381,23 +393,23 @@ class Coordinator:
         self.settling = None
 
         if not divergences:
-            # Nobody disagreed -- the quorum just was not there in time. That is absence, it is a
-            # liveness matter, and it heals on its own.
+            # Nobody disagreed -- the quorum just was not there in time. Absence is a liveness
+            # matter and heals on its own; nothing to log and no counter to advance.
             self._settle_stalls = 0
             return
         self._settle_stalls += 1
-        if self._settle_stalls < _DIVERGENT_STALL_LIMIT:
-            return
-        # Peers signed different anchors for the slice we all ratified, repeatedly, and no camp
-        # reached quorum. A lone divergent node heals itself: the others settle without it and it
-        # adopts their block through the Follower. Reaching here means the disagreement is spread
-        # wide enough that NOTHING can settle. Until now `divergences()` was computed and dropped
-        # on the floor, so a chain in this state was indistinguishable from an idle one -- blocks
-        # simply stopped appearing, with no error anywhere and the mempool growing for ever.
-        raise InvariantError(
-            f"settlement stalled on divergent anchors for {self._settle_stalls} consecutive "
-            f"buckets; peers disagreeing at bucket {s.bucket}: "
-            f"{[(pk.hex()[:8], a) for pk, a in divergences]}"
+        # Peers signed different anchors for the slice we all ratified. A lone divergent node
+        # heals itself: the others settle without it and it adopts their block through the
+        # Follower. Reaching here with divergences means the disagreement is spread wide enough
+        # that NOTHING can settle -- someone has to look at the log line and decide what to roll
+        # back. Do NOT raise: `divergences()` used to be silent, but overreacting the other way and
+        # crashing on peer disagreement would take honest nodes down for a peer's byzantine or
+        # skewed state, and restarting resets the counter without fixing anything.
+        _log.warning(
+            "settlement abandoned with divergent anchors at bucket %d (%d consecutive): %s",
+            s.bucket,
+            self._settle_stalls,
+            [(pk.hex()[:8], a) for pk, a in divergences],
         )
 
 

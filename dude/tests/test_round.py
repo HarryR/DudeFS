@@ -21,6 +21,7 @@ import random
 import unittest
 
 from .. import quorum
+from ..consensus.canonical import CanonicalBatch
 from ..consensus.round import Block, Bodies, Round, RoundMsg, Sig, State, _slice_hash
 from ..core import crypto
 from ..net.postman import Recipient
@@ -55,12 +56,12 @@ def _stubs(*names: str) -> tuple[SignedTransaction, ...]:
     return tuple(_stub_tx(n) for n in names)
 
 
-def _applies_all(txs: tuple[SignedTransaction, ...]) -> tuple[SignedTransaction, ...]:
-    """The screen these scenarios want: everything the slice names applies. This suite is about
+def _applies_all(batch: CanonicalBatch) -> frozenset[crypto.Digest]:
+    """The screen these scenarios want: every op_hash the slice names stays. This suite is about
     convergence -- which holdings become a slice -- and a screen that dropped anything would be
     answering a settlement question with a consensus test. Screening itself is exercised where it
     has a store to screen against (`test_settle_integration`)."""
-    return txs
+    return batch.op_hashes
 
 
 def _hashes(txs: tuple[SignedTransaction, ...]) -> tuple[crypto.Digest, ...]:
