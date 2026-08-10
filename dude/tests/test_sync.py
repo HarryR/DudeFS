@@ -16,7 +16,13 @@ from __future__ import annotations
 import unittest
 from dataclasses import replace
 
-from dude.consensus.settle_round import Anchors, SettledBlock, SettledBlockWithBodies
+from dude.consensus.round import Block
+from dude.consensus.settle_round import (
+    Anchors,
+    SettledBlock,
+    SettledBlockWithBodies,
+    _settle_payload,
+)
 from dude.core import crypto
 from dude.node import Node
 from dude.store import Store
@@ -821,6 +827,67 @@ class TestPickPullSourcePriority(unittest.TestCase):
         follower._pulling = None  # what a verification failure would leave us at
         # Picker returns the same peer -- no exclusion happened.
         self.assertEqual(follower._pick_pull_source(), honest.me.public)
+
+
+class TestABlockMustDeliverEverythingItNames(unittest.TestCase):
+    """A block names exactly what it applied, so a sender that serves fewer bodies than the block
+    names is withholding -- and adopting it would commit a state_root for a set we never saw.
+
+    The check used to be `issubset`, which was right only while a producer could ratify a slice
+    wider than it applied: `bodies_of_block` returns the APPLIED range, so honest bodies were a
+    proper subset of the hash list whenever anything was screened out after ratification. With
+    the screen ahead of the signature the two sets are the same set, and subset is a tolerance
+    for exactly the shape an attacker wants."""
+
+    def test_a_signed_block_naming_a_tx_it_does_not_deliver_is_refused(self):
+        c = Cluster()
+        _run_cluster_producing_n_blocks(c, 2)
+        honest = c.nodes[0]
+        follower = _make_follower(c.provisioned())
+        follower.add_peer(honest.me.public, now=T0)
+
+        real_bytes = honest.store.settled_at(2)
+        assert real_bytes is not None
+        real = SettledBlock.decode(real_bytes)
+        bodies = honest.store.bodies_of_block(2)
+        self.assertEqual(
+            frozenset(tx.op_hash for tx in bodies),
+            frozenset(real.block.hashes),
+            "the honest block already fails to deliver what it names",
+        )
+
+        # Over-claim by one, and AUTHORISE it: the manager slot is a valid quorum proof all by
+        # itself, so this reaches the body check instead of dying at `chain.advance`.
+        over = Block(bucket=real.block.bucket, hashes=(*real.block.hashes, crypto.h(b"never-sent")))
+        roster = MgmtReader(honest.store).roster()
+        n = len(roster) + 1
+        forged = SettledBlock(
+            block=over,
+            anchors=real.anchors,
+            multisig=crypto.MultiSig.combine(
+                {n - 1: c.mgr.sign(_settle_payload(over.slice_hash, real.anchors))}, n
+            ),
+        )
+
+        follower.tick(T0)
+        follower.outbox()
+        follower.receive(serve_height(honest.store), honest.me.public, T0)
+        follower.tick(T0 + 1)
+        follower.outbox()
+
+        before = follower.store.head_block_num() or 0
+        adopted = follower._adopt(SettledBlockWithBodies(block=forged, bodies=bodies))
+        self.assertFalse(adopted, "a block naming a body it never delivered was adopted")
+        self.assertEqual(
+            follower.store.head_block_num() or 0, before, "the withheld block was committed"
+        )
+
+        # The control: the same block, unforged, IS adopted -- so the refusal above is about the
+        # over-claim and not about the fixture being unadoptable for some other reason.
+        self.assertTrue(
+            follower._adopt(SettledBlockWithBodies(block=real, bodies=bodies)),
+            "the honest block was refused too; the assertion above proves nothing",
+        )
 
 
 if __name__ == "__main__":

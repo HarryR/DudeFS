@@ -17,7 +17,7 @@ from ..net.address import Address, Endpoint, Scheme
 from ..net.envelope import Envelope
 from ..net.link import Peer
 from ..net.postman import Postman
-from .test_round import _stubs
+from .test_round import _applies_all, _stubs
 
 T0 = 1_700_000_000_000
 DELTA = 1_000
@@ -132,6 +132,7 @@ class TestGossipGoesToTheRosterNotThePeerTable(unittest.TestCase):
             now=T0,
             close_by=T0 + 1000,
             abandon_by=T0 + 2000,
+            screen=_applies_all,
         )
         r.add_local(())
         RoundAdapter(keys[0], postman, ttl=5_000).flush(r, T0)
@@ -180,6 +181,7 @@ class TestFlushToMailbox(unittest.TestCase):
             now=T0,
             close_by=T0 + 5 * DELTA,
             abandon_by=T0 + 1_000 * DELTA,
+            screen=_applies_all,
         )
         r.add_local(_stubs("tx1"))
 
@@ -207,6 +209,7 @@ class TestFlushToMailbox(unittest.TestCase):
             now=T0,
             close_by=T0 + 5 * DELTA,
             abandon_by=T0 + 1_000 * DELTA,
+            screen=_applies_all,
         )
         r.add_local(_stubs("tx1"))
         adapter = RoundAdapter(self.me, self.postman, ttl=10_000)
@@ -234,6 +237,7 @@ class TestDeliverToRound(unittest.TestCase):
             now=T0,
             close_by=T0 + 5 * DELTA,
             abandon_by=T0 + 1_000 * DELTA,
+            screen=_applies_all,
         )
         r.add_local(_stubs("local"))
 

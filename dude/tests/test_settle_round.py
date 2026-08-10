@@ -46,13 +46,9 @@ def _wire(nodes: dict[crypto.PublicKey, SettleRound], now: int) -> None:
 
 
 def _block(bucket: int = 1, hashes: tuple[bytes, ...] = ()) -> Block:
-    """A stub ratified block. SettleRound only uses `bucket` and `hashes` to derive
-    slice_hash; the ratify proof is Round's business and irrelevant to settlement."""
-    return Block(
-        bucket=bucket,
-        hashes=tuple(sorted(crypto.Digest(h) for h in hashes)),
-        multisig=crypto.UNSIGNED,
-    )
+    """A stub ratified block. SettleRound uses `bucket` and `hashes` to derive slice_hash, and a
+    Block carries nothing else."""
+    return Block(bucket=bucket, hashes=tuple(sorted(crypto.Digest(h) for h in hashes)))
 
 
 def _anchors(block_num: int = 1, height: int = 0, root_seed: bytes = b"root") -> Anchors:
@@ -361,13 +357,6 @@ class TestSettledBlockEncoding(unittest.TestCase):
         self.assertEqual(sb.block_hash, stripped.block_hash)
         # NOT equal to H(encode()): the wire bytes include sigs, the chain hash does not.
         self.assertNotEqual(sb.block_hash, crypto.h(sb.encode()))
-
-    def test_encode_omits_ratify_sigs(self):
-        """#block-shape-settled: ratify sigs are Round's transient consensus infrastructure and
-        MUST NOT be persisted. The decoded block's ratify credentials are empty."""
-        sb = self._sb()
-        got = SettledBlock.decode(sb.encode())
-        self.assertEqual(got.block.multisig, crypto.UNSIGNED)
 
     def test_malformed_bytes_raise_settle_error(self):
         """Bad bytes are a routine peer-input outcome; SettleError is a DudeError that the

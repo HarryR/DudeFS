@@ -166,8 +166,13 @@ _DECODERS: dict[Verb, Callable[[bytes], RoundMsg]] = {
 class Block:
     bucket: Bucket
     hashes: tuple[crypto.Digest, ...]
+    """Screened before the slice was signed, so this is exactly what the block applied -- not a
+    superset of it. Everything downstream that treats membership as application depends on it."""
 
-    multisig: crypto.MultiSig
+    # No ratify multisig here. One used to sit beside `hashes`: never encoded, never verified,
+    # and combined one bitmap slot too narrow for `Authorization`'s (*roster, anchor) -- wrong
+    # the moment anybody actually checked it. The settle multisig signs `slice_hash`, so it
+    # already attests to this exact set; a second proof of the same fact is one to drift.
 
     @property
     def slice_hash(self) -> crypto.Digest:
@@ -197,7 +202,15 @@ class Round:
         now: Millis,
         close_by: Millis,
         abandon_by: Millis,
+        *,
+        screen: Callable[[tuple[SignedTransaction, ...]], tuple[SignedTransaction, ...]],
     ) -> None:
+        """`screen` narrows a candidate slice to what actually applies to committed state, in
+        apply order. REQUIRED, never defaulted: the only available default is identity, which is
+        precisely the defect -- a block naming transactions it did not apply.
+
+        A callable rather than a reader, because the rule below still holds: Round decides WHAT
+        the cluster agrees on, and knows nothing about state to decide it with."""
         if me.public not in roster:
             raise RoundError("my public key is not in the roster")
         if close_by <= now:
@@ -208,6 +221,7 @@ class Round:
         self._me = me
         self._roster = roster
         self._prev_block = prev_block
+        self._screen = screen
         self._quorum = quorum.size(len(roster))
         self._state = State.COLLECT
         self._now = now
@@ -288,7 +302,8 @@ class Round:
         validated: tuple[SignedTransaction, ...],
     ) -> None:
         """`validated` has already been through the admission door. Round holds no reader and no
-        authoriser, so it cannot screen a body and MUST NOT pretend to."""
+        authoriser: what it can apply is a question it asks `screen` at the cut, and never one it
+        answers here about a body arriving mid-collection."""
         if msg.bucket != self._bucket or from_ not in self._roster:
             return
         if msg.prev_block != self._prev_block:
@@ -380,6 +395,11 @@ class Round:
     def bucket(self) -> Bucket:
         return self._bucket
 
+    def prev_block(self) -> crypto.Digest:
+        """The base this round's slice was screened against. The anchors MUST be computed over
+        the same one -- see `Coordinator._promote_to_settling`."""
+        return self._prev_block
+
     def roster(self) -> tuple[crypto.PublicKey, ...]:
         return self._roster
 
@@ -421,14 +441,19 @@ class Round:
         bodies = self._local_bodies
         if bodies is None:
             return
-        local_hashes = frozenset(bodies)
-        slice_hashes = self._compute_slice(local_hashes)
+        candidate = self._compute_slice(frozenset(bodies))
+        # THE CUT. Screen before signing, so what the quorum ratifies is what it applies. Screened
+        # after, a block named transactions that never touched state: they got no log entry, so
+        # `has_settled` stayed false and they were re-admitted and could settle again later -- the
+        # same op_hash legitimately in two blocks, and inclusion proving nothing to anyone.
+        applicable = self._screen(tuple(bodies[h] for h in sorted(candidate)))
+        self._slice_bodies = applicable
+        slice_hashes = frozenset(tx.op_hash for tx in applicable)
         my_sig = Sig.sign(
             self._me, self._bucket, self._prev_block, _slice_hash(self._bucket, slice_hashes)
         )
         self._my_sig = my_sig
         self._peer_sigs[self._me.public] = my_sig
-        self._slice_bodies = tuple(bodies[h] for h in sorted(slice_hashes))
         self._surviving = tuple(bodies[h] for h in sorted(bodies) if h not in slice_hashes)
         self._pending_slice_hashes = slice_hashes
         self._state = State.FINALIZE
@@ -444,11 +469,9 @@ class Round:
         agreeing = {peer: sig for peer, sig in self._peer_sigs.items() if sig.slice_hash == want}
         if len(agreeing) < self._quorum:
             return
-        shares = {i: agreeing[m].sig for i, m in enumerate(self._roster) if m in agreeing}
         self._ratified = Block(
             bucket=self._bucket,
             hashes=tuple(sorted(self._pending_slice_hashes)),
-            multisig=crypto.MultiSig.combine(shares, len(self._roster)),
         )
         self._state = State.GONE
 

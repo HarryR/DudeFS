@@ -332,6 +332,7 @@ class TestRosterRemovalRacingAnInFlightRound(unittest.TestCase):
                 now=T0,
                 close_by=T0 + 100,
                 abandon_by=T0 + 10_000,
+                screen=lambda txs: txs,
             )
             for kp in c.keys
         }
@@ -404,6 +405,78 @@ class TestRosterRemovalRacingAnInFlightRound(unittest.TestCase):
             node.coordinator.mempool.all_bodies(),
             "a seatless node re-admitted work it can never propose",
         )
+
+
+class TestABlockAdoptedMidRoundVoidsTheRound(unittest.TestCase):
+    """The Follower commits on message ARRIVAL, not on the Coordinator's tick, so the head can
+    move between the cut and promote. The round screened its slice against the base it opened on;
+    anchoring that slice to a newer base signs a state_root nothing ever screened against.
+
+    Before the slice was screened at the cut this was survivable-looking -- the anchors were just
+    computed over whatever the store held at promote. It is not survivable now, and it was never
+    correct: `_prev_block`'s docstring said the two reads "MUST be the same value" and no code
+    anywhere checked it."""
+
+    def test_promote_refuses_when_the_head_moved_under_the_round(self):
+        c = Cluster(size=4)
+        node = c.nodes[0]
+        # A REAL client transaction, not a hand-built Set: re-admission runs the full admission
+        # predicate, and a row carrying epoch 0 against a live epoch of 1 is refused as
+        # unappliable -- which would prove the work was dropped when it was never admissible.
+        tx = c.client(c.mgr).put("race", b"v").sign(c.mgr, T0)
+        rounds = TestRosterRemovalRacingAnInFlightRound()._ratified_round_for(c, tx)
+        r = rounds[node.me.public]
+        node.coordinator.current_round = r
+        self.assertIn(node.me.public, node.mgmt.roster(), "must be a member, or it sits out")
+
+        # A block arrives from a peer and the Follower commits it, exactly as `_adopt` does.
+        landed = c.client(c.mgr).put("adopted-from-a-peer", b"v").sign(c.mgr, T0)
+        intervene(node.store, c.mgr, bodies=(landed,), bucket=667)
+        self.assertNotEqual(
+            node.store.head_block_hash(),
+            r.prev_block(),
+            "the head did not actually move; the assertions below would be vacuous",
+        )
+
+        node.coordinator.tick(T0 + 200)
+
+        self.assertIsNone(node.coordinator.current_round, "the round must be released")
+        self.assertIsNone(
+            node.coordinator.settling,
+            "settled a slice against a base it never screened against",
+        )
+        self.assertIn(
+            tx.op_hash,
+            node.coordinator.mempool.all_bodies(),
+            "the round's work was dropped instead of retried in a later bucket",
+        )
+
+
+class TestPromoteScreensAsAnAssertionNotAFilter(unittest.TestCase):
+    """The cut already screened this slice, against this same base. A reject at promote therefore
+    means the two screens disagreed -- non-determinism in the evaluator -- and dropping it quietly
+    here is what used to make `block.hashes` a superset of what applied. Filtering at promote is
+    now a contradiction: the hash list is already signed."""
+
+    def test_a_slice_carrying_an_unappliable_tx_is_fatal_at_promote(self):
+        c = Cluster(size=4)
+        node = c.nodes[0]
+        # Epoch 0 against a live epoch of 1: the evaluator refuses this row. The helper ratifies
+        # with an identity screen, so it reaches promote exactly as a broken screen would leave it.
+        doomed = ops.writes(ops.Set(ops.STORE_DATA, crypto.h(b"boom"), b"v")).sign(c.mgr, T0)
+        rounds = TestRosterRemovalRacingAnInFlightRound()._ratified_round_for(c, doomed)
+        node.coordinator.current_round = rounds[node.me.public]
+        self.assertIn(node.me.public, node.mgmt.roster(), "must be a member, or it sits out")
+        self.assertEqual(
+            node.store.head_block_hash(),
+            rounds[node.me.public].prev_block(),
+            "the head moved; promote would refuse on the base instead",
+        )
+
+        with self.assertRaises(InvariantError) as cm:
+            node.coordinator.tick(T0 + 200)
+        self.assertIn("rejected at promote", str(cm.exception))
+        self.assertIsNone(node.coordinator.settling, "a rejected slice must not settle")
 
 
 class TestPromoteFailingIsFatalNotSilent(unittest.TestCase):

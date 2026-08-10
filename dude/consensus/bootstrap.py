@@ -57,11 +57,7 @@ def _apply_manager_signed_block(  # noqa: PLR0913 -- construction inputs, all re
     )
 
     slice_hashes = tuple(sorted(tx.op_hash for tx in bodies))
-    block = Block(
-        bucket=bucket,
-        hashes=slice_hashes,
-        multisig=crypto.UNSIGNED,
-    )
+    block = Block(bucket=bucket, hashes=slice_hashes)
     manager_sig = manager.sign(_settle_payload(block.slice_hash, anchors))
 
     roster = mgmt.roster()

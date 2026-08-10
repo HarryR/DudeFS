@@ -55,6 +55,14 @@ def _stubs(*names: str) -> tuple[SignedTransaction, ...]:
     return tuple(_stub_tx(n) for n in names)
 
 
+def _applies_all(txs: tuple[SignedTransaction, ...]) -> tuple[SignedTransaction, ...]:
+    """The screen these scenarios want: everything the slice names applies. This suite is about
+    convergence -- which holdings become a slice -- and a screen that dropped anything would be
+    answering a settlement question with a consensus test. Screening itself is exercised where it
+    has a store to screen against (`test_settle_integration`)."""
+    return txs
+
+
 def _hashes(txs: tuple[SignedTransaction, ...]) -> tuple[crypto.Digest, ...]:
     """Sorted op_hashes for a group of stub txs -- the canonical slice-hash order Round uses."""
     return tuple(sorted(tx.op_hash for tx in txs))
@@ -100,6 +108,7 @@ def _setup(
             now=T0,
             close_by=close_by,
             abandon_by=abandon_by,
+            screen=_applies_all,
         )
         for k in keys
     }
@@ -517,7 +526,7 @@ class TestARoundIsKeyedOnTheChain(unittest.TestCase):
         roster = tuple(k.public for k in keys)
         ours, theirs = crypto.h(b"chain-a"), crypto.h(b"chain-b")
         nodes = {
-            k.public: Round(1, k, roster, prev, T0, CLOSE_BY, ABANDON_BY)
+            k.public: Round(1, k, roster, prev, T0, CLOSE_BY, ABANDON_BY, screen=_applies_all)
             for k, prev in zip(keys, (ours, ours, theirs), strict=True)
         }
         for r in nodes.values():
@@ -555,10 +564,16 @@ class TestPipelining(unittest.TestCase):
         keys = [crypto.Keypair.generate() for _ in range(3)]
         roster = tuple(k.public for k in keys)
         rounds_b1 = {
-            k.public: Round(1, k, roster, crypto.h(b"prev"), T0, CLOSE_BY, ABANDON_BY) for k in keys
+            k.public: Round(
+                1, k, roster, crypto.h(b"prev"), T0, CLOSE_BY, ABANDON_BY, screen=_applies_all
+            )
+            for k in keys
         }
         rounds_b2 = {
-            k.public: Round(2, k, roster, crypto.h(b"prev"), T0, CLOSE_BY, ABANDON_BY) for k in keys
+            k.public: Round(
+                2, k, roster, crypto.h(b"prev"), T0, CLOSE_BY, ABANDON_BY, screen=_applies_all
+            )
+            for k in keys
         }
         set_b1 = _stubs("b1-a", "b1-b")
         set_b2 = _stubs("b2-x", "b2-y", "b2-z")
@@ -601,7 +616,9 @@ class TestRandomisedBuckets(unittest.TestCase):
         rounds_by_bucket: dict[int, dict[crypto.PublicKey, Round]] = {}
         for b in buckets:
             rounds_by_bucket[b] = {
-                k.public: Round(b, k, roster, crypto.h(b"prev"), T0, CLOSE_BY, ABANDON_BY)
+                k.public: Round(
+                    b, k, roster, crypto.h(b"prev"), T0, CLOSE_BY, ABANDON_BY, screen=_applies_all
+                )
                 for k in keys
             }
             for r in rounds_by_bucket[b].values():
@@ -852,7 +869,16 @@ class TestPropertyConvergence(unittest.TestCase):
                 keys = [crypto.Keypair.generate() for _ in range(n)]
                 roster = tuple(k.public for k in keys)
                 nodes = {
-                    k.public: Round(1, k, roster, crypto.h(b"prev"), T0, close_by, ABANDON_BY)
+                    k.public: Round(
+                        1,
+                        k,
+                        roster,
+                        crypto.h(b"prev"),
+                        T0,
+                        close_by,
+                        ABANDON_BY,
+                        screen=_applies_all,
+                    )
                     for k in keys
                 }
                 for k in keys:

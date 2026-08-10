@@ -167,7 +167,7 @@ class SettledBlock:
             )
         except DudeError as e:
             raise SettleError(f"malformed SettledBlock: {e}") from e
-        block = Block(bucket=bucket, hashes=hashes, multisig=crypto.UNSIGNED)
+        block = Block(bucket=bucket, hashes=hashes)
         return cls(block=block, anchors=anchors, multisig=multisig)
 
 

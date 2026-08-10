@@ -185,7 +185,10 @@ class Follower:
         walked = chain.advance(self._tip(), (sb,), self.mgmt.roster(), self._require_anchor())
         if isinstance(walked, chain.ChainRefusal):
             return False
-        if not frozenset(tx.op_hash for tx in offer.bodies).issubset(frozenset(sb.block.hashes)):
+        # EQUALITY, not subset. A block names exactly what it applied, so bodies short of the hash
+        # list mean the sender withheld some -- and we would commit a state_root for a set we never
+        # saw. Subset was correct only while a producer could ratify a slice wider than it applied.
+        if frozenset(tx.op_hash for tx in offer.bodies) != frozenset(sb.block.hashes):
             return False
         for tx in offer.bodies:
             if not tx.verify():

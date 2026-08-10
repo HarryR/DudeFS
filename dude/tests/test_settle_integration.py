@@ -8,10 +8,21 @@ happens between Round ratifying and Store advancing.
 from __future__ import annotations
 
 import unittest
+from dataclasses import replace
 
-from dude.consensus.settle_round import SettledBlock, SettleState, genesis_stamp
+from dude.consensus.coordinator import _DIVERGENT_STALL_LIMIT, _Settling
+from dude.consensus.round import Block
+from dude.consensus.settle_round import (
+    Anchors,
+    SettledBlock,
+    SettleRound,
+    SettleSig,
+    SettleState,
+    genesis_stamp,
+)
 from dude.core import crypto
-from dude.store import ops
+from dude.core.errors import InvariantError
+from dude.store import Layer, ops
 
 from .cluster import DELTA, T0, Cluster, D
 
@@ -86,6 +97,166 @@ class TestSettlementIsStaged(unittest.TestCase):
             self.assertIsNotNone(node.store.get(D, cl.token("first")), f"node {i} lost first")
             self.assertIsNotNone(node.store.get(D, cl.token("second")), f"node {i} lost second")
             self.assertEqual(node.store.head(), 3, f"node {i} head={node.store.head()}")
+
+
+def _hashes_by_block(store) -> dict[int, frozenset[crypto.Digest]]:
+    """Every settled block's transaction list, decoded back out of the stored blob. The list is
+    not a column -- it lives only inside `block.bytes`."""
+    out: dict[int, frozenset[crypto.Digest]] = {}
+    for n in range(1, (store.head_block_num() or 0) + 1):
+        raw = store.settled_at(n)
+        if raw is not None:
+            out[n] = frozenset(SettledBlock.decode(raw).block.hashes)
+    return out
+
+
+class TestABlockNamesOnlyWhatItApplied(unittest.TestCase):
+    """A block's hash list is quorum-signed (through `slice_hash`, inside the settle payload), so
+    what it names is what a client can prove. Screened AFTER ratification, it named transactions
+    that never touched state: they got no log entry, so `has_settled` stayed false, so they were
+    re-admitted and could settle in a later block -- the same op_hash legitimately in two blocks,
+    and membership proving nothing."""
+
+    def setUp(self):
+        self.c = Cluster()
+        self.mgr = self.c.mgr
+        self.cl = self.c.client(self.mgr)
+
+    def test_a_guard_its_own_block_falsifies_never_reaches_the_hash_list(self):
+        """Two compare-and-swaps on one name, in one bucket. Both pass admission -- each guard
+        holds against committed state when it arrives -- and the first to apply falsifies the
+        second. Exactly one may appear in the block."""
+        self.c.put("k", b"v0", kp=self.mgr, now=T0)
+        self.c.pump(T0)
+        row = self.c.nodes[0].store.get(D, self.cl.token("k"))
+        assert row is not None, "the setup write never settled"
+
+        first = self.cl.cas("k", row.value, b"v1").sign(self.mgr, T0 + DELTA)
+        second = self.cl.cas("k", row.value, b"v2").sign(self.mgr, T0 + DELTA)
+        self.assertNotEqual(first.op_hash, second.op_hash, "the two CASes are the same tx")
+        self.c.submit(self.mgr, first, to=0, now=T0 + DELTA)
+        self.c.submit(self.mgr, second, to=0, now=T0 + DELTA)
+
+        # INSTRUMENTATION: the scenario is only interesting if BOTH were admitted and therefore
+        # both were candidates for the same slice. If one had been refused at the door this test
+        # would pass while exercising nothing.
+        pooled = self.c.nodes[0].coordinator.mempool.all_bodies()
+        self.assertIn(first.op_hash, pooled, "first CAS never made it into the mempool")
+        self.assertIn(second.op_hash, pooled, "second CAS never made it into the mempool")
+
+        self.c.pump(T0 + DELTA)
+        self.c.pump(T0 + 2 * DELTA)
+
+        for i, node in enumerate(self.c.nodes):
+            named = frozenset().union(*_hashes_by_block(node.store).values())
+            landed = named & {first.op_hash, second.op_hash}
+            self.assertEqual(
+                len(landed), 1, f"node {i} named {len(landed)} of the two CASes, expected exactly 1"
+            )
+            # And what it named is what it applied: the loser has no log entry either.
+            self.assertEqual(
+                node.store.settled_hashes((first.op_hash, second.op_hash)),
+                set(landed),
+                f"node {i} applied a different set than its blocks name",
+            )
+
+
+class TestASilentSettlementStallBecomesLoud(unittest.TestCase):
+    """Safety was never the problem: a peer signing different anchors has its signature dropped at
+    the equality check and never enters the bitmap, and a light client re-verifies the payload
+    itself. A LONE divergent node also heals -- the others reach quorum without it and it adopts
+    their block through the Follower.
+
+    The problem is the case where no camp reaches quorum. Every node abandons, re-admits, and
+    tries again forever. `SettleRound.divergences()` computed exactly the evidence that would name
+    who disagreed and about what, and had no production consumer anywhere: no log, no counter, no
+    metric. A chain in this state was indistinguishable from an idle one -- blocks simply stopped,
+    with no error, and the mempool grew for ever."""
+
+    def _stall(self, c: Cluster, bucket: int, now: int, *, diverge: bool) -> None:
+        """One abandoned settlement on node 0, with or without a peer disagreeing about the
+        anchors. Driven through `Coordinator.tick`, which is what decides abandonment."""
+        node = c.nodes[0]
+        block = Block(bucket=bucket, hashes=())
+        mine = Anchors(
+            block_num=(node.store.head_block_num() or 0) + 1,
+            height=node.store.head(),
+            prev_block=node.store.head_block_hash() or genesis_stamp(c.mgr.public),
+            state_root=node.store.state_root(),
+            acc_state=node.store.accumulator(),
+            acc_log=node.store.log_accumulator(),
+        )
+        sr = SettleRound(block, node.me, node.mgmt.roster(), mine, now, abandon_by=now + 1)
+        if diverge:
+            peer = c.keys[1]
+            sr.receive(
+                SettleSig.sign(peer, block.slice_hash, replace(mine, state_root=crypto.h(b"else"))),
+                from_=peer.public,
+                now=now,
+            )
+            assert sr.divergences(), "the peer's signature was not recorded as a divergence"
+        else:
+            assert not sr.divergences(), "the control stall must carry no divergence"
+        node.coordinator.settling = _Settling(
+            bucket=bucket,
+            block=block,
+            layer=Layer(node.store),
+            applied=(),
+            surviving=(),
+            anchors=mine,
+            first_height=node.store.head() + 1,
+            settle_round=sr,
+        )
+        node.coordinator.tick(now + 2)
+        assert node.coordinator.settling is None, "the settling slot was not released"
+
+    def test_repeated_divergent_stalls_raise_instead_of_hanging_quietly(self):
+        c = Cluster()
+        now = T0
+        for i in range(_DIVERGENT_STALL_LIMIT - 1):
+            self._stall(c, bucket=100 + i, now=now, diverge=True)
+            now += DELTA
+        with self.assertRaises(InvariantError) as cm:
+            self._stall(c, bucket=200, now=now, diverge=True)
+        self.assertIn("divergent anchors", str(cm.exception))
+        self.assertIn(
+            c.keys[1].public.hex()[:8], str(cm.exception), "the error does not name who disagreed"
+        )
+
+    def test_absence_is_not_divergence_and_never_raises(self):
+        """A quorum that simply was not there in time is a liveness matter and heals on its own.
+        Counting it would crash-loop every node through an ordinary partition."""
+        c = Cluster()
+        now = T0
+        for i in range(_DIVERGENT_STALL_LIMIT + 2):
+            self._stall(c, bucket=300 + i, now=now, diverge=False)
+            now += DELTA
+
+    def test_a_settlement_that_lands_clears_the_count(self):
+        """Otherwise divergences separated by weeks of healthy operation eventually add up to a
+        crash, and the threshold stops meaning "consecutive". The reset is driven by settling a
+        real block, not by writing the counter: the point is that `_on_settled` does it."""
+        c = Cluster()
+        coord = c.nodes[0].coordinator
+        now = T0
+        for i in range(_DIVERGENT_STALL_LIMIT - 1):
+            self._stall(c, bucket=400 + i, now=now, diverge=True)
+            now += DELTA
+        self.assertEqual(coord._settle_stalls, _DIVERGENT_STALL_LIMIT - 1, "the count did not move")
+
+        head_before = c.nodes[0].store.head_block_num() or 0
+        c.put("healthy", b"v", kp=c.mgr, now=now)
+        c.pump(now)
+        c.pump(now + DELTA)
+        self.assertGreater(
+            c.nodes[0].store.head_block_num() or 0, head_before, "no block actually settled"
+        )
+        self.assertEqual(coord._settle_stalls, 0, "a settled block did not clear the count")
+
+        now = c.clock + DELTA
+        for i in range(_DIVERGENT_STALL_LIMIT - 1):
+            self._stall(c, bucket=500 + i, now=now, diverge=True)
+            now += DELTA
 
 
 class TestSettleRoundLifecycle(unittest.TestCase):
