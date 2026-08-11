@@ -1,22 +1,7 @@
-"""End-to-end test for `intervene()` (#anchor-is-the-axiom + #manager-sig-overrides-quorum).
-
-The scenario: the manager holds the anchor cold-key. They call `intervene()` against ONE node's
-store, which commits a manager-signed block directly (bypassing consensus). The rest of the
-cluster sees that node's head advance via routine HEIGHT polls, pulls the new block via
-GETBLOCK, verifies it against the anchor slot in `Authorization.verify`, and commits.
-
-This is the load-bearing property: an operator holding the anchor key can push a block into
-one node, and normal sync propagates it to every other node with no special path -- no
-"emergency intervention" wire flag, no evaluator branch, just the same Follower verify-and-
-commit pipeline that pulls any other SETTLED block.
-
-The test drives ONLY the sync path (Follower + Postman + frame delivery), skipping Coordinator
-ticks. In production, intervene() is used when the cluster is hung -- Coordinator wouldn't be
-producing new blocks. Driving both would race the intervene block against fresh consensus
-blocks and produce a divergent chain (unavoidable while both mechanisms compete for block_num
-= head+1). The sync-only pump matches the actual use case AND isolates the property being
-tested: intervene block reaches every node via the ordinary sync verify-and-commit pipeline.
-"""
+"""A manager-signed `intervene()` block on ONE node must reach every other node via ordinary
+Follower sync -- no special wire flag, no evaluator branch. Drives sync only; production uses
+intervene when Coordinator is hung, and driving both would race the manager block against
+fresh consensus."""
 
 from __future__ import annotations
 

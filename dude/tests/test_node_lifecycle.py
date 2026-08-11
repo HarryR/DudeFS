@@ -1,17 +1,5 @@
-"""Node.start(*listeners) / Node.stop() -- the threaded production path.
-
-Every other test in this suite drives `node.tick(now)` and `node.receive(frame, now)`
-from the test thread with an injected `now`. That's the deterministic path -- fast,
-reproducible, no wall clock. This test uses the OTHER path: real threads, real wall
-clock, real TCP sockets. Proves that the primitives Node and Postman rely on actually
-work together when a Node owns its own thread and the clock is real.
-
-Small on purpose: one 3-node cluster, prove that
-  (a) empty blocks get produced (the tick loop actually ticks)
-  (b) frames cross the listener-thread / node-thread boundary via the inbox queue
-      (delivery reaches Coordinator/Follower without hand-drained pumps)
-  (c) stop() returns within a bounded time (the `_stopping` flag is load-bearing)
-"""
+"""The threaded production path: real threads, real wall clock, real TCP. Every other test
+drives `tick`/`receive` from the test thread with an injected `now`."""
 
 from __future__ import annotations
 
@@ -97,19 +85,9 @@ def _wait_until(pred, timeout_sec: float, interval_sec: float = 0.05) -> bool:
 
 class TestNodeLifecycle(unittest.TestCase):
     def test_started_cluster_produces_empty_blocks_and_stops_cleanly(self):
-        """A 3-node TCP cluster in managed mode -- each `Node.start(listener)` spawns
-        its own thread; consensus advances on the real wall clock. Assert:
-
-          * Every node's head advances past 0 within a few `block_time` intervals.
-            Proves the tick loop actually ticks AND that frames cross the listener
-            thread / node thread boundary through the inbox queue.
-          * `Node.stop()` returns within a generous bound on every node. Proves the
-            `_stopping` flag actually breaks the loop and `TCPListener.stop()` joins
-            its reader thread.
-
-        Real wall clock, so this takes seconds -- one block per `TUNABLES.block_time`. It runs
-        on the harness's fast profile, not the production block time: at 30 s a block this would
-        be a two-minute test."""
+        """3-node TCP cluster, managed mode. Heads advance (tick loop ticks; inbox crosses
+        listener/node thread boundary) and stop() returns bounded (`_stopping` breaks the loop;
+        `TCPListener.stop()` joins). Real wall clock; harness's fast profile."""
         _mgr, nodes, listeners = _build_cluster(3)
         try:
             # Managed mode: each node gets its listener at start(). The dial side is not

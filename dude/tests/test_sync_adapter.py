@@ -137,11 +137,8 @@ class TestRefusal(unittest.TestCase):
 
 
 class TestSubmitRefusalsAreNotSyncRefusals(unittest.TestCase):
-    """One verb used to carry both vocabularies: `REFUSED` answered a client's SUBMIT with a
-    `mempool.Refusal` value AND a peer's GETBLOCK with a `SyncRefusal` value, and the body said
-    nothing about which. Decoding was unambiguous only because the two value sets happened not to
-    overlap, while both kept growing -- the first collision would have had a submit refusal
-    correcting down a peer's claimed head."""
+    """SUBMIT and GETBLOCK refusals live on distinct verbs -- one verb carrying both
+    vocabularies collides the first time their value spaces overlap."""
 
     def test_the_two_verbs_are_distinct(self):
         self.assertIsNot(Verb.REFUSED, Verb.SYNC_REFUSED)

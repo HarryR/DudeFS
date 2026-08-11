@@ -256,15 +256,10 @@ class Coordinator:
         self.current_round = None
 
     def _promote_to_settling(self, now: Millis) -> None:
-        """REFUSE FIRST, THEN COMMIT TO IT. Everything that can decline sits above the first
-        mutation; everything below it is core machinery whose failure is not a peer's fault.
-
-        The two used to be interleaved: `current_round` was cleared, and `SettleRound` then
-        refused a roster we had just been removed from with a DudeError -- swallowed at the
-        crash-only boundary with `settling` never assigned. The ratified slice was neither
-        committed nor re-admitted and the whole bucket's agreed work vanished, no error
-        anywhere. Losing a seat was one way in; every raise between those two lines was another.
-        """
+        """REFUSE FIRST, THEN COMMIT. Every decline sits above the first mutation; everything
+        below it is core machinery whose failure is not a peer's fault. Interleaving the two lets
+        a raise between them clear the round without assigning `settling` -- the bucket's work
+        vanishes with no error at the crash-only boundary."""
         r = self.current_round
         if r is None:
             raise InvariantError("_promote_to_settling with no in-flight Round")

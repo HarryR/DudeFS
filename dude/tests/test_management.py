@@ -1,16 +1,4 @@
-"""Tests for dude.store.management -- the anchor axiom, Role.MANAGER grants, and the
-emergency-intervention path.
-
-Two distinct "manager" concepts (#anchor-is-the-axiom + #role-manager-grant):
-  * The **anchor** — one immutable pubkey per store, provisioned at `store.provision()`.
-    `may_write` and `may_send` return True unconditionally for it. Holds bitmap slot N in
-    `Authorization.verify`'s manager slot for the block-level override.
-  * A **Role.MANAGER grant** — any number of runtime-granted identities. Blanket authorship
-    via `may_write`/`may_send`. Does NOT get the block override.
-
-The asymmetry is load-bearing (#trust-tiers): the anchor is cold and unrotatable; Role.MANAGER
-identities are its warm-online delegates.
-"""
+"""Tests for the anchor axiom, Role.MANAGER grants, and the emergency-intervention path."""
 
 from __future__ import annotations
 
@@ -287,18 +275,9 @@ class TestRoleManagerRotation(unittest.TestCase):
 
 
 class TestRevocationIsCompound(unittest.TestCase):
-    """Revoking an identity re-issues every #cert it signed, in the same transaction.
-
-    THE FAILURE THIS EXISTS TO CATCH, measured before the fix: a warm manager admitted three
-    nodes (signing their P_NODE certs and the roster commitment), the anchor revoked that
-    manager, and `roster()` returned ZERO members -- with all three P_NODE rows still present
-    and no error raised anywhere. `verify_cert` asks whether a cert's signer is authorised NOW,
-    so deleting one P_GRANT row silently un-attested every row that manager had signed. A node
-    in that state sits out consensus (`_open_round` refuses `me not in roster`) and gossips to
-    nobody, since round messages address the roster, which reads as a network fault.
-
-    #absence-is-revocation is unharmed: what gets replaced is the standing ATTESTATION on live
-    rows, not the validity of anything the revoked identity authored."""
+    """Revoking an identity MUST re-issue every #cert it signed, in the same transaction --
+    otherwise `verify_cert`'s "signer authorised NOW" check silently un-attests every row that
+    identity signed. A cluster in that state sits out consensus and looks like a network fault."""
 
     def _cluster_admitted_by_a_warm_manager(self, size=3):
         """Anchor grants MANAGER to `warm`; `warm` -- not the anchor -- admits `size` nodes,
@@ -821,12 +800,9 @@ class TestAuthorityRowEncoding(unittest.TestCase):
 
 
 class TestMalformedRowsDoNotPoison(unittest.TestCase):
-    """A garbage value in store 0 is reachable by any store-0-authorised author (a buggy manager
-    tool suffices): settlement checks signature/authority/guards, never that a row parses, and
-    the row then lives in the replicated log so restart replays it. It must degrade to "that
-    identity is absent" -- raising instead poisoned every roster()/may_write call on the hot
-    path of the coordinator, follower, and peer reconcile, and the repair needed a consensus
-    round that could no longer run."""
+    """A store-0 row that doesn't parse MUST read as "identity absent". Settlement never checks
+    parseability, so garbage lands legitimately; a raise poisons every roster()/may_write on the
+    hot path, and repair needs a consensus round that can no longer run."""
 
     def setUp(self):
         self.anchor = crypto.Keypair.generate()

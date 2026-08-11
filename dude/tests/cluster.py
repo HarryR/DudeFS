@@ -86,11 +86,8 @@ class Cluster:
         for node in self.nodes:
             node.tick(T0)
         self._clock: int = T0
-        """The cluster's own monotone clock. `pump(now)` treats its `now` argument as a floor:
-        if a test calls `pump(T0)` then `pump(T0 + DELTA)`, the second pump continues from
-        wherever the first left off rather than trying to run at a time already in the past.
-        This lets the old test pattern -- fixed timestamps spaced by DELTA -- work with the new
-        pump, which advances time internally so Round has room to finalize."""
+        """Monotone. `pump(now)` treats `now` as a floor so a follow-up `pump(T0 + DELTA)`
+        continues from wherever the previous pump ended, not from a time already in the past."""
 
     def _genesis(self) -> tuple[ops.SignedTransaction, ...]:
         # Provision the scratch store with the anchor pubkey so `verify_cert` (called by
@@ -168,14 +165,15 @@ class Cluster:
         return self.pump_without(now, away=set(), rounds=rounds)
 
     def pump_without(self, now: int, away: set[int], rounds: int = 10) -> int:
-        """`pump`, with some nodes switched OFF — not ticked, and their traffic lost rather than
-        queued. A node that was down did not receive what was sent to it while it was down, and
-        letting the switchboard hold it would make the backlog do the catching up.
-
-        TICKS AT A WINDOW'S TWO DECISION POINTS -- the boundary, and `delta - cut_reserve` where
-        the slice is cut. On boundaries alone, `_finalize` and `_abandon` fire in the same tick
-        and nothing ever ratifies."""
+        """`pump`, with some nodes switched OFF -- their traffic lost, not queued (backlog is
+        not what catches a node up). Ticks at a bucket's two decision points -- boundary and
+        cut_by; on boundaries alone `_finalize` and `_abandon` fire in the same tick and
+        nothing ratifies. `now` snapped to the next bucket boundary so the offsets land at
+        those decision points regardless of `T0`'s alignment against `block_time`."""
         now = max(now, self._clock)
+        remainder = now % DELTA
+        if remainder:
+            now += DELTA - remainder
         for _ in range(rounds):
             for offset in (0, DELTA - CUT_RESERVE):
                 at = now + offset

@@ -342,15 +342,9 @@ class TestBlocksChainAndPersist(unittest.TestCase):
             )
 
     def test_every_node_agrees_on_the_chain_hash(self):
-        """The load-bearing property for chain-verify in sync: given the same slice + same
-        anchors, every node's `block_hash` MUST agree, so successors compute the same
-        `prev_block` link. The full `encode()` bytes MAY differ per node (which subset of
-        settle_sigs a node held at SETTLE-moment is timing-dependent), but the sig-independent
-        chain identity MUST NOT.
-
-        Discovered while writing this test at Stage 1: nodes' `encode()` bytes DO differ
-        because of the sig-subset race, which is why `block_hash` was moved to hash only the
-        identity portion of the block."""
+        """`block_hash` MUST hash only the identity, not `encode()`: which subset of settle_sigs
+        a node held at SETTLE is timing-dependent, so encode-bytes differ per node while the
+        chain link cannot."""
         tx = ops.writes(ops.Set(D, crypto.h(b"pin"), b"v")).sign(self.client, T0)
         self.c.submit(self.client, tx, to=0, now=T0)
         self.c.pump(T0)

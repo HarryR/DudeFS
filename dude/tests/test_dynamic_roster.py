@@ -485,12 +485,9 @@ class TestPromoteScreensDisagreeVoidsInsteadOfCrashing(unittest.TestCase):
 
 
 class TestPromoteFailingIsFatalNotSilent(unittest.TestCase):
-    """Promote REFUSES by returning. Anything that RAISES past that point is the evaluator, the
-    SMT or an accumulator failing -- corruption or non-determinism, not a peer's fault. As a
-    DudeError it was swallowed at the crash-only boundary with the round already released and
-    `settling` never assigned, so a whole bucket's agreed work vanished without an error
-    anywhere. There is no transaction to roll back in Python; making the failure fatal is how
-    the core is relied upon."""
+    """Promote REFUSES by returning. Anything that RAISES is corruption or non-determinism and
+    MUST be fatal -- Python has no transaction to roll back, and a DudeError swallowed at the
+    crash-only boundary loses the bucket's agreed work with no error anywhere."""
 
     def test_a_dude_error_from_the_core_is_fatal_and_keeps_the_round(self):
         c = Cluster(size=4)
@@ -516,9 +513,8 @@ class TestPromoteFailingIsFatalNotSilent(unittest.TestCase):
 
 
 class TestANonMemberRefusesSubmissions(unittest.TestCase):
-    """A node outside the roster ACCEPTED submissions, then discarded its whole mempool at
-    the next bucket boundary -- rotation happens before _open_round declines -- so the
-    client held an ACCEPTED for a tx that vanished with no trace, no error anywhere."""
+    """A non-member MUST refuse at `submit`, not ACCEPT and rotate-drop -- that path leaves the
+    client holding an ACCEPTED for a tx with no trace and no error."""
 
     def test_submit_to_a_non_member_is_refused_not_swallowed(self):
         c = Cluster(size=3)
@@ -526,8 +522,7 @@ class TestANonMemberRefusesSubmissions(unittest.TestCase):
         tx = c.client().put("k", b"v").sign(c.mgr, T0)
         self.assertIs(outsider.coordinator.submit(tx, T0), Refusal.NOT_IN_ROSTER)
 
-        # Driven the way production drives it: the SUBMIT frame must leave no trace in the
-        # mempool (it used to sit there until the rotation silently dropped it).
+        # Production path: the SUBMIT frame must leave no trace in the mempool.
         env = Envelope(outsider.me.public, Verb.SUBMIT, b"s" * 16, tx.raw).sign(c.mgr, T0)
         outsider.receive(env.seal(), T0)
         self.assertEqual(len(outsider.mempool), 0)

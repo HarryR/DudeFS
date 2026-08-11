@@ -1,14 +1,5 @@
-"""Store snapshot / writer isolation semantics under threading.
-
-The Store split is only useful if SQLite WAL actually gives us what we've been asserting:
-  - Reader snapshots pin a consistent view across every read inside the scope.
-  - Concurrent readers each get their own independent snapshot.
-  - The writer serialises across threads.
-  - The in-memory Store (backed by a tempfile) supports all of the above.
-
-Each test here isolates ONE of those properties. If any fails, the whole reader/writer
-split's premise is wrong -- we'd be back to hoping about isolation rather than knowing.
-"""
+"""SQLite WAL isolation, one property per test. If any fails, the reader/writer split's
+premise is wrong."""
 
 from __future__ import annotations
 

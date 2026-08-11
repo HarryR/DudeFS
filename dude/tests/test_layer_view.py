@@ -1,13 +1,5 @@
-"""Layer as a View: projected roots match a from-scratch rebuild with the same mutations.
-
-The differential invariant is the whole point of computing roots through the overlay: if
-`Layer(base=store).accumulator()` disagrees with `store.rebuild().apply(muts).accumulator()`,
-then two nodes could ratify a slice and diverge on the settled anchors. Same for `state_root`.
-
-Random topologies are the honest test -- the enumerated cases (empty overlay, single set,
-single del, set-then-del, del-of-absent) exist to pin the specific shapes, but the property
-tests exist because the enumeration cannot cover the space where compression edges bite.
-"""
+"""`Layer(base=store).accumulator()` MUST equal `store.rebuild().apply(muts).accumulator()`
+-- disagreement lets two nodes ratify a slice and diverge on anchors. Same for `state_root`."""
 
 from __future__ import annotations
 

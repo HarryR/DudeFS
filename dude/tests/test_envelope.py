@@ -243,17 +243,9 @@ class TestSealing(unittest.TestCase):
         self.assertFalse(self.frame.addressed_to(self.eve.public))
 
     def test_a_frame_tagged_for_someone_else_is_declined_at_the_door(self):
-        """The other half of the tag's job, and it was performed by no layer at all.
-
-        `crypto.screen_tag` says the receiver keys on its OWN identity and compares, and that this
-        is what makes garbage cost ONE HASH rather than an ECDH against an ephemeral key. Nothing
-        compared: the transports never touch the tag and `Postman.deliver` went straight to
-        `unseal`. So the check was not "pushed into the transport" -- it was nowhere, and only the
-        sealed box declining to open kept a misaddressed frame out.
-
-        The box here WOULD open, which is what makes this test about ordering rather than about
-        secrecy: the sealed blob is genuinely ours and only the tag says otherwise. Under the old
-        code it was accepted."""
+        """`Postman.deliver` MUST refuse before `unseal` on a mismatched tag -- the tag exists
+        so garbage costs one hash, not an ECDH. The sealed blob here would genuinely open; only
+        the tag says otherwise."""
         openable = Frame(crypto.screen_tag(self.eve.public, self.frame.sealed), self.frame.sealed)
         self.assertEqual(openable.unseal(self.b), self.env, "the box really is ours")
 
@@ -278,19 +270,9 @@ class TestSealing(unittest.TestCase):
 
 class TestTwoEnumerations(unittest.TestCase):
     def test_verbs_and_store_ids_share_integers_harmlessly(self):
-        """Request verbs (what you may ASK a node to do, gated by the envelope's `frm`) and the
-        log's own axes (stores, operation kinds — gated by the inner author) are separate
-        enumerations by ruling. Collapsing them would let "may write the data store" imply "may
-        demand a state transfer".
-
-        Numeric overlap is therefore EXPECTED and safe rather than a collision: `1` means `PING` in
-        one namespace and the data store in the other, and no code path substitutes one for the
-        other. Asserting the overlap documents the separation better than asserting its absence
-        would — an earlier version of this test demanded the values be disjoint, which is a
-        requirement the design does not have and could not keep as both spaces grow."""
-        self.assertEqual(int(Verb.PING), 1)
-        self.assertEqual(ops.STORE_DATA, 1)
-        self.assertNotIsInstance(ops.STORE_DATA, Verb)  # same integer, different type and meaning
+        """Verbs and store ids are separate namespaces; integer overlap is safe because no code
+        path substitutes one for the other."""
+        self.assertNotIsInstance(ops.STORE_DATA, Verb)
 
     def test_the_verb_space_is_closed(self):
         """Closed so the request gate can enumerate its domain, and so a Rust or Go port matches

@@ -174,17 +174,9 @@ class TestAdmission(unittest.TestCase):
         self.assertEqual(self._admit(tx), DUPLICATE)
 
     def test_a_transaction_already_in_the_log_is_refused(self):
-        """#dedup-content-address: "A transaction already in the log MUST NOT enter the
-        mempool... this is a property of the door, not something a later stage catches."
-
-        IT WAS A PROPERTY OF A LATER STAGE. `admit` deduped against its own `pending` only, so
-        a settled transaction offered again was accepted. Guarded ones were caught incidentally
-        by `would_apply` -- as CANNOT_APPLY, the wrong reason arrived at by luck -- but an
-        UNGUARDED one, which is what this test uses, sailed through: the client got BODIES back
-        as though it had queued something, the tx burned a slice slot, `_promote_to_settling`
-        filtered it before anchors, and it vanished with nothing reported to anyone. Worse, the
-        same body re-entering via #fall-through-through-the-door was re-broadcast to every
-        roster member (#fall-through-re-broadcasts), so one stale transaction cost N floods."""
+        """#dedup-content-address: a settled tx MUST NOT enter the mempool. Property of the
+        door: dedup against `pending` alone lets a settled UNGUARDED tx sail through, burn a
+        slice slot, and vanish silently to the client."""
         tx = write(self.kp, "settled", b"v", T0)
         self.store.apply((tx,), auth=self.mgmt)
         self.assertEqual(self.store.head(), 1, "precondition: the tx is in the log")

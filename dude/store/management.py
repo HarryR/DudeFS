@@ -493,16 +493,10 @@ class MgmtReader:
         return g.role is Role.CLIENT_RW and store_id in g.stores
 
     def may_read(self, reader: Reader, who: crypto.PublicKey, store_id: int) -> bool:
-        """THE MANAGEMENT STORE IS READABLE BY ANY PRINCIPAL, and must be: it is the trust chain.
-        A light client cannot verify a quorum proof without knowing who the quorum is, which is
-        why `RosterBundle` already ships the roster and every manager grant to anyone who
-        bootstraps. Its wraps are sealed boxes, so they are encrypted rather than withheld, and
-        its possession proofs are public signatures. Scoping it withheld nothing and broke the
-        thing it exists for -- a client could not fetch the keys its own grant depends on.
-
-        Data stores ARE scoped, and the keys agree with the scope: a grant naming store 2 mints
-        store 2's blinding secret and epoch masters and nothing else, so this rule is defence in
-        depth over a key boundary rather than an access rule standing in for one."""
+        """Store 0 is readable by any principal with standing -- it IS the trust chain, and a
+        light client cannot verify quorum without it. Wraps are sealed boxes, so encryption
+        replaces scoping. Data stores stay scoped; keys agree with the scope, so this is
+        defence-in-depth, not the access rule."""
         if store_id == ops.STORE_MANAGEMENT:
             return self.has_standing(reader, who)
         if who == self.src.anchor():
@@ -781,22 +775,13 @@ class MgmtWriter(MgmtReader):
         wraps: dict[crypto.PublicKey, crypto.SealedBlob],
         blinding: dict[crypto.PublicKey, crypto.SealedBlob] | None = None,
     ) -> ops.Transaction:
-        """ONE transaction: the bump and every wrap, or neither. `evaluate` verdicts a whole
-        transaction, so there is never a live epoch nobody holds the master for.
-
-        ONE STORE, so re-keying store 2 does not re-wrap everyone on store 1.
-
-        NO GUARD. A `Holds` on the epoch row was equivalent to the forward-only rule
-        `evaluate` already applies -- both say `from_epoch == current`, since the target is derived
-        from `from_epoch` too -- and the evaluator's version is strictly stronger, because it binds
-        every writer rather than only transactions this method built. Two managers rotating at once
-        are serialised by it: the loser's target is no longer `current + 1` and drops as
-        EPOCH_JUMP.
-
-        A manager MUST be among `wraps`: managers recover any master by unwrapping their own copy
-        from the cluster, so an epoch minted without one can never be re-wrapped for a newcomer.
-        `blinding` is written at the first mint only -- a blinding secret never rotates, since
-        name tokens are SMT paths and rotating one would relocate every row in its store."""
+        """ONE transaction: bump and every wrap, or neither -- otherwise a live epoch has no
+        master. ONE STORE: re-keying store 2 must not re-wrap store 1. NO GUARD on the epoch
+        row: `evaluate`'s forward-only rule binds every writer, whereas a `Holds` would only
+        bind txs this method built. A manager MUST be among `wraps` -- managers recover masters
+        by unwrapping their own copy, so an epoch minted without one is un-rewrappable for a
+        newcomer. `blinding` is written at first mint only; rotating it would relocate every row
+        in the store."""
         to = from_epoch + 1
         steps = [ops.Step((), ops.Set(self.store_id, epoch_key(store_id), codec.encode(to)))]
         steps += [

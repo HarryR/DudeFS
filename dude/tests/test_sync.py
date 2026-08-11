@@ -1,15 +1,5 @@
-"""Tests for dude.sync.follower -- the L6 catch-up state machine, direct-wired.
-
-SAME HARNESS SHAPE AS test_round.py. No net stack, no envelopes, no seals. `_pump` drains the
-follower's outbox, calls `serve_*` against a producer store to build the reply, and hands it
-back to `follower.receive`. Everything is deterministic in `(now, inputs)`.
-
-TWO CATCH-UP SCENARIOS:
-  * LAGGING: joiner has the same block 1 as the cluster (via `bootstrap`), missed blocks 2..N.
-  * FRESH: joiner has only `store.provision(manager)` and pulls block 1 via GETBLOCK first.
-Both use the same Follower with no branching -- the "same trigger for every failure mode"
-property from #height-poll-is-the-trigger.
-"""
+"""Direct-wired Follower tests. LAGGING (joiner has block 1) and FRESH (joiner has only
+provision) share one Follower and one trigger (#height-poll-is-the-trigger)."""
 
 from __future__ import annotations
 

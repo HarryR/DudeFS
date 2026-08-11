@@ -489,9 +489,7 @@ class TestFailureDomains(unittest.TestCase):
 
 
 class TestMultiSigRoundTrip(unittest.TestCase):
-    """A regression for a bug that shipped silently: splitting `_ed25519_verify` into typed errors
-    made it RAISE and return None, so `if not _ed25519_verify(...)` was vacuously true and every
-    multisig verification returned False. Nothing exercised the path, so nothing caught it."""
+    """Genuine sigs verify; forged do not; the bitmap names who signed."""
 
     def setUp(self):
         self.kps = [crypto.Keypair.generate() for _ in range(5)]
@@ -538,8 +536,8 @@ class TestTransferAndSettlementRace(unittest.TestCase):
         self.mgmt = management.MgmtReader(self.s)
 
     def test_a_transaction_already_in_the_log_is_dropped_not_raised(self):
-        """`entry.op_hash UNIQUE` is what makes a settled transaction unrepeatable, and it used to
-        enforce that by throwing out of a frame handler — a routine race reported as corruption."""
+        """A settled tx arriving twice MUST drop as SETTLED, not raise -- it's a routine race
+        between quorum-settle and log-transfer, not corruption."""
         t = tx(self.kp, muts=(ops.Set(ops.STORE_DATA, DK, b"v"),))
         first = self.s.apply((t,), auth=self.mgmt)
         self.assertEqual(len(first.settled), 1)
@@ -550,11 +548,9 @@ class TestTransferAndSettlementRace(unittest.TestCase):
         self.assertEqual(self.s.head(), 1, "the duplicate took a log position")
 
     def test_a_duplicate_within_one_batch_is_dropped_not_raised(self):
-        """The cross-batch case above is held by the pre-loop settled_hashes snapshot; a duplicate
-        WITHIN one block's batch is not in that snapshot, and acceptors cannot screen bodies, so a
-        Byzantine proposer's ratified block used to crash every honest applier identically with
-        sqlite3.IntegrityError through commit_block -- and again after restart, since the block
-        re-arrives on sync. Driven through commit_block because that is the boundary it escaped."""
+        """A within-batch duplicate MUST drop, not raise. Acceptors can't screen bodies, so a
+        byzantine proposer's ratified block would otherwise crash every honest applier with
+        `sqlite3.IntegrityError` -- and again after restart, since sync re-delivers the block."""
         t = tx(self.kp, muts=(ops.Set(ops.STORE_DATA, DK, b"v"),))
         got = self.s.commit_block(
             1,
@@ -609,13 +605,10 @@ class TestTransferAndSettlementRace(unittest.TestCase):
 
 
 class TestADataRowMustBeShapedForEncryption(unittest.TestCase):
-    """Two rules, both in `evaluate` and nowhere else -- it serves the admission door AND
-    settlement, so one check binds both. A copy in `Mempool.valid` alone is how the two halves came
-    apart over duplicate transactions.
-
-    Built with `ops.writes`, NOT the local `tx()` helper: `_at` re-homes every mutation onto one
-    store, so a management write handed to it silently becomes a data write -- the same shape as
-    the epoch it already records dropping."""
+    """Data-row shape rules live in `evaluate` and nowhere else -- it serves both the admission
+    door AND settlement, so one check binds both. `ops.writes` here, not the local `tx()` helper
+    (which re-homes mutations onto one store and silently turns a management write into a data
+    write)."""
 
     def setUp(self):
         self.kp = crypto.Keypair.generate()

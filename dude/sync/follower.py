@@ -110,22 +110,14 @@ class Follower:
         return drained
 
     def behind(self, now: Millis) -> bool:
-        """`f+1` LIVE witnesses reporting a head ABOVE ours. POSITIVE EVIDENCE, and the direction
-        is the whole point: silence, an empty roster and reports too old to trust all answer
-        False, so a node that knows nothing keeps working.
+        """`f+1` LIVE witnesses reporting a head ABOVE ours. POSITIVE EVIDENCE, in this direction:
+        silence, empty roster, and stale reports all answer False, so a node with no data keeps
+        working. Flipping to "f+1 AGREEING with our tip" couples liveness to the height-poll loop
+        -- reports age out between buckets and every node quietly stops leading.
 
-        Asked the other way round -- `f+1` witnesses AGREEING with our tip -- it reads almost the
-        same and fails the opposite way. Gating block production on that couples the cluster's
-        liveness to the height-poll loop: reports age out between buckets and every node quietly
-        stops leading, which is how it was first written and what made a 3-node cluster produce
-        nothing at all.
-
-        Freshness is the clock's, not the newest report's: measured against the reports we happen
-        to hold, a peer that fell silent kept vouching for its own last word forever.
-
-        NOT `chain.is_stale`, which asks whether the CHAIN is advancing -- a different fact, and
-        one this must not carry: a stopped chain keeps every node's head stale, so gating on it
-        would stop every node from restarting the chain."""
+        Freshness is the clock's, not the newest report's, or a silent peer vouches for its own
+        last word forever. NOT `chain.is_stale`: that gates on the CHAIN advancing, and a stopped
+        chain would then prevent any node from restarting it."""
         roster = self.mgmt.roster()
         if not roster:
             return False

@@ -1,17 +1,5 @@
-"""End-to-end sync test, run over REAL TCP sockets.
-
-Parallel to `test_sync_e2e.py`, which drives the same scenario over InProc. The point
-here is to exercise the whole stack (Node dispatch, Postman mailbox correlation,
-Follower verify-and-commit) with actual bytes on 127.0.0.1 sockets, actual length-
-prefix framing, and actual OS-level connect/accept timing -- the failure modes InProc
-hides by construction (synchronous drain, atomic frame delivery, no port state).
-
-CLIENT/LISTENER SPLIT: every node owns a `TCPDialer` (built by its own Postman for
-send, and drained by the test pump for the replies that come back on it) and a
-`TCPListener` (built HERE, and drained by the pump for receive). Only the listener is
-the test's to construct: its `bound_address` is what peers dial, and it's known ONLY
-after bind, which is why listeners get built before the genesis roster.
-"""
+"""TCP twin of `test_sync_e2e.py`. Listeners are built before the genesis roster because a
+`bound_address` is only known after bind, and that address is what peers dial."""
 
 from __future__ import annotations
 

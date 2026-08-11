@@ -166,13 +166,7 @@ _DECODERS: dict[Verb, Callable[[bytes], RoundMsg]] = {
 class Block:
     bucket: Bucket
     hashes: tuple[crypto.Digest, ...]
-    """Screened before the slice was signed, so this is exactly what the block applied -- not a
-    superset of it. Everything downstream that treats membership as application depends on it."""
-
-    # No ratify multisig here. One used to sit beside `hashes`: never encoded, never verified,
-    # and combined one bitmap slot too narrow for `Authorization`'s (*roster, anchor) -- wrong
-    # the moment anybody actually checked it. The settle multisig signs `slice_hash`, so it
-    # already attests to this exact set; a second proof of the same fact is one to drift.
+    """Screened before the slice was signed -- exactly what the block applied, not a superset."""
 
     @property
     def slice_hash(self) -> crypto.Digest:

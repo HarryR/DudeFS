@@ -172,20 +172,8 @@ class TestLightClientBootstrap(unittest.TestCase):
         self.assertGreater(ts.head.block_num, 0)
 
     def test_forged_quorum_proof_does_not_reach_ready(self):
-        """The head's quorum proof is checked, and the client refuses on failure.
-
-        THE HALF THIS FILE NEVER ATTACKED. `test_byzantine_value_fails_proof_verify` forges
-        the VALUE and leans on the SMT fold, explicitly leaving the settle sigs honest -- so
-        the client's authorisation check had happy-path coverage only. It was a second
-        implementation of `MgmtWriter.authorises`' rule, and gutting it to `return True`
-        would not have failed a single test. `Authorization` is now the one implementation;
-        this is what holds it.
-
-        The bundle is untouched and verifies, the envelope is honestly signed by a real
-        node, the roster is the real roster -- only the signatures over
-        `(slice_hash, anchors)` are replaced with well-formed garbage. A bitmap of the same
-        width and a sig list of the same length, so nothing short-circuits on shape: the
-        refusal has to come from verifying the signatures themselves."""
+        """Only the sigs over `(slice_hash, anchors)` are forged; bitmap width and sig-list
+        length match, so the refusal must come from verifying the signatures themselves."""
         c = Cluster()
         client_kp = crypto.Keypair.generate()
         _provision_client(c, client_kp)
@@ -206,7 +194,8 @@ class TestLightClientBootstrap(unittest.TestCase):
             )
 
         client.bootstrap(c.clock + DELTA)
-        for now in (c.clock + DELTA, c.clock + DELTA):
+        now = c.clock + DELTA
+        for _ in range(2):
             for _ in range(5):
                 for node in c.nodes:
                     node._reconcile_peers(now)
@@ -276,16 +265,9 @@ class TestLightClientRead(unittest.TestCase):
         )
 
     def test_byzantine_value_fails_proof_verify(self):
-        """A responder signs an honest envelope (real settle_sigs, real head, real SMT
-        proof for the ACTUAL live value) but swaps the value it claims. The SMT commits
-        to `leaf_hash(path, h(value), h(cred))`; recomputing that with the swapped
-        value produces a different terminal, and the fold to root fails.
-
-        Load-bearing for #light-client-nonmembership: back when `serve_get_proof` shipped
-        `proof: bytes = b""` and the client's `_on_read_reply` just trusted the value,
-        this exact test would have passed with the swapped value -- the whole point of
-        that trap was that verification WASN'T happening. If this test ever passes with
-        an empty/placeholder proof pipeline, verification has been silently disabled again."""
+        """Swap the value on an otherwise honest reply. The SMT commits to
+        `leaf_hash(path, h(value), h(cred))`, so the fold to root fails. If this test starts
+        passing with a stubbed/placeholder proof pipeline, verification has been disabled."""
         c = Cluster()
         c.put("lite-client-byz", b"present", now=T0)
         key = c.token("lite-client-byz")
@@ -407,26 +389,10 @@ class TestLightClientRead(unittest.TestCase):
 
 
 class TestRevokedManagerCannotForgeARoster(unittest.TestCase):
-    """A manager that WAS authorised and has since been revoked must not be able to hand a
-    light client a roster of its own choosing.
-
-    WHY THIS IS NOT COVERED BY THE CERT CHAIN. A #cert carries no serial: "the row is either
-    present (attestation valid) or absent (revoked)". Currency for a cert therefore comes only
-    from observing its grant ROW in the log — the one thing a light client does not have. So a
-    revoked manager's anchor-signed grant cert verifies forever on the client side, and the
-    bundle is the single artefact in a light client's diet whose validity is not self-evident
-    from its own signatures. Blocks are fine (settle_sigs are a quorum multi-sig, chain-linked);
-    values are fine (SMT proof under signed anchors); both survive an arbitrary relay. The
-    bundle does not.
-
-    AND STEADY STATE HAS NO CORROBORATION. Bootstrap is covered by `f+1` agreement on
-    `roster_fingerprint`, so a forged roster there needs `f+1` colluding peers. But
-    `_on_read_reply` adopts a fresh bundle from ONE responder, and a responder may attach one
-    whenever it likes. #absence-is-revocation names the intended defence — "the state root's
-    non-inclusion proof over the grant path is the client's evidence" — and the client never
-    asks for one.
-
-    Asserts the CORRECT behaviour: the client's trusted roster is unchanged. It fails today."""
+    """A revoked manager holds an anchor-signed grant cert forever (cert carries no serial;
+    currency comes only from observing the grant ROW). A light client cannot see the row, so
+    the bundle is the one artefact whose validity is not self-evident from its own signatures.
+    `f+1` corroboration on `roster_fingerprint` is what steady state lacks."""
 
     def test_forged_bundle_from_a_revoked_manager_is_not_adopted(self):
         c = Cluster()
@@ -544,12 +510,9 @@ class TestRevokedManagerCannotForgeARoster(unittest.TestCase):
 
 
 class TestAByzantineResponderCannotKillTheClient(unittest.TestCase):
-    """A responder is not trusted, so nothing it sends may raise past the frame boundary. A
-    multisig bitmap of the wrong width for the roster was enough: `MultiSig.verify` raised
-    `CryptoError` out of `Authorization.verify`, `chain.advance`, `_advance_head` and
-    `_on_read_reply`, and `_run` catches only `queue.Empty` -- the thread died while the listener
-    kept accepting into an inbox nobody drained, so the client looked alive and every read hung
-    for ever. `SettledBlock.decode` wraps whatever bitmap bytes arrive, so it comes off the wire."""
+    """Nothing a responder sends may raise past the frame boundary. A wrong-width multisig
+    bitmap raised `CryptoError` out of every verify path and killed the client's reader thread
+    while its listener kept accepting -- reads hung forever with the client looking alive."""
 
     def test_a_wrong_width_signer_bitmap_fails_the_read_and_nothing_else(self):
         c = Cluster()
