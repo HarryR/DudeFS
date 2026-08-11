@@ -896,7 +896,7 @@ class TestIsMemberAndRosterCannotDisagree(unittest.TestCase):
         plant = ops.writes(
             ops.Set(ops.STORE_MANAGEMENT, P_NODE + victim, forged.encode_row())
         ).sign(c.mgr, T0)
-        intervene(s, c.mgr, bodies=(plant,), bucket=TUNABLES.mempool.bucket(c.clock))
+        intervene(s, c.mgr, bodies=(plant,), bucket=TUNABLES.bucket(c.clock))
 
         mgmt = MgmtReader(s)
         self.assertIsNotNone(s.get(ops.STORE_MANAGEMENT, P_NODE + victim), "the row must exist")
@@ -911,7 +911,7 @@ class TestIsMemberAndRosterCannotDisagree(unittest.TestCase):
         remove = (
             MgmtWriter(s).change_roster(commitment_signer=c.mgr, remove=(victim,)).sign(c.mgr, T0)
         )
-        intervene(s, c.mgr, bodies=(remove,), bucket=TUNABLES.mempool.bucket(c.clock))
+        intervene(s, c.mgr, bodies=(remove,), bucket=TUNABLES.bucket(c.clock))
         self.assertNotIn(victim, MgmtReader(s).roster())
         self.assertFalse(MgmtReader(s).is_member(victim))
 

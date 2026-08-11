@@ -7,18 +7,12 @@ from ..store.ops import SignedTransaction
 
 
 class CanonicalBatch:
-    """Signed transactions in the one order every producer, replayer and settler assumes:
-    ascending `op_hash` as bytes. Sorted BY THE CONSTRUCTOR, not by convention: a public
-    `__init__` that trusted its input to already be sorted would let a fourth caller write
-    `CanonicalBatch(some_tuple)`, pass every typecheck, and silently reintroduce the drift
-    this file exists to kill -- wearing a name that asserts the opposite. Sorting inside
-    `__init__` makes the wrong thing unsayable, and the O(n log n) is nothing beside the
-    signature verification happening either side of every batch.
+    """Signed transactions in ascending `op_hash` order -- the one order every producer,
+    replayer, and settler assumes. Sorted BY THE CONSTRUCTOR, not by convention: `__init__`
+    taking pre-sorted input on faith would let `CanonicalBatch(unsorted)` typecheck.
 
-    Filter, don't rebuild. `filter` narrows by op_hash and is order-preserving, so a screen
-    that returns membership (a `frozenset[Digest]`) cannot widen the slice or shuffle it --
-    the structural guarantee replaces the assertion that would otherwise sit at every
-    consumer."""
+    `filter` is order-preserving, so a screen returning `frozenset[Digest]` cannot widen the
+    slice or shuffle it."""
 
     __slots__ = ("_txs",)
 
@@ -50,10 +44,7 @@ class CanonicalBatch:
 
 
 def bodies_canonical(bodies: Iterable[SignedTransaction]) -> CanonicalBatch:
-    """Named entry point for `CanonicalBatch(...)`. The constructor sorts either way; this
-    exists so call sites read as "canonicalise these bodies" rather than "construct a
-    CanonicalBatch out of these bodies", which is the same operation described from two
-    sides."""
+    """Named alias for `CanonicalBatch(...)`; reads better at call sites."""
     return CanonicalBatch(bodies)
 
 

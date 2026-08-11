@@ -6,6 +6,7 @@ from enum import Enum
 
 from ..core import crypto
 from ..core.units import Millis
+from ..tunables import Tunables
 from .link import Estimator, Link, Peer, SessionLink
 
 type AnyLink = Link | SessionLink
@@ -40,20 +41,8 @@ type Decision = Send | Wait | GiveUp
 
 
 @dataclass(frozen=True, slots=True)
-class PlanTunables:
-    backoff_base: Millis = 100
-
-    backoff_cap: Millis = 5_000
-
-    stagger_cap: Millis = 250
-
-    max_parallel: int = 2
-    max_attempts: int = 8
-
-
-@dataclass(frozen=True, slots=True)
 class Plan:
-    t: PlanTunables = field(default_factory=PlanTunables)
+    t: Tunables
     jitter: Callable[[int, int], int] = field(default=lambda lo, hi: lo + (hi - lo) // 2)
 
     def next(self, peer: Peer, attempts: int, now: Millis, deadline: Millis) -> Decision:

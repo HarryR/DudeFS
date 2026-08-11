@@ -325,7 +325,7 @@ class TestRosterRemovalRacingAnInFlightRound(unittest.TestCase):
         assert prev is not None
         rounds = {
             kp.public: Round(
-                bucket=TUNABLES.mempool.bucket(T0),
+                bucket=TUNABLES.bucket(T0),
                 me=kp,
                 roster=roster,
                 prev_block=prev,
@@ -409,13 +409,8 @@ class TestRosterRemovalRacingAnInFlightRound(unittest.TestCase):
 
 class TestABlockAdoptedMidRoundVoidsTheRound(unittest.TestCase):
     """The Follower commits on message ARRIVAL, not on the Coordinator's tick, so the head can
-    move between the cut and promote. The round screened its slice against the base it opened on;
-    anchoring that slice to a newer base signs a state_root nothing ever screened against.
-
-    Before the slice was screened at the cut this was survivable-looking -- the anchors were just
-    computed over whatever the store held at promote. It is not survivable now, and it was never
-    correct: `_prev_block`'s docstring said the two reads "MUST be the same value" and no code
-    anywhere checked it."""
+    move between the cut and promote. A slice screened at the old base but anchored to a newer
+    one signs a state_root nothing ever screened against -- promote MUST void."""
 
     def test_promote_refuses_when_the_head_moved_under_the_round(self):
         c = Cluster(size=4)
@@ -438,7 +433,10 @@ class TestABlockAdoptedMidRoundVoidsTheRound(unittest.TestCase):
             "the head did not actually move; the assertions below would be vacuous",
         )
 
-        node.coordinator.tick(T0 + 200)
+        # Directly at the promote path -- calling `tick` here would go on to open a fresh round
+        # for the just-closed bucket, and this test is about what promote itself does, not what
+        # cadence does after.
+        node.coordinator._promote_to_settling(T0 + 200)
 
         self.assertIsNone(node.coordinator.current_round, "the round must be released")
         self.assertIsNone(
@@ -453,12 +451,10 @@ class TestABlockAdoptedMidRoundVoidsTheRound(unittest.TestCase):
 
 
 class TestPromoteScreensDisagreeVoidsInsteadOfCrashing(unittest.TestCase):
-    """The cut already screened this slice, against this same base. A reject at promote means the
-    two screens disagreed -- non-determinism in the evaluator -- and dropping it quietly is what
-    used to make `block.hashes` a superset of what applied. Void the round and log; crashing the
-    whole node for a screen disagreement is a footgun (the mempool still holds the work, the next
-    bucket screens against whatever base is current then, and an operator needs the log line to go
-    look, not a restart loop)."""
+    """A reject at promote means THIS NODE's two screens disagreed on the same base -- local
+    non-determinism. The other ratifiers agreed on the same slice_hash and will settle without
+    us; we adopt through the Follower. Void and log; crashing takes an honest node down for its
+    own anomaly while the cluster progresses."""
 
     def test_a_slice_carrying_an_unappliable_tx_voids_and_logs(self):
         c = Cluster(size=4)
@@ -475,20 +471,17 @@ class TestPromoteScreensDisagreeVoidsInsteadOfCrashing(unittest.TestCase):
             "the head moved; promote would refuse on the base instead",
         )
 
+        # Directly at promote for the same reason as the sibling test: `tick` would go on to
+        # open a fresh round for the just-closed bucket, and this test is about promote's void
+        # path, not cadence.
         with self.assertLogs("dude.consensus.coordinator", level="ERROR") as logs:
-            node.coordinator.tick(T0 + 200)
+            node.coordinator._promote_to_settling(T0 + 200)
         self.assertTrue(
             any("promote screen disagreed" in r.getMessage() for r in logs.records),
             f"the disagreement was not logged: {[r.getMessage() for r in logs.records]}",
         )
         self.assertIsNone(node.coordinator.current_round, "the round must be released")
         self.assertIsNone(node.coordinator.settling, "a rejected slice must not settle")
-        # `mempool.admit` re-runs the full admission door on every re-admit, so a permanently
-        # unappliable tx (this one, epoch 0 vs live epoch 1) is honestly refused as CANNOT_APPLY
-        # rather than parked to try again. The void's contract is "release the round, hand back
-        # what mempool can hold"; the door decides the rest. Not asserted here on purpose --
-        # asserting "is or isn't in the mempool" would be asserting `Mempool.valid`'s policy from
-        # the wrong file.
 
 
 class TestPromoteFailingIsFatalNotSilent(unittest.TestCase):

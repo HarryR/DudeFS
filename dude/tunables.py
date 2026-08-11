@@ -1,143 +1,256 @@
+"""Every deployment-global dial. Four physical measurements, three resilience counts, some
+protocol counts -- everything else derives, `block_time` above all: raise a measurement or a
+count and the block time moves in step.
+"""
+
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
-from .consensus.mempool import Tunables as MempoolTunables
 from .core.errors import InvariantError
-from .core.units import Millis
-from .net.link import LinkTunables
-from .net.plan import PlanTunables
+from .core.units import Bucket, Millis
 
 
 @dataclass(frozen=True, slots=True)
-class TimingTunables:
-    """Adding a field here MUST be a decision: everything else is derived from these, and
-    declaring an answer is how a derivation gets bypassed silently.
-    `test_declared_quantities_and_nothing_else` is what forces the decision.
+class LinkTunables:
+    """One link's dials. Built by `Tunables.link_tunables`; never declared."""
 
-    THE GLOBAL CLOCK IS LOAD-BEARING. Every node and client runs NTP; `clock_skew` is the
-    assumed bound. Buckets are `floor(t/delta)` so agreement needs no coordination, and freshness
-    is a WALL-CLOCK bound -- an old quorum-signed block verifies perfectly, so the clock is the
-    only local oracle for currency."""
+    rto_floor: Millis
+    rto_initial: Millis
+    granularity: Millis
+    breaker_threshold: int
+    breaker_cooldown: Millis
+    budget_max_tokens: int
+    budget_token_ratio: int
 
-    rtt_max: Millis = 300
-    """One wave, PROCESSING INCLUDED: getting a message to every peer and handling what comes
-    back. Measured per deployment, so roster size shows up here."""
 
-    clock_skew: Millis = 250
+@dataclass(frozen=True, slots=True)
+class Tunables:
+    # DECLARED. Every field here is a physical measurement, a product decision, or a count.
+    # Arithmetic over them belongs below as a property.
+
+    rtt_max: Millis = 2_000
+    """Maximum physical link round-trip time this deployment tolerates. The wire, nothing else --
+    not "one wave" or "reaching quorum", just one send and one reply on one link."""
+
+    clock_skew: Millis = 2_000
+    """Upper bound on NTP jitter between roster members. Every node runs NTP."""
 
     client_clock_tolerance: Millis = 25_000
+    """Clients are not NTP-disciplined; nodes are. Collapsing the two would either refuse honest
+    clients or widen the replay window for everyone."""
 
-    waves_per_round: int = 3
-    """HELD, SIG, SETTLE_SIG -- all three inside the round's own window."""
+    granularity: Millis = 1
+
+    retry_budget: int = 2
+    """Attempts per sub-round before a peer is lost for that sub-round. Tied to link redundancy:
+    2 links per peer -> 2 attempts."""
+
+    held_convergence_max: int = 3
+    """Maximum HELD/BODIES sub-rounds a wave accepts. Steady state converges in 1-2; partition
+    or asymmetric client load can take more."""
+
+    safety_margin: int = 2
+    """`block_time = safety_margin * block_time_floor`. Slack above the coherent minimum."""
 
     windows_to_settle: int = 2
-    """Collect in W, agree and apply in W+1. Counts WINDOWS; `waves_per_round` counts round
-    trips. Two counters, two units."""
+    """Collect in W, apply in W+1."""
 
     ticks_per_cadence: int = 10
 
-    @property
-    def dissemination(self) -> Millis:
-        return self.waves_per_round * self.rtt_max + self.clock_skew
+    pull_batch: int = 32
+    """Message-size bound, not a rate."""
+
+    max_attempts: int = 8
+    """Hard cap on total retransmit attempts for one message, across its whole lifetime. Distinct
+    from `retry_budget` (per sub-round)."""
+
+    max_parallel: int = 2
+
+    breaker_threshold: int = 5
+    budget_max_tokens: int = 10_000
+    budget_token_ratio: int = 100
+    """MILLI-tokens; MUST NOT become floats. Ten additions of 0.1 sum to 0.9999999999999999,
+    so a bucket refilled by exactly its ratio never reaches a whole token."""
+
+    # DERIVED. Nothing below may be set.
 
     @property
-    def conversation_floor(self) -> Millis:
-        return self.clock_skew + self.rtt_max
+    def single_wave_budget(self) -> Millis:
+        return self.retry_budget * self.rtt_max
+
+    @property
+    def held_wave_budget(self) -> Millis:
+        return self.held_convergence_max * self.single_wave_budget
+
+    @property
+    def block_time_floor(self) -> Millis:
+        return self.held_wave_budget + 2 * self.single_wave_budget + self.clock_skew
+
+    @property
+    def block_time(self) -> Millis:
+        return self.safety_margin * self.block_time_floor
 
     @property
     def cut_reserve(self) -> Millis:
-        """What a window keeps back for the waves after phase 2: the SIG that cuts the slice and
-        the SETTLE_SIG that agrees the anchors. Phase 2 gets the remainder."""
-        return (self.waves_per_round - 1) * self.rtt_max
+        """Time a bucket holds back for SIG and SETTLE_SIG after HELD closes."""
+        return 2 * self.single_wave_budget
 
     @property
     def admission_floor(self) -> Millis:
         return self.client_clock_tolerance + 2 * self.rtt_max
 
-    def skew_buckets(self, bucket_width: Millis) -> int:
-        """Clock skew expressed in buckets: the tolerance on freshness, since a peer whose clock
-        sits behind ours reports a head we would otherwise call stale."""
-        return -(-self.clock_skew // bucket_width)
+    @property
+    def w_admit(self) -> Millis:
+        """How stale a client's own timestamp may be at the door."""
+        return self.admission_floor
 
-    def endorse_margin(self, bucket_width: Millis) -> Millis:
-        return self.windows_to_settle * bucket_width + self.clock_skew
+    @property
+    def endorse_margin(self) -> Millis:
+        return self.windows_to_settle * self.block_time + self.clock_skew
 
+    @property
+    def w_valid_margin(self) -> Millis:
+        return self.endorse_margin
 
-@dataclass(frozen=True, slots=True)
-class NetTunables:
-    window: Millis = 5_000
+    @property
+    def w_valid(self) -> Millis:
+        return self.w_admit + self.w_valid_margin
 
-    ttl: Millis = 10_000
+    @property
+    def evict_after(self) -> Millis:
+        """Nothing held past the point it could still settle."""
+        return self.w_valid
 
+    @property
+    def ttl_round(self) -> Millis:
+        """HELD/SIG/SETTLE_SIG. Dies when its bucket settles."""
+        return self.endorse_margin
 
-@dataclass(frozen=True, slots=True)
-class SyncTunables:
-    poll_interval: Millis = 1_000
+    @property
+    def ttl_exchange(self) -> Millis:
+        """One request, one answer: height polls, block pulls, node replies."""
+        return self.block_time_floor
 
-    pull_timeout: Millis = 3_000
+    @property
+    def ttl_lite(self) -> Millis:
+        """A light client's answer carries a head; a late reply is a NEW question next block."""
+        return self.block_time + self.clock_skew
 
-    freshness_window: Millis = 5_000
+    @property
+    def ttl_longest(self) -> Millis:
+        """Named once: two consumers, one answer, a second spelling would eventually disagree."""
+        return max(self.ttl_round, self.ttl_exchange, self.ttl_lite)
 
-    pull_batch: int = 32
-    """Blocks one GETBLOCK may carry. A message-size bound, not a rate: it trades reply size
-    against round trips, and the server caps at its own value regardless of what is asked."""
+    @property
+    def window(self) -> Millis:
+        """How old an envelope may be and still be accepted. Forced by the longest ttl: the
+        mailbox retransmits the same envelope with its original timestamp until the deadline,
+        so anything shorter refuses live retries at the receiver."""
+        return self.ttl_longest + self.clock_skew
 
+    @property
+    def poll_interval(self) -> Millis:
+        """Nothing polls faster than the thing it observes changes."""
+        return self.block_time
 
-@dataclass(frozen=True, slots=True)
-class LightClientTunables:
-    liveness_window: int = 2
-    """How many headers a reply will carry. A MESSAGE-SIZE bound, not a trust one -- whether a
-    head is current is `chain.is_stale`, judged by the client against its own clock, because a
-    responder cannot be asked to certify its own freshness."""
+    @property
+    def freshness_window(self) -> Millis:
+        """How long a height report is worth believing. A peer answering every poll is never
+        mistaken for a silent one."""
+        return self.poll_interval + self.rtt_max + self.clock_skew
 
+    @property
+    def pull_timeout(self) -> Millis:
+        return self.block_time_floor
 
-@dataclass(frozen=True, slots=True)
-class Tunables:
-    timing: TimingTunables = field(default_factory=TimingTunables)
-    net: NetTunables = field(default_factory=NetTunables)
-    link: LinkTunables = field(default_factory=LinkTunables)
-    plan: PlanTunables = field(default_factory=PlanTunables)
-    mempool: MempoolTunables = field(default_factory=MempoolTunables)
-    sync: SyncTunables = field(default_factory=SyncTunables)
-    light_client: LightClientTunables = field(default_factory=LightClientTunables)
+    @property
+    def liveness_window(self) -> int:
+        """Headers per reply -- a lagging client's catch-up horizon."""
+        return self.windows_to_settle
 
-    def __post_init__(self) -> None:
-        t = self.timing
-        for what, value, floor in (
-            ("mempool.delta", self.mempool.delta, t.dissemination),
-            ("net.window", self.net.window, t.conversation_floor),
-            ("mempool.w_admit", self.mempool.w_admit, t.admission_floor),
-            (
-                "mempool.w_valid_margin",
-                self.mempool.w_valid_margin,
-                t.endorse_margin(self.mempool.delta),
-            ),
-            ("sync.poll_interval", self.sync.poll_interval, t.conversation_floor),
-            ("sync.pull_timeout", self.sync.pull_timeout, t.dissemination),
-            ("sync.freshness_window", self.sync.freshness_window, self.sync.poll_interval),
-        ):
-            if value < floor:
-                raise InvariantError(f"{what} is {value}ms, below its derived floor of {floor}ms")
-        if self.plan.backoff_cap > self.net.ttl:
-            raise InvariantError(
-                f"plan.backoff_cap ({self.plan.backoff_cap}ms) exceeds the deadline it is spent "
-                f"against, net.ttl ({self.net.ttl}ms), so it can never bind before the deadline"
-            )
-        if self.timing.ticks_per_cadence < 1:
-            raise InvariantError(
-                f"timing.ticks_per_cadence ({self.timing.ticks_per_cadence}) must be >= 1; "
-                f"a driver loop that doesn't tick at all cannot advance consensus"
-            )
+    @property
+    def backoff_base(self) -> Millis:
+        """Retry no faster than one wave: sooner is a second copy in flight, not a retry."""
+        return self.rtt_max
+
+    @property
+    def backoff_cap(self) -> Millis:
+        return self.ttl_longest
+
+    @property
+    def stagger_cap(self) -> Millis:
+        return self.rtt_max
+
+    @property
+    def select_timeout(self) -> Millis:
+        """Bounds how long a stopping transport stays unresponsive."""
+        return self.rtt_max
+
+    @property
+    def connect_timeout(self) -> Millis:
+        """Spent on the tick thread: how long one bad peer can stall consensus."""
+        return self.block_time_floor
+
+    @property
+    def send_timeout(self) -> Millis:
+        return self.block_time_floor
+
+    @property
+    def stop_join_timeout(self) -> Millis:
+        return self.select_timeout + self.rtt_max
 
     @property
     def tick_interval(self) -> Millis:
-        smallest_cadence = min(
-            self.plan.backoff_base,
-            self.sync.poll_interval,
-            self.mempool.delta,
+        """Sampled against `cut_reserve`, the tightest deadline the loop must not overshoot."""
+        return max(1, self.cut_reserve // self.ticks_per_cadence)
+
+    @property
+    def breaker_cooldown(self) -> Millis:
+        """A breaker cannot hold a link out across the bucket that needed it."""
+        return self.block_time_floor
+
+    @property
+    def expected_rtt(self) -> Millis:
+        """RTO prior for a link with no Estimator sample yet. Consumers: `Peer.usable` sort
+        tiebreak, `Plan.stagger`."""
+        return self.rtt_max
+
+    @property
+    def link_tunables(self) -> LinkTunables:
+        return LinkTunables(
+            rto_floor=2 * self.granularity,
+            rto_initial=self.expected_rtt,
+            granularity=self.granularity,
+            breaker_threshold=self.breaker_threshold,
+            breaker_cooldown=self.breaker_cooldown,
+            budget_max_tokens=self.budget_max_tokens,
+            budget_token_ratio=self.budget_token_ratio,
         )
-        return max(self.link.granularity, smallest_cadence // self.timing.ticks_per_cadence)
+
+    def skew_buckets(self) -> int:
+        """Clock skew in buckets -- freshness tolerance against a peer whose clock lags."""
+        return -(-self.clock_skew // self.block_time)
+
+    def bucket(self, ts: Millis) -> Bucket:
+        return ts // self.block_time
+
+    def bucket_start(self, b: Bucket) -> Millis:
+        return b * self.block_time
+
+    def __post_init__(self) -> None:
+        for what, count in (
+            ("retry_budget", self.retry_budget),
+            ("held_convergence_max", self.held_convergence_max),
+            ("safety_margin", self.safety_margin),
+            ("windows_to_settle", self.windows_to_settle),
+            ("ticks_per_cadence", self.ticks_per_cadence),
+            ("pull_batch", self.pull_batch),
+            ("max_attempts", self.max_attempts),
+            ("max_parallel", self.max_parallel),
+        ):
+            if count < 1:
+                raise InvariantError(f"{what} is {count}; a count below 1 disables the mechanism")
 
 
 DEFAULT = Tunables()

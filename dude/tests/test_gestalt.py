@@ -13,7 +13,6 @@ from __future__ import annotations
 import time
 import unittest
 from collections.abc import Callable
-from dataclasses import replace
 
 from ..client import Client, Keys, mint_first_keyepoch
 from ..consensus.bootstrap import bootstrap
@@ -35,7 +34,7 @@ from ..store import Store, management, ops
 from ..store.management import Cert, MgmtWriter, NodeRecord, Role
 from ..store.store import StoreError
 from ..sync.lite_client import LightClient
-from ..tunables import SyncTunables, Tunables
+from ..tunables import Tunables
 from .cluster import DELTA, T0, TUNABLES, Cluster, D
 
 
@@ -276,7 +275,9 @@ class TestVerbCoverage(unittest.TestCase):
 # microseconds, so a much tighter rtt/skew is honest here. The invariants
 # (`Tunables.__post_init__`) still verify at construction, so nothing is skipped -- just
 # faster ceremonies.
-_FAST = replace(TUNABLES, sync=SyncTunables(poll_interval=500))
+_FAST = TUNABLES
+"""Was `TUNABLES` with `poll_interval` forced to 500 ms. `poll_interval` derives from the block
+time now, and the block time here IS 500 ms, so the override said what the derivation says."""
 
 
 def _genesis(
@@ -328,7 +329,7 @@ def _build_node(
     side is the Postman's own (#postman-owns-dialling)."""
     store = Store()
     store.provision(mgr.public)
-    bootstrap(store, mgr, genesis, bucket=_FAST.mempool.bucket(T0))
+    bootstrap(store, mgr, genesis, bucket=_FAST.bucket(T0))
     return Node(kp, store, tunables=tunables)
 
 
@@ -425,7 +426,7 @@ class TestScenario(unittest.TestCase):
                 node.start(listener)
             # Every node should get past block 1 within a few buckets (Coordinator ticks
             # each bucket boundary; empty rounds ratify on quorum trivially at n=3).
-            budget = 5 * (_FAST.mempool.delta / 1000)
+            budget = 5 * (_FAST.block_time / 1000)
             self.assertTrue(
                 _wait_until(
                     lambda: all((n.store.head_block_num() or 0) >= 2 for n in nodes),
@@ -449,7 +450,7 @@ class TestScenario(unittest.TestCase):
                     tx,
                     mgr,
                     observed=lambda: all(n.store.get(D, key) is not None for n in nodes),
-                    delta_ms=_FAST.mempool.delta,
+                    delta_ms=_FAST.block_time,
                 ),
                 "phase 1: tx did not settle on every node",
             )
@@ -491,7 +492,7 @@ class TestScenario(unittest.TestCase):
                     grant_tx,
                     mgr,
                     observed=lambda: all(n.mgmt.grant_of(lc_kp.public) is not None for n in nodes),
-                    delta_ms=_FAST.mempool.delta,
+                    delta_ms=_FAST.block_time,
                 ),
                 "phase 2: CLIENT grant did not settle on every node",
             )
@@ -499,7 +500,7 @@ class TestScenario(unittest.TestCase):
             # dials nodes and replies flow back on the sessions it opened (SessionLink);
             # a node learns about a client only when the client's first frame arrives on
             # a session it accepted, at which point Postman.register_session runs.
-            lc = LightClient(me=lc_kp, anchor=mgr.public, postman=Postman(lc_kp), tunables=_FAST)
+            lc = LightClient(me=lc_kp, anchor=mgr.public, postman=Postman(lc_kp, _FAST))
             for i, listener in enumerate(listeners):
                 lc.add_bootstrap_peer(nodes[i].me.public, (Endpoint(listener.bound_address),))
             # NO LISTENER AT ALL, and this is the point of the shape: a light client never
@@ -551,7 +552,7 @@ class TestScenario(unittest.TestCase):
                 add_tx,
                 mgr,
                 observed=lambda: all(n4_kp.public in n.mgmt.roster() for n in nodes),
-                delta_ms=_FAST.mempool.delta,
+                delta_ms=_FAST.block_time,
             )
             if not ok_phase3:
                 # Small diagnostic: the two smoking guns for consensus stalls in this
@@ -582,7 +583,7 @@ class TestScenario(unittest.TestCase):
             # as the others so it can chain-verify from block 1.
             n4_store = Store()
             n4_store.provision(mgr.public)
-            bootstrap(n4_store, mgr, genesis, bucket=_FAST.mempool.bucket(T0))
+            bootstrap(n4_store, mgr, genesis, bucket=_FAST.bucket(T0))
             n4 = Node(n4_kp, n4_store, tunables=_FAST)
             # Manual bootstrap peer wiring (joiner not yet in its own roster's postman;
             # reconciliation will do the rest on tick). This `add_peer` is what builds
@@ -597,7 +598,7 @@ class TestScenario(unittest.TestCase):
                     lambda: (
                         (n4_store.head_block_num() or 0) >= (nodes[0].store.head_block_num() or 0)
                     ),
-                    timeout_sec=20 * (_FAST.mempool.delta / 1000),
+                    timeout_sec=20 * (_FAST.block_time / 1000),
                 ),
                 f"phase 3: joiner did not catch up (n4={n4_store.head_block_num()} "
                 f"vs cluster={nodes[0].store.head_block_num()})",

@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 
 from ...core.errors import DudeError
 from ...core.units import Millis, now_ms
+from ...tunables import DEFAULT
 from ..address import Address, Scheme
 from ..envelope import MAX_FRAME_BYTES, Frame
 from ..link import LinkError, Listener, Transport
@@ -20,12 +21,11 @@ from ..session import Inbound, Session
 
 _LEN = struct.Struct(">I")
 
-_SELECT_TIMEOUT_SEC = 0.5
-
-# Both bounds are spent on the CALLER's thread, and the caller is the node's single tick
-# thread: whatever value sits here is how long one bad peer can stall all consensus and sync.
-_CONNECT_TIMEOUT_SEC = 3.0
-_SEND_TIMEOUT_SEC = 2.0
+# The one place Millis becomes seconds -- `select`, `settimeout`, `Thread.join` want floats.
+_SELECT_TIMEOUT_SEC = DEFAULT.select_timeout / 1000
+_CONNECT_TIMEOUT_SEC = DEFAULT.connect_timeout / 1000
+_SEND_TIMEOUT_SEC = DEFAULT.send_timeout / 1000
+_STOP_JOIN_SEC = DEFAULT.stop_join_timeout / 1000
 
 
 class TCPSession(Session):
@@ -171,7 +171,7 @@ class TCPDialer(Transport, Listener):
         thread = self._thread
         self._thread = None
         if thread is not None and thread.is_alive():
-            thread.join(timeout=2.0)
+            thread.join(timeout=_STOP_JOIN_SEC)
         self.close()
         if self._selector is not None:
             with contextlib.suppress(Exception):
@@ -348,7 +348,7 @@ class TCPListener(Listener):
         thread = self._thread
         self._thread = None
         if thread is not None and thread.is_alive():
-            thread.join(timeout=2.0)
+            thread.join(timeout=_STOP_JOIN_SEC)
         self._close_all()
 
     def drain(self) -> tuple[Inbound, ...]:

@@ -16,7 +16,6 @@ from ..consensus.mempool import (
     UNSIGNED,
     Mempool,
     Refusal,
-    Tunables,
 )
 from ..core import crypto
 from ..quorum import (
@@ -32,6 +31,7 @@ from ..quorum import (
 )
 from ..store import Store, ops, settle
 from ..store.management import MgmtReader
+from ..tunables import Tunables
 
 D = ops.STORE_DATA
 DK = crypto.NameToken(crypto.h(b"k"))
@@ -99,23 +99,19 @@ class TestBuckets(unittest.TestCase):
     def test_boundaries_are_computed_not_negotiated(self):
         """#buckets: two nodes derive the same bucket for the same transaction with ZERO
         communication, because the bucket is arithmetic on the transaction's own timestamp."""
-        a, b = Tunables(delta=1_000), Tunables(delta=1_000)
-        for ts in (T0, T0 + 1, T0 + 999, T0 + 1_000, T0 + 5_500):
+        a, b = Tunables(rtt_max=200), Tunables(rtt_max=200)
+        d = a.block_time
+        self.assertEqual(a.block_time, b.block_time, "the same inputs must derive the same block")
+        for ts in (T0, T0 + 1, T0 + d - 1, T0 + d, T0 + d * 5 + d // 2):
             self.assertEqual(a.bucket(ts), b.bucket(ts))
-        self.assertEqual(a.bucket(T0 + 999) - a.bucket(T0), 0)
-        self.assertEqual(a.bucket(T0 + 1_000) - a.bucket(T0), 1)
-
-    def test_w_valid_is_w_admit_plus_a_margin(self):
-        """Not a second tier — a pipeline allowance, same order of magnitude (§1.2)."""
-        t = Tunables(w_admit=30_000, w_valid_margin=3_000)
-        self.assertEqual(t.w_valid, 33_000)
-        self.assertLess(t.w_valid, 2 * t.w_admit)
+        self.assertEqual(a.bucket(T0 + d - 1) - a.bucket(T0), 0)
+        self.assertEqual(a.bucket(T0 + d) - a.bucket(T0), 1)
 
 
 class TestAdmission(unittest.TestCase):
     def setUp(self):
         self.kp = crypto.Keypair.generate()
-        self.t = Tunables(delta=1_000, w_admit=30_000)
+        self.t = Tunables(rtt_max=200)
         self.mp = Mempool(self.t)
         self.store = Store()  # the door consults state, so it needs one
         self.store.provision(self.kp.public)  # kp is the anchor => may_write returns True

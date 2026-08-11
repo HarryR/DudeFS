@@ -36,16 +36,23 @@ def _sync_only_pump(c: Cluster, now: int, iterations: int = 30) -> int:
     intervene() where the cluster is hung (Coordinator making no progress) and the operator
     uses the anchor key to push a block that sync then propagates."""
     for _ in range(iterations):
-        for node in c.nodes:
-            node.follower.tick(now)
-            # Post the Follower's outbox to the mailbox (same as Node.tick() does after
-            # follower.tick). Follower is otherwise disconnected from the wire.
-            node._flush_follower(now)
-            node.postman.tick(now)
-        # Deliver frames from each node's own listener via the public drain() API.
-        for node in c.nodes:
-            for inbound in c.listeners[node.me.public].drain():
-                node.receive(inbound.frame, now, session=inbound.session)
+        # Quiesce at each instant before advancing time: replies posted mid-handling must be
+        # delivered before a ttl bounded well below DELTA reaps them.
+        for _ in range(len(c.nodes) + 1):
+            delivered = False
+            for node in c.nodes:
+                node.follower.tick(now)
+                # Post the Follower's outbox to the mailbox (same as Node.tick() does after
+                # follower.tick). Follower is otherwise disconnected from the wire.
+                node._flush_follower(now)
+                node.postman.tick(now)
+            # Deliver frames from each node's own listener via the public drain() API.
+            for node in c.nodes:
+                for inbound in c.listeners[node.me.public].drain():
+                    node.receive(inbound.frame, now, session=inbound.session)
+                    delivered = True
+            if not delivered:
+                break
         now += DELTA
     return now
 

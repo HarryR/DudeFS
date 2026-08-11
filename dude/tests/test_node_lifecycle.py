@@ -77,7 +77,7 @@ def _build_cluster(
     for kp in keys:
         store = Store()
         store.provision(mgr.public)
-        bootstrap(store, mgr, genesis, bucket=TUNABLES.mempool.bucket(T0))
+        bootstrap(store, mgr, genesis, bucket=TUNABLES.bucket(T0))
         nodes.append(Node(kp, store, TUNABLES))
 
     return mgr, nodes, listeners
@@ -100,14 +100,14 @@ class TestNodeLifecycle(unittest.TestCase):
         """A 3-node TCP cluster in managed mode -- each `Node.start(listener)` spawns
         its own thread; consensus advances on the real wall clock. Assert:
 
-          * Every node's head advances past 0 within a few `mempool.delta` intervals.
+          * Every node's head advances past 0 within a few `block_time` intervals.
             Proves the tick loop actually ticks AND that frames cross the listener
             thread / node thread boundary through the inbox queue.
           * `Node.stop()` returns within a generous bound on every node. Proves the
             `_stopping` flag actually breaks the loop and `TCPListener.stop()` joins
             its reader thread.
 
-        Real wall clock, so this takes seconds -- one block per `TUNABLES.mempool.delta`. It runs
+        Real wall clock, so this takes seconds -- one block per `TUNABLES.block_time`. It runs
         on the harness's fast profile, not the production block time: at 30 s a block this would
         be a two-minute test."""
         _mgr, nodes, listeners = _build_cluster(3)
@@ -122,7 +122,7 @@ class TestNodeLifecycle(unittest.TestCase):
             # what's there (nothing). With a 3-node roster the Round hits quorum
             # trivially. Give it a few delta intervals to advance.
             target_block = 2
-            budget_sec = (target_block + 2) * (TUNABLES.mempool.delta / 1000)
+            budget_sec = (target_block + 2) * (TUNABLES.block_time / 1000)
             got = _wait_until(
                 lambda: all((n.store.head_block_num() or 0) >= target_block for n in nodes),
                 timeout_sec=budget_sec,

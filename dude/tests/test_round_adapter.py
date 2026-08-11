@@ -17,6 +17,7 @@ from ..net.address import Address, Endpoint, Scheme
 from ..net.envelope import Envelope
 from ..net.link import Peer
 from ..net.postman import Postman
+from ..tunables import DEFAULT
 from .test_round import _applies_all, _stubs
 
 T0 = 1_700_000_000_000
@@ -118,7 +119,7 @@ class TestGossipGoesToTheRosterNotThePeerTable(unittest.TestCase):
         roster = tuple(sorted(k.public for k in keys))
         client = crypto.Keypair.generate()
 
-        postman = Postman(keys[0])
+        postman = Postman(keys[0], DEFAULT)
         for k in keys[1:]:
             postman.add_peer(k.public, (Endpoint(Address(Scheme.INPROC, "peer")),))
         postman.add_peer(client.public, (Endpoint(Address(Scheme.INPROC, "client")),))
@@ -164,11 +165,11 @@ class TestFlushToMailbox(unittest.TestCase):
 
         # Postman + a peer table. We do not need a real Transport here -- `flush` posts to the
         # mailbox and stops there; delivery is another test's concern.
-        self.postman = Postman(self.me)
+        self.postman = Postman(self.me, DEFAULT)
         for k in self.keys[1:]:
             addr = Address(scheme=Scheme.INPROC, value=k.public.hex())
             # Transport factory that never gets called (we do not post beyond the mailbox here).
-            peer = Peer(k.public, lambda _addr: _NoTransport())
+            peer = Peer(k.public, lambda _addr: _NoTransport(), DEFAULT)
             peer.reconfigure((Endpoint(addr),))
             self.postman.peers[k.public] = peer
 
@@ -246,7 +247,7 @@ class TestDeliverToRound(unittest.TestCase):
         env = Envelope(me.public, verb, b"m" * 16, body).sign(peer, T0)
 
         # Adapter needs a Postman to construct, but `deliver` does not use it.
-        adapter = RoundAdapter(me, Postman(me), ttl=10_000)
+        adapter = RoundAdapter(me, Postman(me, DEFAULT), ttl=10_000)
         adapter.deliver(env, r, now=T0)
 
         # Round has stored the peer's holdings.

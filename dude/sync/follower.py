@@ -88,9 +88,9 @@ class Follower:
         for peer, deadline in list(self._poll_at.items()):
             if now >= deadline:
                 self._enqueue(peer, HeightAsk())
-                self._poll_at[peer] = now + self.tunables.sync.poll_interval
+                self._poll_at[peer] = now + self.tunables.poll_interval
         p = self._pulling
-        if p is not None and now - p.sent_at > self.tunables.sync.pull_timeout:
+        if p is not None and now - p.sent_at > self.tunables.pull_timeout:
             self._last_fail_at[p.peer] = now
             self._pulling = None
         if self._pulling is None:
@@ -100,7 +100,7 @@ class Follower:
 
     def _pull_from(self, peer: crypto.PublicKey, now: Millis) -> None:
         frm = (self.store.head_block_num() or 0) + 1
-        count = self.tunables.sync.pull_batch
+        count = self.tunables.pull_batch
         self._enqueue(peer, GetBlocks(frm=frm, count=count))
         self._pulling = PullInFlight(peer, frm, count, now)
 
@@ -134,7 +134,7 @@ class Follower:
         for peer, hr in self._heads.items():
             if peer not in roster:
                 continue
-            if now - hr.at > self.tunables.sync.freshness_window:
+            if now - hr.at > self.tunables.freshness_window:
                 continue
             if hr.block_num > my_num:
                 ahead += 1
@@ -186,9 +186,8 @@ class Follower:
         walked = chain.advance(self._tip(), (sb,), self.mgmt.roster(), self._require_anchor())
         if isinstance(walked, chain.ChainRefusal):
             return False
-        # EQUALITY, not subset. A block names exactly what it applied, so bodies short of the hash
-        # list mean the sender withheld some -- and we would commit a state_root for a set we never
-        # saw. Subset was correct only while a producer could ratify a slice wider than it applied.
+        # Equality: a block names exactly what it applied, so bodies short of the hash list
+        # mean a withholding sender and a state_root we never saw.
         if frozenset(tx.op_hash for tx in offer.bodies) != frozenset(sb.block.hashes):
             return False
         for tx in offer.bodies:

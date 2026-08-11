@@ -19,19 +19,10 @@ class Scheme(Enum):
     TCP = b"tcp"
 
 
-# Dial preference, cheapest first. Sorting by scheme NAME instead would dial TCP before UNIX
-# (b"tcp" < b"unix") -- stable, and wrong.
-_COST = {Scheme.INPROC: 0, Scheme.UNIX: 1, Scheme.TCP: 2}
-
-
 @dataclass(frozen=True, slots=True)
 class Address:
     scheme: Scheme
     value: str
-
-    @property
-    def sort_key(self) -> tuple[int, str]:
-        return (_COST[self.scheme], self.value)
 
     def encode(self) -> bytes:
         return self.scheme.value + b":" + self.value.encode()
@@ -59,7 +50,7 @@ def parse_all(raws: tuple[bytes, ...]) -> tuple[Address, ...]:
             out.append(Address.parse(raw))
         except AddressError:
             continue
-    return tuple(sorted(out, key=lambda a: a.sort_key))
+    return tuple(out)
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,4 +85,4 @@ def endpoints(raws: tuple[bytes, ...]) -> tuple[Endpoint, ...]:
             out.append(Endpoint.parse(raw))
         except (AddressError, codec.CodecError):
             continue
-    return tuple(sorted(out, key=lambda e: e.address.sort_key))
+    return tuple(out)

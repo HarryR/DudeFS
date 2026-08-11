@@ -114,15 +114,11 @@ class Node:
     _listeners: tuple[Listener, ...] = field(default=(), init=False)
 
     def __post_init__(self) -> None:
-        self.postman = Postman(
-            self.me,
-            window=self.tunables.net.window,
-            link_tunables=self.tunables.link,
-        )
-        self.adapter = RoundAdapter(self.me, self.postman, self.tunables.net.ttl)
-        self.settle_adapter = SettleAdapter(self.me, self.postman, self.tunables.net.ttl)
-        self.sync_adapter = SyncAdapter(self.me, self.postman, self.tunables.net.ttl)
-        self.lite_adapter = LiteAdapter(self.me, self.postman, self.tunables.net.ttl)
+        self.postman = Postman(self.me, self.tunables)
+        self.adapter = RoundAdapter(self.me, self.postman, self.tunables.ttl_round)
+        self.settle_adapter = SettleAdapter(self.me, self.postman, self.tunables.ttl_round)
+        self.sync_adapter = SyncAdapter(self.me, self.postman, self.tunables.ttl_exchange)
+        self.lite_adapter = LiteAdapter(self.me, self.postman, self.tunables.ttl_lite)
         # Follower first: the Coordinator asks it whether we are too far behind to lead.
         self.follower = Follower(
             me=self.me,
@@ -279,7 +275,7 @@ class Node:
         if not isinstance(req, GetBlocks):
             return
         self.sync_adapter.reply(
-            env, serve_getblocks(self.store, req, self.tunables.sync.pull_batch), now
+            env, serve_getblocks(self.store, req, self.tunables.pull_batch), now
         )
 
     def _on_sync_refused(self, env: SignedEnvelope, now: Millis) -> None:
@@ -325,7 +321,7 @@ class Node:
             return
         if not isinstance(req, GetAnchors):
             return
-        reply = serve_get_anchors(self.store, req, self.tunables.light_client.liveness_window)
+        reply = serve_get_anchors(self.store, req, self.tunables.liveness_window)
         self.lite_adapter.reply(env, reply, now)
 
     def _on_get_proof(self, env: SignedEnvelope, now: Millis) -> None:
@@ -344,7 +340,7 @@ class Node:
             # store 0 included -- grants, roster rows, possession proofs, wrapped keys.
             self.lite_adapter.reply(env, LiteRefused(SyncRefusal.UNAUTHORISED), now)
             return
-        reply = serve_get_proof(self.store, req, self.tunables.light_client.liveness_window)
+        reply = serve_get_proof(self.store, req, self.tunables.liveness_window)
         self.lite_adapter.reply(env, reply, now)
 
     def tick(self, now: Millis) -> None:
@@ -417,7 +413,10 @@ class Node:
         if not self.postman.can_reply(to.frm):
             return
         self.postman.mailbox.post(
-            to.answer(verb, body).sign(self.me, now), now, self.tunables.net.ttl, await_reply=False
+            to.answer(verb, body).sign(self.me, now),
+            now,
+            self.tunables.ttl_exchange,
+            await_reply=False,
         )
 
 

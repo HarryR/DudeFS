@@ -5,37 +5,10 @@ from enum import Enum
 from typing import Protocol
 
 from ..core import crypto
-from ..core.units import Millis
+from ..core.units import Bucket, Millis
 from ..store import ops, settle
 from ..store.layer import Reader
-
-type Bucket = int
-
-
-@dataclass(frozen=True, slots=True)
-class Tunables:
-    delta: Millis = 30_000
-    """THE BLOCK TIME: how long a client waits before it can prove its write is final. The only
-    operating dial in the timing surface -- everything else derives from it and the measurements.
-    It is not a floor to be parked on; the floors are what `Tunables.__post_init__` checks."""
-
-    w_admit: Millis = 30_000
-
-    w_valid_margin: Millis = 60_250
-
-    @property
-    def w_valid(self) -> Millis:
-        return self.w_admit + self.w_valid_margin
-
-    @property
-    def evict_after(self) -> Millis:
-        return self.w_valid
-
-    def bucket(self, ts: Millis) -> Bucket:
-        return ts // self.delta
-
-    def bucket_start(self, b: Bucket) -> Millis:
-        return b * self.delta
+from ..tunables import Tunables
 
 
 class Refusal(Enum):

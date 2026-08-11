@@ -153,12 +153,8 @@ class SettledBlock:
             outer = codec.as_seq(codec.decode(raw), 3)
             identity = codec.as_seq(codec.decode(codec.as_bytes(outer[0])), 8)
             bucket = codec.as_int(identity[0])
-            # Canonicalise on the way in. `_identity_bytes` canonicalises on the way out, so a
-            # decoded block whose `.hashes` disagreed with its encoded form (the wire order was
-            # not canonical) failed safe -- re-encoding produced a different `block_hash` and it
-            # would not chain -- but the asymmetry left a `Block` instance in memory whose field
-            # disagreed with what any consumer that ran `hashes_canonical` on it would see. Close
-            # the loop here so the field is canonical by construction, not by convention.
+            # Canonicalise on the way in too, so `.hashes` on a decoded Block always equals
+            # `hashes_canonical(.hashes)`. `_identity_bytes` canonicalises on the way out.
             hashes = hashes_canonical(
                 crypto.Digest(codec.as_bytes(h)) for h in codec.as_seq(identity[1])
             )

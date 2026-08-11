@@ -14,7 +14,6 @@ property from #height-poll-is-the-trigger.
 from __future__ import annotations
 
 import unittest
-from dataclasses import replace
 
 from dude.consensus.round import Block
 from dude.consensus.settle_round import (
@@ -36,12 +35,12 @@ from dude.sync.adapter import (
     SyncRefusal,
 )
 from dude.sync.follower import Follower, HeightReport, serve_getblocks, serve_height
-from dude.tunables import DEFAULT, SyncTunables, Tunables
+from dude.tunables import DEFAULT, Tunables
 
 from .cluster import DELTA, T0, TUNABLES, Cluster
 
-POLL = DEFAULT.sync.poll_interval
-PULL_TIMEOUT = DEFAULT.sync.pull_timeout
+POLL = DEFAULT.poll_interval
+PULL_TIMEOUT = DEFAULT.pull_timeout
 
 
 # --------------------------------------------------------------------------------------------- #
@@ -77,9 +76,7 @@ def _pump(
         if isinstance(msg, HeightAsk):
             follower.receive(serve_height(producer), producer_key, now)
         elif isinstance(msg, GetBlocks):
-            follower.receive(
-                serve_getblocks(producer, msg, DEFAULT.sync.pull_batch), producer_key, now
-            )
+            follower.receive(serve_getblocks(producer, msg, DEFAULT.pull_batch), producer_key, now)
 
 
 def _catch_up(
@@ -569,12 +566,11 @@ class TestBehindRequiresFreshWitnessesAboveUs(unittest.TestCase):
     def test_reports_age_against_the_clock_not_against_each_other(self):
         """Freshness was measured against the newest report held, so the window was satisfied by
         the reports themselves and a peer that fell silent vouched for its last word forever."""
-        tight = replace(TUNABLES, sync=SyncTunables(freshness_window=2 * DELTA))
-        c, follower = self._joiner(tight)
+        c, follower = self._joiner(TUNABLES)
         mine = follower.store.head_block_num() or 0
         self._report(c, follower, T0, at=mine + 5)
         self.assertTrue(follower.behind(T0))
-        self.assertFalse(follower.behind(T0 + 2 * DELTA + 1))
+        self.assertFalse(follower.behind(T0 + TUNABLES.freshness_window + 1))
 
 
 class TestABehindNodeDoesNotLeadABucket(unittest.TestCase):
@@ -591,9 +587,12 @@ class TestABehindNodeDoesNotLeadABucket(unittest.TestCase):
 
     def _tick_into_a_leadable_window(self, node: Node) -> int:
         """The first tick only adopts the current bucket; a Round can open once a whole bucket
-        has closed under us."""
+        has closed under us AND we are still inside the next bucket's leadable window (before
+        `cut_reserve` fires). Computed rather than assumed to be `T0 + 2*DELTA`: T0's offset
+        into its bucket depends on block_time, which is now derived and may not align."""
         node.tick(T0)
-        return T0 + 2 * DELTA
+        next_start = TUNABLES.bucket_start(TUNABLES.bucket(T0) + 1)
+        return next_start + 1  # 1 ms into the next bucket -- always inside its leadable window
 
     def test_a_node_nobody_reports_above_opens_its_round(self):
         """The control. Without it, the test below passes for any reason at all."""
@@ -830,14 +829,8 @@ class TestPickPullSourcePriority(unittest.TestCase):
 
 
 class TestABlockMustDeliverEverythingItNames(unittest.TestCase):
-    """A block names exactly what it applied, so a sender that serves fewer bodies than the block
-    names is withholding -- and adopting it would commit a state_root for a set we never saw.
-
-    The check used to be `issubset`, which was right only while a producer could ratify a slice
-    wider than it applied: `bodies_of_block` returns the APPLIED range, so honest bodies were a
-    proper subset of the hash list whenever anything was screened out after ratification. With
-    the screen ahead of the signature the two sets are the same set, and subset is a tolerance
-    for exactly the shape an attacker wants."""
+    """A block names exactly what it applied. A sender serving fewer bodies than the block names
+    is withholding, and adopting it would commit a state_root for a set the receiver never saw."""
 
     def test_a_signed_block_naming_a_tx_it_does_not_deliver_is_refused(self):
         c = Cluster()

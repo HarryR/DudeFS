@@ -23,28 +23,17 @@ from ..net.transports.inproc import _reset_for_tests
 from ..node import Node
 from ..store import Store, management, ops
 from ..store.management import Cert, MgmtWriter, Role
-from ..tunables import MempoolTunables, TimingTunables, Tunables
+from ..tunables import Tunables
 
 D = ops.STORE_DATA
 M = ops.STORE_MANAGEMENT
 T0 = 1_700_000_000_000
 
-_TIMING = TimingTunables(rtt_max=30, clock_skew=25)
-_BLOCK_TIME = 500
+TUNABLES = Tunables(rtt_max=30, clock_skew=25, held_convergence_max=2)
+"""A fast deployment. Everything else derives from these three exactly as in production."""
 
-TUNABLES = Tunables(
-    timing=_TIMING,
-    mempool=MempoolTunables(
-        delta=_BLOCK_TIME,
-        w_valid_margin=_TIMING.endorse_margin(_BLOCK_TIME),
-    ),
-)
-"""A fast deployment, not the production one: at a 30 s block time a pump step exceeds `net.ttl`
-and every message expires before it is sent. Declares only what production declares -- two
-measurements and the block time -- so `w_valid_margin` derives here as it does there."""
-
-DELTA = TUNABLES.mempool.delta
-CUT_RESERVE = TUNABLES.timing.cut_reserve
+DELTA = TUNABLES.block_time
+CUT_RESERVE = TUNABLES.cut_reserve
 
 
 class Cluster:
@@ -82,7 +71,7 @@ class Cluster:
             store.provision(self.mgr.public)
             # Manager signs block 1 containing the roster grants (bootstrap runs once per node
             # at init; every node produces byte-equal block 1 because the inputs are identical).
-            bootstrap(store, self.mgr, genesis, bucket=TUNABLES.mempool.bucket(T0))
+            bootstrap(store, self.mgr, genesis, bucket=TUNABLES.bucket(T0))
             node = Node(kp, store, TUNABLES)
             # Listener registers this identity in the module-scope InProc registry so other
             # nodes' dialers can find us.
@@ -152,7 +141,7 @@ class Cluster:
         that check not existing."""
         s = Store()
         s.provision(self.mgr.public)
-        bootstrap(s, self.mgr, self._genesis_bodies, bucket=TUNABLES.mempool.bucket(T0))
+        bootstrap(s, self.mgr, self._genesis_bodies, bucket=TUNABLES.bucket(T0))
         return s
 
     @property

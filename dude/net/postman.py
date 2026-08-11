@@ -10,6 +10,7 @@ from typing import NamedTuple
 from ..core import crypto
 from ..core.errors import DudeError
 from ..core.units import Millis
+from ..tunables import Tunables
 from . import transports
 from .address import Endpoint, Scheme
 from .envelope import EnvelopeError, Frame, SignedEnvelope
@@ -17,7 +18,6 @@ from .link import (
     CircuitBreaker,
     Estimator,
     LinkError,
-    LinkTunables,
     Listener,
     Peer,
     SessionLink,
@@ -60,22 +60,23 @@ class Received(NamedTuple):
 @dataclass(slots=True)
 class Postman:
     me: crypto.Keypair
+    tunables: Tunables
+
     mailbox: Mailbox = field(default_factory=Mailbox)
     peers: dict[crypto.PublicKey, Peer] = field(default_factory=dict)
-    window: Millis = 5_000
-
-    link_tunables: LinkTunables = field(default_factory=LinkTunables)
-
-    plan: Plan = field(default_factory=Plan)
+    plan: Plan = field(init=False)
 
     _transports_by_scheme: dict[Scheme, Transport] = field(default_factory=dict, init=False)
 
     _inbox: queue.SimpleQueue[Inbound] | None = field(default=None, init=False)
 
+    def __post_init__(self) -> None:
+        self.plan = Plan(self.tunables)
+
     def add_peer(self, pubkey: crypto.PublicKey, endpoints: tuple[Endpoint, ...]) -> None:
         peer = self.peers.get(pubkey)
         if peer is None:
-            peer = Peer(pubkey, self._dial, self.link_tunables)
+            peer = Peer(pubkey, self._dial, self.tunables)
             self.peers[pubkey] = peer
         peer.reconfigure(endpoints)
 
@@ -89,17 +90,18 @@ class Postman:
             raise PostmanError("register_session called before session.bind()")
         peer = self.peers.get(session.identity)
         if peer is None:
-            peer = Peer(session.identity, _no_dial, self.link_tunables)
+            peer = Peer(session.identity, _no_dial, self.tunables)
             self.peers[session.identity] = peer
         for existing in peer.sessions:
             if existing.session is session:
                 return
+        link_t = self.tunables.link_tunables
         link = SessionLink(
             address=session.address,
             session=session,
             policies=(
-                Estimator(self.link_tunables),
-                CircuitBreaker(self.link_tunables),
+                Estimator(link_t),
+                CircuitBreaker(link_t),
                 peer.budget,
             ),
         )
@@ -200,7 +202,7 @@ class Postman:
         if not frame.addressed_to(self.me.public):
             raise EnvelopeError("frame is not addressed to us (screen tag does not match)")
         env = frame.unseal(self.me)
-        env.accept(self.me.public, now, self.window)
+        env.accept(self.me.public, now, self.tunables.window)
         reply = self.mailbox.arrived(env, now)
         if reply is not None:
             self._credit(env.frm, reply, now)

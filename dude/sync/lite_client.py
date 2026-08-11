@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import queue
 import threading
+from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from enum import Enum, auto
 
@@ -25,7 +26,7 @@ from ..store.management import (
     Role,
     RosterCommitment,
 )
-from ..tunables import DEFAULT, Tunables
+from ..tunables import Tunables
 from . import chain
 from .lite_adapter import (
     AnchorsReply,
@@ -113,8 +114,12 @@ class LightClient:
     me: crypto.Keypair
     anchor: crypto.PublicKey
     postman: Postman
-    tunables: Tunables = DEFAULT
     adapter: LiteAdapter = field(init=False)
+
+    @property
+    def tunables(self) -> Tunables:
+        """One source of truth: the Postman's. A second copy could disagree silently."""
+        return self.postman.tunables
 
     state: State = State.UNBOOTSTRAPPED
     trusted_state: TrustedState | None = None
@@ -122,6 +127,7 @@ class LightClient:
     _bootstrap_peers: dict[crypto.PublicKey, _BootstrapReply] = field(default_factory=dict)
     _pending_reads: dict[bytes, _PendingRead] = field(default_factory=dict)
     _pending_bootstrap_mids: dict[bytes, crypto.PublicKey] = field(default_factory=dict)
+    _bootstrap_retry_at: Millis = 0
 
     _inbox: queue.SimpleQueue[Inbound] = field(default_factory=queue.SimpleQueue, init=False)
 
@@ -130,7 +136,7 @@ class LightClient:
     _listeners: tuple[Listener, ...] = field(default=(), init=False)
 
     def __post_init__(self) -> None:
-        self.adapter = LiteAdapter(self.me, self.postman, self.tunables.net.ttl)
+        self.adapter = LiteAdapter(self.me, self.postman, self.tunables.ttl_lite)
 
     def add_bootstrap_peer(self, peer: crypto.PublicKey, endpoints: tuple[Endpoint, ...]) -> None:
         self.postman.add_peer(peer, endpoints)
@@ -142,10 +148,29 @@ class LightClient:
         if not self._bootstrap_peers:
             raise LightClientError("no bootstrap peers registered")
         self.state = State.BOOTSTRAPPING
+        self._bootstrap_retry_at = now + self.tunables.poll_interval
+        self._ask_for_anchors(self._bootstrap_peers, now)
+
+    def _ask_for_anchors(self, peers: Iterable[crypto.PublicKey], now: Millis) -> None:
         req = GetAnchors(known_roster_fingerprint=None, known_trusted_block=None)
-        for peer in self._bootstrap_peers:
+        for peer in peers:
             mid = self.adapter.send(peer, req, now)
             self._pending_bootstrap_mids[mid] = peer
+
+    def _retry_bootstrap(self, now: Millis) -> None:
+        """A stale bootstrap reply cannot age INTO fresh -- ask a NEW question next poll rather
+        than wait longer for the same one. Re-asks only peers whose reply is missing or stale,
+        so a corroborating reply is never churned."""
+        if now < self._bootstrap_retry_at:
+            return
+        self._bootstrap_retry_at = now + self.tunables.poll_interval
+        stale = [
+            peer
+            for peer, entry in self._bootstrap_peers.items()
+            if entry.anchors_reply is None
+            or chain.is_stale(entry.anchors_reply.head.block.bucket, now, self.tunables)
+        ]
+        self._ask_for_anchors(stale, now)
 
     def bootstrapped(self) -> bool:
         return self.state is State.READY
@@ -215,6 +240,8 @@ class LightClient:
 
     def tick(self, now: Millis) -> None:
         self.postman.tick(now)
+        if self.state is State.BOOTSTRAPPING:
+            self._retry_bootstrap(now)
 
     def start(self, *listeners: Listener) -> None:
         if self._thread is not None:

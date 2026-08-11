@@ -10,12 +10,11 @@ from typing import ClassVar
 from .. import quorum
 from ..core import codec, crypto
 from ..core.errors import DudeError
-from ..core.units import Millis
+from ..core.units import Bucket, Millis
 from ..net.envelope import Verb
 from ..net.postman import Recipient, Target
 from ..store.ops import SignedTransaction
 from .canonical import CanonicalBatch, bodies_canonical, hashes_canonical
-from .mempool import Bucket
 
 _SLICE_DOMAIN = b"dude.round.slice"
 

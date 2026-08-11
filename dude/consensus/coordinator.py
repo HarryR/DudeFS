@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 
 from ..core import crypto
 from ..core.errors import DudeError, InvariantError
-from ..core.units import Millis
+from ..core.units import Bucket, Millis
 from ..net.envelope import SignedEnvelope, Verb
 from ..store import Layer, Store, settle
 from ..store.layer import Index
@@ -15,7 +15,7 @@ from ..store.ops import SignedTransaction
 from ..store.store import log_element
 from ..tunables import Tunables
 from .canonical import CanonicalBatch
-from .mempool import Bucket, Mempool, Refusal
+from .mempool import Mempool, Refusal
 from .round import Block, Bodies, Round, RoundAdapterError, RoundMsg
 from .round_adapter import RoundAdapter
 from .settle_adapter import SettleAdapter
@@ -58,14 +58,14 @@ class Coordinator:
     _settle_stalls: int = field(init=False, default=0)
 
     def __post_init__(self) -> None:
-        self.mempool = Mempool(self.tunables.mempool)
+        self.mempool = Mempool(self.tunables)
 
     @property
     def mgmt(self) -> MgmtReader:
         return MgmtReader(self.store)
 
     def _bucket_of(self, now: Millis) -> Bucket:
-        return self.tunables.mempool.bucket(now)
+        return self.tunables.bucket(now)
 
     def _prev_block(self) -> crypto.Digest:
         """The Round is keyed on this and the anchors carry it; they MUST be the same value, or
@@ -88,10 +88,10 @@ class Coordinator:
     # share a bucket again.
 
     def _close_by(self, bucket: Bucket) -> Millis:
-        return self._abandon_by(bucket) - self.tunables.timing.cut_reserve
+        return self._abandon_by(bucket) - self.tunables.cut_reserve
 
     def _abandon_by(self, bucket: Bucket) -> Millis:
-        return self.tunables.mempool.bucket_start(bucket + 2)
+        return self.tunables.bucket_start(bucket + 2)
 
     @property
     def in_roster(self) -> bool:
@@ -207,7 +207,7 @@ class Coordinator:
             self.current_bucket = closed + 1
             return
         frozen = self.mempool
-        self.mempool = Mempool(self.tunables.mempool)
+        self.mempool = Mempool(self.tunables)
         self._open_round(closed, frozen, now)
         self.current_bucket = closed + 1
 
@@ -297,15 +297,9 @@ class Coordinator:
         layer = Layer(self.store)
         screened = settle.apply_to(layer, slice_txs, self.mgmt)
         if screened.rejects:
-            # The slice was screened against this same base before it was signed, so a reject here
-            # means THIS NODE's two screens disagreed -- non-determinism in the evaluator, local
-            # to us. The other ratifiers ran their own cut screens against the same base, agreed
-            # on the same `slice_hash`, and their promotes will agree with those cuts too: they
-            # settle without us, and we adopt their block through the Follower. Voiding
-            # self-heals; crashing didn't -- it would take an honest node down for its own local
-            # anomaly while the cluster progresses without noticing. Log so an operator learns
-            # to go look at WHY the evaluator disagreed with itself; the chain does not need to
-            # wait on that answer.
+            # LOCAL non-determinism: the same screen ran at the cut against the same base and
+            # agreed. Other ratifiers settle without us; we adopt via the Follower. Crashing
+            # would take an honest node down for its own anomaly.
             _log.error(
                 "promote screen disagreed with cut screen at bucket %d: %r",
                 bucket,
@@ -393,18 +387,12 @@ class Coordinator:
         self.settling = None
 
         if not divergences:
-            # Nobody disagreed -- the quorum just was not there in time. Absence is a liveness
-            # matter and heals on its own; nothing to log and no counter to advance.
+            # Absence heals on its own: no log, no counter.
             self._settle_stalls = 0
             return
         self._settle_stalls += 1
-        # Peers signed different anchors for the slice we all ratified. A lone divergent node
-        # heals itself: the others settle without it and it adopts their block through the
-        # Follower. Reaching here with divergences means the disagreement is spread wide enough
-        # that NOTHING can settle -- someone has to look at the log line and decide what to roll
-        # back. Do NOT raise: `divergences()` used to be silent, but overreacting the other way and
-        # crashing on peer disagreement would take honest nodes down for a peer's byzantine or
-        # skewed state, and restarting resets the counter without fixing anything.
+        # Divergence needs an operator, not a crash: crashing takes an honest node down for a
+        # peer's state, and restart resets the counter without fixing anything.
         _log.warning(
             "settlement abandoned with divergent anchors at bucket %d (%d consecutive): %s",
             s.bucket,

@@ -34,7 +34,7 @@ from dude.tunables import DEFAULT
 D = ops.STORE_DATA
 M = ops.STORE_MANAGEMENT
 T0 = 1_700_000_000_000
-DELTA = DEFAULT.mempool.delta
+DELTA = DEFAULT.block_time
 
 
 def _build_cluster(
@@ -85,7 +85,7 @@ def _build_cluster(
     for kp in keys:
         store = Store()
         store.provision(mgr.public)
-        bootstrap(store, mgr, genesis, bucket=DEFAULT.mempool.bucket(T0))
+        bootstrap(store, mgr, genesis, bucket=DEFAULT.bucket(T0))
         nodes.append(Node(kp, store))
 
     # One tick to trigger reconciliation (each node dials every other roster member).

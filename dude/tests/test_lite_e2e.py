@@ -60,7 +60,7 @@ def _provision_client(c: Cluster, kp: crypto.Keypair) -> None:
         + mgmt.admit_reader(kp.public, ops.STORE_DATA, wraps, blinding)
     ).sign(c.mgr, T0)
     for node in c.nodes:
-        intervene(node.store, c.mgr, bodies=(grant_tx,), bucket=TUNABLES.mempool.bucket(c.clock))
+        intervene(node.store, c.mgr, bodies=(grant_tx,), bucket=TUNABLES.bucket(c.clock))
 
 
 class TestServeGetAnchors(unittest.TestCase):

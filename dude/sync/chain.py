@@ -76,9 +76,9 @@ def advance(
 
 
 def buckets_behind(head_bucket: int, now: Millis, t: Tunables) -> int:
-    """Zero when the head is the block for the bucket that just closed, which is as fresh as a
-    head gets."""
-    return t.mempool.bucket(now) - 1 - head_bucket
+    """Zero when the head is the newest block that COULD have settled by now. Counted from
+    `now - windows_to_settle`, since the pipeline commits W-2 during W."""
+    return t.bucket(now) - t.windows_to_settle - head_bucket
 
 
 def is_stale(head_bucket: int, now: Millis, t: Tunables) -> bool:
@@ -86,4 +86,4 @@ def is_stale(head_bucket: int, now: Millis, t: Tunables) -> bool:
     signatures, chain link and quorum proof all pass -- so the clock is the only thing that
     separates current from merely valid. `bucket` sits inside the block identity and inside the
     settle signature, so it is quorum-attested; the only local input is NTP."""
-    return buckets_behind(head_bucket, now, t) > t.timing.skew_buckets(t.mempool.delta)
+    return buckets_behind(head_bucket, now, t) > t.skew_buckets()

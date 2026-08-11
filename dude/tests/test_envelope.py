@@ -11,6 +11,7 @@ from ..core import codec, crypto
 from ..net import Envelope, EnvelopeError, Frame, SignedEnvelope, Verb, request
 from ..net.postman import Postman
 from ..store import ops
+from ..tunables import DEFAULT
 
 T0 = 1_700_000_000_000
 WINDOW = 5_000
@@ -256,7 +257,7 @@ class TestSealing(unittest.TestCase):
         openable = Frame(crypto.screen_tag(self.eve.public, self.frame.sealed), self.frame.sealed)
         self.assertEqual(openable.unseal(self.b), self.env, "the box really is ours")
 
-        post = Postman(self.b)
+        post = Postman(self.b, DEFAULT)
         with self.assertRaises(EnvelopeError) as cm:
             post.deliver(openable, T0)
         self.assertIn("not addressed to us", str(cm.exception))

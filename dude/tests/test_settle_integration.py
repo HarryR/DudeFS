@@ -110,11 +110,9 @@ def _hashes_by_block(store) -> dict[int, frozenset[crypto.Digest]]:
 
 
 class TestABlockNamesOnlyWhatItApplied(unittest.TestCase):
-    """A block's hash list is quorum-signed (through `slice_hash`, inside the settle payload), so
-    what it names is what a client can prove. Screened AFTER ratification, it named transactions
-    that never touched state: they got no log entry, so `has_settled` stayed false, so they were
-    re-admitted and could settle in a later block -- the same op_hash legitimately in two blocks,
-    and membership proving nothing."""
+    """A block's hash list is quorum-signed via `slice_hash`, so membership must equal
+    application -- otherwise the same op_hash can appear in two blocks and inclusion proves
+    nothing to a client."""
 
     def setUp(self):
         self.c = Cluster()
@@ -161,18 +159,9 @@ class TestABlockNamesOnlyWhatItApplied(unittest.TestCase):
 
 
 class TestDivergentSettlementIsLoggedNotFatal(unittest.TestCase):
-    """Safety was never the problem: a peer signing different anchors has its signature dropped at
-    the equality check and never enters the bitmap, and a light client re-verifies the payload
-    itself. A LONE divergent node also heals -- the others reach quorum without it and it adopts
-    their block through the Follower.
-
-    What used to be silent is the case where no camp reaches quorum: every node abandons,
-    re-admits, and tries again forever. `SettleRound.divergences()` computed exactly the evidence
-    that would name who disagreed and about what, and had no production consumer -- no log, no
-    counter. Overreacting the other way and CRASHING on divergence would take honest nodes down
-    for a peer's byzantine or skewed state, and restarting resets nothing that needs resetting.
-    So: log it, name who disagreed and what they signed, and let an operator decide what to roll
-    back. Absence -- no quorum, no disagreement -- is silent because it heals on its own."""
+    """Divergence: name who disagreed and what they signed, let an operator decide what to roll
+    back. Crashing takes honest nodes down for a peer's state. Absence (no quorum, no disagreement)
+    stays silent -- it heals on its own."""
 
     def _stall(self, c: Cluster, bucket: int, now: int, *, diverge: bool) -> None:
         """One abandoned settlement on node 0, with or without a peer disagreeing about the
@@ -223,9 +212,7 @@ class TestDivergentSettlementIsLoggedNotFatal(unittest.TestCase):
         self.assertIn(str(100), line, f"the log did not name the bucket: {line!r}")
 
     def test_absence_of_quorum_is_silent(self):
-        """A quorum that simply was not there in time is a liveness matter and heals on its own.
-        Logging it would drown the operator in noise every partition, so `_on_settle_abandoned`
-        skips the log line when there are no divergences to report."""
+        """No divergence means no log line -- ordinary partitions must not become noise."""
         c = Cluster()
         with self.assertNoLogs("dude.consensus.coordinator", level="WARNING"):
             self._stall(c, bucket=200, now=T0, diverge=False)

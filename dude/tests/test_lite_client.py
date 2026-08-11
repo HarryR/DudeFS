@@ -33,8 +33,8 @@ def _build_light_client(c: Cluster, kp: crypto.Keypair) -> tuple[LightClient, In
     deployment's to know), let Postman build its own send-side carrier, register bootstrap
     peers. Returns both so the test pump can drain the listener via `.drain()`."""
     listener = InProcListener(name_of(kp.public))
-    postman = Postman(kp)
-    client = LightClient(me=kp, anchor=c.mgr.public, postman=postman, tunables=TUNABLES)
+    postman = Postman(kp, TUNABLES)
+    client = LightClient(me=kp, anchor=c.mgr.public, postman=postman)
     for node in c.nodes:
         client.add_bootstrap_peer(node.me.public, (Endpoint(address_of(node.me.public)),))
     return client, listener
@@ -47,7 +47,7 @@ def _one_bucket_after_head(c: Cluster) -> int:
     raw = c.nodes[0].store.settled_at(head_num)
     assert raw is not None
     head_bucket = SettledBlock.decode(raw).block.bucket
-    return TUNABLES.mempool.bucket_start(head_bucket + 1)
+    return TUNABLES.bucket_start(head_bucket + 1)
 
 
 def _provision_client(c: Cluster, kp: crypto.Keypair) -> None:
@@ -71,7 +71,7 @@ def _provision_client(c: Cluster, kp: crypto.Keypair) -> None:
         + mgmt.admit_reader(kp.public, ops.STORE_DATA, wraps, blinding)
     ).sign(c.mgr, T0)
     for node in c.nodes:
-        intervene(node.store, c.mgr, bodies=(grant_tx,), bucket=TUNABLES.mempool.bucket(c.clock))
+        intervene(node.store, c.mgr, bodies=(grant_tx,), bucket=TUNABLES.bucket(c.clock))
 
 
 def _mutate_frame_to_client(  # noqa: PLR0913, PLR0917 -- a byzantine-responder harness needs both identities, the verb it targets, the swap, and the clock; bundling any of them hides what the attack changes
@@ -371,7 +371,7 @@ class TestLightClientRead(unittest.TestCase):
         assert client.trusted_state is not None
         started_at = client.trusted_state.head.block_num
         head_num = c.nodes[0].store.head_block_num() or 0
-        self.assertGreater(head_num - started_at, TUNABLES.light_client.liveness_window)
+        self.assertGreater(head_num - started_at, TUNABLES.liveness_window)
 
         heads = [started_at]
         result = None
@@ -394,7 +394,7 @@ class TestLightClientRead(unittest.TestCase):
                 "behind the responder; retry",
                 f"heads={heads} server={c.nodes[0].store.head_block_num()} "
                 f"head_bucket={client.trusted_state.head.bucket} "
-                f"now_bucket={TUNABLES.mempool.bucket(now)}",
+                f"now_bucket={TUNABLES.bucket(now)}",
             )
             self.assertIs(client.state, State.READY, "a lagging client must not lose its roster")
 
@@ -446,7 +446,7 @@ class TestRevokedManagerCannotForgeARoster(unittest.TestCase):
             grant = mgmt.authorise(
                 warm.public, Role.MANAGER, pop=warm.prove_possession(), cert=warm_cert
             )
-            at = TUNABLES.mempool.bucket(c.clock)
+            at = TUNABLES.bucket(c.clock)
             intervene(node.store, c.mgr, bodies=(grant.sign(c.mgr, T0),), bucket=at)
             revoke = mgmt.revoke(warm.public, reissue_signer=c.mgr)
             intervene(node.store, c.mgr, bodies=(revoke.sign(c.mgr, T0),), bucket=at + 1)
@@ -573,7 +573,7 @@ class TestAByzantineResponderCannotKillTheClient(unittest.TestCase):
         assert client.trusted_state is not None
         gap = (c.nodes[0].store.head_block_num() or 0) - client.trusted_state.head.block_num
         self.assertTrue(
-            0 < gap <= TUNABLES.light_client.liveness_window,
+            0 < gap <= TUNABLES.liveness_window,
             f"gap is {gap}: at 0 the head is not walked, past the cap it is not offered",
         )
 

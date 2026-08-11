@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import unittest
+from dataclasses import replace
 
 from ..core import crypto
 from ..net import (
@@ -25,8 +26,9 @@ from ..net import (
     request,
 )
 from ..net.address import Endpoint
-from ..net.link import LinkError, LinkTunables, Peer
-from ..net.plan import GiveUp, Plan, PlanTunables, Send, Wait, decorrelated
+from ..net.link import LinkError, Peer
+from ..net.plan import GiveUp, Plan, Send, Wait, decorrelated
+from ..tunables import DEFAULT
 
 T0 = 1_700_000_000_000
 TTL = 10_000
@@ -57,13 +59,6 @@ class TestAddress(unittest.TestCase):
         got = parse_all((A1.encode(), b"smoke:signals", A2.encode()))
         self.assertEqual(set(got), {A1, A2})
 
-    def test_dial_order_is_cheapest_first_and_stable(self):
-        """Stable across implementations (Go randomises map iteration) AND meaningful: a peer
-        reachable both in-process and over TCP must not be dialled over TCP. Sorting by scheme name
-        would have been stable and wrong, since b"tcp" sorts before b"unix"."""
-        self.assertEqual(parse_all((A2.encode(), A1.encode(), A3.encode())), (A3, A1, A2))
-        self.assertEqual([a.scheme for a in (A3, A1, A2)], [Scheme.INPROC, Scheme.UNIX, Scheme.TCP])
-
 
 class Dead:
     """Always refuses, so a link failure is a value rather than an environment to arrange."""
@@ -84,7 +79,7 @@ def peer_with(*addresses, transports=None, t=None):
     p = Peer(
         crypto.Keypair.generate().public,
         lambda e: tr.get(e.address, Live()),
-        t or LinkTunables(),
+        t or DEFAULT,
     )
     p.reconfigure(tuple(Endpoint(a) for a in addresses))
     return p
@@ -96,18 +91,23 @@ class TestSelection(unittest.TestCase):
 
     def test_usable_is_ordered_and_excludes_refusing_links(self):
         """A refusing link is dropped, not attempted and failed — what the breaker is for."""
-        t = LinkTunables(breaker_threshold=1)
+        t = replace(DEFAULT, breaker_threshold=1)
         peer = peer_with(A1, A2, A3, t=t)
         self.assertEqual(len(peer.usable(0)), 3)
         peer.links[A1].expired(0)  # one failure at threshold 1 opens it
         self.assertNotIn(A1, [ln.address for ln in peer.usable(0)])
         self.assertTrue(peer.deliverable(0))
 
-    def test_measurement_overrides_the_cost_prior(self):
-        """Unmeasured links start in cost order; a measured RTO beats it as soon as one exists."""
-        peer = peer_with(A1, A2)
-        self.assertEqual([ln.address for ln in peer.usable(0)], [A1, A2])  # unix before tcp
-        peer.links[A2].reply(0, 5)  # tcp turns out to be fast
+    def test_measurement_moves_a_link_in_the_sort(self):
+        """Every unmeasured link starts at the same prior (`expected_rtt`, one deployment-wide
+        number). A real measurement replaces the prior for that link, and its position in
+        `usable` moves accordingly -- the ONE thing we ask of the RTO sort. What order the
+        unmeasured links happen to be in is not asserted, and must not be: the per-transport
+        table that used to promise "unix before tcp" answered a question nobody was asking."""
+        t = replace(DEFAULT, rtt_max=100)  # small prior so a slow sample clearly moves the sort
+        peer = peer_with(A1, A2, t=t)
+        self.assertEqual({ln.address for ln in peer.usable(0)}, {A1, A2})
+        peer.links[A1].reply(0, 400)  # A1 measured well above the 100 ms prior -> A2 wins
         self.assertEqual(next(ln.address for ln in peer.usable(0)), A2)
 
     def test_no_paths_at_all_is_not_deliverable(self):
@@ -120,7 +120,7 @@ class TestPlan(unittest.TestCase):
     """Policy, pure: no mailbox, no clock, no sockets. A retry change touches this file only."""
 
     def test_gives_up_on_the_deadline_and_on_attempts(self):
-        plan = Plan(PlanTunables(max_attempts=3))
+        plan = Plan(replace(DEFAULT, max_attempts=3))
         peer = peer_with(A1)
         self.assertIsInstance(plan.next(peer, 0, T0, T0), GiveUp)  # now == deadline
         self.assertIsInstance(plan.next(peer, 3, T0, T0 + 1000), GiveUp)
@@ -128,7 +128,7 @@ class TestPlan(unittest.TestCase):
     def test_no_usable_link_waits_rather_than_giving_up(self):
         """A breaker's cooldown expires and a roster update may add a link, so unreachable now is
         not unreachable for ever."""
-        plan = Plan()
+        plan = Plan(DEFAULT)
         d = plan.next(peer_with(), 0, T0, T0 + 10_000)
         assert isinstance(d, Wait)
         self.assertGreater(d.until, T0)
@@ -137,7 +137,7 @@ class TestPlan(unittest.TestCase):
         """R6 and R7 interlocking: a healthy peer staggers freely, and an exhausted budget collapses
         it back to serial failover with nothing else deciding that."""
         peer = peer_with(A1, A2, A3)
-        plan = Plan(PlanTunables(max_parallel=2))
+        plan = Plan(replace(DEFAULT, max_parallel=2))
         d = plan.next(peer, 0, T0, T0 + 10_000)
         assert isinstance(d, Send)
         self.assertEqual(len(d.links), 2)
@@ -154,22 +154,23 @@ class TestPlan(unittest.TestCase):
         so the constant is a CAP."""
         peer = peer_with(A1, A2, A3)  # three, so one remains and `again_at` is populated
         peer.links[A1].reply(0, 20)  # a fast unix socket
-        d = Plan(PlanTunables(stagger_cap=250)).next(peer, 0, T0, T0 + 10_000)
+        d = Plan(replace(DEFAULT, rtt_max=250)).next(peer, 0, T0, T0 + 10_000)
         assert isinstance(d, Send)
         assert d.again_at is not None
         self.assertLess(d.again_at - T0, 250)
 
     def test_backoff_grows_and_is_capped(self):
-        plan = Plan(PlanTunables(backoff_base=100, backoff_cap=1_000))
+        t = replace(DEFAULT, rtt_max=100)
+        plan = Plan(t)
         delays = [plan.backoff(n) for n in range(1, 6)]
         self.assertEqual(delays, sorted(delays))
-        self.assertLessEqual(max(delays), 1_000)
-        self.assertGreaterEqual(min(delays), 100)
+        self.assertLessEqual(max(delays), t.backoff_cap)
+        self.assertGreaterEqual(min(delays), t.backoff_base)
 
     def test_jitter_is_injected_so_nothing_above_becomes_flaky(self):
         """The default is the midpoint, not a random draw: a module that silently randomised would
         make every test above it flaky, so unpredictability has to be asked for."""
-        plan = Plan(PlanTunables(backoff_base=100, backoff_cap=10_000))
+        plan = Plan(replace(DEFAULT, rtt_max=100))
         self.assertEqual(plan.backoff(2), plan.backoff(2))
         spread = {decorrelated(100, 10_000) for _ in range(50)}
         self.assertGreater(len(spread), 40)
