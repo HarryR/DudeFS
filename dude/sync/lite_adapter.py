@@ -281,34 +281,11 @@ _DECODERS: dict[Verb, Callable[[bytes], LiteMsg]] = {
 }
 
 
-class LiteAdapter:
-    def __init__(self, me: crypto.Keypair, postman, ttl):
-        self.me = me
-        self.postman = postman
-        self.ttl = ttl
-
-    def send(self, to: crypto.PublicKey, msg: LiteMsg, now) -> bytes:
-        from ..net.envelope import Envelope, new_message_id  # noqa: PLC0415
-
-        verb, body = msg.encode()
-        mid = new_message_id()
-        env = Envelope(to, verb, mid, body).sign(self.me, now)
-        self.postman.mailbox.post(env, now, self.ttl, await_reply=True)
-        return mid
-
-    def reply(self, to, msg: LiteMsg, now):
-        verb, body = msg.encode()
-        self.postman.mailbox.post(
-            to.answer(verb, body).sign(self.me, now), now, self.ttl, await_reply=False
-        )
-
-
 __all__ = [
     "ABSENT_MARKER",
     "AnchorsReply",
     "GetAnchors",
     "GetProof",
-    "LiteAdapter",
     "LiteAdapterError",
     "LiteMsg",
     "LiteRefused",

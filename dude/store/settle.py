@@ -73,7 +73,9 @@ def _data_row_shape(layer: Reader, auth: Authoriser, m: ops.Mutation) -> Reason 
     Management rows are exempt from both, and must be: nodes enforce authorisation out of store 0,
     so it is never encrypted and its names are structured (`grant/` + pubkey) rather than blinded.
     The one management row with a rule of its own is a store's epoch counter."""
-    if not isinstance(m, ops.Set):
+    if isinstance(m, ops.Del):
+        if m.store == ops.STORE_MANAGEMENT and auth.epoch_target(m.name) is not None:
+            return Reason.EPOCH_JUMP
         return None
     if m.store == ops.STORE_MANAGEMENT:
         target = auth.epoch_target(m.name)

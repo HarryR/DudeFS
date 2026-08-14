@@ -65,7 +65,9 @@ class Tunables:
     """Hard cap on total retransmit attempts for one message, across its whole lifetime. Distinct
     from `retry_budget` (per sub-round)."""
 
-    max_parallel: int = 2
+    desired_links_per_peer: int = 2
+    """Concurrent connections the postman maintains to each peer. Dialing is continuous: when a
+    link dies, the postman re-establishes it. All live links are available for sending."""
 
     breaker_threshold: int = 5
     budget_max_tokens: int = 10_000
@@ -183,24 +185,6 @@ class Tunables:
         return self.rtt_max
 
     @property
-    def select_timeout(self) -> Millis:
-        """Bounds how long a stopping transport stays unresponsive."""
-        return self.rtt_max
-
-    @property
-    def connect_timeout(self) -> Millis:
-        """Spent on the tick thread: how long one bad peer can stall consensus."""
-        return self.block_time_floor
-
-    @property
-    def send_timeout(self) -> Millis:
-        return self.block_time_floor
-
-    @property
-    def stop_join_timeout(self) -> Millis:
-        return self.select_timeout + self.rtt_max
-
-    @property
     def tick_interval(self) -> Millis:
         """Sampled against `cut_reserve`, the tightest deadline the loop must not overshoot."""
         return max(1, self.cut_reserve // self.ticks_per_cadence)
@@ -247,7 +231,7 @@ class Tunables:
             ("ticks_per_cadence", self.ticks_per_cadence),
             ("pull_batch", self.pull_batch),
             ("max_attempts", self.max_attempts),
-            ("max_parallel", self.max_parallel),
+            ("desired_links_per_peer", self.desired_links_per_peer),
         ):
             if count < 1:
                 raise InvariantError(f"{what} is {count}; a count below 1 disables the mechanism")

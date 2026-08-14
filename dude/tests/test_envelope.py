@@ -8,10 +8,8 @@ from __future__ import annotations
 import unittest
 
 from ..core import codec, crypto
-from ..net import Envelope, EnvelopeError, Frame, SignedEnvelope, Verb, request
-from ..net.postman import Postman
+from ..net import Envelope, EnvelopeError, Frame, MessageId, SignedEnvelope, Verb, request
 from ..store import ops
-from ..tunables import DEFAULT
 
 T0 = 1_700_000_000_000
 WINDOW = 5_000
@@ -101,7 +99,7 @@ class TestSignedFields(unittest.TestCase):
         as `SignedTransaction` carries them for the store."""
         self.assertNotIn("frm", Envelope.__slots__)
         self.assertNotIn("ts", Envelope.__slots__)
-        signed = Envelope(self.b.public, Verb.PING, b"x" * 16).sign(self.a, T0)
+        signed = Envelope(self.b.public, Verb.PING, MessageId(b"x" * 8)).sign(self.a, T0)
         self.assertEqual(signed.frm, self.a.public)  # the signer, and only ever the signer
 
     def test_roundtrip(self):
@@ -112,7 +110,7 @@ class TestSignedFields(unittest.TestCase):
         sends bytes, and the type system would not let it build the object anyway. This is where the
         closed enumeration earns its keep: an unrecognised verb is a hard refusal rather than
         something that falls through to a default branch."""
-        inner = codec.encode([self.b.public, 999, b"x" * 16, b"", b"", 0])
+        inner = codec.encode([self.b.public, 999, MessageId(b"x" * 8), b"", b""])
         body = codec.encode([self.a.public, T0, inner])
         with self.assertRaises(EnvelopeError) as cm:
             SignedEnvelope.decode(codec.encode([body, self.a.sign(body)]))
@@ -128,10 +126,8 @@ class TestSignedFields(unittest.TestCase):
         `as_seq(..., N)`, this test fails at the shorter-list case. If a field is added to
         decode without encode, the too-many-fields case catches it. Both directions are
         pinned because the trap fires either way."""
-        stamped = Envelope(self.b.public, Verb.PING, b"x" * 16).sign(self.a, T0)
-        # Six fields is what `Envelope.encode` currently emits (to, verb, mid, body,
-        # reply_to, reply_ts). Anything else must be a hard decode refusal.
-        for wrong in (5, 7):
+        stamped = Envelope(self.b.public, Verb.PING, MessageId(b"x" * 8)).sign(self.a, T0)
+        for wrong in (4, 6):
             malformed_inner = codec.encode([b""] * wrong)
             body = codec.encode([self.a.public, T0, malformed_inner])
             with self.assertRaises(EnvelopeError):
@@ -165,7 +161,6 @@ class TestCorrelation(unittest.TestCase):
         r = q.answer(Verb.PONG)
         self.assertEqual(r.to, self.a.public)  # addressed back to the requester
         self.assertEqual(r.reply_to, q.env.mid)
-        self.assertEqual(r.reply_ts, q.ts)  # echoes the attempt it answers
 
     def test_a_request_carries_no_reply_to(self):
         self.assertEqual(request(self.a, self.b.public, Verb.PING, T0).env.reply_to, b"")
@@ -243,18 +238,12 @@ class TestSealing(unittest.TestCase):
         self.assertFalse(self.frame.addressed_to(self.eve.public))
 
     def test_a_frame_tagged_for_someone_else_is_declined_at_the_door(self):
-        """`Postman.deliver` MUST refuse before `unseal` on a mismatched tag -- the tag exists
-        so garbage costs one hash, not an ECDH. The sealed blob here would genuinely open; only
-        the tag says otherwise."""
+        """The screen tag exists so garbage costs one hash, not an ECDH. The sealed blob here
+        would genuinely open; only the tag says otherwise."""
         openable = Frame(crypto.screen_tag(self.eve.public, self.frame.sealed), self.frame.sealed)
         self.assertEqual(openable.unseal(self.b), self.env, "the box really is ours")
-
-        post = Postman(self.b, DEFAULT)
-        with self.assertRaises(EnvelopeError) as cm:
-            post.deliver(openable, T0)
-        self.assertIn("not addressed to us", str(cm.exception))
-
-        self.assertEqual(post.deliver(self.frame, T0).envelope, self.env, "the honest frame lands")
+        self.assertFalse(openable.addressed_to(self.b.public), "tag says not ours")
+        self.assertTrue(self.frame.addressed_to(self.b.public), "honest frame passes")
 
     def test_the_tag_is_a_hint_and_authorises_nothing(self):
         """A tampered frame keeps a matching tag if the tag is recomputed over it, so `addressed_to`

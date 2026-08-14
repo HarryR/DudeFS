@@ -47,17 +47,27 @@ class Verb(IntEnum):
     `SYNC_REFUSED`."""
 
 
-type MessageId = bytes
-MESSAGE_ID_SIZE = 16
+class MessageId(bytes):
+    PREFIX_SIZE = 7
+    SIZE = 8
+
+    @classmethod
+    def random(cls, attempt: int = 0) -> MessageId:
+        return cls(crypto.random_bytes(cls.PREFIX_SIZE) + bytes([attempt]))
+
+    @property
+    def correlation_id(self) -> bytes:
+        return bytes(self[:self.PREFIX_SIZE])
+
+    @property
+    def attempt(self) -> int:
+        return self[self.PREFIX_SIZE]
+
+    def with_attempt(self, attempt: int) -> MessageId:
+        return MessageId(self.correlation_id + bytes([attempt]))
+
 
 MAX_FRAME_BYTES = 1 << 24
-"""CLUSTER-WIDE INVARIANT, not a tunable: two peers with different caps see each other's
-well-formed frames as refusals. Big enough for any envelope here, small enough that a stream
-advertising "the next frame is 4 GiB" costs a length-word read, not a 4 GiB allocation."""
-
-
-def new_message_id() -> MessageId:
-    return crypto.random_bytes(MESSAGE_ID_SIZE)
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,35 +77,29 @@ class Envelope:
     mid: MessageId
     body: bytes = b""
 
-    reply_to: MessageId = b""
-
-    reply_ts: int = 0
-    """The `ts` of the ATTEMPT this answers. Without it Karn's rule discards the RTT sample from
-    anything sent more than once, which under multi-homing is most traffic -- the more paths you
-    use, the less you know about any of them (#rtt-attribution)."""
+    reply_to: MessageId = MessageId(b"")
 
     def encode(self) -> bytes:
         return codec.encode(
-            [self.to, int(self.verb), self.mid, self.body, self.reply_to, self.reply_ts]
+            [self.to, int(self.verb), self.mid, self.body, self.reply_to]
         )
 
     @classmethod
     def decode(cls, raw: bytes) -> Envelope:
         try:
-            f = codec.as_seq(codec.decode(raw), 6)
+            f = codec.as_seq(codec.decode(raw), 5)
             to = crypto.PublicKey(codec.as_bytes(f[0]))
             verb_int = codec.as_int(f[1])
             mid = codec.as_bytes(f[2])
             body = codec.as_bytes(f[3])
             reply_to = codec.as_bytes(f[4])
-            reply_ts = codec.as_int(f[5])
         except (codec.CodecError, crypto.CryptoError) as exc:
             raise EnvelopeError(f"malformed envelope: {exc}") from exc
         try:
             verb = Verb(verb_int)
         except ValueError as exc:
             raise EnvelopeError(f"unknown verb {verb_int}") from exc
-        return cls(to, verb, mid, body, reply_to, reply_ts)
+        return cls(to, verb, MessageId(mid), body, MessageId(reply_to))
 
     def sign(self, kp: crypto.Keypair, ts: int) -> SignedEnvelope:
         return SignedEnvelope(kp.public, ts, self, kp.sign(_body_bytes(kp.public, ts, self)))
@@ -133,7 +137,7 @@ class SignedEnvelope:
         return abs(now - self.ts) <= window
 
     def answer(self, verb: Verb, body: bytes = b"") -> Envelope:
-        return Envelope(self.frm, verb, new_message_id(), body, self.env.mid, self.ts)
+        return Envelope(self.frm, verb, MessageId.random(), body, self.env.mid)
 
     def accept(
         self, me: crypto.PublicKey, now: int, window: int, in_reply_to: MessageId | None = None
@@ -164,7 +168,7 @@ class SignedEnvelope:
 def request(
     kp: crypto.Keypair, to: crypto.PublicKey, verb: Verb, ts: int, body: bytes = b""
 ) -> SignedEnvelope:
-    return Envelope(to, verb, new_message_id(), body).sign(kp, ts)
+    return Envelope(to, verb, MessageId.random(), body).sign(kp, ts)
 
 
 @dataclass(frozen=True, slots=True)

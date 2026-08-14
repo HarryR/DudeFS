@@ -1,321 +1,167 @@
 from __future__ import annotations
 
 import contextlib
-import queue
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import NamedTuple, Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 from ..core import crypto
 from ..core.errors import DudeError
 from ..core.units import Millis
-from ..tunables import LinkTunables, Tunables
+from ..tunables import Tunables
 from .address import Address, Endpoint
 from .envelope import Frame
-from .session import Inbound, Session
+
+type OnFrame = Callable[[Frame, "Link"], None]
+type OnLink = Callable[["Link"], None]
 
 
 class LinkError(DudeError): ...
 
 
-class Transport(Protocol):
-    def send(self, address: Address, frame: Frame) -> None: ...
-
-
 @runtime_checkable
 class Listener(Protocol):
-    def start(self, inbox: queue.SimpleQueue[Inbound]) -> None: ...
+    def start(self, on_frame: OnFrame, on_link: OnLink) -> None: ...
     def stop(self) -> None: ...
-    def drain(self) -> tuple[Inbound, ...]: ...
+    def dial(self, address: Address) -> None: ...
 
 
 class Refused(Enum):
-    INVALID = "invalid"
-    """Unused in Python and MUST stay: a Go port's zero value lands here, not on a real one."""
-
     CIRCUIT_OPEN = "circuit-open"
-    CIRCUIT_PROBING = "circuit-probing"
     TRANSPORT = "transport"
-
-
-class Policy(Protocol):
-    def before_send(self, now: Millis, /) -> Refused | None: ...
-
-    def on_sent(self, now: Millis, /) -> None: ...
-    def on_failed(self, now: Millis, /) -> None: ...
-    def on_reply(self, now: Millis, rtt: Millis | None, /) -> None: ...
-
-
-class _Inert:
-    def before_send(self, _now: Millis, /) -> Refused | None:
-        return None
-
-    def on_sent(self, _now: Millis, /) -> None: ...
-    def on_failed(self, _now: Millis, /) -> None: ...
-    def on_reply(self, _now: Millis, _rtt: Millis | None, /) -> None: ...
-
-
-@dataclass(slots=True)
-class Estimator(_Inert):
-    t: LinkTunables
-    srtt: float | None = None
-    rttvar: float = 0.0
-    samples: int = 0
-    ignored: int = 0
-    last_activity: Millis = 0
-
-    def on_sent(self, now: Millis, /) -> None:
-        self.last_activity = now
-
-    def on_reply(self, now: Millis, rtt: Millis | None, /) -> None:
-        self.last_activity = now
-        if rtt is None:
-            # NOT a zero. Under multi-homing most replies are unattributable, so folding them
-            # in as 0 builds the estimate from un-retried traffic alone (#rtt-attribution).
-            self.ignored += 1
-            return
-        r = float(rtt)
-        if self.srtt is None:  # RFC 6298 (2.2): first sample seeds both
-            self.srtt, self.rttvar = r, r / 2
-        else:
-            self.rttvar = 0.75 * self.rttvar + 0.25 * abs(self.srtt - r)
-            self.srtt = 0.875 * self.srtt + 0.125 * r
-        self.samples += 1
-
-    def rto(self) -> Millis:
-        if self.srtt is None:
-            return self.t.rto_initial
-        return max(self.t.rto_floor, int(self.srtt + max(self.t.granularity, 4 * self.rttvar)))
-
-
-class Breaker(Enum):
-    CLOSED = "closed"
-    OPEN = "open"
-    HALF_OPEN = "half-open"
-
-
-@dataclass(slots=True)
-class CircuitBreaker(_Inert):
-    t: LinkTunables
-    state: Breaker = Breaker.CLOSED
-    consecutive: int = 0
-    opened_at: Millis = 0
-    probing: bool = False
-
-    def before_send(self, now: Millis, /) -> Refused | None:
-        if self.state is Breaker.CLOSED:
-            return None
-        if self.state is Breaker.OPEN:
-            if now - self.opened_at < self.t.breaker_cooldown:
-                return Refused.CIRCUIT_OPEN
-            self.state, self.probing = Breaker.HALF_OPEN, False
-        if self.probing:
-            return Refused.CIRCUIT_PROBING
-        self.probing = True
-        return None
-
-    def on_failed(self, now: Millis, /) -> None:
-        self.consecutive += 1
-        if self.state is Breaker.HALF_OPEN or self.consecutive >= self.t.breaker_threshold:
-            self.state, self.opened_at, self.probing = Breaker.OPEN, now, False
-
-    def on_reply(self, _now: Millis, _rtt: Millis | None, /) -> None:
-        self.state, self.consecutive, self.probing = Breaker.CLOSED, 0, False
-
-
-@dataclass(slots=True)
-class RetryBudget(_Inert):
-    """Per PEER, not per link: one budget spans every path to one identity."""
-
-    max_tokens: int
-    ratio: int
-    tokens: int = -1
-
-    _FULL = 1_000
-
-    def __post_init__(self) -> None:
-        if self.tokens < 0:
-            self.tokens = self.max_tokens
-
-    def spend(self) -> bool:
-        if self.tokens < self._FULL:
-            return False
-        self.tokens -= self._FULL
-        return True
-
-    def on_sent(self, _now: Millis, /) -> None:
-        self.tokens = min(self.max_tokens, self.tokens + self.ratio)
 
 
 @dataclass(slots=True)
 class Link:
     address: Address
-    transport: Transport
-    policies: tuple[Policy, ...] = ()
+    identity: crypto.PublicKey | None
 
-    def send(self, frame: Frame, now: Millis) -> Refused | None:
-        for p in self.policies:
-            refusal = p.before_send(now)
-            if refusal is not None:
-                return refusal
-        try:
-            self.transport.send(self.address, frame)
-        except LinkError:
-            self._each("on_failed", now)
-            return Refused.TRANSPORT
-        self._each("on_sent", now)
-        return None
+    _send_frame: Callable[[Frame], None]
+    _close_transport: Callable[[], None]
 
-    def reply(self, now: Millis, rtt: Millis | None) -> None:
-        for p in self.policies:
-            p.on_reply(now, rtt)
+    last_activity: Millis = 0
 
-    def expired(self, now: Millis) -> None:
-        self._each("on_failed", now)
+    # Estimator (RFC 6298 EWMA)
+    srtt: float | None = field(default=None, repr=False)
+    rttvar: float = field(default=0.0, repr=False)
 
-    def available(self, now: Millis) -> bool:
-        return all(p.before_send(now) is None for p in self.policies)
-
-    def find[T](self, kind: type[T]) -> T | None:
-        for p in self.policies:
-            if isinstance(p, kind):
-                return p
-        return None
-
-    def _each(self, hook: str, now: Millis) -> None:
-        for p in self.policies:
-            getattr(p, hook)(now)
-
-
-@dataclass(slots=True)
-class SessionLink:
-    address: Address
-
-    session: Session
-    policies: tuple[Policy, ...] = ()
-    on_close: Callable[[SessionLink], None] | None = None
+    # CircuitBreaker
+    breaker_failures: int = field(default=0, repr=False)
+    breaker_opened_at: Millis = field(default=0, repr=False)
+    breaker_open: bool = field(default=False, repr=False)
 
     _closed: bool = field(default=False, init=False)
+    _close_notified: bool = field(default=False, init=False)
+    on_close: Callable[[Link], None] | None = None
 
     def send(self, frame: Frame, now: Millis) -> Refused | None:
         if self._closed:
             return Refused.TRANSPORT
-        for p in self.policies:
-            refusal = p.before_send(now)
-            if refusal is not None:
-                return refusal
+        if self.breaker_open:
+            if now - self.breaker_opened_at < self._breaker_cooldown():
+                return Refused.CIRCUIT_OPEN
+            self.breaker_open = False
         try:
-            self.session.send(frame)
+            self._send_frame(frame)
         except LinkError:
-            self._each("on_failed", now)
-            self._close()
+            self._on_failed(now)
+            self.close()
             return Refused.TRANSPORT
-        self._each("on_sent", now)
+        self.last_activity = now
         return None
 
-    def reply(self, now: Millis, rtt: Millis | None) -> None:
-        for p in self.policies:
-            p.on_reply(now, rtt)
+    def on_reply(self, now: Millis, rtt: Millis | None) -> None:
+        self.last_activity = now
+        self.breaker_failures = 0
+        self.breaker_open = False
+        if rtt is None:
+            return
+        r = float(rtt)
+        if self.srtt is None:
+            self.srtt, self.rttvar = r, r / 2
+        else:
+            self.rttvar = 0.75 * self.rttvar + 0.25 * abs(self.srtt - r)
+            self.srtt = 0.875 * self.srtt + 0.125 * r
 
-    def expired(self, now: Millis) -> None:
-        self._each("on_failed", now)
+    def on_expired(self, now: Millis) -> None:
+        self._on_failed(now)
+
+    def _on_failed(self, now: Millis) -> None:
+        self.breaker_failures += 1
+        if self.breaker_failures >= 5:
+            self.breaker_open = True
+            self.breaker_opened_at = now
+
+    def rto(self, initial: Millis) -> Millis:
+        if self.srtt is None:
+            return initial
+        return max(2, int(self.srtt + max(1, 4 * self.rttvar)))
 
     def available(self, now: Millis) -> bool:
         if self._closed:
             return False
-        return all(p.before_send(now) is None for p in self.policies)
+        if self.breaker_open and now - self.breaker_opened_at < self._breaker_cooldown():
+            return False
+        return True
 
-    def find[T](self, kind: type[T]) -> T | None:
-        for p in self.policies:
-            if isinstance(p, kind):
-                return p
-        return None
+    def bind(self, identity: crypto.PublicKey) -> None:
+        if self.identity is not None:
+            if self.identity != identity:
+                raise LinkError(
+                    f"link already bound to {self.identity.hex()[:8]}, "
+                    f"refuses rebind to {identity.hex()[:8]}"
+                )
+            return
+        self.identity = identity
 
-    @property
-    def last_activity(self) -> Millis:
-        return self.session.last_activity
-
-    def _close(self) -> None:
+    def close(self) -> None:
         if self._closed:
             return
         self._closed = True
         with contextlib.suppress(Exception):
-            self.session.close()
+            self._close_transport()
+        self.notify_closed()
+
+    def notify_closed(self) -> None:
+        if self._close_notified:
+            return
+        self._close_notified = True
         if self.on_close is not None:
             self.on_close(self)
 
-    def _each(self, hook: str, now: Millis) -> None:
-        for p in self.policies:
-            getattr(p, hook)(now)
+    def _breaker_cooldown(self) -> Millis:
+        return 10_000
 
 
-def standard(
-    address: Address,
-    transport: Transport,
-    budget: RetryBudget,
-    tunables: LinkTunables,
-) -> Link:
-    return Link(address, transport, (Estimator(t=tunables), CircuitBreaker(t=tunables), budget))
-
-
-class Diff(NamedTuple):
-    added: tuple[Address, ...]
-    removed: tuple[Address, ...]
+# ---------------------------------------------------------------------------
+# Peer
+# ---------------------------------------------------------------------------
 
 
 @dataclass(slots=True)
 class Peer:
     identity: crypto.PublicKey
-    dial: Callable[[Endpoint], Transport]
-
     t: Tunables
-    links: dict[Address, Link] = field(default_factory=dict)
-    sessions: list[SessionLink] = field(default_factory=list)
-    endpoints: dict[Address, Endpoint] = field(default_factory=dict)
-    budget: RetryBudget = field(init=False)
+    dial_targets: dict[Address, Endpoint] = field(default_factory=dict)
+    links: list[Link] = field(default_factory=list)
 
-    def __post_init__(self) -> None:
-        self.budget = RetryBudget(self.t.budget_max_tokens, self.t.budget_token_ratio)
-
-    def reconfigure(self, wanted_eps: tuple[Endpoint, ...]) -> Diff:
-        by_address = {e.address: e for e in wanted_eps}
-        wanted = set(by_address)
-        # Sort by encoded bytes so a Diff over the same inputs is bit-stable.
-        added = tuple(sorted((a for a in wanted if a not in self.links), key=Address.encode))
-        removed = tuple(sorted((a for a in self.links if a not in wanted), key=Address.encode))
-        for a in removed:
-            del self.links[a]
-            self.endpoints.pop(a, None)
-        for a in added:
-            self.links[a] = standard(a, self.dial(by_address[a]), self.budget, self.t.link_tunables)
-        self.endpoints.update(by_address)
-        return Diff(added, removed)
+    def reconfigure(self, wanted_eps: tuple[Endpoint, ...]) -> None:
+        wanted = {e.address: e for e in wanted_eps}
+        for link in tuple(self.links):
+            if link.address not in wanted:
+                link.close()
+        self.dial_targets = wanted
 
     def disconnect(self) -> None:
-        """Close every live pipe to this identity. Dropping the peer entry alone only stopped us
-        DIALLING them: an accepted socket stayed in the listener, stayed registered with the
-        selector and kept feeding frames in, so a revoked node went on being served."""
-        for sl in tuple(self.sessions):
-            sl._close()  # noqa: SLF001 -- same-module cooperative teardown, as `on_close` wiring is
-        self.sessions.clear()
+        for link in tuple(self.links):
+            link.close()
         self.links.clear()
 
-    def usable(self, now: Millis) -> tuple[Link | SessionLink, ...]:
-        session_out = [sl for sl in self.sessions if sl.available(now)]
-        session_out.sort(key=lambda sl: -sl.last_activity)
-        dial_out = [ln for ln in self.links.values() if ln.available(now)]
-        # RTO only. Ties fall through in dict order.
-        dial_out.sort(key=self._rto)
-        return (*session_out, *dial_out)
+    def usable(self, now: Millis) -> tuple[Link, ...]:
+        out = [ln for ln in self.links if ln.available(now)]
+        out.sort(key=lambda ln: ln.rto(self.t.rtt_max))
+        return tuple(out)
 
     def deliverable(self, now: Millis) -> bool:
-        return any(ln.available(now) for ln in self.links.values()) or any(
-            sl.available(now) for sl in self.sessions
-        )
-
-    def _rto(self, link: Link) -> Millis:
-        est = link.find(Estimator)
-        if est is not None:
-            return est.rto()
-        return self.t.link_tunables.rto_initial
+        return any(ln.available(now) for ln in self.links)

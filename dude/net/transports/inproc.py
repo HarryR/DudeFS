@@ -1,116 +1,112 @@
 from __future__ import annotations
 
-import queue
-from collections import deque
 from dataclasses import dataclass, field
 
 from ...core import crypto
-from ...core.units import Millis, now_ms
-from ..address import Address, Scheme
+from ...core.units import now_ms
+from ..address import Address, Endpoint, Scheme
 from ..envelope import Frame
-from ..link import LinkError, Listener, Transport
-from ..session import Inbound, Session
-
-_INBOXES: dict[str, InProcListener] = {}
+from ..link import Link, LinkError, Listener, OnFrame, OnLink
 
 
-class InProcSession(Session):
-    __slots__ = ("_me", "_reply_to")
+_INBOXES: dict[bytes, InProcListener] = {}
 
-    def __init__(self, reply_to: str, me: str) -> None:
-        super().__init__(identity=None, address=Address(Scheme.INPROC, reply_to))
+
+class _InProcConn:
+    __slots__ = ("_me", "_reply_to", "link")
+
+    def __init__(self, reply_to: bytes, me: bytes, address: Address) -> None:
         self._reply_to = reply_to
         self._me = me
+        self.link = Link(
+            address=address,
+            identity=None,
+            _send_frame=self.send_frame,
+            _close_transport=self.close,
+        )
 
-    def send(self, frame: Frame) -> None:
+    def send_frame(self, frame: Frame) -> None:
         target = _INBOXES.get(self._reply_to)
         if target is None:
             raise LinkError(f"in-process reply target no longer registered: {self._reply_to!r}")
-        target._deliver(frame, sender_name=self._me)  # noqa: SLF001 -- same-module cooperative access
-        self.last_activity = now_ms()
+        target._deliver(frame, sender=self._me)  # noqa: SLF001
 
     def close(self) -> None:
-        if self.on_close is not None:
-            self.on_close()
-            self.on_close = None
-
-    def _notify_frame_in(self, now: Millis) -> None:
-        self.last_activity = now
-
-
-@dataclass(slots=True)
-class InProcDialer(Transport):
-    me: str
-
-    def send(self, address: Address, frame: Frame) -> None:
-        if address.scheme is not Scheme.INPROC:
-            raise LinkError(f"inproc cannot dial {address.scheme.value.decode()}")
-        target = _INBOXES.get(address.value)
-        if target is None:
-            raise LinkError(f"no such in-process endpoint: {address.value}")
-        target._deliver(frame, sender_name=self.me)  # noqa: SLF001 -- same-module cooperative access
+        pass
 
 
 @dataclass(slots=True)
 class InProcListener(Listener):
-    me: str
-    _inbox_queue: queue.SimpleQueue[Inbound] | None = field(init=False, default=None)
-    _buffered: deque[Inbound] = field(init=False, default_factory=deque)
-    _sessions: dict[str, InProcSession] = field(init=False, default_factory=dict)
+    identity: crypto.PublicKey
+    _on_frame: OnFrame | None = field(init=False, default=None)
+    _on_link: OnLink | None = field(init=False, default=None)
+    _buffered: list[tuple[Frame, Link]] = field(init=False, default_factory=list)
+    _conns: dict[bytes, _InProcConn] = field(init=False, default_factory=dict)
     _stopped: bool = field(init=False, default=False)
 
     def __post_init__(self) -> None:
-        if self.me in _INBOXES:
-            raise LinkError(f"in-process name already registered: {self.me!r}")
-        _INBOXES[self.me] = self
+        key = bytes(self.identity)
+        if key in _INBOXES:
+            raise LinkError(f"in-process identity already registered: {self.identity.hex()[:8]}")
+        _INBOXES[key] = self
 
-    def _deliver(self, frame: Frame, sender_name: str | None) -> None:
+    @property
+    def endpoint(self) -> Endpoint:
+        return Endpoint(Address(Scheme.INPROC, self.identity.hex()))
+
+    def _deliver(self, frame: Frame, sender: bytes) -> None:
         if self._stopped:
             return
-        if sender_name is None:
-            session: InProcSession = InProcSession(reply_to="", me=self.me)
-        else:
-            session = self._sessions.setdefault(
-                sender_name, InProcSession(reply_to=sender_name, me=self.me)
+        conn = self._conns.get(sender)
+        if conn is None:
+            conn = _InProcConn(
+                reply_to=sender,
+                me=bytes(self.identity),
+                address=Address(Scheme.INPROC, sender.hex()),
             )
-        session._notify_frame_in(now_ms())  # noqa: SLF001 -- same-module cooperative access
-        item = Inbound(frame, session)
-        self._buffered.append(item)
-        if self._inbox_queue is not None:
-            self._inbox_queue.put(item)
-            self._buffered.clear()
+            self._conns[sender] = conn
+            if self._on_link is not None:
+                self._on_link(conn.link)
+        conn.link.last_activity = now_ms()
+        if self._on_frame is not None:
+            self._on_frame(frame, conn.link)
+        else:
+            self._buffered.append((frame, conn.link))
 
-    def start(self, inbox: queue.SimpleQueue[Inbound]) -> None:
-        if self._inbox_queue is inbox:
-            return
-        if self._inbox_queue is not None:
-            raise RuntimeError("InProcListener already started with a different inbox")
-        self._inbox_queue = inbox
-        for item in self._buffered:
-            inbox.put(item)
+    def start(self, on_frame: OnFrame, on_link: OnLink) -> None:
+        if self._on_frame is not None:
+            raise RuntimeError("InProcListener already started")
+        self._on_frame = on_frame
+        self._on_link = on_link
+        for conn in self._conns.values():
+            on_link(conn.link)
+        for frame, link in self._buffered:
+            on_frame(frame, link)
         self._buffered.clear()
+
+    def dial(self, address: Address) -> None:
+        if address.scheme is not Scheme.INPROC or self._on_link is None:
+            return
+        target_key = bytes.fromhex(address.value)
+        if target_key not in _INBOXES or target_key in self._conns:
+            return
+        conn = _InProcConn(
+            reply_to=target_key,
+            me=bytes(self.identity),
+            address=address,
+        )
+        self._conns[target_key] = conn
+        self._on_link(conn.link)
 
     def stop(self) -> None:
         self._stopped = True
-        self._inbox_queue = None
-        _INBOXES.pop(self.me, None)
-        for session in self._sessions.values():
-            session.close()
-        self._sessions.clear()
-
-    def drain(self) -> tuple[Inbound, ...]:
-        out = tuple(self._buffered)
-        self._buffered.clear()
-        return out
+        self._on_frame = None
+        self._on_link = None
+        _INBOXES.pop(bytes(self.identity), None)
+        for conn in self._conns.values():
+            conn.link.close()
+        self._conns.clear()
 
 
 def _reset_for_tests() -> None:
     _INBOXES.clear()
-
-
-def name_of(identity: crypto.PublicKey) -> str:
-    return identity.hex()[:12]
-
-
-def address_of(identity: crypto.PublicKey) -> Address:
-    return Address(Scheme.INPROC, name_of(identity))

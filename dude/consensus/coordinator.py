@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from ..core import crypto
 from ..core.errors import DudeError, InvariantError
 from ..core.units import Bucket, Millis
-from ..net.envelope import SignedEnvelope, Verb
+from ..net.envelope import Verb
 from ..store import Layer, Store, settle
 from ..store.layer import Index
 from ..store.management import MgmtReader
@@ -108,13 +108,9 @@ class Coordinator:
             return Refusal.NOT_IN_ROSTER
         return self.mempool.admit(tx, now, self.store, self.mgmt)
 
-    def on_round_msg(self, env: SignedEnvelope, now: Millis) -> None:
-        """MUST advance state to `now` before dispatching. Dispatch routes on `current_round`'s
-        bucket, so a peer's HELD/SIG arriving in the gap before our own scheduled tick was
-        dropped as "no matching Round" -- every node signed empty slices on buckets the whole
-        cluster held the same tx for, and it looked like packet loss at every layer."""
+    def on_round_msg(self, frm: crypto.PublicKey, verb: Verb, body: bytes, now: Millis) -> None:
         try:
-            bucket = RoundMsg.bucket_of(env.env.body)
+            bucket = RoundMsg.bucket_of(body)
         except RoundAdapterError:
             return
         self.tick(now)
@@ -122,34 +118,34 @@ class Coordinator:
         if r is None or r.bucket() != bucket:
             return
         try:
-            if env.env.verb is Verb.BODIES:
-                self._absorb_bodies(env, r, now)
+            if verb is Verb.BODIES:
+                self._absorb_bodies(frm, verb, body, r, now)
             else:
-                self.adapter.deliver(env, r, now)
+                self.adapter.deliver(frm, verb, body, r, now)
         except RoundAdapterError:
             return
 
-    def _absorb_bodies(self, env: SignedEnvelope, r: Round, now: Millis) -> None:
-        """Unsolicited bodies go through the SAME door a client submission does, or a peer can
-        push us holdings our own predicate would never have admitted."""
-        msg = RoundMsg.decode(env.env.verb, env.env.body)
+    def _absorb_bodies(
+        self, frm: crypto.PublicKey, verb: Verb, body: bytes, r: Round, now: Millis
+    ) -> None:
+        msg = RoundMsg.decode(verb, body)
         if not isinstance(msg, Bodies):
             return
         good = tuple(
             tx for tx in msg.txs if self.mempool.valid(tx, now, self.store, self.mgmt) is None
         )
-        r.absorb(msg, env.frm, good)
+        r.absorb(msg, frm, good)
 
-    def on_settle_msg(self, env: SignedEnvelope, now: Millis) -> None:
+    def on_settle_msg(self, frm: crypto.PublicKey, verb: Verb, body: bytes, now: Millis) -> None:
         try:
-            sh = SettleSig.slice_hash_of(env.env.body)
+            sh = SettleSig.slice_hash_of(body)
         except SettleAdapterError:
             return
         self.tick(now)
         if self.settling is None or self.settling.block.slice_hash != sh:
             return
         try:
-            self.settle_adapter.deliver(env, self.settling.settle_round, now)
+            self.settle_adapter.deliver(frm, verb, body, self.settling.settle_round, now)
         except SettleAdapterError:
             return
 

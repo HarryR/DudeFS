@@ -6,7 +6,6 @@ from .adapter import (
     HeightReply,
     Refused,
     SettledBlockReply,
-    SyncAdapter,
     SyncAdapterError,
     SyncMsg,
 )
@@ -18,7 +17,6 @@ __all__ = [
     "HeightReply",
     "Refused",
     "SettledBlockReply",
-    "SyncAdapter",
     "SyncAdapterError",
     "SyncMsg",
     "SyncRefusal",

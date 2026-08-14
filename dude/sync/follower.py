@@ -69,6 +69,14 @@ class Follower:
             return
         self._poll_at[peer] = now
 
+    def remove_peer(self, peer: crypto.PublicKey) -> None:
+        self._poll_at.pop(peer, None)
+        self._heads.pop(peer, None)
+        self._last_ok_at.pop(peer, None)
+        self._last_fail_at.pop(peer, None)
+        if self._pulling is not None and self._pulling.peer == peer:
+            self._pulling = None
+
     def receive(self, msg: SyncMsg, from_: crypto.PublicKey, now: Millis) -> None:
         if from_ == self.me.public:
             return
@@ -199,34 +207,19 @@ class Follower:
         return True
 
     def _on_refused(self, msg: Refused, from_: crypto.PublicKey, now: Millis) -> None:
-        """EVERY member gets a case, and there is no wildcard: the reason used to be discarded
-        outright, which made the refusal a round trip that bought nothing."""
         p = self._pulling
         if p is None or from_ != p.peer:
             return
         self._pulling = None
-        match msg.reason:
-            case SyncRefusal.NOT_YET_SETTLED:
-                # They reported a head above ours and do not have the block. Correct the claim
-                # rather than shun them (#no-shun-only-priority) -- which also takes them out of
-                # the candidate set, so the immediate retry cannot pick the same peer -- and
-                # spend this tick on someone else instead of waiting for the next one.
-                hr = self._heads.get(from_)
-                if hr is not None:
-                    self._heads[from_] = replace(hr, block_num=p.frm - 1)
-                source = self._pick_pull_source()
-                if source is not None:
-                    self._pull_from(source, now)
-            case (
-                SyncRefusal.INVALID
-                | SyncRefusal.UNKNOWN
-                | SyncRefusal.NO_STATE
-                | SyncRefusal.UNKNOWN_STORE
-                | SyncRefusal.MALFORMED_QUERY
-                | SyncRefusal.FORK_DETECTED
-                | SyncRefusal.INTERNAL
-            ):
-                pass  # nothing this peer can do for us now; the next tick picks a source
+        if msg.reason is SyncRefusal.NOT_YET_SETTLED:
+            hr = self._heads.get(from_)
+            if hr is not None:
+                self._heads[from_] = replace(hr, block_num=p.frm - 1)
+            source = self._pick_pull_source()
+            if source is not None:
+                self._pull_from(source, now)
+        else:
+            self._last_fail_at[from_] = now
 
     def _enqueue(self, peer: crypto.PublicKey, msg: SyncMsg) -> None:
         self._outbox.append((peer, msg))
@@ -289,13 +282,14 @@ class Follower:
 
 
 def serve_height(store: Store) -> HeightReply:
-    tip = store.head_block_hash()
-    if tip is None:
-        anchor = store.anchor()
-        if anchor is None:
-            raise InvariantError("serving HEIGHT from a store that was never provisioned")
-        tip = chain.TrustedHead.genesis(anchor).block_hash
-    return HeightReply(block_num=store.head_block_num() or 0, tip_hash=tip)
+    with store.snapshot() as r:
+        tip = r.head_block_hash()
+        if tip is None:
+            anchor = r.anchor()
+            if anchor is None:
+                raise InvariantError("serving HEIGHT from a store that was never provisioned")
+            tip = chain.TrustedHead.genesis(anchor).block_hash
+        return HeightReply(block_num=r.head_block_num() or 0, tip_hash=tip)
 
 
 def serve_getblocks(store: Store, req: GetBlocks, cap: int) -> SyncMsg:

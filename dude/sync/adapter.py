@@ -8,9 +8,7 @@ from typing import ClassVar
 from ..consensus.settle_round import SettledBlockWithBodies
 from ..core import codec, crypto
 from ..core.errors import DudeError
-from ..core.units import Millis
-from ..net.envelope import Envelope, SignedEnvelope, Verb, new_message_id
-from ..net.postman import Postman
+from ..net.envelope import Verb
 from .refusal import SyncRefusal
 
 
@@ -141,31 +139,12 @@ _DECODERS: dict[Verb, Callable[[bytes], SyncMsg]] = {
 }
 
 
-class SyncAdapter:
-    def __init__(self, me: crypto.Keypair, postman: Postman, ttl: Millis) -> None:
-        self.me = me
-        self.postman = postman
-        self.ttl = ttl
-
-    def send(self, to: crypto.PublicKey, msg: SyncMsg, now: Millis, *, await_reply: bool) -> None:
-        verb, body = msg.encode()
-        env = Envelope(to, verb, new_message_id(), body).sign(self.me, now)
-        self.postman.mailbox.post(env, now, self.ttl, await_reply=await_reply)
-
-    def reply(self, to: SignedEnvelope, msg: SyncMsg, now: Millis) -> None:
-        verb, body = msg.encode()
-        self.postman.mailbox.post(
-            to.answer(verb, body).sign(self.me, now), now, self.ttl, await_reply=False
-        )
-
-
 __all__ = [
     "GetBlocks",
     "HeightAsk",
     "HeightReply",
     "Refused",
     "SettledBlockReply",
-    "SyncAdapter",
     "SyncAdapterError",
     "SyncMsg",
 ]

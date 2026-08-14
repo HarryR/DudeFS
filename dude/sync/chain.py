@@ -6,6 +6,7 @@ from enum import Enum
 
 from ..consensus.settle_round import SettledBlock, _settle_payload, genesis_stamp
 from ..core import crypto
+from ..core.errors import InvariantError
 from ..core.units import Millis
 from ..store import smt
 from ..store.layer import Index
@@ -71,7 +72,8 @@ def advance(
             return ChainRefusal.UNAUTHORISED
         head = TrustedHead(b.anchors.block_num, b.block_hash, b.anchors.state_root, b.block.bucket)
         prev = b.block_hash
-    assert head is not None  # noqa: S101 -- `blocks` is non-empty above
+    if head is None:
+        raise InvariantError("non-empty blocks produced no head")
     return head
 
 

@@ -80,7 +80,7 @@ def _wire(nodes: dict[crypto.PublicKey, Round], now: int) -> None:
     the admission door before handing them over. There is no door here -- no store, no grants --
     so this harness passes them straight through and tests the PROTOCOL: who spots a gap, who
     sends, what the slice becomes. Whether an absorbed body was admissible is the Coordinator's
-    question and `test_gestalt`'s."""
+    question and `test_spaghetti_cancer`'s."""
     for src_id, src in nodes.items():
         for target, msg in src.outbox():
             for dst_id, dst in nodes.items():

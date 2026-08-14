@@ -1,20 +1,15 @@
 from __future__ import annotations
 
-from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 
 from ..core import crypto
 from ..core.units import Millis
 from ..tunables import Tunables
-from .link import Estimator, Link, Peer, SessionLink
-
-type AnyLink = Link | SessionLink
+from .link import Link, Peer
 
 
 class Stalled(Enum):
-    INVALID = "invalid"
-
     NO_USABLE_LINK = "no-usable-link"
     DEADLINE = "deadline"
     ATTEMPTS = "attempts"
@@ -22,7 +17,7 @@ class Stalled(Enum):
 
 @dataclass(frozen=True, slots=True)
 class Send:
-    links: tuple[AnyLink, ...]
+    link: Link
     again_at: Millis | None = None
 
 
@@ -40,40 +35,28 @@ class GiveUp:
 type Decision = Send | Wait | GiveUp
 
 
-@dataclass(frozen=True, slots=True)
-class Plan:
-    t: Tunables
-    jitter: Callable[[int, int], int] = field(default=lambda lo, hi: lo + (hi - lo) // 2)
+def plan_next(t: Tunables, peer: Peer, attempts: int, now: Millis, deadline: Millis) -> Decision:
+    if now >= deadline:
+        return GiveUp(Stalled.DEADLINE)
+    if attempts >= t.max_attempts:
+        return GiveUp(Stalled.ATTEMPTS)
 
-    def next(self, peer: Peer, attempts: int, now: Millis, deadline: Millis) -> Decision:
-        if now >= deadline:
-            return GiveUp(Stalled.DEADLINE)
-        if attempts >= self.t.max_attempts:
-            return GiveUp(Stalled.ATTEMPTS)
-        if not peer.deliverable(now):
-            return Wait(min(deadline, now + self.backoff(attempts)), Stalled.NO_USABLE_LINK)
+    usable = peer.usable(now)
+    if not usable:
+        return Wait(min(deadline, now + backoff(t, attempts)), Stalled.NO_USABLE_LINK)
 
-        usable = peer.usable(now)
-        if not usable:
-            return Wait(min(deadline, now + self.backoff(attempts)), Stalled.NO_USABLE_LINK)
-        picked = [usable[0]]
-        for link in usable[1:]:
-            if len(picked) >= self.t.max_parallel or not peer.budget.spend():
-                break
-            picked.append(link)
-        more = len(usable) > len(picked)
-        return Send(tuple(picked), self.stagger(picked) if more else None)
+    best = usable[0]
+    again = now + min(t.stagger_cap, best.rto(t.rtt_max)) if len(usable) > 1 else None
+    return Send(best, again)
 
-    def backoff(self, attempts: int) -> Millis:
-        hi = min(self.t.backoff_cap, self.t.backoff_base * 3 ** max(1, attempts))
-        return max(self.t.backoff_base, self.jitter(self.t.backoff_base, hi))
 
-    def stagger(self, picked: list[AnyLink]) -> Millis:
-        rtos = [e.rto() for e in (ln.find(Estimator) for ln in picked) if e is not None]
-        return min(self.t.stagger_cap, *rtos) if rtos else self.t.stagger_cap
+def backoff(t: Tunables, attempts: int) -> Millis:
+    hi = min(t.backoff_cap, t.backoff_base * 3 ** max(1, attempts))
+    return t.backoff_base + (hi - t.backoff_base) // 2
 
-    def retry_at(self, attempts: int, now: Millis) -> Millis:
-        return now + self.backoff(attempts)
+
+def retry_at(t: Tunables, attempts: int, now: Millis) -> Millis:
+    return now + backoff(t, attempts)
 
 
 def decorrelated(lo: int, hi: int) -> int:

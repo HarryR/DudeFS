@@ -20,18 +20,33 @@ from dude.net.envelope import Envelope, Frame, Verb
 from dude.net.link import LinkError
 from dude.net.session import Inbound
 from dude.net.transports.tcp import (
-    _CONNECT_TIMEOUT_SEC,
     _LEN,
-    _SEND_TIMEOUT_SEC,
     TCPDialer,
     TCPListener,
     TCPSession,
+    TCPTiming,
 )
+
+_TIMING = TCPTiming()
+"""TCP's own defaults. These tests are about the transport's behaviour under its own bounds, so
+they read them from the transport rather than from a deployment that has no say in them."""
 
 
 def _make_frame(sender: crypto.Keypair, recipient: crypto.PublicKey, body: bytes = b"hi") -> Frame:
     env = Envelope(to=recipient, verb=Verb.PING, mid=b"m" * 16, body=body)
     return env.sign(sender, 1_000_000).seal()
+
+
+def _connected(client: TCPDialer, address: Address, tries: int = 2_000) -> None:
+    """Ask for a link, then wait for it. `send` does not dial any more -- it is the tick thread's
+    caller, and a dial is not the tick thread's work. `Connectivity` keeps a link unusable until
+    the carrier reports `ready`, so a test that sends has to do what a link does."""
+    client.begin_connect(address)
+    for _ in range(tries):
+        if client.ready(address):
+            return
+        time.sleep(0.001)
+    raise AssertionError(f"dialer never became ready for {address.value}")
 
 
 def _drain_until(rx: TCPListener, want: int, tries: int = 200) -> tuple[Frame, ...]:
@@ -61,6 +76,7 @@ class TestTCPRoundTripViaDrain(unittest.TestCase):
         client = TCPDialer()
         try:
             frame = _make_frame(a_kp, b_kp.public)
+            _connected(client, listener.bound_address)
             client.send(listener.bound_address, frame)
             got = _drain_until(listener, 1)
             self.assertEqual(len(got), 1, "expected one frame")
@@ -78,6 +94,7 @@ class TestTCPRoundTripViaDrain(unittest.TestCase):
         client = TCPDialer()
         try:
             frames = [_make_frame(a_kp, b_kp.public, body=f"n={i}".encode()) for i in range(20)]
+            _connected(client, listener.bound_address)
             for f in frames:
                 client.send(listener.bound_address, f)
             got = _drain_until(listener, len(frames))
@@ -99,6 +116,7 @@ class TestTCPRoundTripViaDrain(unittest.TestCase):
         try:
             big_body = b"x" * (128 * 1024)
             frame = _make_frame(a_kp, b_kp.public, body=big_body)
+            _connected(client, listener.bound_address)
             client.send(listener.bound_address, frame)
             got = _drain_until(listener, 1, tries=500)
             self.assertEqual(len(got), 1)
@@ -120,6 +138,14 @@ class TestTCPRoundTripViaDrain(unittest.TestCase):
             probe.stop()
 
             frame = _make_frame(a_kp, b_kp.public)
+            # The dial fails on the carrier's thread, so the link simply never becomes ready --
+            # and a send without one is an error, because `Connectivity` should have stopped it.
+            client.begin_connect(dead_address)
+            for _ in range(2_000):
+                if client.ready(dead_address):
+                    break
+                time.sleep(0.001)
+            self.assertFalse(client.ready(dead_address), "a refused connect produced a session")
             with self.assertRaises(LinkError):
                 client.send(dead_address, frame)
         finally:
@@ -171,6 +197,7 @@ class TestTCPListenerStartStop(unittest.TestCase):
         try:
             listener.start(inbox)
             frame = _make_frame(a_kp, b_kp.public)
+            _connected(client, listener.bound_address)
             client.send(listener.bound_address, frame)
             # Reader thread should push within a few select-cycles.
             got = inbox.get(timeout=2.0)
@@ -252,42 +279,97 @@ def _big_frame(size: int) -> Frame:
     return Frame(crypto.screen_tag(kp.public, b"big"), crypto.SealedBlob(bytes(size)))
 
 
-def _backpressured_session(sndbuf: int = 8192) -> tuple[TCPSession, socket.socket]:
+def _backpressured_session(
+    sndbuf: int = 8192, timing: TCPTiming = _TIMING
+) -> tuple[TCPSession, socket.socket, list[Address]]:
+    """A session whose peer socket nobody reads, so the kernel buffer fills. Returns the list the
+    session appends to when its link breaks -- the report the scheduler needs."""
     left, right = socket.socketpair()
     left.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, sndbuf)
-    left.setblocking(False)
-    return TCPSession(left, Address(Scheme.TCP, "pair:0")), right
+    broken: list[Address] = []
+    session = TCPSession(
+        left, Address(Scheme.TCP, "pair:0"), timing, lambda _item: None, broken.append
+    )
+    return session, right, broken
 
 
-class TestConnectIsBounded(unittest.TestCase):
-    def test_a_blackholed_address_fails_within_the_bound(self):
-        """`_connect` ran a blocking connect() with no timeout -- and it runs on the node's
-        single tick thread, so one firewalled peer stalled ALL consensus and sync for the OS
-        SYN timeout (minutes). 192.0.2.1 is TEST-NET-1 (RFC 5737): never routable, so the SYN
-        goes unanswered -- exactly the firewalled-peer shape."""
+class TestDiallingNeverBlocksTheCaller(unittest.TestCase):
+    """THE INVARIANT: nothing on the caller's path may block on the wire. The caller is the node's
+    single tick thread, so a blocking dial there stalls consensus and sync for as long as it takes.
+
+    It was a blocking `connect()` with no timeout -- the OS SYN timeout, minutes -- and the first
+    fix only bounded it, which chose how long the stall lasted rather than removing it. The bound
+    then derived from the block time, so at production settings one firewalled address stalled the
+    tick thread for 22 seconds.
+
+    192.0.2.1 is TEST-NET-1 (RFC 5737): never routable, so the SYN goes unanswered -- exactly the
+    firewalled-peer shape."""
+
+    def test_begin_connect_to_a_blackholed_address_returns_at_once(self):
         client = TCPDialer()
-        kp = crypto.Keypair.generate()
-        start = time.monotonic()
+        black_hole = Address(Scheme.TCP, "192.0.2.1:9")
         try:
-            with self.assertRaises(LinkError):
-                client.send(Address(Scheme.TCP, "192.0.2.1:9"), _make_frame(kp, kp.public))
+            start = time.monotonic()
+            for _ in range(5):  # a link asks on every tick it is due; none of them may pay
+                client.begin_connect(black_hole)
+            elapsed = time.monotonic() - start
+            self.assertLess(
+                elapsed,
+                0.05,
+                f"begin_connect blocked {elapsed:.2f}s: the wire is back on the caller's thread",
+            )
+            self.assertFalse(client.ready(black_hole), "an unroutable address reported ready")
         finally:
             client.close()
-        elapsed = time.monotonic() - start
-        self.assertLess(
-            elapsed,
-            _CONNECT_TIMEOUT_SEC + 7.0,
-            f"connect blocked {elapsed:.1f}s: the tick thread was stalled unbounded",
-        )
+
+    def test_asking_repeatedly_makes_one_connection_not_a_backlog(self):
+        """A link asks on every tick it is due, so `begin_connect` is called constantly. One peer
+        means one connection paced by its own thread -- there is no queue to fill and no rate
+        limiter to tune, which is what the shared dial worker needed to stay sane."""
+        client = TCPDialer()
+        black_hole = Address(Scheme.TCP, "192.0.2.1:9")
+        before = threading.active_count()
+        try:
+            for _ in range(50):
+                client.begin_connect(black_hole)
+            self.assertEqual(len(client._peers), 1, "asking 50 times built more than one peer")
+            self.assertLessEqual(
+                threading.active_count() - before, 2, "a thread per ask, not per peer"
+            )
+        finally:
+            client.close()
+
+    def test_one_dead_peer_does_not_delay_another(self):
+        """The reason a peer owns its own thread. Behind a shared dial worker an unroutable
+        address blocked the queue for a whole connect bound, so a reachable peer waited behind
+        every dead one -- during a partition recovery, which is when it matters most."""
+        listener = TCPListener()
+        client = TCPDialer()
+        try:
+            for i in range(4):  # four black holes, asked for FIRST
+                client.begin_connect(Address(Scheme.TCP, f"192.0.2.{i + 1}:9"))
+            client.begin_connect(listener.bound_address)
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline and not client.ready(listener.bound_address):
+                time.sleep(0.005)
+            self.assertTrue(
+                client.ready(listener.bound_address),
+                "a reachable peer waited behind four unreachable ones",
+            )
+        finally:
+            client.close()
+            listener.stop()
 
 
 class TestBackpressureIsBoundedNotDropped(unittest.TestCase):
-    """`sendall` on the non-blocking socket raised BlockingIOError the moment the kernel
-    buffer filled: session torn down, consensus frame dropped, indistinguishable from packet
-    loss. A blocked send must wait for writability up to the bound."""
+    """`sendall` on the non-blocking socket raised BlockingIOError the moment the kernel buffer
+    filled: session torn down, consensus frame dropped, indistinguishable from packet loss.
+
+    Backpressure is now the writer thread's business -- it blocks, which is its job -- so the
+    caller never waits and the frame still arrives whole."""
 
     def test_a_send_the_reader_catches_up_on_completes_intact(self):
-        session, right = _backpressured_session()
+        session, right, _broken = _backpressured_session()
         frame = _big_frame(4_000_000)  # far above any socketpair buffer: EAGAIN guaranteed
         expected = _LEN.pack(len(frame.raw)) + frame.raw
         received = bytearray()
@@ -303,28 +385,38 @@ class TestBackpressureIsBoundedNotDropped(unittest.TestCase):
         t = threading.Thread(target=_reader)
         t.start()
         try:
-            session.send(frame)  # must not raise: the momentary EAGAIN is not a failure
+            start = time.monotonic()
+            session.send(frame)  # enqueue only: the wire is the writer thread's problem
+            handed_off = time.monotonic() - start
+            # The reader below sleeps 0.05s before draining, so an inline write cannot beat that.
+            # A queue put is microseconds, so the two are three orders of magnitude apart.
+            self.assertLess(handed_off, 0.02, f"send blocked {handed_off:.3f}s on the caller")
             t.join(timeout=10.0)
             self.assertEqual(bytes(received), expected, "the frame did not arrive intact")
         finally:
             session.close()
             right.close()
 
-    def test_a_send_nobody_drains_fails_at_the_bound_not_instantly(self):
-        session, right = _backpressured_session()
-        start = time.monotonic()
+    def test_a_peer_that_never_reads_breaks_its_own_link_and_reports_it(self):
+        """The writer waits out its bound and then fails -- and REPORTS, because a send that was
+        only accepted for delivery leaves the scheduler holding an in-flight message that will
+        never be answered. Without the report it waits out the whole message deadline instead of
+        trying the next link."""
+        timing = TCPTiming(send=300)
+        session, right, broken = _backpressured_session(timing=timing)
         try:
-            with self.assertRaises(LinkError):
+            for _ in range(4):  # more than the socket buffer can absorb
                 session.send(_big_frame(4_000_000))
+            deadline = time.monotonic() + 10.0
+            while time.monotonic() < deadline and not broken:
+                time.sleep(0.01)
+            self.assertEqual(
+                [a.value for a in broken], ["pair:0"], "a dead link was never reported"
+            )
+            self.assertTrue(session.closed, "a broken session stayed open")
         finally:
-            elapsed = time.monotonic() - start
             session.close()
             right.close()
-        self.assertGreaterEqual(
-            elapsed,
-            _SEND_TIMEOUT_SEC * 0.9,
-            "the send failed instantly: backpressure was dropped, not waited out",
-        )
 
 
 if __name__ == "__main__":

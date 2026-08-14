@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import contextlib
-import queue
 import threading
 from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from enum import Enum, auto
+from typing import Protocol
 
 from .. import quorum
 from ..consensus.settle_round import SettledBlock, _settle_payload
@@ -13,10 +13,9 @@ from ..core import crypto
 from ..core.errors import DudeError
 from ..core.units import Millis, now_ms
 from ..net.address import Endpoint
-from ..net.envelope import Frame
+from ..net.envelope import MessageId
 from ..net.link import Listener
-from ..net.postman import Postman
-from ..net.session import Inbound, Session, SessionBindError
+from ..net.postman import Delivered, Postman
 from ..store import smt
 from ..store.management import (
     CERT_PURPOSE_ROSTER,
@@ -32,7 +31,6 @@ from .lite_adapter import (
     AnchorsReply,
     GetAnchors,
     GetProof,
-    LiteAdapter,
     LiteAdapterError,
     LiteMsg,
     LiteRefused,
@@ -74,7 +72,6 @@ class GetResult:
     value: bytes
     absent: bool
     epoch: int
-    """Which keyepoch opens `value`, carried under the proof rather than beside it."""
     block_num: int
     state_root: crypto.Digest
 
@@ -90,13 +87,49 @@ class _Pending: ...
 PENDING = _Pending()
 
 
+class Request(Protocol):
+    mid: MessageId
+    peer: crypto.PublicKey
+
+    def resolve(self, client: LightClient, msg: LiteMsg, now: Millis) -> None: ...
+
+    def expire(self) -> None: ...
+
+
 @dataclass(slots=True)
-class _PendingRead:
+class Read:
+    mid: MessageId
+    peer: crypto.PublicKey
     store_id: int
     name: bytes
-    peer: crypto.PublicKey
-    sent_at: Millis
     result: GetResult | Failed | None = None
+
+    def poll(self) -> GetResult | Failed | _Pending:
+        return PENDING if self.result is None else self.result
+
+    def resolve(self, client: LightClient, msg: LiteMsg, now: Millis) -> None:
+        try:
+            client.resolve_read(self, msg, now)
+        except DudeError as e:
+            self.result = Failed(reason=f"responder reply refused: {e}")
+
+    def expire(self) -> None:
+        self.result = Failed(reason="request expired")
+
+
+@dataclass(slots=True)
+class _BootstrapRequest:
+    mid: MessageId
+    peer: crypto.PublicKey
+
+    def resolve(self, client: LightClient, msg: LiteMsg, now: Millis) -> None:
+        try:
+            client.on_bootstrap_reply(self.peer, msg, now)
+        except DudeError:
+            client.forget_bootstrap_peer(self.peer)
+
+    def expire(self) -> None:
+        pass
 
 
 @dataclass(slots=True)
@@ -106,37 +139,24 @@ class _BootstrapReply:
     anchors_reply: AnchorsReply | None = None
 
 
-type OutboxItem = tuple[crypto.PublicKey, bytes]
-
-
 @dataclass(slots=True)
 class LightClient:
     me: crypto.Keypair
     anchor: crypto.PublicKey
     postman: Postman
-    adapter: LiteAdapter = field(init=False)
 
     @property
     def tunables(self) -> Tunables:
-        """One source of truth: the Postman's. A second copy could disagree silently."""
         return self.postman.tunables
 
     state: State = State.UNBOOTSTRAPPED
     trusted_state: TrustedState | None = None
 
     _bootstrap_peers: dict[crypto.PublicKey, _BootstrapReply] = field(default_factory=dict)
-    _pending_reads: dict[bytes, _PendingRead] = field(default_factory=dict)
-    _pending_bootstrap_mids: dict[bytes, crypto.PublicKey] = field(default_factory=dict)
-    _bootstrap_retry_at: Millis = 0
-
-    _inbox: queue.SimpleQueue[Inbound] = field(default_factory=queue.SimpleQueue, init=False)
+    _inflight: dict[bytes, Request] = field(default_factory=dict)
 
     _stopping: threading.Event = field(default_factory=threading.Event, init=False)
     _thread: threading.Thread | None = field(default=None, init=False)
-    _listeners: tuple[Listener, ...] = field(default=(), init=False)
-
-    def __post_init__(self) -> None:
-        self.adapter = LiteAdapter(self.me, self.postman, self.tunables.ttl_lite)
 
     def add_bootstrap_peer(self, peer: crypto.PublicKey, endpoints: tuple[Endpoint, ...]) -> None:
         self.postman.add_peer(peer, endpoints)
@@ -148,34 +168,32 @@ class LightClient:
         if not self._bootstrap_peers:
             raise LightClientError("no bootstrap peers registered")
         self.state = State.BOOTSTRAPPING
-        self._bootstrap_retry_at = now + self.tunables.poll_interval
         self._ask_for_anchors(self._bootstrap_peers, now)
 
     def _ask_for_anchors(self, peers: Iterable[crypto.PublicKey], now: Millis) -> None:
         req = GetAnchors(known_roster_fingerprint=None, known_trusted_block=None)
         for peer in peers:
-            mid = self.adapter.send(peer, req, now)
-            self._pending_bootstrap_mids[mid] = peer
+            mid = self.postman.send(peer, req, self.tunables.ttl_lite)
+            self._inflight[mid.correlation_id] = _BootstrapRequest(mid=mid, peer=peer)
 
-    def _retry_bootstrap(self, now: Millis) -> None:
-        """A stale bootstrap reply cannot age INTO fresh -- ask a NEW question next poll rather
-        than wait longer for the same one. Re-asks only peers whose reply is missing or stale,
-        so a corroborating reply is never churned."""
-        if now < self._bootstrap_retry_at:
-            return
-        self._bootstrap_retry_at = now + self.tunables.poll_interval
+    def _ask_stale_peers(self, now: Millis) -> None:
+        waiting = {r.peer for r in self._inflight.values() if isinstance(r, _BootstrapRequest)}
         stale = [
             peer
             for peer, entry in self._bootstrap_peers.items()
-            if entry.anchors_reply is None
-            or chain.is_stale(entry.anchors_reply.head.block.bucket, now, self.tunables)
+            if peer not in waiting
+            and (
+                entry.anchors_reply is None
+                or chain.is_stale(entry.anchors_reply.head.block.bucket, now, self.tunables)
+            )
         ]
-        self._ask_for_anchors(stale, now)
+        if stale:
+            self._ask_for_anchors(stale, now)
 
     def bootstrapped(self) -> bool:
         return self.state is State.READY
 
-    def request_get(self, store_id: int, name: bytes, peer: crypto.PublicKey, now: Millis) -> bytes:
+    def request_get(self, store_id: int, name: bytes, peer: crypto.PublicKey, now: Millis) -> Read:
         if self.state is not State.READY or self.trusted_state is None:
             raise LightClientError(f"request_get in state {self.state.name}; not READY")
         req = GetProof(
@@ -187,79 +205,19 @@ class LightClient:
                 self.trusted_state.head.block_num, self.trusted_state.head.block_hash
             ),
         )
-        mid = self.adapter.send(peer, req, now)
-        self._pending_reads[mid] = _PendingRead(
-            store_id=store_id, name=name, peer=peer, sent_at=now
-        )
-        return mid
+        mid = self.postman.send(peer, req, self.tunables.ttl_lite)
+        handle = Read(mid=mid, peer=peer, store_id=store_id, name=name)
+        self._inflight[mid.correlation_id] = handle
+        return handle
 
-    def poll(self, request_id: bytes) -> GetResult | Failed | _Pending:
-        entry = self._pending_reads.get(request_id)
-        if entry is None:
-            raise LightClientError(f"unknown request_id {request_id.hex()[:8]}")
-        if entry.result is None:
-            return PENDING
-        result = entry.result
-        del self._pending_reads[request_id]
-        return result
-
-    def receive(self, frame: Frame, now: Millis, session: Session | None = None) -> None:
-        try:
-            got = self.postman.deliver(frame, now)
-            if session is not None:
-                self._bind_session(session, got.envelope.frm)
-        except DudeError:
-            return
-        env = got.envelope
-        try:
-            msg = LiteMsg.decode(env.env.verb, env.env.body)
-        except (LiteAdapterError, DudeError):
-            return
-        reply_to = env.env.reply_to
-        # A RESPONDER'S FRAME IS NOT ALLOWED TO RAISE PAST HERE. `Node.receive` puts its dispatch
-        # inside this guard; this one did not, so a `DudeError` from verifying a header -- a
-        # multisig bitmap of the wrong width was enough -- unwound through `_run`, which catches
-        # only `queue.Empty`, and killed the thread. The listener kept accepting into an inbox
-        # nobody drained, so the client looked alive and every read hung for ever.
-        if reply_to in self._pending_bootstrap_mids:
-            peer = self._pending_bootstrap_mids.pop(reply_to)
-            try:
-                self._on_bootstrap_reply(peer, msg, now)
-            except DudeError:
-                self._bootstrap_peers.pop(peer, None)
-            return
-        if reply_to in self._pending_reads:
-            try:
-                self._on_read_reply(reply_to, msg, now)
-            except DudeError as e:
-                # Resolved, not dropped: a read left PENDING never resolves, because nothing
-                # times a pending read out.
-                entry = self._pending_reads[reply_to]
-                entry.result = Failed(reason=f"responder reply refused: {e}")
-            return
-
-    def tick(self, now: Millis) -> None:
-        self.postman.tick(now)
-        if self.state is State.BOOTSTRAPPING:
-            self._retry_bootstrap(now)
+    # -- the run loop -------------------------------------------------------
 
     def start(self, *listeners: Listener) -> None:
         if self._thread is not None:
             return
-        started: list[Listener] = []
-        try:
-            self.postman.start(self._inbox)
-            for listener in listeners:
-                listener.start(self._inbox)
-                started.append(listener)
-        except Exception:
-            for listener in reversed(started):
-                with contextlib.suppress(Exception):
-                    listener.stop()
-            with contextlib.suppress(Exception):
-                self.postman.stop()
-            raise
-        self._listeners = tuple(started)
+        for listener in listeners:
+            self.postman.add_listener(listener)
+        self.postman.start()
         self._thread = threading.Thread(
             target=self._run,
             name=f"lite-{self.me.public.hex()[:8]}",
@@ -269,10 +227,6 @@ class LightClient:
 
     def stop(self, timeout: float = 5.0) -> None:
         self._stopping.set()
-        for listener in self._listeners:
-            with contextlib.suppress(Exception):
-                listener.stop()
-        self._listeners = ()
         self.postman.stop()
         thread = self._thread
         self._thread = None
@@ -280,32 +234,39 @@ class LightClient:
             thread.join(timeout=timeout)
 
     def _run(self) -> None:
-        tick_interval_ms = self.tunables.tick_interval
-        last_tick = now_ms()
+        tick_interval = self.tunables.tick_interval / 1000
         while not self._stopping.is_set():
-            try:
-                inbound = self._inbox.get(timeout=tick_interval_ms / 1000)
-                with contextlib.suppress(DudeError):
-                    self.receive(inbound.frame, now_ms(), session=inbound.session)
-            except queue.Empty:
-                pass
             now = now_ms()
-            if now - last_tick >= tick_interval_ms:
+            for output in self.postman.drain_output():
+                for d in output.delivered:
+                    self._on_delivered(d, now)
+                for e in output.expired:
+                    req = self._inflight.pop(e.prefix, None)
+                    if req is not None:
+                        req.expire()
+            if self.state is State.BOOTSTRAPPING:
                 with contextlib.suppress(DudeError):
-                    self.tick(now)
-                last_tick = now
+                    self._ask_stale_peers(now)
+            self._stopping.wait(timeout=tick_interval)
 
-    def _bind_session(self, session: Session, frm: crypto.PublicKey) -> None:
-        was_unbound = session.identity is None
+    def _on_delivered(self, d: Delivered, now: Millis) -> None:
         try:
-            session.bind(frm)
-        except SessionBindError:
-            session.close()
+            msg = LiteMsg.decode(d.verb, d.body)
+        except (LiteAdapterError, DudeError):
             return
-        if was_unbound:
-            self.postman.register_session(session)
+        if d.in_reply_to is None:
+            return
+        req = self._inflight.pop(d.in_reply_to.correlation_id, None)
+        if req is None:
+            return
+        req.resolve(self, msg, now)
 
-    def _on_bootstrap_reply(self, peer: crypto.PublicKey, msg: LiteMsg, now: Millis) -> None:
+    # -- bootstrap ----------------------------------------------------------
+
+    def forget_bootstrap_peer(self, peer: crypto.PublicKey) -> None:
+        self._bootstrap_peers.pop(peer, None)
+
+    def on_bootstrap_reply(self, peer: crypto.PublicKey, msg: LiteMsg, now: Millis) -> None:
         if self.state is not State.BOOTSTRAPPING:
             return
         if isinstance(msg, LiteRefused):
@@ -326,8 +287,6 @@ class LightClient:
         self._check_bootstrap_convergence(now)
 
     def _check_bootstrap_convergence(self, now: Millis) -> None:
-        """`f+1` agreeing AND LIVE. Agreement alone corroborates what the roster WAS; a set of
-        stale responders can all agree perfectly about a cluster that has moved on."""
         agreed: dict[crypto.Digest, list[_BootstrapReply]] = {}
         for entry in self._bootstrap_peers.values():
             if entry.fingerprint is None or entry.anchors_reply is None:
@@ -337,14 +296,16 @@ class LightClient:
             agreed.setdefault(entry.fingerprint, []).append(entry)
         for fingerprint, entries in agreed.items():
             first = entries[0]
-            assert first.bundle is not None and first.anchors_reply is not None  # noqa: S101 -- type narrowing for the checker; contract invariants above make this unreachable
+            if first.bundle is None or first.anchors_reply is None:
+                continue
             threshold = quorum.corroboration(len(first.bundle.commitment_members))
             if len(entries) >= threshold:
                 self._promote_to_ready(fingerprint, entries[0])
                 return
 
     def _promote_to_ready(self, fingerprint: crypto.Digest, corroborated: _BootstrapReply) -> None:
-        assert corroborated.bundle is not None and corroborated.anchors_reply is not None  # noqa: S101 -- type narrowing for the checker; contract invariants above make this unreachable
+        if corroborated.bundle is None or corroborated.anchors_reply is None:
+            raise LightClientError("promote_to_ready with incomplete bootstrap reply")
         bundle = corroborated.bundle
         head = corroborated.anchors_reply.head
         self.trusted_state = TrustedState(
@@ -358,8 +319,10 @@ class LightClient:
         )
         self.state = State.READY
 
-    def _on_read_reply(self, reply_to: bytes, msg: LiteMsg, now: Millis) -> None:  # noqa: PLR0911 -- each return names a distinct way a reply fails to be a trustworthy answer
-        entry = self._pending_reads[reply_to]
+    # -- read resolution ----------------------------------------------------
+
+    def resolve_read(self, req: Read, msg: LiteMsg, now: Millis) -> None:  # noqa: C901, PLR0911
+        entry = req
         if isinstance(msg, LiteRefused):
             entry.result = Failed(reason=msg.reason.value)
             if msg.reason is SyncRefusal.FORK_DETECTED:
@@ -369,10 +332,9 @@ class LightClient:
         if not isinstance(msg, ProofReply):
             entry.result = Failed(reason="unexpected reply verb")
             return
-        assert self.trusted_state is not None  # noqa: S101 -- type narrowing for the checker; contract invariants above make this unreachable
-        # A MOVED FINGERPRINT MEANS RE-BOOTSTRAP, never adopt-in-place. Adopting a roster from
-        # one responder let a granted-then-revoked manager hand a client a roster of its own keys,
-        # proven end-to-end. Corroboration is f+1 at bootstrap or it is nothing.
+        if self.trusted_state is None:
+            entry.result = Failed(reason="trusted state lost; re-bootstrap")
+            return
         if msg.roster_fingerprint != self.trusted_state.roster_fingerprint:
             entry.result = Failed(reason="roster changed; re-bootstrap")
             self.state = State.UNBOOTSTRAPPED
@@ -381,16 +343,13 @@ class LightClient:
         if not self._advance_head(msg.headers, msg.head):
             entry.result = Failed(reason="header chain-link or settle_sigs verify failed")
             return
-        assert self.trusted_state is not None  # noqa: S101 -- _advance_head keeps it non-None
+        if self.trusted_state is None:
+            entry.result = Failed(reason="trusted state lost; re-bootstrap")
+            return
         if self.trusted_state.head.block_hash != msg.head.block_hash:
-            # More blocks behind than one reply carries headers for. We ADVANCED by what it did
-            # carry, so a retry closes the gap; verifying this proof against a root we have not
-            # walked to would be trusting the responder for the very thing the proof is for.
             entry.result = Failed(reason="behind the responder; retry")
             return
         if chain.is_stale(self.trusted_state.head.bucket, now, self.tunables):
-            # Everything about this reply verifies. It is simply not CURRENT, and no signature
-            # can say so -- an old quorum-signed head is a valid one.
             entry.result = Failed(reason="responder head is stale")
             return
         try:
@@ -399,7 +358,9 @@ class LightClient:
             entry.result = Failed(reason="malformed proof")
             return
         held = None if msg.absent else (msg.value, msg.credential, msg.epoch)
-        assert self.trusted_state is not None  # noqa: S101 -- narrowing; _advance_head keeps it non-None on success
+        if self.trusted_state is None:
+            entry.result = Failed(reason="trusted state lost; re-bootstrap")
+            return
         if not smt.verify(
             self.trusted_state.head.state_root,
             entry.store_id,
@@ -420,11 +381,12 @@ class LightClient:
     def _advance_head(
         self, headers: tuple[SettledBlock, ...], responder_head: SettledBlock
     ) -> bool:
-        assert self.trusted_state is not None  # noqa: S101 -- type narrowing for the checker; contract invariants above make this unreachable
+        if self.trusted_state is None:
+            return False
         ts = self.trusted_state
         above = _contiguous_from(ts.head.block_num, (*headers, responder_head))
         if not above:
-            return True  # the responder is at our head or behind it; nothing to walk
+            return True
         walked = chain.advance(ts.head.block_hash, above, ts.roster, self.anchor)
         if isinstance(walked, chain.ChainRefusal):
             return False
@@ -433,10 +395,6 @@ class LightClient:
 
 
 def _contiguous_from(head_num: int, offered: tuple[SettledBlock, ...]) -> tuple[SettledBlock, ...]:
-    """The unbroken run starting at `head_num + 1`, and nothing past the first gap. `headers` is
-    capped, so on a far-behind client the responder's own head arrives detached from the run --
-    walking it anyway is a BROKEN_LINK that fails the whole read instead of advancing by what
-    actually arrived."""
     by_num = {b.anchors.block_num: b for b in offered}
     run: list[SettledBlock] = []
     n = head_num + 1
@@ -446,7 +404,7 @@ def _contiguous_from(head_num: int, offered: tuple[SettledBlock, ...]) -> tuple[
     return tuple(run)
 
 
-def _verify_bundle(  # noqa: C901, PLR0911 -- verification pipeline; each early-return names a distinct failure mode
+def _verify_bundle(  # noqa: C901, PLR0911
     anchor: crypto.PublicKey, bundle: RosterBundle
 ) -> bool:
     manager_pubkeys: set[crypto.PublicKey] = set()

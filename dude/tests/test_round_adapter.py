@@ -261,6 +261,15 @@ class _NoTransport:
     def send(self, address, frame):  # noqa: ARG002 -- protocol arity, unused in this stub
         raise AssertionError("test should not reach transport-level send")
 
+    def begin_connect(self, address):
+        pass
+
+    def ready(self, address):  # noqa: ARG002 -- protocol arity
+        return True
+
+    def failures(self):
+        return ()
+
 
 if __name__ == "__main__":
     unittest.main()

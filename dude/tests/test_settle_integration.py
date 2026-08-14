@@ -1,6 +1,6 @@
 """End-to-end L5: Coordinator wires RATIFIED -> Layer preview -> SETTLE_SIG exchange -> commit.
 
-The gestalt tests already demonstrate that end-to-end settlement works (a client submits, all
+`test_spaghetti_cancer` already demonstrates that end-to-end settlement works (a client submits, all
 nodes see the tx applied). These tests pin the shapes at the Coordinator's boundary: what
 happens between Round ratifying and Store advancing.
 """

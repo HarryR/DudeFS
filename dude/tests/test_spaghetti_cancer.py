@@ -1,12 +1,14 @@
-# The gestalt: every layer, joined, in one process.
+# Every layer, joined, in one process: can a cluster come up and stay up.
 #
-# Each part below has its own tests and passes them in isolation. THIS file exists to answer the
-# different question — whether isolation was the right decomposition — by making a transaction go
-# the whole way: client -> envelope -> seal -> transport -> postman -> mempool -> propose ->
-# quorum -> settle -> log, on three nodes at once.
+# NAMED FOR WHAT IT BECAME. It should be the thinnest possible layer over the public surfaces, and
+# the place where a missing abstraction announces itself by being awkward to reach. Instead it
+# hard-wires its way past them -- it drives the raw `TCPDialer` beneath any `Link`, reaches into
+# `coordinator.current_round._local_bodies` for diagnostics, and composes genesis by hand. When
+# dialling moved off the tick thread, this was the ONLY caller in the tree that broke, because it
+# was the only one holding a transport instead of asking for a link. That is the tell: a test that
+# breaks when an abstraction changes underneath it was not testing the abstraction.
 #
-# The harness is `cluster.py`; the subjects that grew their own suites are `test_sync.py`,
-# `test_collection.py` and `test_angel.py`.
+# The harness is `cluster.py`.
 
 from __future__ import annotations
 
@@ -373,10 +375,15 @@ def _submit_and_wait(  # noqa: PLR0913, PLR0917 -- one helper with all the param
         env = Envelope(target.me.public, Verb.SUBMIT, crypto.random_bytes(16), tx.raw).sign(
             sender, now_ms()
         )
+        # This is the RAW transport, below any Link -- so it does for itself what `Connectivity`
+        # does for a link: ask for a connection, and accept that the first attempt may land before
+        # the carrier's dial thread has one. The retry below is what closes that gap.
+        address = rec.endpoints[0].address
+        client.begin_connect(address)
         # Best-effort send: transient TCP hiccups are recovered by the next retry.
         # The `observed` predicate is authoritative.
         with contextlib.suppress(Exception):
-            client.send(rec.endpoints[0].address, env.seal())
+            client.send(address, env.seal())
         # One bucket between resubmissions -- next Round has a chance to pick it up.
         time.sleep(delta_ms / 1000)
         if observed():

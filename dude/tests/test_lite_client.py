@@ -243,7 +243,7 @@ class TestLightClientRead(unittest.TestCase):
         self.assertTrue(client.bootstrapped())
 
         # Now do a read.
-        rid = client.request_get(
+        req = client.request_get(
             store_id=ops.STORE_DATA,
             name=key,
             peer=c.nodes[0].me.public,
@@ -251,7 +251,7 @@ class TestLightClientRead(unittest.TestCase):
         )
         _pump(c, client, client_listener, c.clock + DELTA)
 
-        result = client.poll(rid)
+        result = req.poll()
         self.assertNotIsInstance(result, type(PENDING), "read still pending")
         self.assertIsInstance(result, GetResult, f"got {result!r}")
         assert isinstance(result, GetResult)
@@ -284,7 +284,7 @@ class TestLightClientRead(unittest.TestCase):
         _pump(c, client, client_listener, c.clock + DELTA)
         self.assertTrue(client.bootstrapped())
 
-        rid = client.request_get(
+        req = client.request_get(
             store_id=ops.STORE_DATA,
             name=key,
             peer=c.nodes[0].me.public,
@@ -320,7 +320,7 @@ class TestLightClientRead(unittest.TestCase):
             if delivered == 0:
                 break
 
-        result = client.poll(rid)
+        result = req.poll()
         self.assertIsInstance(result, Failed, f"got {result!r}")
         assert isinstance(result, Failed)
         self.assertEqual(result.reason, "proof-verify-failed")
@@ -362,11 +362,11 @@ class TestLightClientRead(unittest.TestCase):
             # last block produced makes the head legitimately stale, which is a different failure
             # wearing this test's name.
             now = _one_bucket_after_head(c)
-            rid = client.request_get(
+            req = client.request_get(
                 store_id=ops.STORE_DATA, name=key, peer=c.nodes[0].me.public, now=now
             )
             _pump(c, client, client_listener, now)
-            result = client.poll(rid)
+            result = req.poll()
             assert client.trusted_state is not None
             heads.append(client.trusted_state.head.block_num)
             if not isinstance(result, Failed):
@@ -463,13 +463,13 @@ class TestRevokedManagerCannotForgeARoster(unittest.TestCase):
         )
 
         # Steady state: one responder attaches the forged bundle to an ordinary read reply.
-        rid = client.request_get(
+        req = client.request_get(
             store_id=ops.STORE_DATA,
             name=crypto.h(b"anything"),
             peer=c.nodes[0].me.public,
             now=c.clock + DELTA,
         )
-        self.assertIsNotNone(rid)
+        self.assertIsNotNone(req)
 
         def swap(msg):
             return replace(
@@ -506,7 +506,7 @@ class TestRevokedManagerCannotForgeARoster(unittest.TestCase):
             self.assertEqual(after.roster, honest_roster, "trusted roster changed")
         self.assertIsNone(after, "client kept trusting a roster it can no longer verify")
         self.assertIs(client.state, State.UNBOOTSTRAPPED)
-        self.assertEqual(client.poll(rid), Failed(reason="roster changed; re-bootstrap"))
+        self.assertEqual(req.poll(), Failed(reason="roster changed; re-bootstrap"))
 
 
 class TestAByzantineResponderCannotKillTheClient(unittest.TestCase):
@@ -541,7 +541,7 @@ class TestAByzantineResponderCannotKillTheClient(unittest.TestCase):
         )
 
         now = _one_bucket_after_head(c)
-        rid = client.request_get(
+        req = client.request_get(
             store_id=ops.STORE_DATA, name=key, peer=c.nodes[0].me.public, now=now
         )
 
@@ -571,7 +571,7 @@ class TestAByzantineResponderCannotKillTheClient(unittest.TestCase):
                     session=inbound.session,
                 )
 
-        result = client.poll(rid)
+        result = req.poll()
         self.assertIsInstance(result, Failed, f"got {result!r}")
         assert isinstance(result, Failed)
         self.assertIn(
@@ -600,17 +600,187 @@ class TestAByzantineResponderCannotKillTheClient(unittest.TestCase):
         # at our own head it returns early and `chain.advance` is never reached.
         c.pump(c.clock + 2 * DELTA)
         now = _one_bucket_after_head(c)
-        rid = client.request_get(
+        req = client.request_get(
             store_id=ops.STORE_DATA, name=b"anything", peer=c.nodes[0].me.public, now=now
         )
         with mock.patch.object(chain, "advance", side_effect=DudeError("header check exploded")):
             _pump(c, client, client_listener, now)
 
-        result = client.poll(rid)
+        result = req.poll()
         self.assertIsInstance(result, Failed, f"read left unresolved: {result!r}")
         assert isinstance(result, Failed)
         self.assertIn("header check exploded", result.reason)
         self.assertIs(client.state, State.READY)
+
+
+class TestReadExpiry(unittest.TestCase):
+    """The postman expires messages whose TTL runs out. Before the fix, `LightClient.tick`
+    discarded those expiries, so a read whose reply never arrived stayed PENDING forever."""
+
+    def _ready_client(self):
+        c = Cluster()
+        c.put("expiry-test", b"present", now=T0)
+        c.pump(T0)
+        c.pump(c.clock + DELTA)
+        client_kp = crypto.Keypair.generate()
+        _provision_client(c, client_kp)
+        client, client_listener = _build_light_client(c, client_kp)
+        client.bootstrap(c.clock + DELTA)
+        _pump(c, client, client_listener, c.clock + DELTA)
+        _pump(c, client, client_listener, c.clock + DELTA)
+        assert client.bootstrapped()
+        return c, client, client_listener, client_kp
+
+    def test_unanswered_read_expires_instead_of_hanging(self):
+        c, client, _client_listener, _ = self._ready_client()
+        now = c.clock + DELTA
+        req = client.request_get(
+            store_id=ops.STORE_DATA,
+            name=c.token("expiry-test"),
+            peer=c.nodes[0].me.public,
+            now=now,
+        )
+        self.assertIs(req.poll(), PENDING)
+
+        deadline = now + TUNABLES.ttl_lite + 1
+        client.tick(deadline)
+
+        result = req.poll()
+        self.assertIsInstance(result, Failed, f"expected Failed, got {result!r}")
+        assert isinstance(result, Failed)
+        self.assertEqual(result.reason, "request expired")
+
+    def test_answered_read_not_affected_by_expiry_of_another(self):
+        c, client, client_listener, _ = self._ready_client()
+        now = c.clock + DELTA
+        key = c.token("expiry-test")
+
+        req_answered = client.request_get(
+            store_id=ops.STORE_DATA, name=key, peer=c.nodes[0].me.public, now=now
+        )
+        phantom = crypto.Keypair.generate().public
+        client.postman.add_peer(phantom, (Endpoint(address_of(c.nodes[1].me.public)),))
+        req_silent = client.request_get(store_id=ops.STORE_DATA, name=key, peer=phantom, now=now)
+
+        _pump(c, client, client_listener, now)
+
+        result_answered = req_answered.poll()
+        self.assertIsInstance(result_answered, GetResult, f"got {result_answered!r}")
+        self.assertIs(req_silent.poll(), PENDING)
+
+        deadline = now + TUNABLES.ttl_lite + 1
+        client.tick(deadline)
+
+        result_silent = req_silent.poll()
+        self.assertIsInstance(result_silent, Failed, f"expected Failed, got {result_silent!r}")
+        assert isinstance(result_silent, Failed)
+        self.assertEqual(result_silent.reason, "request expired")
+
+    def test_bootstrap_message_expiry_does_not_corrupt_state(self):
+        c = Cluster()
+        client_kp = crypto.Keypair.generate()
+        _provision_client(c, client_kp)
+        client, client_listener = _build_light_client(c, client_kp)
+
+        client.bootstrap(c.clock + DELTA)
+        now = c.clock + DELTA
+
+        client.tick(now)
+
+        deadline = now + TUNABLES.ttl_lite + 1
+        client.tick(deadline)
+        self.assertIs(client.state, State.BOOTSTRAPPING)
+
+        _pump(c, client, client_listener, deadline)
+        _pump(c, client, client_listener, deadline)
+        self.assertTrue(client.bootstrapped(), f"state {client.state.name}")
+
+    def test_late_reply_after_expiry_is_harmless(self):
+        c, client, client_listener, _ = self._ready_client()
+        now = c.clock + DELTA
+        req = client.request_get(
+            store_id=ops.STORE_DATA,
+            name=c.token("expiry-test"),
+            peer=c.nodes[0].me.public,
+            now=now,
+        )
+
+        deadline = now + TUNABLES.ttl_lite + 1
+        client.tick(deadline)
+        result = req.poll()
+        self.assertIsInstance(result, Failed)
+
+        _pump(c, client, client_listener, deadline)
+
+        self.assertIs(client.state, State.READY)
+        self.assertIsNotNone(client.trusted_state)
+
+
+class TestInflightBookkeeping(unittest.TestCase):
+    """`_inflight` means "messages still waiting on an answer". An entry leaves on a terminal
+    event -- a reply, or the TTL passing -- and nothing else keeps it there, so the table is
+    bounded by what is in flight within one TTL window."""
+
+    def test_bookkeeping_is_bounded_by_the_ttl_not_by_replies(self):
+        """Peers that never answer, across four TTL windows. Each tick expires what is outstanding
+        and re-asks, so the table returns to one entry per peer every time.
+
+        This is what the split tables could not do: `_pending_bootstrap_mids` was removed from on
+        reply and nowhere else, while re-asks minted a fresh mid every cycle -- so a client whose
+        peers stayed silent grew it by one per peer per window, for ever."""
+        c = Cluster()
+        client_kp = crypto.Keypair.generate()
+        _provision_client(c, client_kp)
+        client, _listener = _build_light_client(c, client_kp)
+
+        now = c.clock + DELTA
+        client.bootstrap(now)
+        peers = len(client._bootstrap_peers)
+        self.assertGreater(peers, 1, "a one-peer client would not show growth either way")
+        self.assertEqual(len(client._inflight), peers, "bootstrap did not register its asks")
+
+        seen = []
+        for _ in range(4):
+            now += TUNABLES.ttl_lite + 1
+            client.tick(now)  # expire what is outstanding, then re-ask the peers still stale
+            seen.append(len(client._inflight))
+
+        self.assertEqual(
+            seen, [peers] * 4, f"in-flight bookkeeping grew across TTL windows: {seen}"
+        )
+        self.assertIs(client.state, State.BOOTSTRAPPING, "the client gave up rather than re-asking")
+
+    def test_a_handle_still_answers_after_it_leaves_bookkeeping(self):
+        """Removing an entry is not discarding the answer. The result lives on the handle, so the
+        client can forget the message the moment it is terminal and the caller still reads it --
+        which is also why polling twice answers twice instead of raising on a forgotten id."""
+        c = Cluster()
+        c.put("handle-outlives", b"present", now=T0)
+        c.pump(T0)
+        c.pump(c.clock + DELTA)
+        client_kp = crypto.Keypair.generate()
+        _provision_client(c, client_kp)
+        client, client_listener = _build_light_client(c, client_kp)
+        client.bootstrap(c.clock + DELTA)
+        _pump(c, client, client_listener, c.clock + DELTA)
+        _pump(c, client, client_listener, c.clock + DELTA)
+        assert client.bootstrapped()
+
+        now = c.clock + DELTA
+        req = client.request_get(
+            store_id=ops.STORE_DATA,
+            name=c.token("handle-outlives"),
+            peer=c.nodes[0].me.public,
+            now=now,
+        )
+        self.assertIn(req.mid, client._inflight, "the ask was never tracked")
+
+        _pump(c, client, client_listener, now)
+
+        self.assertNotIn(req.mid, client._inflight, "a resolved request stayed in bookkeeping")
+        first = req.poll()
+        self.assertIsInstance(first, GetResult, f"got {first!r}")
+        self.assertIs(req.poll(), first, "polling twice consumed the result")
 
 
 if __name__ == "__main__":

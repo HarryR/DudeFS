@@ -182,7 +182,7 @@ class StoreReader:
 
     def head(self) -> Index:
         row = self._conn.execute("SELECT MAX(idx) FROM entry").fetchone()
-        return row[0] or 0
+        return row[0] if row[0] is not None else 0
 
     def entries(self, frm: Index = 1, to: Index | None = None) -> Iterator[Entry]:
         hi = self.head() if to is None else to

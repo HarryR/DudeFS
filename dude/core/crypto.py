@@ -38,7 +38,6 @@ class CryptoError(DudeError): ...
 
 
 class VerifyFailure(Enum):
-    INVALID = "invalid"
     BAD_SIGNATURE = "bad-signature"
     MALFORMED_KEY = "malformed-key"
 
@@ -324,7 +323,6 @@ def sign_share(sk: Seed, msg: bytes) -> Signature:
 
 
 PERSON_ENC = b"dude.enc"
-PERSON_NONCE = b"dude.nonce"
 
 
 type Secret = Master | Seed | NameKey | ValueKey | ItemKey

@@ -1,438 +1,331 @@
 from __future__ import annotations
 
 import contextlib
-import errno
 import queue
-import select
-import selectors
 import socket
 import struct
 import threading
-import time
 from dataclasses import dataclass, field
 
 from ...core.errors import DudeError
 from ...core.units import Millis, now_ms
-from ...tunables import DEFAULT
+from ...tunables import Tunables
 from ..address import Address, Scheme
 from ..envelope import MAX_FRAME_BYTES, Frame
-from ..link import LinkError, Listener, Transport
-from ..session import Inbound, Session
+from ..link import Link, LinkError, Listener, OnFrame, OnLink
 
 _LEN = struct.Struct(">I")
 
-# The one place Millis becomes seconds -- `select`, `settimeout`, `Thread.join` want floats.
-_SELECT_TIMEOUT_SEC = DEFAULT.select_timeout / 1000
-_CONNECT_TIMEOUT_SEC = DEFAULT.connect_timeout / 1000
-_SEND_TIMEOUT_SEC = DEFAULT.send_timeout / 1000
-_STOP_JOIN_SEC = DEFAULT.stop_join_timeout / 1000
+_OUTBOX_DEPTH = 64
 
 
-class TCPSession(Session):
-    __slots__ = ("_closed", "_sock")
+@dataclass(frozen=True, slots=True)
+class TCPTiming:
+    connect: Millis = 6_000
+    send: Millis = 4_000
+    idle_wait: Millis = 500
+    stop_join: Millis = 2_000
 
-    def __init__(self, sock: socket.socket, address: Address) -> None:
-        super().__init__(identity=None, address=address)
+    @classmethod
+    def for_deployment(cls, t: Tunables) -> TCPTiming:
+        return cls(connect=2 * t.rtt_max, send=2 * t.rtt_max)
+
+    @property
+    def connect_sec(self) -> float:
+        return self.connect / 1000
+
+    @property
+    def send_sec(self) -> float:
+        return self.send / 1000
+
+    @property
+    def idle_wait_sec(self) -> float:
+        return self.idle_wait / 1000
+
+    @property
+    def stop_join_sec(self) -> float:
+        return self.stop_join / 1000
+
+
+class _TCPConn:
+    __slots__ = ("_closed", "_out", "_reader", "_sock", "_writer", "link")
+
+    def __init__(
+        self,
+        sock: socket.socket,
+        address: Address,
+        timing: TCPTiming,
+        on_frame: OnFrame,
+        on_link: OnLink,
+    ) -> None:
+        sock.setblocking(True)
+        _bound_sends(sock, timing.send_sec)
         self._sock = sock
         self._closed = False
+        self._out: queue.Queue[bytes | None] = queue.Queue(maxsize=_OUTBOX_DEPTH)
 
-    def send(self, frame: Frame) -> None:
+        self.link = Link(
+            address=address,
+            identity=None,
+            _send_frame=self._enqueue,
+            _close_transport=self._shutdown,
+        )
+        on_link(self.link)
+
+        self._reader = threading.Thread(
+            target=self._read_loop, args=(on_frame,), name="tcp-rx", daemon=True
+        )
+        self._writer = threading.Thread(target=self._write_loop, name="tcp-tx", daemon=True)
+        self._reader.start()
+        self._writer.start()
+
+    def _enqueue(self, frame: Frame) -> None:
         if self._closed:
-            raise LinkError("tcp session is closed")
+            raise LinkError("tcp connection is closed")
         payload = frame.raw
         if len(payload) > MAX_FRAME_BYTES:
             raise LinkError(f"frame too large: {len(payload)} > {MAX_FRAME_BYTES}")
-        blob = _LEN.pack(len(payload)) + payload
         try:
-            self._send_bounded(blob)
-        except LinkError:
-            self._mark_closed()
-            raise
-        except OSError as e:
-            self._mark_closed()
-            raise LinkError(f"tcp session send failed: {e}") from e
-        self.last_activity = now_ms()
+            self._out.put_nowait(_LEN.pack(len(payload)) + payload)
+        except queue.Full as e:
+            raise LinkError("tcp outbox is full; peer is not reading") from e
+        self.link.last_activity = now_ms()
 
-    def _send_bounded(self, blob: bytes) -> None:
-        """`sendall` on the non-blocking socket raised BlockingIOError the moment the kernel
-        buffer filled -- backpressure became a torn-down session and a dropped consensus
-        frame, indistinguishable from packet loss. A blocked send instead waits for
-        writability up to _SEND_TIMEOUT_SEC, then fails as a LinkError the breaker can
-        price. A partial write followed by the timeout leaves the peer mid-frame, which is
-        why the caller closes the session on ANY failure here."""
-        deadline = time.monotonic() + _SEND_TIMEOUT_SEC
-        view = memoryview(blob)
-        while view:
-            try:
-                sent = self._sock.send(view)
-            except (BlockingIOError, InterruptedError):
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise LinkError("tcp session send timed out under backpressure") from None
-                _, writable, _ = select.select([], [self._sock], [], remaining)
-                if not writable:
-                    raise LinkError("tcp session send timed out under backpressure") from None
-                continue
-            view = view[sent:]
-
-    def close(self) -> None:
-        self._mark_closed()
-
-    def _notify_frame_in(self, now: Millis) -> None:
-        self.last_activity = now
-
-    def _mark_closed(self) -> None:
+    def _shutdown(self) -> None:
         if self._closed:
             return
         self._closed = True
+        with contextlib.suppress(queue.Full):
+            self._out.put_nowait(None)
         with contextlib.suppress(OSError):
             self._sock.shutdown(socket.SHUT_RDWR)
         with contextlib.suppress(OSError):
             self._sock.close()
-        if self.on_close is not None:
-            self.on_close()
+
+    def _fail(self) -> None:
+        self._shutdown()
+        self.link.notify_closed()
+
+    def _write_loop(self) -> None:
+        while True:
+            blob = self._out.get()
+            if blob is None:
+                return
+            try:
+                self._sock.sendall(blob)
+            except OSError:
+                self._fail()
+                return
+
+    def _read_loop(self, on_frame: OnFrame) -> None:
+        buf = bytearray()
+        while True:
+            try:
+                chunk = self._sock.recv(65536)
+            except OSError:
+                self._fail()
+                return
+            if not chunk:
+                self._fail()
+                return
+            buf.extend(chunk)
+            if self._extract(buf, on_frame):
+                self._fail()
+                return
+
+    def _extract(self, buf: bytearray, on_frame: OnFrame) -> bool:
+        while len(buf) >= _LEN.size:
+            (length,) = _LEN.unpack_from(buf, 0)
+            if length > MAX_FRAME_BYTES:
+                return True
+            if len(buf) < _LEN.size + length:
+                return False
+            payload = bytes(buf[_LEN.size : _LEN.size + length])
+            del buf[: _LEN.size + length]
+            try:
+                frame = Frame.decode(payload)
+            except DudeError:
+                continue
+            self.link.last_activity = now_ms()
+            on_frame(frame, self.link)
+        return False
 
 
-def _extract_and_dispatch(
-    buf: bytearray,
-    session: TCPSession,
-    buffered: list[Inbound],
-    now: Millis,
-) -> bool:
-    while len(buf) >= _LEN.size:
-        (length,) = _LEN.unpack_from(buf, 0)
-        if length > MAX_FRAME_BYTES:  # refuse BEFORE allocating what the sender claims
-            return True
-        if len(buf) < _LEN.size + length:
-            return False
-        payload = bytes(buf[_LEN.size : _LEN.size + length])
-        del buf[: _LEN.size + length]
-        try:
-            frame = Frame.decode(payload)
-        except DudeError:
-            continue
-        session._notify_frame_in(now)  # noqa: SLF001 -- same-module cooperative access
-        buffered.append(Inbound(frame, session))
-    return False
+def _bound_sends(sock: socket.socket, seconds: float) -> None:
+    whole = int(seconds)
+    with contextlib.suppress(OSError, struct.error):
+        sock.setsockopt(
+            socket.SOL_SOCKET,
+            socket.SO_SNDTIMEO,
+            struct.pack("ll", whole, int((seconds - whole) * 1_000_000)),
+        )
 
 
-@dataclass(slots=True)
-class TCPDialer(Transport, Listener):
-    _sessions: dict[Address, TCPSession] = field(init=False, default_factory=dict)
-    _read_buf: dict[socket.socket, bytearray] = field(init=False, default_factory=dict)
-    _sock_to_session: dict[socket.socket, TCPSession] = field(init=False, default_factory=dict)
-    _pending_registrations: queue.SimpleQueue[socket.socket] = field(
-        init=False, default_factory=queue.SimpleQueue
+class _DialWorker:
+    __slots__ = (
+        "_address", "_on_frame", "_on_link", "_stopping", "_thread", "_timing",
     )
-    _pending_deregistrations: queue.SimpleQueue[socket.socket] = field(
-        init=False, default_factory=queue.SimpleQueue
-    )
-    _selector: selectors.BaseSelector | None = field(init=False, default=None)
-    _buffered: list[Inbound] = field(init=False, default_factory=list)
-    _inbox: queue.SimpleQueue[Inbound] | None = field(init=False, default=None)
-    _stopping: threading.Event = field(init=False, default_factory=threading.Event)
-    _thread: threading.Thread | None = field(init=False, default=None)
 
-    def send(self, address: Address, frame: Frame) -> None:
-        if address.scheme is not Scheme.TCP:
-            raise LinkError(f"tcp cannot dial {address.scheme.value.decode()}")
-        session = self._sessions.get(address)
-        if session is None:
-            sock = self._connect(address)
-            session = TCPSession(sock, address)
-            self._sessions[address] = session
-            self._sock_to_session[sock] = session
-            self._read_buf[sock] = bytearray()
-            self._pending_registrations.put(sock)
-        try:
-            session.send(frame)
-        except LinkError:
-            self._drop_session(address, session)
-            raise
-
-    def close(self) -> None:
-        for address, session in list(self._sessions.items()):
-            self._drop_session(address, session)
-
-    def start(self, inbox: queue.SimpleQueue[Inbound]) -> None:
-        if self._inbox is inbox:
-            return
-        if self._inbox is not None:
-            raise RuntimeError("TCPDialer already started with a different inbox")
-        self._inbox = inbox
-        self._selector = selectors.DefaultSelector()
-        for sock in list(self._sock_to_session):
-            self._pending_registrations.put(sock)
-        self._thread = threading.Thread(target=self._run, name="tcp-dialer-reader", daemon=True)
+    def __init__(
+        self,
+        address: Address,
+        timing: TCPTiming,
+        on_frame: OnFrame,
+        on_link: OnLink,
+    ) -> None:
+        self._address = address
+        self._timing = timing
+        self._on_frame = on_frame
+        self._on_link = on_link
+        self._stopping = threading.Event()
+        self._thread = threading.Thread(
+            target=self._serve, name=f"tcp-dial-{address.value}", daemon=True
+        )
         self._thread.start()
 
     def stop(self) -> None:
         self._stopping.set()
-        thread = self._thread
-        self._thread = None
-        if thread is not None and thread.is_alive():
-            thread.join(timeout=_STOP_JOIN_SEC)
-        self.close()
-        if self._selector is not None:
-            with contextlib.suppress(Exception):
-                self._selector.close()
-            self._selector = None
 
-    def drain(self) -> tuple[Inbound, ...]:
-        if self._stopping.is_set():
-            return ()
-        if self._selector is None:
-            self._selector = selectors.DefaultSelector()
-        self._poll_once(timeout=0, forward_to_inbox=False)
-        out = tuple(self._buffered)
-        self._buffered.clear()
-        return out
-
-    def _connect(self, address: Address) -> socket.socket:
-        host, _, port_s = address.value.partition(":")
-        if not port_s:
-            raise LinkError(f"tcp address missing port: {address.value}")
-        try:
-            port = int(port_s)
-        except ValueError as e:
-            raise LinkError(f"tcp address has non-integer port: {address.value}") from e
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        # Unbounded, this blocking connect ran on the node's tick thread with the OS SYN
-        # timeout (minutes): one firewalled peer address stalled all consensus and sync.
-        sock.settimeout(_CONNECT_TIMEOUT_SEC)
-        try:
-            sock.connect((host, port))
-        except OSError as e:
-            sock.close()
-            raise LinkError(f"tcp connect to {address.value} failed: {e}") from e
-        sock.setblocking(False)
-        return sock
-
-    def _drop_session(self, address: Address, session: TCPSession) -> None:
-        self._sessions.pop(address, None)
-        sock = session._sock  # noqa: SLF001 -- same-module cooperative access
-        self._sock_to_session.pop(sock, None)
-        self._read_buf.pop(sock, None)
-        if self._selector is not None:
-            self._pending_deregistrations.put(sock)
-        session.close()
-
-    def _run(self) -> None:
+    def _serve(self) -> None:
         while not self._stopping.is_set():
-            self._poll_once(timeout=_SELECT_TIMEOUT_SEC, forward_to_inbox=True)
-
-    def _poll_once(self, *, timeout: float, forward_to_inbox: bool) -> None:
-        if self._selector is None:
-            return
-        self._drain_pending()
-        try:
-            events = self._selector.select(timeout=timeout)
-        except OSError:
-            return
-        for key, _events in events:
-            sock = key.fileobj
-            assert isinstance(sock, socket.socket)  # noqa: S101
-            self._read_from(sock)
-        if forward_to_inbox and self._buffered:
-            inbox = self._inbox
-            if inbox is not None:
-                for item in self._buffered:
-                    inbox.put(item)
-                self._buffered.clear()
-
-    def _drain_pending(self) -> None:
-        assert self._selector is not None  # noqa: S101
-        while True:
             try:
-                sock = self._pending_registrations.get_nowait()
-            except queue.Empty:
-                break
-            with contextlib.suppress(KeyError, ValueError):
-                self._selector.register(sock, selectors.EVENT_READ, data="outbound")
-        while True:
-            try:
-                sock = self._pending_deregistrations.get_nowait()
-            except queue.Empty:
-                break
-            with contextlib.suppress(KeyError, ValueError):
-                self._selector.unregister(sock)
+                sock = _connect(self._address, self._timing.connect_sec)
+            except LinkError:
+                self._wait()
+                continue
+            conn = _TCPConn(sock, self._address, self._timing, self._on_frame, self._on_link)
+            conn.link.on_close = lambda _ln: None  # death already notified via notify_closed
+            # block until this connection dies, then retry
+            while not conn._closed and not self._stopping.is_set():  # noqa: SLF001
+                self._stopping.wait(timeout=self._timing.idle_wait_sec)
+            self._wait()
 
-    def _read_from(self, sock: socket.socket) -> None:
-        session = self._sock_to_session.get(sock)
-        buf = self._read_buf.get(sock)
-        if session is None or buf is None:
-            self._close_sock(sock)
-            return
-        try:
-            chunk = sock.recv(65536)
-        except BlockingIOError:
-            return
-        except OSError as e:
-            if e.errno != errno.ECONNRESET:
-                pass
-            self._close_sock(sock)
-            return
-        if not chunk:
-            self._close_sock(sock)
-            return
-        buf.extend(chunk)
-        if _extract_and_dispatch(buf, session, self._buffered, now_ms()):
-            self._close_sock(sock)
+    def _wait(self) -> None:
+        self._stopping.wait(timeout=self._timing.connect_sec)
 
-    def _close_sock(self, sock: socket.socket) -> None:
-        session = self._sock_to_session.pop(sock, None)
-        self._read_buf.pop(sock, None)
-        if self._selector is not None:
-            with contextlib.suppress(KeyError, ValueError):
-                self._selector.unregister(sock)
-        if session is not None:
-            for addr, s in list(self._sessions.items()):
-                if s is session:
-                    del self._sessions[addr]
-                    break
-            session.close()
-        else:
-            with contextlib.suppress(OSError):
-                sock.close()
+
+def _connect(address: Address, timeout_sec: float) -> socket.socket:
+    host, _, port_s = address.value.partition(":")
+    if not port_s:
+        raise LinkError(f"tcp address missing port: {address.value}")
+    try:
+        port = int(port_s)
+    except ValueError as e:
+        raise LinkError(f"tcp address has non-integer port: {address.value}") from e
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(timeout_sec)
+    try:
+        sock.connect((host, port))
+    except OSError as e:
+        sock.close()
+        raise LinkError(f"tcp connect to {address.value} failed: {e}") from e
+    return sock
+
+
+@dataclass(slots=True)
+class TCPDialer(Listener):
+    timing: TCPTiming = TCPTiming()
+
+    _workers: dict[Address, _DialWorker] = field(init=False, default_factory=dict)
+    _on_frame: OnFrame | None = field(init=False, default=None)
+    _on_link: OnLink | None = field(init=False, default=None)
+    _stopping: threading.Event = field(init=False, default_factory=threading.Event)
+
+    def start(self, on_frame: OnFrame, on_link: OnLink) -> None:
+        if self._on_frame is not None:
+            raise RuntimeError("TCPDialer already started")
+        self._on_frame = on_frame
+        self._on_link = on_link
+
+    def dial(self, address: Address) -> None:
+        if address.scheme is not Scheme.TCP or self._stopping.is_set():
+            return
+        if self._on_frame is None or self._on_link is None:
+            return
+        if address not in self._workers:
+            self._workers[address] = _DialWorker(
+                address, self.timing, self._on_frame, self._on_link,
+            )
+
+    def stop(self) -> None:
+        self._stopping.set()
+        for worker in self._workers.values():
+            worker.stop()
+        self._workers.clear()
 
 
 @dataclass(slots=True)
 class TCPListener(Listener):
     listen_host: str = "127.0.0.1"
     listen_port: int = 0
-    _selector: selectors.BaseSelector = field(init=False)
+    timing: TCPTiming = TCPTiming()
     _listener: socket.socket = field(init=False)
     _bound_port: int = field(init=False, default=0)
-    _read_buf: dict[socket.socket, bytearray] = field(init=False, default_factory=dict)
-    _sessions: dict[socket.socket, TCPSession] = field(init=False, default_factory=dict)
-    _buffered: list[Inbound] = field(init=False, default_factory=list)
-    _inbox: queue.SimpleQueue[Inbound] | None = field(init=False, default=None)
+    _conns: list[_TCPConn] = field(init=False, default_factory=list)
+    _on_frame: OnFrame | None = field(init=False, default=None)
+    _on_link: OnLink | None = field(init=False, default=None)
     _stopping: threading.Event = field(init=False, default_factory=threading.Event)
     _thread: threading.Thread | None = field(init=False, default=None)
 
     def __post_init__(self) -> None:
-        self._selector = selectors.DefaultSelector()
         self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
             self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self._listener.bind((self.listen_host, self.listen_port))
-            self._listener.setblocking(False)
             self._listener.listen(128)
         except OSError:
             with contextlib.suppress(OSError):
                 self._listener.close()
-            self._selector.close()
             raise
         self._bound_port = self._listener.getsockname()[1]
-        self._selector.register(self._listener, selectors.EVENT_READ, data="listener")
+        self._thread = threading.Thread(
+            target=self._accept_loop, name=f"tcp-accept-{self._bound_port}", daemon=True
+        )
+        self._thread.start()
 
     @property
     def bound_address(self) -> Address:
         return Address(Scheme.TCP, f"{self.listen_host}:{self._bound_port}")
 
-    def start(self, inbox: queue.SimpleQueue[Inbound]) -> None:
-        if self._inbox is inbox:
-            return
-        if self._inbox is not None:
-            raise RuntimeError("TCPListener already started with a different inbox")
-        self._inbox = inbox
-        self._thread = threading.Thread(
-            target=self._run, name=f"tcp-listener-{self._bound_port}", daemon=True
-        )
-        self._thread.start()
+    def start(self, on_frame: OnFrame, on_link: OnLink) -> None:
+        if self._on_frame is not None:
+            raise RuntimeError("TCPListener already started")
+        self._on_frame = on_frame
+        self._on_link = on_link
+
+    def dial(self, address: Address) -> None:
+        pass
 
     def stop(self) -> None:
         self._stopping.set()
         with contextlib.suppress(OSError):
             self._listener.shutdown(socket.SHUT_RDWR)
+        with contextlib.suppress(OSError):
+            self._listener.close()
         thread = self._thread
         self._thread = None
         if thread is not None and thread.is_alive():
-            thread.join(timeout=_STOP_JOIN_SEC)
-        self._close_all()
+            thread.join(timeout=self.timing.stop_join_sec)
+        for conn in self._conns:
+            conn.link.close()
+        self._conns.clear()
 
-    def drain(self) -> tuple[Inbound, ...]:
-        if self._stopping.is_set():
-            return ()
-        self._poll_once(timeout=0, forward_to_inbox=False)
-        out = tuple(self._buffered)
-        self._buffered.clear()
-        return out
-
-    def _run(self) -> None:
+    def _accept_loop(self) -> None:
         while not self._stopping.is_set():
-            self._poll_once(timeout=_SELECT_TIMEOUT_SEC, forward_to_inbox=True)
-
-    def _poll_once(self, *, timeout: float, forward_to_inbox: bool) -> None:
-        try:
-            events = self._selector.select(timeout=timeout)
-        except OSError:
-            return
-        for key, _events in events:
-            sock = key.fileobj
-            assert isinstance(sock, socket.socket)  # noqa: S101
-            if key.data == "listener":
-                self._accept()
-            else:
-                self._read_from(sock)
-        if forward_to_inbox and self._buffered:
-            inbox = self._inbox
-            if inbox is not None:
-                for item in self._buffered:
-                    inbox.put(item)
-                self._buffered.clear()
-
-    def _accept(self) -> None:
-        while True:
             try:
-                conn, peer_addr = self._listener.accept()
-            except (BlockingIOError, OSError):
+                conn_sock, peer_addr = self._listener.accept()
+            except OSError:
                 return
-            conn.setblocking(False)
-            self._read_buf[conn] = bytearray()
+            if self._on_frame is None or self._on_link is None:
+                conn_sock.close()
+                continue
             host, port = peer_addr[:2]
-            self._sessions[conn] = TCPSession(conn, Address(Scheme.TCP, f"{host}:{port}"))
-            self._selector.register(conn, selectors.EVENT_READ, data="incoming")
-
-    def _read_from(self, sock: socket.socket) -> None:
-        buf = self._read_buf.get(sock)
-        session = self._sessions.get(sock)
-        if buf is None or session is None:
-            self._closesock(sock)
-            return
-        try:
-            chunk = sock.recv(65536)
-        except BlockingIOError:
-            return
-        except OSError as e:
-            if e.errno != errno.ECONNRESET:
-                pass
-            self._closesock(sock)
-            return
-        if not chunk:
-            self._closesock(sock)
-            return
-        buf.extend(chunk)
-        if _extract_and_dispatch(buf, session, self._buffered, now_ms()):
-            self._closesock(sock)
-
-    def _closesock(self, sock: socket.socket) -> None:
-        self._read_buf.pop(sock, None)
-        session = self._sessions.pop(sock, None)
-        with contextlib.suppress(KeyError, ValueError):
-            self._selector.unregister(sock)
-        if session is not None:
-            session.close()
-        else:
-            with contextlib.suppress(OSError):
-                sock.close()
-
-    def _close_all(self) -> None:
-        for sock in list(self._read_buf):
-            self._closesock(sock)
-        if self._listener.fileno() != -1:
-            with contextlib.suppress(KeyError, ValueError):
-                self._selector.unregister(self._listener)
-            self._listener.close()
-        with contextlib.suppress(Exception):
-            self._selector.close()
+            conn = _TCPConn(
+                conn_sock,
+                Address(Scheme.TCP, f"{host}:{port}"),
+                self.timing,
+                self._on_frame,
+                self._on_link,
+            )
+            self._conns.append(conn)
+            self._conns = [c for c in self._conns if not c._closed]  # noqa: SLF001
