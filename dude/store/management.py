@@ -1,4 +1,3 @@
-from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
@@ -39,7 +38,7 @@ class Cert:
     sig: crypto.Signature
 
     @classmethod
-    def sign(cls, signer: crypto.Keypair, subject: bytes, purpose: bytes) -> Cert:
+    def sign(cls, signer: crypto.Keypair, subject: bytes, purpose: bytes) -> "Cert":
         return cls(
             signer.public,
             subject,
@@ -48,15 +47,15 @@ class Cert:
         )
 
     @classmethod
-    def sign_grant(cls, signer: crypto.Keypair, subject: crypto.PublicKey, role: Role) -> Cert:
+    def sign_grant(cls, signer: crypto.Keypair, subject: crypto.PublicKey, role: Role) -> "Cert":
         return cls.sign(signer, bytes(subject), role.value)
 
     @classmethod
-    def sign_roster(cls, signer: crypto.Keypair, subject: crypto.PublicKey) -> Cert:
+    def sign_roster(cls, signer: crypto.Keypair, subject: crypto.PublicKey) -> "Cert":
         return cls.sign(signer, bytes(subject), CERT_PURPOSE_ROSTER)
 
     @classmethod
-    def sign_roster_commitment(cls, signer: crypto.Keypair, commitment_bytes: bytes) -> Cert:
+    def sign_roster_commitment(cls, signer: crypto.Keypair, commitment_bytes: bytes) -> "Cert":
         return cls.sign(signer, crypto.h(commitment_bytes), CERT_PURPOSE_ROSTER_COMMITMENT)
 
     def verify(self) -> bool:
@@ -66,7 +65,7 @@ class Cert:
         return codec.encode([self.signer, self.subject, self.purpose, self.sig])
 
     @classmethod
-    def decode(cls, raw: bytes) -> Cert:
+    def decode(cls, raw: bytes) -> "Cert":
         try:
             p = codec.as_seq(codec.decode(raw), 4)
             return cls(
@@ -121,7 +120,7 @@ class NodeRecord:
         )
 
     @classmethod
-    def decode(cls, raw: bytes) -> NodeRecord:
+    def decode(cls, raw: bytes) -> "NodeRecord":
         f = codec.as_seq(codec.decode(raw), 4)
         identity = crypto.PublicKey(codec.as_bytes(f[0]))
         endpoints = tuple(Endpoint.parse(codec.as_bytes(e)) for e in codec.as_seq(f[1]))
@@ -139,7 +138,7 @@ class NodeRecord:
         )
 
     @classmethod
-    def decode_row(cls, identity: crypto.PublicKey, raw: bytes) -> NodeRecord:
+    def decode_row(cls, identity: crypto.PublicKey, raw: bytes) -> "NodeRecord":
         f = codec.as_seq(codec.decode(raw), 3)
         endpoints = tuple(Endpoint.parse(codec.as_bytes(e)) for e in codec.as_seq(f[0]))
         domains = frozenset(codec.as_bytes(d) for d in codec.as_seq(f[1]))
@@ -199,7 +198,7 @@ class RosterCommitment:
         )
 
     @classmethod
-    def decode_row(cls, raw: bytes) -> RosterCommitment:
+    def decode_row(cls, raw: bytes) -> "RosterCommitment":
         try:
             f = codec.as_seq(codec.decode(raw), 4)
             return cls(
@@ -232,7 +231,7 @@ class Grant:
         )
 
     @classmethod
-    def decode(cls, raw: bytes) -> Grant:
+    def decode(cls, raw: bytes) -> "Grant":
         f = codec.as_seq(codec.decode(raw), 5)
         identity = crypto.PublicKey(codec.as_bytes(f[0]))
         role_bytes = codec.as_bytes(f[1])
@@ -256,7 +255,7 @@ class Grant:
         )
 
     @classmethod
-    def decode_row(cls, identity: crypto.PublicKey, raw: bytes) -> Grant:
+    def decode_row(cls, identity: crypto.PublicKey, raw: bytes) -> "Grant":
         f = codec.as_seq(codec.decode(raw), 4)
         role_bytes = codec.as_bytes(f[0])
         try:
@@ -271,6 +270,11 @@ class Grant:
 
 P_NODE = b"node/"
 P_GRANT = b"grant/"
+
+from .managed import ManagedMap, MapEntry
+
+NODES_MAP = ManagedMap(P_NODE)
+GRANTS_MAP = ManagedMap(P_GRANT)
 P_POP = b"pop/"
 P_WRAP = b"wrap/"
 P_BLIND = b"blind/"
@@ -300,7 +304,7 @@ def blind_key(store_id: int, who: crypto.PublicKey) -> bytes:
     return P_BLIND + _store_key(store_id) + who
 
 
-def _wrap_key(store_id: int, epoch: int, who: crypto.PublicKey) -> bytes:
+def wrap_key(store_id: int, epoch: int, who: crypto.PublicKey) -> bytes:
     return P_WRAP + _store_key(store_id) + epoch.to_bytes(8, "big") + who
 
 
@@ -318,27 +322,35 @@ class Attestation:
 def attestations_by(
     src: Reader, signer: crypto.PublicKey, store_id: int = ops.STORE_MANAGEMENT
 ) -> tuple[Attestation, ...]:
+    nodes_map = ManagedMap(P_NODE, store_id)
+    grants_map = ManagedMap(P_GRANT, store_id)
     out: list[Attestation] = []
-    for name, _prov, value, _ep in src.prefix(store_id, P_NODE):
-        who = crypto.PublicKey(name[len(P_NODE) :])
+    for key in nodes_map.keys(src):
+        who = crypto.PublicKey(key)
+        entry = nodes_map.entry(src, key)
+        if entry is None:
+            continue
         try:
-            rec = NodeRecord.decode_row(who, value)
+            rec = NodeRecord.decode_row(who, entry.value)
         except DudeError:
             continue
         if rec.cert.signer == signer:
-            out.append(Attestation(name, CERT_PURPOSE_ROSTER, bytes(who)))
-    for name, _prov, value, _ep in src.prefix(store_id, P_GRANT):
-        who = crypto.PublicKey(name[len(P_GRANT) :])
+            out.append(Attestation(nodes_map._entry_name(key), CERT_PURPOSE_ROSTER, bytes(who)))
+    for key in grants_map.keys(src):
+        who = crypto.PublicKey(key)
+        entry = grants_map.entry(src, key)
+        if entry is None:
+            continue
         try:
-            grant = Grant.decode_row(who, value)
+            grant = Grant.decode_row(who, entry.value)
         except DudeError:
             continue
         if grant.cert.signer == signer:
-            out.append(Attestation(name, grant.role.value, bytes(who)))
+            out.append(Attestation(grants_map._entry_name(key), grant.role.value, bytes(who)))
     raw = src.get(store_id, P_ROSTER)
     if raw is not None:
         try:
-            rc = RosterCommitment.decode_row(raw[1])
+            rc = RosterCommitment.decode_row(raw.value)
         except DudeError:
             return tuple(sorted(out, key=lambda a: a.key))
         if rc.cert.signer == signer:
@@ -352,15 +364,14 @@ class MgmtReader:
         self.store_id = store_id
 
     def nodes(self) -> dict[crypto.PublicKey, NodeRecord]:
-        """A row that will not decode is a row this reader does not have. Raising here instead
-        made one garbage settled row a poison pill: every roster() caller -- coordinator,
-        follower, peer reconcile -- raised on every read, restart replayed the row, and the
-        repair needed the consensus it had killed."""
         out: dict[crypto.PublicKey, NodeRecord] = {}
-        for name, _prov, value, _ep in self.src.prefix(self.store_id, P_NODE):
-            who = crypto.PublicKey(name[len(P_NODE) :])
+        for key in NODES_MAP.keys(self.src):
+            who = crypto.PublicKey(key)
+            entry = NODES_MAP.entry(self.src, key)
+            if entry is None:
+                continue
             try:
-                out[who] = NodeRecord.decode_row(who, value)
+                out[who] = NodeRecord.decode_row(who, entry.value)
             except DudeError:
                 continue
         return out
@@ -379,14 +390,11 @@ class MgmtReader:
         return tuple(sorted(who for who, rec in self.nodes().items() if self._seats(who, rec)))
 
     def is_member(self, who: crypto.PublicKey) -> bool:
-        """One row read and ONE signature verified, against `roster()`'s one per member. This
-        runs on the submit path for every transaction a client offers, where walking the whole
-        roster made each submission cost a verification per node."""
-        raw = self.src.get(self.store_id, P_NODE + who)
-        if raw is None:
+        entry = NODES_MAP.entry(self.src, who)
+        if entry is None:
             return False
         try:
-            rec = NodeRecord.decode_row(who, raw.value)
+            rec = NodeRecord.decode_row(who, entry.value)
         except DudeError:
             return False
         return self._seats(who, rec)
@@ -422,10 +430,21 @@ class MgmtReader:
             )
         return False
 
+    def authorized_identities(self) -> frozenset[crypto.PublicKey]:
+        out: set[crypto.PublicKey] = set()
+        anchor = self.src.anchor()
+        if anchor is not None:
+            out.add(anchor)
+        for key in GRANTS_MAP.keys(self.src):
+            who = crypto.PublicKey(key)
+            if self.valid_grant(self.src, who) is not None:
+                out.add(who)
+        return frozenset(out)
+
     def manager_grants(self) -> tuple[Grant, ...]:
         out: list[Grant] = []
-        for name, _prov, _value, _ep in self.src.prefix(self.store_id, P_GRANT):
-            who = crypto.PublicKey(name[len(P_GRANT) :])
+        for key in GRANTS_MAP.keys(self.src):
+            who = crypto.PublicKey(key)
             grant = self._read_grant(self.src, who)
             if grant is None or grant.role is not Role.MANAGER:
                 continue
@@ -440,7 +459,7 @@ class MgmtReader:
         if raw is None:
             return None
         try:
-            rc = RosterCommitment.decode_row(raw[1])
+            rc = RosterCommitment.decode_row(raw.value)
         except DudeError:
             return None
         if not rc.attests():
@@ -457,21 +476,19 @@ class MgmtReader:
         rec = self.nodes().get(who)
         return rec.endpoints if rec else ()
 
-    def _read_grant(self, reader: Reader, who: crypto.PublicKey) -> Grant | None:
-        raw = reader.get(self.store_id, P_GRANT + who)
-        if raw is None:
+    def _read_grant(self, reader: Reader, who: crypto.PublicKey) -> "Grant | None":
+        entry = GRANTS_MAP.entry(reader, who)
+        if entry is None:
             return None
         try:
-            return Grant.decode_row(who, raw[1])
+            return Grant.decode_row(who, entry.value)
         except DudeError:
-            # A garbage grant row must read as "no grant" (AUTHORITY refusal), not raise out of
-            # `may_write` mid-settlement and take commit_block down with it.
             return None
 
-    def grant_of(self, who: crypto.PublicKey) -> Grant | None:
+    def grant_of(self, who: crypto.PublicKey) -> "Grant | None":
         return self._read_grant(self.src, who)
 
-    def valid_grant(self, reader: Reader, who: crypto.PublicKey) -> Grant | None:
+    def valid_grant(self, reader: Reader, who: crypto.PublicKey) -> "Grant | None":
         """A grant whose cert still traces to an authorised signer. Read on EVERY request against
         current state: a grant issued by a manager since revoked has no standing, and caching it
         at connect time is how a revoked identity keeps working."""
@@ -537,7 +554,7 @@ class MgmtReader:
 
     def possession_proof(self, who: crypto.PublicKey) -> crypto.Signature | None:
         raw = self.src.get(self.store_id, P_POP + who)
-        return crypto.Signature(raw[1]) if raw else None
+        return crypto.Signature(raw.value) if raw else None
 
     def epoch_target(self, name: bytes) -> int | None:
         """Which store's keyepoch this management row carries, or None if it carries none. Lets
@@ -556,16 +573,12 @@ class MgmtReader:
         return codec.as_int(codec.decode(raw.value)) if raw else ops.EPOCH_NONE
 
     def wraps_for(self, store_id: int, who: crypto.PublicKey) -> dict[int, crypto.SealedBlob]:
-        """Every keyepoch of ONE store this identity was minted a wrap for. Scans the store's
-        prefix and filters on the trailing pubkey: the row key is `P_WRAP + store + epoch + who`,
-        so one store's wraps sit together and one rotation writes a contiguous run."""
+        cur = self.current_epoch(store_id)
         out: dict[int, crypto.SealedBlob] = {}
-        pre = P_WRAP + _store_key(store_id)
-        for row in self.src.prefix(self.store_id, pre):
-            body = row.name[len(pre) :]
-            if len(body) != 8 + len(who) or body[8:] != who:
-                continue
-            out[int.from_bytes(body[:8], "big")] = crypto.SealedBlob(row.value)
+        for epoch in range(1, cur + 1):
+            raw = self.src.get(self.store_id, wrap_key(store_id, epoch, who))
+            if raw is not None:
+                out[epoch] = crypto.SealedBlob(raw.value)
         return out
 
     def blinding_wrap(self, store_id: int, who: crypto.PublicKey) -> crypto.SealedBlob | None:
@@ -625,11 +638,15 @@ class MgmtWriter(MgmtReader):
                     f"cert for node {rec.identity.hex()[:8]} does not verify or signer "
                     f"is not authorised"
                 )
-        steps: list[ops.Mutation] = []
+        tx = ops.Transaction(())
         for who in remove:
-            steps.append(ops.Del(self.store_id, P_NODE + who))
-            steps.append(ops.Del(self.store_id, P_POP + who))
-        steps.extend(ops.Set(self.store_id, P_NODE + rec.identity, rec.encode_row()) for rec in add)
+            tx = tx + NODES_MAP.remove(self.src, who)
+            tx = tx + ops.writes(ops.Del(self.store_id, P_POP + who))
+        if add:
+            tx = tx + NODES_MAP.batch_add(
+                self.src,
+                tuple((bytes(rec.identity), rec.encode_row()) for rec in add),
+            )
         current = self.roster_commitment()
         next_serial = (current.serial + 1) if current is not None else 1
         members = tuple(after)
@@ -643,8 +660,8 @@ class MgmtWriter(MgmtReader):
                 f"to sign the roster commitment (must be anchor or a valid manager)"
             )
         commitment = RosterCommitment(next_serial, members, state_fingerprint, commitment_cert)
-        steps.append(ops.Set(self.store_id, P_ROSTER, commitment.encode_row()))
-        return ops.writes(*steps)
+        tx = tx + ops.writes(ops.Set(self.store_id, P_ROSTER, commitment.encode_row()))
+        return tx
 
     def add_node(
         self,
@@ -690,9 +707,9 @@ class MgmtWriter(MgmtReader):
                 f"cert does not verify or signer is not authorised for role {role.name}"
             )
         record = Grant(who, role, stores, kinds, cert).encode_row()
-        return ops.writes(
-            ops.Set(self.store_id, P_GRANT + who, record),
-            ops.Set(self.store_id, P_POP + who, pop),
+        return (
+            GRANTS_MAP.add(self.src, who, record)
+            + ops.writes(ops.Set(self.store_id, P_POP + who, pop))
         )
 
     def revoke(self, who: crypto.PublicKey, *, reissue_signer: crypto.Keypair) -> ops.Transaction:
@@ -717,32 +734,41 @@ class MgmtWriter(MgmtReader):
                 f"reissue_signer {reissue_signer.public.hex()[:8]} is not the anchor"
             )
         attested = attestations_by(self.src, who, self.store_id)
-        steps: list[ops.Mutation] = [self._reissue(att, reissue_signer) for att in attested]
-        steps.append(ops.Del(self.store_id, P_GRANT + who))
-        steps.append(ops.Del(self.store_id, P_POP + who))
-        return ops.writes(*steps)
+        tx = ops.Transaction(())
+        for att in attested:
+            tx = tx + self._reissue(att, reissue_signer)
+        tx = tx + GRANTS_MAP.remove(self.src, who)
+        tx = tx + ops.writes(ops.Del(self.store_id, P_POP + who))
+        return tx
 
-    def _reissue(self, att: Attestation, signer: crypto.Keypair) -> ops.Mutation:
-        raw = self.src.get(self.store_id, att.key)
-        if raw is None:
-            raise ManagementError(f"row {att.key!r} vanished while composing a revocation")
+    def _reissue(self, att: Attestation, signer: crypto.Keypair) -> ops.Transaction:
         if att.key == P_ROSTER:
-            rc = RosterCommitment.decode_row(raw[1])
+            raw = self.src.get(self.store_id, P_ROSTER)
+            if raw is None:
+                raise ManagementError("roster row vanished while composing a revocation")
+            rc = RosterCommitment.decode_row(raw.value)
             cert = Cert.sign_roster_commitment(
                 signer, RosterCommitment.content(rc.serial, rc.members, rc.state_fingerprint)
             )
             self._require_signer(cert)
-            return ops.Set(self.store_id, P_ROSTER, replace(rc, cert=cert).encode_row())
+            return ops.writes(ops.Set(self.store_id, P_ROSTER, replace(rc, cert=cert).encode_row()))
         identity = crypto.PublicKey(att.subject)
-        if att.key.startswith(P_NODE):
-            rec = NodeRecord.decode_row(identity, raw[1])
+        is_node = att.key == NODES_MAP._entry_name(identity)
+        target_map = NODES_MAP if is_node else GRANTS_MAP
+        entry = target_map.entry(self.src, identity)
+        if entry is None:
+            raise ManagementError(f"row {att.key!r} vanished while composing a revocation")
+        if is_node:
+            rec = NodeRecord.decode_row(identity, entry.value)
             cert = Cert.sign_roster(signer, identity)
             self._require_signer(cert)
-            return ops.Set(self.store_id, att.key, replace(rec, cert=cert).encode_row())
-        grant = Grant.decode_row(identity, raw[1])
-        cert = Cert.sign_grant(signer, identity, grant.role)
-        self._require_signer(cert)
-        return ops.Set(self.store_id, att.key, replace(grant, cert=cert).encode_row())
+            new_value = replace(rec, cert=cert).encode_row()
+        else:
+            grant = Grant.decode_row(identity, entry.value)
+            cert = Cert.sign_grant(signer, identity, grant.role)
+            self._require_signer(cert)
+            new_value = replace(grant, cert=cert).encode_row()
+        return target_map.tx_update(identity, new_value, entry)
 
     def _require_signer(self, cert: Cert) -> None:
         if not self.verify_cert(cert, self.src):
@@ -765,7 +791,7 @@ class MgmtWriter(MgmtReader):
         point: the keys and the grant say the same thing."""
         return ops.writes(
             ops.Set(self.store_id, blind_key(store_id, who), blinding),
-            *(ops.Set(self.store_id, _wrap_key(store_id, e, who), wraps[e]) for e in sorted(wraps)),
+            *(ops.Set(self.store_id, wrap_key(store_id, e, who), wraps[e]) for e in sorted(wraps)),
         )
 
     def rotate(
@@ -785,7 +811,7 @@ class MgmtWriter(MgmtReader):
         to = from_epoch + 1
         steps = [ops.Step((), ops.Set(self.store_id, epoch_key(store_id), codec.encode(to)))]
         steps += [
-            ops.Step((), ops.Set(self.store_id, _wrap_key(store_id, to, who), wraps[who]))
+            ops.Step((), ops.Set(self.store_id, wrap_key(store_id, to, who), wraps[who]))
             for who in sorted(wraps)
         ]
         blind = blinding or {}

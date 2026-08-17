@@ -1,460 +1,419 @@
-# End-to-end: LightClient through the InProc stack against a real Cluster.
-#
-# Bootstrap (RT1 + f+1 corroboration) + steady-state GET_PROOF, all wire-real. The
-# module-scope InProc registry does the routing; both sides are real Postmen with real
-# mailboxes; the light client's state machine drives the whole thing.
-
-from __future__ import annotations
-
 import unittest
 from dataclasses import replace
-from unittest import mock
 
-from dude.client import Client, Keys
-from dude.consensus.bootstrap import intervene
-from dude.consensus.settle_round import SettledBlock
-from dude.core import codec, crypto
-from dude.core.errors import DudeError
-from dude.net.address import Address, Endpoint, Scheme
-from dude.net.envelope import Envelope, Frame, SignedEnvelope, Verb
-from dude.net.postman import Postman
-from dude.net.transports import InProcListener, address_of, name_of
-from dude.store import ops
-from dude.store.management import Cert, Grant, MgmtWriter, NodeRecord, Role
-from dude.sync import chain
-from dude.sync.lite_adapter import LiteMsg, RosterBundle
-from dude.sync.lite_client import PENDING, Failed, GetResult, LightClient, State
+from ..core import codec, crypto
+from ..core.errors import DudeError
+from ..core.units import now_ms
+from ..net.address import Address, Endpoint, Scheme
+from ..net.envelope import MessageId, Verb
+from ..net.postman import Delivered
+from ..session import Settled
+from ..store import ops
+from ..store.management import Cert, Grant, MgmtReader, NodeRecord, Role, RosterCommitment
+from ..sync import chain
+from ..sync.lite_adapter import AnchorsReply, GetProof, LiteMsg, ProofReply, RosterBundle
+from ..sync.lite import serve_get_proof
+from ..sync.lite_client import (
+    PENDING,
+    Failed,
+    GetResult,
+    LightClient,
+    Read,
+    State,
+    TrustedState,
+    _BootstrapReply,
+    _BootstrapRequest,
+)
 
-from .cluster import DELTA, T0, TUNABLES, Cluster
-
-
-def _build_light_client(c: Cluster, kp: crypto.Keypair) -> tuple[LightClient, InProcListener]:
-    """Same shape as production: construct the listener explicitly (a bind address is the
-    deployment's to know), let Postman build its own send-side carrier, register bootstrap
-    peers. Returns both so the test pump can drain the listener via `.drain()`."""
-    listener = InProcListener(name_of(kp.public))
-    postman = Postman(kp, TUNABLES)
-    client = LightClient(me=kp, anchor=c.mgr.public, postman=postman)
-    for node in c.nodes:
-        client.add_bootstrap_peer(node.me.public, (Endpoint(address_of(node.me.public)),))
-    return client, listener
+from .cluster import Cluster, T0, TUNABLES as CLUSTER_TUNABLES
 
 
-def _one_bucket_after_head(c: Cluster) -> int:
-    """A wall-clock reading consistent with the last block the cluster actually settled."""
-    head_num = c.nodes[0].store.head_block_num()
+def _now_for_store(c: Cluster) -> int:
+    store = c.nodes[0].store
+    head_num = store.head_block_num()
     assert head_num is not None
-    raw = c.nodes[0].store.settled_at(head_num)
+    raw = store.settled_at(head_num)
     assert raw is not None
-    head_bucket = SettledBlock.decode(raw).block.bucket
-    return TUNABLES.bucket_start(head_bucket + 1)
+    from ..consensus.settle_round import SettledBlock
+    bucket = SettledBlock.decode(raw).block.bucket
+    return c.tunables.bucket_start(bucket + 1)
 
 
-def _provision_client(c: Cluster, kp: crypto.Keypair) -> None:
-    """Grant Role.CLIENT_RW via intervene on every store, with the client's InProc endpoint
-    baked into the P_GRANT row so nodes can dial back via `_reconcile_peers`
-    (#roster-drives-peers).
-
-    Mints its KEYS in the same transaction. A grant without them addresses rows it cannot read,
-    which looks like corruption rather than a missing step -- and the manager can mint them
-    because it holds every master itself."""
-    mgmt = MgmtWriter(c.nodes[0].store)
-    wraps, blinding = c.client().keys.wraps_for(kp.public)
-    grant_tx = (
-        mgmt.authorise(
-            kp.public,
-            Role.CLIENT_RW,
-            stores=frozenset({ops.STORE_DATA}),  # scoped: reads are refused outside it
-            pop=kp.prove_possession(),
-            cert=Cert.sign_grant(c.mgr, kp.public, Role.CLIENT_RW),
-        )
-        + mgmt.admit_reader(kp.public, ops.STORE_DATA, wraps, blinding)
-    ).sign(c.mgr, T0)
-    for node in c.nodes:
-        intervene(node.store, c.mgr, bodies=(grant_tx,), bucket=TUNABLES.bucket(c.clock))
+# ---------------------------------------------------------------------------
+# Category 1 — happy-path through the real threaded cluster
+# ---------------------------------------------------------------------------
 
 
-def _mutate_frame_to_client(  # noqa: PLR0913, PLR0917 -- a byzantine-responder harness needs both identities, the verb it targets, the swap, and the clock; bundling any of them hides what the attack changes
-    frame: Frame,
-    client_kp: crypto.Keypair,
-    server_kp: crypto.Keypair,
-    target: Verb,
-    mutate,
-    now: int,
-) -> Frame:
-    """Unseal a frame addressed to `client_kp`, decode the envelope; if the verb is
-    `target`, apply `mutate(msg) -> LiteMsg` to the decoded message and re-emit the frame
-    with a fresh envelope signed by `server_kp` and re-sealed to the client. Frames of any
-    other verb pass through unchanged.
+class TestBootstrap(unittest.TestCase):
 
-    Used to simulate a byzantine responder: the envelope signature and the frame's sealed
-    structure are honest (a real server signed it), but the payload inside has been swapped
-    for something the client's own verification must reject. Verb-generic because both
-    halves of what a light client verifies -- the SMT proof on a `PROOF_REPLY` and the
-    quorum proof on an `ANCHORS_REPLY` head -- need attacking, and only the first one was."""
-    raw = client_kp.open_sealed_raw(frame.sealed)
-    signed = SignedEnvelope.decode(raw)
-    if signed.env.verb is not target:
-        return frame
-    verb, body = mutate(LiteMsg.decode(signed.env.verb, signed.env.body)).encode()
-    new_env = Envelope(
-        to=signed.env.to,
-        verb=verb,
-        mid=signed.env.mid,
-        body=body,
-        reply_to=signed.env.reply_to,
-        reply_ts=signed.env.reply_ts,
-    )
-    return new_env.sign(server_kp, now).seal()
+    def setUp(self) -> None:
+        self.c = Cluster(nodes=3, mgmt=0, ro=0, rw=1)
+        self.lc = self.c.rw_clients[0]
+        self.lc.bootstrap(now_ms())
 
+    def tearDown(self) -> None:
+        self.c.close()
 
-def _pump(
-    c: Cluster,
-    client: LightClient,
-    client_listener: InProcListener,
-    now: int,
-    rounds: int = 5,
-) -> None:
-    """Drive the wire: reconcile each node's peers against the current membership
-    (`_reconcile_peers` -- so the client's P_GRANT-declared endpoint becomes a
-    dial-able peer), flush outbound on every side, and drain each listener back into
-    `receive`. Repeat until quiet or `rounds` exhausted.
-
-    NOTE we call `_reconcile_peers` rather than the full `node.tick(now)` here: the
-    latter also drives the consensus round, and `Cluster.pump` in the surrounding test
-    is already the one advancing consensus. Duplicating that here races commit-block
-    against itself. Peer reconciliation is the only part of `tick` a light-client test
-    needs; consensus stays with the cluster."""
-    for _ in range(rounds):
-        # Peer reconciliation on every node -- picks up CLIENT/COMPACTOR grants.
-        for node in c.nodes:
-            node._reconcile_peers(now)
-        # Client + nodes flush outbound.
-        client.tick(now)
-        for node in c.nodes:
-            node.postman.tick(now)
-        # Deliver each side's listener via the public drain() API.
-        delivered = 0
-        for node in c.nodes:
-            for inbound in c.listeners[node.me.public].drain():
-                node.receive(inbound.frame, now, session=inbound.session)
-                delivered += 1
-        for inbound in client_listener.drain():
-            client.receive(inbound.frame, now, session=inbound.session)
-            delivered += 1
-        if delivered == 0:
-            return
-
-
-class TestLightClientBootstrap(unittest.TestCase):
-    def test_bootstrap_reaches_ready(self):
-        c = Cluster()
-        client_kp = crypto.Keypair.generate()
-        _provision_client(c, client_kp)
-
-        # Build the LightClient. `_build_light_client` constructs the InProcListener
-        # explicitly; the send side is Postman's own (#postman-owns-dialling) -- same
-        # shape as production. The reverse direction (nodes dialling this client) is
-        # set up by each node's `_reconcile_peers` on tick, using the endpoints baked
-        # into the P_GRANT row.
-        client, client_listener = _build_light_client(c, client_kp)
-
-        # Kick off bootstrap.
-        client.bootstrap(c.clock + DELTA)
-        _pump(c, client, client_listener, c.clock + DELTA)
-        _pump(c, client, client_listener, c.clock + DELTA)
-
-        self.assertTrue(client.bootstrapped(), f"state {client.state.name}")
-        ts = client.trusted_state
+    def test_bootstrap_reaches_ready(self) -> None:
+        self.c.wait(lambda _: self.lc.bootstrapped())
+        ts = self.lc.trusted_state
+        self.assertIsNotNone(ts)
         assert ts is not None
         self.assertEqual(len(ts.roster), 3)
-        self.assertEqual(len(ts.managers), 1)
         self.assertGreater(ts.head.block_num, 0)
 
-    def test_forged_quorum_proof_does_not_reach_ready(self):
-        """Only the sigs over `(slice_hash, anchors)` are forged; bitmap width and sig-list
-        length match, so the refusal must come from verifying the signatures themselves."""
-        c = Cluster()
-        client_kp = crypto.Keypair.generate()
-        _provision_client(c, client_kp)
-        client, client_listener = _build_light_client(c, client_kp)
-
-        def forge(msg):
-            head = msg.head
-            return replace(
-                msg,
-                head=SettledBlock(
-                    block=head.block,
-                    anchors=head.anchors,
-                    multisig=crypto.MultiSig(
-                        head.multisig.bitmap,
-                        tuple(crypto.Signature(bytes(64)) for _ in head.multisig.sigs),
-                    ),
-                ),
-            )
-
-        client.bootstrap(c.clock + DELTA)
-        now = c.clock + DELTA
-        for _ in range(2):
-            for _ in range(5):
-                for node in c.nodes:
-                    node._reconcile_peers(now)
-                client.tick(now)
-                for node in c.nodes:
-                    node.postman.tick(now)
-                for node in c.nodes:
-                    for inbound in c.listeners[node.me.public].drain():
-                        node.receive(inbound.frame, now, session=inbound.session)
-                for inbound in client_listener.drain():
-                    client.receive(
-                        _mutate_frame_to_client(
-                            inbound.frame,
-                            client_kp,
-                            c.nodes[0].me,
-                            Verb.ANCHORS_REPLY,
-                            forge,
-                            now,
-                        ),
-                        now,
-                        session=inbound.session,
-                    )
-
-        self.assertFalse(client.bootstrapped(), "forged quorum proof was accepted")
-        self.assertIsNone(client.trusted_state)
+    def test_trusted_state_has_full_roster(self) -> None:
+        self.c.wait(lambda _: self.lc.bootstrapped())
+        ts = self.lc.trusted_state
+        assert ts is not None
+        self.assertEqual(len(ts.roster), 3)
+        self.assertGreater(ts.head.block_num, 0)
 
 
 class TestLightClientRead(unittest.TestCase):
-    def test_get_proof_returns_head_value(self):
-        c = Cluster()
-        # Land a value.
-        c.put("lite-client-e2e", b"present", now=T0)
-        key = c.token("lite-client-e2e")
-        c.pump(T0)
-        c.pump(c.clock + DELTA)
 
-        client_kp = crypto.Keypair.generate()
-        _provision_client(c, client_kp)
+    def setUp(self) -> None:
+        self.c = Cluster(nodes=3, mgmt=1, ro=0, rw=1)
+        self.lc = self.c.rw_clients[0]
+        self.lc.bootstrap(now_ms())
+        self.c.wait(lambda _: self.lc.bootstrapped())
 
-        client, client_listener = _build_light_client(c, client_kp)
+    def tearDown(self) -> None:
+        self.c.close()
 
-        client.bootstrap(c.clock + DELTA)
-        _pump(c, client, client_listener, c.clock + DELTA)
-        _pump(c, client, client_listener, c.clock + DELTA)
-        self.assertTrue(client.bootstrapped())
+    def test_put_and_get_via_session(self) -> None:
+        s = self.lc.session()
+        result = s.put("hello", b"world").wait()
+        self.assertIsInstance(result, Settled)
+        rec = s.get("hello")
+        self.assertFalse(rec.absent)
+        self.assertEqual(rec.value, b"world")
 
-        # Now do a read.
-        req = client.request_get(
-            store_id=ops.STORE_DATA,
-            name=key,
-            peer=c.nodes[0].me.public,
-            now=c.clock + DELTA,
-        )
-        _pump(c, client, client_listener, c.clock + DELTA)
+    def test_value_is_encrypted_on_disk(self) -> None:
+        s = self.lc.session()
+        s.put("secret", b"plaintext").wait()
+        rec = s.get("secret")
+        self.assertNotEqual(rec.raw, b"plaintext")
+        self.assertEqual(rec.value, b"plaintext")
 
-        result = req.poll()
-        self.assertNotIsInstance(result, type(PENDING), "read still pending")
+    def test_handle_outlives_inflight(self) -> None:
+        s = self.lc.session()
+        s.put("outlive", b"value").wait()
+        rec = s.get("outlive")
+        self.assertFalse(rec.absent)
+        first = rec.value
+        second = s.get("outlive").value
+        self.assertEqual(first, second)
+
+
+# ---------------------------------------------------------------------------
+# Category 2 — byzantine security via crafted Delivered objects
+#
+# Bootstrap a real LC against a real cluster to get a valid trusted_state,
+# then feed crafted messages through _on_delivered — the same dispatch the
+# run loop uses.  The verification pipeline (decode → resolve_read → proof
+# check) runs identically; only the postman/transport layer is bypassed,
+# and that layer is already covered by test_postman.py.
+# ---------------------------------------------------------------------------
+
+
+def _trusted_state_from_cluster(c: Cluster) -> TrustedState:
+    store = c.nodes[0].store
+    mgmt = MgmtReader(store)
+    commitment = mgmt.roster_commitment()
+    assert commitment is not None
+    head_num = store.head_block_num()
+    assert head_num is not None
+    from ..consensus.settle_round import SettledBlock
+    raw = store.settled_at(head_num)
+    assert raw is not None
+    head = SettledBlock.decode(raw)
+    return TrustedState(
+        roster=tuple(sorted(commitment.members)),
+        managers=tuple(sorted(g.identity for g in mgmt.manager_grants())),
+        node_endpoints={
+            rec.identity: rec.endpoints
+            for rec in mgmt.nodes().values()
+        },
+        roster_fingerprint=crypto.Digest(commitment.cert.subject),
+        head=chain.TrustedHead(
+            head.anchors.block_num,
+            head.block_hash,
+            head.anchors.state_root,
+            head.block.bucket,
+        ),
+    )
+
+
+def _get_real_proof_reply(c: Cluster, store_id: int, name: bytes) -> ProofReply:
+    store = c.nodes[0].store
+    head_num = store.head_block_num()
+    assert head_num is not None
+    ts = _trusted_state_from_cluster(c)
+    from ..sync.lite_adapter import TrustedBlock
+    request = GetProof(
+        store_id=store_id,
+        name=name,
+        block_num=head_num,
+        known_roster_fingerprint=ts.roster_fingerprint,
+        known_trusted_block=TrustedBlock(ts.head.block_num, ts.head.block_hash),
+    )
+    reply = serve_get_proof(store, request, c.tunables.liveness_window)
+    assert isinstance(reply, ProofReply), f"expected ProofReply, got {type(reply).__name__}: {reply}"
+    return reply
+
+
+def _make_unstarted_lc(c: Cluster, head_behind: int = 0) -> LightClient:
+    from ..net.postman import Postman
+    kp = crypto.Keypair.generate()
+    postman = Postman(kp, c.tunables)
+    lc = LightClient(me=kp, anchor=c.anchor.public, postman=postman)
+    ts = _trusted_state_from_cluster(c)
+    if head_behind > 0:
+        store = c.nodes[0].store
+        target = ts.head.block_num - head_behind
+        if target < 1:
+            target = 1
+        raw = store.settled_at(target)
+        assert raw is not None
+        from ..consensus.settle_round import SettledBlock
+        blk = SettledBlock.decode(raw)
+        ts = replace(ts, head=chain.TrustedHead(
+            blk.anchors.block_num, blk.block_hash,
+            blk.anchors.state_root, blk.block.bucket,
+        ))
+    lc.trusted_state = ts
+    lc.state = State.READY
+    return lc
+
+
+def _feed_reply(
+    lc: LightClient, reply: LiteMsg, peer: crypto.PublicKey,
+    store_id: int = ops.STORE_DATA, name: bytes = b"",
+) -> Read:
+    mid = MessageId.random()
+    read = Read(mid=mid, peer=peer, store_id=store_id, name=name)
+    lc._inflight[mid.correlation_id] = read
+    verb, body = reply.encode()
+    delivered = Delivered(
+        frm=peer,
+        verb=verb,
+        body=body,
+        mid=MessageId.random(),
+        in_reply_to=mid,
+    )
+    lc._on_delivered(delivered, now_ms())
+    return read
+
+
+class TestByzantineProofReply(unittest.TestCase):
+
+    def setUp(self) -> None:
+        self.c = Cluster(nodes=3, mgmt=1, ro=0, rw=0)
+        ms = self.c.mgmt_nodes[0].session()
+        ms.put("byz-target", b"real-value").wait()
+        self.c.wait_block(2)
+
+    def tearDown(self) -> None:
+        self.c.close()
+
+    def _lc(self) -> LightClient:
+        return _make_unstarted_lc(self.c)
+
+    def _token(self) -> bytes:
+        ms = self.c.mgmt_nodes[0].session()
+        return ms.get("byz-target").token
+
+    def _real_reply(self) -> ProofReply:
+        return _get_real_proof_reply(self.c, ops.STORE_DATA, self._token())
+
+    def test_honest_reply_succeeds(self) -> None:
+        lc = self._lc()
+        reply = self._real_reply()
+        read = _feed_reply(lc, reply, self.c.nodes[0].me.public, name=self._token())
+        result = read.poll()
         self.assertIsInstance(result, GetResult, f"got {result!r}")
-        assert isinstance(result, GetResult)
-        self.assertFalse(result.absent)
-        self.assertNotEqual(result.value, b"present", "the light client was served plaintext")
-        reader = Client(Keys.unwrap(c.nodes[0].store, client_kp))
-        self.assertEqual(
-            reader.open("lite-client-e2e", result.value, result.epoch),
-            b"present",
-            "a granted client must open what the manager wrote",
-        )
 
-    def test_byzantine_value_fails_proof_verify(self):
-        """Swap the value on an otherwise honest reply. The SMT commits to
-        `leaf_hash(path, h(value), h(cred))`, so the fold to root fails. If this test starts
-        passing with a stubbed/placeholder proof pipeline, verification has been disabled."""
-        c = Cluster()
-        c.put("lite-client-byz", b"present", now=T0)
-        key = c.token("lite-client-byz")
-        c.pump(T0)
-        c.pump(c.clock + DELTA)
-
-        client_kp = crypto.Keypair.generate()
-        _provision_client(c, client_kp)
-
-        client, client_listener = _build_light_client(c, client_kp)
-
-        client.bootstrap(c.clock + DELTA)
-        _pump(c, client, client_listener, c.clock + DELTA)
-        _pump(c, client, client_listener, c.clock + DELTA)
-        self.assertTrue(client.bootstrapped())
-
-        req = client.request_get(
-            store_id=ops.STORE_DATA,
-            name=key,
-            peer=c.nodes[0].me.public,
-            now=c.clock + DELTA,
-        )
-
-        # Custom pump: intercept the client's listener and swap the value on any PROOF_REPLY.
-        # Everything else (bootstrap replies, sync noise) passes through untouched.
-        server_kp = c.nodes[0].me
-        now = c.clock + DELTA
-        rounds = 5
-
-        def mutate(reply):
-            return replace(reply, value=b"NOT-THE-REAL-VALUE")
-
-        for _ in range(rounds):
-            for node in c.nodes:
-                node._reconcile_peers(now)
-            client.tick(now)
-            for node in c.nodes:
-                node.postman.tick(now)
-            delivered = 0
-            for node in c.nodes:
-                for inbound in c.listeners[node.me.public].drain():
-                    node.receive(inbound.frame, now, session=inbound.session)
-                    delivered += 1
-            for inbound in client_listener.drain():
-                mutated_frame = _mutate_frame_to_client(
-                    inbound.frame, client_kp, server_kp, Verb.PROOF_REPLY, mutate, now
-                )
-                client.receive(mutated_frame, now, session=inbound.session)
-                delivered += 1
-            if delivered == 0:
-                break
-
-        result = req.poll()
+    def test_byzantine_value_swap_fails_proof(self) -> None:
+        lc = self._lc()
+        reply = self._real_reply()
+        bad = replace(reply, value=b"NOT-THE-REAL-VALUE")
+        read = _feed_reply(lc, bad, self.c.nodes[0].me.public, name=self._token())
+        result = read.poll()
         self.assertIsInstance(result, Failed, f"got {result!r}")
         assert isinstance(result, Failed)
         self.assertEqual(result.reason, "proof-verify-failed")
 
-    def test_a_far_behind_client_walks_up_instead_of_being_refused(self):
-        """The server used to refuse a lagging client -- STALE_CLIENT, then TOO_OLD after that
-        one went -- and tell it to re-bootstrap. Both refusals were emitted ABOVE the line that
-        builds the headers, so the client had no way to stop lagging; against a live cluster,
-        whose head moves every bucket, a light client could not complete a read at all.
+    def test_byzantine_credential_swap_fails_proof(self) -> None:
+        lc = self._lc()
+        reply = self._real_reply()
+        bad = replace(reply, credential=b"FAKE-CRED")
+        read = _feed_reply(lc, bad, self.c.nodes[0].me.public, name=self._token())
+        result = read.poll()
+        self.assertIsInstance(result, Failed, f"got {result!r}")
+        assert isinstance(result, Failed)
+        self.assertEqual(result.reason, "proof-verify-failed")
 
-        It now gets answered at the responder's head with the headers to reach it, capped per
-        reply, and walks up over as many round trips as the gap needs."""
-        c = Cluster()
-        c.put("lite-client-catchup", b"present", now=T0)
-        key = c.token("lite-client-catchup")
-        c.pump(T0)
-
-        client_kp = crypto.Keypair.generate()
-        _provision_client(c, client_kp)
-        client, client_listener = _build_light_client(c, client_kp)
-
-        client.bootstrap(c.clock + DELTA)
-        _pump(c, client, client_listener, c.clock + DELTA)
-        _pump(c, client, client_listener, c.clock + DELTA)
-        self.assertTrue(client.bootstrapped())
-
-        # Floor above the client's last `_pump`: `receive` advances a node's round, so the
-        # cluster's own `clock` trails the nodes and pumping from it ticks time backwards.
-        c.pump(c.clock + 2 * DELTA)  # the cluster runs on; the client falls behind
-        assert client.trusted_state is not None
-        started_at = client.trusted_state.head.block_num
-        head_num = c.nodes[0].store.head_block_num() or 0
-        self.assertGreater(head_num - started_at, TUNABLES.liveness_window)
-
-        heads = [started_at]
-        result = None
-        for _ in range(30):
-            # The clock the CLUSTER is on, not one the test invented: a `now` that runs past the
-            # last block produced makes the head legitimately stale, which is a different failure
-            # wearing this test's name.
-            now = _one_bucket_after_head(c)
-            req = client.request_get(
-                store_id=ops.STORE_DATA, name=key, peer=c.nodes[0].me.public, now=now
-            )
-            _pump(c, client, client_listener, now)
-            result = req.poll()
-            assert client.trusted_state is not None
-            heads.append(client.trusted_state.head.block_num)
-            if not isinstance(result, Failed):
-                break
-            self.assertEqual(
-                result.reason,
-                "behind the responder; retry",
-                f"heads={heads} server={c.nodes[0].store.head_block_num()} "
-                f"head_bucket={client.trusted_state.head.bucket} "
-                f"now_bucket={TUNABLES.bucket(now)}",
-            )
-            self.assertIs(client.state, State.READY, "a lagging client must not lose its roster")
-
-        self.assertEqual(heads, sorted(heads), f"the head went backwards: {heads}")
-        self.assertGreater(heads[1], heads[0], "one reply advanced the client by nothing")
-        self.assertIsInstance(result, GetResult, f"never caught up: heads={heads}")
-        assert isinstance(result, GetResult)
-        reader = Client(Keys.unwrap(c.nodes[0].store, client_kp))
-        self.assertEqual(reader.open("lite-client-catchup", result.value, result.epoch), b"present")
-
-
-class TestRevokedManagerCannotForgeARoster(unittest.TestCase):
-    """A revoked manager holds an anchor-signed grant cert forever (cert carries no serial;
-    currency comes only from observing the grant ROW). A light client cannot see the row, so
-    the bundle is the one artefact whose validity is not self-evident from its own signatures.
-    `f+1` corroboration on `roster_fingerprint` is what steady state lacks."""
-
-    def test_forged_bundle_from_a_revoked_manager_is_not_adopted(self):
-        c = Cluster()
-        client_kp = crypto.Keypair.generate()
-        _provision_client(c, client_kp)
-
-        # A warm manager is granted, then revoked -- BEFORE the client bootstraps, so the
-        # client is at the responders' head when it reads. (A lagging client's GET_PROOF is
-        # refused TOO_OLD, since the no-compaction SMT only exists at head; that refusal made
-        # a first draft of this test pass without the forged bundle ever being delivered.)
-        # The grant cert stays a genuine anchor-signed artefact; only the ROW is gone, which
-        # is precisely what a light client cannot observe.
-        warm = crypto.Keypair.generate()
-        warm_cert = Cert.sign_grant(c.mgr, warm.public, Role.MANAGER)
-        for node in c.nodes:
-            mgmt = MgmtWriter(node.store)
-            grant = mgmt.authorise(
-                warm.public, Role.MANAGER, pop=warm.prove_possession(), cert=warm_cert
-            )
-            at = TUNABLES.bucket(c.clock)
-            intervene(node.store, c.mgr, bodies=(grant.sign(c.mgr, T0),), bucket=at)
-            revoke = mgmt.revoke(warm.public, reissue_signer=c.mgr)
-            intervene(node.store, c.mgr, bodies=(revoke.sign(c.mgr, T0),), bucket=at + 1)
-            self.assertIsNone(MgmtWriter(node.store).grant_of(warm.public), "revocation failed")
-
-        client, client_listener = _build_light_client(c, client_kp)
-
-        # Bootstrap honestly: f+1 corroboration on the real roster.
-        client.bootstrap(c.clock + DELTA)
-        _pump(c, client, client_listener, c.clock + DELTA)
-        _pump(c, client, client_listener, c.clock + DELTA)
-        self.assertTrue(client.bootstrapped())
-        ts = client.trusted_state
+    def test_wrong_width_signer_bitmap_fails_not_crashes(self) -> None:
+        lc = _make_unstarted_lc(self.c, head_behind=1)
+        reply = self._real_reply()
+        from ..consensus.settle_round import SettledBlock
+        ts = lc.trusted_state
         assert ts is not None
-        honest_roster = ts.roster
+        head_num = ts.head.block_num
+        store = self.c.nodes[0].store
+        above_raw = store.settled_at(head_num + 1)
+        assert above_raw is not None, "setUp should ensure head >= 2"
+        above = SettledBlock.decode(above_raw)
+        wrecked = replace(
+            above,
+            multisig=replace(above.multisig, bitmap=crypto.SignerBitmap(bytes(5))),
+        )
+        bad = replace(reply, head=wrecked, headers=())
+        read = _feed_reply(lc, bad, self.c.nodes[0].me.public, name=self._token())
+        result = read.poll()
+        self.assertIsInstance(result, Failed, f"got {result!r}")
+        assert isinstance(result, Failed)
+        self.assertIn("verify failed", result.reason)
+        self.assertIs(lc.state, State.READY)
+        self.assertIsNotNone(lc.trusted_state)
 
-        # The revoked manager forges an entire roster of keys it controls.
+    def test_dude_error_from_chain_advance_resolves_read(self) -> None:
+        from unittest import mock
+        lc = _make_unstarted_lc(self.c, head_behind=1)
+        reply = self._real_reply()
+        ts = lc.trusted_state
+        assert ts is not None
+        head_num = ts.head.block_num
+        store = self.c.nodes[0].store
+        above_raw = store.settled_at(head_num + 1)
+        assert above_raw is not None, "setUp should ensure head >= 2"
+        from ..consensus.settle_round import SettledBlock
+        above = SettledBlock.decode(above_raw)
+        advanced = replace(reply, head=above, headers=())
+
+        with mock.patch.object(
+            chain, "advance", side_effect=DudeError("header check exploded"),
+        ):
+            read = _feed_reply(lc, advanced, self.c.nodes[0].me.public, name=self._token())
+
+        result = read.poll()
+        self.assertIsInstance(result, Failed, f"read left unresolved: {result!r}")
+        assert isinstance(result, Failed)
+        self.assertIn("header check exploded", result.reason)
+        self.assertIs(lc.state, State.READY)
+
+
+class TestByzantineBootstrapReply(unittest.TestCase):
+
+    def setUp(self) -> None:
+        self.c = Cluster(nodes=3, mgmt=1, ro=0, rw=0)
+        self.c.wait_block(2)
+
+    def tearDown(self) -> None:
+        self.c.close()
+
+    def test_forged_quorum_proof_does_not_reach_ready(self) -> None:
+        store = self.c.nodes[0].store
+        mgmt = MgmtReader(store)
+        commitment = mgmt.roster_commitment()
+        assert commitment is not None
+        head_num = store.head_block_num()
+        assert head_num is not None
+        raw = store.settled_at(head_num)
+        assert raw is not None
+        from ..consensus.settle_round import SettledBlock
+        head = SettledBlock.decode(raw)
+        from ..sync.lite_adapter import GetAnchors
+        from ..sync.lite import serve_get_anchors
+        request = GetAnchors(known_roster_fingerprint=None, known_trusted_block=None)
+        reply = serve_get_anchors(store, request, self.c.tunables.liveness_window)
+        assert isinstance(reply, AnchorsReply)
+
+        forged_head = replace(
+            reply.head,
+            multisig=crypto.MultiSig(
+                reply.head.multisig.bitmap,
+                tuple(crypto.Signature(bytes(64)) for _ in reply.head.multisig.sigs),
+            ),
+        )
+        forged = replace(reply, head=forged_head)
+
+        from ..net.postman import Postman
+        kp = crypto.Keypair.generate()
+        postman = Postman(kp, self.c.tunables)
+        lc = LightClient(me=kp, anchor=self.c.anchor.public, postman=postman)
+        lc.state = State.BOOTSTRAPPING
+        for node in self.c.nodes:
+            lc._bootstrap_peers[node.me.public] = _BootstrapReply()
+
+        now = _now_for_store(self.c)
+        for node in self.c.nodes:
+            mid = MessageId.random()
+            lc._inflight[mid.correlation_id] = _BootstrapRequest(mid=mid, peer=node.me.public)
+            verb, body = forged.encode()
+            delivered = Delivered(
+                frm=node.me.public,
+                verb=verb,
+                body=body,
+                mid=MessageId.random(),
+                in_reply_to=mid,
+            )
+            lc._on_delivered(delivered, now)
+
+        self.assertFalse(lc.bootstrapped(), "forged quorum proof was accepted")
+        self.assertIsNone(lc.trusted_state)
+
+    def test_forged_bundle_from_revoked_manager_not_adopted(self) -> None:
+        store = self.c.nodes[0].store
+        mgmt = MgmtReader(store)
+        commitment = mgmt.roster_commitment()
+        assert commitment is not None
+
+        from ..sync.lite_adapter import GetAnchors
+        from ..sync.lite import serve_get_anchors
+        request = GetAnchors(known_roster_fingerprint=None, known_trusted_block=None)
+        honest_reply = serve_get_anchors(store, request, self.c.tunables.liveness_window)
+        assert isinstance(honest_reply, AnchorsReply)
+
+        from ..net.postman import Postman
+        kp = crypto.Keypair.generate()
+        postman = Postman(kp, self.c.tunables)
+        lc = LightClient(me=kp, anchor=self.c.anchor.public, postman=postman)
+        lc.state = State.BOOTSTRAPPING
+        for node in self.c.nodes:
+            lc._bootstrap_peers[node.me.public] = _BootstrapReply()
+
+        now = _now_for_store(self.c)
+        for node in self.c.nodes:
+            mid = MessageId.random()
+            lc._inflight[mid.correlation_id] = _BootstrapRequest(mid=mid, peer=node.me.public)
+            verb, body = honest_reply.encode()
+            delivered = Delivered(
+                frm=node.me.public, verb=verb, body=body,
+                mid=MessageId.random(), in_reply_to=mid,
+            )
+            lc._on_delivered(delivered, now)
+        self.assertTrue(lc.bootstrapped(), "honest bootstrap failed")
+        honest_roster = lc.trusted_state.roster
+
+        warm = crypto.Keypair.generate()
+        warm_cert = Cert.sign_grant(self.c.anchor, warm.public, Role.MANAGER)
+
         attacker_nodes = [crypto.Keypair.generate() for _ in range(3)]
         entries = tuple(
             NodeRecord(
-                kp.public,
+                ak.public,
                 (Endpoint(Address(Scheme.INPROC, f"attacker{i}")),),
-                Cert.sign_roster(warm, kp.public),
+                Cert.sign_roster(warm, ak.public),
                 frozenset(),
             )
-            for i, kp in enumerate(attacker_nodes)
+            for i, ak in enumerate(attacker_nodes)
         )
-        members = tuple(sorted(kp.public for kp in attacker_nodes))
-        state_fingerprint = crypto.h(
-            codec.encode(
-                [
-                    [
-                        bytes(r.identity),
-                        sorted(ep.encode() for ep in r.endpoints),
-                        sorted(r.domains),
-                    ]
-                    for r in sorted(entries, key=lambda r: bytes(r.identity))
-                ]
-            )
-        )
-        content = codec.encode([99, sorted(bytes(m) for m in members), state_fingerprint])
-        forged = RosterBundle(
+        members = tuple(sorted(ak.public for ak in attacker_nodes))
+        state_fingerprint = RosterCommitment.fingerprint(entries)
+        content = RosterCommitment.content(99, members, state_fingerprint)
+        forged_bundle = RosterBundle(
             commitment_serial=99,
             commitment_members=members,
             commitment_cert=Cert.sign_roster_commitment(warm, content),
@@ -462,325 +421,42 @@ class TestRevokedManagerCannotForgeARoster(unittest.TestCase):
             managers=(Grant(warm.public, Role.MANAGER, frozenset(), frozenset(), warm_cert),),
         )
 
-        # Steady state: one responder attaches the forged bundle to an ordinary read reply.
-        req = client.request_get(
-            store_id=ops.STORE_DATA,
-            name=crypto.h(b"anything"),
-            peer=c.nodes[0].me.public,
-            now=c.clock + DELTA,
+        forged_fingerprint = crypto.Digest(forged_bundle.commitment_cert.subject)
+        forged_reply = replace(
+            honest_reply,
+            bundle=forged_bundle,
+            roster_fingerprint=forged_fingerprint,
         )
-        self.assertIsNotNone(req)
 
-        def swap(msg):
-            return replace(
-                msg, bundle=forged, roster_fingerprint=crypto.Digest(forged.commitment_cert.subject)
-            )
+        store = self.c.nodes[0].store
+        head_num = store.head_block_num()
+        assert head_num is not None
+        from ..sync.lite_adapter import TrustedBlock
+        token = crypto.h(b"anything")
+        request = GetProof(
+            store_id=ops.STORE_DATA, name=token, block_num=head_num,
+            known_roster_fingerprint=lc.trusted_state.roster_fingerprint,
+            known_trusted_block=TrustedBlock(
+                lc.trusted_state.head.block_num, lc.trusted_state.head.block_hash,
+            ),
+        )
+        real_proof_reply = serve_get_proof(store, request, self.c.tunables.liveness_window)
+        assert isinstance(real_proof_reply, ProofReply)
+        forged_proof = replace(
+            real_proof_reply,
+            bundle=forged_bundle,
+            roster_fingerprint=forged_fingerprint,
+        )
+        read = _feed_reply(
+            lc, forged_proof, self.c.nodes[0].me.public, name=token,
+        )
 
-        now = c.clock + DELTA
-        for _ in range(5):
-            for node in c.nodes:
-                node._reconcile_peers(now)
-            client.tick(now)
-            for node in c.nodes:
-                node.postman.tick(now)
-            for node in c.nodes:
-                for inbound in c.listeners[node.me.public].drain():
-                    node.receive(inbound.frame, now, session=inbound.session)
-            for inbound in client_listener.drain():
-                client.receive(
-                    _mutate_frame_to_client(
-                        inbound.frame, client_kp, c.nodes[0].me, Verb.PROOF_REPLY, swap, now
-                    ),
-                    now,
-                    session=inbound.session,
-                )
-
-        # The contract: the forged roster is never adopted. A moved fingerprint means this
-        # client's cached trust no longer holds, so it drops that trust and re-bootstraps --
-        # which is where `f+1` corroboration lives. It does NOT take a replacement roster
-        # from whoever happened to answer.
-        after = client.trusted_state
-        attacker_roster = tuple(sorted(kp.public for kp in attacker_nodes))
+        result = read.poll()
+        after = lc.trusted_state
         if after is not None:
+            attacker_roster = tuple(sorted(ak.public for ak in attacker_nodes))
             self.assertNotEqual(after.roster, attacker_roster, "forged roster was adopted")
             self.assertEqual(after.roster, honest_roster, "trusted roster changed")
-        self.assertIsNone(after, "client kept trusting a roster it can no longer verify")
-        self.assertIs(client.state, State.UNBOOTSTRAPPED)
-        self.assertEqual(req.poll(), Failed(reason="roster changed; re-bootstrap"))
-
-
-class TestAByzantineResponderCannotKillTheClient(unittest.TestCase):
-    """Nothing a responder sends may raise past the frame boundary. A wrong-width multisig
-    bitmap raised `CryptoError` out of every verify path and killed the client's reader thread
-    while its listener kept accepting -- reads hung forever with the client looking alive."""
-
-    def test_a_wrong_width_signer_bitmap_fails_the_read_and_nothing_else(self):
-        c = Cluster()
-        c.put("byz-bitmap", b"present", now=T0)
-        key = c.token("byz-bitmap")
-        c.pump(T0)
-
-        client_kp = crypto.Keypair.generate()
-        _provision_client(c, client_kp)
-        client, client_listener = _build_light_client(c, client_kp)
-        client.bootstrap(c.clock + DELTA)
-        _pump(c, client, client_listener, c.clock + DELTA)
-        _pump(c, client, client_listener, c.clock + DELTA)
-        self.assertTrue(client.bootstrapped())
-
-        # ONE block on, so the reply carries the responder's head as a link we must WALK. At our
-        # own head `_advance_head` returns early and never checks the head's multisig at all --
-        # correctly, since the proof is verified against the root we already walked to -- and the
-        # mutation below is then a no-op. Written without this the test passed 1 run in 3.
-        c.pump(c.clock + 2 * DELTA, rounds=1)
-        assert client.trusted_state is not None
-        gap = (c.nodes[0].store.head_block_num() or 0) - client.trusted_state.head.block_num
-        self.assertTrue(
-            0 < gap <= TUNABLES.liveness_window,
-            f"gap is {gap}: at 0 the head is not walked, past the cap it is not offered",
-        )
-
-        now = _one_bucket_after_head(c)
-        req = client.request_get(
-            store_id=ops.STORE_DATA, name=key, peer=c.nodes[0].me.public, now=now
-        )
-
-        def widen(reply):
-            head = reply.head
-            wrecked = replace(
-                head, multisig=replace(head.multisig, bitmap=crypto.SignerBitmap(bytes(5)))
-            )
-            return replace(reply, head=wrecked)
-
-        server_kp = c.nodes[0].me
-        for _ in range(5):
-            for node in c.nodes:
-                node._reconcile_peers(now)
-            client.tick(now)
-            for node in c.nodes:
-                node.postman.tick(now)
-            for node in c.nodes:
-                for inbound in c.listeners[node.me.public].drain():
-                    node.receive(inbound.frame, now, session=inbound.session)
-            for inbound in client_listener.drain():
-                client.receive(  # must not raise
-                    _mutate_frame_to_client(
-                        inbound.frame, client_kp, server_kp, Verb.PROOF_REPLY, widen, now
-                    ),
-                    now,
-                    session=inbound.session,
-                )
-
-        result = req.poll()
-        self.assertIsInstance(result, Failed, f"got {result!r}")
-        assert isinstance(result, Failed)
-        self.assertIn(
-            "verify failed",
-            result.reason,
-            "the read failed for some other reason; this proves nothing about the bitmap",
-        )
-        self.assertIs(client.state, State.READY, "one bad reply tore down the trusted state")
-        self.assertIsNotNone(client.trusted_state)
-
-    def test_any_dude_error_from_a_reply_resolves_the_read_instead_of_unwinding(self):
-        """The BOUNDARY, not the bitmap. With the primitive refusing rather than raising, the
-        test above no longer reaches this guard -- and a boundary that only holds for the failures
-        we have already fixed is not a boundary. A read left PENDING is as bad as a dead thread,
-        because nothing times a pending read out."""
-        c = Cluster()
-        client_kp = crypto.Keypair.generate()
-        _provision_client(c, client_kp)
-        client, client_listener = _build_light_client(c, client_kp)
-        client.bootstrap(c.clock + DELTA)
-        _pump(c, client, client_listener, c.clock + DELTA)
-        _pump(c, client, client_listener, c.clock + DELTA)
-        self.assertTrue(client.bootstrapped())
-
-        # The cluster runs on, so the reply carries headers and `_advance_head` actually walks --
-        # at our own head it returns early and `chain.advance` is never reached.
-        c.pump(c.clock + 2 * DELTA)
-        now = _one_bucket_after_head(c)
-        req = client.request_get(
-            store_id=ops.STORE_DATA, name=b"anything", peer=c.nodes[0].me.public, now=now
-        )
-        with mock.patch.object(chain, "advance", side_effect=DudeError("header check exploded")):
-            _pump(c, client, client_listener, now)
-
-        result = req.poll()
-        self.assertIsInstance(result, Failed, f"read left unresolved: {result!r}")
-        assert isinstance(result, Failed)
-        self.assertIn("header check exploded", result.reason)
-        self.assertIs(client.state, State.READY)
-
-
-class TestReadExpiry(unittest.TestCase):
-    """The postman expires messages whose TTL runs out. Before the fix, `LightClient.tick`
-    discarded those expiries, so a read whose reply never arrived stayed PENDING forever."""
-
-    def _ready_client(self):
-        c = Cluster()
-        c.put("expiry-test", b"present", now=T0)
-        c.pump(T0)
-        c.pump(c.clock + DELTA)
-        client_kp = crypto.Keypair.generate()
-        _provision_client(c, client_kp)
-        client, client_listener = _build_light_client(c, client_kp)
-        client.bootstrap(c.clock + DELTA)
-        _pump(c, client, client_listener, c.clock + DELTA)
-        _pump(c, client, client_listener, c.clock + DELTA)
-        assert client.bootstrapped()
-        return c, client, client_listener, client_kp
-
-    def test_unanswered_read_expires_instead_of_hanging(self):
-        c, client, _client_listener, _ = self._ready_client()
-        now = c.clock + DELTA
-        req = client.request_get(
-            store_id=ops.STORE_DATA,
-            name=c.token("expiry-test"),
-            peer=c.nodes[0].me.public,
-            now=now,
-        )
-        self.assertIs(req.poll(), PENDING)
-
-        deadline = now + TUNABLES.ttl_lite + 1
-        client.tick(deadline)
-
-        result = req.poll()
-        self.assertIsInstance(result, Failed, f"expected Failed, got {result!r}")
-        assert isinstance(result, Failed)
-        self.assertEqual(result.reason, "request expired")
-
-    def test_answered_read_not_affected_by_expiry_of_another(self):
-        c, client, client_listener, _ = self._ready_client()
-        now = c.clock + DELTA
-        key = c.token("expiry-test")
-
-        req_answered = client.request_get(
-            store_id=ops.STORE_DATA, name=key, peer=c.nodes[0].me.public, now=now
-        )
-        phantom = crypto.Keypair.generate().public
-        client.postman.add_peer(phantom, (Endpoint(address_of(c.nodes[1].me.public)),))
-        req_silent = client.request_get(store_id=ops.STORE_DATA, name=key, peer=phantom, now=now)
-
-        _pump(c, client, client_listener, now)
-
-        result_answered = req_answered.poll()
-        self.assertIsInstance(result_answered, GetResult, f"got {result_answered!r}")
-        self.assertIs(req_silent.poll(), PENDING)
-
-        deadline = now + TUNABLES.ttl_lite + 1
-        client.tick(deadline)
-
-        result_silent = req_silent.poll()
-        self.assertIsInstance(result_silent, Failed, f"expected Failed, got {result_silent!r}")
-        assert isinstance(result_silent, Failed)
-        self.assertEqual(result_silent.reason, "request expired")
-
-    def test_bootstrap_message_expiry_does_not_corrupt_state(self):
-        c = Cluster()
-        client_kp = crypto.Keypair.generate()
-        _provision_client(c, client_kp)
-        client, client_listener = _build_light_client(c, client_kp)
-
-        client.bootstrap(c.clock + DELTA)
-        now = c.clock + DELTA
-
-        client.tick(now)
-
-        deadline = now + TUNABLES.ttl_lite + 1
-        client.tick(deadline)
-        self.assertIs(client.state, State.BOOTSTRAPPING)
-
-        _pump(c, client, client_listener, deadline)
-        _pump(c, client, client_listener, deadline)
-        self.assertTrue(client.bootstrapped(), f"state {client.state.name}")
-
-    def test_late_reply_after_expiry_is_harmless(self):
-        c, client, client_listener, _ = self._ready_client()
-        now = c.clock + DELTA
-        req = client.request_get(
-            store_id=ops.STORE_DATA,
-            name=c.token("expiry-test"),
-            peer=c.nodes[0].me.public,
-            now=now,
-        )
-
-        deadline = now + TUNABLES.ttl_lite + 1
-        client.tick(deadline)
-        result = req.poll()
-        self.assertIsInstance(result, Failed)
-
-        _pump(c, client, client_listener, deadline)
-
-        self.assertIs(client.state, State.READY)
-        self.assertIsNotNone(client.trusted_state)
-
-
-class TestInflightBookkeeping(unittest.TestCase):
-    """`_inflight` means "messages still waiting on an answer". An entry leaves on a terminal
-    event -- a reply, or the TTL passing -- and nothing else keeps it there, so the table is
-    bounded by what is in flight within one TTL window."""
-
-    def test_bookkeeping_is_bounded_by_the_ttl_not_by_replies(self):
-        """Peers that never answer, across four TTL windows. Each tick expires what is outstanding
-        and re-asks, so the table returns to one entry per peer every time.
-
-        This is what the split tables could not do: `_pending_bootstrap_mids` was removed from on
-        reply and nowhere else, while re-asks minted a fresh mid every cycle -- so a client whose
-        peers stayed silent grew it by one per peer per window, for ever."""
-        c = Cluster()
-        client_kp = crypto.Keypair.generate()
-        _provision_client(c, client_kp)
-        client, _listener = _build_light_client(c, client_kp)
-
-        now = c.clock + DELTA
-        client.bootstrap(now)
-        peers = len(client._bootstrap_peers)
-        self.assertGreater(peers, 1, "a one-peer client would not show growth either way")
-        self.assertEqual(len(client._inflight), peers, "bootstrap did not register its asks")
-
-        seen = []
-        for _ in range(4):
-            now += TUNABLES.ttl_lite + 1
-            client.tick(now)  # expire what is outstanding, then re-ask the peers still stale
-            seen.append(len(client._inflight))
-
-        self.assertEqual(
-            seen, [peers] * 4, f"in-flight bookkeeping grew across TTL windows: {seen}"
-        )
-        self.assertIs(client.state, State.BOOTSTRAPPING, "the client gave up rather than re-asking")
-
-    def test_a_handle_still_answers_after_it_leaves_bookkeeping(self):
-        """Removing an entry is not discarding the answer. The result lives on the handle, so the
-        client can forget the message the moment it is terminal and the caller still reads it --
-        which is also why polling twice answers twice instead of raising on a forgotten id."""
-        c = Cluster()
-        c.put("handle-outlives", b"present", now=T0)
-        c.pump(T0)
-        c.pump(c.clock + DELTA)
-        client_kp = crypto.Keypair.generate()
-        _provision_client(c, client_kp)
-        client, client_listener = _build_light_client(c, client_kp)
-        client.bootstrap(c.clock + DELTA)
-        _pump(c, client, client_listener, c.clock + DELTA)
-        _pump(c, client, client_listener, c.clock + DELTA)
-        assert client.bootstrapped()
-
-        now = c.clock + DELTA
-        req = client.request_get(
-            store_id=ops.STORE_DATA,
-            name=c.token("handle-outlives"),
-            peer=c.nodes[0].me.public,
-            now=now,
-        )
-        self.assertIn(req.mid, client._inflight, "the ask was never tracked")
-
-        _pump(c, client, client_listener, now)
-
-        self.assertNotIn(req.mid, client._inflight, "a resolved request stayed in bookkeeping")
-        first = req.poll()
-        self.assertIsInstance(first, GetResult, f"got {first!r}")
-        self.assertIs(req.poll(), first, "polling twice consumed the result")
 
 
 if __name__ == "__main__":

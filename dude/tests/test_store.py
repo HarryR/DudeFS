@@ -57,13 +57,13 @@ class TestSettlement(unittest.TestCase):
         self.K = crypto.NameToken(crypto.h(b"K"))
         self.J = crypto.NameToken(crypto.h(b"J"))
 
-    def test_set_get_and_provenance(self):
+    def test_set_get(self):
         r = self.s.apply((tx(self.kp, (), (ops.Set(0, self.K, b"v1"),)),), auth=self.mgmt)
         self.assertEqual(len(r.settled), 1)
         idx, _ = r.settled[0]
         held = self.s.get(ops.STORE_DATA, self.K)
         assert held is not None
-        self.assertEqual((held.provenance, held.value, held.epoch), (idx, b"v1", ops.EPOCH_NONE))
+        self.assertEqual((held.value, held.epoch), (b"v1", ops.EPOCH_NONE))
         self.assertTrue(held.cred, "a settled row kept no record of what authorised it")
         self.assertEqual(self.s.head(), idx)
 
@@ -103,7 +103,7 @@ class TestSettlement(unittest.TestCase):
         self.assertEqual(len(r.dropped), 1)
         cur = self.s.get(ops.STORE_DATA, self.K)
         assert cur is not None
-        self.assertEqual(cur[1], b"A")
+        self.assertEqual(cur.value, b"A")
 
     def test_both_unconditional_writes_settle(self):
         """#settlement: no predicates, so nothing is invalidated — both apply, last wins."""
@@ -113,7 +113,7 @@ class TestSettlement(unittest.TestCase):
         self.assertEqual(len(r.settled), 2)
         cur = self.s.get(ops.STORE_DATA, self.K)
         assert cur is not None
-        self.assertEqual(cur[1], b"B")
+        self.assertEqual(cur.value, b"B")
 
     def test_atomicity_within_a_transaction(self):
         """Last write wins inside one transaction (#last-write-wins)."""
@@ -123,7 +123,7 @@ class TestSettlement(unittest.TestCase):
         self.assertEqual(len(r.settled), 1)
         cur = self.s.get(ops.STORE_DATA, self.K)
         assert cur is not None
-        self.assertEqual(cur[1], b"2")
+        self.assertEqual(cur.value, b"2")
 
 
 class TestAccumulator(unittest.TestCase):
@@ -225,7 +225,7 @@ class TestReplayEquivalence(unittest.TestCase):
             roll = rng.random()
             if roll < 0.25:  # CAS against what is really there
                 cur = s.get(ops.STORE_DATA, n)
-                d = ops.value_digest(cur[1]) if cur else crypto.h(b"absent")
+                d = ops.value_digest(cur.value) if cur else crypto.h(b"absent")
                 preds = (ops.Holds(D, n, d),) if cur else (ops.Absent(D, n),)
                 muts = (ops.Set(0, n, bytes([rng.randrange(256)])),)
             elif roll < 0.40:  # CAS that should fail
@@ -247,14 +247,7 @@ class TestReplayEquivalence(unittest.TestCase):
                 fresh = s.rebuild()
                 self.assertEqual(s.head(), fresh.head())
                 self.assertEqual(s.accumulator(), fresh.accumulator())
-                self.assertEqual(
-                    s.db.execute(
-                        "SELECT store, name, head, value FROM live ORDER BY store, name"
-                    ).fetchall(),
-                    fresh.db.execute(
-                        "SELECT store, name, head, value FROM live ORDER BY store, name"
-                    ).fetchall(),
-                )
+                self.assertEqual(s.state_root(), fresh.state_root())
 
     def test_negative_control_a_broken_fold_is_caught(self):
         """If the incremental accumulator were wrong, the differential test must notice. Prove the
@@ -290,8 +283,8 @@ class TestStoreIsolation(unittest.TestCase):
         mgmt = self.s.get(ops.STORE_MANAGEMENT, self.name)
         data = self.s.get(ops.STORE_DATA, self.name)
         assert mgmt is not None and data is not None
-        self.assertEqual(mgmt[1], b"mgmt")
-        self.assertEqual(data[1], b"data")
+        self.assertEqual(mgmt.value, b"mgmt")
+        self.assertEqual(data.value, b"data")
         self.assertEqual(self.s.db.execute("SELECT COUNT(*) FROM live").fetchone()[0], 2)
 
     def test_predicates_are_scoped_to_their_store(self):
@@ -317,7 +310,7 @@ class TestStoreIsolation(unittest.TestCase):
         self.assertEqual(len(r.settled), 1)
         mgmt = self.s.get(ops.STORE_MANAGEMENT, self.name)
         assert mgmt is not None
-        self.assertEqual(mgmt[1], b"mgmt")
+        self.assertEqual(mgmt.value, b"mgmt")
 
     def test_accumulator_distinguishes_the_stores(self):
         """Two states differing only in WHICH store holds a value must not fingerprint alike."""

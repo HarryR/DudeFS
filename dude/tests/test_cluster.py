@@ -1,0 +1,125 @@
+
+import unittest
+
+from ..core.units import now_ms
+from ..session import Settled, Refused
+from ..store import ops
+
+from .cluster import Cluster
+
+D = ops.STORE_DATA
+
+
+class TestSessionViaManagementNode(unittest.TestCase):
+
+    def setUp(self) -> None:
+        self.c = Cluster(nodes=3, mgmt=1, ro=0, rw=0)
+        self.s = self.c.mgmt_nodes[0].session()
+
+    def tearDown(self) -> None:
+        self.c.close()
+
+    def test_put_and_get(self) -> None:
+        result = self.s.put("hello", b"world").wait()
+        self.assertIsInstance(result, Settled)
+        rec = self.s.get("hello")
+        self.assertFalse(rec.absent)
+        self.assertEqual(rec.value, b"world")
+
+    def test_value_is_encrypted_on_disk(self) -> None:
+        self.s.put("secret", b"plaintext").wait()
+        rec = self.s.get("secret")
+        self.assertNotEqual(rec.raw, b"plaintext")
+        self.assertEqual(rec.value, b"plaintext")
+
+    def test_all_nodes_agree(self) -> None:
+        self.s.put("consensus", b"check").wait()
+        self.c.wait_head(2)
+        roots = {n.store.state_root() for n in self.c.nodes}
+        accs = {n.store.accumulator() for n in self.c.nodes}
+        self.assertEqual(len(roots), 1, "state roots disagree")
+        self.assertEqual(len(accs), 1, "accumulators disagree")
+
+    def test_management_node_syncs(self) -> None:
+        self.s.put("sync-check", b"v").wait()
+        mn = self.c.mgmt_nodes[0]
+        self.c.wait_head(2, nodes=[mn])
+        rec = self.s.get("sync-check")
+        self.assertEqual(rec.value, b"v")
+
+    def test_guarded_put(self) -> None:
+        r1 = self.s.put("k", b"v1").wait()
+        self.assertIsInstance(r1, Settled)
+        rec = self.s.get("k")
+        self.assertEqual(rec.value, b"v1")
+        r2 = self.s.put("k", b"v2", expect=rec).wait()
+        self.assertIsInstance(r2, Settled, f"guarded put returned {r2!r}, not Settled")
+        final = self.s.get("k")
+        self.assertEqual(final.value, b"v2")
+
+    def test_absent_guard(self) -> None:
+        self.s.put("fresh", b"new", absent=True).wait()
+        self.assertEqual(self.s.get("fresh").value, b"new")
+
+    def test_conflicting_cas_is_refused_or_dropped(self) -> None:
+        self.s.put("race", b"original").wait()
+        rec = self.s.get("race")
+        self.s.put("race", b"winner", expect=rec).wait()
+        result = self.s.put("race", b"loser", expect=rec).wait()
+        self.assertNotIsInstance(result, Settled)
+        self.assertEqual(self.s.get("race").value, b"winner")
+
+    def test_multi_step_transaction(self) -> None:
+        r1 = self.s.put("a", b"1").wait()
+        r2 = self.s.put("b", b"2").wait()
+        self.assertIsInstance(r1, Settled)
+        self.assertIsInstance(r2, Settled)
+        rec_a = self.s.get("a")
+        rec_b = self.s.get("b")
+        self.assertFalse(rec_a.absent, "a absent after Settled")
+        self.assertFalse(rec_b.absent, "b absent after Settled")
+        tx = self.s.begin()
+        tx.put("a", b"10", expect=rec_a)
+        tx.put("b", b"20", expect=rec_b)
+        tx.submit().wait()
+        self.assertEqual(self.s.get("a").value, b"10")
+        self.assertEqual(self.s.get("b").value, b"20")
+
+
+class TestSessionViaLightClient(unittest.TestCase):
+
+    def setUp(self) -> None:
+        self.c = Cluster(nodes=3, mgmt=1, ro=0, rw=1)
+        self.lc = self.c.rw_clients[0]
+        self.lc.bootstrap(now_ms())
+        self.c.wait(lambda _: self.lc.bootstrapped())
+
+    def tearDown(self) -> None:
+        self.c.close()
+
+    def test_put_and_get(self) -> None:
+        s = self.lc.session()
+        result = s.put("hello", b"world").wait()
+        self.assertIsInstance(result, Settled)
+        rec = s.get("hello")
+        self.assertFalse(rec.absent)
+        self.assertEqual(rec.value, b"world")
+
+    def test_value_is_encrypted(self) -> None:
+        s = self.lc.session()
+        s.put("secret", b"plaintext").wait()
+        rec = s.get("secret")
+        self.assertNotEqual(rec.raw, b"plaintext")
+        self.assertEqual(rec.value, b"plaintext")
+
+    def test_guarded_put(self) -> None:
+        s = self.lc.session()
+        s.put("k", b"v1").wait()
+        rec = s.get("k")
+        r = s.put("k", b"v2", expect=rec).wait()
+        self.assertIsInstance(r, Settled)
+        self.assertEqual(s.get("k").value, b"v2")
+
+
+if __name__ == "__main__":
+    unittest.main()

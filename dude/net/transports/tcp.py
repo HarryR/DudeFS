@@ -304,8 +304,8 @@ class TCPListener(Listener):
             self._listener.close()
         thread = self._thread
         self._thread = None
-        if thread is not None and thread.is_alive():
-            thread.join(timeout=self.timing.stop_join_sec)
+        if thread is not None:
+            thread.join()
         for conn in self._conns:
             conn.link.close()
         self._conns.clear()

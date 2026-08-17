@@ -65,7 +65,7 @@ class Follower:
     _outbox: list[OutboxItem] = field(default_factory=list)
 
     def add_peer(self, peer: crypto.PublicKey, now: Millis) -> None:
-        if peer == self.me.public:
+        if peer == self.me.public or peer in self._poll_at:
             return
         self._poll_at[peer] = now
 

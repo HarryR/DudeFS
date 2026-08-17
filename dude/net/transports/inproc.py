@@ -1,4 +1,3 @@
-from __future__ import annotations
 
 from dataclasses import dataclass, field
 
@@ -9,15 +8,16 @@ from ..envelope import Frame
 from ..link import Link, LinkError, Listener, OnFrame, OnLink
 
 
-_INBOXES: dict[bytes, InProcListener] = {}
+type InProcNexus = dict[bytes, "InProcListener"]
 
 
 class _InProcConn:
-    __slots__ = ("_me", "_reply_to", "link")
+    __slots__ = ("_me", "_nexus", "_reply_to", "link")
 
-    def __init__(self, reply_to: bytes, me: bytes, address: Address) -> None:
+    def __init__(self, reply_to: bytes, me: bytes, address: Address, nexus: InProcNexus) -> None:
         self._reply_to = reply_to
         self._me = me
+        self._nexus = nexus
         self.link = Link(
             address=address,
             identity=None,
@@ -26,7 +26,7 @@ class _InProcConn:
         )
 
     def send_frame(self, frame: Frame) -> None:
-        target = _INBOXES.get(self._reply_to)
+        target = self._nexus.get(self._reply_to)
         if target is None:
             raise LinkError(f"in-process reply target no longer registered: {self._reply_to!r}")
         target._deliver(frame, sender=self._me)  # noqa: SLF001
@@ -38,6 +38,7 @@ class _InProcConn:
 @dataclass(slots=True)
 class InProcListener(Listener):
     identity: crypto.PublicKey
+    nexus: InProcNexus
     _on_frame: OnFrame | None = field(init=False, default=None)
     _on_link: OnLink | None = field(init=False, default=None)
     _buffered: list[tuple[Frame, Link]] = field(init=False, default_factory=list)
@@ -46,13 +47,17 @@ class InProcListener(Listener):
 
     def __post_init__(self) -> None:
         key = bytes(self.identity)
-        if key in _INBOXES:
+        if key in self.nexus:
             raise LinkError(f"in-process identity already registered: {self.identity.hex()[:8]}")
-        _INBOXES[key] = self
+        self.nexus[key] = self
 
     @property
     def endpoint(self) -> Endpoint:
-        return Endpoint(Address(Scheme.INPROC, self.identity.hex()))
+        return self.endpoint_for(self.identity)
+
+    @staticmethod
+    def endpoint_for(identity: crypto.PublicKey) -> Endpoint:
+        return Endpoint(Address(Scheme.INPROC, identity.hex()))
 
     def _deliver(self, frame: Frame, sender: bytes) -> None:
         if self._stopped:
@@ -63,6 +68,7 @@ class InProcListener(Listener):
                 reply_to=sender,
                 me=bytes(self.identity),
                 address=Address(Scheme.INPROC, sender.hex()),
+                nexus=self.nexus,
             )
             self._conns[sender] = conn
             if self._on_link is not None:
@@ -74,8 +80,10 @@ class InProcListener(Listener):
             self._buffered.append((frame, conn.link))
 
     def start(self, on_frame: OnFrame, on_link: OnLink) -> None:
-        if self._on_frame is not None:
-            raise RuntimeError("InProcListener already started")
+        self._stopped = False
+        me = bytes(self.identity)
+        if me not in self.nexus:
+            self.nexus[me] = self
         self._on_frame = on_frame
         self._on_link = on_link
         for conn in self._conns.values():
@@ -88,12 +96,13 @@ class InProcListener(Listener):
         if address.scheme is not Scheme.INPROC or self._on_link is None:
             return
         target_key = bytes.fromhex(address.value)
-        if target_key not in _INBOXES or target_key in self._conns:
+        if target_key not in self.nexus or target_key in self._conns:
             return
         conn = _InProcConn(
             reply_to=target_key,
             me=bytes(self.identity),
             address=address,
+            nexus=self.nexus,
         )
         self._conns[target_key] = conn
         self._on_link(conn.link)
@@ -102,11 +111,12 @@ class InProcListener(Listener):
         self._stopped = True
         self._on_frame = None
         self._on_link = None
-        _INBOXES.pop(bytes(self.identity), None)
+        me = bytes(self.identity)
+        self.nexus.pop(me, None)
         for conn in self._conns.values():
             conn.link.close()
         self._conns.clear()
-
-
-def _reset_for_tests() -> None:
-    _INBOXES.clear()
+        for listener in list(self.nexus.values()):
+            remote_conn = listener._conns.pop(me, None)
+            if remote_conn is not None:
+                remote_conn.link.notify_closed()

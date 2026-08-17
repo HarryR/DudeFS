@@ -1,8 +1,7 @@
-from __future__ import annotations
-
 import contextlib
+import time
 import threading
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
 from enum import Enum, auto
 from typing import Protocol
@@ -13,10 +12,11 @@ from ..core import crypto
 from ..core.errors import DudeError
 from ..core.units import Millis, now_ms
 from ..net.address import Endpoint
-from ..net.envelope import MessageId
+from ..net.envelope import MessageId, Verb
 from ..net.link import Listener
 from ..net.postman import Delivered, Postman
 from ..store import smt
+from ..store.layer import Held
 from ..store.management import (
     CERT_PURPOSE_ROSTER,
     CERT_PURPOSE_ROSTER_COMMITMENT,
@@ -27,6 +27,7 @@ from ..store.management import (
 )
 from ..tunables import Tunables
 from . import chain
+from ..store.ops import SignedTransaction
 from .lite_adapter import (
     AnchorsReply,
     GetAnchors,
@@ -38,7 +39,12 @@ from .lite_adapter import (
     RosterBundle,
     SyncRefusal,
     TrustedBlock,
+    TxStatus,
+    TxStatusKind,
+    TxStatusReply,
 )
+
+from ..session import KeyCache, Session, SubmitHandle
 
 
 class LightClientError(DudeError): ...
@@ -70,6 +76,7 @@ class TrustedState:
 @dataclass(slots=True)
 class GetResult:
     value: bytes
+    credential: bytes
     absent: bool
     epoch: int
     block_num: int
@@ -79,6 +86,13 @@ class GetResult:
 @dataclass(slots=True)
 class Failed:
     reason: str
+
+
+@dataclass(slots=True)
+class PeerView:
+    last_block_num: int = 0
+    last_activity: Millis = 0
+    consecutive_failures: int = 0
 
 
 class _Pending: ...
@@ -91,7 +105,7 @@ class Request(Protocol):
     mid: MessageId
     peer: crypto.PublicKey
 
-    def resolve(self, client: LightClient, msg: LiteMsg, now: Millis) -> None: ...
+    def resolve(self, client: "LightClient", msg: LiteMsg, now: Millis) -> None: ...
 
     def expire(self) -> None: ...
 
@@ -107,11 +121,12 @@ class Read:
     def poll(self) -> GetResult | Failed | _Pending:
         return PENDING if self.result is None else self.result
 
-    def resolve(self, client: LightClient, msg: LiteMsg, now: Millis) -> None:
+    def resolve(self, client: "LightClient", msg: LiteMsg, now: Millis) -> None:
         try:
             client.resolve_read(self, msg, now)
         except DudeError as e:
             self.result = Failed(reason=f"responder reply refused: {e}")
+        client._note_read_result(self, now)
 
     def expire(self) -> None:
         self.result = Failed(reason="request expired")
@@ -122,7 +137,7 @@ class _BootstrapRequest:
     mid: MessageId
     peer: crypto.PublicKey
 
-    def resolve(self, client: LightClient, msg: LiteMsg, now: Millis) -> None:
+    def resolve(self, client: "LightClient", msg: LiteMsg, now: Millis) -> None:
         try:
             client.on_bootstrap_reply(self.peer, msg, now)
         except DudeError:
@@ -154,9 +169,28 @@ class LightClient:
 
     _bootstrap_peers: dict[crypto.PublicKey, _BootstrapReply] = field(default_factory=dict)
     _inflight: dict[bytes, Request] = field(default_factory=dict)
+    _submit_callbacks: dict[bytes, Callable[[int, bytes], None]] = field(default_factory=dict, init=False)
+    _key_cache: KeyCache | None = field(default=None, init=False)
+    _peer_views: dict[crypto.PublicKey, PeerView] = field(default_factory=dict, init=False)
 
     _stopping: threading.Event = field(default_factory=threading.Event, init=False)
     _thread: threading.Thread | None = field(default=None, init=False)
+
+    def _peer_view(self, peer: crypto.PublicKey) -> PeerView:
+        pv = self._peer_views.get(peer)
+        if pv is None:
+            pv = PeerView()
+            self._peer_views[peer] = pv
+        return pv
+
+    def _note_read_result(self, req: "Read", now: Millis) -> None:
+        pv = self._peer_view(req.peer)
+        pv.last_activity = now
+        if isinstance(req.result, GetResult):
+            pv.last_block_num = req.result.block_num
+            pv.consecutive_failures = 0
+        elif isinstance(req.result, Failed):
+            pv.consecutive_failures += 1
 
     def add_bootstrap_peer(self, peer: crypto.PublicKey, endpoints: tuple[Endpoint, ...]) -> None:
         self.postman.add_peer(peer, endpoints)
@@ -173,8 +207,9 @@ class LightClient:
     def _ask_for_anchors(self, peers: Iterable[crypto.PublicKey], now: Millis) -> None:
         req = GetAnchors(known_roster_fingerprint=None, known_trusted_block=None)
         for peer in peers:
-            mid = self.postman.send(peer, req, self.tunables.ttl_lite)
+            mid = MessageId.random()
             self._inflight[mid.correlation_id] = _BootstrapRequest(mid=mid, peer=peer)
+            self.postman.send(peer, req, self.tunables.ttl_lite, mid=mid)
 
     def _ask_stale_peers(self, now: Millis) -> None:
         waiting = {r.peer for r in self._inflight.values() if isinstance(r, _BootstrapRequest)}
@@ -205,9 +240,10 @@ class LightClient:
                 self.trusted_state.head.block_num, self.trusted_state.head.block_hash
             ),
         )
-        mid = self.postman.send(peer, req, self.tunables.ttl_lite)
+        mid = MessageId.random()
         handle = Read(mid=mid, peer=peer, store_id=store_id, name=name)
         self._inflight[mid.correlation_id] = handle
+        self.postman.send(peer, req, self.tunables.ttl_lite, mid=mid)
         return handle
 
     # -- the run loop -------------------------------------------------------
@@ -225,36 +261,41 @@ class LightClient:
         )
         self._thread.start()
 
-    def stop(self, timeout: float = 5.0) -> None:
+    def stop(self) -> None:
         self._stopping.set()
         self.postman.stop()
         thread = self._thread
         self._thread = None
-        if thread is not None and thread.is_alive():
-            thread.join(timeout=timeout)
+        if thread is not None:
+            thread.join()
 
     def _run(self) -> None:
         tick_interval = self.tunables.tick_interval / 1000
         while not self._stopping.is_set():
             now = now_ms()
-            for output in self.postman.drain_output():
+            for output in self.postman.drain_output(timeout=tick_interval):
                 for d in output.delivered:
                     self._on_delivered(d, now)
                 for e in output.expired:
                     req = self._inflight.pop(e.prefix, None)
                     if req is not None:
                         req.expire()
+                        self._peer_view(req.peer).consecutive_failures += 1
             if self.state is State.BOOTSTRAPPING:
                 with contextlib.suppress(DudeError):
                     self._ask_stale_peers(now)
-            self._stopping.wait(timeout=tick_interval)
 
     def _on_delivered(self, d: Delivered, now: Millis) -> None:
+        if d.in_reply_to is None:
+            return
+        if d.verb in (Verb.ACCEPTED, Verb.REFUSED):
+            cb = self._submit_callbacks.pop(d.in_reply_to.correlation_id, None)
+            if cb is not None:
+                cb(d.verb, d.body)
+            return
         try:
             msg = LiteMsg.decode(d.verb, d.body)
         except (LiteAdapterError, DudeError):
-            return
-        if d.in_reply_to is None:
             return
         req = self._inflight.pop(d.in_reply_to.correlation_id, None)
         if req is None:
@@ -284,6 +325,10 @@ class LightClient:
         entry.fingerprint = msg.roster_fingerprint
         entry.bundle = msg.bundle
         entry.anchors_reply = msg
+        pv = self._peer_view(peer)
+        pv.last_block_num = msg.head.anchors.block_num
+        pv.last_activity = now
+        pv.consecutive_failures = 0
         self._check_bootstrap_convergence(now)
 
     def _check_bootstrap_convergence(self, now: Millis) -> None:
@@ -372,6 +417,7 @@ class LightClient:
             return
         entry.result = GetResult(
             value=msg.value,
+            credential=msg.credential,
             absent=msg.absent,
             epoch=msg.epoch,
             block_num=msg.head.anchors.block_num,
@@ -392,6 +438,135 @@ class LightClient:
             return False
         self.trusted_state = replace(ts, head=walked)
         return True
+
+    def session(self, store_id: int = 1) -> Session:
+        sub = _LiteSubstrate(self)
+        if self._key_cache is None:
+            self._key_cache = KeyCache(self.me, sub)
+        return Session(sub, self.me, store_id, self._key_cache)
+
+
+@dataclass(slots=True)
+class _TxStatusHandle:
+    mid: MessageId
+    peer: crypto.PublicKey
+    result: TxStatusKind | None = None
+
+    def resolve(self, client: "LightClient", msg: LiteMsg, now: Millis) -> None:
+        if isinstance(msg, TxStatusReply):
+            self.result = msg.status
+            pv = client._peer_view(self.peer)
+            pv.last_activity = now
+            pv.consecutive_failures = 0
+
+    def expire(self) -> None:
+        self.result = TxStatusKind.UNKNOWN
+
+
+class _LiteSubstrate:
+    __slots__ = ("_lc",)
+
+    def __init__(self, lc: LightClient) -> None:
+        self._lc = lc
+
+    def _ranked_peers(self) -> list[crypto.PublicKey]:
+        ts = self._lc.trusted_state
+        if ts is None or not ts.roster:
+            return list(self._lc._bootstrap_peers)
+        head_num = ts.head.block_num
+        views = self._lc._peer_views
+
+        def rank(peer: crypto.PublicKey) -> tuple[int, int, int]:
+            pv = views.get(peer)
+            if pv is None:
+                return (1, 0, 0)
+            in_sync = 1 if pv.last_block_num >= head_num else 0
+            return (in_sync, -pv.consecutive_failures, pv.last_block_num)
+
+        return sorted(ts.roster, key=rank, reverse=True)
+
+    def _pick_peer(self) -> crypto.PublicKey:
+        ranked = self._ranked_peers()
+        if not ranked:
+            raise LightClientError("no peers available")
+        return ranked[0]
+
+    def get(self, store_id: int, name: bytes) -> Held | None:
+        deadline = time.monotonic() + self._lc.tunables.ttl_lite / 1000
+        while time.monotonic() < deadline:
+            peer = self._pick_peer()
+            req = self._lc.request_get(store_id, name, peer, now_ms())
+            while time.monotonic() < deadline:
+                result = req.poll()
+                if isinstance(result, GetResult):
+                    if result.absent:
+                        return None
+                    return Held(result.value, result.epoch, result.credential)
+                if isinstance(result, Failed):
+                    break
+                time.sleep(self._lc.tunables.tick_interval / 1000)
+        return None
+
+    def submit(self, tx: SignedTransaction) -> SubmitHandle:
+        peers = self._ranked_peers()
+        if not peers:
+            raise LightClientError("no peers available")
+        ts = self._lc.trusted_state
+        count = quorum.corroboration(len(ts.roster)) if ts is not None else 1
+        targets = peers[:max(count, 1)]
+
+        mid = MessageId.random()
+        handle = SubmitHandle(mid=mid, op_hash=tx.op_hash, _sub=self, peer=targets[0])
+
+        accepted = [False]
+        refuse_count = [0]
+        total = len(targets)
+
+        for target in targets:
+            peer_mid = MessageId.random()
+
+            def cb(verb: int, body: bytes, _peer: crypto.PublicKey = target) -> None:
+                pv = self._lc._peer_view(_peer)
+                pv.last_activity = now_ms()
+                pv.consecutive_failures = 0
+                if accepted[0]:
+                    return
+                if verb == Verb.ACCEPTED:
+                    accepted[0] = True
+                    handle.peer = _peer
+                    handle.resolve(verb, body)
+                elif verb == Verb.REFUSED:
+                    refuse_count[0] += 1
+                    if refuse_count[0] >= total:
+                        handle.resolve(verb, body)
+
+            self._lc._submit_callbacks[peer_mid.correlation_id] = cb
+            self._lc.postman.send_raw(
+                target, Verb.SUBMIT, tx.raw,
+                self._lc.tunables.ttl_exchange, mid=peer_mid,
+            )
+
+        return handle
+
+    def settled(self, op_hash: crypto.Digest, peer: crypto.PublicKey | None = None) -> bool:
+        if peer is None:
+            peer = self._pick_peer()
+        mid = MessageId.random()
+        handle = _TxStatusHandle(mid=mid, peer=peer)
+        self._lc._inflight[mid.correlation_id] = handle
+        self._lc.postman.send(peer, TxStatus(op_hash=op_hash), self._lc.tunables.ttl_lite, mid=mid)
+        deadline = now_ms() + self._lc.tunables.ttl_lite
+        while now_ms() < deadline:
+            if handle.result is not None:
+                return handle.result is TxStatusKind.SETTLED
+            time.sleep(0.01)
+        return False
+
+    def evict_after_sec(self) -> float:
+        return self._lc.tunables.evict_after / 1000
+
+    def wait_for_commit(self, timeout: float) -> None:
+        time.sleep(min(timeout, self._lc.tunables.block_time / 1000))
 
 
 def _contiguous_from(head_num: int, offered: tuple[SettledBlock, ...]) -> tuple[SettledBlock, ...]:
@@ -469,6 +644,7 @@ __all__ = [
     "GetResult",
     "LightClient",
     "LightClientError",
+    "PeerView",
     "State",
     "TrustedState",
 ]

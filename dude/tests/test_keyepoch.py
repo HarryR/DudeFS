@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import unittest
 
-from dude.client import Client, Keys, mint_first_keyepoch
-from dude.consensus.bootstrap import bootstrap, intervene
+from dude.client import Client, Keys
+from dude.consensus.bootstrap import bootstrap, intervene, mint_first_keyepoch
 from dude.core import codec, crypto
 from dude.core.errors import DudeError
 from dude.store import Store, ops, settle
@@ -30,7 +30,7 @@ def _cluster_of_one() -> tuple[Store, crypto.Keypair, MgmtWriter]:
         pop=mgr.prove_possession(),
         cert=Cert.sign_grant(mgr, mgr.public, Role.MANAGER),
     )
-    tx = tx + mint_first_keyepoch(w, mgr)[0]
+    tx = tx + mint_first_keyepoch(w, mgr)
     bootstrap(s, mgr, (tx.sign(mgr, T0),), bucket=0)
     return s, mgr, MgmtWriter(s)
 
@@ -153,7 +153,7 @@ class TestACiphertextOpensOnlyWhereItWasSealed(unittest.TestCase):
         it cannot read store 1 even holding store 1's bytes. That is what makes `stores` on a
         grant a key boundary rather than an access rule a stale replica could ignore."""
         other = ops.STORE_DATA + 1
-        mint, _ = mint_first_keyepoch(MgmtWriter(self.s), self.mgr, other)
+        mint = mint_first_keyepoch(MgmtWriter(self.s), self.mgr, other)
         intervene(self.s, self.mgr, bodies=(mint.sign(self.mgr, T0 + 5),), bucket=5)
 
         store2 = Client(Keys.unwrap(self.s, self.mgr, other))
@@ -225,19 +225,21 @@ class TestGenesisIsByteEqualOnEveryNode(unittest.TestCase):
     bodies rather than freshly composed ones or it lands on a chain of its own."""
 
     def test_every_node_and_a_later_joiner_share_block_one(self):
-        c = Cluster()
+        c = Cluster(nodes=3, mgmt=1)
         blocks = {n.store.settled_at(1) for n in c.nodes}
         self.assertEqual(len(blocks), 1, "nodes disagree on block 1")
         joiner = c.provisioned()
         self.assertIn(joiner.settled_at(1), blocks, "a joiner was bootstrapped onto its own chain")
+        c.close()
 
     def test_the_cluster_actually_settles_a_block(self):
-        """The control: byte-equal genesis is only interesting because rounds converge on it."""
-        c = Cluster()
-        c.put("probe", b"v", now=T0)
-        c.pump(T0)
+        c = Cluster(nodes=3, mgmt=1)
+        s = c.mgmt_nodes[0].session()
+        s.put("probe", b"v").wait()
+        c.wait_block(2)
         heads = [n.store.head_block_num() or 0 for n in c.nodes]
         self.assertTrue(all(h > 1 for h in heads), f"no block was produced: {heads}")
+        c.close()
 
 
 if __name__ == "__main__":

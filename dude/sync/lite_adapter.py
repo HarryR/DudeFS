@@ -13,7 +13,16 @@ from ..store.management import Cert, Grant, NodeRecord
 from .refusal import SyncRefusal
 
 
+from enum import Enum
+
+
 class LiteAdapterError(DudeError): ...
+
+
+class TxStatusKind(Enum):
+    SETTLED = "settled"
+    PENDING = "pending"
+    UNKNOWN = "unknown"
 
 
 @dataclass(frozen=True, slots=True)
@@ -266,12 +275,47 @@ class LiteRefused(LiteMsg):
         return cls(reason=reason)
 
 
+@dataclass(frozen=True, slots=True)
+class TxStatus(LiteMsg):
+    verb: ClassVar[Verb] = Verb.TX_STATUS
+    op_hash: crypto.Digest
+
+    def _encode(self) -> bytes:
+        return codec.encode([self.op_hash])
+
+    @classmethod
+    def _decode(cls, body: bytes) -> TxStatus:
+        try:
+            p = codec.as_seq(codec.decode(body), 1)
+            return cls(op_hash=crypto.Digest(codec.as_bytes(p[0])))
+        except (DudeError, ValueError) as e:
+            raise LiteAdapterError(f"malformed TX_STATUS body: {e}") from e
+
+
+@dataclass(frozen=True, slots=True)
+class TxStatusReply(LiteMsg):
+    verb: ClassVar[Verb] = Verb.TX_STATUS_REPLY
+    status: TxStatusKind
+
+    def _encode(self) -> bytes:
+        return self.status.value.encode()
+
+    @classmethod
+    def _decode(cls, body: bytes) -> TxStatusReply:
+        try:
+            return cls(status=TxStatusKind(body.decode("utf-8")))
+        except (ValueError, UnicodeDecodeError) as e:
+            raise LiteAdapterError(f"malformed TX_STATUS_REPLY body: {e}") from e
+
+
 _LITE_MSG_CLASSES: tuple[type[LiteMsg], ...] = (
     GetAnchors,
     AnchorsReply,
     GetProof,
     ProofReply,
     LiteRefused,
+    TxStatus,
+    TxStatusReply,
 )
 
 

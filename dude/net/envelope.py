@@ -1,4 +1,3 @@
-from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import IntEnum
@@ -18,8 +17,9 @@ class Verb(IntEnum):
     SUBMIT = 10
     ACCEPTED = 11
     """Admitted to my mempool, and NOTHING more -- not included, not settled, not durable."""
-
+    TX_STATUS = 12
     BODIES = 13
+    TX_STATUS_REPLY = 14
 
     HELD = 22
     SIG = 23
@@ -52,7 +52,7 @@ class MessageId(bytes):
     SIZE = 8
 
     @classmethod
-    def random(cls, attempt: int = 0) -> MessageId:
+    def random(cls, attempt: int = 0) -> "MessageId":
         return cls(crypto.random_bytes(cls.PREFIX_SIZE) + bytes([attempt]))
 
     @property
@@ -63,7 +63,7 @@ class MessageId(bytes):
     def attempt(self) -> int:
         return self[self.PREFIX_SIZE]
 
-    def with_attempt(self, attempt: int) -> MessageId:
+    def with_attempt(self, attempt: int) -> "MessageId":
         return MessageId(self.correlation_id + bytes([attempt]))
 
 
@@ -85,7 +85,7 @@ class Envelope:
         )
 
     @classmethod
-    def decode(cls, raw: bytes) -> Envelope:
+    def decode(cls, raw: bytes) -> "Envelope":
         try:
             f = codec.as_seq(codec.decode(raw), 5)
             to = crypto.PublicKey(codec.as_bytes(f[0]))
@@ -101,7 +101,7 @@ class Envelope:
             raise EnvelopeError(f"unknown verb {verb_int}") from exc
         return cls(to, verb, MessageId(mid), body, MessageId(reply_to))
 
-    def sign(self, kp: crypto.Keypair, ts: int) -> SignedEnvelope:
+    def sign(self, kp: crypto.Keypair, ts: int) -> "SignedEnvelope":
         return SignedEnvelope(kp.public, ts, self, kp.sign(_body_bytes(kp.public, ts, self)))
 
 
@@ -129,14 +129,14 @@ class SignedEnvelope:
     def verify(self) -> bool:
         return self.frm.verify(self._body, self.sig)
 
-    def seal(self) -> Frame:
+    def seal(self) -> "Frame":
         sealed = self.env.to.seal(self.raw)
         return Frame(crypto.screen_tag(self.env.to, sealed), sealed)
 
     def fresh(self, now: int, window: int) -> bool:
         return abs(now - self.ts) <= window
 
-    def answer(self, verb: Verb, body: bytes = b"") -> Envelope:
+    def answer(self, verb: Verb, body: bytes = b"") -> "Envelope":
         return Envelope(self.frm, verb, MessageId.random(), body, self.env.mid)
 
     def accept(
@@ -167,7 +167,7 @@ class SignedEnvelope:
 
 def request(
     kp: crypto.Keypair, to: crypto.PublicKey, verb: Verb, ts: int, body: bytes = b""
-) -> SignedEnvelope:
+) -> "SignedEnvelope":
     return Envelope(to, verb, MessageId.random(), body).sign(kp, ts)
 
 
@@ -188,7 +188,7 @@ class Frame:
     def addressed_to(self, me: crypto.PublicKey) -> bool:
         return crypto.screen_tag(me, self.sealed) == self.tag
 
-    def unseal(self, kp: crypto.Keypair) -> SignedEnvelope:
+    def unseal(self, kp: crypto.Keypair) -> "SignedEnvelope":
         try:
             raw = kp.open_sealed_raw(self.sealed)
         except crypto.SealedBoxError as e:

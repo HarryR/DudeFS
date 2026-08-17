@@ -1,4 +1,3 @@
-from __future__ import annotations
 
 import contextlib
 import os
@@ -13,7 +12,7 @@ from typing import NamedTuple
 from ..core import codec, crypto
 from ..core.errors import DudeError, InvariantError
 from . import ops, settle, smt
-from .layer import Held, Index, PathRow, Row, _prefix_upper, holds
+from .layer import Held, Index, PathRow, holds
 from .management import P_NODE, P_ROSTER, MgmtReader, Role
 
 _SCHEMA = """
@@ -33,8 +32,7 @@ CREATE TABLE IF NOT EXISTS entry (
 CREATE TABLE IF NOT EXISTS live (
     store  INTEGER NOT NULL,
     name   BLOB NOT NULL,
-    head   INTEGER NOT NULL,           -- the settled index of the last write (#provenance)
-    value  BLOB NOT NULL,              -- ciphertext; held here so it outlives its log entry
+    value  BLOB NOT NULL,
     epoch  INTEGER NOT NULL DEFAULT 0, -- which keyepoch `value` is under (#conveyor)
     path   BLOB NOT NULL,              -- H(store||name): where this key sits in the state root
     -- The signed transaction that authorised `value`, for EVERY row. NO DEFAULT: the state root
@@ -138,25 +136,9 @@ class StoreReader:
 
     def get(self, store: int, name: bytes) -> Held | None:
         row = self._conn.execute(
-            "SELECT head, value, epoch, cred FROM live WHERE store=? AND name=?", (store, name)
+            "SELECT value, epoch, cred FROM live WHERE store=? AND name=?", (store, name)
         ).fetchone()
-        return Held(row[0], row[1], row[2], row[3]) if row else None
-
-    def prefix(self, store: int, pre: bytes) -> Iterator[Row]:
-        hi = _prefix_upper(pre)
-        if hi is None:
-            rows = self._conn.execute(
-                "SELECT name, head, value, epoch FROM live WHERE store=? AND name>=? ORDER BY name",
-                (store, pre),
-            ).fetchall()
-        else:
-            rows = self._conn.execute(
-                "SELECT name, head, value, epoch FROM live"
-                " WHERE store=? AND name>=? AND name<? ORDER BY name",
-                (store, pre, hi),
-            ).fetchall()
-        for name, head, value, epoch in rows:
-            yield Row(name, head, value, epoch)
+        return Held(row[0], row[1], row[2]) if row else None
 
     def accumulator(self) -> crypto.Accumulator:
         return crypto.Accumulator(self._get_meta("acc", crypto.ACC_IDENTITY))
@@ -296,12 +278,12 @@ class StoreReader:
             (lo, hi),
         ).fetchall()
         for st, name, value, cred, epoch in rows:
-            yield int(st), name, value, cred, int(epoch)
+            yield PathRow(int(st), name, value, cred, int(epoch))
 
     def has_settled(self, op_hash: crypto.Digest) -> bool:
         return bool(self.settled_hashes((op_hash,)))
 
-    def settled_hashes(self, want: tuple[crypto.Digest, ...]) -> set[bytes]:
+    def settled_hashes(self, want: tuple[crypto.Digest, ...]) -> set[crypto.Digest]:
         if not want:
             return set()
         marks = ",".join("?" * len(want))
@@ -459,9 +441,9 @@ class StoreWriter(StoreReader):
             self._tree.invalidate(path)
             if isinstance(m, ops.Set):
                 self._conn.execute(
-                    "INSERT OR REPLACE INTO live (store, name, head, value, path, epoch, cred)"
-                    " VALUES (?,?,?,?,?,?,?)",
-                    (m.store, m.name, idx, m.value, path, m.epoch, cred),
+                    "INSERT OR REPLACE INTO live (store, name, value, path, epoch, cred)"
+                    " VALUES (?,?,?,?,?,?)",
+                    (m.store, m.name, m.value, path, m.epoch, cred),
                 )
                 acc = crypto.acc_add(acc, element(m.store, m.name, m.value, m.epoch))
             else:
@@ -552,10 +534,6 @@ class Store:
         with self.snapshot() as r:
             return r.get(store, name)
 
-    def prefix(self, store: int, pre: bytes) -> Iterator[Row]:
-        with self.snapshot() as r:
-            yield from list(r.prefix(store, pre))
-
     def head(self) -> Index:
         with self.snapshot() as r:
             return r.head()
@@ -640,7 +618,7 @@ class Store:
         with self.snapshot() as r:
             return r.has_settled(op_hash)
 
-    def settled_hashes(self, want: tuple[crypto.Digest, ...]) -> set[bytes]:
+    def settled_hashes(self, want: tuple[crypto.Digest, ...]) -> set[crypto.Digest]:
         with self.snapshot() as r:
             return r.settled_hashes(want)
 
@@ -688,7 +666,7 @@ class Store:
             return e.why
         return None
 
-    def rebuild(self) -> Store:
+    def rebuild(self) -> "Store":
         fresh = Store(":memory:")
         fresh.replay(list(self.entries()))
         return fresh

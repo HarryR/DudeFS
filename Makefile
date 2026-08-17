@@ -19,6 +19,7 @@ RUFF_VERSION     := 0.16.0
 TY_VERSION       := 0.0.61
 PYNACL_VERSION   := 1.6.2
 COVERAGE_VERSION := 7.6.1
+PYTEST_VERSION   := 8.3.2
 
 # What the tooling runs over. `dudefs/` and `tests/` are the previous package, kept only until the
 # salvage is finished; they are NOT linted, because ruff.toml is now scoped to the rules `dude/`
@@ -53,7 +54,7 @@ uv-bootstrap:
 install: uv-bootstrap
 	"$(UV)" venv "$(VENV)" --python 3.12 --clear
 	"$(UV)" pip install --python "$(PY)" \
-	  ruff==$(RUFF_VERSION) ty==$(TY_VERSION) pynacl==$(PYNACL_VERSION) coverage==$(COVERAGE_VERSION)
+	  ruff==$(RUFF_VERSION) ty==$(TY_VERSION) pynacl==$(PYNACL_VERSION) coverage==$(COVERAGE_VERSION) pytest==$(PYTEST_VERSION)
 	@echo ">> toolchain ready (project-local); 'make check' to run everything"
 
 lint:
@@ -69,14 +70,14 @@ typecheck:
 	"$(TY)" check $(SRC)
 
 test:
-	"$(PY)" -m unittest discover -s $(SRC)/tests -t .
+	"$(PY)" -m pytest $(SRC)/tests -q --tb=short --no-header --durations=0
 
 # Coverage with a 90% floor. Current tree measures 93% (2026-08-03); 90 is a floor a hair below
 # actual, so a temporary in-progress dip does not fail the gate. The CI step name has always
 # claimed this ratchet; before today it was cosmetic (the Makefile ran no floor) and the step
 # passed at any coverage. The number is real now -- raise it as coverage climbs.
 coverage:
-	"$(PY)" -m coverage run --source=$(SRC) -m unittest discover -s $(SRC)/tests -t .
+	"$(PY)" -m coverage run --source=$(SRC) -m pytest $(SRC)/tests -q --tb=short --no-header
 	"$(PY)" -m coverage report -m --fail-under=90
 
 # CI-style gate: no writes, fails on any issue.

@@ -22,8 +22,10 @@ import unittest
 
 from .. import quorum
 from ..consensus.canonical import CanonicalBatch
-from ..consensus.round import Block, Bodies, Round, RoundMsg, Sig, State, _slice_hash
+from ..consensus.round import Block, Bodies, Held, Round, RoundAdapterError, RoundMsg, Sig, State, _slice_hash
+from ..core import codec
 from ..core import crypto
+from ..net.envelope import Verb
 from ..net.postman import Recipient
 from ..store import ops
 from ..store.ops import SignedTransaction
@@ -962,6 +964,56 @@ class TestPropertySafetyUnderByzantine(unittest.TestCase):
                 self.assertLessEqual(
                     len(blocks), 1, f"byzantine n={n} caused disagreement: {blocks}"
                 )
+
+
+class TestRoundMsgEncoding(unittest.TestCase):
+
+    def test_held_roundtrips(self):
+        hashes = frozenset({crypto.h(b"a"), crypto.h(b"b"), crypto.h(b"c")})
+        original = Held(bucket=7, prev_block=crypto.h(b"prev"), hashes=hashes)
+        verb, body = original.encode()
+        self.assertEqual(RoundMsg.decode(verb, body), original)
+
+    def test_sig_roundtrips(self):
+        kp = crypto.Keypair.generate()
+        original = Sig.sign(kp, 3, crypto.h(b"prev"), crypto.h(b"a-slice"))
+        verb, body = original.encode()
+        self.assertEqual(RoundMsg.decode(verb, body), original)
+
+    def test_empty_held_roundtrips(self):
+        original = Held(bucket=1, prev_block=crypto.h(b"prev"), hashes=frozenset())
+        verb, body = original.encode()
+        self.assertEqual(RoundMsg.decode(verb, body), original)
+
+    def test_bodies_roundtrips_and_pins_field_count(self):
+        original = Bodies(bucket=5, prev_block=crypto.h(b"prev"), txs=_stubs("a", "b"))
+        verb, body = original.encode()
+        self.assertEqual(RoundMsg.decode(verb, body), original)
+        for wrong in ([5, b"p"], [5, b"p", [], b"extra"]):
+            with self.assertRaises(RoundAdapterError):
+                RoundMsg.decode(verb, codec.encode(wrong))
+
+    def test_bucket_of_reads_leading_field(self):
+        _, body = Held(bucket=42, prev_block=crypto.h(b"prev"), hashes=frozenset({crypto.h(b"x")})).encode()
+        self.assertEqual(RoundMsg.bucket_of(body), 42)
+
+    def test_held_wrong_field_count_raises(self):
+        for wrong in ([1, []], [1, b"p", [], b"extra"]):
+            with self.assertRaises(RoundAdapterError):
+                RoundMsg.decode(Verb.HELD, codec.encode(wrong))
+
+    def test_sig_wrong_field_count_raises(self):
+        for wrong in ([1, b"p", b"s"], [1, b"p", b"s", b"sig", b"extra"]):
+            with self.assertRaises(RoundAdapterError):
+                RoundMsg.decode(Verb.SIG, codec.encode(wrong))
+
+    def test_non_round_verb_raises(self):
+        with self.assertRaises(RoundAdapterError):
+            RoundMsg.decode(Verb.PING, b"")
+
+    def test_roundmsg_is_abstract(self):
+        with self.assertRaises(TypeError):
+            RoundMsg()
 
 
 if __name__ == "__main__":

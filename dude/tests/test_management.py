@@ -11,6 +11,8 @@ from ..core.errors import DudeError, InvariantError
 from ..net.address import Address, Endpoint, Scheme
 from ..store import Store, ops, settle
 from ..store.management import (
+    GRANTS_MAP,
+    NODES_MAP,
     P_GRANT,
     P_NODE,
     P_POP,
@@ -36,26 +38,34 @@ DJ = crypto.NameToken(crypto.h(b"j"))
 
 def unauthorised_certs(mgmt: MgmtWriter) -> str | None:
     """The #revocation-is-compound invariant, quantified: no live row carries a cert whose signer
-    is not authorised NOW. A TEST helper, not a production check -- the state it reports is
-    reachable by a hand-composed `ops.Del` and refusing it after settlement would brick on
-    exactly the input it means to catch. `verify_cert` is what production consults, per row."""
-    for prefix, decode in (
-        (P_NODE, lambda who, raw: NodeRecord.decode_row(who, raw).cert),
-        (P_GRANT, lambda who, raw: Grant.decode_row(who, raw).cert),
-    ):
-        for name, _prov, value, _ep in mgmt.src.prefix(mgmt.store_id, prefix):
-            who = crypto.PublicKey(name[len(prefix) :])
-            try:
-                cert = decode(who, value)
-            except DudeError as e:
-                return f"row {name!r} will not decode: {e}"
-            if not mgmt.verify_cert(cert, mgmt.src):
-                return f"row {name!r} carries a cert signed by {cert.signer.hex()[:8]}"
+    is not authorised NOW."""
+    for key in NODES_MAP.keys(mgmt.src):
+        who = crypto.PublicKey(key)
+        entry = NODES_MAP.entry(mgmt.src, key)
+        if entry is None:
+            continue
+        try:
+            cert = NodeRecord.decode_row(who, entry.value).cert
+        except DudeError as e:
+            return f"node row {who.hex()[:8]} will not decode: {e}"
+        if not mgmt.verify_cert(cert, mgmt.src):
+            return f"node row {who.hex()[:8]} carries a cert signed by {cert.signer.hex()[:8]}"
+    for key in GRANTS_MAP.keys(mgmt.src):
+        who = crypto.PublicKey(key)
+        entry = GRANTS_MAP.entry(mgmt.src, key)
+        if entry is None:
+            continue
+        try:
+            cert = Grant.decode_row(who, entry.value).cert
+        except DudeError as e:
+            return f"grant row {who.hex()[:8]} will not decode: {e}"
+        if not mgmt.verify_cert(cert, mgmt.src):
+            return f"grant row {who.hex()[:8]} carries a cert signed by {cert.signer.hex()[:8]}"
     raw = mgmt.src.get(mgmt.store_id, P_ROSTER)
     if raw is None:
         return None
     try:
-        rc = RosterCommitment.decode_row(raw[1])
+        rc = RosterCommitment.decode_row(raw.value)
     except DudeError as e:
         return f"roster commitment will not decode: {e}"
     if not mgmt.verify_cert(rc.cert, mgmt.src):
@@ -343,7 +353,7 @@ class TestRevocationIsCompound(unittest.TestCase):
         the write until management operations become typed opcodes."""
         anchor, warm, s, mgmt, _kps = self._cluster_admitted_by_a_warm_manager()
         bare = ops.writes(
-            ops.Del(ops.STORE_MANAGEMENT, P_GRANT + warm.public),
+            ops.Del(ops.STORE_MANAGEMENT, GRANTS_MAP._entry_name(warm.public)),
             ops.Del(ops.STORE_MANAGEMENT, P_POP + warm.public),
         )
         s.apply((_sign(anchor, bare),), auth=mgmt)
@@ -816,7 +826,7 @@ class TestMalformedRowsDoNotPoison(unittest.TestCase):
 
     def test_garbage_node_row_reads_as_absent_and_roster_survives(self):
         stranger = crypto.Keypair.generate().public
-        self._settle_garbage(P_NODE + stranger)
+        self._settle_garbage(NODES_MAP._entry_name(stranger))
         self.assertEqual(set(self.mgmt.roster()), {kp.public for kp in self.kps})
         self.assertNotIn(stranger, self.mgmt.nodes())
         self.assertIsNotNone(self.mgmt.roster_commitment())
@@ -828,7 +838,7 @@ class TestMalformedRowsDoNotPoison(unittest.TestCase):
 
     def test_garbage_grant_row_refuses_authority_not_raising(self):
         writer = crypto.Keypair.generate()
-        self._settle_garbage(P_GRANT + writer.public)
+        self._settle_garbage(GRANTS_MAP._entry_name(writer.public))
         self.assertIsNone(self.mgmt.grant_of(writer.public))
         attempt = ops.writes(ops.Set(ops.STORE_DATA, DK, b"v")).sign(writer, T0 + 2)
         applied = self.s.apply((attempt,), auth=self.mgmt)
@@ -843,7 +853,10 @@ class TestIsMemberAndRosterCannotDisagree(unittest.TestCase):
     on real cluster state, and `_seats` is why they cannot come apart."""
 
     def test_they_agree_on_every_member_and_on_a_stranger(self):
-        mgmt = MgmtReader(Cluster().nodes[0].store)
+        c = Cluster(nodes=3)
+        s = c.provisioned()
+        c.close()
+        mgmt = MgmtReader(s)
         roster = mgmt.roster()
         self.assertTrue(roster, "no roster to compare against")
         for who in roster:
@@ -851,16 +864,14 @@ class TestIsMemberAndRosterCannotDisagree(unittest.TestCase):
         self.assertFalse(mgmt.is_member(crypto.Keypair.generate().public))
 
     def test_a_row_that_is_not_a_seat_is_refused_by_both(self):
-        """THE STATE THAT DISTINGUISHES THEM. Removal deletes the row, so on every other path
-        "a row exists" and "the row is a seat" coincide and an `is_member` that skipped the
-        predicate would pass every other test here. A row whose roster cert does not verify is
-        the one shape where they can disagree."""
-        c = Cluster(size=4)
-        s = c.nodes[0].store
-        victim = c.keys[3].public
-        raw = s.get(ops.STORE_MANAGEMENT, P_NODE + victim)
-        assert raw is not None
-        rec = NodeRecord.decode_row(victim, raw.value)
+        c = Cluster(nodes=4)
+        s = c.provisioned()
+        c.close()
+        node_keys = [n.me.public for n in c.nodes]
+        victim = node_keys[3]
+        entry = NODES_MAP.entry(s, victim)
+        assert entry is not None
+        rec = NodeRecord.decode_row(victim, entry.value)
         forged = NodeRecord(
             identity=rec.identity,
             endpoints=rec.endpoints,
@@ -869,25 +880,29 @@ class TestIsMemberAndRosterCannotDisagree(unittest.TestCase):
             ),
             domains=rec.domains,
         )
+        from ..store.managed import MapEntry
         plant = ops.writes(
-            ops.Set(ops.STORE_MANAGEMENT, P_NODE + victim, forged.encode_row())
-        ).sign(c.mgr, T0)
-        intervene(s, c.mgr, bodies=(plant,), bucket=TUNABLES.bucket(c.clock))
+            ops.Set(ops.STORE_MANAGEMENT, NODES_MAP._entry_name(victim),
+                    MapEntry.encode(entry.index, forged.encode_row()))
+        ).sign(c.anchor, T0)
+        intervene(s, c.anchor, bodies=(plant,), bucket=TUNABLES.bucket(T0))
 
         mgmt = MgmtReader(s)
-        self.assertIsNotNone(s.get(ops.STORE_MANAGEMENT, P_NODE + victim), "the row must exist")
+        self.assertIsNotNone(NODES_MAP.entry(s, victim), "the row must exist")
         self.assertNotIn(victim, mgmt.roster())
         self.assertFalse(mgmt.is_member(victim), "is_member took a row's existence for a seat")
 
     def test_a_removed_node_stops_being_a_member_by_both_readings(self):
-        c = Cluster(size=4)
-        s = c.nodes[0].store
-        victim = c.keys[3].public
+        c = Cluster(nodes=4)
+        s = c.provisioned()
+        c.close()
+        node_keys = [n.me.public for n in c.nodes]
+        victim = node_keys[3]
         self.assertTrue(MgmtReader(s).is_member(victim))
         remove = (
-            MgmtWriter(s).change_roster(commitment_signer=c.mgr, remove=(victim,)).sign(c.mgr, T0)
+            MgmtWriter(s).change_roster(commitment_signer=c.anchor, remove=(victim,)).sign(c.anchor, T0)
         )
-        intervene(s, c.mgr, bodies=(remove,), bucket=TUNABLES.bucket(c.clock))
+        intervene(s, c.anchor, bodies=(remove,), bucket=TUNABLES.bucket(T0))
         self.assertNotIn(victim, MgmtReader(s).roster())
         self.assertFalse(MgmtReader(s).is_member(victim))
 
@@ -997,8 +1012,10 @@ class TestReadAndWriteAreScopedTheSameWay(unittest.TestCase):
             kinds=frozenset(),
             cert=Cert.sign_grant(stranger, who.public, Role.CLIENT_RW),
         )
+        from ..store.managed import MapEntry
         plant = ops.writes(
-            ops.Set(ops.STORE_MANAGEMENT, P_GRANT + who.public, forged.encode_row())
+            ops.Set(ops.STORE_MANAGEMENT, GRANTS_MAP._entry_name(who.public),
+                    MapEntry.encode(0, forged.encode_row()))
         ).sign(anchor, T0)
         intervene(s, anchor, bodies=(plant,), bucket=1)
 

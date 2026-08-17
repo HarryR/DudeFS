@@ -1,4 +1,3 @@
-from __future__ import annotations
 
 from collections.abc import Iterator
 from typing import Any, NamedTuple, Protocol
@@ -12,34 +11,22 @@ class LayerError(Exception): ...
 
 type Index = int
 
-type PathRow = tuple[int, bytes, bytes, bytes, int]
-"""(store, name, value, credential, epoch) -- one row of a path-range scan. Every leaf builder
-needs all five: the SMT leaf commits to the epoch, so a scan that drops it silently stops the root
-committing to it."""
-
-
-PENDING: Index = -1
+class PathRow(NamedTuple):
+    store: int
+    name: bytes
+    value: bytes
+    credential: bytes
+    epoch: int
 
 
 class Held(NamedTuple):
-    provenance: Index
     value: bytes
     epoch: int
-
     cred: bytes
-
-
-class Row(NamedTuple):
-    name: bytes
-    provenance: Index
-    value: bytes
-    epoch: int = ops.EPOCH_NONE
 
 
 class Reader(Protocol):
     def get(self, store: int, name: bytes) -> Held | None: ...
-
-    def prefix(self, store: int, pre: bytes) -> Iterator[Row]: ...
 
 
 class View(Reader, Protocol):
@@ -48,6 +35,8 @@ class View(Reader, Protocol):
     def state_root(self) -> crypto.Digest: ...
 
     def hash_under(self, prefix: bytes, depth: int) -> crypto.Digest: ...
+
+    def _rows_in_path_range(self, lo: bytes, hi: bytes) -> Iterator[PathRow]: ...
 
     @property
     def is_frozen(self) -> bool: ...
@@ -75,18 +64,6 @@ class Overlay[B: Reader]:
             return self._base.get(store, name)
         return self._delta[key]
 
-    def prefix(self, store: int, pre: bytes) -> Iterator[Row]:
-        rows: dict[bytes, Row] = {r.name: r for r in self._base.prefix(store, pre)}
-        for (st, name), held in self._delta.items():
-            if st != store or not name.startswith(pre):
-                continue
-            if held is None:
-                rows.pop(name, None)
-            else:
-                rows[name] = Row(name, held.provenance, held.value, held.epoch)
-        for name in sorted(rows):
-            yield rows[name]
-
     @property
     def is_frozen(self) -> bool:
         return self._frozen
@@ -98,7 +75,7 @@ class Overlay[B: Reader]:
         if self._frozen:
             raise LayerError("frozen; no more mutations")
         self._delta[(m.store, m.name)] = (
-            Held(PENDING, m.value, m.epoch, cred) if isinstance(m, ops.Set) else None
+            Held(m.value, m.epoch, cred) if isinstance(m, ops.Set) else None
         )
         self._log.append(m)
 
@@ -106,7 +83,7 @@ class Overlay[B: Reader]:
     def mutations(self) -> tuple[ops.Mutation, ...]:
         return tuple(self._log)
 
-    def absorb(self, child: Overlay[Any]) -> None:
+    def absorb(self, child: "Overlay[Any]") -> None:
         if self._frozen:
             raise LayerError("frozen; cannot absorb")
         self._delta.update(child._delta)
@@ -198,13 +175,7 @@ class Layer(Overlay[View]):
         return merged[:at_most]
 
     def _base_rows_in_range(self, lo: bytes, hi: bytes) -> Iterator[PathRow]:
-        rows_fn = getattr(self._base, "_rows_in_path_range", None)
-        if rows_fn is None:
-            raise LayerError(
-                "base does not expose _rows_in_path_range; every View in a Layer stack must "
-                "provide a path-range scan"
-            )
-        yield from rows_fn(lo, hi)
+        yield from self._base._rows_in_path_range(lo, hi)
 
     def _rows_in_path_range(self, lo: bytes, hi: bytes) -> Iterator[PathRow]:
         delta_by_path = {
@@ -217,10 +188,10 @@ class Layer(Overlay[View]):
             path = smt.path_of(st, name)
             if path in delta_by_path:
                 continue
-            merged[path] = (st, name, value, cred, epoch)
+            merged[path] = PathRow(st, name, value, cred, epoch)
         for path, (st, name, held) in delta_by_path.items():
             if held is not None:
-                merged[path] = (st, name, held.value, held.cred, held.epoch)
+                merged[path] = PathRow(st, name, held.value, held.cred, held.epoch)
         for path in sorted(merged):
             yield merged[path]
 
@@ -229,11 +200,4 @@ def holds(reader: Reader, pred: ops.Predicate) -> bool:
     cur = reader.get(pred.store, pred.name)
     if isinstance(pred, ops.Absent):
         return cur is None
-    return cur is not None and ops.value_digest(cur[1]) == pred.digest
-
-
-def _prefix_upper(pre: bytes) -> bytes | None:
-    for i in range(len(pre) - 1, -1, -1):
-        if pre[i] != 0xFF:
-            return pre[:i] + bytes([pre[i] + 1])
-    return None
+    return cur is not None and ops.value_digest(cur.value) == pred.digest

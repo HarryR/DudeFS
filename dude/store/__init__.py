@@ -1,5 +1,5 @@
 from . import management, ops, settle
-from .layer import PENDING, Layer, LayerError, Overlay, Reader, View, holds
+from .layer import Layer, LayerError, Overlay, Reader, View, holds
 from .ops import (
     Absent,
     Del,
@@ -15,7 +15,6 @@ from .settle import Verdict, evaluate, would_apply
 from .store import Applied, Commitment, Entry, Index, Store, StoreError, element
 
 __all__ = [
-    "PENDING",
     "Absent",
     "Applied",
     "Commitment",

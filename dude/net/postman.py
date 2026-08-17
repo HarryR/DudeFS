@@ -1,4 +1,3 @@
-from __future__ import annotations
 
 import contextlib
 from mailbox import Message
@@ -159,9 +158,11 @@ class Postman:
         to: crypto.PublicKey,
         msg: Encodable,
         ttl: Millis,
+        mid: MessageId | None = None,
     ) -> MessageId:
         verb, body = msg.encode()
-        mid = MessageId.random()
+        if mid is None:
+            mid = MessageId.random()
         self._input.put(_Send(to, verb, body, ttl, True, MessageId(b""), mid))
         return mid
 
@@ -179,8 +180,10 @@ class Postman:
         ttl: Millis,
         await_reply: bool = True,
         reply_to: MessageId = MessageId(b""),
+        mid: MessageId | None = None,
     ) -> MessageId:
-        mid = MessageId.random()
+        if mid is None:
+            mid = MessageId.random()
         self._input.put(_Send(to, verb, body, ttl, await_reply, reply_to, mid))
         return mid
 
@@ -197,7 +200,12 @@ class Postman:
     def remove_peer(self, pubkey: crypto.PublicKey) -> None:
         self._input.put(_RemovePeer(pubkey))
 
-    def drain_output(self) -> Iterator[Output]:
+    def drain_output(self, timeout: float | None = None) -> Iterator[Output]:
+        if timeout is not None:
+            try:
+                yield self._output.get(timeout=timeout)
+            except queue.Empty:
+                return
         while True:
             try:
                 yield self._output.get_nowait()
@@ -208,11 +216,14 @@ class Postman:
 
     def add_listener(self, listener: Listener) -> None:
         self._listeners.append(listener)
-        listener.start(self._on_frame, self._on_link_established)
+        if self._thread is not None:
+            listener.start(self._on_frame, self._on_link_established)
 
     def start(self) -> None:
         if self._thread is not None:
             return
+        for listener in self._listeners:
+            listener.start(self._on_frame, self._on_link_established)
         self._thread = threading.Thread(
             target=self._run,
             name=f"postman-{self.me.public.hex()[:8]}",
@@ -220,12 +231,12 @@ class Postman:
         )
         self._thread.start()
 
-    def stop(self, timeout: float = 5.0) -> None:
+    def stop(self) -> None:
         self._input.put(_Stop())
         thread = self._thread
         self._thread = None
-        if thread is not None and thread.is_alive():
-            thread.join(timeout=timeout)
+        if thread is not None:
+            thread.join()
         for listener in self._listeners:
             with contextlib.suppress(Exception):
                 listener.stop()
@@ -295,7 +306,7 @@ class Postman:
         authorized: frozenset[crypto.PublicKey],
     ) -> None:
         self._authorized = authorized
-        gone = [pk for pk in self.peers if pk not in wanted_peers]
+        gone = [pk for pk in self.peers if pk not in wanted_peers and pk not in authorized]
         for pk in gone:
             self._do_remove_peer(pk)
         for pk, endpoints in wanted_peers.items():

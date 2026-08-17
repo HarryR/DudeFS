@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from .core import codec, crypto
 from .core.errors import DudeError
 from .store import ops
-from .store.management import MgmtReader, MgmtWriter, Source
+from .store.management import MgmtReader, Source
 
 
 class ClientError(DudeError): ...
@@ -154,23 +154,3 @@ class Client:
         return ops.Transaction((ops.Step((guard,), ops.Set(self.store_id, token, sealed, epoch)),))
 
 
-def mint_first_keyepoch(
-    mgmt: MgmtWriter, manager: crypto.Keypair, store_id: int = ops.STORE_DATA
-) -> tuple[ops.Transaction, Keys]:
-    """Epoch 1 and the blinding secret, for the GENESIS bodies, sealed to the anchor.
-
-    Composed by whoever builds genesis and shared by every node, NOT minted inside `bootstrap`:
-    bootstrap runs once per node and each node's block 1 must come out byte-equal, so anything
-    random in there gives every node a different chain tip and no round can agree what it follows.
-
-    Encryption from block 1, so no cluster ever has a plaintext era to migrate out of. The anchor
-    is the only holder at genesis; every later grant is minted from the manager's own copy."""
-    master = crypto.Master(crypto.random_bytes(crypto.Master.WIDTH))
-    blinding = crypto.Master(crypto.random_bytes(crypto.Master.WIDTH))
-    tx = mgmt.rotate(
-        store_id,
-        ops.EPOCH_NONE,
-        wraps={manager.public: manager.public.seal(master)},
-        blinding={manager.public: manager.public.seal(blinding)},
-    )
-    return tx, Keys(store_id=store_id, blinding=blinding, masters={1: master}, current=1)

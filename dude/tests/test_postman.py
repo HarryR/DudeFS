@@ -15,7 +15,7 @@ from ..core import crypto
 from ..net.address import Endpoint
 from ..net.envelope import MessageId, Verb
 from ..net.postman import Delivered, Postman
-from ..net.transports.inproc import InProcListener, _reset_for_tests
+from ..net.transports.inproc import InProcListener
 from ..net.transports.tcp import TCPDialer, TCPListener, TCPTiming
 from ..tunables import Tunables
 
@@ -46,9 +46,10 @@ class Payload:
 def _pair_inproc() -> tuple[crypto.Keypair, crypto.Keypair, Postman, Postman]:
     a = crypto.Keypair.generate()
     b = crypto.Keypair.generate()
+    nexus: dict[bytes, InProcListener] = {}
 
-    al = InProcListener(a.public)
-    bl = InProcListener(b.public)
+    al = InProcListener(a.public, nexus)
+    bl = InProcListener(b.public, nexus)
 
     ap = Postman(a, T)
     bp = Postman(b, T)
@@ -109,13 +110,11 @@ class _PostmanTests:
     _pair: staticmethod
 
     def setUp(self) -> None:
-        _reset_for_tests()
         self._postmen: list[Postman] = []
 
     def tearDown(self) -> None:
         for p in self._postmen:
-            p.stop(timeout=1.0)
-        _reset_for_tests()
+            p.stop()
 
     def _make_pair(self) -> tuple[crypto.Keypair, crypto.Keypair, Postman, Postman]:
         a, b, ap, bp = self._pair()
@@ -162,14 +161,14 @@ class _PostmanTests:
         self.assertEqual(len(mid), MessageId.SIZE)
 
     def test_unauthorized_sender_is_dropped(self) -> None:
-        _reset_for_tests()
         a = crypto.Keypair.generate()
         b = crypto.Keypair.generate()
         stranger = crypto.Keypair.generate()
+        nexus: dict[bytes, InProcListener] = {}
 
-        al = InProcListener(a.public)
-        bl = InProcListener(b.public)
-        sl = InProcListener(stranger.public)
+        al = InProcListener(a.public, nexus)
+        bl = InProcListener(b.public, nexus)
+        sl = InProcListener(stranger.public, nexus)
 
         bp = Postman(b, T)
         sp = Postman(stranger, T)
@@ -189,12 +188,12 @@ class _PostmanTests:
         self.assertEqual(len(got), 0, "unauthorized sender should be dropped")
 
     def test_authorized_non_peer_is_accepted(self) -> None:
-        _reset_for_tests()
         a = crypto.Keypair.generate()
         client = crypto.Keypair.generate()
+        nexus: dict[bytes, InProcListener] = {}
 
-        al = InProcListener(a.public)
-        cl = InProcListener(client.public)
+        al = InProcListener(a.public, nexus)
+        cl = InProcListener(client.public, nexus)
 
         ap = Postman(a, T)
         cp = Postman(client, T)

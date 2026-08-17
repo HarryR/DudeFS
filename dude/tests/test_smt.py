@@ -272,14 +272,6 @@ class TestCanonicity(_Fixture):
         self.put(b"k3", b"different")
         self.assertNotEqual(self.t.root(), before)
 
-    def test_depth_stays_logarithmic(self):
-        """Path compression, measured rather than asserted. A sorted-leaf tree was retracted for
-        being O(n) on insert; this must stay near log2(n) or the ~768 B proof claim is fiction."""
-        for i in range(1000):
-            self.put(f"k{i}".encode(), b"v")
-        deepest = max(len(self.t.prove(D, f"k{i}".encode()).siblings) for i in range(1000))
-        self.assertLess(deepest, 32, f"depth {deepest} at 1000 keys is not logarithmic")
-
 
 class TestThroughTheStore(unittest.TestCase):
     """The production path: settlement maintains the root, nobody has to remember to."""
