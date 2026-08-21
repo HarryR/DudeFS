@@ -5,9 +5,10 @@ from typing import Self
 from ..core import codec, crypto
 from ..core.errors import DudeError
 from . import ops
+from .errors import StoreError
 
 
-class ManagedMapError(DudeError): ...
+class ManagedMapError(StoreError): ...
 
 
 class MapAcc:

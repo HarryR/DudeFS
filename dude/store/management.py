@@ -9,10 +9,11 @@ from ..core import codec, crypto
 from ..core.errors import DudeError
 from ..net.address import Endpoint
 from . import ops
+from .errors import StoreError
 from .layer import Reader
 
 
-class ManagementError(DudeError): ...
+class ManagementError(StoreError): ...
 
 
 class Role(Enum):

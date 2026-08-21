@@ -4,9 +4,10 @@ from typing import Any, NamedTuple, Protocol
 
 from ..core import crypto
 from . import ops, smt
+from .errors import StoreError
 
 
-class LayerError(Exception): ...
+class LayerError(StoreError): ...
 
 
 type Index = int

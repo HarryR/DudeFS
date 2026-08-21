@@ -12,7 +12,8 @@ from .ops import (
     writes,
 )
 from .settle import Verdict, evaluate, would_apply
-from .store import Applied, Commitment, Entry, Index, Store, StoreError, element
+from .errors import StoreError
+from .store import Applied, Commitment, Entry, Index, Store, element
 
 __all__ = [
     "Absent",

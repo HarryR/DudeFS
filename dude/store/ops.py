@@ -3,10 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from ..core import codec, crypto
-from ..core.errors import DudeError
+
+from .errors import StoreError
 
 
-class OpError(DudeError): ...
+class OpError(StoreError): ...
 
 
 STORE_MANAGEMENT = 0

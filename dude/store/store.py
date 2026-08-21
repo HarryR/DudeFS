@@ -10,8 +10,9 @@ from dataclasses import dataclass
 from typing import NamedTuple
 
 from ..core import codec, crypto
-from ..core.errors import DudeError, InvariantError
+from ..core.errors import InvariantError
 from . import ops, settle, smt
+from .errors import StoreError
 from .layer import Held, Index, PathRow, holds
 from .management import P_NODE, P_ROSTER, MgmtReader, Role
 
@@ -82,7 +83,6 @@ CREATE TABLE IF NOT EXISTS block (
 """
 
 
-class StoreError(DudeError): ...
 
 
 @dataclass(frozen=True, slots=True)
