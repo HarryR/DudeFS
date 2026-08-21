@@ -458,9 +458,9 @@ class _ReplayRefusedError(Exception):
 
 
 class Store:
-    def __init__(self, path: str = ":memory:"):
+    def __init__(self, path: str | None = None):
         self._tempfile_path: str | None = None
-        if path == ":memory:":
+        if path is None:
             fd, self._tempfile_path = tempfile.mkstemp(prefix="dude-store-", suffix=".sqlite")
             os.close(fd)
             path = self._tempfile_path
@@ -667,6 +667,6 @@ class Store:
         return None
 
     def rebuild(self) -> "Store":
-        fresh = Store(":memory:")
+        fresh = Store()
         fresh.replay(list(self.entries()))
         return fresh

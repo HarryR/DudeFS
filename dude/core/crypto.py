@@ -231,6 +231,10 @@ class Keypair:
     def public(self) -> PublicKey:
         return self._public
 
+    @property
+    def seed(self) -> Seed:
+        return self._seed
+
     def sign(self, msg: bytes) -> Signature:
         return Signature(_ed25519_sign(self._seed, msg))
 

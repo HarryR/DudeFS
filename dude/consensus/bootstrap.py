@@ -5,7 +5,7 @@ from ..core import crypto
 from ..core.errors import InvariantError
 from ..core.units import Millis
 from ..net.address import Endpoint
-from ..store import Layer, Store, settle, ops
+from ..store import Layer, Store, ops, settle
 from ..store.management import Cert, MgmtReader, MgmtWriter, NodeRecord, Role
 from ..store.ops import SignedTransaction
 from ..store.store import log_element
@@ -143,13 +143,13 @@ def intervene(
 
 def compose_genesis(
     anchor: crypto.Keypair,
-    node_endpoints: Sequence[tuple[crypto.Keypair, tuple[Endpoint, ...]]],
+    node_endpoints: Sequence[tuple[crypto.PublicKey, tuple[Endpoint, ...]]],
     managers: Sequence[crypto.Keypair] = (),
     ro_clients: Sequence[crypto.Keypair] = (),
     rw_clients: Sequence[crypto.Keypair] = (),
     ts: Millis = 0,
 ) -> tuple[SignedTransaction, ...]:
-    from ..store.management import GRANTS_MAP, Grant, P_POP
+    from ..store.management import GRANTS_MAP, P_POP, Grant
 
     scratch = Store()
     scratch.provision(anchor.public)
@@ -187,8 +187,8 @@ def compose_genesis(
     tx = tx + w.change_roster(
         commitment_signer=anchor,
         add=tuple(
-            NodeRecord(kp.public, endpoints, Cert.sign_roster(anchor, kp.public), frozenset())
-            for kp, endpoints in node_endpoints
+            NodeRecord(pub, endpoints, Cert.sign_roster(anchor, pub), frozenset())
+            for pub, endpoints in node_endpoints
         ),
     )
 

@@ -65,7 +65,7 @@ class Cluster:
         return compose_genesis(
             anchor=self.anchor,
             node_endpoints=[
-                (kp, (InProcListener.endpoint_for(kp.public),))
+                (kp.public, (InProcListener.endpoint_for(kp.public),))
                 for kp in node_keys
             ],
             managers=mgmt_keys,
