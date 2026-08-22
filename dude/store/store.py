@@ -12,7 +12,6 @@ from typing import NamedTuple
 from ..core import codec, crypto
 from ..core.errors import InvariantError
 from . import ops, settle, smt
-from .errors import StoreError
 from .layer import Held, Index, PathRow, holds
 from .management import P_NODE, P_ROSTER, MgmtReader, Role
 
@@ -321,6 +320,22 @@ class StoreWriter(StoreReader):
         self._set_meta("anchor", manager)
         if seeds:
             self._set_meta("seeds", codec.encode(sorted(seeds)))
+
+    def gc_below(self, pivot_block_num: Index) -> int:
+        row = self._conn.execute(
+            "SELECT first_height FROM block WHERE block_num=?", (pivot_block_num,)
+        ).fetchone()
+        if row is None:
+            return 0
+        first_height = row[0]
+        cur = self._conn.execute(
+            "DELETE FROM entry WHERE idx < ?", (first_height,)
+        )
+        entries_deleted = cur.rowcount
+        self._conn.execute(
+            "DELETE FROM block WHERE block_num < ?", (pivot_block_num,)
+        )
+        return entries_deleted
 
     def apply(self, batch: tuple[ops.SignedTransaction, ...], auth: settle.Authoriser) -> Applied:
         return self._apply_within(batch, auth)
@@ -653,6 +668,10 @@ class Store:
                 batch=batch,
                 auth=auth,
             )
+
+    def gc_below(self, pivot_block_num: Index) -> int:
+        with self.write() as w:
+            return w.gc_below(pivot_block_num)
 
     def provision(self, manager: crypto.PublicKey, seeds: Iterable[bytes] = ()) -> None:
         with self.write() as w:
