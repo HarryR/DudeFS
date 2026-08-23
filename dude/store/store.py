@@ -341,6 +341,13 @@ class StoreWriter(StoreReader):
         if seeds:
             self._set_meta("seeds", codec.encode(sorted(seeds)))
 
+    def reset_for_checkpoint(self) -> None:
+        self._conn.execute("DELETE FROM live")
+        self._conn.execute("DELETE FROM entry")
+        self._conn.execute("DELETE FROM block")
+        self._conn.execute("DELETE FROM smt_memo")
+        self._conn.execute("DELETE FROM meta")
+
     def bootstrap_checkpoint(
         self, anchor: crypto.PublicKey, settled_block_bytes: bytes
     ) -> None:
