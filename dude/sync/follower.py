@@ -64,6 +64,7 @@ class Follower:
     _last_ok_at: dict[crypto.PublicKey, Millis] = field(default_factory=dict)
     _last_fail_at: dict[crypto.PublicKey, Millis] = field(default_factory=dict)
     _outbox: list[OutboxItem] = field(default_factory=list)
+    _compacted_at: dict[crypto.PublicKey, int] = field(default_factory=dict)
 
     def add_peer(self, peer: crypto.PublicKey, now: Millis) -> None:
         if peer == self.me.public or peer in self._poll_at:
@@ -219,8 +220,24 @@ class Follower:
             source = self._pick_pull_source()
             if source is not None:
                 self._pull_from(source, now)
+        elif msg.reason is SyncRefusal.COMPACTED and msg.checkpoint_block_num is not None:
+            self._compacted_at[from_] = msg.checkpoint_block_num
+            self._last_fail_at[from_] = now
         else:
             self._last_fail_at[from_] = now
+
+    def needs_checkpoint(self) -> int | None:
+        if not self._compacted_at:
+            return None
+        my_num = self.store.head_block_num() or 0
+        peers_with_heads = {
+            p for p in self._heads if self._heads[p].block_num > my_num
+        }
+        if not peers_with_heads:
+            return None
+        if all(p in self._compacted_at for p in peers_with_heads):
+            return max(self._compacted_at.values())
+        return None
 
     def _enqueue(self, peer: crypto.PublicKey, msg: SyncMsg) -> None:
         self._outbox.append((peer, msg))
@@ -301,5 +318,11 @@ def serve_getblocks(store: Store, req: GetBlocks, cap: int) -> SyncMsg:
             SettledBlockWithBodies(block=SettledBlock.decode(raw), bodies=store.bodies_of_block(n))
         )
     if not out:
+        oldest = store.oldest_block_num()
+        if oldest is not None and req.frm < oldest:
+            return Refused(
+                reason=SyncRefusal.COMPACTED,
+                checkpoint_block_num=oldest,
+            )
         return Refused(reason=SyncRefusal.NOT_YET_SETTLED)
     return SettledBlockReply(payload=tuple(out))

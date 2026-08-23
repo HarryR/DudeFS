@@ -111,12 +111,22 @@ class Refused(SyncMsg):
     verb: ClassVar[Verb] = Verb.SYNC_REFUSED
 
     reason: SyncRefusal
+    checkpoint_block_num: int | None = None
 
     def _encode(self) -> bytes:
+        if self.checkpoint_block_num is not None:
+            return codec.encode([self.reason.value.encode(), self.checkpoint_block_num])
         return self.reason.value.encode()
 
     @classmethod
     def _decode(cls, body: bytes) -> Refused:
+        try:
+            parts = codec.as_seq(codec.decode(body))
+            reason = SyncRefusal(codec.as_bytes(parts[0]).decode("utf-8"))
+            block_num = codec.as_int(parts[1]) if len(parts) > 1 else None
+            return cls(reason=reason, checkpoint_block_num=block_num)
+        except (DudeError, ValueError, UnicodeDecodeError):
+            pass
         try:
             reason = SyncRefusal(body.decode("utf-8"))
         except (ValueError, UnicodeDecodeError) as e:

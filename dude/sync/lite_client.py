@@ -368,7 +368,7 @@ class LightClient:
         entry = req
         if isinstance(msg, LiteRefused):
             entry.result = Failed(reason=msg.reason.value)
-            if msg.reason is SyncRefusal.FORK_DETECTED:
+            if msg.reason in (SyncRefusal.FORK_DETECTED, SyncRefusal.COMPACTED):
                 self.state = State.UNBOOTSTRAPPED
                 self.trusted_state = None
             return

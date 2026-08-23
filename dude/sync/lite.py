@@ -50,7 +50,7 @@ def _anchors(
         if client_num <= head_num:
             client_bytes = r.settled_at(client_num)
             if client_bytes is None:
-                return LiteRefused(SyncRefusal.INTERNAL)
+                return LiteRefused(SyncRefusal.COMPACTED)
             if SettledBlock.decode(client_bytes).block_hash != client_hash:
                 return LiteRefused(SyncRefusal.FORK_DETECTED)
 
@@ -118,7 +118,7 @@ def _proof(  # noqa: PLR0911, PLR0912, C901 -- each early-return names a distinc
         if client_num <= head_num:
             client_bytes = r.settled_at(client_num)
             if client_bytes is None:
-                return LiteRefused(SyncRefusal.INTERNAL)
+                return LiteRefused(SyncRefusal.COMPACTED)
             if SettledBlock.decode(client_bytes).block_hash != client_hash:
                 return LiteRefused(SyncRefusal.FORK_DETECTED)
 

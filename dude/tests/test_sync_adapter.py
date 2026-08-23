@@ -187,6 +187,7 @@ class TestTheRefusalVocabularyIsOneClosedSet(unittest.TestCase):
                 ("FORK_DETECTED", "fork-detected"),
                 ("INTERNAL", "internal"),
                 ("UNAUTHORISED", "unauthorised"),
+                ("COMPACTED", "compacted"),
             ],
             "add a member -> give it a case in Follower._on_refused AND the light client",
         )

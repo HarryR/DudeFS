@@ -21,6 +21,8 @@ from .sync.adapter import (
     SyncMsg,
     SyncRefusal,
 )
+from .sync.checkpoint_adapter import CheckpointAdapterError, GetChunks
+from .sync.checkpoint_server import CheckpointServer
 from .sync.follower import Follower, serve_getblocks, serve_height
 from .sync.lite import serve_get_anchors, serve_get_proof
 from .sync.lite_adapter import (
@@ -198,6 +200,8 @@ HANDLED = frozenset(
         Verb.GET_ANCHORS,
         Verb.GET_PROOF,
         Verb.TX_STATUS,
+        Verb.GET_CHECKPOINT,
+        Verb.GET_CHUNKS,
     }
 )
 
@@ -207,6 +211,7 @@ class Node(_BaseNode):
     adapter: RoundAdapter = field(init=False)
     settle_adapter: SettleAdapter = field(init=False)
     coordinator: Coordinator = field(init=False)
+    checkpoint_server: CheckpointServer | None = field(default=None, init=False)
 
     def _run(self) -> None:
         tick_interval = self.tunables.tick_interval / 1000
@@ -290,6 +295,32 @@ class Node(_BaseNode):
             return None
         return self.postman.reply(
             d, serve_getblocks(self.store, req, self.tunables.pull_batch), self.tunables.ttl_exchange
+        )
+
+    # -- serving checkpoint requests -----------------------------------------
+
+    def _on_get_checkpoint(self, d: Delivered, now: Millis) -> MessageId | None:
+        if self.checkpoint_server is None:
+            return self.postman.reply(
+                d, Refused(reason=SyncRefusal.NO_STATE), self.tunables.ttl_exchange,
+            )
+        return self.postman.reply(
+            d, self.checkpoint_server.serve_meta(), self.tunables.ttl_exchange,
+        )
+
+    def _on_get_chunks(self, d: Delivered, now: Millis) -> MessageId | None:
+        if self.checkpoint_server is None:
+            return self.postman.reply(
+                d, Refused(reason=SyncRefusal.NO_STATE), self.tunables.ttl_exchange,
+            )
+        try:
+            req = GetChunks.decode(d.body)
+        except CheckpointAdapterError:
+            return self.postman.reply(
+                d, Refused(reason=SyncRefusal.MALFORMED_QUERY), self.tunables.ttl_exchange,
+            )
+        return self.postman.reply(
+            d, self.checkpoint_server.serve_chunks(req), self.tunables.ttl_exchange,
         )
 
     # -- serving lite requests ----------------------------------------------

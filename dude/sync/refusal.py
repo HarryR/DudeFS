@@ -32,3 +32,7 @@ class SyncRefusal(Enum):
     UNAUTHORISED = "unauthorised"
     """The requester holds no standing for what they asked. Answered MALFORMED_QUERY before,
     which told an honest caller their request was malformed when it was their grant that was."""
+
+    COMPACTED = "compacted"
+    """The requested blocks have been GC'd. A checkpoint is available at the block_num
+    carried in the Refused payload."""

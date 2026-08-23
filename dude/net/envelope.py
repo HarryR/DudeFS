@@ -31,6 +31,10 @@ class Verb(IntEnum):
     GETBLOCK = 32
     SETTLED_BLOCK = 33
     SYNC_REFUSED = 34
+    GET_CHECKPOINT = 35
+    CHECKPOINT_META = 36
+    GET_CHUNKS = 37
+    CHUNKS_REPLY = 38
     """A Node's answer to a Node's GETBLOCK. SEPARATE FROM `REFUSED`, which answers a client's
     SUBMIT: one verb carried both, so the body was a `SyncRefusal` value or a `mempool.Refusal`
     value depending on who sent it and nothing said which. The two value sets merely happened not
