@@ -8,6 +8,7 @@ from ..consensus.settle_round import (
     Anchors,
     SettledBlock,
     SettledBlockWithBodies,
+    genesis_stamp,
 )
 from ..core import crypto
 from ..core.errors import DudeError, InvariantError
@@ -144,7 +145,7 @@ class Follower:
         n = self.store.head_block_num()
         raw = self.store.settled_at(n) if n is not None else None
         if raw is None:
-            return chain.TrustedHead.genesis(self._require_anchor()).bucket
+            return chain.NO_BUCKET
         return SettledBlock.decode(raw).block.bucket
 
     def _on_height_reply(self, msg: HeightReply, from_: crypto.PublicKey, now: Millis) -> None:
@@ -243,11 +244,9 @@ class Follower:
         return candidates[0][0]
 
     def _tip(self) -> crypto.Digest:
-        """The hash our next block must chain to. ONE spelling of "no block yet" -- this and
-        `serve_height` disagreed, so two fresh nodes read each other as forked."""
         return (
             self.store.head_block_hash()
-            or chain.TrustedHead.genesis(self._require_anchor()).block_hash
+            or genesis_stamp(self._require_anchor())
         )
 
     def _require_anchor(self) -> crypto.PublicKey:
@@ -288,7 +287,7 @@ def serve_height(store: Store) -> HeightReply:
             anchor = r.anchor()
             if anchor is None:
                 raise InvariantError("serving HEIGHT from a store that was never provisioned")
-            tip = chain.TrustedHead.genesis(anchor).block_hash
+            tip = genesis_stamp(anchor)
         return HeightReply(block_num=r.head_block_num() or 0, tip_hash=tip)
 
 

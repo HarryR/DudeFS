@@ -70,7 +70,7 @@ class TrustedState:
 
     roster_fingerprint: crypto.Digest
 
-    head: chain.TrustedHead
+    head: SettledBlock
 
 
 @dataclass(slots=True)
@@ -234,10 +234,10 @@ class LightClient:
         req = GetProof(
             store_id=store_id,
             name=name,
-            block_num=self.trusted_state.head.block_num,
+            block_num=self.trusted_state.head.anchors.block_num,
             known_roster_fingerprint=self.trusted_state.roster_fingerprint,
             known_trusted_block=TrustedBlock(
-                self.trusted_state.head.block_num, self.trusted_state.head.block_hash
+                self.trusted_state.head.anchors.block_num, self.trusted_state.head.block_hash
             ),
         )
         mid = MessageId.random()
@@ -358,9 +358,7 @@ class LightClient:
             managers=tuple(sorted(g.identity for g in bundle.managers)),
             node_endpoints={rec.identity: rec.endpoints for rec in bundle.entries},
             roster_fingerprint=fingerprint,
-            head=chain.TrustedHead(
-                head.anchors.block_num, head.block_hash, head.anchors.state_root, head.block.bucket
-            ),
+            head=head,
         )
         self.state = State.READY
 
@@ -394,7 +392,7 @@ class LightClient:
         if self.trusted_state.head.block_hash != msg.head.block_hash:
             entry.result = Failed(reason="behind the responder; retry")
             return
-        if chain.is_stale(self.trusted_state.head.bucket, now, self.tunables):
+        if chain.is_stale(self.trusted_state.head.block.bucket, now, self.tunables):
             entry.result = Failed(reason="responder head is stale")
             return
         try:
@@ -407,7 +405,7 @@ class LightClient:
             entry.result = Failed(reason="trusted state lost; re-bootstrap")
             return
         if not smt.verify(
-            self.trusted_state.head.state_root,
+            self.trusted_state.head.anchors.state_root,
             entry.store_id,
             entry.name,
             held,
@@ -430,7 +428,7 @@ class LightClient:
         if self.trusted_state is None:
             return False
         ts = self.trusted_state
-        above = _contiguous_from(ts.head.block_num, (*headers, responder_head))
+        above = _contiguous_from(ts.head.anchors.block_num, (*headers, responder_head))
         if not above:
             return True
         walked = chain.advance(ts.head.block_hash, above, ts.roster, self.anchor)
@@ -473,7 +471,7 @@ class _LiteSubstrate:
         ts = self._lc.trusted_state
         if ts is None or not ts.roster:
             return list(self._lc._bootstrap_peers)
-        head_num = ts.head.block_num
+        head_num = ts.head.anchors.block_num
         views = self._lc._peer_views
 
         def rank(peer: crypto.PublicKey) -> tuple[int, int, int]:

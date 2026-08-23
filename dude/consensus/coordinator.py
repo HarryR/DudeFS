@@ -241,6 +241,10 @@ class Coordinator:
         already = self.store.settled_hashes(tuple(tx.op_hash for tx in candidate))
         fresh = tuple(tx for tx in candidate if tx.op_hash not in already)
         survivors = settle.apply_to(Layer(self.store), fresh, self.mgmt).survivors
+        for tx in survivors:
+            grant = self.mgmt.grant_of(tx.author)
+            if grant is not None and grant.role.isolated:
+                return frozenset({tx.op_hash})
         return frozenset(tx.op_hash for tx in survivors)
 
     def _on_round_abandoned(self, now: Millis) -> None:

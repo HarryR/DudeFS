@@ -10,11 +10,11 @@ from .cluster import Cluster
 D = ops.STORE_DATA
 
 
-class TestSessionViaManagementNode(unittest.TestCase):
+class TestSessionViaReplicaNode(unittest.TestCase):
 
     def setUp(self) -> None:
         self.c = Cluster(nodes=3, mgmt=1, ro=0, rw=0)
-        self.s = self.c.mgmt_nodes[0].session()
+        self.s = self.c.replicas[0].session()
 
     def tearDown(self) -> None:
         self.c.close()
@@ -42,7 +42,7 @@ class TestSessionViaManagementNode(unittest.TestCase):
 
     def test_management_node_syncs(self) -> None:
         self.s.put("sync-check", b"v").wait()
-        mn = self.c.mgmt_nodes[0]
+        mn = self.c.replicas[0]
         self.c.wait_head(2, nodes=[mn])
         rec = self.s.get("sync-check")
         self.assertEqual(rec.value, b"v")

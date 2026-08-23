@@ -107,7 +107,7 @@ def bootstrap(
         store,
         master,
         bodies,
-        block_num=1,
+        block_num=0,
         prev_block=genesis_stamp(master.public),
         bucket=bucket,
     )

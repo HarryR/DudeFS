@@ -78,7 +78,7 @@ class _BaseNode:
             return
         self._stopping = threading.Event()
         self.postman.start()
-        prefix = "mgmt" if isinstance(self, ManagementNode) else "node"
+        prefix = "replica" if isinstance(self, ReplicaNode) else "node"
         self._thread = threading.Thread(
             target=self._run,
             name=f"{prefix}-{self.me.public.hex()[:8]}",
@@ -349,10 +349,10 @@ _DISPATCH: dict[Verb, Callable[[Node, Delivered, Millis], MessageId | None]] = {
 
 
 # ---------------------------------------------------------------------------
-# ManagementNode — full validating follower, own state DB, no consensus.
+# ReplicaNode — full validating follower, own state DB, no consensus.
 # ---------------------------------------------------------------------------
 
-_MGMT_HANDLED = frozenset({
+_REPLICA_HANDLED = frozenset({
     Verb.HEIGHT_REPLY,
     Verb.SETTLED_BLOCK,
     Verb.SYNC_REFUSED,
@@ -361,7 +361,7 @@ _MGMT_HANDLED = frozenset({
 
 
 @dataclass(slots=True)
-class ManagementNode(_BaseNode):
+class ReplicaNode(_BaseNode):
     _key_cache: KeyCache | None = field(default=None, init=False)
     _inflight: dict[bytes, SubmitHandle] = field(default_factory=dict, init=False)
     _commit_seq: int = field(default=0, init=False)
@@ -373,7 +373,7 @@ class ManagementNode(_BaseNode):
         )
 
     def session(self, store_id: int = ops.STORE_DATA) -> Session:
-        sub = _MgmtSubstrate(self)
+        sub = _ReplicaSubstrate(self)
         if self._key_cache is None:
             self._key_cache = KeyCache(self.me, sub)
         return Session(sub, self.me, store_id, self._key_cache)
@@ -390,15 +390,15 @@ class ManagementNode(_BaseNode):
             if handle is not None:
                 handle.resolve(d.verb, d.body)
             return
-        fn = _MGMT_DISPATCH.get(d.verb)
+        fn = _REPLICA_DISPATCH.get(d.verb)
         if fn is not None:
             fn(self, d, now)
 
 
-class _MgmtSubstrate:
+class _ReplicaSubstrate:
     __slots__ = ("_node",)
 
-    def __init__(self, node: ManagementNode) -> None:
+    def __init__(self, node: ReplicaNode) -> None:
         self._node = node
 
     def get(self, store_id: int, name: bytes) -> Held | None:
@@ -431,6 +431,6 @@ class _MgmtSubstrate:
             )
 
 
-_MGMT_DISPATCH: dict[Verb, Callable[[ManagementNode, Delivered, Millis], MessageId | None]] = {
-    v: getattr(ManagementNode, f"_on_{v.name.lower()}") for v in _MGMT_HANDLED
+_REPLICA_DISPATCH: dict[Verb, Callable[[ReplicaNode, Delivered, Millis], MessageId | None]] = {
+    v: getattr(ReplicaNode, f"_on_{v.name.lower()}") for v in _REPLICA_HANDLED
 }

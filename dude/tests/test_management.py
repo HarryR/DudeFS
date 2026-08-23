@@ -13,8 +13,6 @@ from ..store import Store, ops, settle
 from ..store.management import (
     GRANTS_MAP,
     NODES_MAP,
-    P_GRANT,
-    P_NODE,
     P_POP,
     P_ROSTER,
     Authorization,
@@ -353,7 +351,7 @@ class TestRevocationIsCompound(unittest.TestCase):
         the write until management operations become typed opcodes."""
         anchor, warm, s, mgmt, _kps = self._cluster_admitted_by_a_warm_manager()
         bare = ops.writes(
-            ops.Del(ops.STORE_MANAGEMENT, GRANTS_MAP._entry_name(warm.public)),
+            ops.Del(ops.STORE_MANAGEMENT, GRANTS_MAP.entry_name(warm.public)),
             ops.Del(ops.STORE_MANAGEMENT, P_POP + warm.public),
         )
         s.apply((_sign(anchor, bare),), auth=mgmt)
@@ -399,7 +397,7 @@ class TestEmergencyIntervention(unittest.TestCase):
         s, mgmt = _provisioned(anchor)
         # Bootstrap first with an empty body set.
         bootstrap(s, anchor, bodies=(), bucket=0)
-        self.assertEqual(s.head_block_num(), 1)
+        self.assertEqual(s.head_block_num(), 0)
         pre_head_hash = s.head_block_hash()
         assert pre_head_hash is not None
 
@@ -416,9 +414,8 @@ class TestEmergencyIntervention(unittest.TestCase):
         grant_tx = _sign(anchor, grant)
         sbwb = intervene(s, anchor, bodies=(grant_tx,), bucket=1)
 
-        # Block 2 chained onto block 1.
-        self.assertEqual(s.head_block_num(), 2)
-        self.assertEqual(sbwb.block.anchors.block_num, 2)
+        self.assertEqual(s.head_block_num(), 1)
+        self.assertEqual(sbwb.block.anchors.block_num, 1)
         self.assertEqual(sbwb.block.anchors.prev_block, pre_head_hash)
 
         # Verifies via the same quorum-proof rule as any other block.
@@ -826,7 +823,7 @@ class TestMalformedRowsDoNotPoison(unittest.TestCase):
 
     def test_garbage_node_row_reads_as_absent_and_roster_survives(self):
         stranger = crypto.Keypair.generate().public
-        self._settle_garbage(NODES_MAP._entry_name(stranger))
+        self._settle_garbage(NODES_MAP.entry_name(stranger))
         self.assertEqual(set(self.mgmt.roster()), {kp.public for kp in self.kps})
         self.assertNotIn(stranger, self.mgmt.nodes())
         self.assertIsNotNone(self.mgmt.roster_commitment())
@@ -838,7 +835,7 @@ class TestMalformedRowsDoNotPoison(unittest.TestCase):
 
     def test_garbage_grant_row_refuses_authority_not_raising(self):
         writer = crypto.Keypair.generate()
-        self._settle_garbage(GRANTS_MAP._entry_name(writer.public))
+        self._settle_garbage(GRANTS_MAP.entry_name(writer.public))
         self.assertIsNone(self.mgmt.grant_of(writer.public))
         attempt = ops.writes(ops.Set(ops.STORE_DATA, DK, b"v")).sign(writer, T0 + 2)
         applied = self.s.apply((attempt,), auth=self.mgmt)
@@ -882,7 +879,7 @@ class TestIsMemberAndRosterCannotDisagree(unittest.TestCase):
         )
         from ..store.managed import MapEntry
         plant = ops.writes(
-            ops.Set(ops.STORE_MANAGEMENT, NODES_MAP._entry_name(victim),
+            ops.Set(ops.STORE_MANAGEMENT, NODES_MAP.entry_name(victim),
                     MapEntry.encode(entry.index, forged.encode_row()))
         ).sign(c.anchor, T0)
         intervene(s, c.anchor, bodies=(plant,), bucket=TUNABLES.bucket(T0))
@@ -1014,7 +1011,7 @@ class TestReadAndWriteAreScopedTheSameWay(unittest.TestCase):
         )
         from ..store.managed import MapEntry
         plant = ops.writes(
-            ops.Set(ops.STORE_MANAGEMENT, GRANTS_MAP._entry_name(who.public),
+            ops.Set(ops.STORE_MANAGEMENT, GRANTS_MAP.entry_name(who.public),
                     MapEntry.encode(0, forged.encode_row()))
         ).sign(anchor, T0)
         intervene(s, anchor, bodies=(plant,), bucket=1)

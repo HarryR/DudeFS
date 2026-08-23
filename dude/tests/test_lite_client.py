@@ -60,14 +60,14 @@ class TestBootstrap(unittest.TestCase):
         self.assertIsNotNone(ts)
         assert ts is not None
         self.assertEqual(len(ts.roster), 3)
-        self.assertGreater(ts.head.block_num, 0)
+        self.assertGreater(ts.head.anchors.block_num, 0)
 
     def test_trusted_state_has_full_roster(self) -> None:
         self.c.wait(lambda _: self.lc.bootstrapped())
         ts = self.lc.trusted_state
         assert ts is not None
         self.assertEqual(len(ts.roster), 3)
-        self.assertGreater(ts.head.block_num, 0)
+        self.assertGreater(ts.head.anchors.block_num, 0)
 
 
 class TestLightClientRead(unittest.TestCase):
@@ -136,12 +136,7 @@ def _trusted_state_from_cluster(c: Cluster) -> TrustedState:
             for rec in mgmt.nodes().values()
         },
         roster_fingerprint=crypto.Digest(commitment.cert.subject),
-        head=chain.TrustedHead(
-            head.anchors.block_num,
-            head.block_hash,
-            head.anchors.state_root,
-            head.block.bucket,
-        ),
+        head=head,
     )
 
 
@@ -156,7 +151,7 @@ def _get_real_proof_reply(c: Cluster, store_id: int, name: bytes) -> ProofReply:
         name=name,
         block_num=head_num,
         known_roster_fingerprint=ts.roster_fingerprint,
-        known_trusted_block=TrustedBlock(ts.head.block_num, ts.head.block_hash),
+        known_trusted_block=TrustedBlock(ts.head.anchors.block_num, ts.head.block_hash),
     )
     reply = serve_get_proof(store, request, c.tunables.liveness_window)
     assert isinstance(reply, ProofReply), f"expected ProofReply, got {type(reply).__name__}: {reply}"
@@ -171,17 +166,13 @@ def _make_unstarted_lc(c: Cluster, head_behind: int = 0) -> LightClient:
     ts = _trusted_state_from_cluster(c)
     if head_behind > 0:
         store = c.nodes[0].store
-        target = ts.head.block_num - head_behind
+        target = ts.head.anchors.block_num - head_behind
         if target < 1:
             target = 1
         raw = store.settled_at(target)
         assert raw is not None
         from ..consensus.settle_round import SettledBlock
-        blk = SettledBlock.decode(raw)
-        ts = replace(ts, head=chain.TrustedHead(
-            blk.anchors.block_num, blk.block_hash,
-            blk.anchors.state_root, blk.block.bucket,
-        ))
+        ts = replace(ts, head=SettledBlock.decode(raw))
     lc.trusted_state = ts
     lc.state = State.READY
     return lc
@@ -210,7 +201,7 @@ class TestByzantineProofReply(unittest.TestCase):
 
     def setUp(self) -> None:
         self.c = Cluster(nodes=3, mgmt=1, ro=0, rw=0)
-        ms = self.c.mgmt_nodes[0].session()
+        ms = self.c.replicas[0].session()
         ms.put("byz-target", b"real-value").wait()
         self.c.wait_block(2)
 
@@ -221,7 +212,7 @@ class TestByzantineProofReply(unittest.TestCase):
         return _make_unstarted_lc(self.c)
 
     def _token(self) -> bytes:
-        ms = self.c.mgmt_nodes[0].session()
+        ms = self.c.replicas[0].session()
         return ms.get("byz-target").token
 
     def _real_reply(self) -> ProofReply:
@@ -260,7 +251,7 @@ class TestByzantineProofReply(unittest.TestCase):
         from ..consensus.settle_round import SettledBlock
         ts = lc.trusted_state
         assert ts is not None
-        head_num = ts.head.block_num
+        head_num = ts.head.anchors.block_num
         store = self.c.nodes[0].store
         above_raw = store.settled_at(head_num + 1)
         assert above_raw is not None, "setUp should ensure head >= 2"
@@ -284,7 +275,7 @@ class TestByzantineProofReply(unittest.TestCase):
         reply = self._real_reply()
         ts = lc.trusted_state
         assert ts is not None
-        head_num = ts.head.block_num
+        head_num = ts.head.anchors.block_num
         store = self.c.nodes[0].store
         above_raw = store.settled_at(head_num + 1)
         assert above_raw is not None, "setUp should ensure head >= 2"
@@ -437,7 +428,7 @@ class TestByzantineBootstrapReply(unittest.TestCase):
             store_id=ops.STORE_DATA, name=token, block_num=head_num,
             known_roster_fingerprint=lc.trusted_state.roster_fingerprint,
             known_trusted_block=TrustedBlock(
-                lc.trusted_state.head.block_num, lc.trusted_state.head.block_hash,
+                lc.trusted_state.head.anchors.block_num, lc.trusted_state.head.block_hash,
             ),
         )
         real_proof_reply = serve_get_proof(store, request, self.c.tunables.liveness_window)

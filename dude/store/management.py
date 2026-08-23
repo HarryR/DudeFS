@@ -11,6 +11,7 @@ from ..net.address import Endpoint
 from . import ops
 from .errors import StoreError
 from .layer import Reader
+from .managed import ManagedMap
 
 
 class ManagementError(StoreError): ...
@@ -21,7 +22,10 @@ class Role(Enum):
     CLIENT_RO = b"client_ro"
     CLIENT_RW = b"client_rw"
     COMPACTOR = b"compactor"
-    """COMPACTOR reads and nothing else until compaction returns. Its own verbs land with it."""
+
+    @property
+    def isolated(self) -> bool:
+        return self is Role.COMPACTOR
 
 
 type Domain = bytes
@@ -272,8 +276,6 @@ class Grant:
 P_NODE = b"node/"
 P_GRANT = b"grant/"
 
-from .managed import ManagedMap, MapEntry
-
 NODES_MAP = ManagedMap(P_NODE)
 GRANTS_MAP = ManagedMap(P_GRANT)
 P_POP = b"pop/"
@@ -282,6 +284,7 @@ P_BLIND = b"blind/"
 """Per-grant wrap of a store's blinding secret. ITS OWN PREFIX, not `P_WRAP` at a reserved epoch:
 a blinding secret never rotates -- name tokens are SMT paths, and rotating one would relocate
 every row in its store -- so filing it under an epoch sentinel would read fine and mislead later."""
+P_COMPACT = b"compact"
 P_ROSTER = b"roster"
 P_EPOCH = b"epoch/"
 """Per store, not one counter. EVERY KEY IS PER-STORE: a grant naming store 2 mints that store's
@@ -320,7 +323,7 @@ class Attestation:
     subject: bytes
 
 
-def attestations_by(
+def attestations_by(  # noqa: C901
     src: Reader, signer: crypto.PublicKey, store_id: int = ops.STORE_MANAGEMENT
 ) -> tuple[Attestation, ...]:
     nodes_map = ManagedMap(P_NODE, store_id)
@@ -336,7 +339,7 @@ def attestations_by(
         except DudeError:
             continue
         if rec.cert.signer == signer:
-            out.append(Attestation(nodes_map._entry_name(key), CERT_PURPOSE_ROSTER, bytes(who)))
+            out.append(Attestation(nodes_map.entry_name(key), CERT_PURPOSE_ROSTER, bytes(who)))
     for key in grants_map.keys(src):
         who = crypto.PublicKey(key)
         entry = grants_map.entry(src, key)
@@ -347,7 +350,7 @@ def attestations_by(
         except DudeError:
             continue
         if grant.cert.signer == signer:
-            out.append(Attestation(grants_map._entry_name(key), grant.role.value, bytes(who)))
+            out.append(Attestation(grants_map.entry_name(key), grant.role.value, bytes(who)))
     raw = src.get(store_id, P_ROSTER)
     if raw is not None:
         try:
@@ -506,8 +509,8 @@ class MgmtReader:
             return False
         if g.role is Role.MANAGER:
             return True
-        # CLIENT_RO and COMPACTOR hold `stores` for READING. Before the roles were split, any
-        # grant naming a store could write it.
+        if g.role is Role.COMPACTOR:
+            return store_id == ops.STORE_MANAGEMENT
         return g.role is Role.CLIENT_RW and store_id in g.stores
 
     def may_read(self, reader: Reader, who: crypto.PublicKey, store_id: int) -> bool:
@@ -602,7 +605,7 @@ class MgmtReader:
 
 
 class MgmtWriter(MgmtReader):
-    def change_roster(
+    def change_roster(  # noqa: C901
         self,
         *,
         commitment_signer: crypto.Keypair,
@@ -661,8 +664,7 @@ class MgmtWriter(MgmtReader):
                 f"to sign the roster commitment (must be anchor or a valid manager)"
             )
         commitment = RosterCommitment(next_serial, members, state_fingerprint, commitment_cert)
-        tx = tx + ops.writes(ops.Set(self.store_id, P_ROSTER, commitment.encode_row()))
-        return tx
+        return tx + ops.writes(ops.Set(self.store_id, P_ROSTER, commitment.encode_row()))
 
     def add_node(
         self,
@@ -739,8 +741,7 @@ class MgmtWriter(MgmtReader):
         for att in attested:
             tx = tx + self._reissue(att, reissue_signer)
         tx = tx + GRANTS_MAP.remove(self.src, who)
-        tx = tx + ops.writes(ops.Del(self.store_id, P_POP + who))
-        return tx
+        return tx + ops.writes(ops.Del(self.store_id, P_POP + who))
 
     def _reissue(self, att: Attestation, signer: crypto.Keypair) -> ops.Transaction:
         if att.key == P_ROSTER:
@@ -754,7 +755,7 @@ class MgmtWriter(MgmtReader):
             self._require_signer(cert)
             return ops.writes(ops.Set(self.store_id, P_ROSTER, replace(rc, cert=cert).encode_row()))
         identity = crypto.PublicKey(att.subject)
-        is_node = att.key == NODES_MAP._entry_name(identity)
+        is_node = att.key == NODES_MAP.entry_name(identity)
         target_map = NODES_MAP if is_node else GRANTS_MAP
         entry = target_map.entry(self.src, identity)
         if entry is None:
@@ -821,3 +822,12 @@ class MgmtWriter(MgmtReader):
             for who in sorted(blind)
         ]
         return ops.Transaction(tuple(steps))
+
+    def compact(self, block_num: int) -> ops.Transaction:
+        held = self.src.get(self.store_id, P_COMPACT)
+        if held is None:
+            guard: ops.Predicate = ops.Absent(self.store_id, P_COMPACT)
+        else:
+            guard = ops.Holds(self.store_id, P_COMPACT, ops.value_digest(held.value))
+        value = block_num.to_bytes(8, "big")
+        return ops.Transaction((ops.Step((guard,), ops.Set(self.store_id, P_COMPACT, value)),))

@@ -6,7 +6,7 @@ from ..consensus.bootstrap import bootstrap, compose_genesis
 from ..core import crypto
 from ..net.postman import Postman
 from ..net.transports.inproc import InProcListener, InProcNexus
-from ..node import ManagementNode, Node
+from ..node import Node, ReplicaNode
 from ..store import Store, ops
 from ..sync.lite_client import LightClient
 from ..tunables import Tunables
@@ -41,9 +41,9 @@ class Cluster:
         for kp in node_keys:
             self._boot_node(kp)
 
-        self.mgmt_nodes: list[ManagementNode] = []
+        self.replicas: list[ReplicaNode] = []
         for kp in mgmt_keys:
-            self._boot_mgmt_node(kp)
+            self.boot_replica(kp)
 
         self.ro_clients: list[LightClient] = []
         for kp in ro_keys:
@@ -90,13 +90,13 @@ class Cluster:
         self.nodes.append(node)
         return node
 
-    def _boot_mgmt_node(self, kp: crypto.Keypair) -> ManagementNode:
+    def boot_replica(self, kp: crypto.Keypair) -> ReplicaNode:
         store = self.provisioned()
-        mn = ManagementNode(kp, store, self.tunables)
-        mn.add_listener(InProcListener(kp.public, self.nexus))
-        mn.start()
-        self.mgmt_nodes.append(mn)
-        return mn
+        rn = ReplicaNode(kp, store, self.tunables)
+        rn.add_listener(InProcListener(kp.public, self.nexus))
+        rn.start()
+        self.replicas.append(rn)
+        return rn
 
     def _boot_light_client(
         self, kp: crypto.Keypair, into: list[LightClient],
@@ -122,7 +122,7 @@ class Cluster:
         self,
         target: int,
         timeout: float | None = None,
-        nodes: list[Node | ManagementNode] | None = None,
+        nodes: list[Node | ReplicaNode] | None = None,
     ) -> None:
         check = nodes if nodes is not None else self.nodes
         current = min((n.store.head() for n in check), default=0)
@@ -133,7 +133,7 @@ class Cluster:
         self,
         target: int,
         timeout: float | None = None,
-        nodes: list[Node | ManagementNode] | None = None,
+        nodes: list[Node | ReplicaNode] | None = None,
     ) -> None:
         check = nodes if nodes is not None else self.nodes
         current = min(((n.store.head_block_num() or 0) for n in check), default=0)
@@ -157,7 +157,7 @@ class Cluster:
     def close(self) -> None:
         for lc in self.ro_clients + self.rw_clients:
             lc.stop()
-        for mn in self.mgmt_nodes:
-            mn.stop()
+        for rn in self.replicas:
+            rn.stop()
         for node in self.nodes:
             node.stop()

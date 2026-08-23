@@ -6,6 +6,7 @@ from ..core import codec, crypto
 from ..core.errors import DudeError
 from . import ops
 from .errors import StoreError
+from .layer import Reader
 
 
 class ManagedMapError(StoreError): ...
@@ -65,9 +66,6 @@ class MapEntry:
         return cls(codec.as_int(p[0]), codec.as_bytes(p[1]), raw)
 
 
-from .layer import Reader as PointReader
-
-
 class ManagedMap:
     __slots__ = ("prefix", "store_id")
 
@@ -81,19 +79,19 @@ class ManagedMap:
     def _index_name(self, idx: int) -> bytes:
         return self.prefix + b"\x01" + idx.to_bytes(4, "big")
 
-    def _entry_name(self, key: bytes) -> bytes:
+    def entry_name(self, key: bytes) -> bytes:
         return self.prefix + b"\x02" + key
 
     # -- reads (all point reads) --------------------------------------------
 
-    def meta(self, reader: PointReader) -> MapMeta | None:
+    def meta(self, reader: Reader) -> MapMeta | None:
         held = reader.get(self.store_id, self._meta_name())
         if held is None:
             return None
         return MapMeta.decode(held.value)
 
-    def entry(self, reader: PointReader, key: bytes) -> MapEntry | None:
-        held = reader.get(self.store_id, self._entry_name(key))
+    def entry(self, reader: Reader, key: bytes) -> MapEntry | None:
+        held = reader.get(self.store_id, self.entry_name(key))
         if held is None:
             return None
         try:
@@ -101,11 +99,11 @@ class ManagedMap:
         except (DudeError, ValueError, IndexError):
             return None
 
-    def key_at(self, reader: PointReader, idx: int) -> bytes | None:
+    def key_at(self, reader: Reader, idx: int) -> bytes | None:
         held = reader.get(self.store_id, self._index_name(idx))
         return held.value if held is not None else None
 
-    def keys(self, reader: PointReader) -> list[bytes]:
+    def keys(self, reader: Reader) -> list[bytes]:
         m = self.meta(reader)
         if m is None:
             return []
@@ -116,7 +114,7 @@ class ManagedMap:
                 out.append(k)
         return out
 
-    def items(self, reader: PointReader) -> list[tuple[bytes, bytes]]:
+    def items(self, reader: Reader) -> list[tuple[bytes, bytes]]:
         out: list[tuple[bytes, bytes]] = []
         for key in self.keys(reader):
             e = self.entry(reader, key)
@@ -142,8 +140,8 @@ class ManagedMap:
             ops.Step((meta_guard,), ops.Set(s, self._meta_name(), new_meta)),
             ops.Step((), ops.Set(s, self._index_name(count), key)),
             ops.Step(
-                (ops.Absent(s, self._entry_name(key)),),
-                ops.Set(s, self._entry_name(key), MapEntry.encode(count, value)),
+                (ops.Absent(s, self.entry_name(key)),),
+                ops.Set(s, self.entry_name(key), MapEntry.encode(count, value)),
             ),
         ))
 
@@ -165,7 +163,7 @@ class ManagedMap:
                 (ops.Holds(s, self._meta_name(), ops.value_digest(current.raw)),),
                 ops.Set(s, self._meta_name(), new_meta),
             ),
-            ops.Step((), ops.Del(s, self._entry_name(key))),
+            ops.Step((), ops.Del(s, self.entry_name(key))),
             ops.Step((), ops.Del(s, self._index_name(last_idx))),
         ]
 
@@ -174,7 +172,7 @@ class ManagedMap:
                 (), ops.Set(s, self._index_name(victim.index), last_key),
             ))
             steps.append(ops.Step(
-                (), ops.Set(s, self._entry_name(last_key),
+                (), ops.Set(s, self.entry_name(last_key),
                             MapEntry.encode(victim.index, last_entry.value)),
             ))
 
@@ -184,8 +182,8 @@ class ManagedMap:
         s = self.store_id
         return ops.Transaction((
             ops.Step(
-                (ops.Holds(s, self._entry_name(key), ops.value_digest(current.raw)),),
-                ops.Set(s, self._entry_name(key), MapEntry.encode(current.index, new_value)),
+                (ops.Holds(s, self.entry_name(key), ops.value_digest(current.raw)),),
+                ops.Set(s, self.entry_name(key), MapEntry.encode(current.index, new_value)),
             ),
         ))
 
@@ -196,8 +194,8 @@ class ManagedMap:
         return ops.Transaction((
             ops.Step((), ops.Set(s, self._index_name(index), key)),
             ops.Step(
-                (ops.Absent(s, self._entry_name(key)),),
-                ops.Set(s, self._entry_name(key), MapEntry.encode(index, value)),
+                (ops.Absent(s, self.entry_name(key)),),
+                ops.Set(s, self.entry_name(key), MapEntry.encode(index, value)),
             ),
         ))
 
@@ -216,7 +214,7 @@ class ManagedMap:
         ))
 
     def batch_add(
-        self, reader: PointReader, entries: tuple[tuple[bytes, bytes], ...],
+        self, reader: Reader, entries: tuple[tuple[bytes, bytes], ...],
     ) -> ops.Transaction:
         meta = self.meta(reader)
         count = meta.count if meta else 0
@@ -230,10 +228,10 @@ class ManagedMap:
 
     # -- convenience: read + compose in one call ----------------------------
 
-    def add(self, reader: PointReader, key: bytes, value: bytes) -> ops.Transaction:
+    def add(self, reader: Reader, key: bytes, value: bytes) -> ops.Transaction:
         return self.tx_add(key, value, self.meta(reader))
 
-    def remove(self, reader: PointReader, key: bytes) -> ops.Transaction:
+    def remove(self, reader: Reader, key: bytes) -> ops.Transaction:
         m = self.meta(reader)
         if m is None:
             raise ManagedMapError("remove from empty map")
@@ -249,7 +247,7 @@ class ManagedMap:
             raise ManagedMapError(f"entry for last key {last_key!r} missing")
         return self.tx_remove(key, m, victim, last_key, last_entry)
 
-    def update(self, reader: PointReader, key: bytes, new_value: bytes) -> ops.Transaction:
+    def update(self, reader: Reader, key: bytes, new_value: bytes) -> ops.Transaction:
         current = self.entry(reader, key)
         if current is None:
             raise ManagedMapError(f"key not in map: {key!r}")

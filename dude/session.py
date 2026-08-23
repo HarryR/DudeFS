@@ -160,7 +160,11 @@ class Session:
         self._store_id = store_id
         self._keys = keys
 
-    def _token(self, name: str) -> crypto.NameToken:
+    @property
+    def store_id(self) -> int:
+        return self._store_id
+
+    def token(self, name: str) -> crypto.NameToken:
         nk = self._keys.ensure_blinding(self._store_id)
         return crypto.derive_name_token(nk, _name_bytes(name))
 
@@ -168,14 +172,14 @@ class Session:
         return codec.encode([self._store_id, bytes(token), epoch])
 
     def _decrypt(self, name: str, ciphertext: bytes, epoch: int) -> bytes:
-        token = self._token(name)
+        token = self.token(name)
         vk = self._keys.value_key(self._store_id, epoch)
         item = crypto.derive_item_key(vk, token)
         return crypto.AeadXcs1.open(item, self._aad(token, epoch), crypto.AeadBlob(ciphertext))
 
     def _seal(self, name: str, value: bytes) -> tuple[crypto.NameToken, bytes, int]:
         epoch = self._keys.current_epoch(self._store_id)
-        token = self._token(name)
+        token = self.token(name)
         vk = self._keys.value_key(self._store_id, epoch)
         item = crypto.derive_item_key(vk, token)
         return token, bytes(crypto.AeadXcs1.seal(item, self._aad(token, epoch), value)), epoch
@@ -183,7 +187,7 @@ class Session:
     # -- public interface ---------------------------------------------------
 
     def get(self, name: str) -> Record:
-        token = self._token(name)
+        token = self.token(name)
         raw = self._sub.get(self._store_id, token)
         if raw is None:
             return Record(
@@ -207,7 +211,7 @@ class Session:
         token, sealed, epoch = self._seal(name, value)
         guards = _collect_guards(self._store_id, token, predicates, expect, absent)
         tx = ops.Transaction((ops.Step(guards, ops.Set(self._store_id, token, sealed, epoch)),))
-        return self._submit(tx)
+        return self.submit(tx)
 
     def delete(
         self,
@@ -215,15 +219,27 @@ class Session:
         *predicates: ops.Predicate | Record,
         expect: Record | None = None,
     ) -> SubmitHandle:
-        token = self._token(name)
+        token = self.token(name)
         guards = _collect_guards(self._store_id, token, predicates, expect, False)
         tx = ops.Transaction((ops.Step(guards, ops.Del(self._store_id, token)),))
-        return self._submit(tx)
+        return self.submit(tx)
+
+    def compact(self, block_num: int) -> SubmitHandle:
+        from .store.management import P_COMPACT  # noqa: PLC0415
+        held = self._sub.get(ops.STORE_MANAGEMENT, P_COMPACT)
+        guard: ops.Predicate
+        if held is None:
+            guard = ops.Absent(ops.STORE_MANAGEMENT, P_COMPACT)
+        else:
+            guard = ops.Holds(ops.STORE_MANAGEMENT, P_COMPACT, ops.value_digest(held.value))
+        value = block_num.to_bytes(8, "big")
+        tx = ops.Transaction((ops.Step((guard,), ops.Set(ops.STORE_MANAGEMENT, P_COMPACT, value)),))
+        return self.submit(tx)
 
     def begin(self) -> "TxBuilder":
         return TxBuilder(self)
 
-    def _submit(self, tx: ops.Transaction) -> SubmitHandle:
+    def submit(self, tx: ops.Transaction) -> SubmitHandle:
         signed = tx.sign(self._kp, now_ms())
         return self._sub.submit(signed)
 
@@ -243,8 +259,8 @@ class TxBuilder:
     ) -> "TxBuilder":
         s = self._session
         token, sealed, epoch = s._seal(name, value)
-        guards = _collect_guards(s._store_id, token, predicates, expect, absent)
-        self._steps.append(ops.Step(guards, ops.Set(s._store_id, token, sealed, epoch)))
+        guards = _collect_guards(s.store_id, token, predicates, expect, absent)
+        self._steps.append(ops.Step(guards, ops.Set(s.store_id, token, sealed, epoch)))
         return self
 
     def delete(
@@ -254,16 +270,16 @@ class TxBuilder:
         expect: Record | None = None,
     ) -> "TxBuilder":
         s = self._session
-        token = s._token(name)
-        guards = _collect_guards(s._store_id, token, predicates, expect, False)
-        self._steps.append(ops.Step(guards, ops.Del(s._store_id, token)))
+        token = s.token(name)
+        guards = _collect_guards(s.store_id, token, predicates, expect, False)
+        self._steps.append(ops.Step(guards, ops.Del(s.store_id, token)))
         return self
 
     def submit(self) -> SubmitHandle:
         if not self._steps:
             raise SessionError("empty transaction")
         tx = ops.Transaction(tuple(self._steps))
-        return self._session._submit(tx)
+        return self._session.submit(tx)
 
 
 def _collect_guards(

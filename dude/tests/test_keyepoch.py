@@ -234,7 +234,7 @@ class TestGenesisIsByteEqualOnEveryNode(unittest.TestCase):
 
     def test_the_cluster_actually_settles_a_block(self):
         c = Cluster(nodes=3, mgmt=1)
-        s = c.mgmt_nodes[0].session()
+        s = c.replicas[0].session()
         s.put("probe", b"v").wait()
         c.wait_block(2)
         heads = [n.store.head_block_num() or 0 for n in c.nodes]

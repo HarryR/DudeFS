@@ -163,7 +163,10 @@ class StoreReader:
 
     def head(self) -> Index:
         row = self._conn.execute("SELECT MAX(idx) FROM entry").fetchone()
-        return row[0] if row[0] is not None else 0
+        if row[0] is not None:
+            return row[0]
+        floor = self._get_meta("head_floor", b"")
+        return int.from_bytes(floor, "big") if floor else 0
 
     def entries(self, frm: Index = 1, to: Index | None = None) -> Iterator[Entry]:
         hi = self.head() if to is None else to
@@ -189,6 +192,10 @@ class StoreReader:
         if first_height > height:
             return ()
         return tuple(e.item for e in self.entries(first_height, height))
+
+    def oldest_block_num(self) -> Index | None:
+        row = self._conn.execute("SELECT MIN(block_num) FROM block").fetchone()
+        return row[0] if row and row[0] is not None else None
 
     def head_block_hash(self) -> crypto.Digest | None:
         row = self._conn.execute(
@@ -270,6 +277,19 @@ class StoreReader:
         row = self._conn.execute("SELECT v FROM meta WHERE k=?", (k,)).fetchone()
         return row[0] if row else default
 
+    def subtree_data_size(self, prefix: bytes, depth: int) -> int:
+        lo, hi = smt.bounds(prefix, depth)
+        row = self._conn.execute(
+            "SELECT COALESCE(SUM(LENGTH(value) + LENGTH(cred)), 0)"
+            " FROM live WHERE path BETWEEN ? AND ?",
+            (lo, hi),
+        ).fetchone()
+        return row[0]
+
+    def subtree_rows(self, prefix: bytes, depth: int) -> tuple[PathRow, ...]:
+        lo, hi = smt.bounds(prefix, depth)
+        return tuple(self._rows_in_path_range(lo, hi))
+
     def _rows_in_path_range(self, lo: bytes, hi: bytes) -> Iterator[PathRow]:
         rows = self._conn.execute(
             "SELECT store, name, value, cred, epoch FROM live"
@@ -320,6 +340,32 @@ class StoreWriter(StoreReader):
         self._set_meta("anchor", manager)
         if seeds:
             self._set_meta("seeds", codec.encode(sorted(seeds)))
+
+    def bootstrap_checkpoint(
+        self, anchor: crypto.PublicKey, settled_block_bytes: bytes
+    ) -> None:
+        from ..consensus.settle_round import SettledBlock  # noqa: PLC0415
+
+        sb = SettledBlock.decode(settled_block_bytes)
+        a = sb.anchors
+        self.provision(anchor)
+        self._set_meta("acc", a.acc_state)
+        self._set_meta("acc_log", a.acc_log)
+        self._set_meta("head_floor", a.height.to_bytes(8, "big"))
+        self._conn.execute(
+            "INSERT INTO block (block_num, first_height, height, bytes, hash)"
+            " VALUES (?,?,?,?,?)",
+            (a.block_num, a.height + 1, a.height, settled_block_bytes, sb.block_hash),
+        )
+
+    def insert_live_row(self, row: PathRow) -> None:
+        path = smt.path_of(row.store, row.name)
+        self._tree.invalidate(path)
+        self._conn.execute(
+            "INSERT OR REPLACE INTO live (store, name, value, epoch, path, cred)"
+            " VALUES (?,?,?,?,?,?)",
+            (row.store, row.name, row.value, row.epoch, path, row.credential),
+        )
 
     def gc_below(self, pivot_block_num: Index) -> int:
         row = self._conn.execute(
@@ -564,6 +610,10 @@ class Store:
     def bodies_of_block(self, block_num: Index) -> tuple[ops.SignedTransaction, ...]:
         with self.snapshot() as r:
             return r.bodies_of_block(block_num)
+
+    def oldest_block_num(self) -> Index | None:
+        with self.snapshot() as r:
+            return r.oldest_block_num()
 
     def head_block_hash(self) -> crypto.Digest | None:
         with self.snapshot() as r:
