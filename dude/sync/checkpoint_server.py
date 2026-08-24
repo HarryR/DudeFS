@@ -2,20 +2,23 @@ from __future__ import annotations
 
 from ..store import Store
 from ..store.checkpoint import CheckpointMeta
-from ..store.smt_sync import Chunk, TreeExporter
-from .checkpoint_adapter import CheckpointMetaReply, ChunksReply, GetChunks
+from ..store.smt_sync import TreeExporter
+from .checkpoint_adapter import (
+    CheckpointMetaReply,
+    ChunksReply,
+    GetChunks,
+    _decode_chunk,
+    _encode_chunk,
+)
 
 
 class CheckpointServer:
-    def __init__(
-        self, meta: CheckpointMeta, chunks: tuple[Chunk, ...], batch_size: int = 10
-    ):
-        self._meta = meta
-        self._chunks = chunks
+    def __init__(self, store: Store, batch_size: int = 10):
+        self._store = store
         self._batch_size = batch_size
 
     @classmethod
-    def from_store(
+    def create_and_persist(
         cls,
         store: Store,
         meta: CheckpointMeta,
@@ -24,13 +27,23 @@ class CheckpointServer:
     ) -> CheckpointServer:
         with store.snapshot() as reader:
             chunks = tuple(TreeExporter(reader, max_chunk_bytes=max_chunk_bytes).chunks())
-        return cls(meta, chunks, batch_size)
+        chunk_blobs = tuple(_encode_chunk(c) for c in chunks)
+        with store.write() as w:
+            w.persist_checkpoint(meta.encode(), chunk_blobs)
+        return cls(store, batch_size)
+
+    def has_checkpoint(self) -> bool:
+        return self._store.checkpoint_meta_bytes() is not None
 
     def serve_meta(self) -> CheckpointMetaReply:
-        return CheckpointMetaReply(meta_bytes=self._meta.encode())
+        raw = self._store.checkpoint_meta_bytes()
+        if raw is None:
+            return CheckpointMetaReply(meta_bytes=b"")
+        return CheckpointMetaReply(meta_bytes=raw)
 
     def serve_chunks(self, req: GetChunks) -> ChunksReply:
-        start = req.offset
-        end = min(start + self._batch_size, len(self._chunks))
-        batch = self._chunks[start:end]
-        return ChunksReply(chunks=batch, more=end < len(self._chunks))
+        blobs = self._store.checkpoint_chunks(req.offset, self._batch_size)
+        chunks = tuple(_decode_chunk(b) for b in blobs)
+        total = self._store.checkpoint_chunk_count()
+        served_up_to = req.offset + len(chunks)
+        return ChunksReply(chunks=chunks, more=served_up_to < total)

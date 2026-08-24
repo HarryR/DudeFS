@@ -8,7 +8,7 @@ from dude.session import Settled
 from dude.store import ops
 from dude.store.checkpoint import CheckpointMeta
 from dude.store.management import Cert, MgmtReader, MgmtWriter, Role
-from dude.store.smt_sync import TreeExporter, TreeImporter
+from dude.store.smt_sync import TreeImporter
 from dude.sync.checkpoint_adapter import GetChunks
 from dude.sync.checkpoint_server import CheckpointServer
 from dude.tests.cluster import Cluster
@@ -60,10 +60,9 @@ class TestFollowerCheckpointFallback(unittest.TestCase):
                     compactor=crypto.Keypair.from_seed(compactor_kp.seed),
                     grant_cert=grant_cert,
                 )
-                chunks = tuple(
-                    TreeExporter(reader, max_chunk_bytes=50_000).chunks()
-                )
-            srv = CheckpointServer(meta, chunks, batch_size=5)
+            srv = CheckpointServer.create_and_persist(
+                source.store, meta, max_chunk_bytes=50_000, batch_size=5,
+            )
             source.checkpoint_server = srv
 
             for i in range(3):

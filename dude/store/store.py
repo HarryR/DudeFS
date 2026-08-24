@@ -79,6 +79,13 @@ CREATE TABLE IF NOT EXISTS block (
     hash         BLOB NOT NULL UNIQUE
 );
 
+-- Persisted checkpoint artifact. Row 0 = CheckpointMeta.encode(). Rows 1..N = bencoded
+-- chunks in TreeExporter walk order. Replaced atomically when a new checkpoint is created.
+CREATE TABLE IF NOT EXISTS checkpoint (
+    seq  INTEGER PRIMARY KEY,
+    data BLOB NOT NULL
+);
+
 """
 
 
@@ -206,6 +213,25 @@ class StoreReader:
     def head_block_num(self) -> Index | None:
         row = self._conn.execute("SELECT MAX(block_num) FROM block").fetchone()
         return row[0] if row and row[0] is not None else None
+
+    def checkpoint_meta_bytes(self) -> bytes | None:
+        row = self._conn.execute(
+            "SELECT data FROM checkpoint WHERE seq = 0",
+        ).fetchone()
+        return bytes(row[0]) if row else None
+
+    def checkpoint_chunk_count(self) -> int:
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM checkpoint WHERE seq > 0",
+        ).fetchone()
+        return row[0]
+
+    def checkpoint_chunks(self, offset: int, limit: int) -> tuple[bytes, ...]:
+        rows = self._conn.execute(
+            "SELECT data FROM checkpoint WHERE seq > ? ORDER BY seq LIMIT ?",
+            (offset, limit),
+        ).fetchall()
+        return tuple(bytes(r[0]) for r in rows)
 
     def credential(self, store: int, name: bytes) -> bytes:
         row = self._conn.execute(
@@ -340,6 +366,16 @@ class StoreWriter(StoreReader):
         self._set_meta("anchor", manager)
         if seeds:
             self._set_meta("seeds", codec.encode(sorted(seeds)))
+
+    def persist_checkpoint(self, meta_bytes: bytes, chunk_blobs: tuple[bytes, ...]) -> None:
+        self._conn.execute("DELETE FROM checkpoint")
+        self._conn.execute(
+            "INSERT INTO checkpoint (seq, data) VALUES (0, ?)", (meta_bytes,),
+        )
+        for i, blob in enumerate(chunk_blobs, 1):
+            self._conn.execute(
+                "INSERT INTO checkpoint (seq, data) VALUES (?, ?)", (i, blob),
+            )
 
     def reset_for_checkpoint(self) -> None:
         self._conn.execute("DELETE FROM live")
@@ -689,6 +725,18 @@ class Store:
     def has_settled(self, op_hash: crypto.Digest) -> bool:
         with self.snapshot() as r:
             return r.has_settled(op_hash)
+
+    def checkpoint_meta_bytes(self) -> bytes | None:
+        with self.snapshot() as r:
+            return r.checkpoint_meta_bytes()
+
+    def checkpoint_chunk_count(self) -> int:
+        with self.snapshot() as r:
+            return r.checkpoint_chunk_count()
+
+    def checkpoint_chunks(self, offset: int, limit: int) -> tuple[bytes, ...]:
+        with self.snapshot() as r:
+            return r.checkpoint_chunks(offset, limit)
 
     def settled_hashes(self, want: tuple[crypto.Digest, ...]) -> set[crypto.Digest]:
         with self.snapshot() as r:

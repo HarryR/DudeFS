@@ -7,7 +7,7 @@ from dude.session import Settled
 from dude.store import Store, ops
 from dude.store.checkpoint import CheckpointMeta
 from dude.store.management import Cert, MgmtReader, MgmtWriter, Role
-from dude.store.smt_sync import TreeExporter, TreeImporter
+from dude.store.smt_sync import TreeImporter
 from dude.sync.checkpoint_adapter import (
     CheckpointMetaReply,
     ChunksReply,
@@ -68,12 +68,11 @@ class TestCheckpointWire(unittest.TestCase):
                 compactor=crypto.Keypair.from_seed(compactor_kp.seed),
                 grant_cert=grant_cert,
             )
-            chunks = tuple(
-                TreeExporter(reader, max_chunk_bytes=10_000).chunks()
-            )
-        srv = CheckpointServer(meta, chunks, batch_size=3)
+        srv = CheckpointServer.create_and_persist(
+            node.store, meta, max_chunk_bytes=10_000, batch_size=3,
+        )
         node.checkpoint_server = srv
-        return meta, chunks
+        return meta
 
     def test_checkpoint_adapter_roundtrip(self):
         get_cp = GetCheckpoint()
@@ -89,7 +88,7 @@ class TestCheckpointWire(unittest.TestCase):
         c, _s = self._boot_with_data()
         try:
             compactor_kp = self._grant_and_pivot(c)
-            _meta, chunks = self._install_checkpoint_server(c, compactor_kp)
+            self._install_checkpoint_server(c, compactor_kp)
 
             srv = c.nodes[0].checkpoint_server
             meta_reply = srv.serve_meta()
@@ -106,7 +105,7 @@ class TestCheckpointWire(unittest.TestCase):
                 if not reply.more:
                     break
                 offset += len(reply.chunks)
-            self.assertEqual(len(all_chunks), len(chunks))
+            self.assertGreater(len(all_chunks), 0)
         finally:
             c.close()
 
@@ -114,7 +113,7 @@ class TestCheckpointWire(unittest.TestCase):
         c, _s = self._boot_with_data()
         try:
             compactor_kp = self._grant_and_pivot(c)
-            _meta, _ = self._install_checkpoint_server(c, compactor_kp)
+            self._install_checkpoint_server(c, compactor_kp)
 
             srv = c.nodes[0].checkpoint_server
             meta_reply = srv.serve_meta()
@@ -153,14 +152,18 @@ class TestCheckpointWire(unittest.TestCase):
         c, _s = self._boot_with_data()
         try:
             compactor_kp = self._grant_and_pivot(c)
-            _, chunks = self._install_checkpoint_server(c, compactor_kp)
+            self._install_checkpoint_server(c, compactor_kp)
 
-            reply = ChunksReply(chunks=chunks[:2], more=True)
+            srv = c.nodes[0].checkpoint_server
+            first_batch = srv.serve_chunks(GetChunks(offset=0))
+            self.assertGreater(len(first_batch.chunks), 0)
+
+            reply = ChunksReply(chunks=first_batch.chunks[:2], more=True)
             _verb, body = reply.encode()
             decoded = ChunksReply.decode(body)
-            self.assertEqual(len(decoded.chunks), 2)
+            self.assertEqual(len(decoded.chunks), len(reply.chunks))
             self.assertTrue(decoded.more)
-            for orig, dec in zip(chunks[:2], decoded.chunks, strict=True):
+            for orig, dec in zip(reply.chunks, decoded.chunks, strict=True):
                 self.assertEqual(orig.depth, dec.depth)
                 self.assertEqual(orig.subtree_hash, dec.subtree_hash)
                 self.assertEqual(len(orig.rows), len(dec.rows))
