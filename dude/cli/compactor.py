@@ -8,9 +8,8 @@ from ..consensus.canonical import bodies_canonical
 from ..consensus.settle_round import SettledBlock
 from ..core import crypto
 from ..core.units import now_ms
-from ..net.address import Address, Scheme
 from ..net.postman import Postman
-from ..net.transports.tcp import TCPDialer, TCPListener, TCPTiming
+from ..net.transports.tcp import TCPDialer, TCPTiming
 from ..node import ReplicaNode
 from ..session import Settled
 from ..store import Store
@@ -43,7 +42,6 @@ def register(sub: argparse._SubParsersAction) -> None:
 
     serve = comp_sub.add_parser("serve", help="run persistent compactor (replica node)")
     serve.add_argument("--dir", type=Path, required=True, help="compactor home directory")
-    serve.add_argument("--listen", default=None, help="listen address")
     serve.add_argument(
         "--interval", type=int, default=86400,
         help="seconds between compaction runs (default: 86400)",
@@ -96,31 +94,8 @@ def cmd_run(args: argparse.Namespace) -> None:
         raise CLIError(f"compact transaction did not settle: {result!r}")
 
     print(f"compaction pivot at block {block_num} settled")
-
-    mgmt_s = lc.session(store_id=0)
-    grant_cert = _find_grant_cert(mgmt_s, kp)
-    meta = CheckpointMeta.create(
-        settled_block_bytes=head.encode(),
-        anchor=seed.anchor,
-        compactor=kp,
-        grant_cert=grant_cert,
-    )
-    meta_path = dir_path / "checkpoint_meta.bin"
-    meta_path.write_bytes(meta.encode())
-    print(f"checkpoint metadata written to {meta_path}")
-
     lc.stop()
     print("done")
-
-
-def _find_grant_cert(mgmt_session, kp: crypto.Keypair) -> Cert:
-    rec = mgmt_session.get(GRANTS_MAP.entry_name(kp.public))
-    if rec.absent:
-        raise CLIError("compactor grant not found in management store")
-    grant = Grant.decode_row(kp.public, rec.value)
-    if grant.role is not Role.COMPACTOR:
-        raise CLIError(f"grant role is {grant.role.name}, not COMPACTOR")
-    return grant.cert
 
 
 def cmd_serve(args: argparse.Namespace) -> None:
@@ -150,21 +125,6 @@ def cmd_serve(args: argparse.Namespace) -> None:
 
     timing = TCPTiming.for_deployment(DEFAULT)
     rn = ReplicaNode(kp, store, DEFAULT)
-
-    if args.listen:
-        addr = Address.parse(args.listen.encode())
-        if addr.scheme is Scheme.TCP:
-            host, _, port_s = addr.value.partition(":")
-            listener = TCPListener(
-                listen_host=host, listen_port=int(port_s), timing=timing,
-            )
-            rn.add_listener(listener)
-            print(f"listening on {listener.bound_address}")
-    else:
-        listener = TCPListener(timing=timing)
-        rn.add_listener(listener)
-        print(f"listening on {listener.bound_address}")
-
     rn.add_listener(TCPDialer(timing=timing))
     rn.start()
     print(f"compactor {kp.public.hex()[:16]}... running (interval={interval}s)")
