@@ -3,7 +3,6 @@ from __future__ import annotations
 import unittest
 
 from dude.core import crypto
-from dude.session import Settled
 from dude.store import Store, ops
 from dude.store.checkpoint import CheckpointMeta
 from dude.store.management import Cert, MgmtReader, MgmtWriter, Role
@@ -23,9 +22,10 @@ class TestCheckpointWire(unittest.TestCase):
     def _boot_with_data(self):
         c = Cluster(nodes=3, mgmt=1)
         s = c.replicas[0].session()
+        last = None
         for i in range(5):
-            s.put(f"k{i}", f"v{i}".encode()).wait()
-        c.wait_block(4)
+            last = s.put(f"k{i}", f"v{i}".encode()).wait()
+        c.wait_settled(last)
         return c, s
 
     def _grant_and_pivot(self, c):
@@ -42,18 +42,12 @@ class TestCheckpointWire(unittest.TestCase):
             pop=compactor_kp.prove_possession(),
             cert=Cert.sign_grant(c.anchor, compactor_kp.public, Role.COMPACTOR),
         )
-        result = anchor_s.submit(grant_tx).wait()
-        if not isinstance(result, Settled):
-            raise AssertionError(f"grant: {result!r}")  # noqa: TRY004
-        c.wait_head(c.nodes[0].store.head())
+        c.wait_settled(anchor_s.submit(grant_tx).wait())
 
         compactor_node = c.boot_replica(compactor_kp)
         c.wait_head(c.nodes[0].store.head(), nodes=[compactor_node])
         cs = compactor_node.session()
-        result = cs.compact(c.nodes[0].store.head_block_num() or 0).wait()
-        if not isinstance(result, Settled):
-            raise AssertionError(f"pivot: {result!r}")  # noqa: TRY004
-        c.wait_head(c.nodes[0].store.head())
+        c.wait_settled(cs.compact(c.nodes[0].store.head_block_num() or 0).wait())
         return compactor_kp
 
     def _install_checkpoint_server(self, c, compactor_kp):

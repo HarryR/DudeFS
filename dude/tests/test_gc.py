@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import unittest
 
-from dude.session import Settled
 from dude.tests.cluster import Cluster
 
 
@@ -16,9 +15,10 @@ class TestStoreGC(unittest.TestCase):
         self.c.close()
 
     def test_gc_preserves_live_and_removes_history(self):
+        last = None
         for i in range(5):
-            self.s.put(f"k{i}", f"v{i}".encode()).wait()
-        self.c.wait_head(self.c.nodes[0].store.head())
+            last = self.s.put(f"k{i}", f"v{i}".encode()).wait()
+        self.c.wait_settled(last)
 
         store = self.c.nodes[0].store
         pre_acc = store.accumulator()
@@ -43,14 +43,13 @@ class TestStoreGC(unittest.TestCase):
         self.assertEqual(store.oldest_block_num(), pivot)
 
     def test_gc_at_nonexistent_block_is_noop(self):
-        self.c.wait_block(1)
         store = self.c.nodes[0].store
         deleted = store.gc_below(9999)
         self.assertEqual(deleted, 0)
 
     def test_gc_keeps_pivot_block(self):
-        self.s.put("x", b"y").wait()
-        self.c.wait_head(self.c.nodes[0].store.head())
+        result = self.s.put("x", b"y").wait()
+        self.c.wait_settled(result)
 
         store = self.c.nodes[0].store
         pivot = store.head_block_num()
@@ -60,15 +59,13 @@ class TestStoreGC(unittest.TestCase):
         self.assertIsNone(store.settled_at(0))
 
     def test_gc_does_not_break_post_gc_settlement(self):
-        self.s.put("before", b"gc").wait()
-        self.c.wait_head(self.c.nodes[0].store.head())
+        result = self.s.put("before", b"gc").wait()
+        self.c.wait_settled(result)
 
         for n in self.c.nodes:
             n.store.gc_below(n.store.head_block_num())
 
-        result = self.s.put("after", b"gc").wait()
-        self.assertIsInstance(result, Settled)
-        self.c.wait_head(self.c.nodes[0].store.head())
+        self.c.wait_settled(self.s.put("after", b"gc").wait())
 
         token = self.s.token("after")
         held = self.c.nodes[0].store.get(self.s.store_id, token)

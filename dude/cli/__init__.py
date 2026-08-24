@@ -1,7 +1,7 @@
 import argparse
 import sys
 
-from . import client, mgr, node
+from . import client, compactor, mgr, node
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -11,6 +11,7 @@ def main(argv: list[str] | None = None) -> None:
     mgr.register(sub)
     node.register(sub)
     client.register(sub)
+    compactor.register(sub)
 
     args = p.parse_args(argv)
     if args.command is None:

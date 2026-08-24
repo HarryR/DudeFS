@@ -12,7 +12,7 @@ from .net import Verb, MessageId
 from .net.link import Listener
 from .net.postman import Delivered, Postman
 from .store import Store, ops
-from .store.layer import Held
+from .store.layer import Held, Settled
 from .store.management import MgmtReader
 from .sync.adapter import (
     GetBlocks,
@@ -79,6 +79,7 @@ class _BaseNode:
         if self._thread is not None:
             return
         self._stopping = threading.Event()
+        self._reconcile_peers()
         self.postman.start()
         prefix = "replica" if isinstance(self, ReplicaNode) else "node"
         self._thread = threading.Thread(
@@ -358,13 +359,18 @@ class Node(_BaseNode):
             return self.postman.reply(d, LiteRefused(SyncRefusal.MALFORMED_QUERY), self.tunables.ttl_lite)
         if not isinstance(req, TxStatus):
             return None
-        if self.store.has_settled(req.op_hash):
-            status = TxStatusKind.SETTLED
+        info = self.store.settlement_of(req.op_hash)
+        if info is not None:
+            reply = TxStatusReply(
+                status=TxStatusKind.SETTLED,
+                block_num=info.block_num,
+                block_hash=info.block_hash,
+            )
         elif req.op_hash in self.coordinator.mempool.all_hashes():
-            status = TxStatusKind.PENDING
+            reply = TxStatusReply(status=TxStatusKind.PENDING)
         else:
-            status = TxStatusKind.UNKNOWN
-        return self.postman.reply(d, TxStatusReply(status=status), self.tunables.ttl_lite)
+            reply = TxStatusReply(status=TxStatusKind.UNKNOWN)
+        return self.postman.reply(d, reply, self.tunables.ttl_lite)
 
     def _lite_authorised(self, requester: crypto.PublicKey) -> bool:
         if requester == self.store.anchor():
@@ -409,6 +415,20 @@ class ReplicaNode(_BaseNode):
             self._key_cache = KeyCache(self.me, sub)
         return Session(sub, self.me, store_id, self._key_cache)
 
+    def _run(self) -> None:
+        tick_interval = self.tunables.tick_interval / 1000
+        while not self._stopping.is_set():
+            now = now_ms()
+            for output in self.postman.drain_output(timeout=tick_interval):
+                for d in output.delivered:
+                    self._on_delivered(d, now)
+                for e in output.expired:
+                    handle = self._inflight.pop(e.prefix, None)
+                    if handle is not None:
+                        handle.expire()
+            with contextlib.suppress(DudeError):
+                self._tick(now)
+
     def _on_settled_block(self, d: Delivered, now: Millis) -> None:
         _BaseNode._on_settled_block(self, d, now)
         with self._commit_cond:
@@ -448,8 +468,8 @@ class _ReplicaSubstrate:
         )
         return handle
 
-    def settled(self, op_hash: crypto.Digest, peer: crypto.PublicKey | None = None) -> bool:
-        return self._node.store.has_settled(op_hash)
+    def settled(self, op_hash: crypto.Digest, peer: crypto.PublicKey | None = None) -> Settled | None:
+        return self._node.store.settlement_of(op_hash)
 
     def evict_after_sec(self) -> float:
         return self._node.tunables.evict_after / 1000

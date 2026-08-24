@@ -4,9 +4,9 @@ import unittest
 
 from dude.consensus.settle_round import SettledBlock
 from dude.core import crypto
-from dude.session import Settled
 from dude.store import Store, ops
 from dude.store.checkpoint import CheckpointMeta
+from dude.store.layer import Settled
 from dude.store.management import (
     Cert,
     MgmtReader,
@@ -30,17 +30,15 @@ class TestCompactionEndToEnd(unittest.TestCase):
         c.wait_head(c.nodes[0].store.head(), nodes=[anchor_node])
         anchor_s = anchor_node.session()
         w = MgmtWriter(anchor_node.store)
-        grant_tx = w.authorise(
-            kp.public,
-            Role.COMPACTOR,
-            stores=frozenset({ops.STORE_MANAGEMENT}),
-            pop=kp.prove_possession(),
-            cert=Cert.sign_grant(c.anchor, kp.public, Role.COMPACTOR),
+        c.wait_settled(
+            anchor_s.submit(w.authorise(
+                kp.public,
+                Role.COMPACTOR,
+                stores=frozenset({ops.STORE_MANAGEMENT}),
+                pop=kp.prove_possession(),
+                cert=Cert.sign_grant(c.anchor, kp.public, Role.COMPACTOR),
+            )).wait(),
         )
-        result = anchor_s.submit(grant_tx).wait()
-        if not isinstance(result, Settled):
-            raise AssertionError(f"grant did not settle: {result!r}")  # noqa: TRY004
-        c.wait_head(c.nodes[0].store.head())
         return kp
 
     def _compactor_session(self, c, compactor_kp):
@@ -50,10 +48,7 @@ class TestCompactionEndToEnd(unittest.TestCase):
 
     def _submit_pivot(self, c, cs):
         block_num = c.nodes[0].store.head_block_num() or 0
-        result = cs.compact(block_num).wait()
-        if not isinstance(result, Settled):
-            raise AssertionError(f"pivot did not settle: {result!r}")  # noqa: TRY004
-        c.wait_head(c.nodes[0].store.head())
+        c.wait_settled(cs.compact(block_num).wait())
 
     def _checkpoint_from(self, store, anchor):
         compactor_kp = crypto.Keypair.generate()
@@ -106,9 +101,10 @@ class TestCompactionEndToEnd(unittest.TestCase):
     def test_full_compaction_through_consensus(self):
         c, s = self._boot()
         try:
+            last = None
             for i in range(5):
-                s.put(f"data-{i}", f"value-{i}".encode()).wait()
-            c.wait_block(4)
+                last = s.put(f"data-{i}", f"value-{i}".encode()).wait()
+            c.wait_settled(last)
 
             compactor_kp = self._grant_compactor(c)
             cs = self._compactor_session(c, compactor_kp)
@@ -127,16 +123,17 @@ class TestCompactionEndToEnd(unittest.TestCase):
     def test_gc_all_nodes_then_joiner_catches_up(self):
         c, s = self._boot()
         try:
+            last = None
             for i in range(5):
-                s.put(f"k{i}", f"v{i}".encode()).wait()
-            c.wait_block(4)
+                last = s.put(f"k{i}", f"v{i}".encode()).wait()
+            c.wait_settled(last)
 
             compactor_kp = self._grant_compactor(c)
             cs = self._compactor_session(c, compactor_kp)
 
             for i in range(3):
-                s.put(f"pre-pivot-{i}", f"p{i}".encode()).wait()
-            c.wait_block(6)
+                last = s.put(f"pre-pivot-{i}", f"p{i}".encode()).wait()
+            c.wait_settled(last)
 
             self._submit_pivot(c, cs)
 
@@ -144,8 +141,8 @@ class TestCompactionEndToEnd(unittest.TestCase):
             meta, chunks, pivot = self._checkpoint_from(source, c.anchor)
 
             for i in range(3):
-                s.put(f"post-pivot-{i}", f"pp{i}".encode()).wait()
-            c.wait_block(10)
+                last = s.put(f"post-pivot-{i}", f"pp{i}".encode()).wait()
+            c.wait_settled(last)
             c.close()
 
             for n in c.nodes:
@@ -166,14 +163,14 @@ class TestCompactionEndToEnd(unittest.TestCase):
     def test_all_nodes_converge_after_gc(self):
         c, s = self._boot()
         try:
+            last = None
             for i in range(5):
-                s.put(f"d{i}", f"v{i}".encode()).wait()
-            c.wait_block(4)
+                last = s.put(f"d{i}", f"v{i}".encode()).wait()
+            c.wait_settled(last)
 
             compactor_kp = self._grant_compactor(c)
             cs = self._compactor_session(c, compactor_kp)
             self._submit_pivot(c, cs)
-            c.wait_head(c.nodes[0].store.head())
 
             pivot_block = c.nodes[0].store.head_block_num()
             for n in c.nodes:
@@ -197,20 +194,20 @@ class TestCompactionEndToEnd(unittest.TestCase):
     def test_consecutive_pivots(self):
         c, s = self._boot()
         try:
+            last = None
             for i in range(3):
-                s.put(f"wave1-{i}", f"a{i}".encode()).wait()
-            c.wait_block(3)
+                last = s.put(f"wave1-{i}", f"a{i}".encode()).wait()
+            c.wait_settled(last)
 
             compactor_kp = self._grant_compactor(c)
             cs = self._compactor_session(c, compactor_kp)
             self._submit_pivot(c, cs)
 
             for i in range(3):
-                s.put(f"wave2-{i}", f"b{i}".encode()).wait()
-            c.wait_block(7)
+                last = s.put(f"wave2-{i}", f"b{i}".encode()).wait()
+            c.wait_settled(last)
 
             self._submit_pivot(c, cs)
-            c.wait_head(c.nodes[0].store.head())
 
             source = c.nodes[0].store
             meta, chunks, pivot = self._checkpoint_from(source, c.anchor)

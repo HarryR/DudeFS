@@ -235,10 +235,8 @@ class TestGenesisIsByteEqualOnEveryNode(unittest.TestCase):
     def test_the_cluster_actually_settles_a_block(self):
         c = Cluster(nodes=3, mgmt=1)
         s = c.replicas[0].session()
-        s.put("probe", b"v").wait()
-        c.wait_block(2)
-        heads = [n.store.head_block_num() or 0 for n in c.nodes]
-        self.assertTrue(all(h > 1 for h in heads), f"no block was produced: {heads}")
+        result = c.wait_settled(s.put("probe", b"v").wait())
+        self.assertGreater(result.block_num, 0, "put did not land in a post-genesis block")
         c.close()
 
 

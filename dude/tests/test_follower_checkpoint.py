@@ -4,7 +4,6 @@ import time
 import unittest
 
 from dude.core import crypto
-from dude.session import Settled
 from dude.store import ops
 from dude.store.checkpoint import CheckpointMeta
 from dude.store.management import Cert, MgmtReader, MgmtWriter, Role
@@ -20,9 +19,10 @@ class TestFollowerCheckpointFallback(unittest.TestCase):
         c = Cluster(nodes=3, mgmt=1)
         try:
             s = c.replicas[0].session()
+            last = None
             for i in range(5):
-                s.put(f"k{i}", f"v{i}".encode()).wait()
-            c.wait_block(4)
+                last = s.put(f"k{i}", f"v{i}".encode()).wait()
+            c.wait_settled(last)
 
             anchor_node = c.boot_replica(c.anchor)
             c.wait_head(c.nodes[0].store.head(), nodes=[anchor_node])
@@ -36,16 +36,12 @@ class TestFollowerCheckpointFallback(unittest.TestCase):
                 pop=compactor_kp.prove_possession(),
                 cert=Cert.sign_grant(c.anchor, compactor_kp.public, Role.COMPACTOR),
             )
-            result = anchor_s.submit(grant_tx).wait()
-            self.assertIsInstance(result, Settled)
-            c.wait_head(c.nodes[0].store.head())
+            c.wait_settled(anchor_s.submit(grant_tx).wait())
 
             compactor_node = c.boot_replica(compactor_kp)
             c.wait_head(c.nodes[0].store.head(), nodes=[compactor_node])
             cs = compactor_node.session()
-            result = cs.compact(c.nodes[0].store.head_block_num() or 0).wait()
-            self.assertIsInstance(result, Settled)
-            c.wait_head(c.nodes[0].store.head())
+            c.wait_settled(cs.compact(c.nodes[0].store.head_block_num() or 0).wait())
 
             source = c.nodes[0]
             grant_cert = Cert.sign_grant(
@@ -65,9 +61,10 @@ class TestFollowerCheckpointFallback(unittest.TestCase):
             )
             source.checkpoint_server = srv
 
+            last = None
             for i in range(3):
-                s.put(f"post-{i}", f"pp{i}".encode()).wait()
-            c.wait_head(c.nodes[0].store.head())
+                last = s.put(f"post-{i}", f"pp{i}".encode()).wait()
+            c.wait_settled(last)
 
             for n in c.nodes:
                 n.store.gc_below(pivot)
@@ -80,9 +77,7 @@ class TestFollowerCheckpointFallback(unittest.TestCase):
                 pop=joiner_kp.prove_possession(),
                 cert=Cert.sign_grant(c.anchor, joiner_kp.public, Role.CLIENT_RW),
             )
-            result = anchor_s.submit(joiner_grant).wait()
-            self.assertIsInstance(result, Settled)
-            c.wait_head(c.nodes[0].store.head())
+            c.wait_settled(anchor_s.submit(joiner_grant).wait())
             late_joiner = c.boot_replica(joiner_kp)
 
             deadline = time.monotonic() + 15.0

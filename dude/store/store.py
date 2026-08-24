@@ -12,7 +12,7 @@ from typing import NamedTuple
 from ..core import codec, crypto
 from ..core.errors import InvariantError
 from . import ops, settle, smt
-from .layer import Held, Index, PathRow, holds
+from .layer import Held, Index, PathRow, Settled, holds
 from .management import P_NODE, P_ROSTER, MgmtReader, Role
 
 _SCHEMA = """
@@ -327,6 +327,17 @@ class StoreReader:
 
     def has_settled(self, op_hash: crypto.Digest) -> bool:
         return bool(self.settled_hashes((op_hash,)))
+
+    def settlement_of(self, op_hash: crypto.Digest) -> Settled | None:
+        row = self._conn.execute(
+            "SELECT b.block_num, b.hash FROM entry e"
+            " JOIN block b ON e.idx BETWEEN b.first_height AND b.height"
+            " WHERE e.op_hash = ?",
+            (op_hash,),
+        ).fetchone()
+        if row is None:
+            return None
+        return Settled(op_hash, row[0], crypto.Digest(bytes(row[1])))
 
     def settled_hashes(self, want: tuple[crypto.Digest, ...]) -> set[crypto.Digest]:
         if not want:
@@ -725,6 +736,10 @@ class Store:
     def has_settled(self, op_hash: crypto.Digest) -> bool:
         with self.snapshot() as r:
             return r.has_settled(op_hash)
+
+    def settlement_of(self, op_hash: crypto.Digest) -> Settled | None:
+        with self.snapshot() as r:
+            return r.settlement_of(op_hash)
 
     def checkpoint_meta_bytes(self) -> bytes | None:
         with self.snapshot() as r:

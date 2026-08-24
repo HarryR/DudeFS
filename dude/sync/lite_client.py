@@ -16,7 +16,7 @@ from ..net.envelope import MessageId, Verb
 from ..net.link import Listener
 from ..net.postman import Delivered, Postman
 from ..store import smt
-from ..store.layer import Held
+from ..store.layer import Held, Settled
 from ..store.management import (
     CERT_PURPOSE_ROSTER,
     CERT_PURPOSE_ROSTER_COMMITMENT,
@@ -449,10 +449,14 @@ class _TxStatusHandle:
     mid: MessageId
     peer: crypto.PublicKey
     result: TxStatusKind | None = None
+    block_num: int | None = None
+    block_hash: crypto.Digest | None = None
 
     def resolve(self, client: "LightClient", msg: LiteMsg, now: Millis) -> None:
         if isinstance(msg, TxStatusReply):
             self.result = msg.status
+            self.block_num = msg.block_num
+            self.block_hash = msg.block_hash
             pv = client._peer_view(self.peer)
             pv.last_activity = now
             pv.consecutive_failures = 0
@@ -546,7 +550,7 @@ class _LiteSubstrate:
 
         return handle
 
-    def settled(self, op_hash: crypto.Digest, peer: crypto.PublicKey | None = None) -> bool:
+    def settled(self, op_hash: crypto.Digest, peer: crypto.PublicKey | None = None) -> Settled | None:
         if peer is None:
             peer = self._pick_peer()
         mid = MessageId.random()
@@ -556,9 +560,11 @@ class _LiteSubstrate:
         deadline = now_ms() + self._lc.tunables.ttl_lite
         while now_ms() < deadline:
             if handle.result is not None:
-                return handle.result is TxStatusKind.SETTLED
+                if handle.result is TxStatusKind.SETTLED and handle.block_num is not None and handle.block_hash is not None:
+                    return Settled(op_hash, handle.block_num, handle.block_hash)
+                return None
             time.sleep(0.01)
-        return False
+        return None
 
     def evict_after_sec(self) -> float:
         return self._lc.tunables.evict_after / 1000

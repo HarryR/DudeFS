@@ -26,6 +26,12 @@ class Held(NamedTuple):
     cred: bytes
 
 
+class Settled(NamedTuple):
+    op_hash: crypto.Digest
+    block_num: Index
+    block_hash: crypto.Digest
+
+
 class Reader(Protocol):
     def get(self, store: int, name: bytes) -> Held | None: ...
 

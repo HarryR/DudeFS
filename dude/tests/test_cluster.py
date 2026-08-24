@@ -2,8 +2,8 @@
 import unittest
 
 from ..core.units import now_ms
-from ..session import Settled, Refused
 from ..store import ops
+from ..store.layer import Settled
 
 from .cluster import Cluster
 
@@ -20,8 +20,7 @@ class TestSessionViaReplicaNode(unittest.TestCase):
         self.c.close()
 
     def test_put_and_get(self) -> None:
-        result = self.s.put("hello", b"world").wait()
-        self.assertIsInstance(result, Settled)
+        self.c.wait_settled(self.s.put("hello", b"world").wait())
         rec = self.s.get("hello")
         self.assertFalse(rec.absent)
         self.assertEqual(rec.value, b"world")
@@ -33,27 +32,22 @@ class TestSessionViaReplicaNode(unittest.TestCase):
         self.assertEqual(rec.value, b"plaintext")
 
     def test_all_nodes_agree(self) -> None:
-        self.s.put("consensus", b"check").wait()
-        self.c.wait_head(2)
+        self.c.wait_settled(self.s.put("consensus", b"check").wait())
         roots = {n.store.state_root() for n in self.c.nodes}
         accs = {n.store.accumulator() for n in self.c.nodes}
         self.assertEqual(len(roots), 1, "state roots disagree")
         self.assertEqual(len(accs), 1, "accumulators disagree")
 
     def test_management_node_syncs(self) -> None:
-        self.s.put("sync-check", b"v").wait()
-        mn = self.c.replicas[0]
-        self.c.wait_head(2, nodes=[mn])
+        self.c.wait_settled(self.s.put("sync-check", b"v").wait())
         rec = self.s.get("sync-check")
         self.assertEqual(rec.value, b"v")
 
     def test_guarded_put(self) -> None:
-        r1 = self.s.put("k", b"v1").wait()
-        self.assertIsInstance(r1, Settled)
+        self.c.wait_settled(self.s.put("k", b"v1").wait())
         rec = self.s.get("k")
         self.assertEqual(rec.value, b"v1")
-        r2 = self.s.put("k", b"v2", expect=rec).wait()
-        self.assertIsInstance(r2, Settled, f"guarded put returned {r2!r}, not Settled")
+        self.c.wait_settled(self.s.put("k", b"v2", expect=rec).wait())
         final = self.s.get("k")
         self.assertEqual(final.value, b"v2")
 
@@ -62,18 +56,16 @@ class TestSessionViaReplicaNode(unittest.TestCase):
         self.assertEqual(self.s.get("fresh").value, b"new")
 
     def test_conflicting_cas_is_refused_or_dropped(self) -> None:
-        self.s.put("race", b"original").wait()
+        self.c.wait_settled(self.s.put("race", b"original").wait())
         rec = self.s.get("race")
-        self.s.put("race", b"winner", expect=rec).wait()
+        self.c.wait_settled(self.s.put("race", b"winner", expect=rec).wait())
         result = self.s.put("race", b"loser", expect=rec).wait()
         self.assertNotIsInstance(result, Settled)
         self.assertEqual(self.s.get("race").value, b"winner")
 
     def test_multi_step_transaction(self) -> None:
-        r1 = self.s.put("a", b"1").wait()
-        r2 = self.s.put("b", b"2").wait()
-        self.assertIsInstance(r1, Settled)
-        self.assertIsInstance(r2, Settled)
+        self.c.wait_settled(self.s.put("a", b"1").wait())
+        self.c.wait_settled(self.s.put("b", b"2").wait())
         rec_a = self.s.get("a")
         rec_b = self.s.get("b")
         self.assertFalse(rec_a.absent, "a absent after Settled")
@@ -81,7 +73,7 @@ class TestSessionViaReplicaNode(unittest.TestCase):
         tx = self.s.begin()
         tx.put("a", b"10", expect=rec_a)
         tx.put("b", b"20", expect=rec_b)
-        tx.submit().wait()
+        self.c.wait_settled(tx.submit().wait())
         self.assertEqual(self.s.get("a").value, b"10")
         self.assertEqual(self.s.get("b").value, b"20")
 
@@ -99,8 +91,7 @@ class TestSessionViaLightClient(unittest.TestCase):
 
     def test_put_and_get(self) -> None:
         s = self.lc.session()
-        result = s.put("hello", b"world").wait()
-        self.assertIsInstance(result, Settled)
+        self.c.wait_settled(s.put("hello", b"world").wait())
         rec = s.get("hello")
         self.assertFalse(rec.absent)
         self.assertEqual(rec.value, b"world")
@@ -116,8 +107,7 @@ class TestSessionViaLightClient(unittest.TestCase):
         s = self.lc.session()
         s.put("k", b"v1").wait()
         rec = s.get("k")
-        r = s.put("k", b"v2", expect=rec).wait()
-        self.assertIsInstance(r, Settled)
+        self.c.wait_settled(s.put("k", b"v2", expect=rec).wait())
         self.assertEqual(s.get("k").value, b"v2")
 
 

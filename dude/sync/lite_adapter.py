@@ -296,12 +296,24 @@ class TxStatus(LiteMsg):
 class TxStatusReply(LiteMsg):
     verb: ClassVar[Verb] = Verb.TX_STATUS_REPLY
     status: TxStatusKind
+    block_num: int | None = None
+    block_hash: crypto.Digest | None = None
 
     def _encode(self) -> bytes:
+        if self.block_num is not None and self.block_hash is not None:
+            return codec.encode([self.status.value.encode(), self.block_num, self.block_hash])
         return self.status.value.encode()
 
     @classmethod
     def _decode(cls, body: bytes) -> TxStatusReply:
+        try:
+            parts = codec.as_seq(codec.decode(body))
+            status = TxStatusKind(codec.as_bytes(parts[0]).decode("utf-8"))
+            block_num = codec.as_int(parts[1]) if len(parts) > 1 else None
+            block_hash = crypto.Digest(codec.as_bytes(parts[2])) if len(parts) > 2 else None
+            return cls(status=status, block_num=block_num, block_hash=block_hash)
+        except (DudeError, ValueError, UnicodeDecodeError):
+            pass
         try:
             return cls(status=TxStatusKind(body.decode("utf-8")))
         except (ValueError, UnicodeDecodeError) as e:

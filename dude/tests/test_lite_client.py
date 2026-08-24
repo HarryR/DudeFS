@@ -7,7 +7,6 @@ from ..core.units import now_ms
 from ..net.address import Address, Endpoint, Scheme
 from ..net.envelope import MessageId, Verb
 from ..net.postman import Delivered
-from ..session import Settled
 from ..store import ops
 from ..store.management import Cert, Grant, MgmtReader, NodeRecord, Role, RosterCommitment
 from ..sync import chain
@@ -83,8 +82,7 @@ class TestLightClientRead(unittest.TestCase):
 
     def test_put_and_get_via_session(self) -> None:
         s = self.lc.session()
-        result = s.put("hello", b"world").wait()
-        self.assertIsInstance(result, Settled)
+        self.c.wait_settled(s.put("hello", b"world").wait())
         rec = s.get("hello")
         self.assertFalse(rec.absent)
         self.assertEqual(rec.value, b"world")
@@ -202,8 +200,8 @@ class TestByzantineProofReply(unittest.TestCase):
     def setUp(self) -> None:
         self.c = Cluster(nodes=3, mgmt=1, ro=0, rw=0)
         ms = self.c.replicas[0].session()
-        ms.put("byz-target", b"real-value").wait()
-        self.c.wait_block(2)
+        self.c.wait_settled(ms.put("byz-target", b"real-value").wait())
+        self.c.wait_settled(ms.put("byz-pad", b"x").wait())
 
     def tearDown(self) -> None:
         self.c.close()

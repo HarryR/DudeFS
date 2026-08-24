@@ -6,7 +6,6 @@ from dude.core import crypto
 from dude.core.units import now_ms
 from dude.net.postman import Postman
 from dude.net.transports.inproc import InProcListener
-from dude.session import Settled
 from dude.store import ops
 from dude.store.checkpoint import CheckpointMeta
 from dude.store.management import Cert, MgmtWriter, Role
@@ -20,9 +19,10 @@ class TestCompactorFromReplicaNode(unittest.TestCase):
         c = Cluster(nodes=3, mgmt=1)
         try:
             s = c.replicas[0].session()
+            last = None
             for i in range(3):
-                s.put(f"k{i}", f"v{i}".encode()).wait()
-            c.wait_block(3)
+                last = s.put(f"k{i}", f"v{i}".encode()).wait()
+            c.wait_settled(last)
 
             anchor_node = c.boot_replica(c.anchor)
             c.wait_head(c.nodes[0].store.head(), nodes=[anchor_node])
@@ -35,17 +35,14 @@ class TestCompactorFromReplicaNode(unittest.TestCase):
                 pop=compactor_kp.prove_possession(),
                 cert=Cert.sign_grant(c.anchor, compactor_kp.public, Role.COMPACTOR),
             )
-            result = anchor_node.session().submit(grant).wait()
-            self.assertIsInstance(result, Settled)
-            c.wait_head(c.nodes[0].store.head())
+            c.wait_settled(anchor_node.session().submit(grant).wait())
 
             compactor_node = c.boot_replica(compactor_kp)
             c.wait_head(c.nodes[0].store.head(), nodes=[compactor_node])
             cs = compactor_node.session()
 
             block_num = c.nodes[0].store.head_block_num() or 0
-            result = cs.compact(block_num).wait()
-            self.assertIsInstance(result, Settled)
+            c.wait_settled(cs.compact(block_num).wait())
 
             held = c.nodes[0].store.get(ops.STORE_MANAGEMENT, b"compact")
             self.assertIsNotNone(held)
@@ -59,9 +56,10 @@ class TestCompactorFromLightClient(unittest.TestCase):
         c = Cluster(nodes=3, mgmt=1, rw=0)
         try:
             s = c.replicas[0].session()
+            last = None
             for i in range(3):
-                s.put(f"k{i}", f"v{i}".encode()).wait()
-            c.wait_block(3)
+                last = s.put(f"k{i}", f"v{i}".encode()).wait()
+            c.wait_settled(last)
 
             anchor_node = c.boot_replica(c.anchor)
             c.wait_head(c.nodes[0].store.head(), nodes=[anchor_node])
@@ -74,9 +72,7 @@ class TestCompactorFromLightClient(unittest.TestCase):
                 pop=compactor_kp.prove_possession(),
                 cert=Cert.sign_grant(c.anchor, compactor_kp.public, Role.COMPACTOR),
             )
-            result = anchor_node.session().submit(grant).wait()
-            self.assertIsInstance(result, Settled)
-            c.wait_head(c.nodes[0].store.head())
+            c.wait_settled(anchor_node.session().submit(grant).wait())
 
             postman = Postman(compactor_kp, c.tunables)
             postman.add_listener(InProcListener(compactor_kp.public, c.nexus))
@@ -92,8 +88,7 @@ class TestCompactorFromLightClient(unittest.TestCase):
 
             cs = lc.session()
             block_num = lc.trusted_state.head.anchors.block_num
-            result = cs.compact(block_num).wait()
-            self.assertIsInstance(result, Settled)
+            c.wait_settled(cs.compact(block_num).wait())
 
             held = c.nodes[0].store.get(ops.STORE_MANAGEMENT, b"compact")
             self.assertIsNotNone(held)

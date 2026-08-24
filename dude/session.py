@@ -18,18 +18,16 @@ class SessionError(DudeError): ...
 
 @dataclass(frozen=True, slots=True)
 class Record:
-    name: str
+    name: str | bytes
     store_id: int
-    token: crypto.NameToken
+    token: bytes
     value: bytes
     raw: bytes
     epoch: int
     absent: bool
 
 
-@dataclass(frozen=True, slots=True)
-class Settled:
-    pass
+from .store.layer import Settled
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,8 +70,9 @@ class SubmitHandle:
         while time.monotonic() < deadline:
             if self._refused_reason is not None:
                 return Refused(self._refused_reason)
-            if self._sub.settled(self.op_hash, self.peer):
-                return Settled()
+            result = self._sub.settled(self.op_hash, self.peer)
+            if result is not None:
+                return result
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
@@ -84,7 +83,7 @@ class SubmitHandle:
 class Substrate(Protocol):
     def get(self, store_id: int, name: bytes) -> Held | None: ...
     def submit(self, tx: ops.SignedTransaction) -> SubmitHandle: ...
-    def settled(self, op_hash: crypto.Digest, peer: crypto.PublicKey | None = None) -> bool: ...
+    def settled(self, op_hash: crypto.Digest, peer: crypto.PublicKey | None = None) -> Settled | None: ...
     def evict_after_sec(self) -> float: ...
     def wait_for_commit(self, timeout: float) -> None: ...
 
@@ -98,7 +97,7 @@ class _StoreKeys:
 
 
 class KeyCache:
-    __slots__ = ("_kp", "_sub", "_stores")
+    __slots__ = ("_kp", "_stores", "_sub")
 
     def __init__(self, kp: crypto.Keypair, sub: Substrate) -> None:
         self._kp = kp
@@ -152,7 +151,7 @@ class KeyCache:
 
 
 class Session:
-    __slots__ = ("_sub", "_kp", "_store_id", "_keys")
+    __slots__ = ("_keys", "_kp", "_store_id", "_sub")
 
     def __init__(self, sub: Substrate, kp: crypto.Keypair, store_id: int, keys: KeyCache) -> None:
         self._sub = sub
@@ -164,29 +163,37 @@ class Session:
     def store_id(self) -> int:
         return self._store_id
 
-    def token(self, name: str) -> crypto.NameToken:
+    def token(self, name: str | bytes) -> bytes:
+        if self._store_id == ops.STORE_MANAGEMENT:
+            return name if isinstance(name, bytes) else name.encode()
+        if not isinstance(name, str):
+            raise SessionError("data store keys must be str, not bytes")
         nk = self._keys.ensure_blinding(self._store_id)
         return crypto.derive_name_token(nk, _name_bytes(name))
 
-    def _aad(self, token: crypto.NameToken, epoch: int) -> bytes:
+    def _aad(self, token: bytes, epoch: int) -> bytes:
         return codec.encode([self._store_id, bytes(token), epoch])
 
-    def _decrypt(self, name: str, ciphertext: bytes, epoch: int) -> bytes:
-        token = self.token(name)
+    def _decrypt(self, name: str | bytes, ciphertext: bytes, epoch: int) -> bytes:
+        if self._store_id == ops.STORE_MANAGEMENT:
+            return ciphertext
+        nt = crypto.NameToken(self.token(name))
         vk = self._keys.value_key(self._store_id, epoch)
-        item = crypto.derive_item_key(vk, token)
-        return crypto.AeadXcs1.open(item, self._aad(token, epoch), crypto.AeadBlob(ciphertext))
+        item = crypto.derive_item_key(vk, nt)
+        return crypto.AeadXcs1.open(item, self._aad(nt, epoch), crypto.AeadBlob(ciphertext))
 
-    def _seal(self, name: str, value: bytes) -> tuple[crypto.NameToken, bytes, int]:
+    def seal(self, name: str | bytes, value: bytes) -> tuple[bytes, bytes, int]:
+        if self._store_id == ops.STORE_MANAGEMENT:
+            return self.token(name), value, ops.EPOCH_NONE
         epoch = self._keys.current_epoch(self._store_id)
-        token = self.token(name)
+        nt = crypto.NameToken(self.token(name))
         vk = self._keys.value_key(self._store_id, epoch)
-        item = crypto.derive_item_key(vk, token)
-        return token, bytes(crypto.AeadXcs1.seal(item, self._aad(token, epoch), value)), epoch
+        item = crypto.derive_item_key(vk, nt)
+        return nt, bytes(crypto.AeadXcs1.seal(item, self._aad(nt, epoch), value)), epoch
 
     # -- public interface ---------------------------------------------------
 
-    def get(self, name: str) -> Record:
+    def get(self, name: str | bytes) -> Record:
         token = self.token(name)
         raw = self._sub.get(self._store_id, token)
         if raw is None:
@@ -208,7 +215,7 @@ class Session:
         expect: Record | None = None,
         absent: bool = False,
     ) -> SubmitHandle:
-        token, sealed, epoch = self._seal(name, value)
+        token, sealed, epoch = self.seal(name, value)
         guards = _collect_guards(self._store_id, token, predicates, expect, absent)
         tx = ops.Transaction((ops.Step(guards, ops.Set(self._store_id, token, sealed, epoch)),))
         return self.submit(tx)
@@ -258,7 +265,7 @@ class TxBuilder:
         absent: bool = False,
     ) -> "TxBuilder":
         s = self._session
-        token, sealed, epoch = s._seal(name, value)
+        token, sealed, epoch = s.seal(name, value)
         guards = _collect_guards(s.store_id, token, predicates, expect, absent)
         self._steps.append(ops.Step(guards, ops.Set(s.store_id, token, sealed, epoch)))
         return self
@@ -284,7 +291,7 @@ class TxBuilder:
 
 def _collect_guards(
     store_id: int,
-    token: crypto.NameToken,
+    token: bytes,
     predicates: tuple[ops.Predicate | Record, ...],
     expect: Record | None,
     absent: bool,

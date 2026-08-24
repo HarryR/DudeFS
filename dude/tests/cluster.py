@@ -8,6 +8,7 @@ from ..net.postman import Postman
 from ..net.transports.inproc import InProcListener, InProcNexus
 from ..node import Node, ReplicaNode
 from ..store import Store, ops
+from ..store.layer import Settled
 from ..sync.lite_client import LightClient
 from ..tunables import Tunables
 
@@ -151,6 +152,17 @@ class Cluster:
                 return
             time.sleep(self.tunables.tick_interval / 1000)
         raise TimeoutError(f"predicate not satisfied within {t:.1f}s")
+
+    def wait_settled(
+        self, result: object, nodes: list[Node | ReplicaNode] | None = None,
+    ) -> Settled:
+        if not isinstance(result, Settled):
+            raise AssertionError(f"expected Settled, got {result!r}")  # noqa: TRY004
+        check = nodes if nodes is not None else self.nodes
+        self.wait(lambda _: all(
+            n.store.has_settled(result.op_hash) for n in check
+        ))
+        return result
 
     # -- teardown -----------------------------------------------------------
 

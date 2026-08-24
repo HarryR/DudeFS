@@ -13,12 +13,13 @@ from dude.tests.cluster import Cluster
 
 class TestCheckpointRoundTrip(unittest.TestCase):
 
-    def _make_cluster_with_data(self, n_keys: int = 5, wait_block: int = 4):
+    def _make_cluster_with_data(self, n_keys: int = 5):
         c = Cluster(nodes=3, mgmt=1)
         s = c.replicas[0].session()
+        last = None
         for i in range(n_keys):
-            s.put(f"key-{i}", f"value-{i}".encode()).wait()
-        c.wait_block(wait_block)
+            last = s.put(f"key-{i}", f"value-{i}".encode()).wait()
+        c.wait_settled(last)
         c.close()
         return c
 
@@ -91,16 +92,17 @@ class TestCheckpointRoundTrip(unittest.TestCase):
     def test_post_pivot_replay_matches(self):
         c = Cluster(nodes=3, mgmt=1)
         s = c.replicas[0].session()
+        last = None
         for i in range(3):
-            s.put(f"early-{i}", f"v{i}".encode()).wait()
-        c.wait_block(3)
+            last = s.put(f"early-{i}", f"v{i}".encode()).wait()
+        c.wait_settled(last)
 
         source = c.nodes[0].store
         meta, chunks, pivot = self._checkpoint_at_head(source, c.anchor)
 
         for i in range(3):
-            s.put(f"late-{i}", f"v{i}".encode()).wait()
-        c.wait_block(6)
+            last = s.put(f"late-{i}", f"v{i}".encode()).wait()
+        c.wait_settled(last)
         c.close()
 
         dst = self._load_checkpoint(meta, chunks, c.anchor.public)
@@ -115,15 +117,13 @@ class TestCheckpointRoundTrip(unittest.TestCase):
     def test_holds_guards_pass_after_checkpoint(self):
         c = Cluster(nodes=3, mgmt=1)
         s = c.replicas[0].session()
-        s.put("guarded", b"v1").wait()
-        c.wait_block(3)
+        c.wait_settled(s.put("guarded", b"v1").wait())
 
         source = c.nodes[0].store
         meta, chunks, pivot = self._checkpoint_at_head(source, c.anchor)
 
         rec = s.get("guarded")
-        s.put("guarded", b"v2", expect=rec).wait()
-        c.wait_block(5)
+        c.wait_settled(s.put("guarded", b"v2", expect=rec).wait())
         c.close()
 
         dst = self._load_checkpoint(meta, chunks, c.anchor.public)
@@ -151,16 +151,17 @@ class TestCheckpointRoundTrip(unittest.TestCase):
     def test_gc_then_checkpoint_then_replay(self):
         c = Cluster(nodes=3, mgmt=1)
         s = c.replicas[0].session()
+        last = None
         for i in range(5):
-            s.put(f"k{i}", f"v{i}".encode()).wait()
-        c.wait_block(4)
+            last = s.put(f"k{i}", f"v{i}".encode()).wait()
+        c.wait_settled(last)
 
         source = c.nodes[0].store
         meta, chunks, pivot = self._checkpoint_at_head(source, c.anchor)
 
         for i in range(3):
-            s.put(f"post-{i}", f"p{i}".encode()).wait()
-        c.wait_block(7)
+            last = s.put(f"post-{i}", f"p{i}".encode()).wait()
+        c.wait_settled(last)
         c.close()
 
         source.gc_below(pivot)

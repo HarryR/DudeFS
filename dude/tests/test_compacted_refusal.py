@@ -40,9 +40,10 @@ class TestServeGetblocksCompacted(unittest.TestCase):
         c = Cluster(nodes=3, mgmt=1)
         try:
             s = c.replicas[0].session()
+            last = None
             for i in range(3):
-                s.put(f"k{i}", f"v{i}".encode()).wait()
-            c.wait_head(c.nodes[0].store.head())
+                last = s.put(f"k{i}", f"v{i}".encode()).wait()
+            c.wait_settled(last)
 
             store = c.nodes[0].store
             pivot = store.head_block_num()
@@ -59,8 +60,7 @@ class TestServeGetblocksCompacted(unittest.TestCase):
         c = Cluster(nodes=3, mgmt=1)
         try:
             s = c.replicas[0].session()
-            s.put("x", b"y").wait()
-            c.wait_head(c.nodes[0].store.head())
+            c.wait_settled(s.put("x", b"y").wait())
 
             store = c.nodes[0].store
             head = store.head_block_num()
@@ -74,7 +74,7 @@ class TestServeGetblocksCompacted(unittest.TestCase):
     def test_no_gc_unsettled_returns_not_yet_settled(self):
         c = Cluster(nodes=3, mgmt=1)
         try:
-            c.wait_block(1)
+            c.wait_head(c.nodes[0].store.head())
             store = c.nodes[0].store
             future = (store.head_block_num() or 0) + 100
             response = serve_getblocks(store, GetBlocks(frm=future, count=5), cap=10)
