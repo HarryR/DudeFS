@@ -3,7 +3,7 @@ import contextlib
 from mailbox import Message
 import queue
 import threading
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import NamedTuple, Protocol
@@ -23,7 +23,6 @@ from .mailbox import Expired, Mailbox, Reply, Transmit
 from .plan import Decision, GiveUp, Send, Wait, plan_next, retry_at
 
 
-class PostmanError(DudeError): ...
 
 
 class Recipient(Enum):
@@ -128,11 +127,6 @@ class Output(NamedTuple):
 # ---------------------------------------------------------------------------
 # The actor.
 # ---------------------------------------------------------------------------
-
-type LinkFactory = Callable[
-    [Address, Callable[[Frame], None], Callable[[], None]],
-    None,
-]
 
 
 @dataclass(slots=True)

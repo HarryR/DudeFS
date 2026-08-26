@@ -11,7 +11,7 @@ from ..consensus.settle_round import (
     genesis_stamp,
 )
 from ..core import crypto
-from ..core.errors import DudeError, InvariantError
+from ..core.errors import InvariantError
 from ..core.units import Millis
 from ..store import Layer, Store, settle
 from ..store.layer import Index
@@ -29,9 +29,6 @@ from .adapter import (
     SyncMsg,
     SyncRefusal,
 )
-
-
-class FollowerError(DudeError): ...
 
 
 @dataclass(frozen=True, slots=True)

@@ -379,9 +379,6 @@ class EpochKeys(NamedTuple):
         return cls(derive_value_key(master))
 
 
-type Keyring = dict[int, EpochKeys]
-
-
 class AeadXcs1:
     suite_id = AEAD_SUITE
 
