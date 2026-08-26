@@ -236,6 +236,12 @@ class Follower:
             return max(self._compacted_at.values())
         return None
 
+    def compacted_peers(self) -> tuple[crypto.PublicKey, ...]:
+        return tuple(self._compacted_at)
+
+    def clear_compacted(self) -> None:
+        self._compacted_at.clear()
+
     def _enqueue(self, peer: crypto.PublicKey, msg: SyncMsg) -> None:
         self._outbox.append((peer, msg))
 

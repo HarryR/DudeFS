@@ -69,22 +69,7 @@ reachability:
 	@echo "=== CLI entry-point reachability ==="
 	@"$(PY)" -m pyan --root . $(PROD_PY) \
 	  --uses --no-defines --dot > reachability.dot
-	@"$(PY)" -c " \
-	nodes, targets = set(), set()  ;\
-	with open('reachability.dot') as f:  ;\
-	    for line in f:  ;\
-	        line = line.strip()  ;\
-	        if '->' in line:  ;\
-	            dst = line.split('->')[1].split('[')[0].strip().strip('\"').rstrip(';')  ;\
-	            targets.add(dst)  ;\
-	        elif 'label=' in line and '->' not in line and 'graph' not in line:  ;\
-	            node = line.split('[')[0].strip().strip('\"').rstrip(';')  ;\
-	            if node: nodes.add(node)  ;\
-	dead = sorted(nodes - targets)  ;\
-	skip = ('__', '_encode', '_decode', 'cli', 'main', 'Substrate.', 'Reader.', 'View.', 'Listener.', 'Protocol', 'Authoriser.')  ;\
-	real = [n for n in dead if not any(s in n for s in skip)]  ;\
-	print(f'{len(nodes)} nodes, {len(targets)} reached, {len(dead)} unreachable, {len(real)} after filtering')  ;\
-	for n in real: print(f'  {n.replace(chr(95)*2, chr(46)).lstrip(chr(46))}')"
+	@"$(PY)" scripts/reachability.py
 
 # CI-style gate: no writes, fails on any issue.
 check: lint format-check typecheck test

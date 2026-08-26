@@ -188,6 +188,7 @@ class TestTheRefusalVocabularyIsOneClosedSet(unittest.TestCase):
                 ("INTERNAL", "internal"),
                 ("UNAUTHORISED", "unauthorised"),
                 ("COMPACTED", "compacted"),
+                ("CHECKPOINT_STALE", "checkpoint-stale"),
             ],
             "add a member -> give it a case in Follower._on_refused AND the light client",
         )

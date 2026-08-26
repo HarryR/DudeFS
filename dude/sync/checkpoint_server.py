@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from ..core import crypto
 from ..store import Store
 from ..store.checkpoint import CheckpointMeta
 from ..store.smt_sync import TreeExporter
@@ -16,6 +17,8 @@ class CheckpointServer:
     def __init__(self, store: Store, batch_size: int = 10):
         self._store = store
         self._batch_size = batch_size
+        raw = store.checkpoint_meta_bytes()
+        self._checkpoint_id: crypto.Digest | None = crypto.h(raw) if raw is not None else None
 
     @classmethod
     def create_and_persist(
@@ -33,7 +36,11 @@ class CheckpointServer:
         return cls(store, batch_size)
 
     def has_checkpoint(self) -> bool:
-        return self._store.checkpoint_meta_bytes() is not None
+        return self._checkpoint_id is not None
+
+    @property
+    def checkpoint_id(self) -> crypto.Digest | None:
+        return self._checkpoint_id
 
     def serve_meta(self) -> CheckpointMetaReply:
         raw = self._store.checkpoint_meta_bytes()
@@ -41,7 +48,9 @@ class CheckpointServer:
             return CheckpointMetaReply(meta_bytes=b"")
         return CheckpointMetaReply(meta_bytes=raw)
 
-    def serve_chunks(self, req: GetChunks) -> ChunksReply:
+    def serve_chunks(self, req: GetChunks) -> ChunksReply | None:
+        if self._checkpoint_id is None or req.checkpoint_id != self._checkpoint_id:
+            return None
         blobs = self._store.checkpoint_chunks(req.offset, self._batch_size)
         chunks = tuple(_decode_chunk(b) for b in blobs)
         total = self._store.checkpoint_chunk_count()

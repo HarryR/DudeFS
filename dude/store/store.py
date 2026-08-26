@@ -348,6 +348,7 @@ class StoreWriter(StoreReader):
             self._conn.execute(
                 "INSERT INTO checkpoint (seq, data) VALUES (?, ?)", (i, blob),
             )
+        self._set_meta("checkpoint_id", crypto.h(meta_bytes))
 
     def reset_for_checkpoint(self) -> None:
         self._conn.execute("DELETE FROM live")

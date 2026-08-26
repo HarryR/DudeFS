@@ -36,3 +36,6 @@ class SyncRefusal(Enum):
     COMPACTED = "compacted"
     """The requested blocks have been GC'd. A checkpoint is available at the block_num
     carried in the Refused payload."""
+
+    CHECKPOINT_STALE = "checkpoint-stale"
+    """The requested checkpoint_id no longer matches the server's current checkpoint."""

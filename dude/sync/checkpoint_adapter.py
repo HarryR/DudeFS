@@ -43,16 +43,20 @@ class CheckpointMetaReply:
 class GetChunks:
     verb: ClassVar[Verb] = Verb.GET_CHUNKS
 
+    checkpoint_id: crypto.Digest
     offset: int
 
     def encode(self) -> tuple[Verb, bytes]:
-        return self.verb, codec.encode([self.offset])
+        return self.verb, codec.encode([self.checkpoint_id, self.offset])
 
     @classmethod
     def decode(cls, body: bytes) -> GetChunks:
         try:
-            p = codec.as_seq(codec.decode(body), 1)
-            return cls(offset=codec.as_int(p[0]))
+            p = codec.as_seq(codec.decode(body), 2)
+            return cls(
+                checkpoint_id=crypto.Digest(codec.as_bytes(p[0])),
+                offset=codec.as_int(p[1]),
+            )
         except DudeError as e:
             raise CheckpointAdapterError(f"malformed GET_CHUNKS: {e}") from e
 

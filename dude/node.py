@@ -1,5 +1,6 @@
 import contextlib
 import threading
+import time
 from dataclasses import dataclass, field
 
 from .consensus import Coordinator, Mempool, RoundAdapter, SettleAdapter
@@ -20,7 +21,13 @@ from .sync.adapter import (
     SyncMsg,
     SyncRefusal,
 )
-from .sync.checkpoint_adapter import CheckpointAdapterError, GetChunks
+from .sync.checkpoint_adapter import (
+    CheckpointAdapterError,
+    CheckpointMetaReply,
+    ChunksReply,
+    GetCheckpoint,
+    GetChunks,
+)
 from .sync.checkpoint_server import CheckpointServer
 from .sync.follower import Follower, serve_getblocks, serve_height
 from .sync.lite import serve_get_anchors, serve_get_proof
@@ -108,11 +115,90 @@ class _BaseNode:
 
     def _tick(self, now: Millis) -> None:
         self._reconcile_peers()
+        checkpoint_block = self.follower.needs_checkpoint()
+        if checkpoint_block is not None:
+            self._download_checkpoint()
+            return
         self.follower.tick(now)
         self._flush_follower(now)
 
     def _on_delivered(self, d: Delivered, now: Millis) -> None:
         raise NotImplementedError
+
+    # -- checkpoint download (synchronous, blocks the tick loop) ------------
+
+    def _send_and_wait(
+        self, peer: crypto.PublicKey, verb: Verb, body: bytes, timeout_sec: float,
+    ) -> Delivered | None:
+        mid = self.postman.send_raw(peer, verb, body, self.tunables.ttl_exchange)
+        tick = self.tunables.tick_interval / 1000
+        deadline = time.monotonic() + timeout_sec
+        while time.monotonic() < deadline and not self._stopping.is_set():
+            remaining = min(tick, deadline - time.monotonic())
+            if remaining <= 0:
+                break
+            for output in self.postman.drain_output(timeout=remaining):
+                for d in output.delivered:
+                    if d.in_reply_to is not None and d.in_reply_to.correlation_id == mid.correlation_id:
+                        return d
+                    self._on_delivered(d, now_ms())
+        return None
+
+    def _download_checkpoint(self) -> None:
+        from .store.checkpoint import CheckpointMeta  # noqa: PLC0415
+        from .store.smt_sync import TreeImporter  # noqa: PLC0415
+
+        peers = list(self.follower.compacted_peers())
+        if not peers:
+            return
+        timeout = self.tunables.ttl_exchange / 1000
+        get_cp_verb, get_cp_body = GetCheckpoint().encode()
+
+        for peer in peers:
+            if self._stopping.is_set():
+                return
+            d = self._send_and_wait(peer, get_cp_verb, get_cp_body, timeout)
+            if d is None or d.verb != Verb.CHECKPOINT_META or not d.body:
+                continue
+
+            meta_bytes = d.body
+            meta = CheckpointMeta.decode(meta_bytes)
+            if meta.verify_compactor(self.store.anchor()) is not None:
+                continue
+
+            checkpoint_id = crypto.h(meta_bytes)
+            chunks: list = []
+            offset = 0
+            ok = True
+            while not self._stopping.is_set():
+                req_verb, req_body = GetChunks(checkpoint_id=checkpoint_id, offset=offset).encode()
+                d = self._send_and_wait(peer, req_verb, req_body, timeout)
+                if d is None or d.verb != Verb.CHUNKS_REPLY:
+                    ok = False
+                    break
+                reply = ChunksReply.decode(d.body)
+                chunks.extend(reply.chunks)
+                if not reply.more:
+                    break
+                offset += len(reply.chunks)
+
+            if not ok or self._stopping.is_set():
+                continue
+
+            with self.store.write() as w:
+                w.reset_for_checkpoint()
+                importer = TreeImporter(w, expected_root=meta.state_root)
+                for chunk in chunks:
+                    importer.load(chunk)
+                importer.verify()
+                w.bootstrap_checkpoint(meta.anchor, meta.settled_block_bytes)
+
+            roster = tuple(sorted(self.store.mgmt_reader.roster()))
+            if meta.verify_quorum(roster) is not None:
+                continue
+
+            self.follower.clear_compacted()
+            return
 
     # -- peer reconciliation ------------------------------------------------
 
@@ -304,9 +390,12 @@ class Node(_BaseNode):
             return self.postman.reply(
                 d, Refused(reason=SyncRefusal.MALFORMED_QUERY), self.tunables.ttl_exchange,
             )
-        return self.postman.reply(
-            d, self.checkpoint_server.serve_chunks(req), self.tunables.ttl_exchange,
-        )
+        reply = self.checkpoint_server.serve_chunks(req)
+        if reply is None:
+            return self.postman.reply(
+                d, Refused(reason=SyncRefusal.CHECKPOINT_STALE), self.tunables.ttl_exchange,
+            )
+        return self.postman.reply(d, reply, self.tunables.ttl_exchange)
 
     # -- serving lite requests ----------------------------------------------
 

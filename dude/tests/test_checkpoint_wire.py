@@ -73,9 +73,11 @@ class TestCheckpointWire(unittest.TestCase):
         _verb, body = get_cp.encode()
         self.assertEqual(body, b"")
 
-        get_ch = GetChunks(offset=5)
+        fake_id = crypto.h(b"test-checkpoint")
+        get_ch = GetChunks(checkpoint_id=fake_id, offset=5)
         _verb, body = get_ch.encode()
         decoded = GetChunks.decode(body)
+        self.assertEqual(decoded.checkpoint_id, fake_id)
         self.assertEqual(decoded.offset, 5)
 
     def test_serve_meta_and_chunks(self):
@@ -90,11 +92,13 @@ class TestCheckpointWire(unittest.TestCase):
             restored = CheckpointMeta.decode(meta_reply.meta_bytes)
             self.assertIsNone(restored.verify_compactor(c.anchor.public))
 
+            cpid = srv.checkpoint_id
+            self.assertIsNotNone(cpid)
             all_chunks = []
             offset = 0
             while True:
-                reply = srv.serve_chunks(GetChunks(offset=offset))
-                self.assertIsInstance(reply, ChunksReply)
+                reply = srv.serve_chunks(GetChunks(checkpoint_id=cpid, offset=offset))
+                self.assertIsNotNone(reply)
                 all_chunks.extend(reply.chunks)
                 if not reply.more:
                     break
@@ -116,12 +120,13 @@ class TestCheckpointWire(unittest.TestCase):
             why = restored_meta.verify_compactor(c.anchor.public)
             self.assertIsNone(why, f"compactor verify: {why}")
 
+            cpid = srv.checkpoint_id
             dst = Store()
             with dst.write() as w:
                 importer = TreeImporter(w, expected_root=restored_meta.state_root)
                 offset = 0
                 while True:
-                    reply = srv.serve_chunks(GetChunks(offset=offset))
+                    reply = srv.serve_chunks(GetChunks(checkpoint_id=cpid, offset=offset))
                     for chunk in reply.chunks:
                         importer.load(chunk)
                     if not reply.more:
@@ -149,7 +154,7 @@ class TestCheckpointWire(unittest.TestCase):
             self._install_checkpoint_server(c, compactor_kp)
 
             srv = c.nodes[0].checkpoint_server
-            first_batch = srv.serve_chunks(GetChunks(offset=0))
+            first_batch = srv.serve_chunks(GetChunks(checkpoint_id=srv.checkpoint_id, offset=0))
             self.assertGreater(len(first_batch.chunks), 0)
 
             reply = ChunksReply(chunks=first_batch.chunks[:2], more=True)
