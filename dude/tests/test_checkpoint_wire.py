@@ -5,7 +5,7 @@ import unittest
 from dude.core import crypto
 from dude.store import Store, ops
 from dude.store.checkpoint import CheckpointMeta
-from dude.store.management import Cert, MgmtReader, MgmtWriter, Role
+from dude.store.management import Cert, MgmtWriter, Role
 from dude.store.smt_sync import TreeImporter
 from dude.sync.checkpoint_adapter import (
     CheckpointMetaReply,
@@ -34,7 +34,7 @@ class TestCheckpointWire(unittest.TestCase):
         anchor_s = anchor_node.session()
 
         compactor_kp = crypto.Keypair.generate()
-        w = MgmtWriter(anchor_node.store)
+        w = anchor_node.store.mgmt_writer
         grant_tx = w.authorise(
             compactor_kp.public,
             Role.COMPACTOR,
@@ -46,8 +46,8 @@ class TestCheckpointWire(unittest.TestCase):
 
         compactor_node = c.boot_replica(compactor_kp)
         c.wait_head(c.nodes[0].store.head(), nodes=[compactor_node])
-        cs = compactor_node.session()
-        c.wait_settled(cs.compact(c.nodes[0].store.head_block_num() or 0).wait())
+        cs = compactor_node.session(store_id=ops.STORE_MANAGEMENT)
+        c.wait_settled(cs.submit(MgmtWriter(cs).compact(c.nodes[0].store.head_block_num() or 0)).wait())
         return compactor_kp
 
     def _install_checkpoint_server(self, c, compactor_kp):
@@ -132,7 +132,7 @@ class TestCheckpointWire(unittest.TestCase):
                     restored_meta.anchor, restored_meta.settled_block_bytes,
                 )
 
-            roster = tuple(sorted(MgmtReader(dst).roster()))
+            roster = tuple(sorted(dst.mgmt_reader.roster()))
             why = restored_meta.verify_quorum(roster)
             self.assertIsNone(why, f"quorum verify: {why}")
 

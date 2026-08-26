@@ -12,9 +12,9 @@ from ..net.postman import Postman
 from ..net.transports.tcp import TCPDialer, TCPTiming
 from ..node import ReplicaNode
 from ..session import Settled
-from ..store import Store
+from ..store import Store, ops
 from ..store.checkpoint import CheckpointMeta
-from ..store.management import GRANTS_MAP, Cert, Grant, MgmtReader, Role
+from ..store.management import Cert, MgmtWriter, Role
 from ..sync.checkpoint_server import CheckpointServer
 from ..sync.lite_client import LightClient
 from ..tunables import DEFAULT
@@ -87,8 +87,8 @@ def cmd_run(args: argparse.Namespace) -> None:
     block_num = head.anchors.block_num
     print(f"bootstrapped at block {block_num}")
 
-    s = lc.session()
-    result = s.compact(block_num).wait()
+    s = lc.session(store_id=ops.STORE_MANAGEMENT)
+    result = s.submit(MgmtWriter(s).compact(block_num)).wait()
     if not isinstance(result, Settled):
         lc.stop()
         raise CLIError(f"compact transaction did not settle: {result!r}")
@@ -112,14 +112,13 @@ def cmd_serve(args: argparse.Namespace) -> None:
         store.provision(seed.anchor)
         sb = SettledBlock.decode(block_bytes)
         ordered = bodies_canonical(bodies).txs
-        mgmt = MgmtReader(store)
         store.commit_block(
             sb.anchors.block_num,
             first_height=1,
             block_bytes=block_bytes,
             block_hash=sb.block_hash,
             batch=ordered,
-            auth=mgmt,
+            auth=store.mgmt_reader,
         )
         print(f"genesis block applied (block {sb.anchors.block_num})")
 
@@ -149,8 +148,8 @@ def _run_compaction_cycle(
     if head_num is None or head_num < 2:
         return
 
-    s = rn.session()
-    result = s.compact(head_num).wait()
+    s = rn.session(store_id=ops.STORE_MANAGEMENT)
+    result = s.submit(MgmtWriter(s).compact(head_num)).wait()
     if not isinstance(result, Settled):
         print(f"compact did not settle: {result!r}")
         return
@@ -173,8 +172,7 @@ def _run_compaction_cycle(
 
 
 def _find_grant_cert_from_store(store: Store, kp: crypto.Keypair) -> Cert:
-    held = store.get(0, GRANTS_MAP.entry_name(kp.public))
-    if held is None:
+    grant = store.mgmt_reader.grant_of(kp.public)
+    if grant is None:
         raise CLIError("compactor grant not found")
-    grant = Grant.decode_row(kp.public, held.value)
     return grant.cert

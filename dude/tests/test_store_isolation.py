@@ -9,7 +9,6 @@ import unittest
 
 from dude.core import crypto
 from dude.store import ops
-from dude.store.management import MgmtReader
 from dude.store.store import Store
 
 D = ops.STORE_DATA
@@ -30,7 +29,7 @@ class TestSnapshotPinsAView(unittest.TestCase):
         store = Store()
         try:
             store.provision(mgr.public)
-            mgmt = MgmtReader(store)
+            mgmt = store.mgmt_reader
             key = crypto.h(b"pinned-key")
             # Land a first value we can pin a snapshot at.
             store.apply((_tx(mgr, key, b"v0"),), auth=mgmt)
@@ -87,7 +86,7 @@ class TestConcurrentSnapshotsAreIndependent(unittest.TestCase):
         store = Store()
         try:
             store.provision(mgr.public)
-            mgmt = MgmtReader(store)
+            mgmt = store.mgmt_reader
             key = crypto.h(b"divergent")
             store.apply((_tx(mgr, key, b"before"),), auth=mgmt)
 
@@ -142,7 +141,7 @@ class TestWriterSerialisesAcrossThreads(unittest.TestCase):
         store = Store()
         try:
             store.provision(mgr.public)
-            mgmt = MgmtReader(store)
+            mgmt = store.mgmt_reader
             key_a = crypto.h(b"a")
             key_b = crypto.h(b"b")
 
@@ -182,7 +181,7 @@ class TestInMemoryStoreIsAShareableWALDb(unittest.TestCase):
         store = Store()
         try:
             store.provision(mgr.public)
-            mgmt = MgmtReader(store)
+            mgmt = store.mgmt_reader
             key = crypto.h(b"shareable")
             store.apply((_tx(mgr, key, b"landed"),), auth=mgmt)
 

@@ -44,7 +44,7 @@ from .lite_adapter import (
     TxStatusReply,
 )
 
-from ..session import KeyCache, Session, SubmitHandle
+from ..session import KeyCache, SessionRW, SubmitHandle
 
 
 class LightClientError(DudeError): ...
@@ -437,11 +437,11 @@ class LightClient:
         self.trusted_state = replace(ts, head=walked)
         return True
 
-    def session(self, store_id: int = 1) -> Session:
+    def session(self, store_id: int = 1) -> SessionRW:
         sub = _LiteSubstrate(self)
         if self._key_cache is None:
             self._key_cache = KeyCache(self.me, sub)
-        return Session(sub, self.me, store_id, self._key_cache)
+        return SessionRW(sub, self.me, store_id)
 
 
 @dataclass(slots=True)
@@ -471,6 +471,9 @@ class _LiteSubstrate:
     def __init__(self, lc: LightClient) -> None:
         self._lc = lc
 
+    def anchor(self) -> crypto.PublicKey:
+        return self._lc.anchor
+
     def _ranked_peers(self) -> list[crypto.PublicKey]:
         ts = self._lc.trusted_state
         if ts is None or not ts.roster:
@@ -493,11 +496,11 @@ class _LiteSubstrate:
             raise LightClientError("no peers available")
         return ranked[0]
 
-    def get(self, store_id: int, name: bytes) -> Held | None:
+    def get(self, store: int, name: bytes) -> Held | None:
         deadline = time.monotonic() + self._lc.tunables.ttl_lite / 1000
         while time.monotonic() < deadline:
             peer = self._pick_peer()
-            req = self._lc.request_get(store_id, name, peer, now_ms())
+            req = self._lc.request_get(store, name, peer, now_ms())
             while time.monotonic() < deadline:
                 result = req.poll()
                 if isinstance(result, GetResult):

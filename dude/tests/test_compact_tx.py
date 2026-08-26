@@ -5,10 +5,9 @@ import unittest
 from dude.core import crypto
 from dude.store import ops
 from dude.store.management import (
-    P_COMPACT,
     Cert,
-    MgmtReader,
     MgmtWriter,
+    P_COMPACT,
     Role,
 )
 from dude.tests.cluster import Cluster
@@ -29,7 +28,7 @@ class TestCompactTransaction(unittest.TestCase):
         self.c.wait_head(self.c.nodes[0].store.head(), nodes=[anchor_node])
         self.c.wait_settled(
             anchor_node.session().submit(
-                MgmtWriter(anchor_node.store).authorise(
+                anchor_node.store.mgmt_writer.authorise(
                     compactor_kp.public,
                     Role.COMPACTOR,
                     stores=frozenset({ops.STORE_MANAGEMENT}),
@@ -45,12 +44,12 @@ class TestCompactTransaction(unittest.TestCase):
     def _compactor_session(self, compactor_kp: crypto.Keypair):
         rn = self.c.boot_replica(compactor_kp)
         self.c.wait_head(self.c.nodes[0].store.head(), nodes=[rn])
-        return rn.session()
+        return rn.session(store_id=ops.STORE_MANAGEMENT)
 
     def test_compactor_can_write_compact_key(self):
         compactor_kp = self._grant_compactor()
         cs = self._compactor_session(compactor_kp)
-        self.c.wait_settled(cs.compact(self.c.nodes[0].store.head_block_num() or 0).wait())
+        self.c.wait_settled(cs.submit(MgmtWriter(cs).compact(self.c.nodes[0].store.head_block_num() or 0)).wait())
         held = self.c.nodes[0].store.get(ops.STORE_MANAGEMENT, P_COMPACT)
         self.assertIsNotNone(held)
 
@@ -64,9 +63,9 @@ class TestCompactTransaction(unittest.TestCase):
         compactor_kp = self._grant_compactor()
         cs = self._compactor_session(compactor_kp)
         head_before = self.c.nodes[0].store.head_block_num() or 0
-        self.c.wait_settled(cs.compact(head_before).wait())
+        self.c.wait_settled(cs.submit(MgmtWriter(cs).compact(head_before)).wait())
         store = self.c.nodes[0].store
-        mgmt = MgmtReader(store)
+        mgmt = store.mgmt_reader
         for n in range(head_before + 1, (store.head_block_num() or 0) + 1):
             bodies = store.bodies_of_block(n)
             for body in bodies:
@@ -79,8 +78,8 @@ class TestCompactTransaction(unittest.TestCase):
     def test_monotonicity_guard(self):
         compactor_kp = self._grant_compactor()
         cs = self._compactor_session(compactor_kp)
-        self.c.wait_settled(cs.compact(self.c.nodes[0].store.head_block_num() or 0).wait())
-        self.c.wait_settled(cs.compact(self.c.nodes[0].store.head_block_num() or 0).wait())
+        self.c.wait_settled(cs.submit(MgmtWriter(cs).compact(self.c.nodes[0].store.head_block_num() or 0)).wait())
+        self.c.wait_settled(cs.submit(MgmtWriter(cs).compact(self.c.nodes[0].store.head_block_num() or 0)).wait())
 
 
 if __name__ == "__main__":

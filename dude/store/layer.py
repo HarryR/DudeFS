@@ -34,6 +34,7 @@ class Settled(NamedTuple):
 
 class Reader(Protocol):
     def get(self, store: int, name: bytes) -> Held | None: ...
+    def anchor(self) -> crypto.PublicKey: ...
 
 
 class View(Reader, Protocol):
@@ -64,6 +65,9 @@ class Overlay[B: Reader]:
         self._delta: dict[tuple[int, bytes], Held | None] = {}
         self._log: list[ops.Mutation] = []
         self._frozen = False
+
+    def anchor(self) -> crypto.PublicKey:
+        return self._base.anchor()
 
     def get(self, store: int, name: bytes) -> Held | None:
         key = (store, name)

@@ -1,0 +1,6 @@
+-r requirements.txt
+ruff==0.16.0
+ty==0.0.61
+coverage==7.6.1
+pytest==8.3.2
+pyan3>=2.8

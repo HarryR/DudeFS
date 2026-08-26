@@ -10,7 +10,7 @@ import sqlite3
 import unittest
 
 from dude.core import crypto
-from dude.store import management, ops, smt, store
+from dude.store import ops, smt, store
 from dude.tests.test_store import tx
 
 D = ops.STORE_DATA
@@ -280,7 +280,7 @@ class TestThroughTheStore(unittest.TestCase):
         self.s = store.Store()
         self.kp = crypto.Keypair.generate()
         self.s.provision(self.kp.public)
-        self.mgmt = management.MgmtReader(self.s)
+        self.mgmt = self.s.mgmt_reader
 
     def _tok(self, name: bytes) -> crypto.NameToken:
         """A data-store name is a 32-byte token, and `evaluate` refuses any other width."""

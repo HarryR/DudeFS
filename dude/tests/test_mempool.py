@@ -30,7 +30,6 @@ from ..quorum import (
     would_brick,
 )
 from ..store import Store, ops, settle
-from ..store.management import MgmtReader
 from ..tunables import Tunables
 
 D = ops.STORE_DATA
@@ -115,7 +114,7 @@ class TestAdmission(unittest.TestCase):
         self.mp = Mempool(self.t)
         self.store = Store()  # the door consults state, so it needs one
         self.store.provision(self.kp.public)  # kp is the anchor => may_write returns True
-        self.mgmt = MgmtReader(self.store)
+        self.mgmt = self.store.mgmt_reader
 
     def _admit(self, tx, now=T0):
         return self.mp.admit(tx, now, self.store, self.mgmt)

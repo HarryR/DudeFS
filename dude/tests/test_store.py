@@ -47,7 +47,7 @@ def provisioned(kp: crypto.Keypair) -> tuple[store.Store, management.MgmtReader]
     anchor-is-always-authorised rule handles their writes without invoking a bypass."""
     s = store.Store()
     s.provision(kp.public)
-    return s, management.MgmtReader(s)
+    return s, s.mgmt_reader
 
 
 class TestSettlement(unittest.TestCase):
@@ -152,7 +152,7 @@ class TestAccumulator(unittest.TestCase):
         vals = [b"v%d" % i for i in range(6)]
         a, b = provisioned(self.kp)[0], provisioned(self.kp)[0]
         for st, order in ((a, range(6)), (b, reversed(range(6)))):
-            m = management.MgmtReader(st)
+            m = st.mgmt_reader
             for i in order:
                 st.apply((tx(self.kp, (), (ops.Set(0, names[i], vals[i]),)),), auth=m)
         self.assertEqual(a.accumulator(), b.accumulator())
@@ -181,7 +181,7 @@ class TestTheAccumulatorCancelsByEpoch(unittest.TestCase):
         self.kp = crypto.Keypair.generate()
         self.s = store.Store()
         self.s.provision(self.kp.public)
-        self.mgmt = management.MgmtReader(self.s)
+        self.mgmt = self.s.mgmt_reader
 
     def _write(self, name: bytes, value: bytes, epoch: int) -> None:
         self.s.apply(
@@ -385,7 +385,7 @@ class TestFailureDomains(unittest.TestCase):
         self.mgr = crypto.Keypair.generate()
         self.store = store.Store()
         self.store.provision(self.mgr.public)
-        self.mgmt = management.MgmtWriter(self.store)
+        self.mgmt = self.store.mgmt_writer
         self.store.apply(
             (
                 self.mgmt.authorise(
@@ -526,7 +526,7 @@ class TestTransferAndSettlementRace(unittest.TestCase):
         # Provision the test key as the anchor so its writes pass authority via the anchor-
         # is-always-authorised rule -- the shape that replaced `auth=None` (Path (a)).
         self.s.provision(self.kp.public)
-        self.mgmt = management.MgmtReader(self.s)
+        self.mgmt = self.s.mgmt_reader
 
     def test_a_transaction_already_in_the_log_is_dropped_not_raised(self):
         """A settled tx arriving twice MUST drop as SETTLED, not raise -- it's a routine race
@@ -607,7 +607,7 @@ class TestADataRowMustBeShapedForEncryption(unittest.TestCase):
         self.kp = crypto.Keypair.generate()
         self.s = store.Store()
         self.s.provision(self.kp.public)
-        self.mgmt = management.MgmtReader(self.s)
+        self.mgmt = self.s.mgmt_reader
         self.ts = 0
 
     def _apply(self, *muts: ops.Mutation) -> settle.Reason | None:

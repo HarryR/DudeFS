@@ -6,7 +6,7 @@ from dude.consensus.settle_round import SettledBlock
 from dude.core import crypto
 from dude.store import Store
 from dude.store.checkpoint import CheckpointMeta
-from dude.store.management import Cert, MgmtReader, Role
+from dude.store.management import Cert, Role
 from dude.store.smt_sync import TreeExporter, TreeImporter
 from dude.tests.cluster import Cluster
 
@@ -53,7 +53,7 @@ class TestCheckpointRoundTrip(unittest.TestCase):
             importer.verify()
             w.bootstrap_checkpoint(meta.anchor, meta.settled_block_bytes)
 
-        roster = tuple(sorted(MgmtReader(dst).roster()))
+        roster = tuple(sorted(dst.mgmt_reader.roster()))
         why = meta.verify_quorum(roster)
         if why is not None:
             raise AssertionError(f"quorum verify failed: {why}")
@@ -62,7 +62,7 @@ class TestCheckpointRoundTrip(unittest.TestCase):
 
     def _replay_above(self, source: Store, dst: Store, pivot: int):
         head_num = source.head_block_num()
-        mgmt = MgmtReader(dst)
+        mgmt = dst.mgmt_reader
         for n in range(pivot + 1, (head_num or 0) + 1):
             sb_bytes = source.settled_at(n)
             if sb_bytes is None:

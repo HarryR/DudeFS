@@ -9,7 +9,6 @@ from dude.store.checkpoint import CheckpointMeta
 from dude.store.layer import Settled
 from dude.store.management import (
     Cert,
-    MgmtReader,
     MgmtWriter,
     Role,
 )
@@ -29,7 +28,7 @@ class TestCompactionEndToEnd(unittest.TestCase):
         anchor_node = c.boot_replica(c.anchor)
         c.wait_head(c.nodes[0].store.head(), nodes=[anchor_node])
         anchor_s = anchor_node.session()
-        w = MgmtWriter(anchor_node.store)
+        w = anchor_node.store.mgmt_writer
         c.wait_settled(
             anchor_s.submit(w.authorise(
                 kp.public,
@@ -44,11 +43,11 @@ class TestCompactionEndToEnd(unittest.TestCase):
     def _compactor_session(self, c, compactor_kp):
         rn = c.boot_replica(compactor_kp)
         c.wait_head(c.nodes[0].store.head(), nodes=[rn])
-        return rn.session()
+        return rn.session(store_id=ops.STORE_MANAGEMENT)
 
     def _submit_pivot(self, c, cs):
         block_num = c.nodes[0].store.head_block_num() or 0
-        c.wait_settled(cs.compact(block_num).wait())
+        c.wait_settled(cs.submit(MgmtWriter(cs).compact(block_num)).wait())
 
     def _checkpoint_from(self, store, anchor):
         compactor_kp = crypto.Keypair.generate()
@@ -76,14 +75,14 @@ class TestCompactionEndToEnd(unittest.TestCase):
                 importer.load(chunk)
             importer.verify()
             w.bootstrap_checkpoint(meta.anchor, meta.settled_block_bytes)
-        roster = tuple(sorted(MgmtReader(dst).roster()))
+        roster = tuple(sorted(dst.mgmt_reader.roster()))
         why = meta.verify_quorum(roster)
         if why is not None:
             raise AssertionError(f"quorum verify: {why}")
         return dst
 
     def _replay_above(self, source, dst, pivot):
-        mgmt = MgmtReader(dst)
+        mgmt = dst.mgmt_reader
         for n in range(pivot + 1, (source.head_block_num() or 0) + 1):
             sb_bytes = source.settled_at(n)
             if sb_bytes is None:

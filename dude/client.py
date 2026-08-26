@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from .core import codec, crypto
 from .core.errors import DudeError
 from .store import ops
-from .store.management import MgmtReader, Source
+from .store.management import MgmtReader
 
 
 class ClientError(DudeError): ...
@@ -45,13 +45,7 @@ class Keys:
     manager admits one, out of the wraps it holds itself."""
 
     @classmethod
-    def unwrap(cls, src: Source, me: crypto.Keypair, store_id: int = ops.STORE_DATA) -> Keys:
-        """Every wrap this identity can open, plus the epoch writes must currently carry.
-
-        The cluster IS the key store: a holder recovers its masters by unsealing its own rows, so
-        nothing durable is kept outside it. Storage nodes replicate these blobs and cannot open
-        one -- they are sealed to the holder's long-term key."""
-        mgmt = MgmtReader(src)
+    def unwrap(cls, mgmt: MgmtReader, me: crypto.Keypair, store_id: int = ops.STORE_DATA) -> Keys:
         blind = mgmt.blinding_wrap(store_id, me.public)
         if blind is None:
             raise ClientError(

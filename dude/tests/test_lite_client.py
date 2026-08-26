@@ -8,7 +8,7 @@ from ..net.address import Address, Endpoint, Scheme
 from ..net.envelope import MessageId, Verb
 from ..net.postman import Delivered
 from ..store import ops
-from ..store.management import Cert, Grant, MgmtReader, NodeRecord, Role, RosterCommitment
+from ..store.management import Cert, Grant, NodeRecord, Role, RosterCommitment
 from ..sync import chain
 from ..sync.lite_adapter import AnchorsReply, GetProof, LiteMsg, ProofReply, RosterBundle
 from ..sync.lite import serve_get_proof
@@ -117,7 +117,7 @@ class TestLightClientRead(unittest.TestCase):
 
 def _trusted_state_from_cluster(c: Cluster) -> TrustedState:
     store = c.nodes[0].store
-    mgmt = MgmtReader(store)
+    mgmt = store.mgmt_reader
     commitment = mgmt.roster_commitment()
     assert commitment is not None
     head_num = store.head_block_num()
@@ -304,7 +304,7 @@ class TestByzantineBootstrapReply(unittest.TestCase):
 
     def test_forged_quorum_proof_does_not_reach_ready(self) -> None:
         store = self.c.nodes[0].store
-        mgmt = MgmtReader(store)
+        mgmt = store.mgmt_reader
         commitment = mgmt.roster_commitment()
         assert commitment is not None
         head_num = store.head_block_num()
@@ -355,7 +355,7 @@ class TestByzantineBootstrapReply(unittest.TestCase):
 
     def test_forged_bundle_from_revoked_manager_not_adopted(self) -> None:
         store = self.c.nodes[0].store
-        mgmt = MgmtReader(store)
+        mgmt = store.mgmt_reader
         commitment = mgmt.roster_commitment()
         assert commitment is not None
 

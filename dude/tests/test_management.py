@@ -11,8 +11,6 @@ from ..core.errors import DudeError, InvariantError
 from ..net.address import Address, Endpoint, Scheme
 from ..store import Store, ops, settle
 from ..store.management import (
-    GRANTS_MAP,
-    NODES_MAP,
     P_POP,
     P_ROSTER,
     Authorization,
@@ -35,49 +33,24 @@ DJ = crypto.NameToken(crypto.h(b"j"))
 
 
 def unauthorised_certs(mgmt: MgmtWriter) -> str | None:
-    """The #revocation-is-compound invariant, quantified: no live row carries a cert whose signer
-    is not authorised NOW."""
-    for key in NODES_MAP.keys(mgmt.src):
-        who = crypto.PublicKey(key)
-        entry = NODES_MAP.entry(mgmt.src, key)
-        if entry is None:
-            continue
-        try:
-            cert = NodeRecord.decode_row(who, entry.value).cert
-        except DudeError as e:
-            return f"node row {who.hex()[:8]} will not decode: {e}"
-        if not mgmt.verify_cert(cert, mgmt.src):
-            return f"node row {who.hex()[:8]} carries a cert signed by {cert.signer.hex()[:8]}"
-    for key in GRANTS_MAP.keys(mgmt.src):
-        who = crypto.PublicKey(key)
-        entry = GRANTS_MAP.entry(mgmt.src, key)
-        if entry is None:
-            continue
-        try:
-            cert = Grant.decode_row(who, entry.value).cert
-        except DudeError as e:
-            return f"grant row {who.hex()[:8]} will not decode: {e}"
-        if not mgmt.verify_cert(cert, mgmt.src):
-            return f"grant row {who.hex()[:8]} carries a cert signed by {cert.signer.hex()[:8]}"
-    raw = mgmt.src.get(mgmt.store_id, P_ROSTER)
-    if raw is None:
-        return None
-    try:
-        rc = RosterCommitment.decode_row(raw.value)
-    except DudeError as e:
-        return f"roster commitment will not decode: {e}"
-    if not mgmt.verify_cert(rc.cert, mgmt.src):
+    for who, rec in mgmt.nodes().items():
+        if not mgmt.verify_cert(rec.cert):
+            return f"node row {who.hex()[:8]} carries a cert signed by {rec.cert.signer.hex()[:8]}"
+    for who in mgmt._grants.keys():
+        who_pk = crypto.PublicKey(who)
+        grant = mgmt.grant_of(who_pk)
+        if grant is None:
+            return f"grant row {who_pk.hex()[:8]} will not decode"
+        if not mgmt.verify_cert(grant.cert):
+            return f"grant row {who_pk.hex()[:8]} carries a cert signed by {grant.cert.signer.hex()[:8]}"
+    rc = mgmt.roster_commitment()
+    if rc is not None and not mgmt.verify_cert(rc.cert):
         return f"the roster commitment is attested by {rc.cert.signer.hex()[:8]}"
     return None
 
 
 def log_authorises_proof(mgmt: MgmtWriter, multisig: crypto.MultiSig, payload: bytes) -> bool:
-    """The log's own answer to "does this quorum proof pass" -- roster and anchor read from state.
-    A TEST helper: production reaches the same rule through `chain.advance`, which takes both
-    explicitly because a light client has no log to read them from."""
-    anchor = mgmt.src.anchor()
-    assert anchor is not None, "store has no manager anchor"
-    return Authorization(multisig, payload, mgmt.roster(), anchor).verify()
+    return Authorization(multisig, payload, mgmt.roster(), mgmt.anchor).verify()
 
 
 def _sign(kp: crypto.Keypair, tx: ops.Transaction) -> ops.SignedTransaction:
@@ -87,7 +60,7 @@ def _sign(kp: crypto.Keypair, tx: ops.Transaction) -> ops.SignedTransaction:
 def _provisioned(anchor_kp: crypto.Keypair) -> tuple[Store, MgmtWriter]:
     s = Store()
     s.provision(anchor_kp.public)
-    return s, MgmtWriter(s)
+    return s, s.mgmt_writer
 
 
 # --------------------------------------------------------------------------------------------- #
@@ -351,7 +324,7 @@ class TestRevocationIsCompound(unittest.TestCase):
         the write until management operations become typed opcodes."""
         anchor, warm, s, mgmt, _kps = self._cluster_admitted_by_a_warm_manager()
         bare = ops.writes(
-            ops.Del(ops.STORE_MANAGEMENT, GRANTS_MAP.entry_name(warm.public)),
+            ops.Del(ops.STORE_MANAGEMENT, mgmt._grants.entry_name(warm.public)),
             ops.Del(ops.STORE_MANAGEMENT, P_POP + warm.public),
         )
         s.apply((_sign(anchor, bare),), auth=mgmt)
@@ -817,13 +790,13 @@ class TestMalformedRowsDoNotPoison(unittest.TestCase):
         self.kps = _seed_cluster(self.s, self.mgmt, self.anchor, 3)
 
     def _settle_garbage(self, name: bytes) -> None:
-        t = ops.writes(ops.Set(self.mgmt.store_id, name, b"\x00not-bencode"))
+        t = ops.writes(ops.Set(ops.STORE_MANAGEMENT, name, b"\x00not-bencode"))
         applied = self.s.apply((t.sign(self.anchor, T0 + 1),), auth=self.mgmt)
         self.assertEqual(len(applied.settled), 1, "the garbage row must land for the test to bite")
 
     def test_garbage_node_row_reads_as_absent_and_roster_survives(self):
         stranger = crypto.Keypair.generate().public
-        self._settle_garbage(NODES_MAP.entry_name(stranger))
+        self._settle_garbage(self.mgmt._nodes.entry_name(stranger))
         self.assertEqual(set(self.mgmt.roster()), {kp.public for kp in self.kps})
         self.assertNotIn(stranger, self.mgmt.nodes())
         self.assertIsNotNone(self.mgmt.roster_commitment())
@@ -835,7 +808,7 @@ class TestMalformedRowsDoNotPoison(unittest.TestCase):
 
     def test_garbage_grant_row_refuses_authority_not_raising(self):
         writer = crypto.Keypair.generate()
-        self._settle_garbage(GRANTS_MAP.entry_name(writer.public))
+        self._settle_garbage(self.mgmt._grants.entry_name(writer.public))
         self.assertIsNone(self.mgmt.grant_of(writer.public))
         attempt = ops.writes(ops.Set(ops.STORE_DATA, DK, b"v")).sign(writer, T0 + 2)
         applied = self.s.apply((attempt,), auth=self.mgmt)
@@ -853,7 +826,7 @@ class TestIsMemberAndRosterCannotDisagree(unittest.TestCase):
         c = Cluster(nodes=3)
         s = c.provisioned()
         c.close()
-        mgmt = MgmtReader(s)
+        mgmt = s.mgmt_reader
         roster = mgmt.roster()
         self.assertTrue(roster, "no roster to compare against")
         for who in roster:
@@ -866,7 +839,7 @@ class TestIsMemberAndRosterCannotDisagree(unittest.TestCase):
         c.close()
         node_keys = [n.me.public for n in c.nodes]
         victim = node_keys[3]
-        entry = NODES_MAP.entry(s, victim)
+        entry = s.mgmt_reader._nodes.entry(victim)
         assert entry is not None
         rec = NodeRecord.decode_row(victim, entry.value)
         forged = NodeRecord(
@@ -879,13 +852,13 @@ class TestIsMemberAndRosterCannotDisagree(unittest.TestCase):
         )
         from ..store.managed import MapEntry
         plant = ops.writes(
-            ops.Set(ops.STORE_MANAGEMENT, NODES_MAP.entry_name(victim),
+            ops.Set(ops.STORE_MANAGEMENT, s.mgmt_reader._nodes.entry_name(victim),
                     MapEntry.encode(entry.index, forged.encode_row()))
         ).sign(c.anchor, T0)
         intervene(s, c.anchor, bodies=(plant,), bucket=TUNABLES.bucket(T0))
 
-        mgmt = MgmtReader(s)
-        self.assertIsNotNone(NODES_MAP.entry(s, victim), "the row must exist")
+        mgmt = s.mgmt_reader
+        self.assertIsNotNone(s.mgmt_reader._nodes.entry(victim), "the row must exist")
         self.assertNotIn(victim, mgmt.roster())
         self.assertFalse(mgmt.is_member(victim), "is_member took a row's existence for a seat")
 
@@ -895,13 +868,13 @@ class TestIsMemberAndRosterCannotDisagree(unittest.TestCase):
         c.close()
         node_keys = [n.me.public for n in c.nodes]
         victim = node_keys[3]
-        self.assertTrue(MgmtReader(s).is_member(victim))
+        self.assertTrue(s.mgmt_reader.is_member(victim))
         remove = (
-            MgmtWriter(s).change_roster(commitment_signer=c.anchor, remove=(victim,)).sign(c.anchor, T0)
+            s.mgmt_writer.change_roster(commitment_signer=c.anchor, remove=(victim,)).sign(c.anchor, T0)
         )
         intervene(s, c.anchor, bodies=(remove,), bucket=TUNABLES.bucket(T0))
-        self.assertNotIn(victim, MgmtReader(s).roster())
-        self.assertFalse(MgmtReader(s).is_member(victim))
+        self.assertNotIn(victim, s.mgmt_reader.roster())
+        self.assertFalse(s.mgmt_reader.is_member(victim))
 
 
 class TestAuthorizationRefusesRatherThanRaises(unittest.TestCase):
@@ -939,7 +912,7 @@ class TestReadAndWriteAreScopedTheSameWay(unittest.TestCase):
         s = Store()
         s.provision(anchor.public)
         who = crypto.Keypair.generate()
-        tx = MgmtWriter(s).authorise(
+        tx = s.mgmt_writer.authorise(
             who.public,
             role,
             stores=stores,
@@ -951,13 +924,13 @@ class TestReadAndWriteAreScopedTheSameWay(unittest.TestCase):
 
     def test_a_read_only_grant_reads_its_store_and_writes_nothing(self):
         s, who = self._granted(Role.CLIENT_RO, frozenset({ops.STORE_DATA}))
-        m = MgmtReader(s)
+        m = s.mgmt_reader
         self.assertTrue(m.may_read(s, who.public, ops.STORE_DATA))
         self.assertFalse(m.may_write(s, who.public, ops.STORE_DATA), "CLIENT_RO wrote")
 
     def test_a_grant_for_one_store_does_not_reach_another(self):
         s, who = self._granted(Role.CLIENT_RW, frozenset({ops.STORE_DATA}))
-        m = MgmtReader(s)
+        m = s.mgmt_reader
         self.assertTrue(m.may_write(s, who.public, ops.STORE_DATA))
         self.assertFalse(m.may_read(s, who.public, ops.STORE_DATA + 1), "read another store")
         self.assertFalse(m.may_write(s, who.public, ops.STORE_DATA + 1))
@@ -969,7 +942,7 @@ class TestReadAndWriteAreScopedTheSameWay(unittest.TestCase):
         encrypted rather than withheld. Scoping it withheld nothing and broke the thing it exists
         for: a client could not fetch the keys its own grant depends on."""
         s, who = self._granted(Role.CLIENT_RO, frozenset({ops.STORE_DATA}))
-        m = MgmtReader(s)
+        m = s.mgmt_reader
         self.assertTrue(
             m.may_read(s, who.public, ops.STORE_MANAGEMENT),
             "a granted client was refused the trust chain",
@@ -985,7 +958,7 @@ class TestReadAndWriteAreScopedTheSameWay(unittest.TestCase):
     def test_a_compactor_reads_its_store_and_writes_nothing(self):
         """It authorises nothing more until compaction returns with its own verbs."""
         s, who = self._granted(Role.COMPACTOR, frozenset({ops.STORE_DATA}))
-        m = MgmtReader(s)
+        m = s.mgmt_reader
         self.assertTrue(m.may_read(s, who.public, ops.STORE_DATA))
         self.assertFalse(m.may_write(s, who.public, ops.STORE_DATA))
 
@@ -1011,12 +984,12 @@ class TestReadAndWriteAreScopedTheSameWay(unittest.TestCase):
         )
         from ..store.managed import MapEntry
         plant = ops.writes(
-            ops.Set(ops.STORE_MANAGEMENT, GRANTS_MAP.entry_name(who.public),
+            ops.Set(ops.STORE_MANAGEMENT, s.mgmt_reader._grants.entry_name(who.public),
                     MapEntry.encode(0, forged.encode_row()))
         ).sign(anchor, T0)
         intervene(s, anchor, bodies=(plant,), bucket=1)
 
-        m = MgmtReader(s)
+        m = s.mgmt_reader
         self.assertIsNotNone(m.grant_of(who.public), "the row must exist, or this is vacuous")
         self.assertFalse(m.may_write(s, who.public, ops.STORE_DATA))
         self.assertFalse(m.may_read(s, who.public, ops.STORE_DATA), "unchained grant still read")

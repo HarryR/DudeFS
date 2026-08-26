@@ -56,7 +56,7 @@ type OutboxItem = tuple[crypto.PublicKey, SyncMsg]
 class Follower:
     me: crypto.Keypair
     store: Store
-    mgmt: MgmtReader
+    mgmt_reader: MgmtReader
     tunables: Tunables
     _heads: dict[crypto.PublicKey, HeightReport] = field(default_factory=dict)
     _poll_at: dict[crypto.PublicKey, Millis] = field(default_factory=dict)
@@ -128,7 +128,7 @@ class Follower:
         Freshness is the clock's, not the newest report's, or a silent peer vouches for its own
         last word forever. NOT `chain.is_stale`: that gates on the CHAIN advancing, and a stopped
         chain would then prevent any node from restarting it."""
-        roster = self.mgmt.roster()
+        roster = self.mgmt_reader.roster()
         if not roster:
             return False
         my_num = self.store.head_block_num() or 0
@@ -185,7 +185,7 @@ class Follower:
         range, because the roster comes from the log and only committing the previous block
         makes its roster change visible (#roster-at-ratification)."""
         sb = offer.block
-        walked = chain.advance(self._tip(), (sb,), self.mgmt.roster(), self._require_anchor())
+        walked = chain.advance(self._tip(), (sb,), self.mgmt_reader.roster(), self._require_anchor())
         if isinstance(walked, chain.ChainRefusal):
             return False
         # Equality: a block names exactly what it applied, so bodies short of the hash list
@@ -204,7 +204,7 @@ class Follower:
             block_bytes=sb.encode(),
             block_hash=sb.block_hash,
             batch=ordered,
-            auth=self.mgmt,
+            auth=self.mgmt_reader,
         )
         return True
 
@@ -278,7 +278,7 @@ class Follower:
         expected: Anchors,
     ) -> bool:
         layer = Layer(self.store)
-        screened = settle.apply_to(layer, bodies, self.mgmt)
+        screened = settle.apply_to(layer, bodies, self.mgmt_reader)
         if screened.rejects:
             return False
         layer.freeze()

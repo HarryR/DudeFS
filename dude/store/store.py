@@ -1,3 +1,4 @@
+from __future__ import annotations
 
 import contextlib
 import os
@@ -7,13 +8,16 @@ import threading
 from collections.abc import Generator, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
+
+if TYPE_CHECKING:
+    from ..session import Session
 
 from ..core import codec, crypto
 from ..core.errors import InvariantError
 from . import ops, settle, smt
 from .layer import Held, Index, PathRow, Settled, holds
-from .management import P_NODE, P_ROSTER, MgmtReader, Role
+from .management import MgmtReader, MgmtWriter
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS entry (
@@ -239,9 +243,11 @@ class StoreReader:
         ).fetchone()
         return row[0] if row else b""
 
-    def anchor(self) -> crypto.PublicKey | None:
+    def anchor(self) -> crypto.PublicKey:
         raw = self._get_meta("anchor", b"")
-        return crypto.PublicKey(raw) if raw else None
+        if not raw:
+            raise InvariantError("store has no anchor")
+        return crypto.PublicKey(raw)
 
     def seeds(self) -> tuple[bytes, ...]:
         raw = self._get_meta("seeds", b"")
@@ -249,55 +255,6 @@ class StoreReader:
 
     def roster_serial(self) -> int:
         return int.from_bytes(self._get_meta("roster_serial", b""))
-
-    def wrong_cluster(self) -> str | None:
-        held = self.anchor()
-        if held is None:
-            return "no anchor: this node was never provisioned with a manager key"
-        grant = self._mgmt().grant_of(held)
-        if grant is None:
-            return "the log holds no grant for the manager we were provisioned with"
-        if grant.role is not Role.MANAGER:
-            return f"our anchor holds {grant.role.value} in this log, not manager"
-        return None
-
-    def unvouched_roster(self) -> str | None:
-        held = self.anchor()
-        if held is None:
-            return "no anchor: this node was never provisioned with a manager key"
-        for who in self._mgmt().roster():
-            name = P_NODE + who
-            author = settle.vouched(self, ops.STORE_MANAGEMENT, name, self.credential(0, name))
-            if author is None:
-                return (
-                    f"roster row for {who.hex()[:8]} carries no credential vouching for its value"
-                )
-            if author != held:
-                return f"roster row for {who.hex()[:8]} is vouched by {author.hex()[:8]}, not by us"
-        return None
-
-    def roster_incomplete(self) -> str | None:
-        held = self.anchor()
-        if held is None:
-            return "no anchor: this node was never provisioned with a manager key"
-        mgmt = self._mgmt()
-        commitment = mgmt.roster_commitment()
-        if commitment is None:
-            return "the log states no roster commitment, so a subset could not be detected"
-        author = settle.vouched(self, ops.STORE_MANAGEMENT, P_ROSTER, self.credential(0, P_ROSTER))
-        if author != held:
-            return f"the roster commitment is vouched by {author.hex()[:8] if author else 'nobody'}"
-        if commitment.members != mgmt.roster():
-            return (
-                f"the roster commitment names {len(commitment.members)} members, "
-                f"the log holds a different set"
-            )
-        if commitment.serial < self.roster_serial():
-            return (
-                f"roster serial {commitment.serial} is older than the "
-                f"{self.roster_serial()} already seen"
-            )
-        return None
 
     def _get_meta(self, k: str, default: bytes) -> bytes:
         row = self._conn.execute("SELECT v FROM meta WHERE k=?", (k,)).fetchone()
@@ -349,8 +306,10 @@ class StoreReader:
         ).fetchall()
         return {r[0] for r in rows}
 
-    def _mgmt(self) -> MgmtReader:
-        return MgmtReader(self)
+    @property
+    def mgmt_reader(self) -> MgmtReader:
+        from ..session import Session  # noqa: PLC0415
+        return MgmtReader(Session(self, ops.STORE_MANAGEMENT))
 
 
 class StoreWriter(StoreReader):
@@ -363,13 +322,15 @@ class StoreWriter(StoreReader):
         self._set_meta("acc_log", crypto.acc_add(self.log_accumulator(), log_element(idx, op_hash)))
 
     def _remember_roster_serial(self) -> None:
-        commitment = self._mgmt().roster_commitment()
+        if not self._get_meta("anchor", b""):
+            return
+        commitment = self.mgmt_reader.roster_commitment()
         if commitment is not None and commitment.serial > self.roster_serial():
             self._set_meta("roster_serial", commitment.serial.to_bytes(8))
 
     def provision(self, manager: crypto.PublicKey, seeds: Iterable[bytes] = ()) -> None:
-        held = self.anchor()
-        if held is not None and held != manager:
+        raw = self._get_meta("anchor", b"")
+        if raw and crypto.PublicKey(raw) != manager:
             raise InvariantError(
                 "this node is provisioned to a different manager; re-provisioning would move it "
                 "between clusters while keeping its identity and its attested height"
@@ -496,44 +457,14 @@ class StoreWriter(StoreReader):
         self._set_meta("acc", acc)
         return Applied(tuple(settled), tuple(dropped))
 
-    def replay(self, items: Iterable[Entry], expect: Commitment | None = None) -> str | None:
+    def replay(self, items: Iterable[Entry]) -> None:
         acc = self.accumulator()
         for e in items:
             if (why := _unverified(e)) is not None:
                 raise _ReplayRefusedError(why)
             acc = self._commit(e.idx, e.item, e.item.txn.mutations, acc)
         self._set_meta("acc", acc)
-        if (why := self._unacceptable(expect)) is not None:
-            raise _ReplayRefusedError(why)
         self._remember_roster_serial()
-        return None
-
-    def _unacceptable(self, expect: Commitment | None) -> str | None:
-        if (
-            expect is not None
-            and self.head() == expect.head
-            and (why := self._disagrees(expect)) is not None
-        ):
-            return why
-        if self.anchor() is None:
-            return None
-        for why in (self.wrong_cluster(), self.unvouched_roster(), self.roster_incomplete()):
-            if why is not None:
-                return f"refusing a log this node's anchor does not authorise: {why}"
-        return None
-
-    def _disagrees(self, expect: Commitment) -> str | None:
-        for what, mine, theirs in (
-            ("state", self.accumulator(), expect.acc_state),
-            ("log", self.log_accumulator(), expect.acc_log),
-            ("root", self.state_root(), expect.root),
-        ):
-            if mine != theirs:
-                return (
-                    f"transferred log disagrees with the sender's signed {what} "
-                    f"at height {expect.head}"
-                )
-        return None
 
     def _commit(
         self,
@@ -701,7 +632,7 @@ class Store:
         with self.snapshot() as r:
             return r.prove(store, name)
 
-    def anchor(self) -> crypto.PublicKey | None:
+    def anchor(self) -> crypto.PublicKey:
         with self.snapshot() as r:
             return r.anchor()
 
@@ -712,18 +643,6 @@ class Store:
     def roster_serial(self) -> int:
         with self.snapshot() as r:
             return r.roster_serial()
-
-    def wrong_cluster(self) -> str | None:
-        with self.snapshot() as r:
-            return r.wrong_cluster()
-
-    def unvouched_roster(self) -> str | None:
-        with self.snapshot() as r:
-            return r.unvouched_roster()
-
-    def roster_incomplete(self) -> str | None:
-        with self.snapshot() as r:
-            return r.roster_incomplete()
 
     def holds(self, pred: ops.Predicate) -> bool:
         with self.snapshot() as r:
@@ -761,9 +680,17 @@ class Store:
     def is_frozen(self) -> bool:
         return True
 
+    def mgmt_session(self) -> Session:
+        from ..session import Session  # noqa: PLC0415
+        return Session(self, ops.STORE_MANAGEMENT)
+
     @property
-    def mgmt(self) -> MgmtReader:
-        return MgmtReader(self)
+    def mgmt_reader(self) -> MgmtReader:
+        return MgmtReader(self.mgmt_session())
+
+    @property
+    def mgmt_writer(self) -> MgmtWriter:
+        return MgmtWriter(self.mgmt_session())
 
     def apply(self, batch: tuple[ops.SignedTransaction, ...], auth: settle.Authoriser) -> Applied:
         with self.write() as w:
@@ -797,15 +724,16 @@ class Store:
         with self.write() as w:
             w.provision(manager, seeds)
 
-    def replay(self, items: Iterable[Entry], expect: Commitment | None = None) -> str | None:
+    def replay(self, items: Iterable[Entry]) -> str | None:
         try:
             with self.write() as w:
-                w.replay(items, expect)
+                w.replay(items)
         except _ReplayRefusedError as e:
             return e.why
         return None
 
     def rebuild(self) -> "Store":
         fresh = Store()
+        fresh.provision(self.anchor())
         fresh.replay(list(self.entries()))
         return fresh

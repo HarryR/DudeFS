@@ -6,7 +6,7 @@ import unittest
 from dude.core import crypto
 from dude.store import ops
 from dude.store.checkpoint import CheckpointMeta
-from dude.store.management import Cert, MgmtReader, MgmtWriter, Role
+from dude.store.management import Cert, MgmtWriter, Role
 from dude.store.smt_sync import TreeImporter
 from dude.sync.checkpoint_adapter import GetChunks
 from dude.sync.checkpoint_server import CheckpointServer
@@ -28,7 +28,7 @@ class TestFollowerCheckpointFallback(unittest.TestCase):
             c.wait_head(c.nodes[0].store.head(), nodes=[anchor_node])
             anchor_s = anchor_node.session()
             compactor_kp = crypto.Keypair.generate()
-            w = MgmtWriter(anchor_node.store)
+            w = anchor_node.store.mgmt_writer
             grant_tx = w.authorise(
                 compactor_kp.public,
                 Role.COMPACTOR,
@@ -40,8 +40,8 @@ class TestFollowerCheckpointFallback(unittest.TestCase):
 
             compactor_node = c.boot_replica(compactor_kp)
             c.wait_head(c.nodes[0].store.head(), nodes=[compactor_node])
-            cs = compactor_node.session()
-            c.wait_settled(cs.compact(c.nodes[0].store.head_block_num() or 0).wait())
+            cs = compactor_node.session(store_id=ops.STORE_MANAGEMENT)
+            c.wait_settled(cs.submit(MgmtWriter(cs).compact(c.nodes[0].store.head_block_num() or 0)).wait())
 
             source = c.nodes[0]
             grant_cert = Cert.sign_grant(
@@ -112,7 +112,7 @@ class TestFollowerCheckpointFallback(unittest.TestCase):
                     restored_meta.anchor, restored_meta.settled_block_bytes,
                 )
 
-            roster = tuple(sorted(MgmtReader(late_joiner.store).roster()))
+            roster = tuple(sorted(late_joiner.store.mgmt_reader.roster()))
             why = restored_meta.verify_quorum(roster)
             self.assertIsNone(why, f"quorum verify: {why}")
 

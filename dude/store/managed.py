@@ -1,12 +1,16 @@
 
+from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import Self
+from typing import TYPE_CHECKING, Self
 
 from ..core import codec, crypto
 from ..core.errors import DudeError
 from . import ops
 from .errors import StoreError
-from .layer import Reader
+
+if TYPE_CHECKING:
+    from ..session import Session
 
 
 class ManagedMapError(StoreError): ...
@@ -67,11 +71,11 @@ class MapEntry:
 
 
 class ManagedMap:
-    __slots__ = ("prefix", "store_id")
+    __slots__ = ("_session", "prefix")
 
-    def __init__(self, prefix: bytes, store_id: int = ops.STORE_MANAGEMENT) -> None:
+    def __init__(self, prefix: bytes, session: Session) -> None:
         self.prefix = prefix
-        self.store_id = store_id
+        self._session = session
 
     def _meta_name(self) -> bytes:
         return self.prefix + b"\x00"
@@ -82,42 +86,47 @@ class ManagedMap:
     def entry_name(self, key: bytes) -> bytes:
         return self.prefix + b"\x02" + key
 
+    def _get(self, name: bytes) -> bytes | None:
+        rec = self._session.get(name)
+        if rec.absent:
+            return None
+        return rec.value
+
     # -- reads (all point reads) --------------------------------------------
 
-    def meta(self, reader: Reader) -> MapMeta | None:
-        held = reader.get(self.store_id, self._meta_name())
-        if held is None:
+    def meta(self) -> MapMeta | None:
+        raw = self._get(self._meta_name())
+        if raw is None:
             return None
-        return MapMeta.decode(held.value)
+        return MapMeta.decode(raw)
 
-    def entry(self, reader: Reader, key: bytes) -> MapEntry | None:
-        held = reader.get(self.store_id, self.entry_name(key))
-        if held is None:
+    def entry(self, key: bytes) -> MapEntry | None:
+        raw = self._get(self.entry_name(key))
+        if raw is None:
             return None
         try:
-            return MapEntry.decode(held.value)
+            return MapEntry.decode(raw)
         except (DudeError, ValueError, IndexError):
             return None
 
-    def key_at(self, reader: Reader, idx: int) -> bytes | None:
-        held = reader.get(self.store_id, self._index_name(idx))
-        return held.value if held is not None else None
+    def key_at(self, idx: int) -> bytes | None:
+        return self._get(self._index_name(idx))
 
-    def keys(self, reader: Reader) -> list[bytes]:
-        m = self.meta(reader)
+    def keys(self) -> list[bytes]:
+        m = self.meta()
         if m is None:
             return []
         out: list[bytes] = []
         for i in range(m.count):
-            k = self.key_at(reader, i)
+            k = self.key_at(i)
             if k is not None:
                 out.append(k)
         return out
 
-    def items(self, reader: Reader) -> list[tuple[bytes, bytes]]:
+    def items(self) -> list[tuple[bytes, bytes]]:
         out: list[tuple[bytes, bytes]] = []
-        for key in self.keys(reader):
-            e = self.entry(reader, key)
+        for key in self.keys():
+            e = self.entry(key)
             if e is not None:
                 out.append((key, e.value))
         return out
@@ -125,7 +134,7 @@ class ManagedMap:
     # -- writes (return Transaction, caller applies) ------------------------
 
     def tx_add(self, key: bytes, value: bytes, current: MapMeta | None) -> ops.Transaction:
-        s = self.store_id
+        s = self._session.store_id
         count = current.count if current else 0
         new_acc = MapAcc(self.prefix, current.acc if current else None).add(key)
         new_meta = MapMeta.encode(count + 1, new_acc)
@@ -153,7 +162,7 @@ class ManagedMap:
         last_key: bytes,
         last_entry: MapEntry,
     ) -> ops.Transaction:
-        s = self.store_id
+        s = self._session.store_id
         last_idx = current.count - 1
         new_acc = MapAcc(self.prefix, current.acc).sub(key)
         new_meta = MapMeta.encode(last_idx, new_acc)
@@ -179,7 +188,7 @@ class ManagedMap:
         return ops.Transaction(tuple(steps))
 
     def tx_update(self, key: bytes, new_value: bytes, current: MapEntry) -> ops.Transaction:
-        s = self.store_id
+        s = self._session.store_id
         return ops.Transaction((
             ops.Step(
                 (ops.Holds(s, self.entry_name(key), ops.value_digest(current.raw)),),
@@ -190,7 +199,7 @@ class ManagedMap:
     # -- batch: multiple adds/removes in one transaction ---------------------
 
     def tx_add_entry(self, key: bytes, value: bytes, index: int) -> ops.Transaction:
-        s = self.store_id
+        s = self._session.store_id
         return ops.Transaction((
             ops.Step((), ops.Set(s, self._index_name(index), key)),
             ops.Step(
@@ -202,7 +211,7 @@ class ManagedMap:
     def tx_meta_write(
         self, new_count: int, new_acc: MapAcc, current: MapMeta | None,
     ) -> ops.Transaction:
-        s = self.store_id
+        s = self._session.store_id
         new_meta = MapMeta.encode(new_count, new_acc)
         guard: ops.Predicate = (
             ops.Holds(s, self._meta_name(), ops.value_digest(current.raw))
@@ -214,9 +223,9 @@ class ManagedMap:
         ))
 
     def batch_add(
-        self, reader: Reader, entries: tuple[tuple[bytes, bytes], ...],
+        self, entries: tuple[tuple[bytes, bytes], ...],
     ) -> ops.Transaction:
-        meta = self.meta(reader)
+        meta = self.meta()
         count = meta.count if meta else 0
         acc = MapAcc(self.prefix, meta.acc if meta else None)
         tx = ops.Transaction(())
@@ -228,27 +237,27 @@ class ManagedMap:
 
     # -- convenience: read + compose in one call ----------------------------
 
-    def add(self, reader: Reader, key: bytes, value: bytes) -> ops.Transaction:
-        return self.tx_add(key, value, self.meta(reader))
+    def add(self, key: bytes, value: bytes) -> ops.Transaction:
+        return self.tx_add(key, value, self.meta())
 
-    def remove(self, reader: Reader, key: bytes) -> ops.Transaction:
-        m = self.meta(reader)
+    def remove(self, key: bytes) -> ops.Transaction:
+        m = self.meta()
         if m is None:
             raise ManagedMapError("remove from empty map")
-        victim = self.entry(reader, key)
+        victim = self.entry(key)
         if victim is None:
             raise ManagedMapError(f"key not in map: {key!r}")
         last_idx = m.count - 1
-        last_key = self.key_at(reader, last_idx)
+        last_key = self.key_at(last_idx)
         if last_key is None:
             raise ManagedMapError(f"index slot {last_idx} missing")
-        last_entry = self.entry(reader, last_key)
+        last_entry = self.entry(last_key)
         if last_entry is None:
             raise ManagedMapError(f"entry for last key {last_key!r} missing")
         return self.tx_remove(key, m, victim, last_key, last_entry)
 
-    def update(self, reader: Reader, key: bytes, new_value: bytes) -> ops.Transaction:
-        current = self.entry(reader, key)
+    def update(self, key: bytes, new_value: bytes) -> ops.Transaction:
+        current = self.entry(key)
         if current is None:
             raise ManagedMapError(f"key not in map: {key!r}")
         return self.tx_update(key, new_value, current)

@@ -61,8 +61,8 @@ class Coordinator:
         self.mempool = Mempool(self.tunables)
 
     @property
-    def mgmt(self) -> MgmtReader:
-        return MgmtReader(self.store)
+    def mgmt_reader(self) -> MgmtReader:
+        return MgmtReader(self.store.mgmt_session())
 
     def _bucket_of(self, now: Millis) -> Bucket:
         return self.tunables.bucket(now)
@@ -97,7 +97,7 @@ class Coordinator:
     def in_roster(self) -> bool:
         """Whether we hold a seat RIGHT NOW. The Follower can adopt a roster change at any tick,
         so this is read at each decision rather than cached at construction."""
-        return self.mgmt.is_member(self.me.public)
+        return self.mgmt_reader.is_member(self.me.public)
 
     def submit(self, tx: SignedTransaction, now: Millis) -> Refusal | None:
         if not self.in_roster:
@@ -106,7 +106,7 @@ class Coordinator:
             # client held an ACCEPTED for a tx that vanished without a trace. Refused here,
             # the client knows to try a roster member instead.
             return Refusal.NOT_IN_ROSTER
-        return self.mempool.admit(tx, now, self.store, self.mgmt)
+        return self.mempool.admit(tx, now, self.store, self.mgmt_reader)
 
     def on_round_msg(self, frm: crypto.PublicKey, verb: Verb, body: bytes, now: Millis) -> None:
         try:
@@ -132,7 +132,7 @@ class Coordinator:
         if not isinstance(msg, Bodies):
             return
         good = tuple(
-            tx for tx in msg.txs if self.mempool.valid(tx, now, self.store, self.mgmt) is None
+            tx for tx in msg.txs if self.mempool.valid(tx, now, self.store, self.mgmt_reader) is None
         )
         r.absorb(msg, frm, good)
 
@@ -211,7 +211,7 @@ class Coordinator:
         if not self.in_roster:
             return  # follower-only: Round refuses `me not in roster`, and the raise would tear
             # down the node's tick. Sit out consensus and let the Follower catch us up.
-        roster = self.mgmt.roster()
+        roster = self.mgmt_reader.roster()
         r = Round(
             bucket=bucket,
             me=self.me,
@@ -240,9 +240,9 @@ class Coordinator:
         a node that needs to catch up."""
         already = self.store.settled_hashes(tuple(tx.op_hash for tx in candidate))
         fresh = tuple(tx for tx in candidate if tx.op_hash not in already)
-        survivors = settle.apply_to(Layer(self.store), fresh, self.mgmt).survivors
+        survivors = settle.apply_to(Layer(self.store), fresh, self.mgmt_reader).survivors
         for tx in survivors:
-            grant = self.mgmt.grant_of(tx.author)
+            grant = self.mgmt_reader.grant_of(tx.author)
             if grant is not None and grant.role.isolated:
                 return frozenset({tx.op_hash})
         return frozenset(tx.op_hash for tx in survivors)
@@ -252,7 +252,7 @@ class Coordinator:
         if r is None:
             raise InvariantError("_on_round_abandoned called with no in-flight Round")
         for tx in r.surviving():
-            self.mempool.admit(tx, now, self.store, self.mgmt)
+            self.mempool.admit(tx, now, self.store, self.mgmt_reader)
         self.current_round = None
 
     def _promote_to_settling(self, now: Millis) -> None:
@@ -284,13 +284,13 @@ class Coordinator:
             # on; anchoring it to a newer one signs a state_root nothing screened against. Void
             # the round -- the work is still in hand, so it retries in a later bucket.
             for tx in (*slice_txs, *surviving):
-                self.mempool.admit(tx, now, self.store, self.mgmt)
+                self.mempool.admit(tx, now, self.store, self.mgmt_reader)
             self.current_round = None
             return
-        roster = self.mgmt.roster()
+        roster = self.mgmt_reader.roster()
 
         layer = Layer(self.store)
-        screened = settle.apply_to(layer, slice_txs, self.mgmt)
+        screened = settle.apply_to(layer, slice_txs, self.mgmt_reader)
         if screened.rejects:
             # LOCAL non-determinism: the same screen ran at the cut against the same base and
             # agreed. Other ratifiers settle without us; we adopt via the Follower. Crashing
@@ -301,7 +301,7 @@ class Coordinator:
                 screened.rejects,
             )
             for tx in (*slice_txs, *surviving):
-                self.mempool.admit(tx, now, self.store, self.mgmt)
+                self.mempool.admit(tx, now, self.store, self.mgmt_reader)
             self.current_round = None
             return
         applied = screened.survivors
@@ -361,13 +361,13 @@ class Coordinator:
             block_bytes=block_bytes,
             block_hash=block_hash,
             batch=s.applied,
-            auth=self.mgmt,
+            auth=self.mgmt_reader,
         )
 
         _expect_anchors(s.anchors, self.store)
 
         for tx in s.surviving:
-            self.mempool.admit(tx, now, self.store, self.mgmt)
+            self.mempool.admit(tx, now, self.store, self.mgmt_reader)
 
         self.settling = None
         self._settle_stalls = 0
@@ -378,7 +378,7 @@ class Coordinator:
             raise InvariantError("_on_settle_abandoned called with no settling slot")
         divergences = s.settle_round.divergences()
         for tx in (*s.applied, *s.surviving):
-            self.mempool.admit(tx, now, self.store, self.mgmt)
+            self.mempool.admit(tx, now, self.store, self.mgmt_reader)
         self.settling = None
 
         if not divergences:

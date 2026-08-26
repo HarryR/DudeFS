@@ -10,20 +10,9 @@
 #   make lint        ruff check
 #   make format      ruff format (writes)
 #   make check       lint + format-check + typecheck + test  (CI-style, no writes)
+#   make reachability  static call graph from CLI entry points
 #   make clean       remove .venv + caches   |   make distclean   also removes .uv
 
-# PINNED. An unpinned lint/typecheck gate changes under you: `ty` is pre-1.0 and a floating upgrade
-# can turn the gate red or green with no code change, and PyNaCl is the entire crypto substrate. For
-# a project whose thesis is integrity, the build inputs should not be the least verified part of it.
-RUFF_VERSION     := 0.16.0
-TY_VERSION       := 0.0.61
-PYNACL_VERSION   := 1.6.2
-COVERAGE_VERSION := 7.6.1
-PYTEST_VERSION   := 8.3.2
-
-# What the tooling runs over. `dudefs/` and `tests/` are the previous package, kept only until the
-# salvage is finished; they are NOT linted, because ruff.toml is now scoped to the rules `dude/`
-# holds itself to and the old tree cannot pass them.
 SRC := dude
 
 TOOLS := $(CURDIR)/.uv
@@ -36,10 +25,10 @@ TY    := $(VENV)/bin/ty
 # Keep uv's cache inside the project too, so `make` creates nothing under $HOME.
 export UV_CACHE_DIR := $(TOOLS)/cache
 
-.PHONY: help install uv-bootstrap lint format format-check typecheck test coverage check clean distclean
+.PHONY: help install uv-bootstrap lint format format-check typecheck test coverage reachability check clean distclean
 
 help:
-	@echo "targets: install | lint | format | format-check | typecheck | test | coverage | check | clean | distclean"
+	@echo "targets: install | lint | format | format-check | typecheck | test | coverage | reachability | check | clean | distclean"
 
 # Install uv as a standalone binary INTO THE PROJECT (./.uv), never touching
 # ~/.local/bin or shell profiles (UV_NO_MODIFY_PATH=1). No-op if already present.
@@ -50,11 +39,9 @@ uv-bootstrap:
 	  curl -LsSf https://astral.sh/uv/install.sh \
 	    | env UV_UNMANAGED_INSTALL="$(TOOLS)" UV_NO_MODIFY_PATH=1 sh; }
 
-# Create the venv (Python 3.12) and install the dev tools into it.
 install: uv-bootstrap
 	"$(UV)" venv "$(VENV)" --python 3.12 --clear
-	"$(UV)" pip install --python "$(PY)" \
-	  ruff==$(RUFF_VERSION) ty==$(TY_VERSION) pynacl==$(PYNACL_VERSION) coverage==$(COVERAGE_VERSION) pytest==$(PYTEST_VERSION)
+	"$(UV)" pip install --python "$(PY)" -r requirements-dev.txt
 	@echo ">> toolchain ready (project-local); 'make check' to run everything"
 
 lint:
@@ -72,19 +59,38 @@ typecheck:
 test:
 	"$(PY)" -m pytest $(SRC)/tests -q --tb=short --no-header --durations=0
 
-# Coverage with a 90% floor. Current tree measures 93% (2026-08-03); 90 is a floor a hair below
-# actual, so a temporary in-progress dip does not fail the gate. The CI step name has always
-# claimed this ratchet; before today it was cosmetic (the Makefile ran no floor) and the step
-# passed at any coverage. The number is real now -- raise it as coverage climbs.
 coverage:
 	"$(PY)" -m coverage run --source=$(SRC) -m pytest $(SRC)/tests -q --tb=short --no-header
 	"$(PY)" -m coverage report -m --fail-under=90
+
+PROD_PY := $(shell find $(SRC) -name '*.py' -not -path '*/tests/*')
+
+reachability:
+	@echo "=== CLI entry-point reachability ==="
+	@"$(PY)" -m pyan --root . $(PROD_PY) \
+	  --uses --no-defines --dot > reachability.dot
+	@"$(PY)" -c " \
+	nodes, targets = set(), set()  ;\
+	with open('reachability.dot') as f:  ;\
+	    for line in f:  ;\
+	        line = line.strip()  ;\
+	        if '->' in line:  ;\
+	            dst = line.split('->')[1].split('[')[0].strip().strip('\"').rstrip(';')  ;\
+	            targets.add(dst)  ;\
+	        elif 'label=' in line and '->' not in line and 'graph' not in line:  ;\
+	            node = line.split('[')[0].strip().strip('\"').rstrip(';')  ;\
+	            if node: nodes.add(node)  ;\
+	dead = sorted(nodes - targets)  ;\
+	skip = ('__', '_encode', '_decode', 'cli', 'main', 'Substrate.', 'Reader.', 'View.', 'Listener.', 'Protocol', 'Authoriser.')  ;\
+	real = [n for n in dead if not any(s in n for s in skip)]  ;\
+	print(f'{len(nodes)} nodes, {len(targets)} reached, {len(dead)} unreachable, {len(real)} after filtering')  ;\
+	for n in real: print(f'  {n.replace(chr(95)*2, chr(46)).lstrip(chr(46))}')"
 
 # CI-style gate: no writes, fails on any issue.
 check: lint format-check typecheck test
 
 clean:
-	rm -rf "$(VENV)" "$(TOOLS)/cache" .ruff_cache
+	rm -rf "$(VENV)" "$(TOOLS)/cache" .ruff_cache reachability.dot
 
 distclean: clean
 	rm -rf "$(TOOLS)"

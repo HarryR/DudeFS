@@ -6,7 +6,7 @@ from ..core.errors import InvariantError
 from ..core.units import Millis
 from ..net.address import Endpoint
 from ..store import Layer, Store, ops, settle
-from ..store.management import Cert, MgmtReader, MgmtWriter, NodeRecord, Role
+from ..store.management import Cert, MgmtWriter, NodeRecord, Role
 from ..store.ops import SignedTransaction
 from ..store.store import log_element
 from .canonical import bodies_canonical, hashes_canonical
@@ -35,9 +35,8 @@ def _apply_manager_signed_block(  # noqa: PLR0913 -- construction inputs, all re
     # every honest node refused it, and the intervened node was stranded on a chain nobody
     # would walk, with no reorg to heal it.
     bodies = bodies_canonical(bodies).txs
-    mgmt = MgmtReader(store)
     layer = Layer(store)
-    screened = settle.apply_to(layer, bodies, mgmt)
+    screened = settle.apply_to(layer, bodies, store.mgmt_reader)
     if screened.rejects:
         raise InvariantError(
             f"manager-signed bodies rejected by the evaluator: {screened.rejects!r}"
@@ -64,7 +63,7 @@ def _apply_manager_signed_block(  # noqa: PLR0913 -- construction inputs, all re
     block = Block(bucket=bucket, hashes=slice_hashes)
     manager_sig = master.sign(_settle_payload(block.slice_hash, anchors))
 
-    roster = mgmt.roster()
+    roster = store.mgmt_reader.roster()
     n = len(roster) + 1
 
     sb = SettledBlock(
@@ -79,7 +78,7 @@ def _apply_manager_signed_block(  # noqa: PLR0913 -- construction inputs, all re
         block_bytes=block_bytes,
         block_hash=sb.block_hash,
         batch=bodies,
-        auth=mgmt,
+        auth=store.mgmt_reader,
     )
     return SettledBlockWithBodies(block=sb, bodies=bodies)
 
@@ -149,11 +148,11 @@ def compose_genesis(
     rw_clients: Sequence[crypto.Keypair] = (),
     ts: Millis = 0,
 ) -> tuple[SignedTransaction, ...]:
-    from ..store.management import GRANTS_MAP, P_POP, Grant
+    from ..store.management import P_POP, Grant
 
     scratch = Store()
     scratch.provision(anchor.public)
-    w = MgmtWriter(scratch)
+    w = MgmtWriter(scratch.mgmt_session())
     tx = ops.Transaction(())
 
     grant_entries: list[tuple[bytes, bytes]] = []
@@ -161,7 +160,7 @@ def compose_genesis(
 
     def _grant(kp: crypto.Keypair, role: Role, stores: frozenset[int]) -> None:
         cert = Cert.sign_grant(anchor, kp.public, role)
-        if not w.verify_cert(cert, scratch):
+        if not w.verify_cert(cert):
             raise InvariantError(f"cert for {kp.public.hex()[:8]} does not verify")
         pop = kp.prove_possession()
         if not kp.public.verify_possession(pop):
@@ -178,7 +177,7 @@ def compose_genesis(
         _grant(kp, Role.CLIENT_RW, frozenset({ops.STORE_DATA}))
 
     if grant_entries:
-        tx = tx + GRANTS_MAP.batch_add(scratch, tuple(grant_entries))
+        tx = tx + w._grants.batch_add(tuple(grant_entries))
         tx = tx + ops.writes(*pop_steps)
 
     all_recipients = tuple(kp.public for kp in (*managers, *ro_clients, *rw_clients))

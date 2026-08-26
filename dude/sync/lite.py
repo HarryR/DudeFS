@@ -31,7 +31,7 @@ def _anchors(
     request: GetAnchors,
     liveness_window: int,
 ) -> AnchorsReply | LiteRefused:
-    mgmt = MgmtReader(r)
+    mgmt = r.mgmt_reader
     head_num = r.head_block_num()
     if not head_num:
         return LiteRefused(SyncRefusal.NO_STATE)
@@ -92,7 +92,7 @@ def _proof(  # noqa: PLR0911, PLR0912, C901 -- each early-return names a distinc
     needs the answer, and does it on the line above the one that would have built the headers.
     A live cluster moves the head every bucket, so that made a light client unable to read at
     all. Whether the walked head is CURRENT is the client's clock's call, not ours."""
-    mgmt = MgmtReader(r)
+    mgmt = r.mgmt_reader
     head_num = r.head_block_num()
     if not head_num:
         return LiteRefused(SyncRefusal.NO_STATE)

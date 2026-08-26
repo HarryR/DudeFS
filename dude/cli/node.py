@@ -10,7 +10,7 @@ from ..net.address import Address, Scheme
 from ..net.transports.tcp import TCPDialer, TCPListener, TCPTiming
 from ..node import Node
 from ..store import Store
-from ..store.management import MgmtReader
+
 from ..tunables import DEFAULT
 from .state import (
     BootstrapSeed,
@@ -60,14 +60,13 @@ def cmd_serve(args: argparse.Namespace) -> None:
         store.provision(seed.anchor)
         sb = SettledBlock.decode(block_bytes)
         ordered = bodies_canonical(bodies).txs
-        mgmt = MgmtReader(store)
         store.commit_block(
             sb.anchors.block_num,
             first_height=1,
             block_bytes=block_bytes,
             block_hash=sb.block_hash,
             batch=ordered,
-            auth=mgmt,
+            auth=store.mgmt_reader,
         )
         print(f"genesis block applied (block 1, {len(ordered)} transactions)")
 

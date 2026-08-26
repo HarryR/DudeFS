@@ -1,12 +1,11 @@
 import contextlib
 import threading
-from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from .consensus import Coordinator, Mempool, RoundAdapter, SettleAdapter
 from .core import crypto
 from .core.errors import DudeError
-from .session import KeyCache, Session, SubmitHandle
+from .session import KeyCache, SessionRW, SubmitHandle
 from .core.units import Millis, now_ms
 from .net import Verb, MessageId
 from .net.link import Listener
@@ -59,16 +58,16 @@ class _BaseNode:
         self.follower = Follower(
             me=self.me,
             store=self.store,
-            mgmt=MgmtReader(self.store),
+            mgmt_reader=self.store.mgmt_reader,
             tunables=self.tunables,
         )
 
     @property
-    def mgmt(self) -> MgmtReader:
-        return MgmtReader(self.store)
+    def mgmt_reader(self) -> MgmtReader:
+        return self.store.mgmt_reader
 
     def roster(self) -> tuple[crypto.PublicKey, ...]:
-        return self.store.mgmt.roster()
+        return self.store.mgmt_reader.roster()
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -118,8 +117,8 @@ class _BaseNode:
     # -- peer reconciliation ------------------------------------------------
 
     def _reconcile_peers(self) -> None:
-        nodes = self.mgmt.nodes()
-        roster = self.mgmt.roster()
+        nodes = self.mgmt_reader.nodes()
+        roster = self.mgmt_reader.roster()
         now = now_ms()
         peers: dict[crypto.PublicKey, tuple] = {}
         for pk in roster:
@@ -129,7 +128,7 @@ class _BaseNode:
             if rec is not None and rec.endpoints:
                 peers[pk] = rec.endpoints
             self.follower.add_peer(pk, now)
-        self.postman.sync(peers, authorized=self.mgmt.authorized_identities())
+        self.postman.sync(peers, authorized=self.mgmt_reader.authorized_identities())
 
     # -- shared helpers -----------------------------------------------------
 
@@ -176,35 +175,7 @@ class _BaseNode:
 # Node — consensus participant.
 # ---------------------------------------------------------------------------
 
-CONSENSUS_ONLY = frozenset(
-    {
-        Verb.BODIES,
-        Verb.HELD,
-        Verb.SIG,
-        Verb.SETTLE_SIG,
-    }
-)
-
-HANDLED = frozenset(
-    {
-        Verb.SUBMIT,
-        Verb.HELD,
-        Verb.SIG,
-        Verb.BODIES,
-        Verb.SETTLE_SIG,
-        Verb.HEIGHT,
-        Verb.HEIGHT_REPLY,
-        Verb.GETBLOCK,
-        Verb.SETTLED_BLOCK,
-        Verb.SYNC_REFUSED,
-        Verb.PING,
-        Verb.GET_ANCHORS,
-        Verb.GET_PROOF,
-        Verb.TX_STATUS,
-        Verb.GET_CHECKPOINT,
-        Verb.GET_CHUNKS,
-    }
-)
+CONSENSUS_ONLY = frozenset({Verb.BODIES, Verb.HELD, Verb.SIG, Verb.SETTLE_SIG})
 
 
 @dataclass(slots=True)
@@ -251,15 +222,28 @@ class Node(_BaseNode):
     # -- inbound dispatch ---------------------------------------------------
 
     def _on_delivered(self, d: Delivered, now: Millis) -> None:
-        fn = _DISPATCH.get(d.verb)
-        if fn is None:
-            return
         if d.verb in CONSENSUS_ONLY and not self._is_node(d.frm):
             return
-        fn(self, d, now)
+        match d.verb:
+            case Verb.SUBMIT: self._on_submit(d, now)
+            case Verb.HELD: self._on_held(d, now)
+            case Verb.SIG: self._on_sig(d, now)
+            case Verb.BODIES: self._on_bodies(d, now)
+            case Verb.SETTLE_SIG: self._on_settle_sig(d, now)
+            case Verb.HEIGHT: self._on_height(d, now)
+            case Verb.HEIGHT_REPLY: self._on_height_reply(d, now)
+            case Verb.GETBLOCK: self._on_getblock(d, now)
+            case Verb.SETTLED_BLOCK: self._on_settled_block(d, now)
+            case Verb.SYNC_REFUSED: self._on_sync_refused(d, now)
+            case Verb.PING: self._on_ping(d, now)
+            case Verb.GET_ANCHORS: self._on_get_anchors(d, now)
+            case Verb.GET_PROOF: self._on_get_proof(d, now)
+            case Verb.TX_STATUS: self._on_tx_status(d, now)
+            case Verb.GET_CHECKPOINT: self._on_get_checkpoint(d, now)
+            case Verb.GET_CHUNKS: self._on_get_chunks(d, now)
 
     def _is_node(self, who: crypto.PublicKey) -> bool:
-        return who == self.store.anchor() or self.mgmt.is_member(who)
+        return who == self.store.anchor() or self.mgmt_reader.is_member(who)
 
     # -- consensus verb handlers --------------------------------------------
 
@@ -346,7 +330,7 @@ class Node(_BaseNode):
             return self.postman.reply(d, LiteRefused(SyncRefusal.MALFORMED_QUERY), self.tunables.ttl_lite)
         if not isinstance(req, GetProof):
             return None
-        if not self.mgmt.may_read(self.store, d.frm, req.store_id):
+        if not self.mgmt_reader.may_read(self.store, d.frm, req.store_id):
             return self.postman.reply(d, LiteRefused(SyncRefusal.UNAUTHORISED), self.tunables.ttl_lite)
         return self.postman.reply(d, serve_get_proof(self.store, req, self.tunables.liveness_window), self.tunables.ttl_lite)
 
@@ -375,26 +359,14 @@ class Node(_BaseNode):
     def _lite_authorised(self, requester: crypto.PublicKey) -> bool:
         if requester == self.store.anchor():
             return True
-        if self.mgmt.is_member(requester):
+        if self.mgmt_reader.is_member(requester):
             return True
-        return self.mgmt.valid_grant(self.store, requester) is not None
-
-
-_DISPATCH: dict[Verb, Callable[[Node, Delivered, Millis], MessageId | None]] = {
-    v: getattr(Node, f"_on_{v.name.lower()}") for v in HANDLED
-}
+        return self.mgmt_reader.valid_grant(requester) is not None
 
 
 # ---------------------------------------------------------------------------
 # ReplicaNode — full validating follower, own state DB, no consensus.
 # ---------------------------------------------------------------------------
-
-_REPLICA_HANDLED = frozenset({
-    Verb.HEIGHT_REPLY,
-    Verb.SETTLED_BLOCK,
-    Verb.SYNC_REFUSED,
-    Verb.PING,
-})
 
 
 @dataclass(slots=True)
@@ -409,11 +381,11 @@ class ReplicaNode(_BaseNode):
             to, Verb.SUBMIT, tx.raw, self.tunables.ttl_exchange,
         )
 
-    def session(self, store_id: int = ops.STORE_DATA) -> Session:
+    def session(self, store_id: int = ops.STORE_DATA) -> SessionRW:
         sub = _ReplicaSubstrate(self)
         if self._key_cache is None:
             self._key_cache = KeyCache(self.me, sub)
-        return Session(sub, self.me, store_id, self._key_cache)
+        return SessionRW(sub, self.me, store_id)
 
     def _run(self) -> None:
         tick_interval = self.tunables.tick_interval / 1000
@@ -441,9 +413,11 @@ class ReplicaNode(_BaseNode):
             if handle is not None:
                 handle.resolve(d.verb, d.body)
             return
-        fn = _REPLICA_DISPATCH.get(d.verb)
-        if fn is not None:
-            fn(self, d, now)
+        match d.verb:
+            case Verb.HEIGHT_REPLY: self._on_height_reply(d, now)
+            case Verb.SETTLED_BLOCK: self._on_settled_block(d, now)
+            case Verb.SYNC_REFUSED: self._on_sync_refused(d, now)
+            case Verb.PING: self._on_ping(d, now)
 
 
 class _ReplicaSubstrate:
@@ -452,11 +426,14 @@ class _ReplicaSubstrate:
     def __init__(self, node: ReplicaNode) -> None:
         self._node = node
 
-    def get(self, store_id: int, name: bytes) -> Held | None:
-        return self._node.store.get(store_id, name)
+    def anchor(self) -> crypto.PublicKey:
+        return self._node.store.anchor()
+
+    def get(self, store: int, name: bytes) -> Held | None:
+        return self._node.store.get(store, name)
 
     def submit(self, tx: ops.SignedTransaction) -> SubmitHandle:
-        roster = self._node.mgmt.roster()
+        roster = self._node.mgmt_reader.roster()
         if not roster:
             raise DudeError("no roster members to submit to")
         target = roster[0]
@@ -482,6 +459,3 @@ class _ReplicaSubstrate:
             )
 
 
-_REPLICA_DISPATCH: dict[Verb, Callable[[ReplicaNode, Delivered, Millis], MessageId | None]] = {
-    v: getattr(ReplicaNode, f"_on_{v.name.lower()}") for v in _REPLICA_HANDLED
-}

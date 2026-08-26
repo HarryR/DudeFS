@@ -9,7 +9,7 @@ from .core.errors import DudeError
 from .core.units import now_ms
 from .net.envelope import MessageId, Verb
 from .store import ops
-from .store.layer import Held
+from .store.layer import Held, Reader
 from .store.management import blind_key, epoch_key, wrap_key
 
 
@@ -81,7 +81,8 @@ class SubmitHandle:
 
 
 class Substrate(Protocol):
-    def get(self, store_id: int, name: bytes) -> Held | None: ...
+    def anchor(self) -> crypto.PublicKey: ...
+    def get(self, store: int, name: bytes) -> Held | None: ...
     def submit(self, tx: ops.SignedTransaction) -> SubmitHandle: ...
     def settled(self, op_hash: crypto.Digest, peer: crypto.PublicKey | None = None) -> Settled | None: ...
     def evict_after_sec(self) -> float: ...
@@ -97,11 +98,11 @@ class _StoreKeys:
 
 
 class KeyCache:
-    __slots__ = ("_kp", "_stores", "_sub")
+    __slots__ = ("_kp", "_reader", "_stores")
 
-    def __init__(self, kp: crypto.Keypair, sub: Substrate) -> None:
+    def __init__(self, kp: crypto.Keypair, reader: Reader) -> None:
         self._kp = kp
-        self._sub = sub
+        self._reader = reader
         self._stores: dict[int, _StoreKeys] = {}
 
     def _keys(self, store_id: int) -> _StoreKeys:
@@ -115,7 +116,7 @@ class KeyCache:
         sk = self._keys(store_id)
         if sk.name_key is not None:
             return sk.name_key
-        raw = self._sub.get(ops.STORE_MANAGEMENT, blind_key(store_id, self._kp.public))
+        raw = self._reader.get(ops.STORE_MANAGEMENT, blind_key(store_id, self._kp.public))
         if raw is None:
             raise SessionError(
                 f"{self._kp.public.hex()[:8]} has no blinding key for store {store_id}"
@@ -127,7 +128,7 @@ class KeyCache:
     def value_key(self, store_id: int, epoch: int) -> crypto.ValueKey:
         sk = self._keys(store_id)
         if epoch not in sk.masters:
-            raw = self._sub.get(
+            raw = self._reader.get(
                 ops.STORE_MANAGEMENT, wrap_key(store_id, epoch, self._kp.public),
             )
             if raw is None:
@@ -143,7 +144,7 @@ class KeyCache:
         sk = self._keys(store_id)
         if sk.current_epoch is not None:
             return sk.current_epoch
-        raw = self._sub.get(ops.STORE_MANAGEMENT, epoch_key(store_id))
+        raw = self._reader.get(ops.STORE_MANAGEMENT, epoch_key(store_id))
         if raw is None:
             raise SessionError(f"no epoch for store {store_id}")
         sk.current_epoch = codec.as_int(codec.decode(raw.value))
@@ -151,13 +152,21 @@ class KeyCache:
 
 
 class Session:
-    __slots__ = ("_keys", "_kp", "_store_id", "_sub")
+    __slots__ = ("_keys", "_reader", "_store_id")
 
-    def __init__(self, sub: Substrate, kp: crypto.Keypair, store_id: int, keys: KeyCache) -> None:
-        self._sub = sub
-        self._kp = kp
+    def __init__(self, reader: Reader, store_id: int, kp: crypto.Keypair | None = None) -> None:
+        self._reader = reader
         self._store_id = store_id
-        self._keys = keys
+        self._keys: KeyCache | None = KeyCache(kp, reader) if kp is not None else None
+
+    def _require_keys(self) -> KeyCache:
+        if self._keys is None:
+            raise SessionError("data store operations require a keypair")
+        return self._keys
+
+    @property
+    def anchor(self) -> crypto.PublicKey:
+        return self._reader.anchor()
 
     @property
     def store_id(self) -> int:
@@ -168,7 +177,7 @@ class Session:
             return name if isinstance(name, bytes) else name.encode()
         if not isinstance(name, str):
             raise SessionError("data store keys must be str, not bytes")
-        nk = self._keys.ensure_blinding(self._store_id)
+        nk = self._require_keys().ensure_blinding(self._store_id)
         return crypto.derive_name_token(nk, _name_bytes(name))
 
     def _aad(self, token: bytes, epoch: int) -> bytes:
@@ -178,24 +187,23 @@ class Session:
         if self._store_id == ops.STORE_MANAGEMENT:
             return ciphertext
         nt = crypto.NameToken(self.token(name))
-        vk = self._keys.value_key(self._store_id, epoch)
+        vk = self._require_keys().value_key(self._store_id, epoch)
         item = crypto.derive_item_key(vk, nt)
         return crypto.AeadXcs1.open(item, self._aad(nt, epoch), crypto.AeadBlob(ciphertext))
 
     def seal(self, name: str | bytes, value: bytes) -> tuple[bytes, bytes, int]:
         if self._store_id == ops.STORE_MANAGEMENT:
             return self.token(name), value, ops.EPOCH_NONE
-        epoch = self._keys.current_epoch(self._store_id)
+        keys = self._require_keys()
+        epoch = keys.current_epoch(self._store_id)
         nt = crypto.NameToken(self.token(name))
-        vk = self._keys.value_key(self._store_id, epoch)
+        vk = keys.value_key(self._store_id, epoch)
         item = crypto.derive_item_key(vk, nt)
         return nt, bytes(crypto.AeadXcs1.seal(item, self._aad(nt, epoch), value)), epoch
 
-    # -- public interface ---------------------------------------------------
-
     def get(self, name: str | bytes) -> Record:
         token = self.token(name)
-        raw = self._sub.get(self._store_id, token)
+        raw = self._reader.get(self._store_id, token)
         if raw is None:
             return Record(
                 name=name, store_id=self._store_id, token=token,
@@ -206,6 +214,15 @@ class Session:
             name=name, store_id=self._store_id, token=token,
             value=plaintext, raw=raw.value, epoch=raw.epoch, absent=False,
         )
+
+
+class SessionRW(Session):
+    __slots__ = ("_kp", "_sub")
+
+    def __init__(self, sub: Substrate, kp: crypto.Keypair, store_id: int) -> None:
+        super().__init__(sub, store_id, kp)
+        self._kp = kp
+        self._sub = sub
 
     def put(
         self,
@@ -231,18 +248,6 @@ class Session:
         tx = ops.Transaction((ops.Step(guards, ops.Del(self._store_id, token)),))
         return self.submit(tx)
 
-    def compact(self, block_num: int) -> SubmitHandle:
-        from .store.management import P_COMPACT  # noqa: PLC0415
-        held = self._sub.get(ops.STORE_MANAGEMENT, P_COMPACT)
-        guard: ops.Predicate
-        if held is None:
-            guard = ops.Absent(ops.STORE_MANAGEMENT, P_COMPACT)
-        else:
-            guard = ops.Holds(ops.STORE_MANAGEMENT, P_COMPACT, ops.value_digest(held.value))
-        value = block_num.to_bytes(8, "big")
-        tx = ops.Transaction((ops.Step((guard,), ops.Set(ops.STORE_MANAGEMENT, P_COMPACT, value)),))
-        return self.submit(tx)
-
     def begin(self) -> "TxBuilder":
         return TxBuilder(self)
 
@@ -252,7 +257,7 @@ class Session:
 
 
 class TxBuilder:
-    def __init__(self, session: Session) -> None:
+    def __init__(self, session: SessionRW) -> None:
         self._session = session
         self._steps: list[ops.Step] = []
 

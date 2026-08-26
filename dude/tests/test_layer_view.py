@@ -9,8 +9,6 @@ from collections.abc import Sequence
 
 from ..core import crypto
 from ..store import Layer, LayerError, Overlay, Store, ops
-from ..store.management import MgmtReader
-
 D = ops.STORE_DATA
 
 
@@ -29,7 +27,7 @@ def _seed_store(kp: crypto.Keypair, count: int) -> Store:
     if count:
         s.apply(
             (_writes(kp, [ops.Set(D, crypto.h(f"seed{i}".encode()), b"v") for i in range(count)]),),
-            auth=MgmtReader(s),
+            auth=s.mgmt_reader,
         )
     return s
 
@@ -103,7 +101,7 @@ class TestAccumulatorProjection(unittest.TestCase):
     def _committed(self, seed: int, muts: Sequence[ops.Mutation]) -> crypto.Accumulator:
         """The reference: seed the Store, apply the mutations, read A_state."""
         s = _seed_store(self.kp, seed)
-        s.apply((_writes(self.kp, muts, ts=2),), auth=MgmtReader(s))
+        s.apply((_writes(self.kp, muts, ts=2),), auth=s.mgmt_reader)
         return s.accumulator()
 
     def _projected(self, seed: int, muts: Sequence[ops.Mutation]) -> crypto.Accumulator:
@@ -174,7 +172,7 @@ class TestStateRootProjection(unittest.TestCase):
 
     def _committed(self, seed: int, muts: Sequence[ops.Mutation]) -> crypto.Digest:
         s = _seed_store(self.kp, seed)
-        s.apply((_writes(self.kp, muts, ts=2),), auth=MgmtReader(s))
+        s.apply((_writes(self.kp, muts, ts=2),), auth=s.mgmt_reader)
         return s.state_root()
 
     def _projected(self, seed: int, muts: Sequence[ops.Mutation]) -> crypto.Digest:
@@ -261,7 +259,7 @@ class TestFrozenLayerAsBase(unittest.TestCase):
         # Reference: commit A and B as one flat transaction
         ref = _seed_store(self.kp, 2)
         ref_tx = _writes(self.kp, muts_a + muts_b, ts=2)
-        ref.apply((ref_tx,), auth=MgmtReader(ref))
+        ref.apply((ref_tx,), auth=ref.mgmt_reader)
 
         # Overlay: same transaction, split across two stacked Layers, same tx.raw as credential
         inner = Layer(s)

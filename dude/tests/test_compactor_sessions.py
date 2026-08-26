@@ -26,7 +26,7 @@ class TestCompactorFromReplicaNode(unittest.TestCase):
 
             anchor_node = c.boot_replica(c.anchor)
             c.wait_head(c.nodes[0].store.head(), nodes=[anchor_node])
-            w = MgmtWriter(anchor_node.store)
+            w = anchor_node.store.mgmt_writer
 
             compactor_kp = crypto.Keypair.generate()
             grant = w.authorise(
@@ -39,10 +39,10 @@ class TestCompactorFromReplicaNode(unittest.TestCase):
 
             compactor_node = c.boot_replica(compactor_kp)
             c.wait_head(c.nodes[0].store.head(), nodes=[compactor_node])
-            cs = compactor_node.session()
+            cs = compactor_node.session(store_id=ops.STORE_MANAGEMENT)
 
             block_num = c.nodes[0].store.head_block_num() or 0
-            c.wait_settled(cs.compact(block_num).wait())
+            c.wait_settled(cs.submit(MgmtWriter(cs).compact(block_num)).wait())
 
             held = c.nodes[0].store.get(ops.STORE_MANAGEMENT, b"compact")
             self.assertIsNotNone(held)
@@ -63,7 +63,7 @@ class TestCompactorFromLightClient(unittest.TestCase):
 
             anchor_node = c.boot_replica(c.anchor)
             c.wait_head(c.nodes[0].store.head(), nodes=[anchor_node])
-            w = MgmtWriter(anchor_node.store)
+            w = anchor_node.store.mgmt_writer
 
             compactor_kp = crypto.Keypair.generate()
             grant = w.authorise(
@@ -86,9 +86,9 @@ class TestCompactorFromLightClient(unittest.TestCase):
             lc.bootstrap(now_ms())
             c.wait(lambda _: lc.bootstrapped())
 
-            cs = lc.session()
+            cs = lc.session(store_id=ops.STORE_MANAGEMENT)
             block_num = lc.trusted_state.head.anchors.block_num
-            c.wait_settled(cs.compact(block_num).wait())
+            c.wait_settled(cs.submit(MgmtWriter(cs).compact(block_num)).wait())
 
             held = c.nodes[0].store.get(ops.STORE_MANAGEMENT, b"compact")
             self.assertIsNotNone(held)
