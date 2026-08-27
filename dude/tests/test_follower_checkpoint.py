@@ -59,10 +59,10 @@ class TestColdJoinerCatchesUpViaCheckpoint(unittest.TestCase):
             joiner_kp = crypto.Keypair.generate()
             c.wait_settled(anchor_s.submit(w.authorise(
                 joiner_kp.public,
-                Role.CLIENT_RW,
-                stores=frozenset({ops.STORE_DATA}),
+                Role.MANAGER,
+                stores=frozenset({ops.STORE_MANAGEMENT, ops.STORE_DATA}),
                 pop=joiner_kp.prove_possession(),
-                cert=Cert.sign_grant(c.anchor, joiner_kp.public, Role.CLIENT_RW),
+                cert=Cert.sign_grant(c.anchor, joiner_kp.public, Role.MANAGER),
             )).wait())
 
             joiner = c.boot_replica(joiner_kp)

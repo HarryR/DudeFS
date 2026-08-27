@@ -13,7 +13,7 @@ from .net.link import Listener
 from .net.postman import Delivered, Postman
 from .store import Store, ops
 from .store.layer import Held, Settled
-from .store.management import MgmtReader
+from .store.management import MgmtReader, Role
 from .sync.adapter import (
     GetBlocks,
     Refused,
@@ -358,6 +358,8 @@ class Node(_BaseNode):
         return self.postman.reply(d, serve_height(self.store), self.tunables.ttl_exchange)
 
     def _on_getblock(self, d: Delivered, now: Millis) -> MessageId | None:
+        if not self._replica_authorised(d.frm):
+            return self.postman.reply(d, Refused(reason=SyncRefusal.UNAUTHORISED), self.tunables.ttl_exchange)
         try:
             req = SyncMsg.decode(d.verb, d.body)
         except SyncAdapterError:
@@ -370,7 +372,17 @@ class Node(_BaseNode):
 
     # -- serving checkpoint requests -----------------------------------------
 
+    def _replica_authorised(self, who: crypto.PublicKey) -> bool:
+        if who == self.store.anchor() or self.mgmt_reader.is_member(who):
+            return True
+        grant = self.mgmt_reader.grant_of(who)
+        return grant is not None and grant.role in (Role.MANAGER, Role.COMPACTOR)
+
     def _on_get_checkpoint(self, d: Delivered, now: Millis) -> MessageId | None:
+        if not self._replica_authorised(d.frm):
+            return self.postman.reply(
+                d, Refused(reason=SyncRefusal.UNAUTHORISED), self.tunables.ttl_exchange,
+            )
         if self.checkpoint_server is None:
             return self.postman.reply(
                 d, Refused(reason=SyncRefusal.NO_STATE), self.tunables.ttl_exchange,
@@ -380,6 +392,10 @@ class Node(_BaseNode):
         )
 
     def _on_get_chunks(self, d: Delivered, now: Millis) -> MessageId | None:
+        if not self._replica_authorised(d.frm):
+            return self.postman.reply(
+                d, Refused(reason=SyncRefusal.UNAUTHORISED), self.tunables.ttl_exchange,
+            )
         if self.checkpoint_server is None:
             return self.postman.reply(
                 d, Refused(reason=SyncRefusal.NO_STATE), self.tunables.ttl_exchange,
