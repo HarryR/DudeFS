@@ -102,6 +102,11 @@ class _TCPConn:
         with contextlib.suppress(OSError):
             self._sock.close()
 
+    def join(self) -> None:
+        self._shutdown()
+        self._reader.join()
+        self._writer.join()
+
     def _fail(self) -> None:
         self._shutdown()
         self.link.notify_closed()
@@ -163,7 +168,9 @@ def _bound_sends(sock: socket.socket, seconds: float) -> None:
 
 class _DialWorker:
     __slots__ = (
-        "_address", "_on_frame", "_on_link", "_stopping", "_thread", "_timing",
+        "_address", "_on_frame", "_on_link",
+        "_stopping", "_thread", "_timing",
+        "_pending_sock", "_sock_lock",
     )
 
     def __init__(
@@ -178,6 +185,8 @@ class _DialWorker:
         self._on_frame = on_frame
         self._on_link = on_link
         self._stopping = threading.Event()
+        self._pending_sock: socket.socket | None = None
+        self._sock_lock = threading.Lock()
         self._thread = threading.Thread(
             target=self._serve, name=f"tcp-dial-{address.value}", daemon=True
         )
@@ -185,41 +194,50 @@ class _DialWorker:
 
     def stop(self) -> None:
         self._stopping.set()
+        with self._sock_lock:
+            if self._pending_sock is not None:
+                with contextlib.suppress(OSError):
+                    self._pending_sock.close()
+
+    def join(self) -> None:
+        self._thread.join()
 
     def _serve(self) -> None:
         while not self._stopping.is_set():
-            try:
-                sock = _connect(self._address, self._timing.connect_sec)
-            except LinkError:
-                self._wait()
+            sock = self._try_connect()
+            if sock is None:
+                self._stopping.wait(timeout=self._timing.connect_sec)
                 continue
             conn = _TCPConn(sock, self._address, self._timing, self._on_frame, self._on_link)
-            conn.link.on_close = lambda _ln: None  # death already notified via notify_closed
-            # block until this connection dies, then retry
+            conn.link.on_close = lambda _ln: None
             while not conn._closed and not self._stopping.is_set():  # noqa: SLF001
                 self._stopping.wait(timeout=self._timing.idle_wait_sec)
-            self._wait()
+            conn.join()
 
-    def _wait(self) -> None:
-        self._stopping.wait(timeout=self._timing.connect_sec)
-
-
-def _connect(address: Address, timeout_sec: float) -> socket.socket:
-    host, _, port_s = address.value.partition(":")
-    if not port_s:
-        raise LinkError(f"tcp address missing port: {address.value}")
-    try:
-        port = int(port_s)
-    except ValueError as e:
-        raise LinkError(f"tcp address has non-integer port: {address.value}") from e
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(timeout_sec)
-    try:
-        sock.connect((host, port))
-    except OSError as e:
-        sock.close()
-        raise LinkError(f"tcp connect to {address.value} failed: {e}") from e
-    return sock
+    def _try_connect(self) -> socket.socket | None:
+        host, _, port_s = self._address.value.partition(":")
+        if not port_s:
+            return None
+        try:
+            port = int(port_s)
+        except ValueError:
+            return None
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(self._timing.connect_sec)
+        with self._sock_lock:
+            if self._stopping.is_set():
+                sock.close()
+                return None
+            self._pending_sock = sock
+        try:
+            sock.connect((host, port))
+        except OSError:
+            sock.close()
+            return None
+        finally:
+            with self._sock_lock:
+                self._pending_sock = None
+        return sock
 
 
 @dataclass(slots=True)
@@ -251,6 +269,8 @@ class TCPDialer(Listener):
         self._stopping.set()
         for worker in self._workers.values():
             worker.stop()
+        for worker in self._workers.values():
+            worker.join()
         self._workers.clear()
 
 
@@ -307,7 +327,7 @@ class TCPListener(Listener):
         if thread is not None:
             thread.join()
         for conn in self._conns:
-            conn.link.close()
+            conn.join()
         self._conns.clear()
 
     def _accept_loop(self) -> None:
