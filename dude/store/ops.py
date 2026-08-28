@@ -129,6 +129,13 @@ class Transaction:
     def then(self, mutation: Mutation, *guards: Predicate) -> Transaction:
         return Transaction((*self.steps, Step(tuple(guards), mutation)))
 
+    def encode(self) -> bytes:
+        return codec.encode([st.encode() for st in self.steps])
+
+    @classmethod
+    def decode(cls, raw: bytes) -> Transaction:
+        return cls(tuple(Step.decode(s) for s in codec.as_seq(codec.decode(raw))))
+
     def sign(self, kp: crypto.Keypair, ts: int) -> SignedTransaction:
         return SignedTransaction(
             kp.public, ts, self, kp.sign(_body_bytes(kp.public, ts, self.steps))

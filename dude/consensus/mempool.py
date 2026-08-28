@@ -2,12 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from abc import abstractmethod
-
 from ..core import crypto
 from ..core.units import Bucket, Millis
 from ..store import ops, settle
-from ..store.layer import Reader
+from ..store.layer import Ledger, Reader
 from ..tunables import Tunables
 
 
@@ -28,11 +26,6 @@ TOO_NEW = Refusal.TOO_NEW
 DUPLICATE = Refusal.DUPLICATE
 UNSIGNED = Refusal.UNSIGNED
 CANNOT_APPLY = Refusal.CANNOT_APPLY
-
-
-class Ledger(Reader):
-    @abstractmethod
-    def has_settled(self, op_hash: crypto.Digest) -> bool: ...
 
 
 @dataclass(slots=True)

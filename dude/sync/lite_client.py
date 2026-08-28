@@ -16,7 +16,7 @@ from ..net.envelope import MessageId, Verb
 from ..net.link import Listener
 from ..net.postman import Delivered, Postman
 from ..store import smt
-from ..store.layer import Held, Settled
+from ..store.layer import BlockHead, Held
 from ..store.management import (
     CERT_PURPOSE_ROSTER,
     CERT_PURPOSE_ROSTER_COMMITMENT,
@@ -44,7 +44,7 @@ from .lite_adapter import (
     TxStatusReply,
 )
 
-from ..session import KeyCache, SessionRW, SubmitHandle, Substrate
+from ..session import KeyCache, SessionRW, Settled, SubmitHandle, SubmitResult, Substrate
 from ..store import ops
 
 
@@ -176,6 +176,7 @@ class LightClient:
     _peer_views: dict[crypto.PublicKey, PeerView] = field(default_factory=dict, init=False)
 
     _commit_cond: threading.Condition = field(default_factory=threading.Condition, init=False)
+    _commit_seq: int = field(default=0, init=False)
     _stopping: threading.Event = field(default_factory=threading.Event, init=False)
     _thread: threading.Thread | None = field(default=None, init=False)
 
@@ -289,6 +290,7 @@ class LightClient:
                         activity = True
             if activity:
                 with self._commit_cond:
+                    self._commit_seq += 1
                     self._commit_cond.notify_all()
             if self.state is State.BOOTSTRAPPING:
                 with contextlib.suppress(DudeError):
@@ -580,7 +582,7 @@ class _LiteSubstrate(Substrate):
 
         return handle
 
-    def settled(self, op_hash: crypto.Digest) -> Settled | None:
+    def settled(self, op_hash: crypto.Digest) -> SubmitResult | None:
         peer = self._pick_peer()
         mid = MessageId.random()
         handle = _TxStatusHandle(mid=mid, peer=peer)
@@ -606,6 +608,19 @@ class _LiteSubstrate(Substrate):
         cap = self._lc.tunables.block_time / 1000
         with self._lc._commit_cond:
             self._lc._commit_cond.wait(min(timeout, cap))
+
+    @property
+    def commit_cond(self) -> threading.Condition:
+        return self._lc._commit_cond
+
+    def commit_generation(self) -> int:
+        return self._lc._commit_seq
+
+    def head(self) -> BlockHead | None:
+        ts = self._lc.trusted_state
+        if ts is None:
+            return None
+        return BlockHead(ts.head.anchors.block_num, ts.head.block_hash)
 
 
 def _contiguous_from(head_num: int, offered: tuple[SettledBlock, ...]) -> tuple[SettledBlock, ...]:

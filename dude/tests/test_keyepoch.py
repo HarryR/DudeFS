@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import unittest
 
 from dude.consensus.bootstrap import bootstrap, intervene, mint_first_keyepoch
@@ -9,7 +10,8 @@ from dude.core import codec, crypto
 from dude.core.errors import DudeError
 from dude.session import KeyCache, SessionRW, Substrate
 from dude.store import Store, ops, settle
-from dude.store.layer import Held, Settled
+from dude.session import SubmitResult
+from dude.store.layer import Held
 from dude.store.management import Cert, MgmtWriter, Role, epoch_key
 
 from .cluster import Cluster
@@ -60,13 +62,23 @@ class _StoreSubstrate(Substrate):
     def submit(self, tx: ops.Transaction) -> ...:
         raise NotImplementedError
 
-    def settled(self, op_hash: crypto.Digest) -> Settled | None:
+    def settled(self, op_hash: crypto.Digest) -> SubmitResult | None:
         raise NotImplementedError
 
     def evict_after_sec(self) -> float:
         raise NotImplementedError
 
     def wait_for_commit(self, timeout: float) -> None:
+        raise NotImplementedError
+
+    @property
+    def commit_cond(self) -> threading.Condition:
+        raise NotImplementedError
+
+    def commit_generation(self) -> int:
+        raise NotImplementedError
+
+    def head(self):
         raise NotImplementedError
 
 

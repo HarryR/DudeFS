@@ -3,7 +3,7 @@ import unittest
 
 from ..core.units import now_ms
 from ..store import ops
-from ..store.layer import Settled
+from ..session import Settled
 
 from .cluster import Cluster
 

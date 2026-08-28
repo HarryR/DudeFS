@@ -8,7 +8,7 @@ from ..net.postman import Postman
 from ..net.transports.inproc import InProcListener, InProcNexus
 from ..node import Node, ReplicaNode
 from ..store import Store, ops
-from ..store.layer import Settled
+from ..session import Settled
 from ..sync.lite_client import LightClient
 from ..tunables import Tunables
 

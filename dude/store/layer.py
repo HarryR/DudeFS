@@ -3,7 +3,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Iterator
 from typing import Any, NamedTuple
 
-from ..core import crypto
+from ..core import codec, crypto
 from . import ops, smt
 from .errors import StoreError
 
@@ -26,11 +26,26 @@ class Held(NamedTuple):
     epoch: int
     cred: bytes
 
+    def encode(self) -> bytes:
+        return codec.encode([self.value, self.epoch, self.cred])
 
-class Settled(NamedTuple):
-    op_hash: crypto.Digest
+    @classmethod
+    def decode(cls, raw: bytes) -> "Held":
+        parts = codec.as_seq(codec.decode(raw), 3)
+        return cls(codec.as_bytes(parts[0]), codec.as_int(parts[1]), codec.as_bytes(parts[2]))
+
+
+class BlockHead(NamedTuple):
     block_num: Index
     block_hash: crypto.Digest
+
+    def encode(self) -> bytes:
+        return codec.encode([self.block_num, self.block_hash])
+
+    @classmethod
+    def decode(cls, raw: bytes) -> "BlockHead":
+        parts = codec.as_seq(codec.decode(raw), 2)
+        return cls(codec.as_int(parts[0]), crypto.Digest(codec.as_bytes(parts[1])))
 
 
 class Reader(ABC):
@@ -38,6 +53,11 @@ class Reader(ABC):
     def get(self, store: int, name: bytes) -> Held | None: ...
     @abstractmethod
     def anchor(self) -> crypto.PublicKey: ...
+
+
+class Ledger(Reader):
+    @abstractmethod
+    def has_settled(self, op_hash: crypto.Digest) -> bool: ...
 
 
 class View(Reader):

@@ -6,13 +6,13 @@ from dataclasses import dataclass, field
 from .consensus import Coordinator, Mempool, RoundAdapter, SettleAdapter
 from .core import crypto
 from .core.errors import DudeError
-from .session import KeyCache, SessionRW, SubmitHandle, Substrate
+from .session import KeyCache, SessionRW, Settled, SubmitHandle, SubmitResult, Substrate
 from .core.units import Millis, now_ms
 from .net import Verb, MessageId
 from .net.link import Listener
 from .net.postman import Delivered, Postman
 from .store import Store, ops
-from .store.layer import Held, Settled
+from .store.layer import BlockHead, Held
 from .store.management import MgmtReader, Role
 from .sync.adapter import (
     GetBlocks,
@@ -563,7 +563,7 @@ class _ReplicaSubstrate(Substrate):
         )
         return handle
 
-    def settled(self, op_hash: crypto.Digest) -> Settled | None:
+    def settled(self, op_hash: crypto.Digest) -> SubmitResult | None:
         return self._node.store.settlement_of(op_hash)
 
     def evict_after_sec(self) -> float:
@@ -575,6 +575,22 @@ class _ReplicaSubstrate(Substrate):
             self._node._commit_cond.wait_for(
                 lambda: self._node._commit_seq > seq, timeout=timeout,
             )
+
+    @property
+    def commit_cond(self) -> threading.Condition:
+        return self._node._commit_cond
+
+    def commit_generation(self) -> int:
+        return self._node._commit_seq
+
+    def head(self) -> BlockHead | None:
+        num = self._node.store.head_block_num()
+        if num is None:
+            return None
+        h = self._node.store.head_block_hash()
+        if h is None:
+            return None
+        return BlockHead(num, h)
 
 
 

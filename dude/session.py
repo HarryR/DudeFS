@@ -1,4 +1,5 @@
 
+import threading
 import time
 import unicodedata
 from dataclasses import dataclass, field
@@ -8,7 +9,7 @@ from .core import codec, crypto
 from .core.errors import DudeError
 from .net.envelope import MessageId, Verb
 from .store import ops
-from .store.layer import Held, Reader
+from .store.layer import BlockHead, Held, Reader
 from .store.management import blind_key, epoch_key, wrap_key
 
 
@@ -26,20 +27,54 @@ class Record:
     absent: bool
 
 
-from .store.layer import Settled
+from .store.layer import Index
+
+
+class SubmitResult(ABC):
+    @abstractmethod
+    def encode(self) -> bytes: ...
+
+    @classmethod
+    def decode(cls, raw: bytes) -> "SubmitResult":
+        parts = codec.as_seq(codec.decode(raw))
+        tag = codec.as_bytes(parts[0])
+        if tag == b"S":
+            return Settled(
+                crypto.Digest(codec.as_bytes(parts[1])),
+                codec.as_int(parts[2]),
+                crypto.Digest(codec.as_bytes(parts[3])),
+            )
+        if tag == b"R":
+            return Refused(codec.as_bytes(parts[1]).decode())
+        if tag == b"D":
+            return Dropped()
+        raise DudeError(f"unknown SubmitResult tag: {tag!r}")
 
 
 @dataclass(frozen=True, slots=True)
-class Refused:
+class Settled(SubmitResult):
+    op_hash: crypto.Digest
+    block_num: Index
+    block_hash: crypto.Digest
+
+    def encode(self) -> bytes:
+        return codec.encode([b"S", self.op_hash, self.block_num, self.block_hash])
+
+
+@dataclass(frozen=True, slots=True)
+class Refused(SubmitResult):
     reason: str
 
+    def encode(self) -> bytes:
+        return codec.encode([b"R", self.reason.encode()])
+
 
 @dataclass(frozen=True, slots=True)
-class Dropped:
-    pass
+class Dropped(SubmitResult):
+    def encode(self) -> bytes:
+        return codec.encode([b"D"])
 
 
-type SubmitResult = Settled | Refused | Dropped
 
 
 @dataclass(slots=True)
@@ -61,15 +96,16 @@ class SubmitHandle:
         if not self._accepted and self._refused_reason is None:
             self._refused_reason = "expired"
 
-    def wait(self) -> SubmitResult:
+    def poll(self) -> SubmitResult | None:
         if self._refused_reason is not None:
             return Refused(self._refused_reason)
+        return self._sub.settled(self.op_hash)
+
+    def wait(self) -> SubmitResult:
         evict = self._sub.evict_after_sec()
         deadline = time.monotonic() + evict
         while time.monotonic() < deadline:
-            if self._refused_reason is not None:
-                return Refused(self._refused_reason)
-            result = self._sub.settled(self.op_hash)
+            result = self.poll()
             if result is not None:
                 return result
             remaining = deadline - time.monotonic()
@@ -83,11 +119,18 @@ class Substrate(Reader, ABC):
     @abstractmethod
     def submit(self, tx: ops.Transaction) -> "SubmitHandle": ...
     @abstractmethod
-    def settled(self, op_hash: crypto.Digest) -> Settled | None: ...
+    def settled(self, op_hash: crypto.Digest) -> "SubmitResult | None": ...
     @abstractmethod
     def evict_after_sec(self) -> float: ...
     @abstractmethod
     def wait_for_commit(self, timeout: float) -> None: ...
+    @property
+    @abstractmethod
+    def commit_cond(self) -> "threading.Condition": ...
+    @abstractmethod
+    def commit_generation(self) -> int: ...
+    @abstractmethod
+    def head(self) -> BlockHead | None: ...
     @abstractmethod
     def token(self, store_id: int, name: str) -> bytes: ...
     @abstractmethod

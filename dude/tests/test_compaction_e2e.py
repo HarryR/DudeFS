@@ -6,7 +6,7 @@ from dude.consensus.settle_round import SettledBlock
 from dude.core import crypto
 from dude.store import Store, ops
 from dude.store.checkpoint import CheckpointMeta
-from dude.store.layer import Settled
+from dude.session import Settled
 from dude.store.management import (
     Cert,
     MgmtWriter,

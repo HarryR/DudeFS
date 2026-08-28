@@ -1,6 +1,12 @@
-"""Analyze a pyan3 dot graph to find production functions with no callers."""
+"""Analyze a pyan3 dot graph for unreachable production code.
+
+pyan3 cannot trace abstract dispatch, property access, or match-statement
+dispatch. This script reports raw unreachable nodes grouped by module so
+a human can spot genuine dead code among the structural false positives.
+"""
 
 import sys
+from collections import defaultdict
 
 
 def analyze(dot_path: str) -> None:
@@ -20,31 +26,33 @@ def analyze(dot_path: str) -> None:
 
     dead = sorted(nodes - targets)
 
-    # False positives: protocols (called via duck typing), magic methods,
-    # encode/decode (called via base-class dispatch), entry points, dispatch handlers
-    skip = (
-        "__",
-        "_encode",
-        "_decode",
-        "cli",
-        "main",
-        "Substrate.",
-        "Reader.",
-        "View.",
-        "Listener.",
-        "Protocol",
-        "Authoriser.",
-        "_on_",
-    )
-    real = [n for n in dead if not any(s in n for s in skip)]
+    by_module: dict[str, list[str]] = defaultdict(list)
+    modules = 0
+    magic = 0
 
-    def clean(name: str) -> str:
-        return name.replace("__", ".").replace("dude.", "").lstrip(".")
+    for n in dead:
+        clean = n.replace("__", ".").replace("dude.", "").lstrip(".")
+        parts = clean.rsplit(".", 1)
+        method = parts[1] if len(parts) == 2 else ""
 
-    print(f"{len(nodes)} nodes, {len(targets)} reached, {len(dead)} unreachable raw, {len(real)} after filtering")
+        if "." not in clean:
+            modules += 1
+            continue
+        if method.startswith(".") and method.endswith("."):
+            magic += 1
+            continue
+
+        mod = clean.rsplit(".", 1)[0]
+        by_module[mod].append(method or clean)
+
+    total_reported = sum(len(v) for v in by_module.values())
+    print(f"{len(nodes)} nodes, {len(targets)} reached, {len(dead)} unreachable raw")
+    print(f"  {modules} module entries, {magic} magic methods, {total_reported} reported")
     print()
-    for n in real:
-        print(f"  {clean(n)}")
+
+    for mod in sorted(by_module):
+        methods = by_module[mod]
+        print(f"  {mod}: {', '.join(methods)}")
 
 
 if __name__ == "__main__":

@@ -11,13 +11,12 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, NamedTuple
 
 if TYPE_CHECKING:
-    from ..session import Session
+    from ..session import Session, Settled
 
-from ..consensus.mempool import Ledger
 from ..core import codec, crypto
 from ..core.errors import InvariantError
 from . import ops, settle, smt
-from .layer import Held, Index, PathRow, Settled, View, holds
+from .layer import Held, Index, Ledger, PathRow, View, holds
 from .management import MgmtReader, MgmtWriter
 from .smt_sync import _ExportSource, _ImportTarget
 
@@ -288,6 +287,7 @@ class StoreReader(View, Ledger, _ExportSource):
         return bool(self.settled_hashes((op_hash,)))
 
     def settlement_of(self, op_hash: crypto.Digest) -> Settled | None:
+        from ..session import Settled  # noqa: PLC0415
         row = self._conn.execute(
             "SELECT b.block_num, b.hash FROM entry e"
             " JOIN block b ON e.idx BETWEEN b.first_height AND b.height"
