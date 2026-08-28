@@ -6,7 +6,8 @@ import threading
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import NamedTuple, Protocol
+from abc import ABC, abstractmethod
+from typing import NamedTuple
 
 from ..core import crypto
 from ..core.errors import DudeError
@@ -40,7 +41,8 @@ def recipients(
     return [target] if target != me else []
 
 
-class Encodable(Protocol):
+class Encodable(ABC):
+    @abstractmethod
     def encode(self) -> tuple[Verb, bytes]: ...
 
 

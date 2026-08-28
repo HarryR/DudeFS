@@ -6,6 +6,7 @@ from typing import ClassVar
 from ..core import codec, crypto
 from ..core.errors import DudeError
 from ..net.envelope import Verb
+from ..net.postman import Encodable
 from ..store.layer import PathRow
 from ..store.smt_sync import Chunk
 
@@ -14,7 +15,7 @@ class CheckpointAdapterError(DudeError): ...
 
 
 @dataclass(frozen=True, slots=True)
-class GetCheckpoint:
+class GetCheckpoint(Encodable):
     verb: ClassVar[Verb] = Verb.GET_CHECKPOINT
 
     def encode(self) -> tuple[Verb, bytes]:
@@ -26,7 +27,7 @@ class GetCheckpoint:
 
 
 @dataclass(frozen=True, slots=True)
-class CheckpointMetaReply:
+class CheckpointMetaReply(Encodable):
     verb: ClassVar[Verb] = Verb.CHECKPOINT_META
 
     meta_bytes: bytes
@@ -40,7 +41,7 @@ class CheckpointMetaReply:
 
 
 @dataclass(frozen=True, slots=True)
-class GetChunks:
+class GetChunks(Encodable):
     verb: ClassVar[Verb] = Verb.GET_CHUNKS
 
     checkpoint_id: crypto.Digest
@@ -89,7 +90,7 @@ def _decode_chunk(raw: bytes) -> Chunk:
 
 
 @dataclass(frozen=True, slots=True)
-class ChunksReply:
+class ChunksReply(Encodable):
     verb: ClassVar[Verb] = Verb.CHUNKS_REPLY
 
     chunks: tuple[Chunk, ...]

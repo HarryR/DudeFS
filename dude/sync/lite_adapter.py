@@ -9,6 +9,7 @@ from ..consensus.settle_round import SettledBlock
 from ..core import codec, crypto
 from ..core.errors import DudeError
 from ..net.envelope import Verb
+from ..net.postman import Encodable
 from ..store.management import Cert, Grant, NodeRecord
 from .refusal import SyncRefusal
 
@@ -58,7 +59,7 @@ class RosterBundle:
         return cls(serial, members, commitment_cert, entries, managers)
 
 
-class LiteMsg(ABC):
+class LiteMsg(Encodable):
     verb: ClassVar[Verb]
 
     @abstractmethod

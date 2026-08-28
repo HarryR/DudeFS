@@ -10,7 +10,7 @@ from ..core import codec, crypto
 from ..core.errors import DudeError
 from ..core.units import Millis
 from ..net.envelope import Verb
-from ..net.postman import Recipient, Target
+from ..net.postman import Encodable, Recipient, Target
 from ..store.layer import Index
 from ..store.ops import SignedTransaction
 from .canonical import hashes_canonical
@@ -37,7 +37,7 @@ class Anchors:
 
 
 @dataclass(frozen=True, slots=True)
-class SettleSig:
+class SettleSig(Encodable):
     verb: ClassVar[Verb] = Verb.SETTLE_SIG
 
     slice_hash: crypto.Digest

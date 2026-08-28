@@ -12,6 +12,7 @@ from ..net.address import Endpoint
 from . import ops
 from .errors import StoreError
 from .layer import Reader
+from .settle import Authoriser
 from .managed import ManagedMap, MapEntry
 
 if TYPE_CHECKING:
@@ -360,7 +361,7 @@ def attestations_by(  # noqa: C901
     return tuple(sorted(out, key=lambda a: a.key))
 
 
-class MgmtReader:
+class MgmtReader(Authoriser):
     def __init__(self, session: Session) -> None:
         self._session = session
         self._anchor = session.anchor

@@ -12,7 +12,7 @@ from ..core import codec, crypto
 from ..core.errors import DudeError
 from ..core.units import Bucket, Millis
 from ..net.envelope import Verb
-from ..net.postman import Recipient, Target
+from ..net.postman import Encodable, Recipient, Target
 from ..store.ops import SignedTransaction
 from .canonical import CanonicalBatch, bodies_canonical, hashes_canonical
 
@@ -25,7 +25,7 @@ class RoundError(DudeError): ...
 class RoundAdapterError(DudeError): ...
 
 
-class RoundMsg(ABC):
+class RoundMsg(Encodable):
     verb: ClassVar[Verb]
 
     bucket: Bucket

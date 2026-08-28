@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import Protocol
+from abc import ABC, abstractmethod
 
 from ..core import crypto
 from . import smt
@@ -21,9 +21,12 @@ class Chunk:
     rows: tuple[PathRow, ...]
 
 
-class _ExportSource(Protocol):
+class _ExportSource(ABC):
+    @abstractmethod
     def subtree_data_size(self, prefix: bytes, depth: int) -> int: ...
+    @abstractmethod
     def subtree_rows(self, prefix: bytes, depth: int) -> tuple[PathRow, ...]: ...
+    @abstractmethod
     def hash_under(self, prefix: bytes, depth: int) -> crypto.Digest: ...
 
 
@@ -50,9 +53,12 @@ class TreeExporter:
         yield from self._walk(right, depth + 1)
 
 
-class _ImportTarget(Protocol):
+class _ImportTarget(ABC):
+    @abstractmethod
     def insert_live_row(self, row: PathRow) -> None: ...
+    @abstractmethod
     def hash_under(self, prefix: bytes, depth: int) -> crypto.Digest: ...
+    @abstractmethod
     def state_root(self) -> crypto.Digest: ...
 
 

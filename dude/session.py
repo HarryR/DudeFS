@@ -2,11 +2,10 @@
 import time
 import unicodedata
 from dataclasses import dataclass, field
-from typing import Protocol
+from abc import ABC, abstractmethod
 
 from .core import codec, crypto
 from .core.errors import DudeError
-from .core.units import now_ms
 from .net.envelope import MessageId, Verb
 from .store import ops
 from .store.layer import Held, Reader
@@ -70,7 +69,7 @@ class SubmitHandle:
         while time.monotonic() < deadline:
             if self._refused_reason is not None:
                 return Refused(self._refused_reason)
-            result = self._sub.settled(self.op_hash, self.peer)
+            result = self._sub.settled(self.op_hash)
             if result is not None:
                 return result
             remaining = deadline - time.monotonic()
@@ -80,13 +79,21 @@ class SubmitHandle:
         return Dropped()
 
 
-class Substrate(Protocol):
-    def anchor(self) -> crypto.PublicKey: ...
-    def get(self, store: int, name: bytes) -> Held | None: ...
-    def submit(self, tx: ops.SignedTransaction) -> SubmitHandle: ...
-    def settled(self, op_hash: crypto.Digest, peer: crypto.PublicKey | None = None) -> Settled | None: ...
+class Substrate(Reader, ABC):
+    @abstractmethod
+    def submit(self, tx: ops.Transaction) -> "SubmitHandle": ...
+    @abstractmethod
+    def settled(self, op_hash: crypto.Digest) -> Settled | None: ...
+    @abstractmethod
     def evict_after_sec(self) -> float: ...
+    @abstractmethod
     def wait_for_commit(self, timeout: float) -> None: ...
+    @abstractmethod
+    def token(self, store_id: int, name: str) -> bytes: ...
+    @abstractmethod
+    def seal(self, store_id: int, name: str, value: bytes) -> tuple[bytes, bytes, int]: ...
+    @abstractmethod
+    def decrypt(self, store_id: int, name: str, ciphertext: bytes, epoch: int) -> bytes: ...
 
 
 @dataclass(slots=True)
@@ -150,19 +157,32 @@ class KeyCache:
         sk.current_epoch = codec.as_int(codec.decode(raw.value))
         return sk.current_epoch
 
+    def token(self, store_id: int, name: str) -> bytes:
+        nk = self.ensure_blinding(store_id)
+        return crypto.derive_name_token(nk, unicodedata.normalize("NFC", name).encode())
+
+    def seal(self, store_id: int, name: str, value: bytes) -> tuple[bytes, bytes, int]:
+        epoch = self.current_epoch(store_id)
+        nt = crypto.NameToken(self.token(store_id, name))
+        vk = self.value_key(store_id, epoch)
+        item = crypto.derive_item_key(vk, nt)
+        aad = codec.encode([store_id, bytes(nt), epoch])
+        return nt, bytes(crypto.AeadXcs1.seal(item, aad, value)), epoch
+
+    def decrypt(self, store_id: int, name: str, ciphertext: bytes, epoch: int) -> bytes:
+        nt = crypto.NameToken(self.token(store_id, name))
+        vk = self.value_key(store_id, epoch)
+        item = crypto.derive_item_key(vk, nt)
+        aad = codec.encode([store_id, bytes(nt), epoch])
+        return crypto.AeadXcs1.open(item, aad, crypto.AeadBlob(ciphertext))
+
 
 class Session:
-    __slots__ = ("_keys", "_reader", "_store_id")
+    __slots__ = ("_reader", "_store_id")
 
-    def __init__(self, reader: Reader, store_id: int, kp: crypto.Keypair | None = None) -> None:
+    def __init__(self, reader: Reader, store_id: int) -> None:
         self._reader = reader
         self._store_id = store_id
-        self._keys: KeyCache | None = KeyCache(kp, reader) if kp is not None else None
-
-    def _require_keys(self) -> KeyCache:
-        if self._keys is None:
-            raise SessionError("data store operations require a keypair")
-        return self._keys
 
     @property
     def anchor(self) -> crypto.PublicKey:
@@ -177,29 +197,17 @@ class Session:
             return name if isinstance(name, bytes) else name.encode()
         if not isinstance(name, str):
             raise SessionError("data store keys must be str, not bytes")
-        nk = self._require_keys().ensure_blinding(self._store_id)
-        return crypto.derive_name_token(nk, _name_bytes(name))
-
-    def _aad(self, token: bytes, epoch: int) -> bytes:
-        return codec.encode([self._store_id, bytes(token), epoch])
-
-    def _decrypt(self, name: str | bytes, ciphertext: bytes, epoch: int) -> bytes:
-        if self._store_id == ops.STORE_MANAGEMENT:
-            return ciphertext
-        nt = crypto.NameToken(self.token(name))
-        vk = self._require_keys().value_key(self._store_id, epoch)
-        item = crypto.derive_item_key(vk, nt)
-        return crypto.AeadXcs1.open(item, self._aad(nt, epoch), crypto.AeadBlob(ciphertext))
+        raise SessionError("data store token requires a Substrate with crypto")
 
     def seal(self, name: str | bytes, value: bytes) -> tuple[bytes, bytes, int]:
         if self._store_id == ops.STORE_MANAGEMENT:
             return self.token(name), value, ops.EPOCH_NONE
-        keys = self._require_keys()
-        epoch = keys.current_epoch(self._store_id)
-        nt = crypto.NameToken(self.token(name))
-        vk = keys.value_key(self._store_id, epoch)
-        item = crypto.derive_item_key(vk, nt)
-        return nt, bytes(crypto.AeadXcs1.seal(item, self._aad(nt, epoch), value)), epoch
+        raise SessionError("data store seal requires a Substrate with crypto")
+
+    def _decrypt(self, name: str | bytes, ciphertext: bytes, epoch: int) -> bytes:
+        if self._store_id == ops.STORE_MANAGEMENT:
+            return ciphertext
+        raise SessionError("data store decrypt requires a Substrate with crypto")
 
     def get(self, name: str | bytes) -> Record:
         token = self.token(name)
@@ -217,12 +225,32 @@ class Session:
 
 
 class SessionRW(Session):
-    __slots__ = ("_kp", "_sub")
+    __slots__ = ("_sub",)
 
-    def __init__(self, sub: Substrate, kp: crypto.Keypair, store_id: int) -> None:
-        super().__init__(sub, store_id, kp)
-        self._kp = kp
+    def __init__(self, sub: Substrate, store_id: int) -> None:
+        super().__init__(sub, store_id)
         self._sub = sub
+
+    def token(self, name: str | bytes) -> bytes:
+        if self._store_id == ops.STORE_MANAGEMENT:
+            return name if isinstance(name, bytes) else name.encode()
+        if not isinstance(name, str):
+            raise SessionError("data store keys must be str, not bytes")
+        return self._sub.token(self._store_id, name)
+
+    def seal(self, name: str | bytes, value: bytes) -> tuple[bytes, bytes, int]:
+        if self._store_id == ops.STORE_MANAGEMENT:
+            return self.token(name), value, ops.EPOCH_NONE
+        if not isinstance(name, str):
+            raise SessionError("data store keys must be str, not bytes")
+        return self._sub.seal(self._store_id, name, value)
+
+    def _decrypt(self, name: str | bytes, ciphertext: bytes, epoch: int) -> bytes:
+        if self._store_id == ops.STORE_MANAGEMENT:
+            return ciphertext
+        if not isinstance(name, str):
+            raise SessionError("data store keys must be str, not bytes")
+        return self._sub.decrypt(self._store_id, name, ciphertext, epoch)
 
     def put(
         self,
@@ -252,8 +280,7 @@ class SessionRW(Session):
         return TxBuilder(self)
 
     def submit(self, tx: ops.Transaction) -> SubmitHandle:
-        signed = tx.sign(self._kp, now_ms())
-        return self._sub.submit(signed)
+        return self._sub.submit(tx)
 
 
 class TxBuilder:
@@ -318,5 +345,3 @@ def _collect_guards(
     return tuple(out)
 
 
-def _name_bytes(name: str) -> bytes:
-    return unicodedata.normalize("NFC", name).encode("utf-8")

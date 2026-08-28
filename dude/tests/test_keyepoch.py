@@ -7,8 +7,9 @@ import unittest
 from dude.consensus.bootstrap import bootstrap, intervene, mint_first_keyepoch
 from dude.core import codec, crypto
 from dude.core.errors import DudeError
-from dude.session import Session
+from dude.session import KeyCache, SessionRW, Substrate
 from dude.store import Store, ops, settle
+from dude.store.layer import Held, Settled
 from dude.store.management import Cert, MgmtWriter, Role, epoch_key
 
 from .cluster import Cluster
@@ -34,8 +35,43 @@ def _cluster_of_one() -> tuple[Store, crypto.Keypair, MgmtWriter]:
     return s, mgr, s.mgmt_writer
 
 
-def _data_session(s: Store, kp: crypto.Keypair) -> Session:
-    return Session(s, ops.STORE_DATA, kp)
+class _StoreSubstrate(Substrate):
+    __slots__ = ("_store", "_cache")
+
+    def __init__(self, store: Store, kp: crypto.Keypair) -> None:
+        self._store = store
+        self._cache = KeyCache(kp, store)
+
+    def anchor(self) -> crypto.PublicKey:
+        return self._store.anchor()
+
+    def get(self, store: int, name: bytes) -> Held | None:
+        return self._store.get(store, name)
+
+    def token(self, store_id: int, name: str) -> bytes:
+        return self._cache.token(store_id, name)
+
+    def seal(self, store_id: int, name: str, value: bytes) -> tuple[bytes, bytes, int]:
+        return self._cache.seal(store_id, name, value)
+
+    def decrypt(self, store_id: int, name: str, ciphertext: bytes, epoch: int) -> bytes:
+        return self._cache.decrypt(store_id, name, ciphertext, epoch)
+
+    def submit(self, tx: ops.Transaction) -> ...:
+        raise NotImplementedError
+
+    def settled(self, op_hash: crypto.Digest) -> Settled | None:
+        raise NotImplementedError
+
+    def evict_after_sec(self) -> float:
+        raise NotImplementedError
+
+    def wait_for_commit(self, timeout: float) -> None:
+        raise NotImplementedError
+
+
+def _data_session(s: Store, kp: crypto.Keypair) -> SessionRW:
+    return SessionRW(_StoreSubstrate(s, kp), ops.STORE_DATA)
 
 
 def _rotate(s: Store, mgr: crypto.Keypair, who: list[crypto.PublicKey]) -> ops.Transaction:

@@ -1,6 +1,7 @@
 
+from abc import ABC, abstractmethod
 from collections.abc import Iterator
-from typing import Any, NamedTuple, Protocol
+from typing import Any, NamedTuple
 
 from ..core import crypto
 from . import ops, smt
@@ -32,25 +33,28 @@ class Settled(NamedTuple):
     block_hash: crypto.Digest
 
 
-class Reader(Protocol):
+class Reader(ABC):
+    @abstractmethod
     def get(self, store: int, name: bytes) -> Held | None: ...
+    @abstractmethod
     def anchor(self) -> crypto.PublicKey: ...
 
 
-class View(Reader, Protocol):
+class View(Reader):
+    @abstractmethod
     def accumulator(self) -> crypto.Accumulator: ...
-
+    @abstractmethod
     def state_root(self) -> crypto.Digest: ...
-
+    @abstractmethod
     def hash_under(self, prefix: bytes, depth: int) -> crypto.Digest: ...
-
+    @abstractmethod
     def _rows_in_path_range(self, lo: bytes, hi: bytes) -> Iterator[PathRow]: ...
-
     @property
+    @abstractmethod
     def is_frozen(self) -> bool: ...
 
 
-class Overlay[B: Reader]:
+class Overlay[B: Reader](Reader):
     """Buffered mutations over any `Reader`. Reads see the delta, then the base.
 
     It computes NO roots, and that is the point: a root is only meaningful once every base

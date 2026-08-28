@@ -4,7 +4,7 @@ import contextlib
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Protocol, runtime_checkable
+from abc import ABC, abstractmethod
 
 from ..core import crypto
 from ..core.errors import DudeError
@@ -20,10 +20,12 @@ type OnLink = Callable[["Link"], None]
 class LinkError(DudeError): ...
 
 
-@runtime_checkable
-class Listener(Protocol):
+class Listener(ABC):
+    @abstractmethod
     def start(self, on_frame: OnFrame, on_link: OnLink) -> None: ...
+    @abstractmethod
     def stop(self) -> None: ...
+    @abstractmethod
     def dial(self, address: Address) -> None: ...
 
 

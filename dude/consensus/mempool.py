@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Protocol
+from abc import abstractmethod
 
 from ..core import crypto
 from ..core.units import Bucket, Millis
@@ -30,7 +30,8 @@ UNSIGNED = Refusal.UNSIGNED
 CANNOT_APPLY = Refusal.CANNOT_APPLY
 
 
-class Ledger(Reader, Protocol):
+class Ledger(Reader):
+    @abstractmethod
     def has_settled(self, op_hash: crypto.Digest) -> bool: ...
 
 

@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from ..core import crypto
 from ..net.address import Endpoint
 from ..net.envelope import MessageId, Verb
-from ..net.postman import Delivered, Postman
+from ..net.postman import Delivered, Encodable, Postman
 from ..net.transports.inproc import InProcListener
 from ..net.transports.tcp import TCPDialer, TCPListener, TCPTiming
 from ..tunables import Tunables
@@ -24,19 +24,19 @@ TCP_TIMING = TCPTiming(connect=1000, send=1000)
 
 
 @dataclass(frozen=True)
-class Ping:
+class Ping(Encodable):
     def encode(self) -> tuple[Verb, bytes]:
         return Verb.PING, b""
 
 
 @dataclass(frozen=True)
-class Pong:
+class Pong(Encodable):
     def encode(self) -> tuple[Verb, bytes]:
         return Verb.PONG, b""
 
 
 @dataclass(frozen=True)
-class Payload:
+class Payload(Encodable):
     data: bytes
 
     def encode(self) -> tuple[Verb, bytes]:

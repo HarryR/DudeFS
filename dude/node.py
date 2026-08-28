@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from .consensus import Coordinator, Mempool, RoundAdapter, SettleAdapter
 from .core import crypto
 from .core.errors import DudeError
-from .session import KeyCache, SessionRW, SubmitHandle
+from .session import KeyCache, SessionRW, SubmitHandle, Substrate
 from .core.units import Millis, now_ms
 from .net import Verb, MessageId
 from .net.link import Listener
@@ -476,7 +476,6 @@ class Node(_BaseNode):
 
 @dataclass(slots=True)
 class ReplicaNode(_BaseNode):
-    _key_cache: KeyCache | None = field(default=None, init=False)
     _inflight: dict[bytes, SubmitHandle] = field(default_factory=dict, init=False)
     _commit_seq: int = field(default=0, init=False)
     _commit_cond: threading.Condition = field(default_factory=threading.Condition, init=False)
@@ -488,9 +487,7 @@ class ReplicaNode(_BaseNode):
 
     def session(self, store_id: int = ops.STORE_DATA) -> SessionRW:
         sub = _ReplicaSubstrate(self)
-        if self._key_cache is None:
-            self._key_cache = KeyCache(self.me, sub)
-        return SessionRW(sub, self.me, store_id)
+        return SessionRW(sub, store_id)
 
     def _run(self) -> None:
         tick_interval = self.tunables.tick_interval / 1000
@@ -525,11 +522,17 @@ class ReplicaNode(_BaseNode):
             case Verb.PING: self._on_ping(d, now)
 
 
-class _ReplicaSubstrate:
-    __slots__ = ("_node",)
+class _ReplicaSubstrate(Substrate):
+    __slots__ = ("_node", "_key_cache")
 
     def __init__(self, node: ReplicaNode) -> None:
         self._node = node
+        self._key_cache: KeyCache | None = None
+
+    def _ensure_cache(self) -> KeyCache:
+        if self._key_cache is None:
+            self._key_cache = KeyCache(self._node.me, self)
+        return self._key_cache
 
     def anchor(self) -> crypto.PublicKey:
         return self._node.store.anchor()
@@ -537,20 +540,30 @@ class _ReplicaSubstrate:
     def get(self, store: int, name: bytes) -> Held | None:
         return self._node.store.get(store, name)
 
-    def submit(self, tx: ops.SignedTransaction) -> SubmitHandle:
+    def token(self, store_id: int, name: str) -> bytes:
+        return self._ensure_cache().token(store_id, name)
+
+    def seal(self, store_id: int, name: str, value: bytes) -> tuple[bytes, bytes, int]:
+        return self._ensure_cache().seal(store_id, name, value)
+
+    def decrypt(self, store_id: int, name: str, ciphertext: bytes, epoch: int) -> bytes:
+        return self._ensure_cache().decrypt(store_id, name, ciphertext, epoch)
+
+    def submit(self, tx: ops.Transaction) -> SubmitHandle:
+        signed = tx.sign(self._node.me, now_ms())
         roster = self._node.mgmt_reader.roster()
         if not roster:
             raise DudeError("no roster members to submit to")
         target = roster[0]
         mid = MessageId.random()
-        handle = SubmitHandle(mid=mid, op_hash=tx.op_hash, _sub=self)
+        handle = SubmitHandle(mid=mid, op_hash=signed.op_hash, _sub=self)
         self._node._inflight[mid.correlation_id] = handle
         self._node.postman.send_raw(
-            target, Verb.SUBMIT, tx.raw, self._node.tunables.ttl_exchange, mid=mid,
+            target, Verb.SUBMIT, signed.raw, self._node.tunables.ttl_exchange, mid=mid,
         )
         return handle
 
-    def settled(self, op_hash: crypto.Digest, peer: crypto.PublicKey | None = None) -> Settled | None:
+    def settled(self, op_hash: crypto.Digest) -> Settled | None:
         return self._node.store.settlement_of(op_hash)
 
     def evict_after_sec(self) -> float:
@@ -562,5 +575,7 @@ class _ReplicaSubstrate:
             self._node._commit_cond.wait_for(
                 lambda: self._node._commit_seq > seq, timeout=timeout,
             )
+
+
 
 

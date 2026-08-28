@@ -13,11 +13,13 @@ from typing import TYPE_CHECKING, NamedTuple
 if TYPE_CHECKING:
     from ..session import Session
 
+from ..consensus.mempool import Ledger
 from ..core import codec, crypto
 from ..core.errors import InvariantError
 from . import ops, settle, smt
-from .layer import Held, Index, PathRow, Settled, holds
+from .layer import Held, Index, PathRow, Settled, View, holds
 from .management import MgmtReader, MgmtWriter
+from .smt_sync import _ExportSource, _ImportTarget
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS entry (
@@ -137,7 +139,7 @@ def _unverified(e: Entry) -> str | None:
     return None
 
 
-class StoreReader:
+class StoreReader(View, Ledger, _ExportSource):
     _memoize: bool = False
 
     def __init__(self, conn: sqlite3.Connection):
@@ -312,7 +314,7 @@ class StoreReader:
         return MgmtReader(Session(self, ops.STORE_MANAGEMENT))
 
 
-class StoreWriter(StoreReader):
+class StoreWriter(StoreReader, _ImportTarget):
     _memoize: bool = True
 
     def _set_meta(self, k: str, v: bytes) -> None:
@@ -504,7 +506,7 @@ class _ReplayRefusedError(Exception):
         self.why = why
 
 
-class Store:
+class Store(View, Ledger):
     def __init__(self, path: str | None = None):
         self._tempfile_path: str | None = None
         if path is None:

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, NamedTuple, Protocol
+from typing import Any, NamedTuple
 
 from ..core import codec, crypto
 from ..core.errors import DudeError
@@ -10,11 +11,12 @@ from . import ops
 from .layer import Overlay, Reader, holds
 
 
-class Authoriser(Protocol):
+class Authoriser(ABC):
+    @abstractmethod
     def may_write(self, reader: Reader, who: crypto.PublicKey, store_id: int) -> bool: ...
-
+    @abstractmethod
     def current_epoch(self, store_id: int, reader: Reader) -> int: ...
-
+    @abstractmethod
     def epoch_target(self, name: bytes) -> int | None: ...
 
 

@@ -9,13 +9,14 @@ from ..consensus.settle_round import SettledBlockWithBodies
 from ..core import codec, crypto
 from ..core.errors import DudeError
 from ..net.envelope import Verb
+from ..net.postman import Encodable
 from .refusal import SyncRefusal
 
 
 class SyncAdapterError(DudeError): ...
 
 
-class SyncMsg(ABC):
+class SyncMsg(Encodable):
     verb: ClassVar[Verb]
 
     @abstractmethod
