@@ -9,9 +9,15 @@ from ..core.errors import DudeError
 
 
 class FramingError(DudeError): ...
-class FrameTooLarge(FramingError): ...
-class FrameTruncated(FramingError): ...
-class UnknownTag(FramingError): ...
+
+
+class FrameTooLargeError(FramingError): ...
+
+
+class FrameTruncatedError(FramingError): ...
+
+
+class UnknownTagError(FramingError): ...
 
 
 class Request(bytes, Enum):
@@ -73,15 +79,15 @@ def _read[T](sock: socket.socket, lookup: dict[bytes, T]) -> tuple[T, bytes, byt
         return None
     length = _HDR.unpack(raw_len)[0]
     if length > _MAX_FRAME:
-        raise FrameTooLarge(length)
+        raise FrameTooLargeError(length)
     raw_body = _recv_exact(sock, length)
     if raw_body is None:
-        raise FrameTruncated()
+        raise FrameTruncatedError
     parts = codec.as_seq(codec.decode(raw_body), 3)
     raw_tag = codec.as_bytes(parts[0])
     tag = lookup.get(raw_tag)
     if tag is None:
-        raise UnknownTag(raw_tag)
+        raise UnknownTagError(raw_tag)
     return tag, codec.as_bytes(parts[1]), codec.as_bytes(parts[2])
 
 
@@ -91,7 +97,7 @@ def _recv_exact(sock: socket.socket, n: int) -> bytes | None:
         chunk = sock.recv(n - len(buf))
         if not chunk:
             if buf:
-                raise FrameTruncated()
+                raise FrameTruncatedError
             return None
         buf.extend(chunk)
     return bytes(buf)

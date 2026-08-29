@@ -1,11 +1,27 @@
+import argparse
 import json
+import signal
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from ..consensus.canonical import bodies_canonical
+from ..consensus.settle_round import SettledBlock
 from ..core import codec, crypto
 from ..core.errors import DudeError
+from ..core.units import now_ms
 from ..net.address import Address, Endpoint
+from ..net.postman import Postman
+from ..net.socket_server import SocketServer
+from ..net.socket_substrate import SocketSubstrate
+from ..net.transports.tcp import TCPDialer, TCPTiming
+from ..node import ReplicaNode
+from ..session import SessionRW
+from ..store import Store, ops
 from ..store.ops import SignedTransaction
+from ..sync.lite_client import LightClient
+from ..tunables import DEFAULT
 
 
 class CLIError(DudeError): ...
@@ -101,3 +117,90 @@ def load_genesis(dir_path: Path) -> tuple[bytes, tuple[SignedTransaction, ...]]:
         SignedTransaction.decode(codec.as_bytes(item)) for item in codec.as_seq(outer[1])
     )
     return block_bytes, bodies
+
+
+def add_dir_arg(parser: argparse.ArgumentParser, **kwargs) -> None:
+    parser.add_argument("--dir", type=Path, **kwargs)
+
+
+def cmd_init(args: argparse.Namespace, label: str) -> None:
+    dir_path: Path = args.dir
+    kp = crypto.Keypair.generate()
+    save_keypair(dir_path, kp)
+    pop = kp.prove_possession()
+    print(f"{label} identity created in {dir_path}")
+    print(f"  public key: {kp.public.hex()}")
+    print(f"  possession: {pop.hex()}")
+
+
+def open_store_with_genesis(dir_path: Path) -> Store:
+    seed = BootstrapSeed.load(dir_path)
+    store = Store(store_path(dir_path))
+    if store.head_block_num() is None:
+        block_bytes, bodies = load_genesis(dir_path)
+        store.provision(seed.anchor)
+        sb = SettledBlock.decode(block_bytes)
+        ordered = bodies_canonical(bodies).txs
+        store.commit_block(
+            sb.anchors.block_num,
+            first_height=1,
+            block_bytes=block_bytes,
+            block_hash=sb.block_hash,
+            batch=ordered,
+            auth=store.mgmt_reader,
+        )
+        print(f"genesis block applied (block {sb.anchors.block_num})")
+    return store
+
+
+def start_replica(dir_path: Path) -> tuple[ReplicaNode, Store]:
+    kp = load_keypair(dir_path)
+    store = open_store_with_genesis(dir_path)
+    timing = TCPTiming.for_deployment(DEFAULT)
+    rn = ReplicaNode(kp, store, DEFAULT)
+    rn.add_listener(TCPDialer(timing=timing))
+    rn.start()
+    return rn, store
+
+
+def start_light_client(dir_path: Path) -> LightClient:
+    kp = load_keypair(dir_path)
+    seed = BootstrapSeed.load(dir_path)
+    timing = TCPTiming.for_deployment(DEFAULT)
+    postman = Postman(kp, DEFAULT)
+    postman.add_listener(TCPDialer(timing=timing))
+    lc = LightClient(me=kp, anchor=seed.anchor, postman=postman)
+    for pub, endpoints in seed.peers:
+        lc.add_bootstrap_peer(pub, endpoints)
+    lc.start()
+    lc.bootstrap(now_ms())
+    print("bootstrapping...")
+    deadline = time.monotonic() + 30.0
+    while not lc.bootstrapped() and time.monotonic() < deadline:
+        time.sleep(0.1)
+    if not lc.bootstrapped():
+        lc.stop()
+        raise CLIError("failed to bootstrap within 30s")
+    print(f"bootstrapped at block {lc.trusted_state.head.anchors.block_num}")
+    return lc
+
+
+def serve_with_socket(label: str, dir_path: Path, sub, stop_fn) -> None:
+    sock = socket_path(dir_path)
+    server = SocketServer(sock, sub)
+    server.start()
+    print(f"{label} serving on {sock}")
+    stop = threading.Event()
+    signal.signal(signal.SIGINT, lambda *_: stop.set())
+    signal.signal(signal.SIGTERM, lambda *_: stop.set())
+    stop.wait()
+    print("shutting down...")
+    server.stop()
+    stop_fn()
+
+
+def connect_socket(
+    dir_path: Path, store_id: int = ops.STORE_DATA
+) -> tuple[SocketSubstrate, SessionRW]:
+    sub = SocketSubstrate(socket_path(dir_path), DEFAULT)
+    return sub, SessionRW(sub, store_id)

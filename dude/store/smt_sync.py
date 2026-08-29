@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from collections.abc import Iterator
 from dataclasses import dataclass
-from abc import ABC, abstractmethod
 
 from ..core import crypto
 from . import smt

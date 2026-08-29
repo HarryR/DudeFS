@@ -9,7 +9,6 @@ from dude.tests.cluster import Cluster
 
 
 class TestCompactedRefusalWire(unittest.TestCase):
-
     def test_compacted_with_payload_roundtrips(self):
         msg = Refused(reason=SyncRefusal.COMPACTED, checkpoint_block_num=42)
         verb, body = msg.encode()
@@ -35,7 +34,6 @@ class TestCompactedRefusalWire(unittest.TestCase):
 
 
 class TestServeGetblocksCompacted(unittest.TestCase):
-
     def test_gc_then_request_returns_compacted(self):
         c = Cluster(nodes=3, mgmt=1)
         try:

@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -19,7 +18,7 @@ class ManagedMapError(StoreError): ...
 class MapAcc:
     __slots__ = ("_acc", "_prefix")
 
-    def __init__(self, prefix: bytes, acc: crypto.Accumulator | None=None) -> None:
+    def __init__(self, prefix: bytes, acc: crypto.Accumulator | None = None) -> None:
         self._acc = acc if acc is not None else crypto.Accumulator(crypto.ACC_IDENTITY)
         self._prefix = prefix
 
@@ -27,10 +26,10 @@ class MapAcc:
     def _element(prefix: bytes, key: bytes) -> crypto.Accumulator:
         return crypto.acc_element(codec.encode([prefix, key]))
 
-    def add(self, key: bytes) -> "MapAcc":
+    def add(self, key: bytes) -> MapAcc:
         return MapAcc(self._prefix, crypto.acc_add(self._acc, self._element(self._prefix, key)))
 
-    def sub(self, key: bytes) -> "MapAcc":
+    def sub(self, key: bytes) -> MapAcc:
         return MapAcc(self._prefix, crypto.acc_sub(self._acc, self._element(self._prefix, key)))
 
     @property
@@ -141,18 +140,20 @@ class ManagedMap:
 
         meta_guard: ops.Predicate = (
             ops.Holds(s, self._meta_name(), ops.value_digest(current.raw))
-            if current else
-            ops.Absent(s, self._meta_name())
+            if current
+            else ops.Absent(s, self._meta_name())
         )
 
-        return ops.Transaction((
-            ops.Step((meta_guard,), ops.Set(s, self._meta_name(), new_meta)),
-            ops.Step((), ops.Set(s, self._index_name(count), key)),
-            ops.Step(
-                (ops.Absent(s, self.entry_name(key)),),
-                ops.Set(s, self.entry_name(key), MapEntry.encode(count, value)),
-            ),
-        ))
+        return ops.Transaction(
+            (
+                ops.Step((meta_guard,), ops.Set(s, self._meta_name(), new_meta)),
+                ops.Step((), ops.Set(s, self._index_name(count), key)),
+                ops.Step(
+                    (ops.Absent(s, self.entry_name(key)),),
+                    ops.Set(s, self.entry_name(key), MapEntry.encode(count, value)),
+                ),
+            )
+        )
 
     def tx_remove(
         self,
@@ -177,53 +178,68 @@ class ManagedMap:
         ]
 
         if victim.index != last_idx:
-            steps.append(ops.Step(
-                (), ops.Set(s, self._index_name(victim.index), last_key),
-            ))
-            steps.append(ops.Step(
-                (), ops.Set(s, self.entry_name(last_key),
-                            MapEntry.encode(victim.index, last_entry.value)),
-            ))
+            steps.append(
+                ops.Step(
+                    (),
+                    ops.Set(s, self._index_name(victim.index), last_key),
+                )
+            )
+            steps.append(
+                ops.Step(
+                    (),
+                    ops.Set(
+                        s,
+                        self.entry_name(last_key),
+                        MapEntry.encode(victim.index, last_entry.value),
+                    ),
+                )
+            )
 
         return ops.Transaction(tuple(steps))
 
     def tx_update(self, key: bytes, new_value: bytes, current: MapEntry) -> ops.Transaction:
         s = self._session.store_id
-        return ops.Transaction((
-            ops.Step(
-                (ops.Holds(s, self.entry_name(key), ops.value_digest(current.raw)),),
-                ops.Set(s, self.entry_name(key), MapEntry.encode(current.index, new_value)),
-            ),
-        ))
+        return ops.Transaction(
+            (
+                ops.Step(
+                    (ops.Holds(s, self.entry_name(key), ops.value_digest(current.raw)),),
+                    ops.Set(s, self.entry_name(key), MapEntry.encode(current.index, new_value)),
+                ),
+            )
+        )
 
     # -- batch: multiple adds/removes in one transaction ---------------------
 
     def tx_add_entry(self, key: bytes, value: bytes, index: int) -> ops.Transaction:
         s = self._session.store_id
-        return ops.Transaction((
-            ops.Step((), ops.Set(s, self._index_name(index), key)),
-            ops.Step(
-                (ops.Absent(s, self.entry_name(key)),),
-                ops.Set(s, self.entry_name(key), MapEntry.encode(index, value)),
-            ),
-        ))
+        return ops.Transaction(
+            (
+                ops.Step((), ops.Set(s, self._index_name(index), key)),
+                ops.Step(
+                    (ops.Absent(s, self.entry_name(key)),),
+                    ops.Set(s, self.entry_name(key), MapEntry.encode(index, value)),
+                ),
+            )
+        )
 
     def tx_meta_write(
-        self, new_count: int, new_acc: MapAcc, current: MapMeta | None,
+        self,
+        new_count: int,
+        new_acc: MapAcc,
+        current: MapMeta | None,
     ) -> ops.Transaction:
         s = self._session.store_id
         new_meta = MapMeta.encode(new_count, new_acc)
         guard: ops.Predicate = (
             ops.Holds(s, self._meta_name(), ops.value_digest(current.raw))
-            if current else
-            ops.Absent(s, self._meta_name())
+            if current
+            else ops.Absent(s, self._meta_name())
         )
-        return ops.Transaction((
-            ops.Step((guard,), ops.Set(s, self._meta_name(), new_meta)),
-        ))
+        return ops.Transaction((ops.Step((guard,), ops.Set(s, self._meta_name(), new_meta)),))
 
     def batch_add(
-        self, entries: tuple[tuple[bytes, bytes], ...],
+        self,
+        entries: tuple[tuple[bytes, bytes], ...],
     ) -> ops.Transaction:
         meta = self.meta()
         count = meta.count if meta else 0

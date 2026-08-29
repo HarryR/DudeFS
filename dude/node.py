@@ -6,11 +6,11 @@ from dataclasses import dataclass, field
 from .consensus import Coordinator, Mempool, RoundAdapter, SettleAdapter
 from .core import crypto
 from .core.errors import DudeError
-from .session import KeyCache, SessionRW, Settled, SubmitHandle, SubmitResult, Substrate
 from .core.units import Millis, now_ms
-from .net import Verb, MessageId
+from .net import MessageId, Verb
 from .net.link import Listener
 from .net.postman import Delivered, Postman
+from .session import KeyCache, SessionRW, SubmitHandle, SubmitResult, Substrate
 from .store import Store, ops
 from .store.layer import BlockHead, Held
 from .store.management import MgmtReader, Role
@@ -23,7 +23,6 @@ from .sync.adapter import (
 )
 from .sync.checkpoint_adapter import (
     CheckpointAdapterError,
-    CheckpointMetaReply,
     ChunksReply,
     GetCheckpoint,
     GetChunks,
@@ -42,7 +41,6 @@ from .sync.lite_adapter import (
     TxStatusReply,
 )
 from .tunables import DEFAULT, Tunables
-
 
 # ---------------------------------------------------------------------------
 # Base — the run loop, lifecycle, peer reconciliation, follower, sync handlers.
@@ -128,7 +126,11 @@ class _BaseNode:
     # -- checkpoint download (synchronous, blocks the tick loop) ------------
 
     def _send_and_wait(
-        self, peer: crypto.PublicKey, verb: Verb, body: bytes, timeout_sec: float,
+        self,
+        peer: crypto.PublicKey,
+        verb: Verb,
+        body: bytes,
+        timeout_sec: float,
     ) -> Delivered | None:
         mid = self.postman.send_raw(peer, verb, body, self.tunables.ttl_exchange)
         tick = self.tunables.tick_interval / 1000
@@ -139,7 +141,10 @@ class _BaseNode:
                 break
             for output in self.postman.drain_output(timeout=remaining):
                 for d in output.delivered:
-                    if d.in_reply_to is not None and d.in_reply_to.correlation_id == mid.correlation_id:
+                    if (
+                        d.in_reply_to is not None
+                        and d.in_reply_to.correlation_id == mid.correlation_id
+                    ):
                         return d
                     self._on_delivered(d, now_ms())
         return None
@@ -220,8 +225,12 @@ class _BaseNode:
 
     def _reply(self, d: Delivered, verb: Verb, body: bytes) -> MessageId:
         return self.postman.send_raw(
-            d.frm, verb, body, self.tunables.ttl_exchange,
-            await_reply=False, reply_to=d.mid,
+            d.frm,
+            verb,
+            body,
+            self.tunables.ttl_exchange,
+            await_reply=False,
+            reply_to=d.mid,
         )
 
     def _flush_follower(self, now: Millis) -> None:
@@ -311,22 +320,38 @@ class Node(_BaseNode):
         if d.verb in CONSENSUS_ONLY and not self._is_node(d.frm):
             return
         match d.verb:
-            case Verb.SUBMIT: self._on_submit(d, now)
-            case Verb.HELD: self._on_held(d, now)
-            case Verb.SIG: self._on_sig(d, now)
-            case Verb.BODIES: self._on_bodies(d, now)
-            case Verb.SETTLE_SIG: self._on_settle_sig(d, now)
-            case Verb.HEIGHT: self._on_height(d, now)
-            case Verb.HEIGHT_REPLY: self._on_height_reply(d, now)
-            case Verb.GETBLOCK: self._on_getblock(d, now)
-            case Verb.SETTLED_BLOCK: self._on_settled_block(d, now)
-            case Verb.SYNC_REFUSED: self._on_sync_refused(d, now)
-            case Verb.PING: self._on_ping(d, now)
-            case Verb.GET_ANCHORS: self._on_get_anchors(d, now)
-            case Verb.GET_PROOF: self._on_get_proof(d, now)
-            case Verb.TX_STATUS: self._on_tx_status(d, now)
-            case Verb.GET_CHECKPOINT: self._on_get_checkpoint(d, now)
-            case Verb.GET_CHUNKS: self._on_get_chunks(d, now)
+            case Verb.SUBMIT:
+                self._on_submit(d, now)
+            case Verb.HELD:
+                self._on_held(d, now)
+            case Verb.SIG:
+                self._on_sig(d, now)
+            case Verb.BODIES:
+                self._on_bodies(d, now)
+            case Verb.SETTLE_SIG:
+                self._on_settle_sig(d, now)
+            case Verb.HEIGHT:
+                self._on_height(d, now)
+            case Verb.HEIGHT_REPLY:
+                self._on_height_reply(d, now)
+            case Verb.GETBLOCK:
+                self._on_getblock(d, now)
+            case Verb.SETTLED_BLOCK:
+                self._on_settled_block(d, now)
+            case Verb.SYNC_REFUSED:
+                self._on_sync_refused(d, now)
+            case Verb.PING:
+                self._on_ping(d, now)
+            case Verb.GET_ANCHORS:
+                self._on_get_anchors(d, now)
+            case Verb.GET_PROOF:
+                self._on_get_proof(d, now)
+            case Verb.TX_STATUS:
+                self._on_tx_status(d, now)
+            case Verb.GET_CHECKPOINT:
+                self._on_get_checkpoint(d, now)
+            case Verb.GET_CHUNKS:
+                self._on_get_chunks(d, now)
 
     def _is_node(self, who: crypto.PublicKey) -> bool:
         return who == self.store.anchor() or self.mgmt_reader.is_member(who)
@@ -359,15 +384,21 @@ class Node(_BaseNode):
 
     def _on_getblock(self, d: Delivered, now: Millis) -> MessageId | None:
         if not self._replica_authorised(d.frm):
-            return self.postman.reply(d, Refused(reason=SyncRefusal.UNAUTHORISED), self.tunables.ttl_exchange)
+            return self.postman.reply(
+                d, Refused(reason=SyncRefusal.UNAUTHORISED), self.tunables.ttl_exchange
+            )
         try:
             req = SyncMsg.decode(d.verb, d.body)
         except SyncAdapterError:
-            return self.postman.reply(d, Refused(reason=SyncRefusal.UNKNOWN), self.tunables.ttl_exchange)
+            return self.postman.reply(
+                d, Refused(reason=SyncRefusal.UNKNOWN), self.tunables.ttl_exchange
+            )
         if not isinstance(req, GetBlocks):
             return None
         return self.postman.reply(
-            d, serve_getblocks(self.store, req, self.tunables.pull_batch), self.tunables.ttl_exchange
+            d,
+            serve_getblocks(self.store, req, self.tunables.pull_batch),
+            self.tunables.ttl_exchange,
         )
 
     # -- serving checkpoint requests -----------------------------------------
@@ -381,35 +412,49 @@ class Node(_BaseNode):
     def _on_get_checkpoint(self, d: Delivered, now: Millis) -> MessageId | None:
         if not self._replica_authorised(d.frm):
             return self.postman.reply(
-                d, Refused(reason=SyncRefusal.UNAUTHORISED), self.tunables.ttl_exchange,
+                d,
+                Refused(reason=SyncRefusal.UNAUTHORISED),
+                self.tunables.ttl_exchange,
             )
         if self.checkpoint_server is None:
             return self.postman.reply(
-                d, Refused(reason=SyncRefusal.NO_STATE), self.tunables.ttl_exchange,
+                d,
+                Refused(reason=SyncRefusal.NO_STATE),
+                self.tunables.ttl_exchange,
             )
         return self.postman.reply(
-            d, self.checkpoint_server.serve_meta(), self.tunables.ttl_exchange,
+            d,
+            self.checkpoint_server.serve_meta(),
+            self.tunables.ttl_exchange,
         )
 
     def _on_get_chunks(self, d: Delivered, now: Millis) -> MessageId | None:
         if not self._replica_authorised(d.frm):
             return self.postman.reply(
-                d, Refused(reason=SyncRefusal.UNAUTHORISED), self.tunables.ttl_exchange,
+                d,
+                Refused(reason=SyncRefusal.UNAUTHORISED),
+                self.tunables.ttl_exchange,
             )
         if self.checkpoint_server is None:
             return self.postman.reply(
-                d, Refused(reason=SyncRefusal.NO_STATE), self.tunables.ttl_exchange,
+                d,
+                Refused(reason=SyncRefusal.NO_STATE),
+                self.tunables.ttl_exchange,
             )
         try:
             req = GetChunks.decode(d.body)
         except CheckpointAdapterError:
             return self.postman.reply(
-                d, Refused(reason=SyncRefusal.MALFORMED_QUERY), self.tunables.ttl_exchange,
+                d,
+                Refused(reason=SyncRefusal.MALFORMED_QUERY),
+                self.tunables.ttl_exchange,
             )
         reply = self.checkpoint_server.serve_chunks(req)
         if reply is None:
             return self.postman.reply(
-                d, Refused(reason=SyncRefusal.CHECKPOINT_STALE), self.tunables.ttl_exchange,
+                d,
+                Refused(reason=SyncRefusal.CHECKPOINT_STALE),
+                self.tunables.ttl_exchange,
             )
         return self.postman.reply(d, reply, self.tunables.ttl_exchange)
 
@@ -417,35 +462,57 @@ class Node(_BaseNode):
 
     def _on_get_anchors(self, d: Delivered, now: Millis) -> MessageId | None:
         if not self._lite_authorised(d.frm):
-            return self.postman.reply(d, LiteRefused(SyncRefusal.UNAUTHORISED), self.tunables.ttl_lite)
+            return self.postman.reply(
+                d, LiteRefused(SyncRefusal.UNAUTHORISED), self.tunables.ttl_lite
+            )
         try:
             req = LiteMsg.decode(d.verb, d.body)
         except (LiteAdapterError, DudeError):
-            return self.postman.reply(d, LiteRefused(SyncRefusal.MALFORMED_QUERY), self.tunables.ttl_lite)
+            return self.postman.reply(
+                d, LiteRefused(SyncRefusal.MALFORMED_QUERY), self.tunables.ttl_lite
+            )
         if not isinstance(req, GetAnchors):
             return None
-        return self.postman.reply(d, serve_get_anchors(self.store, req, self.tunables.liveness_window), self.tunables.ttl_lite)
+        return self.postman.reply(
+            d,
+            serve_get_anchors(self.store, req, self.tunables.liveness_window),
+            self.tunables.ttl_lite,
+        )
 
     def _on_get_proof(self, d: Delivered, now: Millis) -> MessageId | None:
         if not self._lite_authorised(d.frm):
-            return self.postman.reply(d, LiteRefused(SyncRefusal.UNAUTHORISED), self.tunables.ttl_lite)
+            return self.postman.reply(
+                d, LiteRefused(SyncRefusal.UNAUTHORISED), self.tunables.ttl_lite
+            )
         try:
             req = LiteMsg.decode(d.verb, d.body)
         except (LiteAdapterError, DudeError):
-            return self.postman.reply(d, LiteRefused(SyncRefusal.MALFORMED_QUERY), self.tunables.ttl_lite)
+            return self.postman.reply(
+                d, LiteRefused(SyncRefusal.MALFORMED_QUERY), self.tunables.ttl_lite
+            )
         if not isinstance(req, GetProof):
             return None
         if not self.mgmt_reader.may_read(self.store, d.frm, req.store_id):
-            return self.postman.reply(d, LiteRefused(SyncRefusal.UNAUTHORISED), self.tunables.ttl_lite)
-        return self.postman.reply(d, serve_get_proof(self.store, req, self.tunables.liveness_window), self.tunables.ttl_lite)
+            return self.postman.reply(
+                d, LiteRefused(SyncRefusal.UNAUTHORISED), self.tunables.ttl_lite
+            )
+        return self.postman.reply(
+            d,
+            serve_get_proof(self.store, req, self.tunables.liveness_window),
+            self.tunables.ttl_lite,
+        )
 
     def _on_tx_status(self, d: Delivered, now: Millis) -> MessageId | None:
         if not self._lite_authorised(d.frm):
-            return self.postman.reply(d, LiteRefused(SyncRefusal.UNAUTHORISED), self.tunables.ttl_lite)
+            return self.postman.reply(
+                d, LiteRefused(SyncRefusal.UNAUTHORISED), self.tunables.ttl_lite
+            )
         try:
             req = LiteMsg.decode(d.verb, d.body)
         except (LiteAdapterError, DudeError):
-            return self.postman.reply(d, LiteRefused(SyncRefusal.MALFORMED_QUERY), self.tunables.ttl_lite)
+            return self.postman.reply(
+                d, LiteRefused(SyncRefusal.MALFORMED_QUERY), self.tunables.ttl_lite
+            )
         if not isinstance(req, TxStatus):
             return None
         info = self.store.settlement_of(req.op_hash)
@@ -482,7 +549,10 @@ class ReplicaNode(_BaseNode):
 
     def submit(self, tx: ops.SignedTransaction, to: crypto.PublicKey) -> MessageId:
         return self.postman.send_raw(
-            to, Verb.SUBMIT, tx.raw, self.tunables.ttl_exchange,
+            to,
+            Verb.SUBMIT,
+            tx.raw,
+            self.tunables.ttl_exchange,
         )
 
     def session(self, store_id: int = ops.STORE_DATA) -> SessionRW:
@@ -516,14 +586,18 @@ class ReplicaNode(_BaseNode):
                 handle.resolve(d.verb, d.body)
             return
         match d.verb:
-            case Verb.HEIGHT_REPLY: self._on_height_reply(d, now)
-            case Verb.SETTLED_BLOCK: self._on_settled_block(d, now)
-            case Verb.SYNC_REFUSED: self._on_sync_refused(d, now)
-            case Verb.PING: self._on_ping(d, now)
+            case Verb.HEIGHT_REPLY:
+                self._on_height_reply(d, now)
+            case Verb.SETTLED_BLOCK:
+                self._on_settled_block(d, now)
+            case Verb.SYNC_REFUSED:
+                self._on_sync_refused(d, now)
+            case Verb.PING:
+                self._on_ping(d, now)
 
 
 class _ReplicaSubstrate(Substrate):
-    __slots__ = ("_node", "_key_cache")
+    __slots__ = ("_key_cache", "_node")
 
     def __init__(self, node: ReplicaNode) -> None:
         self._node = node
@@ -559,7 +633,11 @@ class _ReplicaSubstrate(Substrate):
         handle = SubmitHandle(mid=mid, op_hash=signed.op_hash, _sub=self)
         self._node._inflight[mid.correlation_id] = handle
         self._node.postman.send_raw(
-            target, Verb.SUBMIT, signed.raw, self._node.tunables.ttl_exchange, mid=mid,
+            target,
+            Verb.SUBMIT,
+            signed.raw,
+            self._node.tunables.ttl_exchange,
+            mid=mid,
         )
         return handle
 
@@ -573,7 +651,8 @@ class _ReplicaSubstrate(Substrate):
         with self._node._commit_cond:
             seq = self._node._commit_seq
             self._node._commit_cond.wait_for(
-                lambda: self._node._commit_seq > seq, timeout=timeout,
+                lambda: self._node._commit_seq > seq,
+                timeout=timeout,
             )
 
     @property
@@ -591,7 +670,3 @@ class _ReplicaSubstrate(Substrate):
         if h is None:
             return None
         return BlockHead(num, h)
-
-
-
-

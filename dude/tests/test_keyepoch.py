@@ -8,9 +8,8 @@ import unittest
 from dude.consensus.bootstrap import bootstrap, intervene, mint_first_keyepoch
 from dude.core import codec, crypto
 from dude.core.errors import DudeError
-from dude.session import KeyCache, SessionRW, Substrate
+from dude.session import KeyCache, SessionRW, SubmitResult, Substrate
 from dude.store import Store, ops, settle
-from dude.session import SubmitResult
 from dude.store.layer import Held
 from dude.store.management import Cert, MgmtWriter, Role, epoch_key
 
@@ -38,7 +37,7 @@ def _cluster_of_one() -> tuple[Store, crypto.Keypair, MgmtWriter]:
 
 
 class _StoreSubstrate(Substrate):
-    __slots__ = ("_store", "_cache")
+    __slots__ = ("_cache", "_store")
 
     def __init__(self, store: Store, kp: crypto.Keypair) -> None:
         self._store = store
@@ -150,7 +149,6 @@ class TestWhatANodeHolds(unittest.TestCase):
 
 
 class TestACiphertextOpensOnlyWhereItWasSealed(unittest.TestCase):
-
     def setUp(self):
         self.s, self.mgr, _ = _cluster_of_one()
         self.ds = _data_session(self.s, self.mgr)
@@ -203,7 +201,6 @@ class TestACiphertextOpensOnlyWhereItWasSealed(unittest.TestCase):
 
 
 class TestGenesisIsByteEqualOnEveryNode(unittest.TestCase):
-
     def test_every_node_and_a_later_joiner_share_block_one(self):
         c = Cluster(nodes=3, mgmt=1)
         blocks = {n.store.settled_at(1) for n in c.nodes}

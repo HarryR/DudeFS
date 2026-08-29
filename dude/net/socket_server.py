@@ -1,18 +1,18 @@
 from __future__ import annotations
 
+import contextlib
 import os
 import socket
 import threading
 
 from ..core import codec, crypto
 from ..core.errors import DudeError
-from ..session import Dropped, Substrate, SubmitHandle
+from ..session import Dropped, SubmitHandle, Substrate
 from ..store import ops
 from .socket_framing import QUERY_PENDING, Request, Response, read_request, send_response
 
 
 class SocketServer:
-
     def __init__(self, path: str, substrate: Substrate) -> None:
         self._path = path
         self._sub = substrate
@@ -35,10 +35,8 @@ class SocketServer:
 
     def stop(self) -> None:
         self._stopping.set()
-        try:
+        with contextlib.suppress(OSError):
             self._sock.shutdown(socket.SHUT_RDWR)
-        except OSError:
-            pass
         self._sock.close()
         for c in list(self._clients):
             c.stop()
@@ -54,7 +52,7 @@ class SocketServer:
         while not self._stopping.is_set():
             try:
                 conn, _ = self._sock.accept()
-            except (OSError, socket.timeout):
+            except (TimeoutError, OSError):
                 continue
             handler = _ClientHandler(conn, self._sub, self._clients)
             self._clients.append(handler)
@@ -77,8 +75,9 @@ class SocketServer:
 
 
 class _ClientHandler:
-
-    def __init__(self, conn: socket.socket, substrate: Substrate, siblings: list[_ClientHandler]) -> None:
+    def __init__(
+        self, conn: socket.socket, substrate: Substrate, siblings: list[_ClientHandler]
+    ) -> None:
         self._conn = conn
         self._sub = substrate
         self._siblings = siblings
@@ -94,18 +93,14 @@ class _ClientHandler:
 
     def stop(self) -> None:
         self._stopped = True
-        try:
+        with contextlib.suppress(OSError):
             self._conn.shutdown(socket.SHUT_RDWR)
-        except OSError:
-            pass
         if self._reader_thread is not None:
             self._reader_thread.join()
 
     def push_commit_wake(self, payload: bytes) -> None:
-        try:
+        with contextlib.suppress(OSError):
             self._respond(Response.COMMIT, b"", payload)
-        except OSError:
-            pass
 
     def _respond(self, tag: Response, corr_id: bytes, payload: bytes) -> None:
         with self._send_lock:
@@ -127,16 +122,14 @@ class _ClientHandler:
         finally:
             self.alive = False
             self._stopped = True
-            try:
+            with contextlib.suppress(ValueError):
                 self._siblings.remove(self)
-            except ValueError:
-                pass
-            try:
+            with contextlib.suppress(OSError):
                 self._conn.close()
-            except OSError:
-                pass
 
-    def _dispatch(self, tag: Request, corr_id: bytes, payload: bytes) -> None:
+    def _dispatch(  # noqa: PLR0912, PLR0915, C901 — one branch per verb, no nesting
+        self, tag: Request, corr_id: bytes, payload: bytes
+    ) -> None:
         match tag:
             case Request.GET:
                 parts = codec.as_seq(codec.decode(payload), 2)

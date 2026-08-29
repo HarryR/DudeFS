@@ -44,7 +44,6 @@ def _test_fixture():
 
 
 class TestCheckpointMeta(unittest.TestCase):
-
     def test_create_and_verify_compactor(self):
         anchor, _, compactor, grant_cert, sb, _ = _test_fixture()
         meta = CheckpointMeta.create(sb.encode(), anchor.public, compactor, grant_cert)

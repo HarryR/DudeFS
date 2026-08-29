@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import os
 import socket
 import threading
@@ -7,7 +8,7 @@ import threading
 from ..core import codec, crypto
 from ..core.errors import DudeError
 from ..net.envelope import MessageId
-from ..session import Substrate, SubmitHandle, SubmitResult
+from ..session import SubmitHandle, SubmitResult, Substrate
 from ..store import ops
 from ..store.layer import BlockHead, Held
 from ..tunables import Tunables
@@ -15,12 +16,16 @@ from .socket_framing import QUERY_PENDING, Request, Response, read_response, sen
 
 
 class SocketSubstrateError(DudeError): ...
-class RequestTimedOut(SocketSubstrateError): ...
-class ConnectionLost(SocketSubstrateError): ...
+
+
+class RequestTimedOutError(SocketSubstrateError): ...
+
+
+class ConnectionLostError(SocketSubstrateError): ...
 
 
 class _ReplySlot:
-    __slots__ = ("_event", "_value", "_error")
+    __slots__ = ("_error", "_event", "_value")
 
     def __init__(self) -> None:
         self._event = threading.Event()
@@ -37,16 +42,15 @@ class _ReplySlot:
 
     def wait(self, timeout: float) -> bytes:
         if not self._event.wait(timeout):
-            raise RequestTimedOut()
+            raise RequestTimedOutError
         if self._error:
-            raise ConnectionLost()
+            raise ConnectionLostError
         if self._value is None:
             raise SocketSubstrateError("slot signalled without a value")
         return self._value
 
 
 class SocketSubstrate(Substrate):
-
     def __init__(self, path: str, tunables: Tunables) -> None:
         self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self._sock.connect(path)
@@ -82,7 +86,9 @@ class SocketSubstrate(Substrate):
         return codec.as_bytes(parts[0]), codec.as_bytes(parts[1]), codec.as_int(parts[2])
 
     def decrypt(self, store_id: int, name: str, ciphertext: bytes, epoch: int) -> bytes:
-        return self._request(Request.DECRYPT, codec.encode([store_id, name.encode(), ciphertext, epoch]))
+        return self._request(
+            Request.DECRYPT, codec.encode([store_id, name.encode(), ciphertext, epoch])
+        )
 
     def submit(self, tx: ops.Transaction) -> SubmitHandle:
         corr_id = os.urandom(16)
@@ -125,10 +131,8 @@ class SocketSubstrate(Substrate):
 
     def close(self) -> None:
         self._closed = True
-        try:
+        with contextlib.suppress(OSError):
             self._sock.shutdown(socket.SHUT_RDWR)
-        except OSError:
-            pass
         self._sock.close()
         self._reader_thread.join()
 

@@ -1,4 +1,3 @@
-
 from dataclasses import dataclass, field
 
 from ...core import crypto
@@ -6,7 +5,6 @@ from ...core.units import now_ms
 from ..address import Address, Endpoint, Scheme
 from ..envelope import Frame
 from ..link import Link, LinkError, Listener, OnFrame, OnLink
-
 
 type InProcNexus = dict[bytes, "InProcListener"]
 

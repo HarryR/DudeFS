@@ -108,7 +108,7 @@ class TestPlan(unittest.TestCase):
         t = replace(DEFAULT, rtt_max=200)
         peer = _peer(A1, A2)
         peer.links[0].on_reply(0, 300)  # A1 slow
-        peer.links[1].on_reply(0, 50)   # A2 fast
+        peer.links[1].on_reply(0, 50)  # A2 fast
         d = plan_next(t, peer, 0, T0, T0 + 10_000)
         assert isinstance(d, Send)
         self.assertEqual(d.link.address, A2)
@@ -157,8 +157,13 @@ class TestMaybeReply(unittest.TestCase):
 
         reply = request(self.peer, self.me.public, Verb.PONG, T0 + 5, b"data")
         # Set reply_to to the original mid so the mailbox correlates
-        reply_env = Envelope(self.me.public, Verb.PONG, MessageId.random(), b"data",
-                             reply_to=env.mid.with_attempt(t.attempt))
+        reply_env = Envelope(
+            self.me.public,
+            Verb.PONG,
+            MessageId.random(),
+            b"data",
+            reply_to=env.mid.with_attempt(t.attempt),
+        )
         reply_signed = reply_env.sign(self.peer, T0 + 5)
         got = self.box.arrived(reply_signed, T0 + 5)
         assert got is not None
@@ -197,7 +202,10 @@ class TestMaybeReply(unittest.TestCase):
         self.box.expired(T0 + TTL)
 
         late_reply = Envelope(
-            self.me.public, Verb.PONG, MessageId.random(), b"data",
+            self.me.public,
+            Verb.PONG,
+            MessageId.random(),
+            b"data",
             reply_to=env.mid.with_attempt(t.attempt),
         ).sign(self.peer, T0 + TTL + 1)
         self.assertIsNone(self.box.arrived(late_reply, T0 + TTL + 1))
@@ -208,7 +216,10 @@ class TestMaybeReply(unittest.TestCase):
         self.box.sent(t.prefix, t.attempt, A1, T0)
 
         reply = Envelope(
-            self.me.public, Verb.PONG, MessageId.random(), b"",
+            self.me.public,
+            Verb.PONG,
+            MessageId.random(),
+            b"",
             reply_to=env.mid.with_attempt(t.attempt),
         ).sign(self.peer, T0 + 40)
         got = self.box.arrived(reply, T0 + 40)
@@ -225,7 +236,10 @@ class TestMaybeReply(unittest.TestCase):
         self.box.sent(t1.prefix, t1.attempt, A2, T0 + 500)
 
         reply = Envelope(
-            self.me.public, Verb.PONG, MessageId.random(), b"",
+            self.me.public,
+            Verb.PONG,
+            MessageId.random(),
+            b"",
             reply_to=env.mid.with_attempt(t1.attempt),
         ).sign(self.peer, T0 + 600)
         got = self.box.arrived(reply, T0 + 600)
@@ -258,7 +272,10 @@ class TestOnlyThePeerWeAskedMayAnswer(unittest.TestCase):
         (t,) = self.box.due(T0)
         self.box.sent(t.prefix, t.attempt, A1, T0)
         reply = Envelope(
-            self.me.public, Verb.PONG, MessageId.random(), b"",
+            self.me.public,
+            Verb.PONG,
+            MessageId.random(),
+            b"",
             reply_to=env.mid.with_attempt(t.attempt),
         ).sign(self.asked, T0 + 5)
         self.assertIsNotNone(self.box.arrived(reply, T0 + 5))
@@ -268,7 +285,10 @@ class TestOnlyThePeerWeAskedMayAnswer(unittest.TestCase):
         (t,) = self.box.due(T0)
         self.box.sent(t.prefix, t.attempt, A1, T0)
         theirs = Envelope(
-            self.me.public, Verb.PONG, MessageId.random(), b"",
+            self.me.public,
+            Verb.PONG,
+            MessageId.random(),
+            b"",
             reply_to=env.mid.with_attempt(t.attempt),
         ).sign(self.other, T0 + 5)
         self.assertIsNone(self.box.arrived(theirs, T0 + 5))

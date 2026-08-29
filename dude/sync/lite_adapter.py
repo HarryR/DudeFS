@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
+from abc import abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
+from enum import Enum
 from typing import ClassVar
 
 from ..consensus.settle_round import SettledBlock
@@ -12,9 +13,6 @@ from ..net.envelope import Verb
 from ..net.postman import Encodable
 from ..store.management import Cert, Grant, NodeRecord
 from .refusal import SyncRefusal
-
-
-from enum import Enum
 
 
 class LiteAdapterError(DudeError): ...

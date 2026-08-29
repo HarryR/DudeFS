@@ -1,15 +1,14 @@
-
 import threading
 import time
 import unicodedata
-from dataclasses import dataclass, field
 from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
 
 from .core import codec, crypto
 from .core.errors import DudeError
 from .net.envelope import MessageId, Verb
 from .store import ops
-from .store.layer import BlockHead, Held, Reader
+from .store.layer import BlockHead, Reader
 from .store.management import blind_key, epoch_key, wrap_key
 
 
@@ -73,8 +72,6 @@ class Refused(SubmitResult):
 class Dropped(SubmitResult):
     def encode(self) -> bytes:
         return codec.encode([b"D"])
-
-
 
 
 @dataclass(slots=True)
@@ -179,7 +176,8 @@ class KeyCache:
         sk = self._keys(store_id)
         if epoch not in sk.masters:
             raw = self._reader.get(
-                ops.STORE_MANAGEMENT, wrap_key(store_id, epoch, self._kp.public),
+                ops.STORE_MANAGEMENT,
+                wrap_key(store_id, epoch, self._kp.public),
             )
             if raw is None:
                 raise SessionError(
@@ -257,13 +255,23 @@ class Session:
         raw = self._reader.get(self._store_id, token)
         if raw is None:
             return Record(
-                name=name, store_id=self._store_id, token=token,
-                value=b"", raw=b"", epoch=0, absent=True,
+                name=name,
+                store_id=self._store_id,
+                token=token,
+                value=b"",
+                raw=b"",
+                epoch=0,
+                absent=True,
             )
         plaintext = self._decrypt(name, raw.value, raw.epoch)
         return Record(
-            name=name, store_id=self._store_id, token=token,
-            value=plaintext, raw=raw.value, epoch=raw.epoch, absent=False,
+            name=name,
+            store_id=self._store_id,
+            token=token,
+            value=plaintext,
+            raw=raw.value,
+            epoch=raw.epoch,
+            absent=False,
         )
 
 
@@ -386,5 +394,3 @@ def _collect_guards(
     if absent:
         out.append(ops.Absent(store_id, token))
     return tuple(out)
-
-

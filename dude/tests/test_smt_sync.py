@@ -23,7 +23,6 @@ def _populate(store: Store, n: int, value_size: int = 64) -> crypto.Accumulator:
 
 
 class TestSmtSync(unittest.TestCase):
-
     def _round_trip(self, src: Store, budget: int) -> Store:
         src_root = src.state_root()
         with src.snapshot() as reader:
@@ -84,7 +83,9 @@ class TestSmtSync(unittest.TestCase):
         original = chunks[0]
         bad_row = original.rows[0]._replace(value=crypto.random_bytes(64))
         tampered = Chunk(
-            original.depth, original.prefix, original.subtree_hash,
+            original.depth,
+            original.prefix,
+            original.subtree_hash,
             (bad_row, *original.rows[1:]),
         )
 

@@ -1,13 +1,14 @@
 import argparse
 import sys
 
-from . import client, compactor, mgr, node
+from . import anchor, client, compactor, mgr, node
 
 
 def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(prog="dude", description="DudeFS cluster management")
     sub = p.add_subparsers(dest="command")
 
+    anchor.register(sub)
     mgr.register(sub)
     node.register(sub)
     client.register(sub)

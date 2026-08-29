@@ -1,4 +1,3 @@
-
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import Self
@@ -61,7 +60,7 @@ class MessageId(bytes):
 
     @property
     def correlation_id(self) -> bytes:
-        return bytes(self[:self.PREFIX_SIZE])
+        return bytes(self[: self.PREFIX_SIZE])
 
     @property
     def attempt(self) -> int:
@@ -84,9 +83,7 @@ class Envelope:
     reply_to: MessageId = MessageId(b"")
 
     def encode(self) -> bytes:
-        return codec.encode(
-            [self.to, int(self.verb), self.mid, self.body, self.reply_to]
-        )
+        return codec.encode([self.to, int(self.verb), self.mid, self.body, self.reply_to])
 
     @classmethod
     def decode(cls, raw: bytes) -> "Envelope":

@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import contextlib
+from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
-from abc import ABC, abstractmethod
 
 from ..core import crypto
 from ..core.errors import DudeError

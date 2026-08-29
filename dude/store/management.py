@@ -12,8 +12,8 @@ from ..net.address import Endpoint
 from . import ops
 from .errors import StoreError
 from .layer import Reader
-from .settle import Authoriser
 from .managed import ManagedMap, MapEntry
+from .settle import Authoriser
 
 if TYPE_CHECKING:
     from ..session import Session
@@ -48,7 +48,7 @@ class Cert:
     sig: crypto.Signature
 
     @classmethod
-    def sign(cls, signer: crypto.Keypair, subject: bytes, purpose: bytes) -> "Cert":
+    def sign(cls, signer: crypto.Keypair, subject: bytes, purpose: bytes) -> Cert:
         return cls(
             signer.public,
             subject,
@@ -57,15 +57,15 @@ class Cert:
         )
 
     @classmethod
-    def sign_grant(cls, signer: crypto.Keypair, subject: crypto.PublicKey, role: Role) -> "Cert":
+    def sign_grant(cls, signer: crypto.Keypair, subject: crypto.PublicKey, role: Role) -> Cert:
         return cls.sign(signer, bytes(subject), role.value)
 
     @classmethod
-    def sign_roster(cls, signer: crypto.Keypair, subject: crypto.PublicKey) -> "Cert":
+    def sign_roster(cls, signer: crypto.Keypair, subject: crypto.PublicKey) -> Cert:
         return cls.sign(signer, bytes(subject), CERT_PURPOSE_ROSTER)
 
     @classmethod
-    def sign_roster_commitment(cls, signer: crypto.Keypair, commitment_bytes: bytes) -> "Cert":
+    def sign_roster_commitment(cls, signer: crypto.Keypair, commitment_bytes: bytes) -> Cert:
         return cls.sign(signer, crypto.h(commitment_bytes), CERT_PURPOSE_ROSTER_COMMITMENT)
 
     def verify(self) -> bool:
@@ -75,7 +75,7 @@ class Cert:
         return codec.encode([self.signer, self.subject, self.purpose, self.sig])
 
     @classmethod
-    def decode(cls, raw: bytes) -> "Cert":
+    def decode(cls, raw: bytes) -> Cert:
         try:
             p = codec.as_seq(codec.decode(raw), 4)
             return cls(
@@ -130,7 +130,7 @@ class NodeRecord:
         )
 
     @classmethod
-    def decode(cls, raw: bytes) -> "NodeRecord":
+    def decode(cls, raw: bytes) -> NodeRecord:
         f = codec.as_seq(codec.decode(raw), 4)
         identity = crypto.PublicKey(codec.as_bytes(f[0]))
         endpoints = tuple(Endpoint.parse(codec.as_bytes(e)) for e in codec.as_seq(f[1]))
@@ -148,7 +148,7 @@ class NodeRecord:
         )
 
     @classmethod
-    def decode_row(cls, identity: crypto.PublicKey, raw: bytes) -> "NodeRecord":
+    def decode_row(cls, identity: crypto.PublicKey, raw: bytes) -> NodeRecord:
         f = codec.as_seq(codec.decode(raw), 3)
         endpoints = tuple(Endpoint.parse(codec.as_bytes(e)) for e in codec.as_seq(f[0]))
         domains = frozenset(codec.as_bytes(d) for d in codec.as_seq(f[1]))
@@ -208,7 +208,7 @@ class RosterCommitment:
         )
 
     @classmethod
-    def decode_row(cls, raw: bytes) -> "RosterCommitment":
+    def decode_row(cls, raw: bytes) -> RosterCommitment:
         try:
             f = codec.as_seq(codec.decode(raw), 4)
             return cls(
@@ -241,7 +241,7 @@ class Grant:
         )
 
     @classmethod
-    def decode(cls, raw: bytes) -> "Grant":
+    def decode(cls, raw: bytes) -> Grant:
         f = codec.as_seq(codec.decode(raw), 5)
         identity = crypto.PublicKey(codec.as_bytes(f[0]))
         role_bytes = codec.as_bytes(f[1])
@@ -265,7 +265,7 @@ class Grant:
         )
 
     @classmethod
-    def decode_row(cls, identity: crypto.PublicKey, raw: bytes) -> "Grant":
+    def decode_row(cls, identity: crypto.PublicKey, raw: bytes) -> Grant:
         f = codec.as_seq(codec.decode(raw), 4)
         role_bytes = codec.as_bytes(f[0])
         try:
@@ -314,7 +314,6 @@ def wrap_key(store_id: int, epoch: int, who: crypto.PublicKey) -> bytes:
     return P_WRAP + _store_key(store_id) + epoch.to_bytes(8, "big") + who
 
 
-
 @dataclass(frozen=True, slots=True)
 class Attestation:
     key: bytes
@@ -323,7 +322,8 @@ class Attestation:
 
 
 def attestations_by(  # noqa: C901
-    session: Session, signer: crypto.PublicKey,
+    session: Session,
+    signer: crypto.PublicKey,
 ) -> tuple[Attestation, ...]:
     nodes_map = ManagedMap(P_NODE, session)
     grants_map = ManagedMap(P_GRANT, session)
@@ -405,7 +405,7 @@ class MgmtReader(Authoriser):
             return False
         return self._seats(who, rec)
 
-    def verify_cert(self, cert: Cert, reader: Reader | None = None) -> bool:  # noqa: PLR0911 -- each early-return names a distinct refusal reason; collapsing them into one `and`-chain hides which check failed
+    def verify_cert(self, cert: Cert, reader: Reader | None = None) -> bool:
         if not cert.verify():
             return False
         anchor_only_purposes = (Role.MANAGER.value, Role.COMPACTOR.value)
@@ -528,9 +528,7 @@ class MgmtReader(Authoriser):
 
     def has_standing(self, reader: Reader, who: crypto.PublicKey) -> bool:
         return (
-            who == self._anchor
-            or self.is_member(who)
-            or self.valid_grant(who, reader) is not None
+            who == self._anchor or self.is_member(who) or self.valid_grant(who, reader) is not None
         )
 
     def may_send(self, who: crypto.PublicKey, kind: int) -> bool:
@@ -701,9 +699,8 @@ class MgmtWriter(MgmtReader):
                 f"cert does not verify or signer is not authorised for role {role.name}"
             )
         record = Grant(who, role, stores, kinds, cert).encode_row()
-        return (
-            self._grants.add(who, record)
-            + ops.writes(ops.Set(self._session.store_id, P_POP + who, pop))
+        return self._grants.add(who, record) + ops.writes(
+            ops.Set(self._session.store_id, P_POP + who, pop)
         )
 
     def revoke(self, who: crypto.PublicKey, *, reissue_signer: crypto.Keypair) -> ops.Transaction:
@@ -744,7 +741,9 @@ class MgmtWriter(MgmtReader):
                 signer, RosterCommitment.content(rc.serial, rc.members, rc.state_fingerprint)
             )
             self._require_signer(cert)
-            return ops.writes(ops.Set(self._session.store_id, P_ROSTER, replace(rc, cert=cert).encode_row()))
+            return ops.writes(
+                ops.Set(self._session.store_id, P_ROSTER, replace(rc, cert=cert).encode_row())
+            )
         identity = crypto.PublicKey(att.subject)
         is_node = att.key == self._nodes.entry_name(identity)
         target_map = self._nodes if is_node else self._grants
@@ -784,7 +783,10 @@ class MgmtWriter(MgmtReader):
         point: the keys and the grant say the same thing."""
         return ops.writes(
             ops.Set(self._session.store_id, blind_key(store_id, who), blinding),
-            *(ops.Set(self._session.store_id, wrap_key(store_id, e, who), wraps[e]) for e in sorted(wraps)),
+            *(
+                ops.Set(self._session.store_id, wrap_key(store_id, e, who), wraps[e])
+                for e in sorted(wraps)
+            ),
         )
 
     def rotate(
@@ -802,7 +804,9 @@ class MgmtWriter(MgmtReader):
         newcomer. `blinding` is written at first mint only; rotating it would relocate every row
         in the store."""
         to = from_epoch + 1
-        steps = [ops.Step((), ops.Set(self._session.store_id, epoch_key(store_id), codec.encode(to)))]
+        steps = [
+            ops.Step((), ops.Set(self._session.store_id, epoch_key(store_id), codec.encode(to)))
+        ]
         steps += [
             ops.Step((), ops.Set(self._session.store_id, wrap_key(store_id, to, who), wraps[who]))
             for who in sorted(wraps)

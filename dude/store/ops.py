@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from ..core import codec, crypto
-
 from .errors import StoreError
 
 

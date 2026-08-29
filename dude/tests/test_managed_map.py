@@ -53,7 +53,6 @@ class MemSession:
 
 
 class TestManagedMap(unittest.TestCase):
-
     def setUp(self) -> None:
         self.session = MemSession()
         self.m = ManagedMap(b"test/", self.session)

@@ -14,7 +14,6 @@ from dude.tests.cluster import Cluster
 
 
 class TestCompactorFromReplicaNode(unittest.TestCase):
-
     def test_replica_compactor_submits_pivot(self):
         c = Cluster(nodes=3, mgmt=1)
         try:
@@ -30,7 +29,8 @@ class TestCompactorFromReplicaNode(unittest.TestCase):
 
             compactor_kp = crypto.Keypair.generate()
             grant = w.authorise(
-                compactor_kp.public, Role.COMPACTOR,
+                compactor_kp.public,
+                Role.COMPACTOR,
                 stores=frozenset({ops.STORE_MANAGEMENT}),
                 pop=compactor_kp.prove_possession(),
                 cert=Cert.sign_grant(c.anchor, compactor_kp.public, Role.COMPACTOR),
@@ -51,7 +51,6 @@ class TestCompactorFromReplicaNode(unittest.TestCase):
 
 
 class TestCompactorFromLightClient(unittest.TestCase):
-
     def test_light_client_compactor_submits_pivot(self):
         c = Cluster(nodes=3, mgmt=1, rw=0)
         try:
@@ -67,7 +66,8 @@ class TestCompactorFromLightClient(unittest.TestCase):
 
             compactor_kp = crypto.Keypair.generate()
             grant = w.authorise(
-                compactor_kp.public, Role.COMPACTOR,
+                compactor_kp.public,
+                Role.COMPACTOR,
                 stores=frozenset({ops.STORE_MANAGEMENT}),
                 pop=compactor_kp.prove_possession(),
                 cert=Cert.sign_grant(c.anchor, compactor_kp.public, Role.COMPACTOR),
@@ -95,7 +95,9 @@ class TestCompactorFromLightClient(unittest.TestCase):
 
             sb = lc.trusted_state.head
             grant_cert = Cert.sign_grant(
-                c.anchor, compactor_kp.public, Role.COMPACTOR,
+                c.anchor,
+                compactor_kp.public,
+                Role.COMPACTOR,
             )
             meta = CheckpointMeta.create(
                 settled_block_bytes=sb.encode(),

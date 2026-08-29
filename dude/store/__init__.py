@@ -1,4 +1,5 @@
 from . import management, ops, settle
+from .errors import StoreError
 from .layer import Layer, LayerError, Overlay, Reader, View, holds
 from .ops import (
     Absent,
@@ -12,7 +13,6 @@ from .ops import (
     writes,
 )
 from .settle import Verdict, evaluate, would_apply
-from .errors import StoreError
 from .store import Applied, Commitment, Entry, Index, Store, element
 
 __all__ = [

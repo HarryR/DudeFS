@@ -182,7 +182,9 @@ class Follower:
         range, because the roster comes from the log and only committing the previous block
         makes its roster change visible (#roster-at-ratification)."""
         sb = offer.block
-        walked = chain.advance(self._tip(), (sb,), self.mgmt_reader.roster(), self._require_anchor())
+        walked = chain.advance(
+            self._tip(), (sb,), self.mgmt_reader.roster(), self._require_anchor()
+        )
         if isinstance(walked, chain.ChainRefusal):
             return False
         # Equality: a block names exactly what it applied, so bodies short of the hash list
@@ -227,9 +229,7 @@ class Follower:
         if not self._compacted_at:
             return None
         my_num = self.store.head_block_num() or 0
-        peers_with_heads = {
-            p for p in self._heads if self._heads[p].block_num > my_num
-        }
+        peers_with_heads = {p for p in self._heads if self._heads[p].block_num > my_num}
         if not peers_with_heads:
             return None
         if all(p in self._compacted_at for p in peers_with_heads):
@@ -264,10 +264,7 @@ class Follower:
         return candidates[0][0]
 
     def _tip(self) -> crypto.Digest:
-        return (
-            self.store.head_block_hash()
-            or genesis_stamp(self._require_anchor())
-        )
+        return self.store.head_block_hash() or genesis_stamp(self._require_anchor())
 
     def _require_anchor(self) -> crypto.PublicKey:
         anchor = self.store.anchor()

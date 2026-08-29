@@ -18,7 +18,6 @@ from dude.tests.cluster import Cluster
 
 
 class TestCheckpointWire(unittest.TestCase):
-
     def _boot_with_data(self):
         c = Cluster(nodes=3, mgmt=1)
         s = c.replicas[0].session()
@@ -47,7 +46,9 @@ class TestCheckpointWire(unittest.TestCase):
         compactor_node = c.boot_replica(compactor_kp)
         c.wait_head(c.nodes[0].store.head(), nodes=[compactor_node])
         cs = compactor_node.session(store_id=ops.STORE_MANAGEMENT)
-        c.wait_settled(cs.submit(MgmtWriter(cs).compact(c.nodes[0].store.head_block_num() or 0)).wait())
+        c.wait_settled(
+            cs.submit(MgmtWriter(cs).compact(c.nodes[0].store.head_block_num() or 0)).wait()
+        )
         return compactor_kp
 
     def _install_checkpoint_server(self, c, compactor_kp):
@@ -63,7 +64,10 @@ class TestCheckpointWire(unittest.TestCase):
                 grant_cert=grant_cert,
             )
         srv = CheckpointServer.create_and_persist(
-            node.store, meta, max_chunk_bytes=10_000, batch_size=3,
+            node.store,
+            meta,
+            max_chunk_bytes=10_000,
+            batch_size=3,
         )
         node.checkpoint_server = srv
         return meta
@@ -134,7 +138,8 @@ class TestCheckpointWire(unittest.TestCase):
                     offset += len(reply.chunks)
                 importer.verify()
                 w.bootstrap_checkpoint(
-                    restored_meta.anchor, restored_meta.settled_block_bytes,
+                    restored_meta.anchor,
+                    restored_meta.settled_block_bytes,
                 )
 
             roster = tuple(sorted(dst.mgmt_reader.roster()))

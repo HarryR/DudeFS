@@ -1,4 +1,3 @@
-
 import time
 from collections.abc import Callable
 
@@ -7,8 +6,8 @@ from ..core import crypto
 from ..net.postman import Postman
 from ..net.transports.inproc import InProcListener, InProcNexus
 from ..node import Node, ReplicaNode
-from ..store import Store, ops
 from ..session import Settled
+from ..store import Store, ops
 from ..sync.lite_client import LightClient
 from ..tunables import Tunables
 
@@ -18,7 +17,6 @@ TUNABLES = Tunables(rtt_max=50, clock_skew=25, held_convergence_max=2)
 
 
 class Cluster:
-
     def __init__(
         self,
         nodes: int = 3,
@@ -66,8 +64,7 @@ class Cluster:
         return compose_genesis(
             anchor=self.anchor,
             node_endpoints=[
-                (kp.public, (InProcListener.endpoint_for(kp.public),))
-                for kp in node_keys
+                (kp.public, (InProcListener.endpoint_for(kp.public),)) for kp in node_keys
             ],
             managers=mgmt_keys,
             ro_clients=ro_keys,
@@ -100,14 +97,17 @@ class Cluster:
         return rn
 
     def _boot_light_client(
-        self, kp: crypto.Keypair, into: list[LightClient],
+        self,
+        kp: crypto.Keypair,
+        into: list[LightClient],
     ) -> LightClient:
         postman = Postman(kp, self.tunables)
         postman.add_listener(InProcListener(kp.public, self.nexus))
         lc = LightClient(me=kp, anchor=self.anchor.public, postman=postman)
         for node in self.nodes:
             lc.add_bootstrap_peer(
-                node.me.public, (InProcListener.endpoint_for(node.me.public),),
+                node.me.public,
+                (InProcListener.endpoint_for(node.me.public),),
             )
         lc.start()
         into.append(lc)
@@ -154,14 +154,14 @@ class Cluster:
         raise TimeoutError(f"predicate not satisfied within {t:.1f}s")
 
     def wait_settled(
-        self, result: object, nodes: list[Node | ReplicaNode] | None = None,
+        self,
+        result: object,
+        nodes: list[Node | ReplicaNode] | None = None,
     ) -> Settled:
         if not isinstance(result, Settled):
             raise AssertionError(f"expected Settled, got {result!r}")  # noqa: TRY004
         check = nodes if nodes is not None else self.nodes
-        self.wait(lambda _: all(
-            n.store.has_settled(result.op_hash) for n in check
-        ))
+        self.wait(lambda _: all(n.store.has_settled(result.op_hash) for n in check))
         return result
 
     # -- teardown -----------------------------------------------------------

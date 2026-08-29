@@ -11,7 +11,6 @@ from dude.tests.cluster import Cluster
 
 
 class TestColdJoinerCatchesUpViaCheckpoint(unittest.TestCase):
-
     def test_joiner_downloads_checkpoint_and_converges(self):
         c = Cluster(nodes=3, mgmt=1)
         try:
@@ -26,18 +25,24 @@ class TestColdJoinerCatchesUpViaCheckpoint(unittest.TestCase):
             anchor_s = anchor_node.session()
             compactor_kp = crypto.Keypair.generate()
             w = anchor_node.store.mgmt_writer
-            c.wait_settled(anchor_s.submit(w.authorise(
-                compactor_kp.public,
-                Role.COMPACTOR,
-                stores=frozenset({ops.STORE_MANAGEMENT}),
-                pop=compactor_kp.prove_possession(),
-                cert=Cert.sign_grant(c.anchor, compactor_kp.public, Role.COMPACTOR),
-            )).wait())
+            c.wait_settled(
+                anchor_s.submit(
+                    w.authorise(
+                        compactor_kp.public,
+                        Role.COMPACTOR,
+                        stores=frozenset({ops.STORE_MANAGEMENT}),
+                        pop=compactor_kp.prove_possession(),
+                        cert=Cert.sign_grant(c.anchor, compactor_kp.public, Role.COMPACTOR),
+                    )
+                ).wait()
+            )
 
             compactor_node = c.boot_replica(compactor_kp)
             c.wait_head(c.nodes[0].store.head(), nodes=[compactor_node])
             cs = compactor_node.session(store_id=ops.STORE_MANAGEMENT)
-            c.wait_settled(cs.submit(MgmtWriter(cs).compact(c.nodes[0].store.head_block_num() or 0)).wait())
+            c.wait_settled(
+                cs.submit(MgmtWriter(cs).compact(c.nodes[0].store.head_block_num() or 0)).wait()
+            )
 
             source = c.nodes[0]
             grant_cert = Cert.sign_grant(c.anchor, compactor_kp.public, Role.COMPACTOR)
@@ -57,13 +62,17 @@ class TestColdJoinerCatchesUpViaCheckpoint(unittest.TestCase):
                 n.store.gc_below(pivot)
 
             joiner_kp = crypto.Keypair.generate()
-            c.wait_settled(anchor_s.submit(w.authorise(
-                joiner_kp.public,
-                Role.MANAGER,
-                stores=frozenset({ops.STORE_MANAGEMENT, ops.STORE_DATA}),
-                pop=joiner_kp.prove_possession(),
-                cert=Cert.sign_grant(c.anchor, joiner_kp.public, Role.MANAGER),
-            )).wait())
+            c.wait_settled(
+                anchor_s.submit(
+                    w.authorise(
+                        joiner_kp.public,
+                        Role.MANAGER,
+                        stores=frozenset({ops.STORE_MANAGEMENT, ops.STORE_DATA}),
+                        pop=joiner_kp.prove_possession(),
+                        cert=Cert.sign_grant(c.anchor, joiner_kp.public, Role.MANAGER),
+                    )
+                ).wait()
+            )
 
             joiner = c.boot_replica(joiner_kp)
             c.wait_head(c.nodes[0].store.head(), nodes=[joiner])

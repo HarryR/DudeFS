@@ -12,7 +12,6 @@ from dude.tests.cluster import Cluster
 
 
 class TestCheckpointRoundTrip(unittest.TestCase):
-
     def _make_cluster_with_data(self, n_keys: int = 5):
         c = Cluster(nodes=3, mgmt=1)
         s = c.replicas[0].session()

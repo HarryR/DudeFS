@@ -70,7 +70,8 @@ class CheckpointMeta:
         return None
 
     def verify_quorum(
-        self, roster: tuple[crypto.PublicKey, ...],
+        self,
+        roster: tuple[crypto.PublicKey, ...],
     ) -> str | None:
         sb = self.settled_block()
         payload = _settle_payload(sb.block.slice_hash, sb.anchors)
@@ -80,13 +81,15 @@ class CheckpointMeta:
         return None
 
     def encode(self) -> bytes:
-        return codec.encode([
-            self.settled_block_bytes,
-            self.anchor,
-            self.compactor,
-            self.grant_cert.encode(),
-            self.sig,
-        ])
+        return codec.encode(
+            [
+                self.settled_block_bytes,
+                self.anchor,
+                self.compactor,
+                self.grant_cert.encode(),
+                self.sig,
+            ]
+        )
 
     @classmethod
     def decode(cls, raw: bytes) -> CheckpointMeta:

@@ -1,19 +1,18 @@
 import unittest
 from dataclasses import replace
 
-from ..core import codec, crypto
+from ..core import crypto
 from ..core.errors import DudeError
 from ..core.units import now_ms
 from ..net.address import Address, Endpoint, Scheme
-from ..net.envelope import MessageId, Verb
+from ..net.envelope import MessageId
 from ..net.postman import Delivered
 from ..store import ops
 from ..store.management import Cert, Grant, NodeRecord, Role, RosterCommitment
 from ..sync import chain
-from ..sync.lite_adapter import AnchorsReply, GetProof, LiteMsg, ProofReply, RosterBundle
 from ..sync.lite import serve_get_proof
+from ..sync.lite_adapter import AnchorsReply, GetProof, LiteMsg, ProofReply, RosterBundle
 from ..sync.lite_client import (
-    PENDING,
     Failed,
     GetResult,
     LightClient,
@@ -23,8 +22,7 @@ from ..sync.lite_client import (
     _BootstrapReply,
     _BootstrapRequest,
 )
-
-from .cluster import Cluster, T0, TUNABLES as CLUSTER_TUNABLES
+from .cluster import Cluster
 
 
 def _now_for_store(c: Cluster) -> int:
@@ -34,6 +32,7 @@ def _now_for_store(c: Cluster) -> int:
     raw = store.settled_at(head_num)
     assert raw is not None
     from ..consensus.settle_round import SettledBlock
+
     bucket = SettledBlock.decode(raw).block.bucket
     return c.tunables.bucket_start(bucket + 1)
 
@@ -44,7 +43,6 @@ def _now_for_store(c: Cluster) -> int:
 
 
 class TestBootstrap(unittest.TestCase):
-
     def setUp(self) -> None:
         self.c = Cluster(nodes=3, mgmt=0, ro=0, rw=1)
         self.lc = self.c.rw_clients[0]
@@ -70,7 +68,6 @@ class TestBootstrap(unittest.TestCase):
 
 
 class TestLightClientRead(unittest.TestCase):
-
     def setUp(self) -> None:
         self.c = Cluster(nodes=3, mgmt=1, ro=0, rw=1)
         self.lc = self.c.rw_clients[0]
@@ -123,16 +120,14 @@ def _trusted_state_from_cluster(c: Cluster) -> TrustedState:
     head_num = store.head_block_num()
     assert head_num is not None
     from ..consensus.settle_round import SettledBlock
+
     raw = store.settled_at(head_num)
     assert raw is not None
     head = SettledBlock.decode(raw)
     return TrustedState(
         roster=tuple(sorted(commitment.members)),
         managers=tuple(sorted(g.identity for g in mgmt.manager_grants())),
-        node_endpoints={
-            rec.identity: rec.endpoints
-            for rec in mgmt.nodes().values()
-        },
+        node_endpoints={rec.identity: rec.endpoints for rec in mgmt.nodes().values()},
         roster_fingerprint=crypto.Digest(commitment.cert.subject),
         head=head,
     )
@@ -144,6 +139,7 @@ def _get_real_proof_reply(c: Cluster, store_id: int, name: bytes) -> ProofReply:
     assert head_num is not None
     ts = _trusted_state_from_cluster(c)
     from ..sync.lite_adapter import TrustedBlock
+
     request = GetProof(
         store_id=store_id,
         name=name,
@@ -152,12 +148,15 @@ def _get_real_proof_reply(c: Cluster, store_id: int, name: bytes) -> ProofReply:
         known_trusted_block=TrustedBlock(ts.head.anchors.block_num, ts.head.block_hash),
     )
     reply = serve_get_proof(store, request, c.tunables.liveness_window)
-    assert isinstance(reply, ProofReply), f"expected ProofReply, got {type(reply).__name__}: {reply}"
+    assert isinstance(reply, ProofReply), (
+        f"expected ProofReply, got {type(reply).__name__}: {reply}"
+    )
     return reply
 
 
 def _make_unstarted_lc(c: Cluster, head_behind: int = 0) -> LightClient:
     from ..net.postman import Postman
+
     kp = crypto.Keypair.generate()
     postman = Postman(kp, c.tunables)
     lc = LightClient(me=kp, anchor=c.anchor.public, postman=postman)
@@ -165,11 +164,11 @@ def _make_unstarted_lc(c: Cluster, head_behind: int = 0) -> LightClient:
     if head_behind > 0:
         store = c.nodes[0].store
         target = ts.head.anchors.block_num - head_behind
-        if target < 1:
-            target = 1
+        target = max(target, 1)
         raw = store.settled_at(target)
         assert raw is not None
         from ..consensus.settle_round import SettledBlock
+
         ts = replace(ts, head=SettledBlock.decode(raw))
     lc.trusted_state = ts
     lc.state = State.READY
@@ -177,8 +176,11 @@ def _make_unstarted_lc(c: Cluster, head_behind: int = 0) -> LightClient:
 
 
 def _feed_reply(
-    lc: LightClient, reply: LiteMsg, peer: crypto.PublicKey,
-    store_id: int = ops.STORE_DATA, name: bytes = b"",
+    lc: LightClient,
+    reply: LiteMsg,
+    peer: crypto.PublicKey,
+    store_id: int = ops.STORE_DATA,
+    name: bytes = b"",
 ) -> Read:
     mid = MessageId.random()
     read = Read(mid=mid, peer=peer, store_id=store_id, name=name)
@@ -196,7 +198,6 @@ def _feed_reply(
 
 
 class TestByzantineProofReply(unittest.TestCase):
-
     def setUp(self) -> None:
         self.c = Cluster(nodes=3, mgmt=1, ro=0, rw=0)
         ms = self.c.replicas[0].session()
@@ -247,6 +248,7 @@ class TestByzantineProofReply(unittest.TestCase):
         lc = _make_unstarted_lc(self.c, head_behind=1)
         reply = self._real_reply()
         from ..consensus.settle_round import SettledBlock
+
         ts = lc.trusted_state
         assert ts is not None
         head_num = ts.head.anchors.block_num
@@ -269,6 +271,7 @@ class TestByzantineProofReply(unittest.TestCase):
 
     def test_dude_error_from_chain_advance_resolves_read(self) -> None:
         from unittest import mock
+
         lc = _make_unstarted_lc(self.c, head_behind=1)
         reply = self._real_reply()
         ts = lc.trusted_state
@@ -278,11 +281,14 @@ class TestByzantineProofReply(unittest.TestCase):
         above_raw = store.settled_at(head_num + 1)
         assert above_raw is not None, "setUp should ensure head >= 2"
         from ..consensus.settle_round import SettledBlock
+
         above = SettledBlock.decode(above_raw)
         advanced = replace(reply, head=above, headers=())
 
         with mock.patch.object(
-            chain, "advance", side_effect=DudeError("header check exploded"),
+            chain,
+            "advance",
+            side_effect=DudeError("header check exploded"),
         ):
             read = _feed_reply(lc, advanced, self.c.nodes[0].me.public, name=self._token())
 
@@ -294,7 +300,6 @@ class TestByzantineProofReply(unittest.TestCase):
 
 
 class TestByzantineBootstrapReply(unittest.TestCase):
-
     def setUp(self) -> None:
         self.c = Cluster(nodes=3, mgmt=1, ro=0, rw=0)
         self.c.wait_block(2)
@@ -312,9 +317,11 @@ class TestByzantineBootstrapReply(unittest.TestCase):
         raw = store.settled_at(head_num)
         assert raw is not None
         from ..consensus.settle_round import SettledBlock
+
         head = SettledBlock.decode(raw)
-        from ..sync.lite_adapter import GetAnchors
         from ..sync.lite import serve_get_anchors
+        from ..sync.lite_adapter import GetAnchors
+
         request = GetAnchors(known_roster_fingerprint=None, known_trusted_block=None)
         reply = serve_get_anchors(store, request, self.c.tunables.liveness_window)
         assert isinstance(reply, AnchorsReply)
@@ -329,6 +336,7 @@ class TestByzantineBootstrapReply(unittest.TestCase):
         forged = replace(reply, head=forged_head)
 
         from ..net.postman import Postman
+
         kp = crypto.Keypair.generate()
         postman = Postman(kp, self.c.tunables)
         lc = LightClient(me=kp, anchor=self.c.anchor.public, postman=postman)
@@ -359,13 +367,15 @@ class TestByzantineBootstrapReply(unittest.TestCase):
         commitment = mgmt.roster_commitment()
         assert commitment is not None
 
-        from ..sync.lite_adapter import GetAnchors
         from ..sync.lite import serve_get_anchors
+        from ..sync.lite_adapter import GetAnchors
+
         request = GetAnchors(known_roster_fingerprint=None, known_trusted_block=None)
         honest_reply = serve_get_anchors(store, request, self.c.tunables.liveness_window)
         assert isinstance(honest_reply, AnchorsReply)
 
         from ..net.postman import Postman
+
         kp = crypto.Keypair.generate()
         postman = Postman(kp, self.c.tunables)
         lc = LightClient(me=kp, anchor=self.c.anchor.public, postman=postman)
@@ -379,8 +389,11 @@ class TestByzantineBootstrapReply(unittest.TestCase):
             lc._inflight[mid.correlation_id] = _BootstrapRequest(mid=mid, peer=node.me.public)
             verb, body = honest_reply.encode()
             delivered = Delivered(
-                frm=node.me.public, verb=verb, body=body,
-                mid=MessageId.random(), in_reply_to=mid,
+                frm=node.me.public,
+                verb=verb,
+                body=body,
+                mid=MessageId.random(),
+                in_reply_to=mid,
             )
             lc._on_delivered(delivered, now)
         self.assertTrue(lc.bootstrapped(), "honest bootstrap failed")
@@ -421,12 +434,16 @@ class TestByzantineBootstrapReply(unittest.TestCase):
         head_num = store.head_block_num()
         assert head_num is not None
         from ..sync.lite_adapter import TrustedBlock
+
         token = crypto.h(b"anything")
         request = GetProof(
-            store_id=ops.STORE_DATA, name=token, block_num=head_num,
+            store_id=ops.STORE_DATA,
+            name=token,
+            block_num=head_num,
             known_roster_fingerprint=lc.trusted_state.roster_fingerprint,
             known_trusted_block=TrustedBlock(
-                lc.trusted_state.head.anchors.block_num, lc.trusted_state.head.block_hash,
+                lc.trusted_state.head.anchors.block_num,
+                lc.trusted_state.head.block_hash,
             ),
         )
         real_proof_reply = serve_get_proof(store, request, self.c.tunables.liveness_window)
@@ -437,7 +454,10 @@ class TestByzantineBootstrapReply(unittest.TestCase):
             roster_fingerprint=forged_fingerprint,
         )
         read = _feed_reply(
-            lc, forged_proof, self.c.nodes[0].me.public, name=token,
+            lc,
+            forged_proof,
+            self.c.nodes[0].me.public,
+            name=token,
         )
 
         result = read.poll()

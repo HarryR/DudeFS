@@ -132,7 +132,9 @@ class Coordinator:
         if not isinstance(msg, Bodies):
             return
         good = tuple(
-            tx for tx in msg.txs if self.mempool.valid(tx, now, self.store, self.mgmt_reader) is None
+            tx
+            for tx in msg.txs
+            if self.mempool.valid(tx, now, self.store, self.mgmt_reader) is None
         )
         r.absorb(msg, frm, good)
 

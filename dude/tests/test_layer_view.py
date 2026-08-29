@@ -9,6 +9,7 @@ from collections.abc import Sequence
 
 from ..core import crypto
 from ..store import Layer, LayerError, Overlay, Store, ops
+
 D = ops.STORE_DATA
 
 

@@ -1,4 +1,3 @@
-
 from collections.abc import Sequence
 
 from ..core import crypto

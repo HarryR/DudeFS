@@ -22,9 +22,18 @@ import unittest
 
 from .. import quorum
 from ..consensus.canonical import CanonicalBatch
-from ..consensus.round import Block, Bodies, Held, Round, RoundAdapterError, RoundMsg, Sig, State, _slice_hash
-from ..core import codec
-from ..core import crypto
+from ..consensus.round import (
+    Block,
+    Bodies,
+    Held,
+    Round,
+    RoundAdapterError,
+    RoundMsg,
+    Sig,
+    State,
+    _slice_hash,
+)
+from ..core import codec, crypto
 from ..net.envelope import Verb
 from ..net.postman import Recipient
 from ..store import ops
@@ -967,7 +976,6 @@ class TestPropertySafetyUnderByzantine(unittest.TestCase):
 
 
 class TestRoundMsgEncoding(unittest.TestCase):
-
     def test_held_roundtrips(self):
         hashes = frozenset({crypto.h(b"a"), crypto.h(b"b"), crypto.h(b"c")})
         original = Held(bucket=7, prev_block=crypto.h(b"prev"), hashes=hashes)
@@ -994,7 +1002,9 @@ class TestRoundMsgEncoding(unittest.TestCase):
                 RoundMsg.decode(verb, codec.encode(wrong))
 
     def test_bucket_of_reads_leading_field(self):
-        _, body = Held(bucket=42, prev_block=crypto.h(b"prev"), hashes=frozenset({crypto.h(b"x")})).encode()
+        _, body = Held(
+            bucket=42, prev_block=crypto.h(b"prev"), hashes=frozenset({crypto.h(b"x")})
+        ).encode()
         self.assertEqual(RoundMsg.bucket_of(body), 42)
 
     def test_held_wrong_field_count_raises(self):

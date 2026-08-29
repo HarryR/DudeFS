@@ -1,17 +1,14 @@
-
 import unittest
 
 from ..core.units import now_ms
-from ..store import ops
 from ..session import Settled
-
+from ..store import ops
 from .cluster import Cluster
 
 D = ops.STORE_DATA
 
 
 class TestSessionViaReplicaNode(unittest.TestCase):
-
     def setUp(self) -> None:
         self.c = Cluster(nodes=3, mgmt=1, ro=0, rw=0)
         self.s = self.c.replicas[0].session()
@@ -79,7 +76,6 @@ class TestSessionViaReplicaNode(unittest.TestCase):
 
 
 class TestSessionViaLightClient(unittest.TestCase):
-
     def setUp(self) -> None:
         self.c = Cluster(nodes=3, mgmt=1, ro=0, rw=1)
         self.lc = self.c.rw_clients[0]

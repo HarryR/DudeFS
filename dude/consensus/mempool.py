@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+
 from ..core import crypto
 from ..core.units import Bucket, Millis
 from ..store import ops, settle
-from ..store.layer import Ledger, Reader
+from ..store.layer import Ledger
 from ..tunables import Tunables
 
 

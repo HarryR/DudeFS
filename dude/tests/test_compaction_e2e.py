@@ -6,7 +6,6 @@ from dude.consensus.settle_round import SettledBlock
 from dude.core import crypto
 from dude.store import Store, ops
 from dude.store.checkpoint import CheckpointMeta
-from dude.session import Settled
 from dude.store.management import (
     Cert,
     MgmtWriter,
@@ -17,7 +16,6 @@ from dude.tests.cluster import Cluster
 
 
 class TestCompactionEndToEnd(unittest.TestCase):
-
     def _boot(self):
         c = Cluster(nodes=3, mgmt=1)
         s = c.replicas[0].session()
@@ -30,13 +28,15 @@ class TestCompactionEndToEnd(unittest.TestCase):
         anchor_s = anchor_node.session()
         w = anchor_node.store.mgmt_writer
         c.wait_settled(
-            anchor_s.submit(w.authorise(
-                kp.public,
-                Role.COMPACTOR,
-                stores=frozenset({ops.STORE_MANAGEMENT}),
-                pop=kp.prove_possession(),
-                cert=Cert.sign_grant(c.anchor, kp.public, Role.COMPACTOR),
-            )).wait(),
+            anchor_s.submit(
+                w.authorise(
+                    kp.public,
+                    Role.COMPACTOR,
+                    stores=frozenset({ops.STORE_MANAGEMENT}),
+                    pop=kp.prove_possession(),
+                    cert=Cert.sign_grant(c.anchor, kp.public, Role.COMPACTOR),
+                )
+            ).wait(),
         )
         return kp
 
@@ -184,9 +184,7 @@ class TestCompactionEndToEnd(unittest.TestCase):
 
             for n in c.nodes:
                 self.assertIsNone(n.store.settled_at(0), "block 0 should be GC'd")
-                self.assertIsNotNone(
-                    n.store.settled_at(pivot_block), "pivot block should survive"
-                )
+                self.assertIsNotNone(n.store.settled_at(pivot_block), "pivot block should survive")
         finally:
             c.close()
 

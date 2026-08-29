@@ -19,7 +19,9 @@ class SettleAdapter:
             for peer in recipients(target, round_.roster(), self.me.public):
                 self.postman.send_raw(peer, verb, body, self.ttl, await_reply=False)
 
-    def deliver(self, frm: crypto.PublicKey, verb: Verb, body: bytes, round_: SettleRound, now: Millis) -> None:
+    def deliver(
+        self, frm: crypto.PublicKey, verb: Verb, body: bytes, round_: SettleRound, now: Millis
+    ) -> None:
         round_.receive(SettleSig.decode(verb, body), from_=frm, now=now)
 
 

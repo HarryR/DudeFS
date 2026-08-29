@@ -168,9 +168,14 @@ def _bound_sends(sock: socket.socket, seconds: float) -> None:
 
 class _DialWorker:
     __slots__ = (
-        "_address", "_on_frame", "_on_link",
-        "_stopping", "_thread", "_timing",
-        "_pending_sock", "_sock_lock",
+        "_address",
+        "_on_frame",
+        "_on_link",
+        "_pending_sock",
+        "_sock_lock",
+        "_stopping",
+        "_thread",
+        "_timing",
     )
 
     def __init__(
@@ -262,7 +267,10 @@ class TCPDialer(Listener):
             return
         if address not in self._workers:
             self._workers[address] = _DialWorker(
-                address, self.timing, self._on_frame, self._on_link,
+                address,
+                self.timing,
+                self._on_frame,
+                self._on_link,
             )
 
     def stop(self) -> None:

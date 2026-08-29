@@ -19,7 +19,9 @@ class RoundAdapter:
             for peer in recipients(target, round_.roster(), self.me.public):
                 self.postman.send_raw(peer, verb, body, self.ttl, await_reply=False)
 
-    def deliver(self, frm: crypto.PublicKey, verb: Verb, body: bytes, round_: Round, now: Millis) -> None:
+    def deliver(
+        self, frm: crypto.PublicKey, verb: Verb, body: bytes, round_: Round, now: Millis
+    ) -> None:
         round_.receive(RoundMsg.decode(verb, body), from_=frm, now=now)
 
 

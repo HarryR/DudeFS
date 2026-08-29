@@ -1,10 +1,10 @@
 import contextlib
-import time
 import threading
+import time
+from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
 from enum import Enum, auto
-from abc import ABC, abstractmethod
 
 from .. import quorum
 from ..consensus.settle_round import SettledBlock, _settle_payload
@@ -15,7 +15,8 @@ from ..net.address import Endpoint
 from ..net.envelope import MessageId, Verb
 from ..net.link import Listener
 from ..net.postman import Delivered, Postman
-from ..store import smt
+from ..session import KeyCache, SessionRW, Settled, SubmitHandle, SubmitResult, Substrate
+from ..store import ops, smt
 from ..store.layer import BlockHead, Held
 from ..store.management import (
     CERT_PURPOSE_ROSTER,
@@ -27,7 +28,6 @@ from ..store.management import (
 )
 from ..tunables import Tunables
 from . import chain
-from ..store.ops import SignedTransaction
 from .lite_adapter import (
     AnchorsReply,
     GetAnchors,
@@ -43,9 +43,6 @@ from .lite_adapter import (
     TxStatusKind,
     TxStatusReply,
 )
-
-from ..session import KeyCache, SessionRW, Settled, SubmitHandle, SubmitResult, Substrate
-from ..store import ops
 
 
 class LightClientError(DudeError): ...
@@ -171,7 +168,9 @@ class LightClient:
 
     _bootstrap_peers: dict[crypto.PublicKey, _BootstrapReply] = field(default_factory=dict)
     _inflight: dict[bytes, Request] = field(default_factory=dict)
-    _submit_callbacks: dict[bytes, Callable[[int, bytes], None]] = field(default_factory=dict, init=False)
+    _submit_callbacks: dict[bytes, Callable[[int, bytes], None]] = field(
+        default_factory=dict, init=False
+    )
     _key_cache: KeyCache | None = field(default=None, init=False)
     _peer_views: dict[crypto.PublicKey, PeerView] = field(default_factory=dict, init=False)
 
@@ -475,7 +474,7 @@ class _TxStatusHandle(Request):
 
 
 class _LiteSubstrate(Substrate):
-    __slots__ = ("_lc", "_key_cache")
+    __slots__ = ("_key_cache", "_lc")
 
     def __init__(self, lc: LightClient) -> None:
         self._lc = lc
@@ -547,7 +546,7 @@ class _LiteSubstrate(Substrate):
             raise LightClientError("no peers available")
         ts = self._lc.trusted_state
         count = quorum.corroboration(len(ts.roster)) if ts is not None else 1
-        targets = peers[:max(count, 1)]
+        targets = peers[: max(count, 1)]
 
         mid = MessageId.random()
         handle = SubmitHandle(mid=mid, op_hash=signed.op_hash, _sub=self, peer=targets[0])
@@ -576,8 +575,11 @@ class _LiteSubstrate(Substrate):
 
             self._lc._submit_callbacks[peer_mid.correlation_id] = cb
             self._lc.postman.send_raw(
-                target, Verb.SUBMIT, signed.raw,
-                self._lc.tunables.ttl_exchange, mid=peer_mid,
+                target,
+                Verb.SUBMIT,
+                signed.raw,
+                self._lc.tunables.ttl_exchange,
+                mid=peer_mid,
             )
 
         return handle
@@ -592,7 +594,11 @@ class _LiteSubstrate(Substrate):
         with self._lc._commit_cond:
             while now_ms() < deadline_ms:
                 if handle.result is not None:
-                    if handle.result is TxStatusKind.SETTLED and handle.block_num is not None and handle.block_hash is not None:
+                    if (
+                        handle.result is TxStatusKind.SETTLED
+                        and handle.block_num is not None
+                        and handle.block_hash is not None
+                    ):
                         return Settled(op_hash, handle.block_num, handle.block_hash)
                     return None
                 remaining = (deadline_ms - now_ms()) / 1000

@@ -1,12 +1,10 @@
-
 import contextlib
-from mailbox import Message
 import queue
 import threading
+from abc import ABC, abstractmethod
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from abc import ABC, abstractmethod
 from typing import NamedTuple
 
 from ..core import crypto
@@ -22,8 +20,6 @@ from .link import (
 )
 from .mailbox import Expired, Mailbox, Reply, Transmit
 from .plan import Decision, GiveUp, Send, Wait, plan_next, retry_at
-
-
 
 
 class Recipient(Enum):
@@ -277,7 +273,9 @@ class Postman:
     def _process(self, cmd: _Cmd, now: Millis) -> None:
         match cmd:
             case _Send(to, verb, body, ttl, await_reply, reply_to, prefix):
-                env = Envelope(to, verb, MessageId(prefix + b"\x00"), body, reply_to=MessageId(reply_to))
+                env = Envelope(
+                    to, verb, MessageId(prefix + b"\x00"), body, reply_to=MessageId(reply_to)
+                )
                 self.mailbox.post(env, now, ttl, await_reply)
             case _Sync(peers, authorized):
                 self._do_sync(peers, authorized)
@@ -362,26 +360,29 @@ class Postman:
 
         if solicited:
             self._credit(env.frm, reply, now)
-        else:
-            if env.frm not in self.peers and env.frm not in self._authorized:
-                link.close()
-                return
+        elif env.frm not in self.peers and env.frm not in self._authorized:
+            link.close()
+            return
 
         if link.identity is None:
             link.bind(env.frm)
             self._do_link_established(link)
 
         reply_to = env.env.reply_to
-        self._output.put(Output(
-            delivered=(Delivered(
-                frm=env.frm,
-                verb=env.env.verb,
-                body=env.env.body,
-                mid=env.env.mid,
-                in_reply_to=MessageId(reply_to) if reply_to else None,
-            ),),
-            expired=(),
-        ))
+        self._output.put(
+            Output(
+                delivered=(
+                    Delivered(
+                        frm=env.frm,
+                        verb=env.env.verb,
+                        body=env.env.body,
+                        mid=env.env.mid,
+                        in_reply_to=MessageId(reply_to) if reply_to else None,
+                    ),
+                ),
+                expired=(),
+            )
+        )
 
     def _maintain_links(self) -> None:
         desired = self.tunables.desired_links_per_peer
@@ -399,7 +400,7 @@ class Postman:
             for link in peer.links:
                 if link.address == address:
                     link.on_expired(now)
-        self.mailbox.failed_on(address, retry_at(self.tunables,0, now))
+        self.mailbox.failed_on(address, retry_at(self.tunables, 0, now))
 
     # -- the tick (postman thread only) -------------------------------------
 
@@ -408,9 +409,13 @@ class Postman:
         for t in self.mailbox.due(now):
             peer = self.peers.get(t.to)
             if peer is None:
-                self.mailbox.failed(t.prefix, retry_at(self.tunables,t.attempt, now))
+                self.mailbox.failed(t.prefix, retry_at(self.tunables, t.attempt, now))
                 continue
-            self._act(plan_next(self.tunables,peer, t.attempt, now, self.mailbox.deadline(t.prefix)), t, now)
+            self._act(
+                plan_next(self.tunables, peer, t.attempt, now, self.mailbox.deadline(t.prefix)),
+                t,
+                now,
+            )
         expired = self._reap(now)
         if expired:
             self._output.put(Output(delivered=(), expired=expired))
@@ -431,11 +436,9 @@ class Postman:
                 )
                 stamped = env.sign(self.me, now)
                 if link.send(stamped.seal(), now) is None:
-                    self.mailbox.sent(
-                        t.prefix, t.attempt, link.address, now, again_at=again_at
-                    )
+                    self.mailbox.sent(t.prefix, t.attempt, link.address, now, again_at=again_at)
                 else:
-                    self.mailbox.failed(t.prefix, retry_at(self.tunables,t.attempt, now))
+                    self.mailbox.failed(t.prefix, retry_at(self.tunables, t.attempt, now))
 
     def _credit(self, frm: crypto.PublicKey, reply: Reply, now: Millis) -> None:
         peer = self.peers.get(frm)

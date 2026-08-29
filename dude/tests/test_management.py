@@ -12,12 +12,10 @@ from ..net.address import Address, Endpoint, Scheme
 from ..store import Store, ops, settle
 from ..store.management import (
     P_POP,
-    P_ROSTER,
     Authorization,
     Cert,
     Grant,
     ManagementError,
-    MgmtReader,
     MgmtWriter,
     NodeRecord,
     Role,
@@ -851,9 +849,13 @@ class TestIsMemberAndRosterCannotDisagree(unittest.TestCase):
             domains=rec.domains,
         )
         from ..store.managed import MapEntry
+
         plant = ops.writes(
-            ops.Set(ops.STORE_MANAGEMENT, s.mgmt_reader._nodes.entry_name(victim),
-                    MapEntry.encode(entry.index, forged.encode_row()))
+            ops.Set(
+                ops.STORE_MANAGEMENT,
+                s.mgmt_reader._nodes.entry_name(victim),
+                MapEntry.encode(entry.index, forged.encode_row()),
+            )
         ).sign(c.anchor, T0)
         intervene(s, c.anchor, bodies=(plant,), bucket=TUNABLES.bucket(T0))
 
@@ -869,8 +871,8 @@ class TestIsMemberAndRosterCannotDisagree(unittest.TestCase):
         node_keys = [n.me.public for n in c.nodes]
         victim = node_keys[3]
         self.assertTrue(s.mgmt_reader.is_member(victim))
-        remove = (
-            s.mgmt_writer.change_roster(commitment_signer=c.anchor, remove=(victim,)).sign(c.anchor, T0)
+        remove = s.mgmt_writer.change_roster(commitment_signer=c.anchor, remove=(victim,)).sign(
+            c.anchor, T0
         )
         intervene(s, c.anchor, bodies=(remove,), bucket=TUNABLES.bucket(T0))
         self.assertNotIn(victim, s.mgmt_reader.roster())
@@ -983,9 +985,13 @@ class TestReadAndWriteAreScopedTheSameWay(unittest.TestCase):
             cert=Cert.sign_grant(stranger, who.public, Role.CLIENT_RW),
         )
         from ..store.managed import MapEntry
+
         plant = ops.writes(
-            ops.Set(ops.STORE_MANAGEMENT, s.mgmt_reader._grants.entry_name(who.public),
-                    MapEntry.encode(0, forged.encode_row()))
+            ops.Set(
+                ops.STORE_MANAGEMENT,
+                s.mgmt_reader._grants.entry_name(who.public),
+                MapEntry.encode(0, forged.encode_row()),
+            )
         ).sign(anchor, T0)
         intervene(s, anchor, bodies=(plant,), bucket=1)
 

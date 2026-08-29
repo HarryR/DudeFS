@@ -94,8 +94,6 @@ CREATE TABLE IF NOT EXISTS checkpoint (
 """
 
 
-
-
 @dataclass(frozen=True, slots=True)
 class Entry:
     idx: Index
@@ -288,6 +286,7 @@ class StoreReader(View, Ledger, _ExportSource):
 
     def settlement_of(self, op_hash: crypto.Digest) -> Settled | None:
         from ..session import Settled  # noqa: PLC0415
+
         row = self._conn.execute(
             "SELECT b.block_num, b.hash FROM entry e"
             " JOIN block b ON e.idx BETWEEN b.first_height AND b.height"
@@ -311,6 +310,7 @@ class StoreReader(View, Ledger, _ExportSource):
     @property
     def mgmt_reader(self) -> MgmtReader:
         from ..session import Session  # noqa: PLC0415
+
         return MgmtReader(Session(self, ops.STORE_MANAGEMENT))
 
 
@@ -344,11 +344,13 @@ class StoreWriter(StoreReader, _ImportTarget):
     def persist_checkpoint(self, meta_bytes: bytes, chunk_blobs: tuple[bytes, ...]) -> None:
         self._conn.execute("DELETE FROM checkpoint")
         self._conn.execute(
-            "INSERT INTO checkpoint (seq, data) VALUES (0, ?)", (meta_bytes,),
+            "INSERT INTO checkpoint (seq, data) VALUES (0, ?)",
+            (meta_bytes,),
         )
         for i, blob in enumerate(chunk_blobs, 1):
             self._conn.execute(
-                "INSERT INTO checkpoint (seq, data) VALUES (?, ?)", (i, blob),
+                "INSERT INTO checkpoint (seq, data) VALUES (?, ?)",
+                (i, blob),
             )
         self._set_meta("checkpoint_id", crypto.h(meta_bytes))
 
@@ -359,9 +361,7 @@ class StoreWriter(StoreReader, _ImportTarget):
         self._conn.execute("DELETE FROM smt_memo")
         self._conn.execute("DELETE FROM meta")
 
-    def bootstrap_checkpoint(
-        self, anchor: crypto.PublicKey, settled_block_bytes: bytes
-    ) -> None:
+    def bootstrap_checkpoint(self, anchor: crypto.PublicKey, settled_block_bytes: bytes) -> None:
         from ..consensus.settle_round import SettledBlock  # noqa: PLC0415
 
         sb = SettledBlock.decode(settled_block_bytes)
@@ -371,8 +371,7 @@ class StoreWriter(StoreReader, _ImportTarget):
         self._set_meta("acc_log", a.acc_log)
         self._set_meta("head_floor", a.height.to_bytes(8, "big"))
         self._conn.execute(
-            "INSERT INTO block (block_num, first_height, height, bytes, hash)"
-            " VALUES (?,?,?,?,?)",
+            "INSERT INTO block (block_num, first_height, height, bytes, hash) VALUES (?,?,?,?,?)",
             (a.block_num, a.height + 1, a.height, settled_block_bytes, sb.block_hash),
         )
 
@@ -392,13 +391,9 @@ class StoreWriter(StoreReader, _ImportTarget):
         if row is None:
             return 0
         first_height = row[0]
-        cur = self._conn.execute(
-            "DELETE FROM entry WHERE idx < ?", (first_height,)
-        )
+        cur = self._conn.execute("DELETE FROM entry WHERE idx < ?", (first_height,))
         entries_deleted = cur.rowcount
-        self._conn.execute(
-            "DELETE FROM block WHERE block_num < ?", (pivot_block_num,)
-        )
+        self._conn.execute("DELETE FROM block WHERE block_num < ?", (pivot_block_num,))
         return entries_deleted
 
     def apply(self, batch: tuple[ops.SignedTransaction, ...], auth: settle.Authoriser) -> Applied:
@@ -685,6 +680,7 @@ class Store(View, Ledger):
 
     def mgmt_session(self) -> Session:
         from ..session import Session  # noqa: PLC0415
+
         return Session(self, ops.STORE_MANAGEMENT)
 
     @property
@@ -735,7 +731,7 @@ class Store(View, Ledger):
             return e.why
         return None
 
-    def rebuild(self) -> "Store":
+    def rebuild(self) -> Store:
         fresh = Store()
         fresh.provision(self.anchor())
         fresh.replay(list(self.entries()))

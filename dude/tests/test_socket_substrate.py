@@ -4,22 +4,21 @@ import os
 import tempfile
 import unittest
 
-from ..session import SessionRW, Settled
-from ..store import ops
-from ..tunables import DEFAULT
 from ..net.socket_server import SocketServer
 from ..net.socket_substrate import SocketSubstrate
+from ..node import _ReplicaSubstrate
+from ..session import SessionRW
+from ..store import ops
+from ..tunables import DEFAULT
 from .cluster import Cluster
 
 
 class TestSocketSubstrate(unittest.TestCase):
-
     def setUp(self) -> None:
         self.c = Cluster(nodes=3, mgmt=1)
         self._tmpdir = tempfile.mkdtemp()
         self._sock_path = os.path.join(self._tmpdir, "test.sock")
         replica = self.c.replicas[0]
-        from ..node import _ReplicaSubstrate
         self._real_sub = _ReplicaSubstrate(replica)
         self._server = SocketServer(self._sock_path, self._real_sub)
         self._server.start()

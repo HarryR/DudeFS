@@ -63,12 +63,14 @@ class GetChunks(Encodable):
 
 
 def _encode_chunk(chunk: Chunk) -> bytes:
-    return codec.encode([
-        chunk.depth,
-        chunk.prefix,
-        chunk.subtree_hash,
-        [[r.store, r.name, r.value, r.credential, r.epoch] for r in chunk.rows],
-    ])
+    return codec.encode(
+        [
+            chunk.depth,
+            chunk.prefix,
+            chunk.subtree_hash,
+            [[r.store, r.name, r.value, r.credential, r.epoch] for r in chunk.rows],
+        ]
+    )
 
 
 def _decode_chunk(raw: bytes) -> Chunk:
@@ -97,10 +99,12 @@ class ChunksReply(Encodable):
     more: bool
 
     def encode(self) -> tuple[Verb, bytes]:
-        return self.verb, codec.encode([
-            [_encode_chunk(c) for c in self.chunks],
-            1 if self.more else 0,
-        ])
+        return self.verb, codec.encode(
+            [
+                [_encode_chunk(c) for c in self.chunks],
+                1 if self.more else 0,
+            ]
+        )
 
     @classmethod
     def decode(cls, body: bytes) -> ChunksReply:
