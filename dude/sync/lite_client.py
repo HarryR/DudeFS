@@ -177,6 +177,7 @@ class LightClient:
     _commit_seq: int = field(default=0, init=False)
     _stopping: threading.Event = field(default_factory=threading.Event, init=False)
     _thread: threading.Thread | None = field(default=None, init=False)
+    _socket_servers: list = field(default_factory=list, init=False)
 
     def _peer_view(self, peer: crypto.PublicKey) -> PeerView:
         pv = self._peer_views.get(peer)
@@ -250,10 +251,26 @@ class LightClient:
 
     # -- the run loop -------------------------------------------------------
 
+    def add_socket(self, path: str) -> None:
+        from ..net.socket_server import SocketServer  # noqa: PLC0415
+
+        sub = _LiteSubstrate(self)
+        srv = SocketServer(path, sub)
+        self._socket_servers.append(srv)
+
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.stop()
+
     def start(self) -> None:
         if self._thread is not None:
             return
         self.postman.start()
+        for srv in self._socket_servers:
+            srv.start()
         self._thread = threading.Thread(
             target=self._run,
             name=f"lite-{self.me.public.hex()[:8]}",
@@ -263,6 +280,8 @@ class LightClient:
 
     def stop(self) -> None:
         self._stopping.set()
+        for srv in self._socket_servers:
+            srv.stop()
         self.postman.stop()
         thread = self._thread
         self._thread = None

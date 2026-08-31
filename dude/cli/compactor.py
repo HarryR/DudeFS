@@ -15,8 +15,6 @@ from .state import (
     CLIError,
     load_keypair,
     save_keypair,
-    start_light_client,
-    start_replica,
     until_terminated,
 )
 
@@ -43,20 +41,18 @@ def init(cfg: DudeConfig) -> None:
 @group.command()
 @click.pass_obj
 def run(cfg: DudeConfig) -> None:
-    dir_path = cfg.compactor_dir
-    lc = start_light_client(dir_path)
+    with cfg.light_client(cfg.compactor_dir) as lc:
+        head = lc.trusted_state
+        if head is None:
+            raise CLIError("light client failed to bootstrap")
+        block_num = head.head.anchors.block_num
 
-    head = lc.trusted_state.head
-    block_num = head.anchors.block_num
+        s = lc.session(store_id=ops.STORE_MANAGEMENT)
+        result = s.submit(MgmtWriter(s).compact(block_num)).wait()
+        if not isinstance(result, Settled):
+            raise CLIError(f"compact transaction did not settle: {result!r}")
 
-    s = lc.session(store_id=ops.STORE_MANAGEMENT)
-    result = s.submit(MgmtWriter(s).compact(block_num)).wait()
-    if not isinstance(result, Settled):
-        lc.stop()
-        raise CLIError(f"compact transaction did not settle: {result!r}")
-
-    click.echo(f"compaction pivot at block {block_num} settled")
-    lc.stop()
+        click.echo(f"compaction pivot at block {block_num} settled")
     click.echo("done")
 
 
@@ -64,20 +60,14 @@ def run(cfg: DudeConfig) -> None:
 @click.option("--interval", type=int, default=86400, help="seconds between compaction runs")
 @click.pass_obj
 def serve(cfg: DudeConfig, interval: int) -> None:
-    dir_path = cfg.compactor_dir
-    rn, store = start_replica(dir_path)
-    kp = load_keypair(dir_path)
-
-    log.info("compactor %s running (interval=%ds)", kp.public.hex()[:16], interval)
-
-    with until_terminated() as stop:
-        while not stop.is_set():
-            _run_compaction_cycle(rn, kp)
-            stop.wait(timeout=interval)
-
-    log.info("shutting down")
-    rn.stop()
-    store.close()
+    kp = load_keypair(cfg.compactor_dir)
+    with cfg.replica(cfg.compactor_dir, cfg.compactor_cfg) as rn:
+        log.info("compactor %s running (interval=%ds)", kp.public.hex()[:16], interval)
+        with until_terminated() as stop:
+            while not stop.is_set():
+                _run_compaction_cycle(rn, kp)
+                stop.wait(timeout=interval)
+        log.info("shutting down")
 
 
 def _run_compaction_cycle(rn, kp: crypto.Keypair) -> None:

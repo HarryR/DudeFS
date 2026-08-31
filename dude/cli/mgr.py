@@ -1,22 +1,25 @@
 from __future__ import annotations
 
+import logging
+
 import click
 
 from ..core import crypto
-from ..node import _ReplicaSubstrate
-from ..session import Settled
+from ..net.socket_substrate import SocketSubstrate
+from ..session import SessionRW, Settled
 from ..store import ops
 from ..store.management import Cert, MgmtWriter, Role
 from .config import DudeConfig
 from .params import PUBKEY, ROLE, SIGNATURE
 from .state import (
     CLIError,
-    connect_socket,
     load_keypair,
     save_keypair,
-    serve_with_socket,
-    start_replica,
+    socket_path,
+    until_terminated,
 )
+
+log = logging.getLogger(__name__)
 
 
 @click.group("mgr")
@@ -39,16 +42,10 @@ def init(cfg: DudeConfig) -> None:
 @group.command()
 @click.pass_obj
 def serve(cfg: DudeConfig) -> None:
-    dir_path = cfg.manager_dir
-    rn, store = start_replica(dir_path)
-    sub = _ReplicaSubstrate(rn)
-    label = f"manager {rn.me.public.hex()[:16]}..."
-
-    def stop_fn() -> None:
-        rn.stop()
-        store.close()
-
-    serve_with_socket(label, dir_path, sub, stop_fn)
+    with cfg.replica(cfg.manager_dir, cfg.manager_cfg) as rn:
+        log.info("manager %s running", rn.me.public.hex()[:16])
+        with until_terminated():
+            log.info("shutting down")
 
 
 @group.command()
@@ -66,8 +63,8 @@ def grant(cfg: DudeConfig, pub: crypto.PublicKey, pop: crypto.Signature, role: R
     cert = Cert.sign_grant(signer, pub, role)
     stores = frozenset({ops.STORE_MANAGEMENT, ops.STORE_DATA})
 
-    sub, session = connect_socket(dir_path, ops.STORE_MANAGEMENT)
-    try:
+    with SocketSubstrate(socket_path(dir_path), cfg.tunables) as sub:
+        session = SessionRW(sub, ops.STORE_MANAGEMENT)
         w = MgmtWriter(session)
         tx = w.authorise(pub, role, stores=stores, pop=pop, cert=cert)
         result = session.submit(tx).wait()
@@ -76,8 +73,6 @@ def grant(cfg: DudeConfig, pub: crypto.PublicKey, pop: crypto.Signature, role: R
         click.echo(
             f"granted {role.name} to {pub.hex()[:16]}... (block {result.block_num})"
         )
-    finally:
-        sub.close()
 
 
 @group.command()
@@ -87,13 +82,11 @@ def revoke(cfg: DudeConfig, pub: crypto.PublicKey) -> None:
     dir_path = cfg.manager_dir
     signer = load_keypair(dir_path)
 
-    sub, session = connect_socket(dir_path, ops.STORE_MANAGEMENT)
-    try:
+    with SocketSubstrate(socket_path(dir_path), cfg.tunables) as sub:
+        session = SessionRW(sub, ops.STORE_MANAGEMENT)
         w = MgmtWriter(session)
         tx = w.revoke(pub, reissue_signer=signer)
         result = session.submit(tx).wait()
         if not isinstance(result, Settled):
             raise CLIError(f"revoke failed: {result!r}")
         click.echo(f"revoked {pub.hex()[:16]}... (block {result.block_num})")
-    finally:
-        sub.close()

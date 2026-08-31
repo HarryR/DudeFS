@@ -4,7 +4,6 @@ import json
 import logging
 import signal as _signal
 import threading
-import time
 from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -14,17 +13,9 @@ from ..consensus.canonical import bodies_canonical
 from ..consensus.settle_round import SettledBlock
 from ..core import codec, crypto
 from ..core.errors import DudeError
-from ..core.units import now_ms
 from ..net.address import Address, Endpoint
-from ..net.postman import Postman
-from ..net.socket_server import SocketServer
-from ..net.socket_substrate import SocketSubstrate
-from ..node import ReplicaNode
-from ..session import SessionRW
-from ..store import Store, ops
+from ..store import Store
 from ..store.ops import SignedTransaction
-from ..sync.lite_client import LightClient
-from ..tunables import DEFAULT
 
 log = logging.getLogger(__name__)
 
@@ -158,34 +149,6 @@ def open_store_with_genesis(dir_path: Path) -> Store:
     return store
 
 
-def start_replica(dir_path: Path) -> tuple[ReplicaNode, Store]:
-    kp = load_keypair(dir_path)
-    store = open_store_with_genesis(dir_path)
-    rn = ReplicaNode(kp, store, DEFAULT)
-    rn.start()
-    return rn, store
-
-
-def start_light_client(dir_path: Path) -> LightClient:
-    kp = load_keypair(dir_path)
-    seed = BootstrapSeed.load(dir_path)
-    postman = Postman(kp, DEFAULT)
-    lc = LightClient(me=kp, anchor=seed.anchor, postman=postman)
-    for pub, endpoints in seed.peers:
-        lc.add_bootstrap_peer(pub, endpoints)
-    lc.start()
-    lc.bootstrap(now_ms())
-    log.info("bootstrapping...")
-    deadline = time.monotonic() + 30.0
-    while not lc.bootstrapped() and time.monotonic() < deadline:
-        time.sleep(0.1)
-    if not lc.bootstrapped():
-        lc.stop()
-        raise CLIError("failed to bootstrap within 30s")
-    log.info("bootstrapped at block %d", lc.trusted_state.head.anchors.block_num)
-    return lc
-
-
 @contextmanager
 def until_terminated() -> Generator[threading.Event]:
     stop = threading.Event()
@@ -199,19 +162,3 @@ def until_terminated() -> Generator[threading.Event]:
         _signal.signal(_signal.SIGTERM, prev_term)
 
 
-def serve_with_socket(label: str, dir_path: Path, sub, stop_fn) -> None:
-    sock = socket_path(dir_path)
-    server = SocketServer(sock, sub)
-    server.start()
-    log.info("%s serving on %s", label, sock)
-    with until_terminated():
-        log.info("shutting down")
-    server.stop()
-    stop_fn()
-
-
-def connect_socket(
-    dir_path: Path, store_id: int = ops.STORE_DATA
-) -> tuple[SocketSubstrate, SessionRW]:
-    sub = SocketSubstrate(socket_path(dir_path), DEFAULT)
-    return sub, SessionRW(sub, store_id)

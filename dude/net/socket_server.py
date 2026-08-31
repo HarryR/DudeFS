@@ -7,9 +7,16 @@ import threading
 
 from ..core import codec, crypto
 from ..core.errors import DudeError
-from ..session import Dropped, SubmitHandle, Substrate
+from ..session import SubmitHandle, Substrate
 from ..store import ops
-from .socket_framing import QUERY_PENDING, Request, Response, read_request, send_response
+from .socket_framing import (
+    QUERY_PENDING,
+    QUERY_UNKNOWN,
+    Request,
+    Response,
+    read_request,
+    send_response,
+)
 
 
 class SocketServer:
@@ -26,6 +33,13 @@ class SocketServer:
         self._clients: list[_ClientHandler] = []
         self._accept_thread: threading.Thread | None = None
         self._notify_thread: threading.Thread | None = None
+
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.stop()
 
     def start(self) -> None:
         self._accept_thread = threading.Thread(target=self._accept_loop, daemon=True)
@@ -174,7 +188,7 @@ class _ClientHandler:
                 op_hash = crypto.Digest(payload)
                 handle = self._inflight.get(op_hash)
                 if handle is None:
-                    self._respond(Response.QUERY, corr_id, Dropped().encode())
+                    self._respond(Response.QUERY, corr_id, QUERY_UNKNOWN)
                     return
                 result = handle.poll()
                 if result is not None:

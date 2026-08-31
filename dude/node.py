@@ -12,6 +12,7 @@ from .core.units import Millis, now_ms
 from .net import MessageId, Verb
 from .net.link import Acceptor, Dialer
 from .net.postman import Delivered, Postman
+from .net.socket_server import SocketServer
 from .session import KeyCache, SessionRW, SubmitHandle, SubmitResult, Substrate
 from .store import Store, ops
 from .store.layer import BlockHead, Held
@@ -59,6 +60,7 @@ class _BaseNode:
 
     _stopping: threading.Event = field(default_factory=threading.Event, init=False)
     _thread: threading.Thread | None = field(default=None, init=False)
+    _socket_servers: list[SocketServer] = field(default_factory=list, init=False)
 
     def __post_init__(self) -> None:
         self.postman = Postman(self.me, self.tunables)
@@ -84,6 +86,11 @@ class _BaseNode:
     def add_dialer(self, dialer: Dialer) -> None:
         self.postman.add_dialer(dialer)
 
+    def add_socket(self, path: str) -> None:
+        sub = _ReplicaSubstrate(self)
+        srv = SocketServer(path, sub)
+        self._socket_servers.append(srv)
+
     def __enter__(self):
         self.start()
         return self
@@ -98,6 +105,8 @@ class _BaseNode:
         self._stopping = threading.Event()
         self._reconcile_peers()
         self.postman.start()
+        for srv in self._socket_servers:
+            srv.start()
         prefix = "replica" if isinstance(self, ReplicaNode) else "node"
         self._thread = threading.Thread(
             target=self._run,
@@ -108,6 +117,8 @@ class _BaseNode:
 
     def stop(self) -> None:
         self._stopping.set()
+        for srv in self._socket_servers:
+            srv.stop()
         self.postman.stop()
         thread = self._thread
         self._thread = None

@@ -44,6 +44,7 @@ class Response(bytes, Enum):
 
 
 QUERY_PENDING = b"P"
+QUERY_UNKNOWN = b"U"
 
 _REQ_BY_VALUE: dict[bytes, Request] = {t.value: t for t in Request}
 _RESP_BY_VALUE: dict[bytes, Response] = {t.value: t for t in Response}

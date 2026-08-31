@@ -102,28 +102,28 @@ class Tunables:
 
     @property
     def single_wave_budget(self) -> Millis:
-        return self.retry_budget * self.rtt_max
+        return self.rtt_max * self.retry_budget
 
     @property
     def held_wave_budget(self) -> Millis:
-        return self.held_convergence_max * self.single_wave_budget
+        return self.single_wave_budget * self.held_convergence_max
 
     @property
     def block_time_floor(self) -> Millis:
-        return self.held_wave_budget + 2 * self.single_wave_budget + self.clock_skew
+        return self.held_wave_budget + self.single_wave_budget * 2 + self.clock_skew
 
     @property
     def block_time(self) -> Millis:
-        return self.safety_margin * self.block_time_floor
+        return self.block_time_floor * self.safety_margin
 
     @property
     def cut_reserve(self) -> Millis:
         """Time a bucket holds back for SIG and SETTLE_SIG after HELD closes."""
-        return 2 * self.single_wave_budget
+        return self.single_wave_budget * 2
 
     @property
     def admission_floor(self) -> Millis:
-        return self.block_time + self.clock_skew + 2 * self.rtt_max
+        return self.block_time + self.clock_skew + self.rtt_max * 2
 
     @property
     def w_admit(self) -> Millis:
@@ -132,7 +132,7 @@ class Tunables:
 
     @property
     def endorse_margin(self) -> Millis:
-        return self.windows_to_settle * self.block_time + self.clock_skew
+        return self.block_time * self.windows_to_settle + self.clock_skew
 
     @property
     def w_valid_margin(self) -> Millis:
@@ -210,7 +210,7 @@ class Tunables:
     @property
     def tick_interval(self) -> Millis:
         """Sampled against `cut_reserve`, the tightest deadline the loop must not overshoot."""
-        return max(1, self.cut_reserve // self.ticks_per_cadence)
+        return max(Millis(1), self.cut_reserve // self.ticks_per_cadence)
 
     @property
     def breaker_cooldown(self) -> Millis:
@@ -226,7 +226,7 @@ class Tunables:
     @property
     def link_tunables(self) -> LinkTunables:
         return LinkTunables(
-            rto_floor=2 * self.granularity,
+            rto_floor=self.granularity * 2,
             rto_initial=self.expected_rtt,
             granularity=self.granularity,
             breaker_threshold=self.breaker_threshold,
@@ -237,11 +237,11 @@ class Tunables:
 
     @property
     def tcp_connect(self) -> Millis:
-        return 2 * self.rtt_max
+        return self.rtt_max * 2
 
     @property
     def tcp_send(self) -> Millis:
-        return 2 * self.rtt_max
+        return self.rtt_max * 2
 
     def skew_buckets(self) -> int:
         """Clock skew in buckets -- freshness tolerance against a peer whose clock lags."""
@@ -251,7 +251,7 @@ class Tunables:
         return ts // self.block_time
 
     def bucket_start(self, b: Bucket) -> Millis:
-        return b * self.block_time
+        return self.block_time * b
 
     def __post_init__(self) -> None:
         for name in ("rtt_max", "clock_skew", "granularity"):

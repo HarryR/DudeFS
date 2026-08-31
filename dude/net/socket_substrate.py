@@ -13,7 +13,14 @@ from ..session import SubmitHandle, SubmitResult, Substrate
 from ..store import ops
 from ..store.layer import BlockHead, Held
 from ..tunables import Tunables
-from .socket_framing import QUERY_PENDING, Request, Response, read_response, send_request
+from .socket_framing import (
+    QUERY_PENDING,
+    QUERY_UNKNOWN,
+    Request,
+    Response,
+    read_response,
+    send_request,
+)
 
 
 class SocketSubstrateError(DudeError): ...
@@ -108,6 +115,8 @@ class SocketSubstrate(Substrate):
         reply = self._request(Request.QUERY, bytes(op_hash))
         if reply == QUERY_PENDING:
             return None
+        if reply == QUERY_UNKNOWN:
+            raise SocketSubstrateError(f"server has no record of {op_hash.hex()[:16]}")
         return SubmitResult.decode(reply)
 
     def evict_after_sec(self) -> float:
@@ -129,6 +138,12 @@ class SocketSubstrate(Substrate):
 
     def head(self) -> BlockHead | None:
         return self._head
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
 
     def close(self) -> None:
         self._closed = True
