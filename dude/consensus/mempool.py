@@ -68,6 +68,31 @@ class Mempool:
             return Refusal.CANNOT_APPLY
         return None
 
+    def valid_for_bucket(
+        self,
+        tx: ops.SignedTransaction,
+        bucket: Bucket,
+        reader: Ledger,
+        auth: settle.Authoriser,
+    ) -> Refusal | None:
+        t = self.tunables
+        earliest = t.bucket_start(bucket) - t.w_admit - t.clock_skew
+        latest = t.bucket_start(bucket + 1) + t.w_admit + t.clock_skew
+        if tx.ts < earliest:
+            return Refusal.TOO_OLD
+        if tx.ts > latest:
+            return Refusal.TOO_NEW
+        if not tx.verify():
+            return Refusal.UNSIGNED
+        mutations = [step.mutation for step in tx.steps]
+        if len(set(mutations)) != len(mutations):
+            return Refusal.REPEATED_OP
+        if reader.has_settled(tx.op_hash):
+            return Refusal.DUPLICATE
+        if settle.would_apply(reader, (tx,), auth).rejects:
+            return Refusal.CANNOT_APPLY
+        return None
+
     def admit(
         self,
         tx: ops.SignedTransaction,
@@ -92,6 +117,19 @@ class Mempool:
 
     def all_bodies(self) -> dict[crypto.Digest, ops.SignedTransaction]:
         return {tx.op_hash: tx for txs in self.pending.values() for tx in txs.values()}
+
+    def snapshot(self) -> Mempool:
+        return Mempool(
+            tunables=self.tunables,
+            pending={b: dict(txs) for b, txs in self.pending.items() if txs},
+        )
+
+    def evict_settled(self, reader: Ledger) -> None:
+        for bucket_txs in self.pending.values():
+            for h in list(bucket_txs):
+                if reader.has_settled(h):
+                    del bucket_txs[h]
+        self.pending = {b: txs for b, txs in self.pending.items() if txs}
 
     def __len__(self) -> int:
         return sum(len(held) for held in self.pending.values())

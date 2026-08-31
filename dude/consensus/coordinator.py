@@ -134,7 +134,10 @@ class Coordinator:
         good = tuple(
             tx
             for tx in msg.txs
-            if self.mempool.valid(tx, now, self.store, self.mgmt_reader) is None
+            if self.mempool.valid_for_bucket(
+                tx, r.bucket(), self.store, self.mgmt_reader
+            )
+            is None
         )
         r.absorb(msg, frm, good)
 
@@ -204,9 +207,7 @@ class Coordinator:
             # admitted stays admitted, and `evict_after` bounds it.
             self.current_bucket = closed + 1
             return
-        frozen = self.mempool
-        self.mempool = Mempool(self.tunables)
-        self._open_round(closed, frozen, now)
+        self._open_round(closed, self.mempool.snapshot(), now)
         self.current_bucket = closed + 1
 
     def _open_round(self, bucket: Bucket, frozen: Mempool, now: Millis) -> None:
@@ -250,11 +251,8 @@ class Coordinator:
         return frozenset(tx.op_hash for tx in survivors)
 
     def _on_round_abandoned(self, now: Millis) -> None:
-        r = self.current_round
-        if r is None:
+        if self.current_round is None:
             raise InvariantError("_on_round_abandoned called with no in-flight Round")
-        for tx in r.surviving():
-            self.mempool.admit(tx, now, self.store, self.mgmt_reader)
         self.current_round = None
 
     def _promote_to_settling(self, now: Millis) -> None:
@@ -281,12 +279,6 @@ class Coordinator:
         slice_txs = r.slice_bodies()
         surviving = r.surviving()
         if self._prev_block() != r.prev_block():
-            # The Follower commits on message ARRIVAL, not on our tick, so the head can move
-            # between the cut and here. The slice was screened against the base the round opened
-            # on; anchoring it to a newer one signs a state_root nothing screened against. Void
-            # the round -- the work is still in hand, so it retries in a later bucket.
-            for tx in (*slice_txs, *surviving):
-                self.mempool.admit(tx, now, self.store, self.mgmt_reader)
             self.current_round = None
             return
         roster = self.mgmt_reader.roster()
@@ -302,8 +294,6 @@ class Coordinator:
                 bucket,
                 screened.rejects,
             )
-            for tx in (*slice_txs, *surviving):
-                self.mempool.admit(tx, now, self.store, self.mgmt_reader)
             self.current_round = None
             return
         applied = screened.survivors
@@ -368,8 +358,7 @@ class Coordinator:
 
         _expect_anchors(s.anchors, self.store)
 
-        for tx in s.surviving:
-            self.mempool.admit(tx, now, self.store, self.mgmt_reader)
+        self.mempool.evict_settled(self.store)
 
         self.settling = None
         self._settle_stalls = 0
@@ -379,8 +368,6 @@ class Coordinator:
         if s is None:
             raise InvariantError("_on_settle_abandoned called with no settling slot")
         divergences = s.settle_round.divergences()
-        for tx in (*s.applied, *s.surviving):
-            self.mempool.admit(tx, now, self.store, self.mgmt_reader)
         self.settling = None
 
         if not divergences:

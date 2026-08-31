@@ -12,6 +12,31 @@ from .core.units import Bucket, Millis
 
 
 @dataclass(frozen=True, slots=True)
+class TCPTransport:
+    enabled: bool = True
+    socks5: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class OnionTransport:
+    enabled: bool = False
+    socks5: str = "127.0.0.1:9050"
+
+
+_DEFAULT_TCP = TCPTransport()
+_DEFAULT_ONION = OnionTransport()
+
+
+@dataclass(frozen=True, slots=True)
+class TransportPolicy:
+    tcp: TCPTransport = _DEFAULT_TCP
+    onion: OnionTransport = _DEFAULT_ONION
+
+
+_DEFAULT_TRANSPORTS = TransportPolicy()
+
+
+@dataclass(frozen=True, slots=True)
 class LinkTunables:
     """One link's dials. Built by `Tunables.link_tunables`; never declared."""
 
@@ -29,18 +54,14 @@ class Tunables:
     # DECLARED. Every field here is a physical measurement, a product decision, or a count.
     # Arithmetic over them belongs below as a property.
 
-    rtt_max: Millis = 2_000
+    rtt_max: Millis = Millis(2_000)
     """Maximum physical link round-trip time this deployment tolerates. The wire, nothing else --
     not "one wave" or "reaching quorum", just one send and one reply on one link."""
 
-    clock_skew: Millis = 2_000
+    clock_skew: Millis = Millis(2_000)
     """Upper bound on NTP jitter between roster members. Every node runs NTP."""
 
-    client_clock_tolerance: Millis = 25_000
-    """Clients are not NTP-disciplined; nodes are. Collapsing the two would either refuse honest
-    clients or widen the replay window for everyone."""
-
-    granularity: Millis = 1
+    granularity: Millis = Millis(1)
 
     retry_budget: int = 2
     """Attempts per sub-round before a peer is lost for that sub-round. Tied to link redundancy:
@@ -68,6 +89,8 @@ class Tunables:
     desired_links_per_peer: int = 2
     """Concurrent connections the postman maintains to each peer. Dialing is continuous: when a
     link dies, the postman re-establishes it. All live links are available for sending."""
+
+    transports: TransportPolicy = _DEFAULT_TRANSPORTS
 
     breaker_threshold: int = 5
     budget_max_tokens: int = 10_000
@@ -100,7 +123,7 @@ class Tunables:
 
     @property
     def admission_floor(self) -> Millis:
-        return self.client_clock_tolerance + 2 * self.rtt_max
+        return self.block_time + self.clock_skew + 2 * self.rtt_max
 
     @property
     def w_admit(self) -> Millis:
@@ -212,6 +235,14 @@ class Tunables:
             budget_token_ratio=self.budget_token_ratio,
         )
 
+    @property
+    def tcp_connect(self) -> Millis:
+        return 2 * self.rtt_max
+
+    @property
+    def tcp_send(self) -> Millis:
+        return 2 * self.rtt_max
+
     def skew_buckets(self) -> int:
         """Clock skew in buckets -- freshness tolerance against a peer whose clock lags."""
         return -(-self.clock_skew // self.block_time)
@@ -223,6 +254,10 @@ class Tunables:
         return b * self.block_time
 
     def __post_init__(self) -> None:
+        for name in ("rtt_max", "clock_skew", "granularity"):
+            v = getattr(self, name)
+            if not isinstance(v, Millis):
+                object.__setattr__(self, name, Millis(v))
         for what, count in (
             ("retry_budget", self.retry_budget),
             ("held_convergence_max", self.held_convergence_max),

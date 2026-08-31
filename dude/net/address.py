@@ -17,6 +17,7 @@ class Scheme(Enum):
 
     UNIX = b"unix"
     TCP = b"tcp"
+    ONION = b"onion"
 
 
 @dataclass(frozen=True, slots=True)

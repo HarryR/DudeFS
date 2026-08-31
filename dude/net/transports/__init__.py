@@ -1,10 +1,10 @@
 from .inproc import InProcListener, InProcNexus
-from .tcp import TCPDialer, TCPListener, TCPTiming
+from .tcp import OnionDialer, TCPDialer, TCPListener
 
 __all__ = [
     "InProcListener",
     "InProcNexus",
+    "OnionDialer",
     "TCPDialer",
     "TCPListener",
-    "TCPTiming",
 ]

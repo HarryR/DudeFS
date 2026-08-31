@@ -1,12 +1,17 @@
+from __future__ import annotations
+
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from ...core import crypto
 from ...core.units import now_ms
 from ..address import Address, Endpoint, Scheme
 from ..envelope import Frame
-from ..link import Link, LinkError, Listener, OnFrame, OnLink
+from ..link import Acceptor, Dialer, Link, LinkError, OnFrame, OnLink
 
-type InProcNexus = dict[bytes, "InProcListener"]
+if TYPE_CHECKING:
+    from ...node import _BaseNode
+    from ..postman import Postman
 
 
 class _InProcConn:
@@ -24,7 +29,7 @@ class _InProcConn:
         )
 
     def send_frame(self, frame: Frame) -> None:
-        target = self._nexus.get(self._reply_to)
+        target = self._nexus._listeners.get(self._reply_to)  # noqa: SLF001
         if target is None:
             raise LinkError(f"in-process reply target no longer registered: {self._reply_to!r}")
         target._deliver(frame, sender=self._me)  # noqa: SLF001
@@ -34,7 +39,7 @@ class _InProcConn:
 
 
 @dataclass(slots=True)
-class InProcListener(Listener):
+class InProcListener(Acceptor, Dialer):
     identity: crypto.PublicKey
     nexus: InProcNexus
     _on_frame: OnFrame | None = field(init=False, default=None)
@@ -45,9 +50,9 @@ class InProcListener(Listener):
 
     def __post_init__(self) -> None:
         key = bytes(self.identity)
-        if key in self.nexus:
+        if key in self.nexus._listeners:  # noqa: SLF001
             raise LinkError(f"in-process identity already registered: {self.identity.hex()[:8]}")
-        self.nexus[key] = self
+        self.nexus._listeners[key] = self  # noqa: SLF001
 
     @property
     def endpoint(self) -> Endpoint:
@@ -80,8 +85,8 @@ class InProcListener(Listener):
     def start(self, on_frame: OnFrame, on_link: OnLink) -> None:
         self._stopped = False
         me = bytes(self.identity)
-        if me not in self.nexus:
-            self.nexus[me] = self
+        if me not in self.nexus._listeners:  # noqa: SLF001
+            self.nexus._listeners[me] = self  # noqa: SLF001
         self._on_frame = on_frame
         self._on_link = on_link
         for conn in self._conns.values():
@@ -90,12 +95,12 @@ class InProcListener(Listener):
             on_frame(frame, link)
         self._buffered.clear()
 
-    def dial(self, address: Address) -> None:
+    def dial(self, address: Address) -> bool:
         if address.scheme is not Scheme.INPROC or self._on_link is None:
-            return
+            return False
         target_key = bytes.fromhex(address.value)
-        if target_key not in self.nexus or target_key in self._conns:
-            return
+        if target_key not in self.nexus._listeners or target_key in self._conns:  # noqa: SLF001
+            return False
         conn = _InProcConn(
             reply_to=target_key,
             me=bytes(self.identity),
@@ -104,17 +109,35 @@ class InProcListener(Listener):
         )
         self._conns[target_key] = conn
         self._on_link(conn.link)
+        return True
 
     def stop(self) -> None:
         self._stopped = True
         self._on_frame = None
         self._on_link = None
         me = bytes(self.identity)
-        self.nexus.pop(me, None)
+        self.nexus._listeners.pop(me, None)  # noqa: SLF001
         for conn in self._conns.values():
             conn.link.close()
         self._conns.clear()
-        for listener in list(self.nexus.values()):
+        for listener in list(self.nexus._listeners.values()):  # noqa: SLF001
             remote_conn = listener._conns.pop(me, None)
             if remote_conn is not None:
                 remote_conn.link.notify_closed()
+
+
+class InProcNexus:
+    __slots__ = ("_listeners",)
+
+    def __init__(self) -> None:
+        self._listeners: dict[bytes, InProcListener] = {}
+
+    def attach(self, target: Postman | _BaseNode) -> InProcListener:
+        pub = target.me.public
+        inproc = InProcListener(pub, self)
+        target.add_acceptor(inproc)
+        target.add_dialer(inproc)
+        return inproc
+
+    def endpoint_for(self, identity: crypto.PublicKey) -> Endpoint:
+        return InProcListener.endpoint_for(identity)

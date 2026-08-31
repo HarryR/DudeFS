@@ -1,22 +1,40 @@
-import argparse
-import sys
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+
+import click
 
 from . import anchor, client, compactor, mgr, node
+from .config import DudeConfig
 
 
-def main(argv: list[str] | None = None) -> None:
-    p = argparse.ArgumentParser(prog="dude", description="DudeFS cluster management")
-    sub = p.add_subparsers(dest="command")
+@click.group()
+@click.option(
+    "--home",
+    envvar="DUDE_HOME",
+    default="~/.dude",
+    type=click.Path(),
+    help="DudeFS home directory",
+)
+@click.option("-v", "--verbose", count=True, help="-v info, -vv debug")
+@click.pass_context
+def cli(ctx: click.Context, home: str, verbose: int) -> None:
+    level = (logging.WARNING, logging.INFO, logging.DEBUG)[min(verbose, 2)]
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname).1s %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    ctx.obj = DudeConfig(home=Path(home).expanduser())
 
-    anchor.register(sub)
-    mgr.register(sub)
-    node.register(sub)
-    client.register(sub)
-    compactor.register(sub)
 
-    args = p.parse_args(argv)
-    if args.command is None:
-        p.print_help()
-        sys.exit(1)
+cli.add_command(anchor.group)
+cli.add_command(node.group)
+cli.add_command(client.group)
+cli.add_command(mgr.group)
+cli.add_command(compactor.group)
 
-    args.func(args)
+
+def main() -> None:
+    cli()

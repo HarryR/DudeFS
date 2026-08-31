@@ -18,6 +18,7 @@ from ..consensus.mempool import (
     Refusal,
 )
 from ..core import crypto
+from ..core.units import Millis
 from ..quorum import (
     QuorumError,
     corroboration,
@@ -38,7 +39,7 @@ DJ = crypto.NameToken(crypto.h(b"j"))
 """Data-store names are 32-byte tokens: a node must not be able to read a key name, and
 `evaluate` refuses any other width."""
 M = ops.STORE_MANAGEMENT
-T0 = 1_700_000_000_000  # a fixed epoch, so bucket ids in assertions are stable
+T0 = Millis(1_700_000_000_000)
 
 
 def name(s: str) -> bytes:
@@ -146,24 +147,27 @@ class TestAdmission(unittest.TestCase):
 
     def test_clock_faults_are_named_not_merely_refused(self):
         """A client self-corrects only if the refusal says WHICH way its clock is wrong (§1.1)."""
-        self.assertEqual(self._admit(write(self.kp, "a", b"v", T0 - 60_000)), TOO_OLD)
-        self.assertEqual(self._admit(write(self.kp, "b", b"v", T0 + 60_000)), TOO_NEW)
+        beyond = self.t.w_admit + 1
+        self.assertEqual(self._admit(write(self.kp, "a", b"v", T0 - beyond)), TOO_OLD)
+        self.assertEqual(self._admit(write(self.kp, "b", b"v", T0 + beyond)), TOO_NEW)
         self.assertIsNone(self._admit(write(self.kp, "c", b"v", T0)))
 
     def test_late_is_carried_forward_not_stranded(self):
         """§1.1's floor-not-window rule. A slow client's transaction lands in the CURRENT bucket,
         so it settles a few buckets later than its own clock suggests — never stranded in a bucket
         that has already gone."""
-        late = write(self.kp, "late", b"v", T0 - 20_000)  # inside w_admit, 20 buckets back
+        lag = self.t.w_admit // 2
+        late = write(self.kp, "late", b"v", T0 - lag)
         self.assertIsNone(self._admit(late))
         self.assertEqual(self.mp.buckets(), (self.t.bucket(T0),))
-        self.assertNotIn(self.t.bucket(T0 - 20_000), self.mp.buckets())
+        self.assertNotIn(self.t.bucket(T0 - lag), self.mp.buckets())
 
     def test_early_client_waits_in_its_own_future_bucket(self):
         """The mirror case: a fast client's transaction lands where its `ts` says, ahead of now."""
-        early = write(self.kp, "early", b"v", T0 + 20_000)
+        lead = self.t.w_admit // 2
+        early = write(self.kp, "early", b"v", T0 + lead)
         self.assertIsNone(self._admit(early))
-        self.assertEqual(self.mp.buckets(), (self.t.bucket(T0 + 20_000),))
+        self.assertEqual(self.mp.buckets(), (self.t.bucket(T0 + lead),))
 
     def test_unsigned_and_duplicate(self):
         tx = write(self.kp, "x", b"v", T0)

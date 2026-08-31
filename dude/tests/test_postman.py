@@ -15,12 +15,11 @@ from ..core import crypto
 from ..net.address import Endpoint
 from ..net.envelope import MessageId, Verb
 from ..net.postman import Delivered, Encodable, Postman
-from ..net.transports.inproc import InProcListener
-from ..net.transports.tcp import TCPDialer, TCPListener, TCPTiming
+from ..net.transports.inproc import InProcListener, InProcNexus
+from ..net.transports.tcp import TCPListener
 from ..tunables import Tunables
 
 T = Tunables(rtt_max=200, clock_skew=200)
-TCP_TIMING = TCPTiming(connect=1000, send=1000)
 
 
 @dataclass(frozen=True)
@@ -46,16 +45,13 @@ class Payload(Encodable):
 def _pair_inproc() -> tuple[crypto.Keypair, crypto.Keypair, Postman, Postman]:
     a = crypto.Keypair.generate()
     b = crypto.Keypair.generate()
-    nexus: dict[bytes, InProcListener] = {}
-
-    al = InProcListener(a.public, nexus)
-    bl = InProcListener(b.public, nexus)
+    nexus = InProcNexus()
 
     ap = Postman(a, T)
     bp = Postman(b, T)
 
-    ap.add_listener(al)
-    bp.add_listener(bl)
+    al = nexus.attach(ap)
+    bl = nexus.attach(bp)
 
     ap.add_peer(b.public, (bl.endpoint,))
     bp.add_peer(a.public, (al.endpoint,))
@@ -70,18 +66,14 @@ def _pair_tcp() -> tuple[crypto.Keypair, crypto.Keypair, Postman, Postman]:
     a = crypto.Keypair.generate()
     b = crypto.Keypair.generate()
 
-    al = TCPListener(timing=TCP_TIMING)
-    bl = TCPListener(timing=TCP_TIMING)
-    ad = TCPDialer(timing=TCP_TIMING)
-    bd = TCPDialer(timing=TCP_TIMING)
+    al = TCPListener(T)
+    bl = TCPListener(T)
 
     ap = Postman(a, T)
     bp = Postman(b, T)
 
-    ap.add_listener(al)
-    ap.add_listener(ad)
-    bp.add_listener(bl)
-    bp.add_listener(bd)
+    ap.add_acceptor(al)
+    bp.add_acceptor(bl)
 
     ap.add_peer(b.public, (Endpoint(bl.bound_address),))
     bp.add_peer(a.public, (Endpoint(al.bound_address),))
@@ -164,19 +156,17 @@ class _PostmanTests:
         a = crypto.Keypair.generate()
         b = crypto.Keypair.generate()
         stranger = crypto.Keypair.generate()
-        nexus: dict[bytes, InProcListener] = {}
+        nexus = InProcNexus()
 
-        al = InProcListener(a.public, nexus)
-        bl = InProcListener(b.public, nexus)
-        sl = InProcListener(stranger.public, nexus)
+        InProcListener(a.public, nexus)
 
         bp = Postman(b, T)
         sp = Postman(stranger, T)
 
-        bp.add_listener(bl)
-        sp.add_listener(sl)
+        bl = nexus.attach(bp)
+        nexus.attach(sp)
 
-        bp.add_peer(a.public, (al.endpoint,))
+        bp.add_peer(a.public, (nexus.endpoint_for(a.public),))
         sp.add_peer(b.public, (bl.endpoint,))
 
         bp.start()
@@ -190,16 +180,13 @@ class _PostmanTests:
     def test_authorized_non_peer_is_accepted(self) -> None:
         a = crypto.Keypair.generate()
         client = crypto.Keypair.generate()
-        nexus: dict[bytes, InProcListener] = {}
-
-        al = InProcListener(a.public, nexus)
-        cl = InProcListener(client.public, nexus)
+        nexus = InProcNexus()
 
         ap = Postman(a, T)
         cp = Postman(client, T)
 
-        ap.add_listener(al)
-        cp.add_listener(cl)
+        al = nexus.attach(ap)
+        nexus.attach(cp)
 
         cp.add_peer(a.public, (al.endpoint,))
         ap.sync({}, authorized=frozenset({client.public}))

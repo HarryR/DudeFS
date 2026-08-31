@@ -1,5 +1,7 @@
-import argparse
+from __future__ import annotations
+
 import json
+import logging
 import signal
 import threading
 import time
@@ -15,7 +17,6 @@ from ..net.address import Address, Endpoint
 from ..net.postman import Postman
 from ..net.socket_server import SocketServer
 from ..net.socket_substrate import SocketSubstrate
-from ..net.transports.tcp import TCPDialer, TCPTiming
 from ..node import ReplicaNode
 from ..session import SessionRW
 from ..store import Store, ops
@@ -23,11 +24,14 @@ from ..store.ops import SignedTransaction
 from ..sync.lite_client import LightClient
 from ..tunables import DEFAULT
 
+log = logging.getLogger(__name__)
+
 
 class CLIError(DudeError): ...
 
 
 KEYFILE = "identity.key"
+ANCHOR_PUBKEY = "anchor.pub"
 STORE_DB = "store.sqlite"
 BOOTSTRAP_SEED = "bootstrap.json"
 GENESIS_DATA = "genesis.bin"
@@ -46,6 +50,19 @@ def save_keypair(dir_path: Path, kp: crypto.Keypair) -> None:
         raise CLIError(f"identity already exists: {target}")
     target.write_bytes(bytes(kp.seed))
     target.chmod(0o600)
+
+
+def save_anchor(dir_path: Path, anchor: crypto.PublicKey) -> None:
+    ensure_dir(dir_path)
+    target = dir_path / ANCHOR_PUBKEY
+    target.write_bytes(bytes(anchor))
+
+
+def load_anchor(dir_path: Path) -> crypto.PublicKey:
+    target = dir_path / ANCHOR_PUBKEY
+    if not target.exists():
+        raise CLIError(f"no anchor pubkey at {target}; run 'node init --anchor' first")
+    return crypto.PublicKey(target.read_bytes())
 
 
 def load_keypair(dir_path: Path) -> crypto.Keypair:
@@ -82,7 +99,7 @@ class BootstrapSeed:
         target.write_text(json.dumps(data, indent=2))
 
     @classmethod
-    def load(cls, dir_path: Path) -> "BootstrapSeed":
+    def load(cls, dir_path: Path) -> BootstrapSeed:
         target = dir_path / BOOTSTRAP_SEED
         if not target.exists():
             raise CLIError(f"no bootstrap seed at {target}")
@@ -119,20 +136,6 @@ def load_genesis(dir_path: Path) -> tuple[bytes, tuple[SignedTransaction, ...]]:
     return block_bytes, bodies
 
 
-def add_dir_arg(parser: argparse.ArgumentParser, **kwargs) -> None:
-    parser.add_argument("--dir", type=Path, **kwargs)
-
-
-def cmd_init(args: argparse.Namespace, label: str) -> None:
-    dir_path: Path = args.dir
-    kp = crypto.Keypair.generate()
-    save_keypair(dir_path, kp)
-    pop = kp.prove_possession()
-    print(f"{label} identity created in {dir_path}")
-    print(f"  public key: {kp.public.hex()}")
-    print(f"  possession: {pop.hex()}")
-
-
 def open_store_with_genesis(dir_path: Path) -> Store:
     seed = BootstrapSeed.load(dir_path)
     store = Store(store_path(dir_path))
@@ -149,16 +152,14 @@ def open_store_with_genesis(dir_path: Path) -> Store:
             batch=ordered,
             auth=store.mgmt_reader,
         )
-        print(f"genesis block applied (block {sb.anchors.block_num})")
+        log.info("genesis block applied (block %d)", sb.anchors.block_num)
     return store
 
 
 def start_replica(dir_path: Path) -> tuple[ReplicaNode, Store]:
     kp = load_keypair(dir_path)
     store = open_store_with_genesis(dir_path)
-    timing = TCPTiming.for_deployment(DEFAULT)
     rn = ReplicaNode(kp, store, DEFAULT)
-    rn.add_listener(TCPDialer(timing=timing))
     rn.start()
     return rn, store
 
@@ -166,22 +167,20 @@ def start_replica(dir_path: Path) -> tuple[ReplicaNode, Store]:
 def start_light_client(dir_path: Path) -> LightClient:
     kp = load_keypair(dir_path)
     seed = BootstrapSeed.load(dir_path)
-    timing = TCPTiming.for_deployment(DEFAULT)
     postman = Postman(kp, DEFAULT)
-    postman.add_listener(TCPDialer(timing=timing))
     lc = LightClient(me=kp, anchor=seed.anchor, postman=postman)
     for pub, endpoints in seed.peers:
         lc.add_bootstrap_peer(pub, endpoints)
     lc.start()
     lc.bootstrap(now_ms())
-    print("bootstrapping...")
+    log.info("bootstrapping...")
     deadline = time.monotonic() + 30.0
     while not lc.bootstrapped() and time.monotonic() < deadline:
         time.sleep(0.1)
     if not lc.bootstrapped():
         lc.stop()
         raise CLIError("failed to bootstrap within 30s")
-    print(f"bootstrapped at block {lc.trusted_state.head.anchors.block_num}")
+    log.info("bootstrapped at block %d", lc.trusted_state.head.anchors.block_num)
     return lc
 
 
@@ -189,12 +188,12 @@ def serve_with_socket(label: str, dir_path: Path, sub, stop_fn) -> None:
     sock = socket_path(dir_path)
     server = SocketServer(sock, sub)
     server.start()
-    print(f"{label} serving on {sock}")
+    log.info("%s serving on %s", label, sock)
     stop = threading.Event()
     signal.signal(signal.SIGINT, lambda *_: stop.set())
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
     stop.wait()
-    print("shutting down...")
+    log.info("shutting down")
     server.stop()
     stop_fn()
 

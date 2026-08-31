@@ -14,12 +14,14 @@ from ..tunables import Tunables
 from .address import Address, Endpoint
 from .envelope import Envelope, EnvelopeError, Frame, MessageId, Verb
 from .link import (
+    Acceptor,
+    Dialer,
     Link,
-    Listener,
     Peer,
 )
 from .mailbox import Expired, Mailbox, Reply, Transmit
 from .plan import Decision, GiveUp, Send, Wait, plan_next, retry_at
+from .transports.tcp import OnionDialer, TCPDialer
 
 
 class Recipient(Enum):
@@ -141,7 +143,12 @@ class Postman:
     _output: queue.SimpleQueue[Output] = field(default_factory=queue.SimpleQueue, init=False)
 
     _thread: threading.Thread | None = field(default=None, init=False)
-    _listeners: list[Listener] = field(default_factory=list, init=False)
+    _acceptors: list[Acceptor] = field(default_factory=list, init=False)
+    _dialers: list[Dialer] = field(default_factory=list, init=False)
+
+    def __post_init__(self) -> None:
+        self._dialers.append(TCPDialer(self.tunables))
+        self._dialers.append(OnionDialer(self.tunables))
 
     # -- public interface: queue puts, never direct state mutation -----------
 
@@ -206,16 +213,23 @@ class Postman:
 
     # -- lifecycle ----------------------------------------------------------
 
-    def add_listener(self, listener: Listener) -> None:
-        self._listeners.append(listener)
+    def add_acceptor(self, acceptor: Acceptor) -> None:
+        self._acceptors.append(acceptor)
         if self._thread is not None:
-            listener.start(self._on_frame, self._on_link_established)
+            acceptor.start(self._on_frame, self._on_link_established)
+
+    def add_dialer(self, dialer: Dialer) -> None:
+        self._dialers.append(dialer)
+        if self._thread is not None:
+            dialer.start(self._on_frame, self._on_link_established)
 
     def start(self) -> None:
         if self._thread is not None:
             return
-        for listener in self._listeners:
-            listener.start(self._on_frame, self._on_link_established)
+        for acceptor in self._acceptors:
+            acceptor.start(self._on_frame, self._on_link_established)
+        for dialer in self._dialers:
+            dialer.start(self._on_frame, self._on_link_established)
         self._thread = threading.Thread(
             target=self._run,
             name=f"postman-{self.me.public.hex()[:8]}",
@@ -229,12 +243,15 @@ class Postman:
         self._thread = None
         if thread is not None:
             thread.join()
-        for listener in self._listeners:
+        for acceptor in self._acceptors:
             with contextlib.suppress(Exception):
-                listener.stop()
+                acceptor.stop()
+        for dialer in self._dialers:
+            with contextlib.suppress(Exception):
+                dialer.stop()
 
     def _run(self) -> None:
-        tick_interval = self.tunables.tick_interval / 1000
+        tick_interval = self.tunables.tick_interval.as_seconds
         while True:
             try:
                 cmd = self._input.get(timeout=tick_interval)
@@ -392,8 +409,9 @@ class Postman:
             for address in peer.dial_targets:
                 if any(ln.address == address for ln in peer.links):
                     continue
-                for listener in self._listeners:
-                    listener.dial(address)
+                for dialer in self._dialers:
+                    if dialer.dial(address):
+                        break
 
     def _do_link_broken(self, address: Address, now: Millis) -> None:
         for peer in self.peers.values():

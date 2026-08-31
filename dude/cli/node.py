@@ -1,66 +1,107 @@
-import argparse
+from __future__ import annotations
+
+import logging
 import signal
 import threading
+from collections.abc import Generator
+from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 
-from ..net.address import Address, Scheme
-from ..net.transports.tcp import TCPDialer, TCPListener, TCPTiming
+import click
+
+from ..core import crypto
+from ..net.link import Acceptor, Dialer
+from ..net.transports.tcp import TCPListener
 from ..node import Node
-from ..tunables import DEFAULT
+from ..store import Store
+from ..tunables import DEFAULT, Tunables
+from .config import DudeConfig
+from .params import ACCEPTOR, PUBKEY
 from .state import (
-    add_dir_arg,
-    cmd_init,
+    GENESIS_DATA,
+    load_anchor,
     load_keypair,
     open_store_with_genesis,
+    save_anchor,
+    save_keypair,
+    store_path,
 )
 
-
-def register(sub: argparse._SubParsersAction) -> None:
-    node = sub.add_parser("node", help="storage node commands")
-    node_sub = node.add_subparsers(dest="node_command")
-
-    init = node_sub.add_parser("init", help="mint node identity")
-    add_dir_arg(init, required=True, help="node home directory")
-    init.set_defaults(func=lambda args: cmd_init(args, "node"))
-
-    serve = node_sub.add_parser("serve", help="run the storage node")
-    add_dir_arg(serve, required=True, help="node home directory")
-    serve.add_argument("--listen", default=None, help="listen address (e.g. tcp:0.0.0.0:9000)")
-    serve.set_defaults(func=cmd_serve)
-
-    node.set_defaults(func=lambda _args: node.print_help())
+log = logging.getLogger(__name__)
 
 
-def cmd_serve(args: argparse.Namespace) -> None:
-    dir_path: Path = args.dir
-    kp = load_keypair(dir_path)
-    store = open_store_with_genesis(dir_path)
+@dataclass(frozen=True, slots=True)
+class NodeConfig:
+    dir: Path
+    acceptors: tuple[Acceptor, ...] = ()
+    dialers: tuple[Dialer, ...] = ()
+    tunables: Tunables = DEFAULT
 
-    timing = TCPTiming.for_deployment(DEFAULT)
-    n = Node(kp, store, DEFAULT)
 
-    if args.listen:
-        addr = Address.parse(args.listen.encode())
-        if addr.scheme is Scheme.TCP:
-            host, _, port_s = addr.value.partition(":")
-            listener = TCPListener(listen_host=host, listen_port=int(port_s), timing=timing)
-            n.add_listener(listener)
-            print(f"listening on {listener.bound_address}")
+@contextmanager
+def node_serve(cfg: NodeConfig) -> Generator[Node]:
+    kp = load_keypair(cfg.dir)
+
+    if (cfg.dir / GENESIS_DATA).exists():
+        store = open_store_with_genesis(cfg.dir)
     else:
-        listener = TCPListener(timing=timing)
-        n.add_listener(listener)
-        print(f"listening on {listener.bound_address}")
+        anchor_pub = load_anchor(cfg.dir)
+        store = Store(store_path(cfg.dir))
+        if store.head_block_num() is None:
+            store.provision(anchor_pub)
 
-    n.add_listener(TCPDialer(timing=timing))
+    n = Node(kp, store, cfg.tunables)
+    for a in cfg.acceptors:
+        n.add_acceptor(a)
+    for d in cfg.dialers:
+        n.add_dialer(d)
     n.start()
+    try:
+        yield n
+    finally:
+        n.stop()
+        store.close()
 
-    print(f"node {kp.public.hex()[:16]}... running")
 
-    stop = threading.Event()
-    signal.signal(signal.SIGINT, lambda *_: stop.set())
-    signal.signal(signal.SIGTERM, lambda *_: stop.set())
-    stop.wait()
+@click.group("node")
+def group() -> None:
+    pass
 
-    print("shutting down...")
-    n.stop()
-    store.close()
+
+@group.command()
+@click.option("--anchor", required=True, type=PUBKEY, help="anchor public key (hex)")
+@click.pass_obj
+def init(cfg: DudeConfig, anchor: crypto.PublicKey) -> None:
+    dir_path = cfg.node_dir
+    kp = crypto.Keypair.generate()
+    save_keypair(dir_path, kp)
+    save_anchor(dir_path, anchor)
+    pop = kp.prove_possession()
+    click.echo(f"node identity created in {dir_path}")
+    click.echo(f"  public key: {kp.public.hex()}")
+    click.echo(f"  possession: {pop.hex()}")
+    click.echo(f"  anchor:     {anchor.hex()[:16]}...")
+
+
+@group.command()
+@click.option("--listen", type=ACCEPTOR, default=None, help="listen address (tcp:host:port)")
+@click.pass_obj
+def serve(cfg: DudeConfig, listen: Acceptor | None) -> None:
+    acceptor = listen or TCPListener(cfg.tunables)
+    node_cfg = NodeConfig(
+        dir=cfg.node_dir,
+        acceptors=(acceptor,),
+        tunables=cfg.tunables,
+    )
+    with node_serve(node_cfg) as n:
+        if n.store.head_block_num() is None:
+            log.info("unprovisioned — waiting for genesis from anchor")
+        else:
+            log.info("node %s running", n.me.public.hex()[:16])
+
+        stop = threading.Event()
+        signal.signal(signal.SIGINT, lambda *_: stop.set())
+        signal.signal(signal.SIGTERM, lambda *_: stop.set())
+        stop.wait()
+        log.info("shutting down")

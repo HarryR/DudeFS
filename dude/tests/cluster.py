@@ -4,7 +4,7 @@ from collections.abc import Callable
 from ..consensus.bootstrap import bootstrap, compose_genesis
 from ..core import crypto
 from ..net.postman import Postman
-from ..net.transports.inproc import InProcListener, InProcNexus
+from ..net.transports.inproc import InProcNexus
 from ..node import Node, ReplicaNode
 from ..session import Settled
 from ..store import Store, ops
@@ -25,7 +25,7 @@ class Cluster:
         rw: int = 0,
         tunables: Tunables | None = None,
     ):
-        self.nexus: InProcNexus = {}
+        self.nexus = InProcNexus()
         self.tunables = tunables or TUNABLES
         self.anchor = crypto.Keypair.generate()
 
@@ -64,7 +64,7 @@ class Cluster:
         return compose_genesis(
             anchor=self.anchor,
             node_endpoints=[
-                (kp.public, (InProcListener.endpoint_for(kp.public),)) for kp in node_keys
+                (kp.public, (self.nexus.endpoint_for(kp.public),)) for kp in node_keys
             ],
             managers=mgmt_keys,
             ro_clients=ro_keys,
@@ -83,7 +83,7 @@ class Cluster:
     def _boot_node(self, kp: crypto.Keypair) -> Node:
         store = self.provisioned()
         node = Node(kp, store, self.tunables)
-        node.add_listener(InProcListener(kp.public, self.nexus))
+        self.nexus.attach(node)
         node.start()
         self.nodes.append(node)
         return node
@@ -91,7 +91,7 @@ class Cluster:
     def boot_replica(self, kp: crypto.Keypair) -> ReplicaNode:
         store = self.provisioned()
         rn = ReplicaNode(kp, store, self.tunables)
-        rn.add_listener(InProcListener(kp.public, self.nexus))
+        self.nexus.attach(rn)
         rn.start()
         self.replicas.append(rn)
         return rn
@@ -102,12 +102,12 @@ class Cluster:
         into: list[LightClient],
     ) -> LightClient:
         postman = Postman(kp, self.tunables)
-        postman.add_listener(InProcListener(kp.public, self.nexus))
+        self.nexus.attach(postman)
         lc = LightClient(me=kp, anchor=self.anchor.public, postman=postman)
         for node in self.nodes:
             lc.add_bootstrap_peer(
                 node.me.public,
-                (InProcListener.endpoint_for(node.me.public),),
+                (self.nexus.endpoint_for(node.me.public),),
             )
         lc.start()
         into.append(lc)
@@ -116,8 +116,8 @@ class Cluster:
     # -- waiting for convergence --------------------------------------------
 
     def _default_timeout(self, blocks: int = 10) -> float:
-        floor = 3 * self.tunables.block_time / 1000
-        return max(floor, blocks * self.tunables.block_time / 1000)
+        floor = 3 * self.tunables.block_time.as_seconds
+        return max(floor, blocks * self.tunables.block_time.as_seconds)
 
     def wait_head(
         self,
@@ -150,7 +150,7 @@ class Cluster:
         while time.monotonic() < deadline:
             if predicate(self):
                 return
-            time.sleep(self.tunables.tick_interval / 1000)
+            time.sleep(self.tunables.tick_interval.as_seconds)
         raise TimeoutError(f"predicate not satisfied within {t:.1f}s")
 
     def wait_settled(

@@ -49,7 +49,6 @@ class TestTheDeclaredSetIsSmall(unittest.TestCase):
                 "breaker_threshold",
                 "budget_max_tokens",
                 "budget_token_ratio",
-                "client_clock_tolerance",
                 "clock_skew",
                 "desired_links_per_peer",
                 "granularity",
@@ -60,6 +59,7 @@ class TestTheDeclaredSetIsSmall(unittest.TestCase):
                 "rtt_max",
                 "safety_margin",
                 "ticks_per_cadence",
+                "transports",
                 "windows_to_settle",
             ],
         )

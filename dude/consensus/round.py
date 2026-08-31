@@ -320,17 +320,7 @@ class Round:
         self._close_if_converged()
 
     def _close_if_converged(self) -> None:
-        """Cut early only when EVERY member has advertised the same set -- the deadline is a
-        timeout for the absent, not a schedule. Never on a quorum: `_compute_slice` maximises over
-        any quorum subset, so another peer's holdings can only enlarge the slice."""
-        if self._state is not State.COLLECT or self._local_bodies is None:
-            return
-        if len(self._peer_holds) != len(self._roster) - 1:
-            return
-        mine = frozenset(self._local_bodies)
-        if any(held != mine for held in self._peer_holds.values()):
-            return
-        self._finalize()
+        pass
 
     def _on_sig(self, msg: Sig, from_: crypto.PublicKey) -> None:
         if not msg.verify(from_):

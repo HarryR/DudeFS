@@ -7,6 +7,7 @@ import threading
 
 from ..core import codec, crypto
 from ..core.errors import DudeError
+from ..core.units import Millis
 from ..net.envelope import MessageId
 from ..session import SubmitHandle, SubmitResult, Substrate
 from ..store import ops
@@ -54,7 +55,7 @@ class SocketSubstrate(Substrate):
     def __init__(self, path: str, tunables: Tunables) -> None:
         self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self._sock.connect(path)
-        self._request_timeout = tunables.ttl_exchange / 1000
+        self._request_timeout = tunables.ttl_exchange.as_seconds
         self._send_lock = threading.Lock()
         self._cond = threading.Condition()
         self._commit_seq = 0
@@ -112,7 +113,7 @@ class SocketSubstrate(Substrate):
     def evict_after_sec(self) -> float:
         if self._evict_cache is None:
             reply = self._request(Request.EVICT, b"")
-            self._evict_cache = codec.as_int(codec.decode(reply)) / 1000
+            self._evict_cache = Millis(codec.as_int(codec.decode(reply))).as_seconds
         return self._evict_cache
 
     def wait_for_commit(self, timeout: float) -> None:

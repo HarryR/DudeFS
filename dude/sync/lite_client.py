@@ -13,7 +13,6 @@ from ..core.errors import DudeError
 from ..core.units import Millis, now_ms
 from ..net.address import Endpoint
 from ..net.envelope import MessageId, Verb
-from ..net.link import Listener
 from ..net.postman import Delivered, Postman
 from ..session import KeyCache, SessionRW, Settled, SubmitHandle, SubmitResult, Substrate
 from ..store import ops, smt
@@ -251,11 +250,9 @@ class LightClient:
 
     # -- the run loop -------------------------------------------------------
 
-    def start(self, *listeners: Listener) -> None:
+    def start(self) -> None:
         if self._thread is not None:
             return
-        for listener in listeners:
-            self.postman.add_listener(listener)
         self.postman.start()
         self._thread = threading.Thread(
             target=self._run,
@@ -273,7 +270,7 @@ class LightClient:
             thread.join()
 
     def _run(self) -> None:
-        tick_interval = self.tunables.tick_interval / 1000
+        tick_interval = self.tunables.tick_interval.as_seconds
         while not self._stopping.is_set():
             now = now_ms()
             activity = False
@@ -511,7 +508,7 @@ class _LiteSubstrate(Substrate):
         return ranked[0]
 
     def get(self, store: int, name: bytes) -> Held | None:
-        deadline = time.monotonic() + self._lc.tunables.ttl_lite / 1000
+        deadline = time.monotonic() + self._lc.tunables.ttl_lite.as_seconds
         while time.monotonic() < deadline:
             peer = self._pick_peer()
             req = self._lc.request_get(store, name, peer, now_ms())
@@ -601,17 +598,17 @@ class _LiteSubstrate(Substrate):
                     ):
                         return Settled(op_hash, handle.block_num, handle.block_hash)
                     return None
-                remaining = (deadline_ms - now_ms()) / 1000
+                remaining = Millis(deadline_ms - now_ms()).as_seconds
                 if remaining <= 0:
                     break
                 self._lc._commit_cond.wait(remaining)
         return None
 
     def evict_after_sec(self) -> float:
-        return self._lc.tunables.evict_after / 1000
+        return self._lc.tunables.evict_after.as_seconds
 
     def wait_for_commit(self, timeout: float) -> None:
-        cap = self._lc.tunables.block_time / 1000
+        cap = self._lc.tunables.block_time.as_seconds
         with self._lc._commit_cond:
             self._lc._commit_cond.wait(min(timeout, cap))
 

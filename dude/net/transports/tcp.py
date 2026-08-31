@@ -5,14 +5,17 @@ import queue
 import socket
 import struct
 import threading
+import time
+
+import socks
 from dataclasses import dataclass, field
 
 from ...core.errors import DudeError
-from ...core.units import Millis, now_ms
+from ...core.units import now_ms
 from ...tunables import Tunables
 from ..address import Address, Scheme
 from ..envelope import MAX_FRAME_BYTES, Frame
-from ..link import Link, LinkError, Listener, OnFrame, OnLink
+from ..link import Acceptor, Dialer, Link, LinkError, OnFrame, OnLink
 
 _LEN = struct.Struct(">I")
 
@@ -20,31 +23,18 @@ _OUTBOX_DEPTH = 64
 
 
 @dataclass(frozen=True, slots=True)
-class TCPTiming:
-    connect: Millis = 6_000
-    send: Millis = 4_000
-    idle_wait: Millis = 500
-    stop_join: Millis = 2_000
+class _TCPTiming:
+    connect_sec: float
+    send_sec: float
+    idle_wait_sec: float
 
     @classmethod
-    def for_deployment(cls, t: Tunables) -> TCPTiming:
-        return cls(connect=2 * t.rtt_max, send=2 * t.rtt_max)
-
-    @property
-    def connect_sec(self) -> float:
-        return self.connect / 1000
-
-    @property
-    def send_sec(self) -> float:
-        return self.send / 1000
-
-    @property
-    def idle_wait_sec(self) -> float:
-        return self.idle_wait / 1000
-
-    @property
-    def stop_join_sec(self) -> float:
-        return self.stop_join / 1000
+    def from_tunables(cls, t: Tunables) -> _TCPTiming:
+        return cls(
+            connect_sec=t.tcp_connect.as_seconds,
+            send_sec=t.tcp_send.as_seconds,
+            idle_wait_sec=t.tick_interval.as_seconds,
+        )
 
 
 class _TCPConn:
@@ -54,7 +44,7 @@ class _TCPConn:
         self,
         sock: socket.socket,
         address: Address,
-        timing: TCPTiming,
+        timing: _TCPTiming,
         on_frame: OnFrame,
         on_link: OnLink,
     ) -> None:
@@ -173,29 +163,37 @@ class _DialWorker:
         "_on_link",
         "_pending_sock",
         "_sock_lock",
+        "_socks5",
         "_stopping",
         "_thread",
         "_timing",
+        "connected",
     )
 
     def __init__(
         self,
         address: Address,
-        timing: TCPTiming,
+        timing: _TCPTiming,
         on_frame: OnFrame,
         on_link: OnLink,
+        socks5: tuple[str, int] | None = None,
     ) -> None:
         self._address = address
         self._timing = timing
         self._on_frame = on_frame
         self._on_link = on_link
+        self._socks5 = socks5
         self._stopping = threading.Event()
         self._pending_sock: socket.socket | None = None
         self._sock_lock = threading.Lock()
+        self.connected = False
         self._thread = threading.Thread(
             target=self._serve, name=f"tcp-dial-{address.value}", daemon=True
         )
         self._thread.start()
+
+    def alive(self) -> bool:
+        return self._thread.is_alive()
 
     def stop(self) -> None:
         self._stopping.set()
@@ -208,16 +206,15 @@ class _DialWorker:
         self._thread.join()
 
     def _serve(self) -> None:
-        while not self._stopping.is_set():
-            sock = self._try_connect()
-            if sock is None:
-                self._stopping.wait(timeout=self._timing.connect_sec)
-                continue
-            conn = _TCPConn(sock, self._address, self._timing, self._on_frame, self._on_link)
-            conn.link.on_close = lambda _ln: None
-            while not conn._closed and not self._stopping.is_set():  # noqa: SLF001
-                self._stopping.wait(timeout=self._timing.idle_wait_sec)
-            conn.join()
+        sock = self._try_connect()
+        if sock is None:
+            return
+        self.connected = True
+        conn = _TCPConn(sock, self._address, self._timing, self._on_frame, self._on_link)
+        conn.link.on_close = lambda _ln: None
+        while not conn._closed and not self._stopping.is_set():  # noqa: SLF001
+            self._stopping.wait(timeout=self._timing.idle_wait_sec)
+        conn.join()
 
     def _try_connect(self) -> socket.socket | None:
         host, _, port_s = self._address.value.partition(":")
@@ -227,7 +224,11 @@ class _DialWorker:
             port = int(port_s)
         except ValueError:
             return None
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        if self._socks5 is not None:
+            sock = socks.socksocket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.set_proxy(socks.SOCKS5, self._socks5[0], self._socks5[1])
+        else:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(self._timing.connect_sec)
         with self._sock_lock:
             if self._stopping.is_set():
@@ -245,33 +246,75 @@ class _DialWorker:
         return sock
 
 
-@dataclass(slots=True)
-class TCPDialer(Listener):
-    timing: TCPTiming = TCPTiming()
+def _parse_socks5(addr: str | None) -> tuple[str, int] | None:
+    if addr is None:
+        return None
+    host, _, port_s = addr.rpartition(":")
+    if not host:
+        return None
+    return host, int(port_s)
 
+
+@dataclass(slots=True)
+class TCPDialer(Dialer):
+    tunables: Tunables
+    _timing: _TCPTiming = field(init=False)
+    _socks5: tuple[str, int] | None = field(init=False)
     _workers: dict[Address, _DialWorker] = field(init=False, default_factory=dict)
+    _failures: dict[Address, int] = field(init=False, default_factory=dict)
+    _cooldown_until: dict[Address, float] = field(init=False, default_factory=dict)
     _on_frame: OnFrame | None = field(init=False, default=None)
     _on_link: OnLink | None = field(init=False, default=None)
     _stopping: threading.Event = field(init=False, default_factory=threading.Event)
 
+    def __post_init__(self) -> None:
+        self._timing = _TCPTiming.from_tunables(self.tunables)
+        self._socks5 = _parse_socks5(self.tunables.transports.tcp.socks5)
+
+    def _accepts(self, address: Address) -> Address | None:
+        if address.scheme is not Scheme.TCP:
+            return None
+        if not self.tunables.transports.tcp.enabled:
+            return None
+        return address
+
     def start(self, on_frame: OnFrame, on_link: OnLink) -> None:
-        if self._on_frame is not None:
-            raise RuntimeError("TCPDialer already started")
         self._on_frame = on_frame
         self._on_link = on_link
 
-    def dial(self, address: Address) -> None:
-        if address.scheme is not Scheme.TCP or self._stopping.is_set():
-            return
-        if self._on_frame is None or self._on_link is None:
-            return
-        if address not in self._workers:
-            self._workers[address] = _DialWorker(
-                address,
-                self.timing,
-                self._on_frame,
-                self._on_link,
-            )
+    def dial(self, address: Address) -> bool:
+        if self._stopping.is_set() or self._on_frame is None or self._on_link is None:
+            return False
+        wire_addr = self._accepts(address)
+        if wire_addr is None:
+            return False
+        now = time.monotonic()
+        if wire_addr in self._cooldown_until:
+            if now < self._cooldown_until[wire_addr]:
+                return False
+            del self._cooldown_until[wire_addr]
+        if wire_addr in self._workers:
+            worker = self._workers[wire_addr]
+            if worker.alive():
+                return True
+            del self._workers[wire_addr]
+            if worker.connected:
+                self._failures.pop(wire_addr, None)
+            else:
+                n = self._failures.get(wire_addr, 0) + 1
+                self._failures[wire_addr] = n
+                cap = self._timing.connect_sec * 30
+                backoff = min(self._timing.connect_sec * (2 ** n), cap)
+                self._cooldown_until[wire_addr] = now + backoff
+                return False
+        self._workers[wire_addr] = _DialWorker(
+            wire_addr,
+            self._timing,
+            self._on_frame,
+            self._on_link,
+            socks5=self._socks5,
+        )
+        return True
 
     def stop(self) -> None:
         self._stopping.set()
@@ -283,10 +326,31 @@ class TCPDialer(Listener):
 
 
 @dataclass(slots=True)
-class TCPListener(Listener):
+class OnionDialer(TCPDialer):
+    def __post_init__(self) -> None:
+        self._timing = _TCPTiming.from_tunables(self.tunables)
+        parsed = _parse_socks5(self.tunables.transports.onion.socks5)
+        if parsed is None:
+            raise ValueError("onion transport requires a socks5 proxy address")
+        self._socks5 = parsed
+
+    def _accepts(self, address: Address) -> Address | None:
+        if address.scheme is not Scheme.ONION:
+            return None
+        if not self.tunables.transports.onion.enabled:
+            return None
+        host, _, _ = address.value.partition(":")
+        if not host.endswith(".onion"):
+            return None
+        return address
+
+
+@dataclass(slots=True)
+class TCPListener(Acceptor):
+    tunables: Tunables
     listen_host: str = "127.0.0.1"
     listen_port: int = 0
-    timing: TCPTiming = TCPTiming()
+    _timing: _TCPTiming = field(init=False)
     _listener: socket.socket = field(init=False)
     _bound_port: int = field(init=False, default=0)
     _conns: list[_TCPConn] = field(init=False, default_factory=list)
@@ -296,6 +360,7 @@ class TCPListener(Listener):
     _thread: threading.Thread | None = field(init=False, default=None)
 
     def __post_init__(self) -> None:
+        self._timing = _TCPTiming.from_tunables(self.tunables)
         self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
             self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -320,9 +385,6 @@ class TCPListener(Listener):
             raise RuntimeError("TCPListener already started")
         self._on_frame = on_frame
         self._on_link = on_link
-
-    def dial(self, address: Address) -> None:
-        pass
 
     def stop(self) -> None:
         self._stopping.set()
@@ -351,7 +413,7 @@ class TCPListener(Listener):
             conn = _TCPConn(
                 conn_sock,
                 Address(Scheme.TCP, f"{host}:{port}"),
-                self.timing,
+                self._timing,
                 self._on_frame,
                 self._on_link,
             )

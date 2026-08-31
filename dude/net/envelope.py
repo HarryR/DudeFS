@@ -49,6 +49,8 @@ class Verb(IntEnum):
     """A node's answer to a client's SUBMIT, body a `mempool.Refusal` value. Sync refusals are
     `SYNC_REFUSED`."""
 
+    PROVISION = 100
+
 
 class MessageId(bytes):
     PREFIX_SIZE = 7

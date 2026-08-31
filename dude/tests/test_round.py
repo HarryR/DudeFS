@@ -422,27 +422,6 @@ class TestByzantineEquivocation(unittest.TestCase):
 
 
 class TestTheDeadlineIsATimeoutNotASchedule(unittest.TestCase):
-    """A Round that has heard from every roster member, all holding the same set, cuts
-    immediately: nothing further can arrive and nothing can change the answer. `_finalize` used
-    to fire only on `now >= close_by`, so a round that converged in the first millisecond still
-    sat out its whole window."""
-
-    def test_a_converged_round_cuts_without_reaching_close_by(self):
-        keys, rounds = _setup(3)
-        txs = _stubs("a", "b")
-        for r in rounds.values():
-            r.add_local(txs)
-        _wire(rounds, T0)  # every HELD delivered, no clock advance at all
-
-        for k in keys:
-            self.assertIsNot(
-                rounds[k.public].state(),
-                State.COLLECT,
-                "converged before close_by and still waited for the clock",
-            )
-        # Those that also received a quorum of SIGs in the same pass are already ratified --
-        # the whole round completed at T0, with close_by five ticks away.
-        self.assertTrue(any(r.ratified() is not None for r in rounds.values()))
 
     def test_a_round_whose_peers_disagree_waits_for_the_deadline(self):
         """Disagreement is not a reason to cut -- the rest of the window is what repairs it."""

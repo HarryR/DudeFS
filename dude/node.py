@@ -4,11 +4,13 @@ import time
 from dataclasses import dataclass, field
 
 from .consensus import Coordinator, Mempool, RoundAdapter, SettleAdapter
-from .core import crypto
+from .consensus.canonical import bodies_canonical
+from .consensus.settle_round import SettledBlock
+from .core import codec, crypto
 from .core.errors import DudeError
 from .core.units import Millis, now_ms
 from .net import MessageId, Verb
-from .net.link import Listener
+from .net.link import Acceptor, Dialer
 from .net.postman import Delivered, Postman
 from .session import KeyCache, SessionRW, SubmitHandle, SubmitResult, Substrate
 from .store import Store, ops
@@ -76,8 +78,11 @@ class _BaseNode:
 
     # -- lifecycle ----------------------------------------------------------
 
-    def add_listener(self, listener: Listener) -> None:
-        self.postman.add_listener(listener)
+    def add_acceptor(self, acceptor: Acceptor) -> None:
+        self.postman.add_acceptor(acceptor)
+
+    def add_dialer(self, dialer: Dialer) -> None:
+        self.postman.add_dialer(dialer)
 
     def start(self) -> None:
         if self._thread is not None:
@@ -102,7 +107,7 @@ class _BaseNode:
             thread.join()
 
     def _run(self) -> None:
-        tick_interval = self.tunables.tick_interval / 1000
+        tick_interval = self.tunables.tick_interval.as_seconds
         while not self._stopping.is_set():
             now = now_ms()
             for output in self.postman.drain_output(timeout=tick_interval):
@@ -133,7 +138,7 @@ class _BaseNode:
         timeout_sec: float,
     ) -> Delivered | None:
         mid = self.postman.send_raw(peer, verb, body, self.tunables.ttl_exchange)
-        tick = self.tunables.tick_interval / 1000
+        tick = self.tunables.tick_interval.as_seconds
         deadline = time.monotonic() + timeout_sec
         while time.monotonic() < deadline and not self._stopping.is_set():
             remaining = min(tick, deadline - time.monotonic())
@@ -156,7 +161,7 @@ class _BaseNode:
         peers = list(self.follower.compacted_peers())
         if not peers:
             return
-        timeout = self.tunables.ttl_exchange / 1000
+        timeout = self.tunables.ttl_exchange.as_seconds
         get_cp_verb, get_cp_body = GetCheckpoint().encode()
 
         for peer in peers:
@@ -281,7 +286,7 @@ class Node(_BaseNode):
     checkpoint_server: CheckpointServer | None = field(default=None, init=False)
 
     def _run(self) -> None:
-        tick_interval = self.tunables.tick_interval / 1000
+        tick_interval = self.tunables.tick_interval.as_seconds
         while not self._stopping.is_set():
             now = now_ms()
             for output in self.postman.drain_output():
@@ -352,6 +357,8 @@ class Node(_BaseNode):
                 self._on_get_checkpoint(d, now)
             case Verb.GET_CHUNKS:
                 self._on_get_chunks(d, now)
+            case Verb.PROVISION:
+                self._on_provision(d, now)
 
     def _is_node(self, who: crypto.PublicKey) -> bool:
         return who == self.store.anchor() or self.mgmt_reader.is_member(who)
@@ -376,6 +383,33 @@ class Node(_BaseNode):
 
     def _on_settle_sig(self, d: Delivered, now: Millis) -> None:
         self.coordinator.on_settle_msg(d.frm, d.verb, d.body, now)
+
+    # -- provisioning -------------------------------------------------------
+
+    def _on_provision(self, d: Delivered, now: Millis) -> None:
+        if d.frm != self.store.anchor():
+            return
+        if self.store.head_block_num() is not None:
+            self._reply(d, Verb.REFUSED, b"already provisioned")
+            return
+        outer = codec.as_seq(codec.decode(d.body), 2)
+        block_bytes = codec.as_bytes(outer[0])
+        bodies = tuple(
+            ops.SignedTransaction.decode(codec.as_bytes(item))
+            for item in codec.as_seq(outer[1])
+        )
+        sb = SettledBlock.decode(block_bytes)
+        ordered = bodies_canonical(bodies).txs
+        self.store.commit_block(
+            sb.anchors.block_num,
+            first_height=1,
+            block_bytes=block_bytes,
+            block_hash=sb.block_hash,
+            batch=ordered,
+            auth=self.mgmt_reader,
+        )
+        self._reconcile_peers()
+        self._reply(d, Verb.ACCEPTED, b"provisioned")
 
     # -- serving sync requests ----------------------------------------------
 
@@ -560,7 +594,7 @@ class ReplicaNode(_BaseNode):
         return SessionRW(sub, store_id)
 
     def _run(self) -> None:
-        tick_interval = self.tunables.tick_interval / 1000
+        tick_interval = self.tunables.tick_interval.as_seconds
         while not self._stopping.is_set():
             now = now_ms()
             for output in self.postman.drain_output(timeout=tick_interval):
@@ -645,7 +679,7 @@ class _ReplicaSubstrate(Substrate):
         return self._node.store.settlement_of(op_hash)
 
     def evict_after_sec(self) -> float:
-        return self._node.tunables.evict_after / 1000
+        return self._node.tunables.evict_after.as_seconds
 
     def wait_for_commit(self, timeout: float) -> None:
         with self._node._commit_cond:

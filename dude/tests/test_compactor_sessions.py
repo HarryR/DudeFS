@@ -5,7 +5,6 @@ import unittest
 from dude.core import crypto
 from dude.core.units import now_ms
 from dude.net.postman import Postman
-from dude.net.transports.inproc import InProcListener
 from dude.store import ops
 from dude.store.checkpoint import CheckpointMeta
 from dude.store.management import Cert, MgmtWriter, Role
@@ -75,12 +74,12 @@ class TestCompactorFromLightClient(unittest.TestCase):
             c.wait_settled(anchor_node.session().submit(grant).wait())
 
             postman = Postman(compactor_kp, c.tunables)
-            postman.add_listener(InProcListener(compactor_kp.public, c.nexus))
+            c.nexus.attach(postman)
             lc = LightClient(me=compactor_kp, anchor=c.anchor.public, postman=postman)
             for node in c.nodes:
                 lc.add_bootstrap_peer(
                     node.me.public,
-                    (InProcListener.endpoint_for(node.me.public),),
+                    (c.nexus.endpoint_for(node.me.public),),
                 )
             lc.start()
             lc.bootstrap(now_ms())
