@@ -84,13 +84,13 @@ def _pair_tcp() -> tuple[crypto.Keypair, crypto.Keypair, Postman, Postman]:
     return a, b, ap, bp
 
 
-def _drain_delivered(p: Postman, timeout: float = 0.5) -> list[Delivered]:
+def _drain_delivered(p: Postman, timeout: float = T.ttl_exchange.as_seconds, count: int = 1) -> list[Delivered]:
     deadline = time.monotonic() + timeout
     out: list[Delivered] = []
     while time.monotonic() < deadline:
         for output in p.drain_output():
             out.extend(output.delivered)
-        if out:
+        if len(out) >= count:
             return out
         time.sleep(0.02)
     return out
@@ -174,7 +174,7 @@ class _PostmanTests:
         self._postmen.extend([bp, sp])
 
         sp.send(b.public, Ping(), T.ttl_exchange)
-        got = _drain_delivered(bp, timeout=0.3)
+        got = _drain_delivered(bp, timeout=T.rtt_max.as_seconds)
         self.assertEqual(len(got), 0, "unauthorized sender should be dropped")
 
     def test_authorized_non_peer_is_accepted(self) -> None:
@@ -204,7 +204,7 @@ class _PostmanTests:
         a, b, ap, bp = self._make_pair()
         for i in range(5):
             ap.send(b.public, Payload(i.to_bytes(1)), T.ttl_exchange)
-        got = _drain_delivered(bp, timeout=1.0)
+        got = _drain_delivered(bp, count=5)
         self.assertEqual(len(got), 5)
         received = sorted(d.body for d in got)
         self.assertEqual(received, [i.to_bytes(1) for i in range(5)])
@@ -229,9 +229,6 @@ class TestInProc(_PostmanTests, unittest.TestCase):
 
 class TestTCP(_PostmanTests, unittest.TestCase):
     _pair = staticmethod(_pair_tcp)
-
-    def _drain(self, p: Postman, **kw) -> list[Delivered]:
-        return _drain_delivered(p, timeout=kw.get("timeout", 2.0))
 
 
 if __name__ == "__main__":

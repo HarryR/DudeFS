@@ -23,7 +23,7 @@ class TestSessionViaReplicaNode(unittest.TestCase):
         self.assertEqual(rec.value, b"world")
 
     def test_value_is_encrypted_on_disk(self) -> None:
-        self.s.put("secret", b"plaintext").wait()
+        self.c.wait_settled(self.s.put("secret", b"plaintext").wait())
         rec = self.s.get("secret")
         self.assertNotEqual(rec.raw, b"plaintext")
         self.assertEqual(rec.value, b"plaintext")
@@ -49,7 +49,7 @@ class TestSessionViaReplicaNode(unittest.TestCase):
         self.assertEqual(final.value, b"v2")
 
     def test_absent_guard(self) -> None:
-        self.s.put("fresh", b"new", absent=True).wait()
+        self.c.wait_settled(self.s.put("fresh", b"new", absent=True).wait())
         self.assertEqual(self.s.get("fresh").value, b"new")
 
     def test_conflicting_cas_is_refused_or_dropped(self) -> None:
@@ -94,14 +94,14 @@ class TestSessionViaLightClient(unittest.TestCase):
 
     def test_value_is_encrypted(self) -> None:
         s = self.lc.session()
-        s.put("secret", b"plaintext").wait()
+        self.c.wait_settled(s.put("secret", b"plaintext").wait())
         rec = s.get("secret")
         self.assertNotEqual(rec.raw, b"plaintext")
         self.assertEqual(rec.value, b"plaintext")
 
     def test_guarded_put(self) -> None:
         s = self.lc.session()
-        s.put("k", b"v1").wait()
+        self.c.wait_settled(s.put("k", b"v1").wait())
         rec = s.get("k")
         self.c.wait_settled(s.put("k", b"v2", expect=rec).wait())
         self.assertEqual(s.get("k").value, b"v2")

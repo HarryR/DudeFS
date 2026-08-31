@@ -1,67 +1,15 @@
 from __future__ import annotations
 
 import logging
-import signal
-import threading
-from collections.abc import Generator
-from contextlib import contextmanager
-from dataclasses import dataclass
-from pathlib import Path
 
 import click
 
 from ..core import crypto
-from ..net.link import Acceptor, Dialer
-from ..net.transports.tcp import TCPListener
-from ..node import Node
-from ..store import Store
-from ..tunables import DEFAULT, Tunables
-from .config import DudeConfig
-from .params import ACCEPTOR, PUBKEY
-from .state import (
-    GENESIS_DATA,
-    load_anchor,
-    load_keypair,
-    open_store_with_genesis,
-    save_anchor,
-    save_keypair,
-    store_path,
-)
+from .config import DudeConfig, NodeListenConfig, TCPListenConfig
+from .params import LISTEN, PUBKEY
+from .state import save_anchor, save_keypair, until_terminated
 
 log = logging.getLogger(__name__)
-
-
-@dataclass(frozen=True, slots=True)
-class NodeConfig:
-    dir: Path
-    acceptors: tuple[Acceptor, ...] = ()
-    dialers: tuple[Dialer, ...] = ()
-    tunables: Tunables = DEFAULT
-
-
-@contextmanager
-def node_serve(cfg: NodeConfig) -> Generator[Node]:
-    kp = load_keypair(cfg.dir)
-
-    if (cfg.dir / GENESIS_DATA).exists():
-        store = open_store_with_genesis(cfg.dir)
-    else:
-        anchor_pub = load_anchor(cfg.dir)
-        store = Store(store_path(cfg.dir))
-        if store.head_block_num() is None:
-            store.provision(anchor_pub)
-
-    n = Node(kp, store, cfg.tunables)
-    for a in cfg.acceptors:
-        n.add_acceptor(a)
-    for d in cfg.dialers:
-        n.add_dialer(d)
-    n.start()
-    try:
-        yield n
-    finally:
-        n.stop()
-        store.close()
 
 
 @click.group("node")
@@ -85,23 +33,17 @@ def init(cfg: DudeConfig, anchor: crypto.PublicKey) -> None:
 
 
 @group.command()
-@click.option("--listen", type=ACCEPTOR, default=None, help="listen address (tcp:host:port)")
+@click.option("--listen", type=LISTEN, default=None, help="additional listen address")
 @click.pass_obj
-def serve(cfg: DudeConfig, listen: Acceptor | None) -> None:
-    acceptor = listen or TCPListener(cfg.tunables)
-    node_cfg = NodeConfig(
-        dir=cfg.node_dir,
-        acceptors=(acceptor,),
-        tunables=cfg.tunables,
-    )
-    with node_serve(node_cfg) as n:
+def serve(cfg: DudeConfig, listen: TCPListenConfig | None) -> None:
+    if listen:
+        if cfg.node_listen is None:
+            cfg.node_listen = NodeListenConfig()
+        cfg.node_listen.tcp.append(listen)
+    with cfg.node() as n:
         if n.store.head_block_num() is None:
             log.info("unprovisioned — waiting for genesis from anchor")
         else:
             log.info("node %s running", n.me.public.hex()[:16])
-
-        stop = threading.Event()
-        signal.signal(signal.SIGINT, lambda *_: stop.set())
-        signal.signal(signal.SIGTERM, lambda *_: stop.set())
-        stop.wait()
-        log.info("shutting down")
+        with until_terminated():
+            log.info("shutting down")

@@ -84,6 +84,14 @@ class _BaseNode:
     def add_dialer(self, dialer: Dialer) -> None:
         self.postman.add_dialer(dialer)
 
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.stop()
+        self.store.close()
+
     def start(self) -> None:
         if self._thread is not None:
             return

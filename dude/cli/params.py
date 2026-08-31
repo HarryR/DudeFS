@@ -1,17 +1,10 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 import click
 
 from ..core import crypto
-from ..net.address import Address, AddressError, Scheme
-from ..net.link import Acceptor
-from ..net.transports.tcp import TCPListener
 from ..store.management import Role
-
-if TYPE_CHECKING:
-    from .config import DudeConfig
+from .config import TCPListenConfig
 
 
 class PublicKeyParam(click.ParamType):
@@ -62,26 +55,28 @@ class RoleParam(click.ParamType):
         return "[" + "|".join(r.name.lower() for r in Role) + "]"
 
 
-class AcceptorParam(click.ParamType):
+class ListenParam(click.ParamType):
     name = "listen-addr"
 
     def convert(
         self, value: str, param: click.Parameter | None, ctx: click.Context | None,
-    ) -> Acceptor:
-        try:
-            addr = Address.parse(value.encode())
-        except AddressError as e:
-            self.fail(str(e), param, ctx)
-            raise AssertionError("unreachable") from e
-        cfg: DudeConfig = ctx.obj  # type: ignore[union-attr]
-        if addr.scheme is Scheme.TCP:
-            host, _, port_s = addr.value.partition(":")
-            return TCPListener(cfg.tunables, listen_host=host, listen_port=int(port_s))
-        self.fail(f"unsupported scheme {addr.scheme.value.decode()!r}", param, ctx)
+    ) -> TCPListenConfig:
+        parts = value.split(":")
+        if len(parts) == 3 and parts[0] == "tcp":
+            try:
+                return TCPListenConfig(host=parts[1], port=int(parts[2]))
+            except ValueError:
+                self.fail(f"invalid port in {value!r}", param, ctx)
+        if len(parts) == 2:
+            try:
+                return TCPListenConfig(host=parts[0], port=int(parts[1]))
+            except ValueError:
+                self.fail(f"invalid port in {value!r}", param, ctx)
+        self.fail(f"expected tcp:host:port or host:port, got {value!r}", param, ctx)
         raise AssertionError("unreachable")
 
 
 PUBKEY = PublicKeyParam()
 SIGNATURE = SignatureParam()
 ROLE = RoleParam()
-ACCEPTOR = AcceptorParam()
+LISTEN = ListenParam()

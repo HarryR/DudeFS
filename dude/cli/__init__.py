@@ -26,7 +26,7 @@ def cli(ctx: click.Context, home: str, verbose: int) -> None:
         format="%(asctime)s %(levelname).1s %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
-    ctx.obj = DudeConfig(home=Path(home).expanduser())
+    ctx.obj = DudeConfig.load(Path(home).expanduser())
 
 
 cli.add_command(anchor.group)

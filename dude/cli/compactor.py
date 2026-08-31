@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import logging
-import signal
-import threading
 
 import click
 
@@ -19,6 +17,7 @@ from .state import (
     save_keypair,
     start_light_client,
     start_replica,
+    until_terminated,
 )
 
 log = logging.getLogger(__name__)
@@ -71,13 +70,10 @@ def serve(cfg: DudeConfig, interval: int) -> None:
 
     log.info("compactor %s running (interval=%ds)", kp.public.hex()[:16], interval)
 
-    stop = threading.Event()
-    signal.signal(signal.SIGINT, lambda *_: stop.set())
-    signal.signal(signal.SIGTERM, lambda *_: stop.set())
-
-    while not stop.is_set():
-        _run_compaction_cycle(rn, kp)
-        stop.wait(timeout=interval)
+    with until_terminated() as stop:
+        while not stop.is_set():
+            _run_compaction_cycle(rn, kp)
+            stop.wait(timeout=interval)
 
     log.info("shutting down")
     rn.stop()

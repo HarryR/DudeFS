@@ -1,16 +1,18 @@
 from __future__ import annotations
 
+import shutil
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
-from ..cli.node import NodeConfig, node_serve
-from ..cli.state import save_anchor, save_keypair
+from ..cli.state import save_anchor, save_keypair, store_path
 from ..consensus.bootstrap import bootstrap, compose_genesis
 from ..core import codec, crypto
 from ..net.envelope import Verb
 from ..net.postman import Postman
 from ..net.transports.inproc import InProcListener, InProcNexus
+from ..node import Node
 from ..store import Store
 from ..tunables import Tunables
 
@@ -26,7 +28,7 @@ class TestLiveProvisioning(unittest.TestCase):
         node_keys = [crypto.Keypair.generate() for _ in range(3)]
 
         dirs = [tempfile.mkdtemp() for _ in node_keys]
-        for kp, d in zip(node_keys, dirs):
+        for kp, d in zip(node_keys, dirs, strict=True):
             save_keypair(Path(d), kp)
             save_anchor(Path(d), anchor.public)
 
@@ -35,20 +37,23 @@ class TestLiveProvisioning(unittest.TestCase):
             for kp in node_keys
         ]
 
+        nodes: list[Node] = []
+        stores: list[Store] = []
         inprocs = [InProcListener(kp.public, nexus) for kp in node_keys]
-        configs = [
-            NodeConfig(
-                dir=Path(d),
-                acceptors=(ip,),
-                dialers=(ip,),
-                tunables=TUNABLES,
-            )
-            for d, ip in zip(dirs, inprocs)
-        ]
-
-        contexts = [node_serve(cfg) for cfg in configs]
-        nodes = [ctx.__enter__() for ctx in contexts]
         try:
+            for kp, d, ip in zip(node_keys, dirs, inprocs, strict=True):
+                anchor_pub = crypto.PublicKey(
+                    (Path(d) / "anchor.pub").read_bytes()
+                )
+                store = Store(store_path(Path(d)))
+                store.provision(anchor_pub)
+                stores.append(store)
+                n = Node(kp, store, TUNABLES)
+                n.add_acceptor(ip)
+                n.add_dialer(ip)
+                n.start()
+                nodes.append(n)
+
             for n in nodes:
                 self.assertIsNone(n.store.head_block_num())
 
@@ -71,7 +76,6 @@ class TestLiveProvisioning(unittest.TestCase):
             for pub, _ in node_endpoints:
                 anchor_postman.send_raw(pub, Verb.PROVISION, genesis_wire, TUNABLES.ttl_exchange)
 
-            import time
             deadline = time.monotonic() + 5.0
             provisioned = set()
             while len(provisioned) < len(node_keys) and time.monotonic() < deadline:
@@ -89,10 +93,10 @@ class TestLiveProvisioning(unittest.TestCase):
                 self.assertIsNotNone(n.store.head_block_num())
                 self.assertEqual(n.store.mgmt_reader.roster(), expected_roster)
         finally:
-            for ctx in contexts:
-                ctx.__exit__(None, None, None)
-
-            import shutil
+            for n in nodes:
+                n.stop()
+            for s in stores:
+                s.close()
             for d in dirs:
                 shutil.rmtree(d)
 

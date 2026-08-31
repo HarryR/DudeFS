@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import logging
-import signal
+import signal as _signal
 import threading
 import time
+from collections.abc import Generator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -184,16 +186,26 @@ def start_light_client(dir_path: Path) -> LightClient:
     return lc
 
 
+@contextmanager
+def until_terminated() -> Generator[threading.Event]:
+    stop = threading.Event()
+    prev_int = _signal.signal(_signal.SIGINT, lambda *_: stop.set())
+    prev_term = _signal.signal(_signal.SIGTERM, lambda *_: stop.set())
+    try:
+        yield stop
+        stop.wait()
+    finally:
+        _signal.signal(_signal.SIGINT, prev_int)
+        _signal.signal(_signal.SIGTERM, prev_term)
+
+
 def serve_with_socket(label: str, dir_path: Path, sub, stop_fn) -> None:
     sock = socket_path(dir_path)
     server = SocketServer(sock, sub)
     server.start()
     log.info("%s serving on %s", label, sock)
-    stop = threading.Event()
-    signal.signal(signal.SIGINT, lambda *_: stop.set())
-    signal.signal(signal.SIGTERM, lambda *_: stop.set())
-    stop.wait()
-    log.info("shutting down")
+    with until_terminated():
+        log.info("shutting down")
     server.stop()
     stop_fn()
 
