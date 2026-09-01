@@ -145,7 +145,7 @@ def compose_genesis(
     managers: Sequence[crypto.Keypair] = (),
     ro_clients: Sequence[crypto.Keypair] = (),
     rw_clients: Sequence[crypto.Keypair] = (),
-    ts: Millis = 0,
+    ts: Millis = Millis(0),
 ) -> tuple[SignedTransaction, ...]:
     from ..store.management import P_POP, Grant
 

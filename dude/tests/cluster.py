@@ -3,6 +3,7 @@ from collections.abc import Callable
 
 from ..consensus.bootstrap import bootstrap, compose_genesis
 from ..core import crypto
+from ..core.units import Millis
 from ..net.postman import Postman
 from ..net.transports.inproc import InProcNexus
 from ..node import Node, ReplicaNode
@@ -11,9 +12,10 @@ from ..store import Store, ops
 from ..sync.lite_client import LightClient
 from ..tunables import Tunables
 
-T0 = 1_700_000_000_000
 
-TUNABLES = Tunables(rtt_max=50, clock_skew=25, held_convergence_max=2)
+T0 = Millis(1_700_000_000_000)
+
+TUNABLES = Tunables(rtt_max=Millis(50), clock_skew=Millis(25), held_convergence_max=2)
 
 
 class Cluster:
@@ -112,6 +114,15 @@ class Cluster:
         lc.start()
         into.append(lc)
         return lc
+
+    # -- forcing blocks (test acceleration) -----------------------------------
+
+    def set_immediate(self, enabled: bool = True) -> None:
+        for node in self.nodes:
+            node.set_immediate(enabled)
+
+    def force_block(self) -> None:
+        self.set_immediate(True)
 
     # -- waiting for convergence --------------------------------------------
 

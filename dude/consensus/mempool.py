@@ -105,7 +105,7 @@ class Mempool:
         if (why := self.valid(tx, now, reader, auth)) is not None:
             return why
         t = self.tunables
-        landed = max(t.bucket(tx.ts), t.bucket(now))
+        landed = max(t.bucket(Millis(tx.ts)), t.bucket(now))
         self.pending.setdefault(landed, {})[tx.op_hash] = tx
         return None
 

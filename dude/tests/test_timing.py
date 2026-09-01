@@ -8,6 +8,7 @@ import unittest
 from dataclasses import replace
 
 from ..core.errors import DudeError, InvariantError
+from ..core.units import Millis
 from ..tunables import DEFAULT, Tunables
 
 
@@ -16,8 +17,8 @@ class TestBlockTimeDerivation(unittest.TestCase):
         """Pins the arithmetic against a sign flip, a missing summand, or an off-by-one in the
         wave count. Monotonicity tests would miss any of those."""
         t = Tunables(
-            rtt_max=100,
-            clock_skew=200,
+            rtt_max=Millis(100),
+            clock_skew=Millis(200),
             retry_budget=2,
             held_convergence_max=3,
             safety_margin=2,

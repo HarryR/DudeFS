@@ -99,7 +99,7 @@ class TestBuckets(unittest.TestCase):
     def test_boundaries_are_computed_not_negotiated(self):
         """#buckets: two nodes derive the same bucket for the same transaction with ZERO
         communication, because the bucket is arithmetic on the transaction's own timestamp."""
-        a, b = Tunables(rtt_max=200), Tunables(rtt_max=200)
+        a, b = Tunables(rtt_max=Millis(200)), Tunables(rtt_max=Millis(200))
         d = a.block_time
         self.assertEqual(a.block_time, b.block_time, "the same inputs must derive the same block")
         for ts in (T0, T0 + 1, T0 + d - 1, T0 + d, T0 + d * 5 + d // 2):
@@ -111,7 +111,7 @@ class TestBuckets(unittest.TestCase):
 class TestAdmission(unittest.TestCase):
     def setUp(self):
         self.kp = crypto.Keypair.generate()
-        self.t = Tunables(rtt_max=200)
+        self.t = Tunables(rtt_max=Millis(200))
         self.mp = Mempool(self.t)
         self.store = Store()  # the door consults state, so it needs one
         self.store.provision(self.kp.public)  # kp is the anchor => may_write returns True

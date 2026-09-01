@@ -332,6 +332,9 @@ class Node(_BaseNode):
     def mempool(self) -> Mempool:
         return self.coordinator.mempool
 
+    def set_immediate(self, enabled: bool = True) -> None:
+        self.coordinator.set_immediate(enabled)
+
     def _tick(self, now: Millis) -> None:
         self._reconcile_peers()
         self.coordinator.tick(now)

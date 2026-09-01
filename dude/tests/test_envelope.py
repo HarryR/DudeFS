@@ -10,8 +10,10 @@ import unittest
 from ..core import codec, crypto
 from ..net import Envelope, EnvelopeError, Frame, MessageId, SignedEnvelope, Verb, request
 from ..store import ops
+from ..core.units import Millis
 
-T0 = 1_700_000_000_000
+
+T0 = Millis(1_700_000_000_000)
 WINDOW = 5_000
 
 

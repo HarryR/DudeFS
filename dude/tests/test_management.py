@@ -21,9 +21,10 @@ from ..store.management import (
     Role,
     RosterCommitment,
 )
+from ..core.units import Millis
 from .cluster import TUNABLES, Cluster
 
-T0 = 1_700_000_000_000
+T0 = Millis(1_700_000_000_000)
 DK = crypto.NameToken(crypto.h(b"k"))
 DJ = crypto.NameToken(crypto.h(b"j"))
 """Data-store names are 32-byte tokens: a node must not be able to read a key name, and

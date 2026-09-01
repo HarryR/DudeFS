@@ -38,8 +38,10 @@ from ..net.envelope import Verb
 from ..net.postman import Recipient
 from ..store import ops
 from ..store.ops import SignedTransaction
+from ..core.units import Millis
 
-T0 = 1_700_000_000_000
+
+T0 = Millis(1_700_000_000_000)
 DELTA = 1_000
 CLOSE_BY = T0 + 5 * DELTA
 """Collection window for tests: five ticks. Enough for a Held to reach every peer and be
@@ -80,7 +82,7 @@ def _hashes(txs: tuple[SignedTransaction, ...]) -> tuple[crypto.Digest, ...]:
     return tuple(sorted(tx.op_hash for tx in txs))
 
 
-def _wire(nodes: dict[crypto.PublicKey, Round], now: int) -> None:
+def _wire(nodes: dict[crypto.PublicKey, Round], now: Millis) -> None:
     """Drain every Round's outbox and deliver to targets.
 
     A message addressed to `Recipient.ALL` goes to every OTHER node (never back to sender).
@@ -106,7 +108,7 @@ def _wire(nodes: dict[crypto.PublicKey, Round], now: int) -> None:
 
 
 def _setup(
-    n: int, bucket: int = 1, close_by: int = CLOSE_BY, abandon_by: int = ABANDON_BY
+    n: int, bucket: int = 1, close_by: Millis = CLOSE_BY, abandon_by: Millis = ABANDON_BY
 ) -> tuple[list[crypto.Keypair], dict[crypto.PublicKey, Round]]:
     """N nodes, one Round instance each, all for the same bucket."""
     keys = [crypto.Keypair.generate() for _ in range(n)]
@@ -127,7 +129,7 @@ def _setup(
     return keys, rounds
 
 
-def _run(nodes: dict[crypto.PublicKey, Round], rounds: int = 20, start: int = T0) -> int:
+def _run(nodes: dict[crypto.PublicKey, Round], rounds: int = 20, start: Millis = T0) -> Millis:
     """Tick + wire, `rounds` times. Returns the final `now`."""
     now = start
     for _ in range(rounds):
@@ -233,7 +235,7 @@ class Fabric:
         the cut. That is the only condition under which holdings still differ at `_finalize`,
         and therefore the only one under which slice selection has anything to select."""
         self.partition: set[tuple[crypto.PublicKey, crypto.PublicKey]] = set()
-        self.pending: list[tuple[crypto.PublicKey, crypto.PublicKey, RoundMsg, int]] = []
+        self.pending: list[tuple[crypto.PublicKey, crypto.PublicKey, RoundMsg, Millis]] = []
 
     def partition_pair(self, a: crypto.PublicKey, b: crypto.PublicKey) -> None:
         """Nothing flows between `a` and `b`, either direction."""
@@ -241,12 +243,12 @@ class Fabric:
         self.partition.add((b, a))
 
     def inject(
-        self, msg: RoundMsg, from_: crypto.PublicKey, to: crypto.PublicKey, now: int
+        self, msg: RoundMsg, from_: crypto.PublicKey, to: crypto.PublicKey, now: Millis
     ) -> None:
         """Deliver `msg` to `to` as if from `from_`, right now. Bypasses outbox and partition."""
         self.nodes[to].receive(msg, from_=from_, now=now)
 
-    def tick(self, now: int) -> None:
+    def tick(self, now: Millis) -> None:
         """One round: drain every Round's outbox into `pending`, then deliver anything due."""
         for src_id, src in self.nodes.items():
             for target, msg in src.outbox():
@@ -259,7 +261,7 @@ class Fabric:
                 remaining.append((src_id, dst_id, msg, deliver_at))
         self.pending = remaining
 
-    def _enqueue(self, src_id: crypto.PublicKey, target: object, msg: RoundMsg, now: int) -> None:
+    def _enqueue(self, src_id: crypto.PublicKey, target: object, msg: RoundMsg, now: Millis) -> None:
         for dst_id in self.nodes:
             if dst_id == src_id:
                 continue
@@ -272,7 +274,7 @@ class Fabric:
             self.pending.append((src_id, dst_id, msg, now + self.delay))
 
     def _deliver(
-        self, src_id: crypto.PublicKey, dst_id: crypto.PublicKey, msg: RoundMsg, now: int
+        self, src_id: crypto.PublicKey, dst_id: crypto.PublicKey, msg: RoundMsg, now: Millis
     ) -> None:
         if isinstance(msg, Bodies):
             self.nodes[dst_id].absorb(msg, src_id, msg.txs)
@@ -281,8 +283,8 @@ class Fabric:
 
 
 def _run_fabric(
-    nodes: dict[crypto.PublicKey, Round], fabric: Fabric, rounds: int = 20, start: int = T0
-) -> int:
+    nodes: dict[crypto.PublicKey, Round], fabric: Fabric, rounds: int = 20, start: Millis = T0
+) -> Millis:
     now = start
     for _ in range(rounds):
         for r in nodes.values():
@@ -292,7 +294,7 @@ def _run_fabric(
     return now
 
 
-def _run_multi(rounds_list: list[tuple[crypto.PublicKey, Round]], ticks: int = 20) -> int:
+def _run_multi(rounds_list: list[tuple[crypto.PublicKey, Round]], ticks: int = 20) -> Millis:
     """Wire a list of `(node_id, Round)` where multiple Rounds MAY share a `node_id` (one per
     bucket, per node). A Round drops foreign-bucket messages internally, so all deliveries flow
     through this one loop and buckets stay independent."""

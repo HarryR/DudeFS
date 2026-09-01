@@ -49,7 +49,7 @@ class Link:
     _send_frame: Callable[[Frame], None]
     _close_transport: Callable[[], None]
 
-    last_activity: Millis = 0
+    last_activity: Millis = Millis(0)
 
     # Estimator (RFC 6298 EWMA)
     srtt: float | None = field(default=None, repr=False)
@@ -57,7 +57,7 @@ class Link:
 
     # CircuitBreaker
     breaker_failures: int = field(default=0, repr=False)
-    breaker_opened_at: Millis = field(default=0, repr=False)
+    breaker_opened_at: Millis = field(default=Millis(0), repr=False)
     breaker_open: bool = field(default=False, repr=False)
 
     _closed: bool = field(default=False, init=False)
@@ -105,7 +105,7 @@ class Link:
     def rto(self, initial: Millis) -> Millis:
         if self.srtt is None:
             return initial
-        return max(2, int(self.srtt + max(1, 4 * self.rttvar)))
+        return Millis(max(2, int(self.srtt + max(1, 4 * self.rttvar))))
 
     def available(self, now: Millis) -> bool:
         if self._closed:
@@ -140,7 +140,7 @@ class Link:
             self.on_close(self)
 
     def _breaker_cooldown(self) -> Millis:
-        return 10_000
+        return Millis(10_000)
 
 
 # ---------------------------------------------------------------------------

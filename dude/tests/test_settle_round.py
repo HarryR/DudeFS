@@ -22,10 +22,12 @@ from dude.consensus.settle_round import (
     genesis_stamp,
 )
 from dude.core import codec, crypto
+from dude.core.units import Millis
+
 from dude.net.envelope import Verb
 from dude.net.postman import Recipient
 
-T0 = 1_700_000_000_000
+T0 = Millis(1_700_000_000_000)
 DELTA = 1_000
 ABANDON_BY = T0 + 1_000 * DELTA
 """SettleRound abandonment deadline for the scenario suite. Far past every test's runtime so
@@ -33,7 +35,7 @@ no test's SettleRound times out incidentally. Abandonment behaviour has its own 
 test class that sets a shorter value on purpose."""
 
 
-def _wire(nodes: dict[crypto.PublicKey, SettleRound], now: int) -> None:
+def _wire(nodes: dict[crypto.PublicKey, SettleRound], now: Millis) -> None:
     """Drain every SettleRound's outbox and deliver to targets. Broadcasts (Recipient.ALL)
     reach every other node; directed sends reach only the named node."""
     for src_id, src in nodes.items():

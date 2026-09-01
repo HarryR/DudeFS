@@ -88,7 +88,7 @@ class Failed:
 @dataclass(slots=True)
 class PeerView:
     last_block_num: int = 0
-    last_activity: Millis = 0
+    last_activity: Millis = Millis(0)
     consecutive_failures: int = 0
 
 

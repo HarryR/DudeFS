@@ -15,9 +15,11 @@ from ..net.transports.inproc import InProcListener, InProcNexus
 from ..node import Node
 from ..store import Store
 from ..tunables import Tunables
+from ..core.units import Millis
 
-T0 = 1_700_000_000_000
-TUNABLES = Tunables(rtt_max=50, clock_skew=25, held_convergence_max=2)
+
+T0 = Millis(1_700_000_000_000)
+TUNABLES = Tunables(rtt_max=Millis(50), clock_skew=Millis(25), held_convergence_max=2)
 
 
 class TestLiveProvisioning(unittest.TestCase):

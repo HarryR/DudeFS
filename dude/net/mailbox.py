@@ -168,7 +168,7 @@ class Mailbox:
 
     def deadline(self, prefix: bytes) -> Millis:
         p = self.pending.get(prefix)
-        return p.deadline if p else 0
+        return p.deadline if p else Millis(0)
 
     def outstanding(self) -> tuple[bytes, ...]:
         return tuple(self.pending)

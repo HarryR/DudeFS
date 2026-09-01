@@ -12,6 +12,7 @@ import unittest
 from dataclasses import dataclass
 
 from ..core import crypto
+from ..core.units import Millis
 from ..net.address import Endpoint
 from ..net.envelope import MessageId, Verb
 from ..net.postman import Delivered, Encodable, Postman
@@ -19,7 +20,7 @@ from ..net.transports.inproc import InProcListener, InProcNexus
 from ..net.transports.tcp import TCPListener
 from ..tunables import Tunables
 
-T = Tunables(rtt_max=200, clock_skew=200)
+T = Tunables(rtt_max=Millis(200), clock_skew=Millis(200))
 
 
 @dataclass(frozen=True)
@@ -96,9 +97,8 @@ def _drain_delivered(p: Postman, timeout: float = T.ttl_exchange.as_seconds, cou
     return out
 
 
-class _PostmanTests:
-    """Mixin: the actual test methods. Subclasses set `_pair` to the transport factory."""
-
+class _PostmanTests(unittest.TestCase):
+    __test__ = False
     _pair: staticmethod
 
     def setUp(self) -> None:
@@ -216,18 +216,19 @@ class _PostmanTests:
 
         got_by_b = _drain_delivered(bp)
         got_by_a = _drain_delivered(ap)
-
         self.assertEqual(len(got_by_b), 1)
         self.assertEqual(got_by_b[0].body, b"from-a")
         self.assertEqual(len(got_by_a), 1)
         self.assertEqual(got_by_a[0].body, b"from-b")
 
 
-class TestInProc(_PostmanTests, unittest.TestCase):
+class TestInProc(_PostmanTests):
+    __test__ = True
     _pair = staticmethod(_pair_inproc)
 
 
-class TestTCP(_PostmanTests, unittest.TestCase):
+class TestTCP(_PostmanTests):
+    __test__ = True
     _pair = staticmethod(_pair_tcp)
 
 

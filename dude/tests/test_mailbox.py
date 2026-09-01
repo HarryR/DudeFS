@@ -6,6 +6,7 @@ import unittest
 from dataclasses import replace
 
 from ..core import crypto
+from ..core.units import Millis
 from ..net import (
     Address,
     AddressError,
@@ -22,8 +23,9 @@ from ..net.link import Link, Peer
 from ..net.plan import GiveUp, Send, Wait, backoff, decorrelated, plan_next
 from ..tunables import DEFAULT
 
-T0 = 1_700_000_000_000
-TTL = 10_000
+
+T0 = Millis(1_700_000_000_000)
+TTL = Millis(10_000)
 
 A1 = Address(Scheme.UNIX, "/run/dude/a.sock")
 A2 = Address(Scheme.TCP, "10.0.0.2:9001")
@@ -73,23 +75,23 @@ def _peer(*addresses: Address, t=None) -> Peer:
 class TestSelection(unittest.TestCase):
     def test_usable_excludes_broken_links(self):
         peer = _peer(A1, A2, A3)
-        self.assertEqual(len(peer.usable(0)), 3)
+        self.assertEqual(len(peer.usable(Millis(0))), 3)
         peer.links[0].breaker_open = True
-        peer.links[0].breaker_opened_at = 0
-        usable_addrs = [ln.address for ln in peer.usable(0)]
+        peer.links[0].breaker_opened_at = Millis(0)
+        usable_addrs = [ln.address for ln in peer.usable(Millis(0))]
         self.assertNotIn(A1, usable_addrs)
-        self.assertTrue(peer.deliverable(0))
+        self.assertTrue(peer.deliverable(Millis(0)))
 
     def test_measurement_moves_a_link_in_the_sort(self):
-        t = replace(DEFAULT, rtt_max=100)
+        t = replace(DEFAULT, rtt_max=Millis(100))
         peer = _peer(A1, A2, t=t)
-        peer.links[0].on_reply(0, 400)  # A1 measured well above 100ms prior
-        self.assertEqual(peer.usable(0)[0].address, A2)
+        peer.links[0].on_reply(Millis(0), Millis(400))  # A1 measured well above 100ms prior
+        self.assertEqual(peer.usable(Millis(0))[0].address, A2)
 
     def test_no_paths_at_all_is_not_deliverable(self):
         peer = _peer()
-        self.assertFalse(peer.deliverable(0))
-        self.assertEqual(peer.usable(0), ())
+        self.assertFalse(peer.deliverable(Millis(0)))
+        self.assertEqual(peer.usable(Millis(0)), ())
 
 
 class TestPlan(unittest.TestCase):
@@ -105,10 +107,10 @@ class TestPlan(unittest.TestCase):
         self.assertGreater(d.until, T0)
 
     def test_picks_best_link_by_rto(self):
-        t = replace(DEFAULT, rtt_max=200)
+        t = replace(DEFAULT, rtt_max=Millis(200))
         peer = _peer(A1, A2)
-        peer.links[0].on_reply(0, 300)  # A1 slow
-        peer.links[1].on_reply(0, 50)  # A2 fast
+        peer.links[0].on_reply(Millis(0), Millis(300))  # A1 slow
+        peer.links[1].on_reply(Millis(0), Millis(50))  # A2 fast
         d = plan_next(t, peer, 0, T0, T0 + 10_000)
         assert isinstance(d, Send)
         self.assertEqual(d.link.address, A2)
@@ -125,14 +127,14 @@ class TestPlan(unittest.TestCase):
         self.assertIsNone(d.again_at)
 
     def test_backoff_grows_and_is_capped(self):
-        t = replace(DEFAULT, rtt_max=100)
+        t = replace(DEFAULT, rtt_max=Millis(100))
         delays = [backoff(t, n) for n in range(1, 6)]
         self.assertEqual(delays, sorted(delays))
         self.assertLessEqual(max(delays), t.backoff_cap)
         self.assertGreaterEqual(min(delays), t.backoff_base)
 
     def test_jitter_is_deterministic_by_default(self):
-        t = replace(DEFAULT, rtt_max=100)
+        t = replace(DEFAULT, rtt_max=Millis(100))
         self.assertEqual(backoff(t, 2), backoff(t, 2))
         spread = {decorrelated(100, 10_000) for _ in range(50)}
         self.assertGreater(len(spread), 40)
@@ -264,7 +266,7 @@ class TestOnlyThePeerWeAskedMayAnswer(unittest.TestCase):
 
     def _question(self) -> Envelope:
         signed = request(self.me, self.asked.public, Verb.PING, T0)
-        self.box.post(signed.env, T0, ttl=10_000, await_reply=True)
+        self.box.post(signed.env, T0, ttl=Millis(10_000), await_reply=True)
         return signed.env
 
     def test_the_peer_we_asked_is_answered(self):

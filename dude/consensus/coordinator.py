@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -56,9 +57,13 @@ class Coordinator:
     settling: _Settling | None = field(init=False, default=None)
     current_bucket: Bucket = field(init=False, default=-1)
     _settle_stalls: int = field(init=False, default=0)
+    _force_close: bool = field(init=False, default=False)
 
     def __post_init__(self) -> None:
         self.mempool = Mempool(self.tunables)
+
+    def set_immediate(self, enabled: bool = True) -> None:
+        self._force_close = enabled
 
     @property
     def mgmt_reader(self) -> MgmtReader:
@@ -191,20 +196,19 @@ class Coordinator:
         self._close_current_bucket(now)
 
     def _close_current_bucket(self, now: Millis) -> None:
-        """Always the bucket the clock has just closed; missed ones are SKIPPED, never queued.
-        A per-Round counter drifts off `floor(t/delta)`, and a node one bucket behind has its
-        HELD/SIG dropped by every peer as "no matching Round"."""
-        closed = self._bucket_of(now) - 1
-        if closed < self.current_bucket or self.current_round is not None:
+        forced = self._force_close
+        if forced:
+            closed = self.current_bucket
+        else:
+            closed = self._bucket_of(now) - 1
+        if self.current_round is not None:
             return
-        if now >= self._close_by(closed):
-            # Past this window's HELD wave: sit it out rather than open a Round nobody is on.
+        if closed < self.current_bucket:
+            return
+        if not forced and now >= self._close_by(closed):
             self.current_bucket = closed + 1
             return
-        if self.behind(now):
-            # Demonstrably behind: we would be leading a bucket over a chain we do not hold. Sit
-            # the window out and keep syncing. The mempool is deliberately NOT rotated -- what was
-            # admitted stays admitted, and `evict_after` bounds it.
+        if not forced and self.behind(now):
             self.current_bucket = closed + 1
             return
         self._open_round(closed, self.mempool.snapshot(), now)

@@ -7,6 +7,8 @@ import unittest
 
 from dude.consensus.bootstrap import bootstrap, intervene, mint_first_keyepoch
 from dude.core import codec, crypto
+from dude.core.units import Millis
+
 from dude.core.errors import DudeError
 from dude.session import KeyCache, SessionRW, SubmitResult, Substrate
 from dude.store import Store, ops, settle
@@ -15,7 +17,7 @@ from dude.store.management import Cert, MgmtWriter, Role, epoch_key
 
 from .cluster import Cluster
 
-T0 = 1_700_000_000_000
+T0 = Millis(1_700_000_000_000)
 
 
 def _cluster_of_one() -> tuple[Store, crypto.Keypair, MgmtWriter]:

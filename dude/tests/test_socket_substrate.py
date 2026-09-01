@@ -111,6 +111,7 @@ class TestSocketSubstrate(unittest.TestCase):
         self.c.wait_settled(s.put("probe", b"v").wait())
         h = sub.head()
         self.assertIsNotNone(h)
+        assert h is not None
         self.assertGreater(h.block_num, 0)
         self.assertEqual(len(h.block_hash), 32)
 

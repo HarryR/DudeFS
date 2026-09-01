@@ -3,7 +3,7 @@ from dataclasses import replace
 
 from ..core import crypto
 from ..core.errors import DudeError
-from ..core.units import now_ms
+from ..core.units import Millis, now_ms
 from ..net.address import Address, Endpoint, Scheme
 from ..net.envelope import MessageId
 from ..net.postman import Delivered
@@ -25,7 +25,7 @@ from ..sync.lite_client import (
 from .cluster import Cluster
 
 
-def _now_for_store(c: Cluster) -> int:
+def _now_for_store(c: Cluster) -> Millis:
     store = c.nodes[0].store
     head_num = store.head_block_num()
     assert head_num is not None

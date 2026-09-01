@@ -3,10 +3,24 @@ from __future__ import annotations
 import time
 
 
+class Seconds(float):
+    @property
+    def as_millis(self) -> Millis:
+        return Millis(int(self * 1000))
+
+    @staticmethod
+    def now() -> Seconds:
+        return Seconds(time.monotonic())
+
+
 class Millis(int):
     @property
-    def as_seconds(self) -> float:
-        return self / 1000
+    def as_seconds(self) -> Seconds:
+        return Seconds(self / 1000)
+
+    @staticmethod
+    def now() -> Millis:
+        return Millis(time.time_ns() // 1_000_000)
 
     def __add__(self, other: int) -> Millis:
         return Millis(int.__add__(self, other))
@@ -40,4 +54,4 @@ live in the module that reads it."""
 
 
 def now_ms() -> Millis:
-    return Millis(time.time_ns() // 1_000_000)
+    return Millis.now()

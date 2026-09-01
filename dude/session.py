@@ -135,6 +135,14 @@ class Substrate(Reader, ABC):
     @abstractmethod
     def decrypt(self, store_id: int, name: str, ciphertext: bytes, epoch: int) -> bytes: ...
 
+    def close(self) -> None: ...
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
 
 @dataclass(slots=True)
 class _StoreKeys:
