@@ -109,7 +109,9 @@ class SocketSubstrate(Substrate):
             op_hash = crypto.Digest(slot.wait(self._request_timeout))
         finally:
             self._pending.pop(corr_id, None)
-        return SubmitHandle(mid=mid, op_hash=op_hash, _sub=self)
+        handle = SubmitHandle(mid=mid, op_hash=op_hash, _sub=self)
+        handle.mark_accepted()
+        return handle
 
     def settled(self, op_hash: crypto.Digest) -> SubmitResult | None:
         reply = self._request(Request.QUERY, bytes(op_hash))

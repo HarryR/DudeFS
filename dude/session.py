@@ -46,7 +46,8 @@ class SubmitResult(ABC):
         if tag == b"R":
             return Refused(codec.as_bytes(parts[1]).decode())
         if tag == b"D":
-            return Dropped()
+            reason = codec.as_bytes(parts[1]).decode() if len(parts) > 1 else ""
+            return Dropped(reason)
         raise DudeError(f"unknown SubmitResult tag: {tag!r}")
 
 
@@ -70,8 +71,10 @@ class Refused(SubmitResult):
 
 @dataclass(frozen=True, slots=True)
 class Dropped(SubmitResult):
+    reason: str = ""
+
     def encode(self) -> bytes:
-        return codec.encode([b"D"])
+        return codec.encode([b"D", self.reason.encode()])
 
 
 @dataclass(slots=True)
@@ -82,16 +85,23 @@ class SubmitHandle:
     peer: crypto.PublicKey | None = None
     _accepted: bool = False
     _refused_reason: str | None = None
+    _ack: threading.Event = field(default_factory=threading.Event)
 
     def resolve(self, verb: int, body: bytes) -> None:
         if verb == Verb.ACCEPTED:
             self._accepted = True
         elif verb == Verb.REFUSED:
             self._refused_reason = body.decode("utf-8", errors="replace")
+        self._ack.set()
+
+    def mark_accepted(self) -> None:
+        self._accepted = True
+        self._ack.set()
 
     def expire(self) -> None:
         if not self._accepted and self._refused_reason is None:
             self._refused_reason = "expired"
+        self._ack.set()
 
     def poll(self) -> SubmitResult | None:
         if self._refused_reason is not None:
@@ -100,16 +110,20 @@ class SubmitHandle:
 
     def wait(self) -> SubmitResult:
         evict = self._sub.evict_after_sec()
+        if not self._ack.wait(evict):
+            return Dropped("no acknowledgement from node")
+        if self._refused_reason is not None:
+            return Refused(self._refused_reason)
         deadline = time.monotonic() + evict
         while time.monotonic() < deadline:
-            result = self.poll()
+            result = self._sub.settled(self.op_hash)
             if result is not None:
                 return result
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
             self._sub.wait_for_commit(min(remaining, evict))
-        return Dropped()
+        return Dropped("settlement timeout after acceptance")
 
 
 class Substrate(Reader, ABC):
