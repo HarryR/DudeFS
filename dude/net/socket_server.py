@@ -74,11 +74,15 @@ class SocketServer:
 
     def _commit_notify_loop(self) -> None:
         cond = self._sub.commit_cond
-        last = self._sub.commit_generation()
+        last = self._sub.commit_seq
         while not self._stopping.is_set():
             with cond:
-                cond.wait(timeout=1.0)
-            cur = self._sub.commit_generation()
+                baseline = last
+                cond.wait_for(
+                    lambda: self._sub.commit_seq > baseline or self._stopping.is_set(),  # noqa: B023
+                    timeout=1.0,
+                )
+            cur = self._sub.commit_seq
             if cur > last:
                 last = cur
                 h = self._sub.head()

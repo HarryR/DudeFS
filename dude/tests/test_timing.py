@@ -52,7 +52,6 @@ class TestTheDeclaredSetIsSmall(unittest.TestCase):
                 "budget_token_ratio",
                 "clock_skew",
                 "desired_links_per_peer",
-                "granularity",
                 "held_convergence_max",
                 "max_attempts",
                 "pull_batch",

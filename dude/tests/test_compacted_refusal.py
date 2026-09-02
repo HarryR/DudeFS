@@ -13,7 +13,7 @@ class TestCompactedRefusalWire(unittest.TestCase):
         msg = Refused(reason=SyncRefusal.COMPACTED, checkpoint_block_num=42)
         verb, body = msg.encode()
         decoded = SyncMsg.decode(verb, body)
-        self.assertIsInstance(decoded, Refused)
+        assert isinstance(decoded, Refused)
         self.assertEqual(decoded.reason, SyncRefusal.COMPACTED)
         self.assertEqual(decoded.checkpoint_block_num, 42)
 
@@ -21,7 +21,7 @@ class TestCompactedRefusalWire(unittest.TestCase):
         msg = Refused(reason=SyncRefusal.NOT_YET_SETTLED)
         verb, body = msg.encode()
         decoded = SyncMsg.decode(verb, body)
-        self.assertIsInstance(decoded, Refused)
+        assert isinstance(decoded, Refused)
         self.assertEqual(decoded.reason, SyncRefusal.NOT_YET_SETTLED)
         self.assertIsNone(decoded.checkpoint_block_num)
 
@@ -29,6 +29,7 @@ class TestCompactedRefusalWire(unittest.TestCase):
         msg = Refused(reason=SyncRefusal.COMPACTED)
         verb, body = msg.encode()
         decoded = SyncMsg.decode(verb, body)
+        assert isinstance(decoded, Refused)
         self.assertEqual(decoded.reason, SyncRefusal.COMPACTED)
         self.assertIsNone(decoded.checkpoint_block_num)
 
@@ -45,10 +46,11 @@ class TestServeGetblocksCompacted(unittest.TestCase):
 
             store = c.nodes[0].store
             pivot = store.head_block_num()
+            assert pivot is not None
             store.gc_below(pivot)
 
             response = serve_getblocks(store, GetBlocks(frm=0, count=5), cap=10)
-            self.assertIsInstance(response, Refused)
+            assert isinstance(response, Refused)
             self.assertEqual(response.reason, SyncRefusal.COMPACTED)
             self.assertEqual(response.checkpoint_block_num, pivot)
         finally:
@@ -62,6 +64,7 @@ class TestServeGetblocksCompacted(unittest.TestCase):
 
             store = c.nodes[0].store
             head = store.head_block_num()
+            assert head is not None
             store.gc_below(head)
 
             response = serve_getblocks(store, GetBlocks(frm=head, count=5), cap=10)
@@ -76,11 +79,7 @@ class TestServeGetblocksCompacted(unittest.TestCase):
             store = c.nodes[0].store
             future = (store.head_block_num() or 0) + 100
             response = serve_getblocks(store, GetBlocks(frm=future, count=5), cap=10)
-            self.assertIsInstance(response, Refused)
+            assert isinstance(response, Refused)
             self.assertEqual(response.reason, SyncRefusal.NOT_YET_SETTLED)
         finally:
             c.close()
-
-
-if __name__ == "__main__":
-    unittest.main()

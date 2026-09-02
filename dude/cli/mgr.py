@@ -70,9 +70,7 @@ def grant(cfg: DudeConfig, pub: crypto.PublicKey, pop: crypto.Signature, role: R
         result = session.submit(tx).wait()
         if not isinstance(result, Settled):
             raise CLIError(f"grant failed: {result!r}")
-        click.echo(
-            f"granted {role.name} to {pub.hex()[:16]}... (block {result.block_num})"
-        )
+        click.echo(f"granted {role.name} to {pub.hex()[:16]}... (block {result.block_num})")
 
 
 @group.command()

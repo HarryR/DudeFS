@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from ..session import Settled, Refused
+from ..session import Refused, Settled
 from ..store import ops
 from ..store.managed import ManagedMap
 from .cluster import Cluster
@@ -34,12 +34,12 @@ class TestManagedMap(unittest.TestCase):
 
     def test_add_one(self) -> None:
         self.assertTrue(self._apply(self.m.add(b"alice", b"value_a")))
-        meta = self.m.meta()        
+        meta = self.m.meta()
         self.assertIsNotNone(meta)
         assert meta is not None
         self.assertEqual(meta.count, 1)
         self.assertEqual(self.m.keys(), [b"alice"])
-        e = self.m.entry(b"alice")        
+        e = self.m.entry(b"alice")
         self.assertIsNotNone(e)
         assert e is not None
         self.assertEqual(e.value, b"value_a")
@@ -155,18 +155,22 @@ class TestManagedMap(unittest.TestCase):
 
     def test_accumulator_changes_on_add(self) -> None:
         self.assertTrue(self._apply(self.m.add(b"a", b"v")))
-        acc1 = self.m.meta().acc
+        m1 = self.m.meta()
+        assert m1 is not None
         self.assertTrue(self._apply(self.m.add(b"b", b"v")))
-        acc2 = self.m.meta().acc
-        self.assertNotEqual(acc1, acc2)
+        m2 = self.m.meta()
+        assert m2 is not None
+        self.assertNotEqual(m1.acc, m2.acc)
 
     def test_accumulator_restores_after_remove(self) -> None:
         self.assertTrue(self._apply(self.m.add(b"a", b"v")))
-        acc_one = self.m.meta().acc
+        m_one = self.m.meta()
+        assert m_one is not None
         self.assertTrue(self._apply(self.m.add(b"b", b"v")))
         self.assertTrue(self._apply(self.m.remove(b"b")))
-        acc_back = self.m.meta().acc
-        self.assertEqual(acc_one, acc_back)
+        m_back = self.m.meta()
+        assert m_back is not None
+        self.assertEqual(m_one.acc, m_back.acc)
 
     def test_iterate_after_churn(self) -> None:
         for i in range(5):

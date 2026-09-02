@@ -1,6 +1,5 @@
 import unittest
 
-from ..core.units import now_ms
 from ..session import Settled
 from ..store import ops
 from .cluster import Cluster
@@ -79,8 +78,7 @@ class TestSessionViaLightClient(unittest.TestCase):
     def setUp(self) -> None:
         self.c = Cluster(nodes=3, mgmt=1, ro=0, rw=1)
         self.lc = self.c.rw_clients[0]
-        self.lc.bootstrap(now_ms())
-        self.c.wait(lambda _: self.lc.bootstrapped())
+        self.lc.bootstrap()
 
     def tearDown(self) -> None:
         self.c.close()

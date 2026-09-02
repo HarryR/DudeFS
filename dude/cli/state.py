@@ -160,5 +160,3 @@ def until_terminated() -> Generator[threading.Event]:
     finally:
         _signal.signal(_signal.SIGINT, prev_int)
         _signal.signal(_signal.SIGTERM, prev_term)
-
-

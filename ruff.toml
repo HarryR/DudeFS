@@ -66,6 +66,7 @@ ignore = [
     "EM101",   # string literal in raise — see the header
     "EM102",   # f-string in raise — see the header
     "PLR2004", # magic value comparison — widths and tag bytes
+    "SIM118",  # `key in dict` — fires on ManagedMap.keys() which is not a dict
     "TRY300",  # `else` after try — guard-then-return reads better here
     "TID252",  # relative imports — this is one package; relative is correct within it
 ]

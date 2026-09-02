@@ -1,7 +1,6 @@
 import contextlib
 import threading
 import time
-from dataclasses import dataclass, field
 
 from .consensus import Coordinator, Mempool, RoundAdapter, SettleAdapter
 from .consensus.canonical import bodies_canonical
@@ -13,7 +12,7 @@ from .net import MessageId, Verb
 from .net.link import Acceptor, Dialer
 from .net.postman import Delivered, Postman
 from .net.socket_server import SocketServer
-from .session import KeyCache, SessionRW, SubmitHandle, SubmitResult, Substrate
+from .session import Inflight, KeyCache, SessionRW, SubmitHandle, SubmitResult, Substrate
 from .store import Store, ops
 from .store.layer import BlockHead, Held
 from .store.management import MgmtReader, Role
@@ -50,26 +49,21 @@ from .tunables import DEFAULT, Tunables
 # ---------------------------------------------------------------------------
 
 
-@dataclass(slots=True)
 class _BaseNode:
-    me: crypto.Keypair
-    store: Store
-    tunables: Tunables = DEFAULT
-    postman: Postman = field(init=False)
-    follower: Follower = field(init=False)
-
-    _stopping: threading.Event = field(default_factory=threading.Event, init=False)
-    _thread: threading.Thread | None = field(default=None, init=False)
-    _socket_servers: list[SocketServer] = field(default_factory=list, init=False)
-
-    def __post_init__(self) -> None:
-        self.postman = Postman(self.me, self.tunables)
+    def __init__(self, me: crypto.Keypair, store: Store, tunables: Tunables = DEFAULT) -> None:
+        self.me = me
+        self.store = store
+        self.tunables = tunables
+        self.postman = Postman(me, tunables)
         self.follower = Follower(
-            me=self.me,
-            store=self.store,
-            mgmt_reader=self.store.mgmt_reader,
-            tunables=self.tunables,
+            me=me, store=store, mgmt_reader=store.mgmt_reader, tunables=tunables
         )
+        self.inflight = Inflight()
+        self.commit_seq = 0
+        self.commit_cond = threading.Condition()
+        self._stopping = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._socket_servers: list[SocketServer] = []
 
     @property
     def mgmt_reader(self) -> MgmtReader:
@@ -97,7 +91,6 @@ class _BaseNode:
 
     def __exit__(self, *_: object) -> None:
         self.stop()
-        self.store.close()
 
     def start(self) -> None:
         if self._thread is not None:
@@ -116,14 +109,16 @@ class _BaseNode:
         self._thread.start()
 
     def stop(self) -> None:
+        thread = self._thread
+        if thread is None:
+            return
+        self._thread = None
         self._stopping.set()
         for srv in self._socket_servers:
             srv.stop()
         self.postman.stop()
-        thread = self._thread
-        self._thread = None
-        if thread is not None:
-            thread.join()
+        thread.join()
+        self.store.close()
 
     def _run(self) -> None:
         tick_interval = self.tunables.tick_interval.as_seconds
@@ -173,7 +168,7 @@ class _BaseNode:
                     self._on_delivered(d, now_ms())
         return None
 
-    def _download_checkpoint(self) -> None:
+    def _download_checkpoint(self) -> None:  # noqa: C901
         from .store.checkpoint import CheckpointMeta  # noqa: PLC0415
         from .store.smt_sync import TreeImporter  # noqa: PLC0415
 
@@ -257,13 +252,13 @@ class _BaseNode:
             reply_to=d.mid,
         )
 
-    def _flush_follower(self, now: Millis) -> None:
+    def _flush_follower(self, now: Millis) -> None:  # noqa: ARG002
         for peer, msg in self.follower.outbox():
             self.postman.send(peer, msg, self.tunables.ttl_exchange)
 
     # -- sync verb handlers (shared) ----------------------------------------
 
-    def _on_ping(self, d: Delivered, now: Millis) -> MessageId:
+    def _on_ping(self, d: Delivered, now: Millis) -> MessageId:  # noqa: ARG002
         return self._reply(d, Verb.PONG, b"")
 
     def _on_height_reply(self, d: Delivered, now: Millis) -> None:
@@ -297,12 +292,20 @@ class _BaseNode:
 CONSENSUS_ONLY = frozenset({Verb.BODIES, Verb.HELD, Verb.SIG, Verb.SETTLE_SIG})
 
 
-@dataclass(slots=True)
 class Node(_BaseNode):
-    adapter: RoundAdapter = field(init=False)
-    settle_adapter: SettleAdapter = field(init=False)
-    coordinator: Coordinator = field(init=False)
-    checkpoint_server: CheckpointServer | None = field(default=None, init=False)
+    def __init__(self, me: crypto.Keypair, store: Store, tunables: Tunables = DEFAULT) -> None:
+        super().__init__(me, store, tunables)
+        self.adapter = RoundAdapter(me, self.postman, tunables.ttl_round)
+        self.settle_adapter = SettleAdapter(me, self.postman, tunables.ttl_round)
+        self.coordinator = Coordinator(
+            me,
+            store,
+            self.adapter,
+            self.settle_adapter,
+            tunables,
+            self.follower.behind,
+        )
+        self.checkpoint_server: CheckpointServer | None = None
 
     def _run(self) -> None:
         tick_interval = self.tunables.tick_interval.as_seconds
@@ -315,19 +318,6 @@ class Node(_BaseNode):
                 self._tick(now)
             self._stopping.wait(timeout=tick_interval)
 
-    def __post_init__(self) -> None:
-        _BaseNode.__post_init__(self)
-        self.adapter = RoundAdapter(self.me, self.postman, self.tunables.ttl_round)
-        self.settle_adapter = SettleAdapter(self.me, self.postman, self.tunables.ttl_round)
-        self.coordinator = Coordinator(
-            self.me,
-            self.store,
-            self.adapter,
-            self.settle_adapter,
-            self.tunables,
-            self.follower.behind,
-        )
-
     @property
     def mempool(self) -> Mempool:
         return self.coordinator.mempool
@@ -337,13 +327,23 @@ class Node(_BaseNode):
 
     def _tick(self, now: Millis) -> None:
         self._reconcile_peers()
+        prev_head = self.store.head_block_num()
         self.coordinator.tick(now)
+        if self.store.head_block_num() != prev_head:
+            self._notify_followers()
         self.follower.tick(now)
         self._flush_follower(now)
 
+    def _notify_followers(self) -> None:
+        reply = serve_height(self.store)
+        roster = frozenset(self.roster())
+        for pub in self.postman.peers:
+            if pub not in roster:
+                self.postman.send(pub, reply, self.tunables.ttl_exchange)
+
     # -- inbound dispatch ---------------------------------------------------
 
-    def _on_delivered(self, d: Delivered, now: Millis) -> None:
+    def _on_delivered(self, d: Delivered, now: Millis) -> None:  # noqa: C901, PLR0912
         if d.verb in CONSENSUS_ONLY and not self._is_node(d.frm):
             return
         match d.verb:
@@ -408,7 +408,7 @@ class Node(_BaseNode):
 
     # -- provisioning -------------------------------------------------------
 
-    def _on_provision(self, d: Delivered, now: Millis) -> None:
+    def _on_provision(self, d: Delivered, now: Millis) -> None:  # noqa: ARG002
         if d.frm != self.store.anchor():
             return
         if self.store.head_block_num() is not None:
@@ -417,8 +417,7 @@ class Node(_BaseNode):
         outer = codec.as_seq(codec.decode(d.body), 2)
         block_bytes = codec.as_bytes(outer[0])
         bodies = tuple(
-            ops.SignedTransaction.decode(codec.as_bytes(item))
-            for item in codec.as_seq(outer[1])
+            ops.SignedTransaction.decode(codec.as_bytes(item)) for item in codec.as_seq(outer[1])
         )
         sb = SettledBlock.decode(block_bytes)
         ordered = bodies_canonical(bodies).txs
@@ -435,10 +434,10 @@ class Node(_BaseNode):
 
     # -- serving sync requests ----------------------------------------------
 
-    def _on_height(self, d: Delivered, now: Millis) -> MessageId:
+    def _on_height(self, d: Delivered, now: Millis) -> MessageId:  # noqa: ARG002
         return self.postman.reply(d, serve_height(self.store), self.tunables.ttl_exchange)
 
-    def _on_getblock(self, d: Delivered, now: Millis) -> MessageId | None:
+    def _on_getblock(self, d: Delivered, now: Millis) -> MessageId | None:  # noqa: ARG002
         if not self._replica_authorised(d.frm):
             return self.postman.reply(
                 d, Refused(reason=SyncRefusal.UNAUTHORISED), self.tunables.ttl_exchange
@@ -465,7 +464,7 @@ class Node(_BaseNode):
         grant = self.mgmt_reader.grant_of(who)
         return grant is not None and grant.role in (Role.MANAGER, Role.COMPACTOR)
 
-    def _on_get_checkpoint(self, d: Delivered, now: Millis) -> MessageId | None:
+    def _on_get_checkpoint(self, d: Delivered, now: Millis) -> MessageId | None:  # noqa: ARG002
         if not self._replica_authorised(d.frm):
             return self.postman.reply(
                 d,
@@ -484,7 +483,7 @@ class Node(_BaseNode):
             self.tunables.ttl_exchange,
         )
 
-    def _on_get_chunks(self, d: Delivered, now: Millis) -> MessageId | None:
+    def _on_get_chunks(self, d: Delivered, now: Millis) -> MessageId | None:  # noqa: ARG002
         if not self._replica_authorised(d.frm):
             return self.postman.reply(
                 d,
@@ -516,7 +515,7 @@ class Node(_BaseNode):
 
     # -- serving lite requests ----------------------------------------------
 
-    def _on_get_anchors(self, d: Delivered, now: Millis) -> MessageId | None:
+    def _on_get_anchors(self, d: Delivered, now: Millis) -> MessageId | None:  # noqa: ARG002
         if not self._lite_authorised(d.frm):
             return self.postman.reply(
                 d, LiteRefused(SyncRefusal.UNAUTHORISED), self.tunables.ttl_lite
@@ -535,7 +534,7 @@ class Node(_BaseNode):
             self.tunables.ttl_lite,
         )
 
-    def _on_get_proof(self, d: Delivered, now: Millis) -> MessageId | None:
+    def _on_get_proof(self, d: Delivered, now: Millis) -> MessageId | None:  # noqa: ARG002
         if not self._lite_authorised(d.frm):
             return self.postman.reply(
                 d, LiteRefused(SyncRefusal.UNAUTHORISED), self.tunables.ttl_lite
@@ -558,7 +557,7 @@ class Node(_BaseNode):
             self.tunables.ttl_lite,
         )
 
-    def _on_tx_status(self, d: Delivered, now: Millis) -> MessageId | None:
+    def _on_tx_status(self, d: Delivered, now: Millis) -> MessageId | None:  # noqa: ARG002
         if not self._lite_authorised(d.frm):
             return self.postman.reply(
                 d, LiteRefused(SyncRefusal.UNAUTHORISED), self.tunables.ttl_lite
@@ -597,12 +596,7 @@ class Node(_BaseNode):
 # ---------------------------------------------------------------------------
 
 
-@dataclass(slots=True)
 class ReplicaNode(_BaseNode):
-    _inflight: dict[bytes, SubmitHandle] = field(default_factory=dict, init=False)
-    _commit_seq: int = field(default=0, init=False)
-    _commit_cond: threading.Condition = field(default_factory=threading.Condition, init=False)
-
     def submit(self, tx: ops.SignedTransaction, to: crypto.PublicKey) -> MessageId:
         return self.postman.send_raw(
             to,
@@ -623,23 +617,20 @@ class ReplicaNode(_BaseNode):
                 for d in output.delivered:
                     self._on_delivered(d, now)
                 for e in output.expired:
-                    handle = self._inflight.pop(e.prefix, None)
-                    if handle is not None:
-                        handle.expire()
+                    self.inflight.on_expired(e.prefix)
             with contextlib.suppress(DudeError):
                 self._tick(now)
 
     def _on_settled_block(self, d: Delivered, now: Millis) -> None:
-        _BaseNode._on_settled_block(self, d, now)
-        with self._commit_cond:
-            self._commit_seq += 1
-            self._commit_cond.notify_all()
+        super()._on_settled_block(d, now)
+        with self.commit_cond:
+            self.commit_seq += 1
+            self.commit_cond.notify_all()
 
     def _on_delivered(self, d: Delivered, now: Millis) -> None:
-        if d.verb in (Verb.ACCEPTED, Verb.REFUSED) and d.in_reply_to is not None:
-            handle = self._inflight.pop(d.in_reply_to.correlation_id, None)
-            if handle is not None:
-                handle.resolve(d.verb, d.body)
+        if d.in_reply_to is not None and self.inflight.on_reply(
+            d.in_reply_to.correlation_id, d.verb, d.body
+        ):
             return
         match d.verb:
             case Verb.HEIGHT_REPLY:
@@ -655,7 +646,7 @@ class ReplicaNode(_BaseNode):
 class _ReplicaSubstrate(Substrate):
     __slots__ = ("_key_cache", "_node")
 
-    def __init__(self, node: ReplicaNode) -> None:
+    def __init__(self, node: _BaseNode) -> None:
         self._node = node
         self._key_cache: KeyCache | None = None
 
@@ -687,7 +678,7 @@ class _ReplicaSubstrate(Substrate):
         target = roster[0]
         mid = MessageId.random()
         handle = SubmitHandle(mid=mid, op_hash=signed.op_hash, _sub=self)
-        self._node._inflight[mid.correlation_id] = handle
+        self._node.inflight.register(mid, handle)
         self._node.postman.send_raw(
             target,
             Verb.SUBMIT,
@@ -703,20 +694,21 @@ class _ReplicaSubstrate(Substrate):
     def evict_after_sec(self) -> float:
         return self._node.tunables.evict_after.as_seconds
 
-    def wait_for_commit(self, timeout: float) -> None:
-        with self._node._commit_cond:
-            seq = self._node._commit_seq
-            self._node._commit_cond.wait_for(
-                lambda: self._node._commit_seq > seq,
+    def wait_for_commit(self, timeout: float, since: int = -1) -> None:
+        with self._node.commit_cond:
+            baseline = since if since >= 0 else self._node.commit_seq
+            self._node.commit_cond.wait_for(
+                lambda: self._node.commit_seq > baseline,
                 timeout=timeout,
             )
 
     @property
     def commit_cond(self) -> threading.Condition:
-        return self._node._commit_cond
+        return self._node.commit_cond
 
-    def commit_generation(self) -> int:
-        return self._node._commit_seq
+    @property
+    def commit_seq(self) -> int:
+        return self._node.commit_seq
 
     def head(self) -> BlockHead | None:
         num = self._node.store.head_block_num()

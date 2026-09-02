@@ -34,12 +34,11 @@ from ..consensus.round import (
     _slice_hash,
 )
 from ..core import codec, crypto
+from ..core.units import Millis
 from ..net.envelope import Verb
 from ..net.postman import Recipient
 from ..store import ops
 from ..store.ops import SignedTransaction
-from ..core.units import Millis
-
 
 T0 = Millis(1_700_000_000_000)
 DELTA = 1_000
@@ -261,7 +260,9 @@ class Fabric:
                 remaining.append((src_id, dst_id, msg, deliver_at))
         self.pending = remaining
 
-    def _enqueue(self, src_id: crypto.PublicKey, target: object, msg: RoundMsg, now: Millis) -> None:
+    def _enqueue(
+        self, src_id: crypto.PublicKey, target: object, msg: RoundMsg, now: Millis
+    ) -> None:
         for dst_id in self.nodes:
             if dst_id == src_id:
                 continue
@@ -424,7 +425,6 @@ class TestByzantineEquivocation(unittest.TestCase):
 
 
 class TestTheDeadlineIsATimeoutNotASchedule(unittest.TestCase):
-
     def test_a_round_whose_peers_disagree_waits_for_the_deadline(self):
         """Disagreement is not a reason to cut -- the rest of the window is what repairs it."""
         keys, rounds = _setup(3)

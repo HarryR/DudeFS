@@ -57,7 +57,7 @@ typecheck:
 	"$(TY)" check $(SRC)
 
 test:
-	"$(PY)" -m pytest $(SRC)/tests -q --tb=short --no-header --durations=0
+	"$(PY)" -m pytest $(SRC)/tests -q --tb=short --no-header --durations=0 -vv
 
 coverage:
 	"$(PY)" -m coverage run --source=$(SRC) -m pytest $(SRC)/tests -q --tb=short --no-header

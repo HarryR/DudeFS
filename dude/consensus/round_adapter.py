@@ -13,7 +13,7 @@ class RoundAdapter:
         self.postman = postman
         self.ttl = ttl
 
-    def flush(self, round_: Round, now: Millis) -> None:
+    def flush(self, round_: Round, _now: Millis) -> None:
         for target, msg in round_.outbox():
             verb, body = msg.encode()
             for peer in recipients(target, round_.roster(), self.me.public):

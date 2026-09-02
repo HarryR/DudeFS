@@ -6,9 +6,9 @@ import socket
 import struct
 import threading
 import time
+from dataclasses import dataclass, field
 
 import socks
-from dataclasses import dataclass, field
 
 from ...core.errors import DudeError
 from ...core.units import now_ms
@@ -304,7 +304,7 @@ class TCPDialer(Dialer):
                 n = self._failures.get(wire_addr, 0) + 1
                 self._failures[wire_addr] = n
                 cap = self._timing.connect_sec * 30
-                backoff = min(self._timing.connect_sec * (2 ** n), cap)
+                backoff = min(self._timing.connect_sec * (2**n), cap)
                 self._cooldown_until[wire_addr] = now + backoff
                 return False
         self._workers[wire_addr] = _DialWorker(

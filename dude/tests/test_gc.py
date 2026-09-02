@@ -25,7 +25,9 @@ class TestStoreGC(unittest.TestCase):
         pre_head = store.head()
         pre_block_num = store.head_block_num()
 
-        pivot = store.head_block_num() - 1
+        head_num = store.head_block_num()
+        assert head_num is not None
+        pivot = head_num - 1
         entries_deleted = store.gc_below(pivot)
         self.assertGreater(entries_deleted, 0)
 
@@ -52,6 +54,7 @@ class TestStoreGC(unittest.TestCase):
 
         store = self.c.nodes[0].store
         pivot = store.head_block_num()
+        assert pivot is not None
         store.gc_below(pivot)
 
         self.assertIsNotNone(store.settled_at(pivot))
@@ -62,7 +65,9 @@ class TestStoreGC(unittest.TestCase):
         self.c.wait_settled(result)
 
         for n in self.c.nodes:
-            n.store.gc_below(n.store.head_block_num())
+            head = n.store.head_block_num()
+            assert head is not None
+            n.store.gc_below(head)
 
         self.c.wait_settled(self.s.put("after", b"gc").wait())
 

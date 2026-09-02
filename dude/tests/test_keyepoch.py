@@ -7,10 +7,9 @@ import unittest
 
 from dude.consensus.bootstrap import bootstrap, intervene, mint_first_keyepoch
 from dude.core import codec, crypto
-from dude.core.units import Millis
-
 from dude.core.errors import DudeError
-from dude.session import KeyCache, SessionRW, SubmitResult, Substrate
+from dude.core.units import Millis
+from dude.session import KeyCache, SessionRW, SubmitHandle, SubmitResult, Substrate
 from dude.store import Store, ops, settle
 from dude.store.layer import Held
 from dude.store.management import Cert, MgmtWriter, Role, epoch_key
@@ -60,7 +59,7 @@ class _StoreSubstrate(Substrate):
     def decrypt(self, store_id: int, name: str, ciphertext: bytes, epoch: int) -> bytes:
         return self._cache.decrypt(store_id, name, ciphertext, epoch)
 
-    def submit(self, tx: ops.Transaction) -> ...:
+    def submit(self, tx: ops.Transaction) -> SubmitHandle:
         raise NotImplementedError
 
     def settled(self, op_hash: crypto.Digest) -> SubmitResult | None:
@@ -69,14 +68,15 @@ class _StoreSubstrate(Substrate):
     def evict_after_sec(self) -> float:
         raise NotImplementedError
 
-    def wait_for_commit(self, timeout: float) -> None:
+    def wait_for_commit(self, timeout: float, since: int = -1) -> None:
         raise NotImplementedError
 
     @property
     def commit_cond(self) -> threading.Condition:
         raise NotImplementedError
 
-    def commit_generation(self) -> int:
+    @property
+    def commit_seq(self) -> int:
         raise NotImplementedError
 
     def head(self):
@@ -87,7 +87,7 @@ def _data_session(s: Store, kp: crypto.Keypair) -> SessionRW:
     return SessionRW(_StoreSubstrate(s, kp), ops.STORE_DATA)
 
 
-def _rotate(s: Store, mgr: crypto.Keypair, who: list[crypto.PublicKey]) -> ops.Transaction:
+def _rotate(s: Store, _mgr: crypto.Keypair, who: list[crypto.PublicKey]) -> ops.Transaction:
     cur = s.mgmt_reader.current_epoch(ops.STORE_DATA)
     master = crypto.Master(crypto.random_bytes(crypto.Master.WIDTH))
     return s.mgmt_writer.rotate(ops.STORE_DATA, cur, {p: p.seal(master) for p in who})

@@ -1,20 +1,19 @@
 from __future__ import annotations
 
 import logging
-import time
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
 import dacite
 
-from ..core.units import Millis, now_ms
+from ..core.units import Millis
 from ..net.link import Acceptor
 from ..net.postman import Postman
 from ..net.transports.tcp import TCPListener
 from ..node import Node, ReplicaNode
 from ..store import Store
-from ..sync.lite_client import LightClient
+from ..sync.lite_client import LightClient, LightClientError
 from ..tunables import DEFAULT, Tunables
 from .state import (
     GENESIS_DATA,
@@ -150,14 +149,15 @@ class DudeConfig:
             lc.add_bootstrap_peer(pub, endpoints)
         lc.add_socket(self._role_socket(role_cfg, role_dir))
         lc.start()
-        lc.bootstrap(now_ms())
         log.info("bootstrapping...")
-        deadline = time.monotonic() + self.tunables.evict_after.as_seconds
-        while not lc.bootstrapped() and time.monotonic() < deadline:
-            time.sleep(0.1)
-        if not lc.bootstrapped() or lc.trusted_state is None:
+        try:
+            lc.bootstrap()
+        except LightClientError:
             lc.stop()
-            raise CLIError("failed to bootstrap")
+            raise CLIError("failed to bootstrap") from None
+        if lc.trusted_state is None:
+            lc.stop()
+            raise CLIError("bootstrap completed but no trusted state")
         log.info("bootstrapped at block %d", lc.trusted_state.head.anchors.block_num)
         return lc
 

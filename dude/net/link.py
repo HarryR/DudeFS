@@ -49,7 +49,7 @@ class Link:
     _send_frame: Callable[[Frame], None]
     _close_transport: Callable[[], None]
 
-    last_activity: Millis = Millis(0)
+    last_activity: Millis = field(default_factory=lambda: Millis(0))
 
     # Estimator (RFC 6298 EWMA)
     srtt: float | None = field(default=None, repr=False)
@@ -110,9 +110,7 @@ class Link:
     def available(self, now: Millis) -> bool:
         if self._closed:
             return False
-        if self.breaker_open and now - self.breaker_opened_at < self._breaker_cooldown():
-            return False
-        return True
+        return not (self.breaker_open and now - self.breaker_opened_at < self._breaker_cooldown())
 
     def bind(self, identity: crypto.PublicKey) -> None:
         if self.identity is not None:

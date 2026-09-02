@@ -8,7 +8,7 @@ from .core import codec, crypto
 from .core.errors import DudeError
 from .net.envelope import MessageId, Verb
 from .store import ops
-from .store.layer import BlockHead, Reader
+from .store.layer import BlockHead, Index, Reader
 from .store.management import blind_key, epoch_key, wrap_key
 
 
@@ -24,9 +24,6 @@ class Record:
     raw: bytes
     epoch: int
     absent: bool
-
-
-from .store.layer import Index
 
 
 class SubmitResult(ABC):
@@ -77,8 +74,40 @@ class Dropped(SubmitResult):
         return codec.encode([b"D", self.reason.encode()])
 
 
+class InflightHandle(ABC):
+    @abstractmethod
+    def on_reply(self, verb: Verb, body: bytes) -> None: ...
+    @abstractmethod
+    def on_expired(self) -> None: ...
+
+
+class Inflight:
+    __slots__ = ("_pending",)
+
+    def __init__(self) -> None:
+        self._pending: dict[bytes, InflightHandle] = {}
+
+    def register(self, mid: MessageId, handle: InflightHandle) -> None:
+        self._pending[mid.correlation_id] = handle
+
+    def on_reply(self, correlation_id: bytes, verb: Verb, body: bytes) -> bool:
+        handle = self._pending.pop(correlation_id, None)
+        if handle is None:
+            return False
+        handle.on_reply(verb, body)
+        return True
+
+    def on_expired(self, correlation_id: bytes) -> None:
+        handle = self._pending.pop(correlation_id, None)
+        if handle is not None:
+            handle.on_expired()
+
+    def pending_of_type[T](self, cls: type[T]) -> list[T]:
+        return [h for h in self._pending.values() if isinstance(h, cls)]
+
+
 @dataclass(slots=True)
-class SubmitHandle:
+class SubmitHandle(InflightHandle):
     mid: MessageId
     op_hash: crypto.Digest
     _sub: "Substrate"
@@ -87,7 +116,7 @@ class SubmitHandle:
     _refused_reason: str | None = None
     _ack: threading.Event = field(default_factory=threading.Event)
 
-    def resolve(self, verb: int, body: bytes) -> None:
+    def on_reply(self, verb: Verb, body: bytes) -> None:
         if verb == Verb.ACCEPTED:
             self._accepted = True
         elif verb == Verb.REFUSED:
@@ -98,7 +127,7 @@ class SubmitHandle:
         self._accepted = True
         self._ack.set()
 
-    def expire(self) -> None:
+    def on_expired(self) -> None:
         if not self._accepted and self._refused_reason is None:
             self._refused_reason = "expired"
         self._ack.set()
@@ -116,13 +145,14 @@ class SubmitHandle:
             return Refused(self._refused_reason)
         deadline = time.monotonic() + evict
         while time.monotonic() < deadline:
+            gen = self._sub.commit_seq
             result = self._sub.settled(self.op_hash)
             if result is not None:
                 return result
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
-            self._sub.wait_for_commit(min(remaining, evict))
+            self._sub.wait_for_commit(min(remaining, evict), since=gen)
         return Dropped("settlement timeout after acceptance")
 
 
@@ -134,12 +164,13 @@ class Substrate(Reader, ABC):
     @abstractmethod
     def evict_after_sec(self) -> float: ...
     @abstractmethod
-    def wait_for_commit(self, timeout: float) -> None: ...
+    def wait_for_commit(self, timeout: float, since: int = -1) -> None: ...
     @property
     @abstractmethod
     def commit_cond(self) -> "threading.Condition": ...
+    @property
     @abstractmethod
-    def commit_generation(self) -> int: ...
+    def commit_seq(self) -> int: ...
     @abstractmethod
     def head(self) -> BlockHead | None: ...
     @abstractmethod
@@ -267,7 +298,7 @@ class Session:
             return self.token(name), value, ops.EPOCH_NONE
         raise SessionError("data store seal requires a Substrate with crypto")
 
-    def _decrypt(self, name: str | bytes, ciphertext: bytes, epoch: int) -> bytes:
+    def _decrypt(self, name: str | bytes, ciphertext: bytes, epoch: int) -> bytes:  # noqa: ARG002
         if self._store_id == ops.STORE_MANAGEMENT:
             return ciphertext
         raise SessionError("data store decrypt requires a Substrate with crypto")

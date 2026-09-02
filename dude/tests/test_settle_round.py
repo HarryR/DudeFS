@@ -23,7 +23,6 @@ from dude.consensus.settle_round import (
 )
 from dude.core import codec, crypto
 from dude.core.units import Millis
-
 from dude.net.envelope import Verb
 from dude.net.postman import Recipient
 

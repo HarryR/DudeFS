@@ -12,7 +12,6 @@ from ..store import Store, ops
 from ..sync.lite_client import LightClient
 from ..tunables import Tunables
 
-
 T0 = Millis(1_700_000_000_000)
 
 TUNABLES = Tunables(rtt_max=Millis(50), clock_skew=Millis(25), held_convergence_max=2)
@@ -65,9 +64,7 @@ class Cluster:
     ) -> tuple[ops.SignedTransaction, ...]:
         return compose_genesis(
             anchor=self.anchor,
-            node_endpoints=[
-                (kp.public, (self.nexus.endpoint_for(kp.public),)) for kp in node_keys
-            ],
+            node_endpoints=[(kp.public, (self.nexus.endpoint_for(kp.public),)) for kp in node_keys],
             managers=mgmt_keys,
             ro_clients=ro_keys,
             rw_clients=rw_keys,
@@ -171,11 +168,18 @@ class Cluster:
     ) -> Settled:
         if not isinstance(result, Settled):
             raise AssertionError(f"expected Settled, got {result!r}")  # noqa: TRY004
+        settled = result
         check = nodes if nodes is not None else self.nodes
-        self.wait(lambda _: all(n.store.has_settled(result.op_hash) for n in check))
+        self.wait(lambda _: all(n.store.has_settled(settled.op_hash) for n in check))
         return result
 
     # -- teardown -----------------------------------------------------------
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
 
     def close(self) -> None:
         for lc in self.ro_clients + self.rw_clients:

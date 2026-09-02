@@ -68,7 +68,7 @@ class Mempool:
             return Refusal.CANNOT_APPLY
         return None
 
-    def valid_for_bucket(
+    def valid_for_bucket(  # noqa: PLR0911
         self,
         tx: ops.SignedTransaction,
         bucket: Bucket,

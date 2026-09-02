@@ -48,7 +48,9 @@ class TestColdJoinerCatchesUpViaCheckpoint(unittest.TestCase):
             grant_cert = Cert.sign_grant(c.anchor, compactor_kp.public, Role.COMPACTOR)
             with source.store.snapshot() as reader:
                 pivot = reader.head_block_num()
+                assert pivot is not None
                 sb_bytes = reader.settled_at(pivot)
+                assert sb_bytes is not None
                 meta = CheckpointMeta.create(
                     settled_block_bytes=sb_bytes,
                     anchor=c.anchor.public,
@@ -59,6 +61,7 @@ class TestColdJoinerCatchesUpViaCheckpoint(unittest.TestCase):
             source.checkpoint_server = srv
 
             for n in c.nodes:
+                assert pivot is not None
                 n.store.gc_below(pivot)
 
             joiner_kp = crypto.Keypair.generate()

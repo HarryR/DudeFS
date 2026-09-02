@@ -54,7 +54,9 @@ class TestCompactionEndToEnd(unittest.TestCase):
         grant_cert = Cert.sign_grant(anchor, compactor_kp.public, Role.COMPACTOR)
         with store.snapshot() as reader:
             pivot = reader.head_block_num()
+            assert pivot is not None
             sb_bytes = reader.settled_at(pivot)
+            assert sb_bytes is not None
             meta = CheckpointMeta.create(
                 settled_block_bytes=sb_bytes,
                 anchor=anchor.public,
@@ -98,8 +100,8 @@ class TestCompactionEndToEnd(unittest.TestCase):
             )
 
     def test_full_compaction_through_consensus(self):
-        c, s = self._boot()
-        try:
+        with Cluster(nodes=3, mgmt=1) as c:
+            s = c.replicas[0].session()
             last = None
             for i in range(5):
                 last = s.put(f"data-{i}", f"value-{i}".encode()).wait()
@@ -116,12 +118,10 @@ class TestCompactionEndToEnd(unittest.TestCase):
 
             held = c.nodes[0].store.get(ops.STORE_MANAGEMENT, b"compact")
             self.assertIsNotNone(held, "compact/ key not set after pivot")
-        finally:
-            c.close()
 
     def test_gc_all_nodes_then_joiner_catches_up(self):
-        c, s = self._boot()
-        try:
+        with Cluster(nodes=3, mgmt=1) as c:
+            s = c.replicas[0].session()
             last = None
             for i in range(5):
                 last = s.put(f"k{i}", f"v{i}".encode()).wait()
@@ -142,7 +142,6 @@ class TestCompactionEndToEnd(unittest.TestCase):
             for i in range(3):
                 last = s.put(f"post-pivot-{i}", f"pp{i}".encode()).wait()
             c.wait_settled(last)
-            c.close()
 
             for n in c.nodes:
                 n.store.gc_below(pivot)
@@ -155,13 +154,10 @@ class TestCompactionEndToEnd(unittest.TestCase):
             self.assertEqual(dst.state_root(), source.state_root())
             self.assertEqual(dst.head(), source.head())
             self.assertEqual(dst.head_block_num(), source.head_block_num())
-        except Exception:
-            c.close()
-            raise
 
     def test_all_nodes_converge_after_gc(self):
-        c, s = self._boot()
-        try:
+        with Cluster(nodes=3, mgmt=1) as c:
+            s = c.replicas[0].session()
             last = None
             for i in range(5):
                 last = s.put(f"d{i}", f"v{i}".encode()).wait()
@@ -172,6 +168,7 @@ class TestCompactionEndToEnd(unittest.TestCase):
             self._submit_pivot(c, cs)
 
             pivot_block = c.nodes[0].store.head_block_num()
+            assert pivot_block is not None
             for n in c.nodes:
                 n.store.gc_below(pivot_block)
 
@@ -185,12 +182,10 @@ class TestCompactionEndToEnd(unittest.TestCase):
             for n in c.nodes:
                 self.assertIsNone(n.store.settled_at(0), "block 0 should be GC'd")
                 self.assertIsNotNone(n.store.settled_at(pivot_block), "pivot block should survive")
-        finally:
-            c.close()
 
     def test_consecutive_pivots(self):
-        c, s = self._boot()
-        try:
+        with Cluster(nodes=3, mgmt=1) as c:
+            s = c.replicas[0].session()
             last = None
             for i in range(3):
                 last = s.put(f"wave1-{i}", f"a{i}".encode()).wait()
@@ -208,16 +203,12 @@ class TestCompactionEndToEnd(unittest.TestCase):
 
             source = c.nodes[0].store
             meta, chunks, pivot = self._checkpoint_from(source, c.anchor)
-            c.close()
 
             source.gc_below(pivot)
             dst = self._load_from_checkpoint(meta, chunks, c.anchor.public)
 
             self.assertEqual(dst.accumulator(), source.accumulator())
             self.assertEqual(dst.state_root(), source.state_root())
-        except Exception:
-            c.close()
-            raise
 
 
 if __name__ == "__main__":

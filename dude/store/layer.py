@@ -125,7 +125,7 @@ class Overlay[B: Reader](Reader):
         self._log.extend(child._log)
 
 
-class Layer(Overlay[View]):
+class Layer(Overlay[View], View):
     """An `Overlay` that can also compute roots, which is why its base MUST be frozen
     (#frozen-base-for-layer): a root taken over a base that can still move is a root that
     lies. Enforced at the constructor, so it is not a rule a caller has to remember.

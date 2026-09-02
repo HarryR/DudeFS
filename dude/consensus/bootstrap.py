@@ -139,15 +139,15 @@ def intervene(
     )
 
 
-def compose_genesis(
+def compose_genesis(  # noqa: PLR0913, PLR0917
     anchor: crypto.Keypair,
     node_endpoints: Sequence[tuple[crypto.PublicKey, tuple[Endpoint, ...]]],
     managers: Sequence[crypto.Keypair] = (),
     ro_clients: Sequence[crypto.Keypair] = (),
     rw_clients: Sequence[crypto.Keypair] = (),
-    ts: Millis = Millis(0),
+    ts: Millis = Millis(0),  # noqa: B008
 ) -> tuple[SignedTransaction, ...]:
-    from ..store.management import P_POP, Grant
+    from ..store.management import P_POP, Grant  # noqa: PLC0415
 
     scratch = Store()
     scratch.provision(anchor.public)
@@ -176,7 +176,7 @@ def compose_genesis(
         _grant(kp, Role.CLIENT_RW, frozenset({ops.STORE_DATA}))
 
     if grant_entries:
-        tx = tx + w._grants.batch_add(tuple(grant_entries))
+        tx = tx + w._grants.batch_add(tuple(grant_entries))  # noqa: SLF001
         tx = tx + ops.writes(*pop_steps)
 
     all_recipients = tuple(kp.public for kp in (*managers, *ro_clients, *rw_clients))

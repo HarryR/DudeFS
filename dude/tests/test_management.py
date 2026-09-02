@@ -8,8 +8,10 @@ from ..consensus.bootstrap import bootstrap, intervene
 from ..consensus.settle_round import _settle_payload
 from ..core import codec, crypto
 from ..core.errors import DudeError, InvariantError
+from ..core.units import Millis
 from ..net.address import Address, Endpoint, Scheme
 from ..store import Store, ops, settle
+from ..store.managed import MapEntry
 from ..store.management import (
     P_POP,
     Authorization,
@@ -21,7 +23,6 @@ from ..store.management import (
     Role,
     RosterCommitment,
 )
-from ..core.units import Millis
 from .cluster import TUNABLES, Cluster
 
 T0 = Millis(1_700_000_000_000)
@@ -41,7 +42,8 @@ def unauthorised_certs(mgmt: MgmtWriter) -> str | None:
         if grant is None:
             return f"grant row {who_pk.hex()[:8]} will not decode"
         if not mgmt.verify_cert(grant.cert):
-            return f"grant row {who_pk.hex()[:8]} carries a cert signed by {grant.cert.signer.hex()[:8]}"
+            signer = grant.cert.signer.hex()[:8]
+            return f"grant row {who_pk.hex()[:8]} carries a cert signed by {signer}"
     rc = mgmt.roster_commitment()
     if rc is not None and not mgmt.verify_cert(rc.cert):
         return f"the roster commitment is attested by {rc.cert.signer.hex()[:8]}"
@@ -849,7 +851,6 @@ class TestIsMemberAndRosterCannotDisagree(unittest.TestCase):
             ),
             domains=rec.domains,
         )
-        from ..store.managed import MapEntry
 
         plant = ops.writes(
             ops.Set(
@@ -985,7 +986,6 @@ class TestReadAndWriteAreScopedTheSameWay(unittest.TestCase):
             kinds=frozenset(),
             cert=Cert.sign_grant(stranger, who.public, Role.CLIENT_RW),
         )
-        from ..store.managed import MapEntry
 
         plant = ops.writes(
             ops.Set(

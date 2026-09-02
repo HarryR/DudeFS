@@ -171,16 +171,18 @@ class Postman:
         self._input.put(_Send(d.frm, verb, body, ttl, False, d.mid, new_mid))
         return new_mid
 
-    def send_raw(
+    def send_raw(  # noqa: PLR0913, PLR0917
         self,
         to: crypto.PublicKey,
         verb: Verb,
         body: bytes,
         ttl: Millis,
         await_reply: bool = True,
-        reply_to: MessageId = MessageId(b""),
+        reply_to: MessageId | None = None,
         mid: MessageId | None = None,
     ) -> MessageId:
+        if reply_to is None:
+            reply_to = MessageId(b"")
         if mid is None:
             mid = MessageId.random()
         self._input.put(_Send(to, verb, body, ttl, await_reply, reply_to, mid))

@@ -9,21 +9,19 @@ from pathlib import Path
 from ..cli.state import save_anchor, save_keypair, store_path
 from ..consensus.bootstrap import bootstrap, compose_genesis
 from ..core import codec, crypto
+from ..core.units import Millis
 from ..net.envelope import Verb
 from ..net.postman import Postman
 from ..net.transports.inproc import InProcListener, InProcNexus
 from ..node import Node
 from ..store import Store
 from ..tunables import Tunables
-from ..core.units import Millis
-
 
 T0 = Millis(1_700_000_000_000)
 TUNABLES = Tunables(rtt_max=Millis(50), clock_skew=Millis(25), held_convergence_max=2)
 
 
 class TestLiveProvisioning(unittest.TestCase):
-
     def test_anchor_provisions_nodes_over_wire(self) -> None:
         nexus = InProcNexus()
         anchor = crypto.Keypair.generate()
@@ -34,19 +32,14 @@ class TestLiveProvisioning(unittest.TestCase):
             save_keypair(Path(d), kp)
             save_anchor(Path(d), anchor.public)
 
-        node_endpoints = [
-            (kp.public, (nexus.endpoint_for(kp.public),))
-            for kp in node_keys
-        ]
+        node_endpoints = [(kp.public, (nexus.endpoint_for(kp.public),)) for kp in node_keys]
 
         nodes: list[Node] = []
         stores: list[Store] = []
         inprocs = [InProcListener(kp.public, nexus) for kp in node_keys]
         try:
             for kp, d, ip in zip(node_keys, dirs, inprocs, strict=True):
-                anchor_pub = crypto.PublicKey(
-                    (Path(d) / "anchor.pub").read_bytes()
-                )
+                anchor_pub = crypto.PublicKey((Path(d) / "anchor.pub").read_bytes())
                 store = Store(store_path(Path(d)))
                 store.provision(anchor_pub)
                 stores.append(store)

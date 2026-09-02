@@ -51,7 +51,10 @@ def _parse_node_specs(raw: tuple[str, ...]) -> list[tuple[crypto.PublicKey, tupl
 
 
 def _wait_for_verb(
-    postman: Postman, pub: crypto.PublicKey, verb: Verb, timeout_ms: Millis,
+    postman: Postman,
+    pub: crypto.PublicKey,
+    verb: Verb,
+    timeout_ms: Millis,
 ) -> bool:
     deadline = time.monotonic() + timeout_ms.as_seconds
     while time.monotonic() < deadline:

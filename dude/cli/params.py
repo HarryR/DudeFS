@@ -11,7 +11,10 @@ class PublicKeyParam(click.ParamType):
     name = "pubkey"
 
     def convert(
-        self, value: str, param: click.Parameter | None, ctx: click.Context | None,
+        self,
+        value: str,
+        param: click.Parameter | None,
+        ctx: click.Context | None,
     ) -> crypto.PublicKey:
         try:
             raw = bytes.fromhex(value)
@@ -27,7 +30,10 @@ class SignatureParam(click.ParamType):
     name = "signature"
 
     def convert(
-        self, value: str, param: click.Parameter | None, ctx: click.Context | None,
+        self,
+        value: str,
+        param: click.Parameter | None,
+        ctx: click.Context | None,
     ) -> crypto.Signature:
         try:
             raw = bytes.fromhex(value)
@@ -43,7 +49,10 @@ class RoleParam(click.ParamType):
     name = "role"
 
     def convert(
-        self, value: str, param: click.Parameter | None, ctx: click.Context | None,
+        self,
+        value: str,
+        param: click.Parameter | None,
+        ctx: click.Context | None,
     ) -> Role:
         try:
             return Role[value.upper()]
@@ -59,7 +68,10 @@ class ListenParam(click.ParamType):
     name = "listen-addr"
 
     def convert(
-        self, value: str, param: click.Parameter | None, ctx: click.Context | None,
+        self,
+        value: str,
+        param: click.Parameter | None,
+        ctx: click.Context | None,
     ) -> TCPListenConfig:
         parts = value.split(":")
         if len(parts) == 3 and parts[0] == "tcp":

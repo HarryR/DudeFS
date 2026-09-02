@@ -36,32 +36,22 @@ class TransportPolicy:
 _DEFAULT_TRANSPORTS = TransportPolicy()
 
 
-@dataclass(frozen=True, slots=True)
-class LinkTunables:
-    """One link's dials. Built by `Tunables.link_tunables`; never declared."""
-
-    rto_floor: Millis
-    rto_initial: Millis
-    granularity: Millis
-    breaker_threshold: int
-    breaker_cooldown: Millis
-    budget_max_tokens: int
-    budget_token_ratio: int
-
+ONE_SECOND = Millis(1000)
+TWO_SECONDS = ONE_SECOND * 2
 
 @dataclass(frozen=True, slots=True)
 class Tunables:
     # DECLARED. Every field here is a physical measurement, a product decision, or a count.
     # Arithmetic over them belongs below as a property.
 
-    rtt_max: Millis = Millis(2_000)
+    rtt_max: Millis = TWO_SECONDS
     """Maximum physical link round-trip time this deployment tolerates. The wire, nothing else --
     not "one wave" or "reaching quorum", just one send and one reply on one link."""
 
-    clock_skew: Millis = Millis(2_000)
+    clock_skew: Millis = TWO_SECONDS
     """Upper bound on NTP jitter between roster members. Every node runs NTP."""
 
-    granularity: Millis = Millis(1)
+
 
     retry_budget: int = 2
     """Attempts per sub-round before a peer is lost for that sub-round. Tied to link redundancy:
@@ -224,18 +214,6 @@ class Tunables:
         return self.rtt_max
 
     @property
-    def link_tunables(self) -> LinkTunables:
-        return LinkTunables(
-            rto_floor=self.granularity * 2,
-            rto_initial=self.expected_rtt,
-            granularity=self.granularity,
-            breaker_threshold=self.breaker_threshold,
-            breaker_cooldown=self.breaker_cooldown,
-            budget_max_tokens=self.budget_max_tokens,
-            budget_token_ratio=self.budget_token_ratio,
-        )
-
-    @property
     def tcp_connect(self) -> Millis:
         return self.rtt_max * 2
 
@@ -254,7 +232,7 @@ class Tunables:
         return self.block_time * b
 
     def __post_init__(self) -> None:
-        for name in ("rtt_max", "clock_skew", "granularity"):
+        for name in ("rtt_max", "clock_skew"):
             v = getattr(self, name)
             if not isinstance(v, Millis):
                 object.__setattr__(self, name, Millis(v))

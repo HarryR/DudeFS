@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Self
 
@@ -82,7 +82,7 @@ class Envelope:
     mid: MessageId
     body: bytes = b""
 
-    reply_to: MessageId = MessageId(b"")
+    reply_to: MessageId = field(default_factory=lambda: MessageId(b""))
 
     def encode(self) -> bytes:
         return codec.encode([self.to, int(self.verb), self.mid, self.body, self.reply_to])

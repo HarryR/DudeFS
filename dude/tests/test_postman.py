@@ -85,7 +85,9 @@ def _pair_tcp() -> tuple[crypto.Keypair, crypto.Keypair, Postman, Postman]:
     return a, b, ap, bp
 
 
-def _drain_delivered(p: Postman, timeout: float = T.ttl_exchange.as_seconds, count: int = 1) -> list[Delivered]:
+def _drain_delivered(
+    p: Postman, timeout: float = T.ttl_exchange.as_seconds, count: int = 1
+) -> list[Delivered]:
     deadline = time.monotonic() + timeout
     out: list[Delivered] = []
     while time.monotonic() < deadline:
@@ -122,7 +124,7 @@ class _PostmanTests(unittest.TestCase):
         self.assertEqual(got[0].verb, Verb.PING)
 
     def test_body_is_delivered_intact(self) -> None:
-        a, b, ap, bp = self._make_pair()
+        _a, b, ap, bp = self._make_pair()
         payload = b"hello world"
         ap.send(b.public, Payload(payload), T.ttl_exchange)
         got = _drain_delivered(bp)
@@ -130,7 +132,7 @@ class _PostmanTests(unittest.TestCase):
         self.assertEqual(got[0].body, payload)
 
     def test_reply_correlates(self) -> None:
-        a, b, ap, bp = self._make_pair()
+        _a, b, ap, bp = self._make_pair()
         mid = ap.send(b.public, Ping(), T.ttl_exchange)
 
         got = _drain_delivered(bp)
@@ -147,7 +149,7 @@ class _PostmanTests(unittest.TestCase):
         self.assertEqual(irt.correlation_id, mid.correlation_id)
 
     def test_send_returns_message_id(self) -> None:
-        a, b, ap, bp = self._make_pair()
+        _a, b, ap, _bp = self._make_pair()
         mid = ap.send(b.public, Ping(), T.ttl_exchange)
         self.assertIsInstance(mid, MessageId)
         self.assertEqual(len(mid), MessageId.SIZE)
@@ -201,7 +203,7 @@ class _PostmanTests(unittest.TestCase):
         self.assertEqual(got[0].frm, client.public)
 
     def test_multiple_messages_all_arrive(self) -> None:
-        a, b, ap, bp = self._make_pair()
+        _a, b, ap, bp = self._make_pair()
         for i in range(5):
             ap.send(b.public, Payload(i.to_bytes(1)), T.ttl_exchange)
         got = _drain_delivered(bp, count=5)

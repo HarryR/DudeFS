@@ -23,7 +23,6 @@ from ..net.link import Link, Peer
 from ..net.plan import GiveUp, Send, Wait, backoff, decorrelated, plan_next
 from ..tunables import DEFAULT
 
-
 T0 = Millis(1_700_000_000_000)
 TTL = Millis(10_000)
 
@@ -157,7 +156,7 @@ class TestMaybeReply(unittest.TestCase):
         self.box.sent(t.prefix, t.attempt, A1, T0)
         self.assertEqual(len(self.box), 1)
 
-        reply = request(self.peer, self.me.public, Verb.PONG, T0 + 5, b"data")
+        request(self.peer, self.me.public, Verb.PONG, T0 + 5, b"data")
         # Set reply_to to the original mid so the mailbox correlates
         reply_env = Envelope(
             self.me.public,
@@ -173,7 +172,7 @@ class TestMaybeReply(unittest.TestCase):
         self.assertEqual(len(self.box), 0)
 
     def test_it_died_before_replying_is_an_ordinary_expiry(self):
-        env, prefix = self._post_request()
+        self._post_request()
         (t,) = self.box.due(T0)
         self.box.sent(t.prefix, t.attempt, A1, T0)
         self.assertEqual(self.box.expired(T0 + TTL - 1), ())
@@ -198,7 +197,7 @@ class TestMaybeReply(unittest.TestCase):
         self.assertIsNone(self.box.arrived(unsolicited, T0))
 
     def test_a_reply_to_something_we_stopped_waiting_for_is_not_matched(self):
-        env, prefix = self._post_request()
+        env, _prefix = self._post_request()
         (t,) = self.box.due(T0)
         self.box.sent(t.prefix, t.attempt, A1, T0)
         self.box.expired(T0 + TTL)
@@ -213,7 +212,7 @@ class TestMaybeReply(unittest.TestCase):
         self.assertIsNone(self.box.arrived(late_reply, T0 + TTL + 1))
 
     def test_attempt_byte_attributes_the_link(self):
-        env, prefix = self._post_request()
+        env, _prefix = self._post_request()
         (t,) = self.box.due(T0)
         self.box.sent(t.prefix, t.attempt, A1, T0)
 
@@ -229,7 +228,7 @@ class TestMaybeReply(unittest.TestCase):
         self.assertEqual((got.address, got.rtt), (A1, 40))
 
     def test_second_attempt_on_different_link_attributed_correctly(self):
-        env, prefix = self._post_request()
+        env, _prefix = self._post_request()
         (t0,) = self.box.due(T0)
         self.box.sent(t0.prefix, t0.attempt, A1, T0)
         self.box.failed(t0.prefix, T0 + 100)

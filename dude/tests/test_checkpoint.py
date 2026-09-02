@@ -59,6 +59,7 @@ class TestCheckpointMeta(unittest.TestCase):
         meta = CheckpointMeta.create(sb.encode(), anchor.public, compactor, grant_cert)
         wrong_anchor = crypto.Keypair.generate()
         why = meta.verify_compactor(wrong_anchor.public)
+        assert why is not None
         self.assertIn("anchor", why)
 
     def test_tampered_block_bytes_rejected(self):
@@ -72,6 +73,7 @@ class TestCheckpointMeta(unittest.TestCase):
             sig=meta.sig,
         )
         why = tampered.verify_compactor(anchor.public)
+        assert why is not None
         self.assertIn("compactor signature invalid", why)
 
     def test_wrong_compactor_key_rejected(self):
@@ -87,6 +89,7 @@ class TestCheckpointMeta(unittest.TestCase):
             sig=meta.sig,
         )
         why = forged.verify_compactor(anchor.public)
+        assert why is not None
         self.assertIn("compactor signature invalid", why)
 
     def test_grant_not_signed_by_anchor_rejected(self):
@@ -95,6 +98,7 @@ class TestCheckpointMeta(unittest.TestCase):
         bad_grant = Cert.sign_grant(rogue, compactor.public, Role.COMPACTOR)
         meta = CheckpointMeta.create(sb.encode(), anchor.public, compactor, bad_grant)
         why = meta.verify_compactor(anchor.public)
+        assert why is not None
         self.assertIn("grant not signed by anchor", why)
 
     def test_grant_wrong_role_rejected(self):
@@ -102,6 +106,7 @@ class TestCheckpointMeta(unittest.TestCase):
         wrong_role = Cert.sign_grant(anchor, compactor.public, Role.CLIENT_RO)
         meta = CheckpointMeta.create(sb.encode(), anchor.public, compactor, wrong_role)
         why = meta.verify_compactor(anchor.public)
+        assert why is not None
         self.assertIn("COMPACTOR", why)
 
     def test_quorum_with_wrong_roster_rejected(self):
@@ -109,6 +114,7 @@ class TestCheckpointMeta(unittest.TestCase):
         meta = CheckpointMeta.create(sb.encode(), anchor.public, compactor, grant_cert)
         wrong_roster = tuple(crypto.Keypair.generate().public for _ in range(3))
         why = meta.verify_quorum(wrong_roster)
+        assert why is not None
         self.assertIn("quorum", why)
 
     def test_encode_decode_roundtrip(self):

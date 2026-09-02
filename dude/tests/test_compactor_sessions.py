@@ -3,7 +3,6 @@ from __future__ import annotations
 import unittest
 
 from dude.core import crypto
-from dude.core.units import now_ms
 from dude.net.postman import Postman
 from dude.store import ops
 from dude.store.checkpoint import CheckpointMeta
@@ -82,16 +81,17 @@ class TestCompactorFromLightClient(unittest.TestCase):
                     (c.nexus.endpoint_for(node.me.public),),
                 )
             lc.start()
-            lc.bootstrap(now_ms())
-            c.wait(lambda _: lc.bootstrapped())
+            lc.bootstrap()
 
             cs = lc.session(store_id=ops.STORE_MANAGEMENT)
+            assert lc.trusted_state is not None
             block_num = lc.trusted_state.head.anchors.block_num
             c.wait_settled(cs.submit(MgmtWriter(cs).compact(block_num)).wait())
 
             held = c.nodes[0].store.get(ops.STORE_MANAGEMENT, b"compact")
             self.assertIsNotNone(held)
 
+            assert lc.trusted_state is not None
             sb = lc.trusted_state.head
             grant_cert = Cert.sign_grant(
                 c.anchor,

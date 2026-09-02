@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -131,7 +130,7 @@ class Coordinator:
             return
 
     def _absorb_bodies(
-        self, frm: crypto.PublicKey, verb: Verb, body: bytes, r: Round, now: Millis
+        self, frm: crypto.PublicKey, verb: Verb, body: bytes, r: Round, _now: Millis
     ) -> None:
         msg = RoundMsg.decode(verb, body)
         if not isinstance(msg, Bodies):
@@ -139,10 +138,7 @@ class Coordinator:
         good = tuple(
             tx
             for tx in msg.txs
-            if self.mempool.valid_for_bucket(
-                tx, r.bucket(), self.store, self.mgmt_reader
-            )
-            is None
+            if self.mempool.valid_for_bucket(tx, r.bucket(), self.store, self.mgmt_reader) is None
         )
         r.absorb(msg, frm, good)
 
@@ -197,10 +193,7 @@ class Coordinator:
 
     def _close_current_bucket(self, now: Millis) -> None:
         forced = self._force_close
-        if forced:
-            closed = self.current_bucket
-        else:
-            closed = self._bucket_of(now) - 1
+        closed = self.current_bucket if forced else self._bucket_of(now) - 1
         if self.current_round is not None:
             return
         if closed < self.current_bucket:
@@ -254,7 +247,7 @@ class Coordinator:
                 return frozenset({tx.op_hash})
         return frozenset(tx.op_hash for tx in survivors)
 
-    def _on_round_abandoned(self, now: Millis) -> None:
+    def _on_round_abandoned(self, _now: Millis) -> None:
         if self.current_round is None:
             raise InvariantError("_on_round_abandoned called with no in-flight Round")
         self.current_round = None
@@ -341,7 +334,7 @@ class Coordinator:
         self.current_round = None  # released only now that `settling` holds the ratified block
         self.settle_adapter.flush(sr, now)
 
-    def _on_settled(self, now: Millis) -> None:
+    def _on_settled(self, _now: Millis) -> None:
         s = self.settling
         if s is None:
             raise InvariantError("_on_settled called with no settling slot")
@@ -367,7 +360,7 @@ class Coordinator:
         self.settling = None
         self._settle_stalls = 0
 
-    def _on_settle_abandoned(self, now: Millis) -> None:
+    def _on_settle_abandoned(self, _now: Millis) -> None:
         s = self.settling
         if s is None:
             raise InvariantError("_on_settle_abandoned called with no settling slot")

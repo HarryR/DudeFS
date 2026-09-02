@@ -121,7 +121,7 @@ class InProcListener(Acceptor, Dialer):
             conn.link.close()
         self._conns.clear()
         for listener in list(self.nexus._listeners.values()):  # noqa: SLF001
-            remote_conn = listener._conns.pop(me, None)
+            remote_conn = listener._conns.pop(me, None)  # noqa: SLF001
             if remote_conn is not None:
                 remote_conn.link.notify_closed()
 

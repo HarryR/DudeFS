@@ -62,10 +62,10 @@ class SocketSubstrate(Substrate):
     def __init__(self, path: str, tunables: Tunables) -> None:
         self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self._sock.connect(path)
-        self._request_timeout = tunables.ttl_exchange.as_seconds
+        self._request_timeout = tunables.evict_after.as_seconds
         self._send_lock = threading.Lock()
         self._cond = threading.Condition()
-        self._commit_seq = 0
+        self._seq = 0
         self._pending: dict[bytes, _ReplySlot] = {}
         self._head: BlockHead | None = None
         self._anchor_cache: crypto.PublicKey | None = None
@@ -127,16 +127,20 @@ class SocketSubstrate(Substrate):
             self._evict_cache = Millis(codec.as_int(codec.decode(reply))).as_seconds
         return self._evict_cache
 
-    def wait_for_commit(self, timeout: float) -> None:
+    def wait_for_commit(self, timeout: float, since: int = -1) -> None:
         with self._cond:
-            self._cond.wait(timeout)
+            if since >= 0:
+                self._cond.wait_for(lambda: self._seq > since, timeout=timeout)
+            else:
+                self._cond.wait(timeout)
 
     @property
     def commit_cond(self) -> threading.Condition:
         return self._cond
 
-    def commit_generation(self) -> int:
-        return self._commit_seq
+    @property
+    def commit_seq(self) -> int:
+        return self._seq
 
     def head(self) -> BlockHead | None:
         return self._head
@@ -179,7 +183,7 @@ class SocketSubstrate(Substrate):
                     if payload:
                         self._head = BlockHead.decode(payload)
                     with self._cond:
-                        self._commit_seq += 1
+                        self._seq += 1
                         self._cond.notify_all()
                 else:
                     slot = self._pending.get(corr_id)
@@ -189,5 +193,5 @@ class SocketSubstrate(Substrate):
             for slot in self._pending.values():
                 slot.abort()
             with self._cond:
-                self._commit_seq += 1
+                self._seq += 1
                 self._cond.notify_all()

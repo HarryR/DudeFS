@@ -12,23 +12,15 @@ from dude.tests.cluster import Cluster
 
 
 class TestCheckpointRoundTrip(unittest.TestCase):
-    def _make_cluster_with_data(self, n_keys: int = 5):
-        c = Cluster(nodes=3, mgmt=1)
-        s = c.replicas[0].session()
-        last = None
-        for i in range(n_keys):
-            last = s.put(f"key-{i}", f"value-{i}".encode()).wait()
-        c.wait_settled(last)
-        c.close()
-        return c
-
     def _checkpoint_at_head(self, source: Store, anchor: crypto.Keypair):
         compactor_kp = crypto.Keypair.generate()
         grant_cert = Cert.sign_grant(anchor, compactor_kp.public, Role.COMPACTOR)
 
         with source.snapshot() as reader:
             pivot = reader.head_block_num()
+            assert pivot is not None
             sb_bytes = reader.settled_at(pivot)
+            assert sb_bytes is not None
             meta = CheckpointMeta.create(
                 settled_block_bytes=sb_bytes,
                 anchor=anchor.public,
@@ -78,98 +70,105 @@ class TestCheckpointRoundTrip(unittest.TestCase):
             )
 
     def test_checkpoint_produces_matching_state(self):
-        c = self._make_cluster_with_data(5)
-        source = c.nodes[0].store
+        with Cluster(nodes=3, mgmt=1) as c:
+            s = c.replicas[0].session()
+            last = None
+            for i in range(5):
+                last = s.put(f"key-{i}", f"value-{i}".encode()).wait()
+            c.wait_settled(last)
 
-        meta, chunks, _pivot = self._checkpoint_at_head(source, c.anchor)
-        dst = self._load_checkpoint(meta, chunks, c.anchor.public)
+            source = c.nodes[0].store
+            meta, chunks, _pivot = self._checkpoint_at_head(source, c.anchor)
+            dst = self._load_checkpoint(meta, chunks, c.anchor.public)
 
-        self.assertEqual(dst.accumulator(), source.accumulator())
-        self.assertEqual(dst.log_accumulator(), source.log_accumulator())
-        self.assertEqual(dst.state_root(), source.state_root())
+            self.assertEqual(dst.accumulator(), source.accumulator())
+            self.assertEqual(dst.log_accumulator(), source.log_accumulator())
+            self.assertEqual(dst.state_root(), source.state_root())
 
     def test_post_pivot_replay_matches(self):
-        c = Cluster(nodes=3, mgmt=1)
-        s = c.replicas[0].session()
-        last = None
-        for i in range(3):
-            last = s.put(f"early-{i}", f"v{i}".encode()).wait()
-        c.wait_settled(last)
+        with Cluster(nodes=3, mgmt=1) as c:
+            s = c.replicas[0].session()
+            last = None
+            for i in range(3):
+                last = s.put(f"early-{i}", f"v{i}".encode()).wait()
+            c.wait_settled(last)
 
-        source = c.nodes[0].store
-        meta, chunks, pivot = self._checkpoint_at_head(source, c.anchor)
+            source = c.nodes[0].store
+            meta, chunks, pivot = self._checkpoint_at_head(source, c.anchor)
 
-        for i in range(3):
-            last = s.put(f"late-{i}", f"v{i}".encode()).wait()
-        c.wait_settled(last)
-        c.close()
+            for i in range(3):
+                last = s.put(f"late-{i}", f"v{i}".encode()).wait()
+            c.wait_settled(last)
 
-        dst = self._load_checkpoint(meta, chunks, c.anchor.public)
-        self._replay_above(source, dst, pivot)
+            dst = self._load_checkpoint(meta, chunks, c.anchor.public)
+            self._replay_above(source, dst, pivot)
 
-        self.assertEqual(dst.accumulator(), source.accumulator())
-        self.assertEqual(dst.log_accumulator(), source.log_accumulator())
-        self.assertEqual(dst.state_root(), source.state_root())
-        self.assertEqual(dst.head(), source.head())
-        self.assertEqual(dst.head_block_num(), source.head_block_num())
+            self.assertEqual(dst.accumulator(), source.accumulator())
+            self.assertEqual(dst.log_accumulator(), source.log_accumulator())
+            self.assertEqual(dst.state_root(), source.state_root())
+            self.assertEqual(dst.head(), source.head())
+            self.assertEqual(dst.head_block_num(), source.head_block_num())
 
     def test_holds_guards_pass_after_checkpoint(self):
-        c = Cluster(nodes=3, mgmt=1)
-        s = c.replicas[0].session()
-        c.wait_settled(s.put("guarded", b"v1").wait())
+        with Cluster(nodes=3, mgmt=1) as c:
+            s = c.replicas[0].session()
+            c.wait_settled(s.put("guarded", b"v1").wait())
 
-        source = c.nodes[0].store
-        meta, chunks, pivot = self._checkpoint_at_head(source, c.anchor)
+            source = c.nodes[0].store
+            meta, chunks, pivot = self._checkpoint_at_head(source, c.anchor)
 
-        rec = s.get("guarded")
-        c.wait_settled(s.put("guarded", b"v2", expect=rec).wait())
-        c.close()
+            rec = s.get("guarded")
+            c.wait_settled(s.put("guarded", b"v2", expect=rec).wait())
 
-        dst = self._load_checkpoint(meta, chunks, c.anchor.public)
-        self._replay_above(source, dst, pivot)
+            dst = self._load_checkpoint(meta, chunks, c.anchor.public)
+            self._replay_above(source, dst, pivot)
 
-        self.assertEqual(dst.accumulator(), source.accumulator())
-        self.assertEqual(dst.state_root(), source.state_root())
+            self.assertEqual(dst.accumulator(), source.accumulator())
+            self.assertEqual(dst.state_root(), source.state_root())
 
     def test_all_values_readable_after_checkpoint(self):
-        c = self._make_cluster_with_data(8)
-        source = c.nodes[0].store
+        with Cluster(nodes=3, mgmt=1) as c:
+            s = c.replicas[0].session()
+            last = None
+            for i in range(8):
+                last = s.put(f"key-{i}", f"value-{i}".encode()).wait()
+            c.wait_settled(last)
 
-        meta, chunks, _pivot = self._checkpoint_at_head(source, c.anchor)
-        dst = self._load_checkpoint(meta, chunks, c.anchor.public)
+            source = c.nodes[0].store
+            meta, chunks, _pivot = self._checkpoint_at_head(source, c.anchor)
+            dst = self._load_checkpoint(meta, chunks, c.anchor.public)
 
-        root_prefix = bytes(crypto.DIGEST_SIZE)
-        with source.snapshot() as r:
-            src_rows = r.subtree_rows(root_prefix, 0)
-        with dst.snapshot() as r:
-            dst_rows = r.subtree_rows(root_prefix, 0)
-        self.assertEqual(len(dst_rows), len(src_rows))
-        for s_row, d_row in zip(src_rows, dst_rows, strict=True):
-            self.assertEqual(s_row, d_row)
+            root_prefix = bytes(crypto.DIGEST_SIZE)
+            with source.snapshot() as r:
+                src_rows = r.subtree_rows(root_prefix, 0)
+            with dst.snapshot() as r:
+                dst_rows = r.subtree_rows(root_prefix, 0)
+            self.assertEqual(len(dst_rows), len(src_rows))
+            for s_row, d_row in zip(src_rows, dst_rows, strict=True):
+                self.assertEqual(s_row, d_row)
 
     def test_gc_then_checkpoint_then_replay(self):
-        c = Cluster(nodes=3, mgmt=1)
-        s = c.replicas[0].session()
-        last = None
-        for i in range(5):
-            last = s.put(f"k{i}", f"v{i}".encode()).wait()
-        c.wait_settled(last)
+        with Cluster(nodes=3, mgmt=1) as c:
+            s = c.replicas[0].session()
+            last = None
+            for i in range(5):
+                last = s.put(f"k{i}", f"v{i}".encode()).wait()
+            c.wait_settled(last)
 
-        source = c.nodes[0].store
-        meta, chunks, pivot = self._checkpoint_at_head(source, c.anchor)
+            source = c.nodes[0].store
+            meta, chunks, pivot = self._checkpoint_at_head(source, c.anchor)
 
-        for i in range(3):
-            last = s.put(f"post-{i}", f"p{i}".encode()).wait()
-        c.wait_settled(last)
-        c.close()
+            for i in range(3):
+                last = s.put(f"post-{i}", f"p{i}".encode()).wait()
+            c.wait_settled(last)
 
-        source.gc_below(pivot)
-        dst = self._load_checkpoint(meta, chunks, c.anchor.public)
-        self._replay_above(source, dst, pivot)
+            source.gc_below(pivot)
+            dst = self._load_checkpoint(meta, chunks, c.anchor.public)
+            self._replay_above(source, dst, pivot)
 
-        self.assertEqual(dst.accumulator(), source.accumulator())
-        self.assertEqual(dst.state_root(), source.state_root())
-        self.assertEqual(dst.head(), source.head())
+            self.assertEqual(dst.accumulator(), source.accumulator())
+            self.assertEqual(dst.state_root(), source.state_root())
+            self.assertEqual(dst.head(), source.head())
 
 
 if __name__ == "__main__":
