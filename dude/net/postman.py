@@ -9,7 +9,7 @@ from typing import NamedTuple
 
 from ..core import crypto
 from ..core.errors import DudeError
-from ..core.units import Millis, now_ms
+from ..core.units import Millis
 from ..tunables import Tunables
 from .address import Address, Endpoint
 from .envelope import Envelope, EnvelopeError, Frame, MessageId, Verb
@@ -261,7 +261,7 @@ class Postman:
                 cmd = None
             if isinstance(cmd, _Stop):
                 return
-            now = now_ms()
+            now = Millis.now()
             if cmd is not None:
                 self._process(cmd, now)
             self._drain_input(now)

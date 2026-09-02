@@ -7,7 +7,7 @@ import click
 
 from ..consensus.bootstrap import bootstrap, compose_genesis
 from ..core import codec, crypto
-from ..core.units import Millis, now_ms
+from ..core.units import Millis
 from ..net.address import Address, Endpoint
 from ..net.envelope import Verb
 from ..net.postman import Postman
@@ -107,7 +107,7 @@ def genesis(cfg: DudeConfig, nodes: tuple[str, ...], dry_run: bool) -> None:
         click.echo("dry run complete — all nodes reachable")
         return
 
-    now = now_ms()
+    now = Millis.now()
     genesis_bodies = compose_genesis(
         anchor=anchor,
         node_endpoints=node_specs,

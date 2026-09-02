@@ -5,7 +5,7 @@ from unittest import mock
 from ..consensus.settle_round import SettledBlock
 from ..core import crypto
 from ..core.errors import DudeError
-from ..core.units import Millis, now_ms
+from ..core.units import Millis
 from ..net.address import Address, Endpoint, Scheme
 from ..net.envelope import MessageId
 from ..net.postman import Delivered, Postman
@@ -190,7 +190,7 @@ def _feed_reply(
         mid=MessageId.random(),
         in_reply_to=mid,
     )
-    lc._on_delivered(delivered, now_ms())
+    lc._on_delivered(delivered, Millis.now())
     return read
 
 

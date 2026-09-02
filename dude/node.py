@@ -7,7 +7,7 @@ from .consensus.canonical import bodies_canonical
 from .consensus.settle_round import SettledBlock
 from .core import codec, crypto
 from .core.errors import DudeError
-from .core.units import Millis, now_ms
+from .core.units import Millis
 from .net import MessageId, Verb
 from .net.link import Acceptor, Dialer
 from .net.postman import Delivered, Postman
@@ -123,7 +123,7 @@ class _BaseNode:
     def _run(self) -> None:
         tick_interval = self.tunables.tick_interval.as_seconds
         while not self._stopping.is_set():
-            now = now_ms()
+            now = Millis.now()
             for output in self.postman.drain_output(timeout=tick_interval):
                 for d in output.delivered:
                     self._on_delivered(d, now)
@@ -165,7 +165,7 @@ class _BaseNode:
                         and d.in_reply_to.correlation_id == mid.correlation_id
                     ):
                         return d
-                    self._on_delivered(d, now_ms())
+                    self._on_delivered(d, Millis.now())
         return None
 
     def _download_checkpoint(self) -> None:  # noqa: C901
@@ -229,7 +229,7 @@ class _BaseNode:
     def _reconcile_peers(self) -> None:
         nodes = self.mgmt_reader.nodes()
         roster = self.mgmt_reader.roster()
-        now = now_ms()
+        now = Millis.now()
         peers: dict[crypto.PublicKey, tuple] = {}
         for pk in roster:
             if pk == self.me.public:
@@ -310,7 +310,7 @@ class Node(_BaseNode):
     def _run(self) -> None:
         tick_interval = self.tunables.tick_interval.as_seconds
         while not self._stopping.is_set():
-            now = now_ms()
+            now = Millis.now()
             for output in self.postman.drain_output():
                 for d in output.delivered:
                     self._on_delivered(d, now)
@@ -612,7 +612,7 @@ class ReplicaNode(_BaseNode):
     def _run(self) -> None:
         tick_interval = self.tunables.tick_interval.as_seconds
         while not self._stopping.is_set():
-            now = now_ms()
+            now = Millis.now()
             for output in self.postman.drain_output(timeout=tick_interval):
                 for d in output.delivered:
                     self._on_delivered(d, now)
@@ -671,7 +671,7 @@ class _ReplicaSubstrate(Substrate):
         return self._ensure_cache().decrypt(store_id, name, ciphertext, epoch)
 
     def submit(self, tx: ops.Transaction) -> SubmitHandle:
-        signed = tx.sign(self._node.me, now_ms())
+        signed = tx.sign(self._node.me, Millis.now())
         roster = self._node.mgmt_reader.roster()
         if not roster:
             raise DudeError("no roster members to submit to")

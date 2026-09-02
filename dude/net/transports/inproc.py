@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from ...core import crypto
-from ...core.units import now_ms
+from ...core.units import Millis
 from ..address import Address, Endpoint, Scheme
 from ..envelope import Frame
 from ..link import Acceptor, Dialer, Link, LinkError, OnFrame, OnLink
@@ -76,7 +76,7 @@ class InProcListener(Acceptor, Dialer):
             self._conns[sender] = conn
             if self._on_link is not None:
                 self._on_link(conn.link)
-        conn.link.last_activity = now_ms()
+        conn.link.last_activity = Millis.now()
         if self._on_frame is not None:
             self._on_frame(frame, conn.link)
         else:

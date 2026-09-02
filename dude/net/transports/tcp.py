@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 import socks
 
 from ...core.errors import DudeError
-from ...core.units import now_ms
+from ...core.units import Millis
 from ...tunables import Tunables
 from ..address import Address, Scheme
 from ..envelope import MAX_FRAME_BYTES, Frame
@@ -79,7 +79,7 @@ class _TCPConn:
             self._out.put_nowait(_LEN.pack(len(payload)) + payload)
         except queue.Full as e:
             raise LinkError("tcp outbox is full; peer is not reading") from e
-        self.link.last_activity = now_ms()
+        self.link.last_activity = Millis.now()
 
     def _shutdown(self) -> None:
         if self._closed:
@@ -141,7 +141,7 @@ class _TCPConn:
                 frame = Frame.decode(payload)
             except DudeError:
                 continue
-            self.link.last_activity = now_ms()
+            self.link.last_activity = Millis.now()
             on_frame(frame, self.link)
         return False
 
