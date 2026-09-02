@@ -8,11 +8,11 @@ from ..core import crypto
 from ..core.errors import DudeError, InvariantError
 from ..core.units import Bucket, Millis
 from ..net.envelope import Verb
-from ..store import Layer, Store, settle
-from ..store.layer import Index
+from ..store import settle
+from ..store.layer import Index, Layer
 from ..store.management import MgmtReader
 from ..store.ops import SignedTransaction
-from ..store.store import log_element
+from ..store.store import Store, log_element
 from ..tunables import Tunables
 from .canonical import CanonicalBatch
 from .mempool import Mempool, Refusal

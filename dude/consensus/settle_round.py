@@ -215,13 +215,13 @@ class SettleState(Enum):
 
 
 class SettleRound:
-    def __init__(  # noqa: PLR0913, PLR0917 -- construction inputs, all required
+    def __init__(
         self,
         block: Block,
         me: crypto.Keypair,
         roster: tuple[crypto.PublicKey, ...],
         anchors: Anchors,
-        now: Millis,  # noqa: ARG002 -- reserved for telemetry
+        now: Millis,
         abandon_by: Millis,
     ):
         if me.public not in roster:
@@ -244,7 +244,7 @@ class SettleRound:
         self._outbox.append((Recipient.ALL, my_msg))
         self._try_settle()
 
-    def receive(self, msg: SettleSig, from_: crypto.PublicKey, now: Millis) -> None:  # noqa: ARG002 -- `now` reserved
+    def receive(self, msg: SettleSig, from_: crypto.PublicKey, now: Millis) -> None:
         if from_ not in self._roster:
             return
         if from_ == self._me.public:

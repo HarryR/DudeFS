@@ -298,7 +298,7 @@ class Session:
             return self.token(name), value, ops.EPOCH_NONE
         raise SessionError("data store seal requires a Substrate with crypto")
 
-    def _decrypt(self, name: str | bytes, ciphertext: bytes, epoch: int) -> bytes:  # noqa: ARG002
+    def _decrypt(self, name: str | bytes, ciphertext: bytes, epoch: int) -> bytes:
         if self._store_id == ops.STORE_MANAGEMENT:
             return ciphertext
         raise SessionError("data store decrypt requires a Substrate with crypto")

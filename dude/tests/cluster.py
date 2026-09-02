@@ -167,7 +167,7 @@ class Cluster:
         nodes: list[Node | ReplicaNode] | None = None,
     ) -> Settled:
         if not isinstance(result, Settled):
-            raise AssertionError(f"expected Settled, got {result!r}")  # noqa: TRY004
+            raise TypeError(f"expected Settled, got {result!r}")
         settled = result
         check = nodes if nodes is not None else self.nodes
         self.wait(lambda _: all(n.store.has_settled(settled.op_hash) for n in check))

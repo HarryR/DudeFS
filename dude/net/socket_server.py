@@ -79,7 +79,7 @@ class SocketServer:
             with cond:
                 baseline = last
                 cond.wait_for(
-                    lambda: self._sub.commit_seq > baseline or self._stopping.is_set(),  # noqa: B023
+                    lambda: self._sub.commit_seq > baseline or self._stopping.is_set(),
                     timeout=1.0,
                 )
             cur = self._sub.commit_seq
@@ -145,9 +145,7 @@ class _ClientHandler:
             with contextlib.suppress(OSError):
                 self._conn.close()
 
-    def _dispatch(  # noqa: PLR0912, PLR0915, C901 — one branch per verb, no nesting
-        self, tag: Request, corr_id: bytes, payload: bytes
-    ) -> None:
+    def _dispatch(self, tag: Request, corr_id: bytes, payload: bytes) -> None:
         match tag:
             case Request.GET:
                 parts = codec.as_seq(codec.decode(payload), 2)

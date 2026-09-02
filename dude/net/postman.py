@@ -171,7 +171,7 @@ class Postman:
         self._input.put(_Send(d.frm, verb, body, ttl, False, d.mid, new_mid))
         return new_mid
 
-    def send_raw(  # noqa: PLR0913, PLR0917
+    def send_raw(
         self,
         to: crypto.PublicKey,
         verb: Verb,

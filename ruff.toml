@@ -66,6 +66,12 @@ ignore = [
     "EM101",   # string literal in raise — see the header
     "EM102",   # f-string in raise — see the header
     "PLR2004", # magic value comparison — widths and tag bytes
+    "C901",    # mccabe complexity — dispatch tables and integration tests are inherently branchy
+    "PLR0911", # too many return statements — same
+    "PLR0912", # too many branches — same
+    "PLR0913", # too many arguments — constructors and wire functions have the args they have
+    "PLR0915", # too many statements — same as C901
+    "PLR0917", # too many positional arguments — same as PLR0913
     "SIM118",  # `key in dict` — fires on ManagedMap.keys() which is not a dict
     "TRY300",  # `else` after try — guard-then-return reads better here
     "TID252",  # relative imports — this is one package; relative is correct within it

@@ -13,6 +13,7 @@ from ..core.units import Millis
 from ..net.address import Endpoint
 from ..net.envelope import MessageId, Verb
 from ..net.postman import Delivered, Postman
+from ..net.socket_server import SocketServer
 from ..session import (
     Inflight,
     InflightHandle,
@@ -92,7 +93,9 @@ class GetResult:
 class Failed:
     reason: str
 
+
 ZERO_MILLIS = Millis(0)
+
 
 @dataclass(slots=True)
 class PeerView:
@@ -268,12 +271,11 @@ class LightClient:
 
     # -- the run loop -------------------------------------------------------
 
-    def add_socket(self, path: str) -> None:
-        from ..net.socket_server import SocketServer  # noqa: PLC0415
-
+    def add_socket(self, path: str) -> SocketServer:
         sub = _LiteSubstrate(self)
         srv = SocketServer(path, sub)
         self._socket_servers.append(srv)
+        return srv
 
     def __enter__(self):
         self.start()
@@ -399,7 +401,7 @@ class LightClient:
 
     # -- read resolution ----------------------------------------------------
 
-    def resolve_read(self, req: Read, msg: LiteMsg, now: Millis) -> None:  # noqa: C901, PLR0911
+    def resolve_read(self, req: Read, msg: LiteMsg, now: Millis) -> None:
         entry = req
         if isinstance(msg, LiteRefused):
             entry.result = Failed(reason=msg.reason.value)
@@ -689,9 +691,7 @@ def _contiguous_from(head_num: int, offered: tuple[SettledBlock, ...]) -> tuple[
     return tuple(run)
 
 
-def _verify_bundle(  # noqa: C901, PLR0911
-    anchor: crypto.PublicKey, bundle: RosterBundle
-) -> bool:
+def _verify_bundle(anchor: crypto.PublicKey, bundle: RosterBundle) -> bool:
     manager_pubkeys: set[crypto.PublicKey] = set()
     for grant in bundle.managers:
         if not _verify_grant_cert(grant, anchor, expected_role=Role.MANAGER):

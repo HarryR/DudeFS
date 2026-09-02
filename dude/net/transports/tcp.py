@@ -212,7 +212,7 @@ class _DialWorker:
         self.connected = True
         conn = _TCPConn(sock, self._address, self._timing, self._on_frame, self._on_link)
         conn.link.on_close = lambda _ln: None
-        while not conn._closed and not self._stopping.is_set():  # noqa: SLF001
+        while not conn._closed and not self._stopping.is_set():
             self._stopping.wait(timeout=self._timing.idle_wait_sec)
         conn.join()
 
@@ -418,4 +418,4 @@ class TCPListener(Acceptor):
                 self._on_link,
             )
             self._conns.append(conn)
-            self._conns = [c for c in self._conns if not c._closed]  # noqa: SLF001
+            self._conns = [c for c in self._conns if not c._closed]

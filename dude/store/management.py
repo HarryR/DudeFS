@@ -321,7 +321,7 @@ class Attestation:
     subject: bytes
 
 
-def attestations_by(  # noqa: C901
+def attestations_by(
     session: Session,
     signer: crypto.PublicKey,
 ) -> tuple[Attestation, ...]:
@@ -595,7 +595,7 @@ class MgmtReader(Authoriser):
 
 
 class MgmtWriter(MgmtReader):
-    def change_roster(  # noqa: C901
+    def change_roster(
         self,
         *,
         commitment_signer: crypto.Keypair,
@@ -674,7 +674,7 @@ class MgmtWriter(MgmtReader):
     ) -> ops.Transaction:
         return self.change_roster(commitment_signer=commitment_signer, remove=(who,))
 
-    def authorise(  # noqa: PLR0913, PLR0917 -- every arg is a distinct required piece of a grant; collapsing them hides intent and forces callers to build dicts
+    def authorise(
         self,
         who: crypto.PublicKey,
         role: Role,

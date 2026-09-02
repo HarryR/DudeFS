@@ -8,13 +8,11 @@ import threading
 from collections.abc import Generator, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, NamedTuple
-
-if TYPE_CHECKING:
-    from ..session import Session, Settled
+from typing import NamedTuple
 
 from ..core import codec, crypto
 from ..core.errors import InvariantError
+from ..session import Session, Settled
 from . import ops, settle, smt
 from .layer import Held, Index, Ledger, PathRow, View, holds
 from .management import MgmtReader, MgmtWriter
@@ -285,8 +283,6 @@ class StoreReader(View, Ledger, _ExportSource):
         return bool(self.settled_hashes((op_hash,)))
 
     def settlement_of(self, op_hash: crypto.Digest) -> Settled | None:
-        from ..session import Settled  # noqa: PLC0415
-
         row = self._conn.execute(
             "SELECT b.block_num, b.hash FROM entry e"
             " JOIN block b ON e.idx BETWEEN b.first_height AND b.height"
@@ -302,15 +298,13 @@ class StoreReader(View, Ledger, _ExportSource):
             return set()
         marks = ",".join("?" * len(want))
         rows = self._conn.execute(
-            f"SELECT op_hash FROM entry WHERE op_hash IN ({marks})",  # noqa: S608
+            f"SELECT op_hash FROM entry WHERE op_hash IN ({marks})",
             want,
         ).fetchall()
         return {r[0] for r in rows}
 
     @property
     def mgmt_reader(self) -> MgmtReader:
-        from ..session import Session  # noqa: PLC0415
-
         return MgmtReader(Session(self, ops.STORE_MANAGEMENT))
 
 
@@ -399,7 +393,7 @@ class StoreWriter(StoreReader, _ImportTarget):
     def apply(self, batch: tuple[ops.SignedTransaction, ...], auth: settle.Authoriser) -> Applied:
         return self._apply_within(batch, auth)
 
-    def commit_block(  # noqa: PLR0913
+    def commit_block(
         self,
         block_num: Index,
         *,
@@ -648,7 +642,7 @@ class Store(View, Ledger):
 
     def _rows_in_path_range(self, lo: bytes, hi: bytes) -> Iterator[PathRow]:
         with self.snapshot() as r:
-            yield from list(r._rows_in_path_range(lo, hi))  # noqa: SLF001
+            yield from list(r._rows_in_path_range(lo, hi))
 
     def has_settled(self, op_hash: crypto.Digest) -> bool:
         with self.snapshot() as r:
@@ -679,8 +673,6 @@ class Store(View, Ledger):
         return True
 
     def mgmt_session(self) -> Session:
-        from ..session import Session  # noqa: PLC0415
-
         return Session(self, ops.STORE_MANAGEMENT)
 
     @property
@@ -695,7 +687,7 @@ class Store(View, Ledger):
         with self.write() as w:
             return w.apply(batch, auth)
 
-    def commit_block(  # noqa: PLR0913
+    def commit_block(
         self,
         block_num: Index,
         *,

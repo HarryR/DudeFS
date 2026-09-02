@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 from abc import abstractmethod
-from collections.abc import Callable
 from dataclasses import dataclass
-from typing import ClassVar
+from typing import ClassVar, Self
 
 from ..consensus.settle_round import SettledBlockWithBodies
 from ..core import codec, crypto
@@ -20,29 +19,33 @@ class SyncMsg(Encodable):
     verb: ClassVar[Verb]
 
     @abstractmethod
-    def _encode(self) -> bytes: ...
+    def encode_inner(self) -> bytes: ...
+
+    @classmethod
+    @abstractmethod
+    def decode_inner(cls, body: bytes) -> Self: ...
 
     def encode(self) -> tuple[Verb, bytes]:
-        return self.verb, self._encode()
+        return self.verb, self.encode_inner()
 
     @classmethod
     def decode(cls, verb: Verb, body: bytes) -> SyncMsg:
         try:
-            handler = _DECODERS[verb]
+            handler = _SYNC_MSG_VERB_TO_CLASS[verb]
         except KeyError as e:
             raise SyncAdapterError(f"not a sync verb: {verb.name}") from e
-        return handler(body)
+        return handler.decode_inner(body)
 
 
 @dataclass(frozen=True, slots=True)
 class HeightAsk(SyncMsg):
     verb: ClassVar[Verb] = Verb.HEIGHT
 
-    def _encode(self) -> bytes:
+    def encode_inner(self) -> bytes:
         return b""
 
     @classmethod
-    def _decode(cls, body: bytes) -> HeightAsk:
+    def decode_inner(cls, body: bytes) -> HeightAsk:
         if body != b"":
             raise SyncAdapterError(f"HEIGHT body must be empty, got {body!r}")
         return cls()
@@ -55,11 +58,11 @@ class HeightReply(SyncMsg):
     block_num: int
     tip_hash: crypto.Digest
 
-    def _encode(self) -> bytes:
+    def encode_inner(self) -> bytes:
         return codec.encode([self.block_num, self.tip_hash])
 
     @classmethod
-    def _decode(cls, body: bytes) -> HeightReply:
+    def decode_inner(cls, body: bytes) -> HeightReply:
         try:
             p = codec.as_seq(codec.decode(body), 2)
             return cls(
@@ -77,11 +80,11 @@ class GetBlocks(SyncMsg):
     frm: int
     count: int
 
-    def _encode(self) -> bytes:
+    def encode_inner(self) -> bytes:
         return codec.encode([self.frm, self.count])
 
     @classmethod
-    def _decode(cls, body: bytes) -> GetBlocks:
+    def decode_inner(cls, body: bytes) -> GetBlocks:
         try:
             p = codec.as_seq(codec.decode(body), 2)
             return cls(frm=codec.as_int(p[0]), count=codec.as_int(p[1]))
@@ -95,11 +98,11 @@ class SettledBlockReply(SyncMsg):
 
     payload: tuple[SettledBlockWithBodies, ...]
 
-    def _encode(self) -> bytes:
+    def encode_inner(self) -> bytes:
         return codec.encode([b.encode() for b in self.payload])
 
     @classmethod
-    def _decode(cls, body: bytes) -> SettledBlockReply:
+    def decode_inner(cls, body: bytes) -> SettledBlockReply:
         try:
             raw = codec.as_seq(codec.decode(body))
         except DudeError as e:
@@ -114,13 +117,13 @@ class Refused(SyncMsg):
     reason: SyncRefusal
     checkpoint_block_num: int | None = None
 
-    def _encode(self) -> bytes:
+    def encode_inner(self) -> bytes:
         if self.checkpoint_block_num is not None:
             return codec.encode([self.reason.value.encode(), self.checkpoint_block_num])
         return self.reason.value.encode()
 
     @classmethod
-    def _decode(cls, body: bytes) -> Refused:
+    def decode_inner(cls, body: bytes) -> Refused:
         try:
             parts = codec.as_seq(codec.decode(body))
             reason = SyncRefusal(codec.as_bytes(parts[0]).decode("utf-8"))
@@ -143,11 +146,7 @@ _SYNC_MSG_CLASSES: tuple[type[SyncMsg], ...] = (
     Refused,
 )
 
-
-_DECODERS: dict[Verb, Callable[[bytes], SyncMsg]] = {
-    c.verb: c._decode  # noqa: SLF001 -- same-module dispatch table
-    for c in _SYNC_MSG_CLASSES
-}
+_SYNC_MSG_VERB_TO_CLASS: dict[Verb, type[SyncMsg]] = {c.verb: c for c in _SYNC_MSG_CLASSES}
 
 
 __all__ = [

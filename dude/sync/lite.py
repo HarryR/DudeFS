@@ -82,7 +82,7 @@ def serve_get_proof(
         return _proof(r, request, liveness_window)
 
 
-def _proof(  # noqa: PLR0911, PLR0912, C901 -- each early-return names a distinct SyncRefusal; branches map 1:1 to reasons in the closed enum
+def _proof(
     r: StoreReader,
     request: GetProof,
     liveness_window: int,

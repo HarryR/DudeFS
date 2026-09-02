@@ -39,6 +39,7 @@ _DEFAULT_TRANSPORTS = TransportPolicy()
 ONE_SECOND = Millis(1000)
 TWO_SECONDS = ONE_SECOND * 2
 
+
 @dataclass(frozen=True, slots=True)
 class Tunables:
     # DECLARED. Every field here is a physical measurement, a product decision, or a count.
@@ -50,8 +51,6 @@ class Tunables:
 
     clock_skew: Millis = TWO_SECONDS
     """Upper bound on NTP jitter between roster members. Every node runs NTP."""
-
-
 
     retry_budget: int = 2
     """Attempts per sub-round before a peer is lost for that sub-round. Tied to link redundancy:

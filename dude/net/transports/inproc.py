@@ -29,10 +29,10 @@ class _InProcConn:
         )
 
     def send_frame(self, frame: Frame) -> None:
-        target = self._nexus._listeners.get(self._reply_to)  # noqa: SLF001
+        target = self._nexus._listeners.get(self._reply_to)
         if target is None:
             raise LinkError(f"in-process reply target no longer registered: {self._reply_to!r}")
-        target._deliver(frame, sender=self._me)  # noqa: SLF001
+        target._deliver(frame, sender=self._me)
 
     def close(self) -> None:
         pass
@@ -50,9 +50,9 @@ class InProcListener(Acceptor, Dialer):
 
     def __post_init__(self) -> None:
         key = bytes(self.identity)
-        if key in self.nexus._listeners:  # noqa: SLF001
+        if key in self.nexus._listeners:
             raise LinkError(f"in-process identity already registered: {self.identity.hex()[:8]}")
-        self.nexus._listeners[key] = self  # noqa: SLF001
+        self.nexus._listeners[key] = self
 
     @property
     def endpoint(self) -> Endpoint:
@@ -85,8 +85,8 @@ class InProcListener(Acceptor, Dialer):
     def start(self, on_frame: OnFrame, on_link: OnLink) -> None:
         self._stopped = False
         me = bytes(self.identity)
-        if me not in self.nexus._listeners:  # noqa: SLF001
-            self.nexus._listeners[me] = self  # noqa: SLF001
+        if me not in self.nexus._listeners:
+            self.nexus._listeners[me] = self
         self._on_frame = on_frame
         self._on_link = on_link
         for conn in self._conns.values():
@@ -99,7 +99,7 @@ class InProcListener(Acceptor, Dialer):
         if address.scheme is not Scheme.INPROC or self._on_link is None:
             return False
         target_key = bytes.fromhex(address.value)
-        if target_key not in self.nexus._listeners or target_key in self._conns:  # noqa: SLF001
+        if target_key not in self.nexus._listeners or target_key in self._conns:
             return False
         conn = _InProcConn(
             reply_to=target_key,
@@ -116,12 +116,12 @@ class InProcListener(Acceptor, Dialer):
         self._on_frame = None
         self._on_link = None
         me = bytes(self.identity)
-        self.nexus._listeners.pop(me, None)  # noqa: SLF001
+        self.nexus._listeners.pop(me, None)
         for conn in self._conns.values():
             conn.link.close()
         self._conns.clear()
-        for listener in list(self.nexus._listeners.values()):  # noqa: SLF001
-            remote_conn = listener._conns.pop(me, None)  # noqa: SLF001
+        for listener in list(self.nexus._listeners.values()):
+            remote_conn = listener._conns.pop(me, None)
             if remote_conn is not None:
                 remote_conn.link.notify_closed()
 

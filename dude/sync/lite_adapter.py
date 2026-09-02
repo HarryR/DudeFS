@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 from abc import abstractmethod
-from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
-from typing import ClassVar
+from typing import ClassVar, Self
 
 from ..consensus.settle_round import SettledBlock
 from ..core import codec, crypto
@@ -32,7 +31,7 @@ class RosterBundle:
     entries: tuple[NodeRecord, ...]
     managers: tuple[Grant, ...]
 
-    def _encode(self) -> bytes:
+    def encode(self) -> bytes:
         return codec.encode(
             [
                 self.commitment_serial,
@@ -44,7 +43,7 @@ class RosterBundle:
         )
 
     @classmethod
-    def _decode(cls, raw: bytes) -> RosterBundle:
+    def decode(cls, raw: bytes) -> RosterBundle:
         try:
             p = codec.as_seq(codec.decode(raw), 5)
             serial = codec.as_int(p[0])
@@ -61,18 +60,22 @@ class LiteMsg(Encodable):
     verb: ClassVar[Verb]
 
     @abstractmethod
-    def _encode(self) -> bytes: ...
+    def encode_inner(self) -> bytes: ...
+
+    @classmethod
+    @abstractmethod
+    def decode_inner(cls, body: bytes) -> Self: ...
 
     def encode(self) -> tuple[Verb, bytes]:
-        return self.verb, self._encode()
+        return self.verb, self.encode_inner()
 
     @classmethod
     def decode(cls, verb: Verb, body: bytes) -> LiteMsg:
         try:
-            handler = _DECODERS[verb]
+            handler = _LITE_MSG_VERB_TO_CLASS[verb]
         except KeyError as e:
             raise LiteAdapterError(f"not a lite-client verb: {verb.name}") from e
-        return handler(body)
+        return handler.decode_inner(body)
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,7 +107,7 @@ class GetAnchors(LiteMsg):
     known_roster_fingerprint: crypto.Digest | None
     known_trusted_block: TrustedBlock | None
 
-    def _encode(self) -> bytes:
+    def encode_inner(self) -> bytes:
         return codec.encode(
             [
                 self.known_roster_fingerprint or b"",
@@ -113,7 +116,7 @@ class GetAnchors(LiteMsg):
         )
 
     @classmethod
-    def _decode(cls, body: bytes) -> GetAnchors:
+    def decode_inner(cls, body: bytes) -> GetAnchors:
         try:
             p = codec.as_seq(codec.decode(body), 2)
             fp_raw = codec.as_bytes(p[0])
@@ -135,24 +138,24 @@ class AnchorsReply(LiteMsg):
     bundle: RosterBundle | None
     headers: tuple[SettledBlock, ...]
 
-    def _encode(self) -> bytes:
+    def encode_inner(self) -> bytes:
         return codec.encode(
             [
                 self.head.encode(),
                 self.roster_fingerprint,
-                self.bundle._encode() if self.bundle is not None else b"",  # noqa: SLF001
+                self.bundle.encode() if self.bundle is not None else b"",
                 [h.encode() for h in self.headers],
             ]
         )
 
     @classmethod
-    def _decode(cls, body: bytes) -> AnchorsReply:
+    def decode_inner(cls, body: bytes) -> AnchorsReply:
         try:
             p = codec.as_seq(codec.decode(body), 4)
             head = SettledBlock.decode(codec.as_bytes(p[0]))
             roster_fingerprint = crypto.Digest(codec.as_bytes(p[1]))
             bundle_bytes = codec.as_bytes(p[2])
-            bundle = RosterBundle._decode(bundle_bytes) if bundle_bytes else None  # noqa: SLF001
+            bundle = RosterBundle.decode(bundle_bytes) if bundle_bytes else None
             headers = tuple(SettledBlock.decode(codec.as_bytes(h)) for h in codec.as_seq(p[3]))
         except DudeError as e:
             raise LiteAdapterError(f"malformed ANCHORS_REPLY body: {e}") from e
@@ -169,7 +172,7 @@ class GetProof(LiteMsg):
     known_roster_fingerprint: crypto.Digest | None
     known_trusted_block: TrustedBlock | None
 
-    def _encode(self) -> bytes:
+    def encode_inner(self) -> bytes:
         return codec.encode(
             [
                 self.store_id,
@@ -181,7 +184,7 @@ class GetProof(LiteMsg):
         )
 
     @classmethod
-    def _decode(cls, body: bytes) -> GetProof:
+    def decode_inner(cls, body: bytes) -> GetProof:
         try:
             p = codec.as_seq(codec.decode(body), 5)
             fp_raw = codec.as_bytes(p[3])
@@ -217,7 +220,7 @@ class ProofReply(LiteMsg):
     bundle: RosterBundle | None
     headers: tuple[SettledBlock, ...]
 
-    def _encode(self) -> bytes:
+    def encode_inner(self) -> bytes:
         return codec.encode(
             [
                 self.value,
@@ -227,19 +230,19 @@ class ProofReply(LiteMsg):
                 self.epoch,
                 self.head.encode(),
                 self.roster_fingerprint,
-                self.bundle._encode() if self.bundle is not None else b"",  # noqa: SLF001
+                self.bundle.encode() if self.bundle is not None else b"",
                 [h.encode() for h in self.headers],
             ]
         )
 
     @classmethod
-    def _decode(cls, body: bytes) -> ProofReply:
+    def decode_inner(cls, body: bytes) -> ProofReply:
         try:
             p = codec.as_seq(codec.decode(body), 9)
             head = SettledBlock.decode(codec.as_bytes(p[5]))
             roster_fingerprint = crypto.Digest(codec.as_bytes(p[6]))
             bundle_bytes = codec.as_bytes(p[7])
-            bundle = RosterBundle._decode(bundle_bytes) if bundle_bytes else None  # noqa: SLF001
+            bundle = RosterBundle.decode(bundle_bytes) if bundle_bytes else None
             headers = tuple(SettledBlock.decode(codec.as_bytes(h)) for h in codec.as_seq(p[8]))
             return cls(
                 value=codec.as_bytes(p[0]),
@@ -262,11 +265,11 @@ class LiteRefused(LiteMsg):
 
     reason: SyncRefusal
 
-    def _encode(self) -> bytes:
+    def encode_inner(self) -> bytes:
         return self.reason.value.encode()
 
     @classmethod
-    def _decode(cls, body: bytes) -> LiteRefused:
+    def decode_inner(cls, body: bytes) -> LiteRefused:
         try:
             reason = SyncRefusal(body.decode("utf-8"))
         except (ValueError, UnicodeDecodeError) as e:
@@ -279,11 +282,11 @@ class TxStatus(LiteMsg):
     verb: ClassVar[Verb] = Verb.TX_STATUS
     op_hash: crypto.Digest
 
-    def _encode(self) -> bytes:
+    def encode_inner(self) -> bytes:
         return codec.encode([self.op_hash])
 
     @classmethod
-    def _decode(cls, body: bytes) -> TxStatus:
+    def decode_inner(cls, body: bytes) -> TxStatus:
         try:
             p = codec.as_seq(codec.decode(body), 1)
             return cls(op_hash=crypto.Digest(codec.as_bytes(p[0])))
@@ -298,13 +301,13 @@ class TxStatusReply(LiteMsg):
     block_num: int | None = None
     block_hash: crypto.Digest | None = None
 
-    def _encode(self) -> bytes:
+    def encode_inner(self) -> bytes:
         if self.block_num is not None and self.block_hash is not None:
             return codec.encode([self.status.value.encode(), self.block_num, self.block_hash])
         return self.status.value.encode()
 
     @classmethod
-    def _decode(cls, body: bytes) -> TxStatusReply:
+    def decode_inner(cls, body: bytes) -> TxStatusReply:
         try:
             parts = codec.as_seq(codec.decode(body))
             status = TxStatusKind(codec.as_bytes(parts[0]).decode("utf-8"))
@@ -329,12 +332,7 @@ _LITE_MSG_CLASSES: tuple[type[LiteMsg], ...] = (
     TxStatusReply,
 )
 
-
-_DECODERS: dict[Verb, Callable[[bytes], LiteMsg]] = {
-    c.verb: c._decode  # noqa: SLF001 -- same-module dispatch table
-    for c in _LITE_MSG_CLASSES
-}
-
+_LITE_MSG_VERB_TO_CLASS: dict[Verb, type[LiteMsg]] = {c.verb: c for c in _LITE_MSG_CLASSES}
 
 __all__ = [
     "ABSENT_MARKER",

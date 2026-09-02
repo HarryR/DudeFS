@@ -141,7 +141,7 @@ class Layer(Overlay[View], View):
         self._smt_memo: dict[tuple[int, bytes], crypto.Digest] = {}
 
     def accumulator(self) -> crypto.Accumulator:
-        from .store import element  # noqa: PLC0415 — store imports layer, so this is deferred
+        from .store import element
 
         acc = self._base.accumulator()
         for (st, name), held in self._delta.items():

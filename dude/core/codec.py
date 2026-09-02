@@ -12,7 +12,7 @@ def encode(value: object) -> bytes:
     return bytes(out)
 
 
-def _encode_into(value: object, out: bytearray) -> None:  # noqa: C901
+def _encode_into(value: object, out: bytearray) -> None:
     if isinstance(value, bool):
         raise CodecError("bool is not encodable; use int 0/1")
     if isinstance(value, int):

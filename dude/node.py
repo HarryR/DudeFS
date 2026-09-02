@@ -168,9 +168,9 @@ class _BaseNode:
                     self._on_delivered(d, Millis.now())
         return None
 
-    def _download_checkpoint(self) -> None:  # noqa: C901
-        from .store.checkpoint import CheckpointMeta  # noqa: PLC0415
-        from .store.smt_sync import TreeImporter  # noqa: PLC0415
+    def _download_checkpoint(self) -> None:
+        from .store.checkpoint import CheckpointMeta
+        from .store.smt_sync import TreeImporter
 
         peers = list(self.follower.compacted_peers())
         if not peers:
@@ -252,13 +252,13 @@ class _BaseNode:
             reply_to=d.mid,
         )
 
-    def _flush_follower(self, now: Millis) -> None:  # noqa: ARG002
+    def _flush_follower(self, now: Millis) -> None:
         for peer, msg in self.follower.outbox():
             self.postman.send(peer, msg, self.tunables.ttl_exchange)
 
     # -- sync verb handlers (shared) ----------------------------------------
 
-    def _on_ping(self, d: Delivered, now: Millis) -> MessageId:  # noqa: ARG002
+    def _on_ping(self, d: Delivered, now: Millis) -> MessageId:
         return self._reply(d, Verb.PONG, b"")
 
     def _on_height_reply(self, d: Delivered, now: Millis) -> None:
@@ -343,7 +343,7 @@ class Node(_BaseNode):
 
     # -- inbound dispatch ---------------------------------------------------
 
-    def _on_delivered(self, d: Delivered, now: Millis) -> None:  # noqa: C901, PLR0912
+    def _on_delivered(self, d: Delivered, now: Millis) -> None:
         if d.verb in CONSENSUS_ONLY and not self._is_node(d.frm):
             return
         match d.verb:
@@ -408,7 +408,7 @@ class Node(_BaseNode):
 
     # -- provisioning -------------------------------------------------------
 
-    def _on_provision(self, d: Delivered, now: Millis) -> None:  # noqa: ARG002
+    def _on_provision(self, d: Delivered, now: Millis) -> None:
         if d.frm != self.store.anchor():
             return
         if self.store.head_block_num() is not None:
@@ -434,10 +434,10 @@ class Node(_BaseNode):
 
     # -- serving sync requests ----------------------------------------------
 
-    def _on_height(self, d: Delivered, now: Millis) -> MessageId:  # noqa: ARG002
+    def _on_height(self, d: Delivered, now: Millis) -> MessageId:
         return self.postman.reply(d, serve_height(self.store), self.tunables.ttl_exchange)
 
-    def _on_getblock(self, d: Delivered, now: Millis) -> MessageId | None:  # noqa: ARG002
+    def _on_getblock(self, d: Delivered, now: Millis) -> MessageId | None:
         if not self._replica_authorised(d.frm):
             return self.postman.reply(
                 d, Refused(reason=SyncRefusal.UNAUTHORISED), self.tunables.ttl_exchange
@@ -464,7 +464,7 @@ class Node(_BaseNode):
         grant = self.mgmt_reader.grant_of(who)
         return grant is not None and grant.role in (Role.MANAGER, Role.COMPACTOR)
 
-    def _on_get_checkpoint(self, d: Delivered, now: Millis) -> MessageId | None:  # noqa: ARG002
+    def _on_get_checkpoint(self, d: Delivered, now: Millis) -> MessageId | None:
         if not self._replica_authorised(d.frm):
             return self.postman.reply(
                 d,
@@ -483,7 +483,7 @@ class Node(_BaseNode):
             self.tunables.ttl_exchange,
         )
 
-    def _on_get_chunks(self, d: Delivered, now: Millis) -> MessageId | None:  # noqa: ARG002
+    def _on_get_chunks(self, d: Delivered, now: Millis) -> MessageId | None:
         if not self._replica_authorised(d.frm):
             return self.postman.reply(
                 d,
@@ -515,7 +515,7 @@ class Node(_BaseNode):
 
     # -- serving lite requests ----------------------------------------------
 
-    def _on_get_anchors(self, d: Delivered, now: Millis) -> MessageId | None:  # noqa: ARG002
+    def _on_get_anchors(self, d: Delivered, now: Millis) -> MessageId | None:
         if not self._lite_authorised(d.frm):
             return self.postman.reply(
                 d, LiteRefused(SyncRefusal.UNAUTHORISED), self.tunables.ttl_lite
@@ -534,7 +534,7 @@ class Node(_BaseNode):
             self.tunables.ttl_lite,
         )
 
-    def _on_get_proof(self, d: Delivered, now: Millis) -> MessageId | None:  # noqa: ARG002
+    def _on_get_proof(self, d: Delivered, now: Millis) -> MessageId | None:
         if not self._lite_authorised(d.frm):
             return self.postman.reply(
                 d, LiteRefused(SyncRefusal.UNAUTHORISED), self.tunables.ttl_lite
@@ -557,7 +557,7 @@ class Node(_BaseNode):
             self.tunables.ttl_lite,
         )
 
-    def _on_tx_status(self, d: Delivered, now: Millis) -> MessageId | None:  # noqa: ARG002
+    def _on_tx_status(self, d: Delivered, now: Millis) -> MessageId | None:
         if not self._lite_authorised(d.frm):
             return self.postman.reply(
                 d, LiteRefused(SyncRefusal.UNAUTHORISED), self.tunables.ttl_lite

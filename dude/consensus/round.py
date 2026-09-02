@@ -156,10 +156,7 @@ class Bodies(RoundMsg):
 _ROUND_MSG_CLASSES: tuple[type[RoundMsg], ...] = (Held, Sig, Bodies)
 
 
-_DECODERS: dict[Verb, Callable[[bytes], RoundMsg]] = {
-    c.verb: c._decode  # noqa: SLF001 -- same-module dispatch table
-    for c in _ROUND_MSG_CLASSES
-}
+_DECODERS: dict[Verb, Callable[[bytes], RoundMsg]] = {c.verb: c._decode for c in _ROUND_MSG_CLASSES}
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,7 +184,7 @@ class State(Enum):
 
 
 class Round:
-    def __init__(  # noqa: PLR0913, PLR0917 -- cadence + identity are all required, no defaults
+    def __init__(
         self,
         bucket: Bucket,
         me: crypto.Keypair,

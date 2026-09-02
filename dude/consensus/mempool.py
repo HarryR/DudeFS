@@ -34,7 +34,7 @@ class Mempool:
     tunables: Tunables = field(default_factory=Tunables)
     pending: dict[Bucket, dict[crypto.Digest, ops.SignedTransaction]] = field(default_factory=dict)
 
-    def valid(  # noqa: PLR0911 -- each early-return names a distinct refusal a client can act
+    def valid(
         # on; collapsing them hides which door it was turned away at.
         # THE CLOCK MAY CHOOSE, IT MAY NOT JUDGE: `now` is read here and in `propose`,
         # never in verifying a proposal. A clock read anywhere else turns skew from a throughput
@@ -68,7 +68,7 @@ class Mempool:
             return Refusal.CANNOT_APPLY
         return None
 
-    def valid_for_bucket(  # noqa: PLR0911
+    def valid_for_bucket(
         self,
         tx: ops.SignedTransaction,
         bucket: Bucket,

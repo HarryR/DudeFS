@@ -60,7 +60,7 @@ class RoleParam(click.ParamType):
             choices = ", ".join(r.name.lower() for r in Role)
             self.fail(f"{value!r} is not a valid role (choose from: {choices})", param, ctx)
 
-    def get_metavar(self, param: click.Parameter, ctx: click.Context) -> str:  # noqa: ARG002
+    def get_metavar(self, param: click.Parameter, ctx: click.Context) -> str:
         return "[" + "|".join(r.name.lower() for r in Role) + "]"
 
 
