@@ -173,7 +173,7 @@ class _BaseNode:
     # -- event handlers --------------------------------------------------------
 
     def _on_message_in(self, event: MessageIn) -> None:
-        self._on_delivered(event.delivered, Millis.now())
+        self._on_delivered(event.delivered)
 
     def _on_message_expired(self, event: MessageExpired) -> None:
         self.inflight.on_expired(event.prefix)
@@ -190,7 +190,7 @@ class _BaseNode:
             Millis.now() + self.tunables.tick_interval, ReconcilePeers()
         )
 
-    def _on_delivered(self, d: Delivered, now: Millis) -> None:
+    def _on_delivered(self, d: Delivered) -> None:
         raise NotImplementedError
 
     # -- checkpoint download (synchronous, blocks the tick loop) ------------
@@ -216,7 +216,7 @@ class _BaseNode:
                         and d.in_reply_to.correlation_id == mid.correlation_id
                     ):
                         return d
-                    self._on_delivered(d, Millis.now())
+                    self._on_delivered(d)
         return None
 
     def _download_checkpoint(self) -> None:
@@ -304,17 +304,17 @@ class _BaseNode:
 
     # -- sync verb handlers (shared) ----------------------------------------
 
-    def _on_ping(self, d: Delivered, now: Millis) -> MessageId:
+    def _on_ping(self, d: Delivered) -> MessageId:
         return self._reply(d, Verb.PONG, b"")
 
-    def _on_height_reply(self, d: Delivered, now: Millis) -> None:
+    def _on_height_reply(self, d: Delivered) -> None:
         try:
             msg = SyncMsg.decode(d.verb, d.body)
         except SyncAdapterError:
             return
         self.follower.post(PeerMessage(msg, d.frm))
 
-    def _on_settled_block(self, d: Delivered, now: Millis) -> None:
+    def _on_settled_block(self, d: Delivered) -> None:
         try:
             msg = SyncMsg.decode(d.verb, d.body)
         except (SyncAdapterError, DudeError):
@@ -322,7 +322,7 @@ class _BaseNode:
             return
         self.follower.post(PeerMessage(msg, d.frm))
 
-    def _on_sync_refused(self, d: Delivered, now: Millis) -> None:
+    def _on_sync_refused(self, d: Delivered) -> None:
         try:
             msg = SyncMsg.decode(d.verb, d.body)
         except SyncAdapterError:
@@ -385,56 +385,56 @@ class Node(_BaseNode):
 
     # -- inbound dispatch ---------------------------------------------------
 
-    def _on_delivered(self, d: Delivered, now: Millis) -> None:
+    def _on_delivered(self, d: Delivered) -> None:
         if d.verb in CONSENSUS_ONLY and not self._is_node(d.frm):
             return
         match d.verb:
             case Verb.SUBMIT:
-                self._on_submit(d, now)
+                self._on_submit(d)
             case Verb.HELD | Verb.SIG | Verb.BODIES:
                 self.coordinator.post(RoundMessage(d.frm, d.verb, d.body))
             case Verb.SETTLE_SIG:
                 self.coordinator.post(SettleMessage(d.frm, d.verb, d.body))
             case Verb.HEIGHT:
-                self._on_height(d, now)
+                self._on_height(d)
             case Verb.HEIGHT_REPLY:
-                self._on_height_reply(d, now)
+                self._on_height_reply(d)
             case Verb.GETBLOCK:
-                self._on_getblock(d, now)
+                self._on_getblock(d)
             case Verb.SETTLED_BLOCK:
-                self._on_settled_block(d, now)
+                self._on_settled_block(d)
             case Verb.SYNC_REFUSED:
-                self._on_sync_refused(d, now)
+                self._on_sync_refused(d)
             case Verb.PING:
-                self._on_ping(d, now)
+                self._on_ping(d)
             case Verb.GET_ANCHORS:
-                self._on_get_anchors(d, now)
+                self._on_get_anchors(d)
             case Verb.GET_PROOF:
-                self._on_get_proof(d, now)
+                self._on_get_proof(d)
             case Verb.TX_STATUS:
-                self._on_tx_status(d, now)
+                self._on_tx_status(d)
             case Verb.GET_CHECKPOINT:
-                self._on_get_checkpoint(d, now)
+                self._on_get_checkpoint(d)
             case Verb.GET_CHUNKS:
-                self._on_get_chunks(d, now)
+                self._on_get_chunks(d)
             case Verb.PROVISION:
-                self._on_provision(d, now)
+                self._on_provision(d)
 
     def _is_node(self, who: crypto.PublicKey) -> bool:
         return who == self.store.anchor() or self.mgmt_reader.is_member(who)
 
     # -- consensus verb handlers --------------------------------------------
 
-    def _on_submit(self, d: Delivered, now: Millis) -> MessageId:
+    def _on_submit(self, d: Delivered) -> MessageId:
         tx = ops.SignedTransaction.decode(d.body)
-        refusal = self.coordinator.submit(tx, now)
+        refusal = self.coordinator.submit(tx, Millis.now())
         if refusal is not None:
             return self._reply(d, Verb.REFUSED, refusal.value.encode())
         return self._reply(d, Verb.ACCEPTED, tx.op_hash)
 
     # -- provisioning -------------------------------------------------------
 
-    def _on_provision(self, d: Delivered, now: Millis) -> None:
+    def _on_provision(self, d: Delivered) -> None:
         if d.frm != self.store.anchor():
             return
         if self.store.head_block_num() is not None:
@@ -460,10 +460,10 @@ class Node(_BaseNode):
 
     # -- serving sync requests ----------------------------------------------
 
-    def _on_height(self, d: Delivered, now: Millis) -> MessageId:
+    def _on_height(self, d: Delivered) -> MessageId:
         return self.postman.reply(d, serve_height(self.store), self.tunables.ttl_exchange)
 
-    def _on_getblock(self, d: Delivered, now: Millis) -> MessageId | None:
+    def _on_getblock(self, d: Delivered) -> MessageId | None:
         if not self._replica_authorised(d.frm):
             return self.postman.reply(
                 d, Refused(reason=SyncRefusal.UNAUTHORISED), self.tunables.ttl_exchange
@@ -490,7 +490,7 @@ class Node(_BaseNode):
         grant = self.mgmt_reader.grant_of(who)
         return grant is not None and grant.role in (Role.MANAGER, Role.COMPACTOR)
 
-    def _on_get_checkpoint(self, d: Delivered, now: Millis) -> MessageId | None:
+    def _on_get_checkpoint(self, d: Delivered) -> MessageId | None:
         if not self._replica_authorised(d.frm):
             return self.postman.reply(
                 d,
@@ -509,7 +509,7 @@ class Node(_BaseNode):
             self.tunables.ttl_exchange,
         )
 
-    def _on_get_chunks(self, d: Delivered, now: Millis) -> MessageId | None:
+    def _on_get_chunks(self, d: Delivered) -> MessageId | None:
         if not self._replica_authorised(d.frm):
             return self.postman.reply(
                 d,
@@ -541,7 +541,7 @@ class Node(_BaseNode):
 
     # -- serving lite requests ----------------------------------------------
 
-    def _on_get_anchors(self, d: Delivered, now: Millis) -> MessageId | None:
+    def _on_get_anchors(self, d: Delivered) -> MessageId | None:
         if not self._lite_authorised(d.frm):
             return self.postman.reply(
                 d, LiteRefused(SyncRefusal.UNAUTHORISED), self.tunables.ttl_lite
@@ -560,7 +560,7 @@ class Node(_BaseNode):
             self.tunables.ttl_lite,
         )
 
-    def _on_get_proof(self, d: Delivered, now: Millis) -> MessageId | None:
+    def _on_get_proof(self, d: Delivered) -> MessageId | None:
         if not self._lite_authorised(d.frm):
             return self.postman.reply(
                 d, LiteRefused(SyncRefusal.UNAUTHORISED), self.tunables.ttl_lite
@@ -583,7 +583,7 @@ class Node(_BaseNode):
             self.tunables.ttl_lite,
         )
 
-    def _on_tx_status(self, d: Delivered, now: Millis) -> MessageId | None:
+    def _on_tx_status(self, d: Delivered) -> MessageId | None:
         if not self._lite_authorised(d.frm):
             return self.postman.reply(
                 d, LiteRefused(SyncRefusal.UNAUTHORISED), self.tunables.ttl_lite
@@ -643,20 +643,20 @@ class ReplicaNode(_BaseNode):
         sub = _ReplicaSubstrate(self)
         return SessionRW(sub, store_id)
 
-    def _on_delivered(self, d: Delivered, now: Millis) -> None:
+    def _on_delivered(self, d: Delivered) -> None:
         if d.in_reply_to is not None and self.inflight.on_reply(
             d.in_reply_to.correlation_id, d.verb, d.body
         ):
             return
         match d.verb:
             case Verb.HEIGHT_REPLY:
-                self._on_height_reply(d, now)
+                self._on_height_reply(d)
             case Verb.SETTLED_BLOCK:
-                self._on_settled_block(d, now)
+                self._on_settled_block(d)
             case Verb.SYNC_REFUSED:
-                self._on_sync_refused(d, now)
+                self._on_sync_refused(d)
             case Verb.PING:
-                self._on_ping(d, now)
+                self._on_ping(d)
 
 
 class _ReplicaSubstrate(Substrate):

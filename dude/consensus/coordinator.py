@@ -309,7 +309,7 @@ class Coordinator:
             return
         try:
             msg = SettleSig.decode(event.verb, event.body)
-            self.settling.settle_round.receive(msg, from_=event.frm, now=now)
+            self.settling.settle_round.receive(msg, from_=event.frm)
         except SettleAdapterError:
             return
         self._flush_settle()
@@ -378,7 +378,7 @@ class Coordinator:
             and self.settling is None
         ):
             try:
-                self._promote_to_settling(Millis.now())
+                self._promote_to_settling()
             except DudeError as e:
                 raise InvariantError(f"promote to settling raised mid-transition: {e}") from e
 
@@ -445,7 +445,7 @@ class Coordinator:
                 return frozenset({tx.op_hash})
         return frozenset(tx.op_hash for tx in survivors)
 
-    def _promote_to_settling(self, now: Millis) -> None:
+    def _promote_to_settling(self) -> None:
         r = self.current_round
         if r is None:
             raise InvariantError("_promote_to_settling with no in-flight Round")
@@ -501,7 +501,6 @@ class Coordinator:
             self.me,
             roster,
             anchors,
-            now,
             abandon_by=self._abandon_by(bucket),
         )
         self.settling = _Settling(

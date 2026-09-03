@@ -221,7 +221,6 @@ class SettleRound:
         me: crypto.Keypair,
         roster: tuple[crypto.PublicKey, ...],
         anchors: Anchors,
-        now: Millis,
         abandon_by: Millis,
     ):
         if me.public not in roster:
@@ -244,7 +243,7 @@ class SettleRound:
         self._outbox.append((Recipient.ALL, my_msg))
         self._try_settle()
 
-    def receive(self, msg: SettleSig, from_: crypto.PublicKey, now: Millis) -> None:
+    def receive(self, msg: SettleSig, from_: crypto.PublicKey) -> None:
         if from_ not in self._roster:
             return
         if from_ == self._me.public:
