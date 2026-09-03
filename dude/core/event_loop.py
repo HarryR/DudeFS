@@ -63,6 +63,10 @@ class EventLoop[E: Event]:
             self._cond.notify()
         return s
 
+    @property
+    def running(self) -> bool:
+        return self._thread is not None and not self._stopping
+
     def pending(self) -> int:
         with self._cond:
             return sum(1 for e in self._heap if not e.cancelled)

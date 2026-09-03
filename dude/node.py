@@ -1,7 +1,8 @@
-import contextlib
 import threading
 import time
+from abc import ABC
 from collections.abc import Callable
+from dataclasses import dataclass
 
 from .consensus import Mempool
 from .consensus.canonical import bodies_canonical
@@ -15,10 +16,11 @@ from .consensus.coordinator import (
 from .consensus.settle_round import SettledBlock
 from .core import codec, crypto
 from .core.errors import DudeError
+from .core.event_loop import Event, EventLoop
 from .core.units import Millis
 from .net import MessageId, Verb
 from .net.link import Acceptor, Dialer
-from .net.postman import Delivered, Postman
+from .net.postman import Delivered, Output, Postman
 from .net.socket_server import SocketServer
 from .session import Inflight, KeyCache, SessionRW, SubmitHandle, SubmitResult, Substrate
 from .store import Store, ops
@@ -61,6 +63,27 @@ from .sync.lite_adapter import (
 )
 from .tunables import DEFAULT, Tunables
 
+# -- node events -----------------------------------------------------------
+
+
+class NodeEvent(Event, ABC):
+    __slots__ = ()
+
+
+@dataclass(frozen=True, slots=True)
+class MessageIn(NodeEvent):
+    delivered: Delivered
+
+
+@dataclass(frozen=True, slots=True)
+class MessageExpired(NodeEvent):
+    prefix: bytes
+
+
+class ReconcilePeers(NodeEvent):
+    __slots__ = ()
+
+
 # ---------------------------------------------------------------------------
 # Base — the run loop, lifecycle, peer reconciliation, follower, sync handlers.
 # ---------------------------------------------------------------------------
@@ -77,7 +100,14 @@ class _BaseNode:
         self.me = me
         self.store = store
         self.tunables = tunables
-        self.postman = Postman(me, tunables)
+
+        def _on_postman_output(out: Output) -> None:
+            for d in out.delivered:
+                self._loop.post(MessageIn(d))
+            for e in out.expired:
+                self._loop.post(MessageExpired(e.prefix))
+
+        self.postman = Postman(me, tunables, on_output=_on_postman_output)
 
         def _on_send(e: SendToPeer) -> None:
             self.postman.send(e.peer, e.msg, tunables.ttl_exchange)
@@ -89,9 +119,12 @@ class _BaseNode:
         self.inflight = Inflight()
         self.commit_seq = 0
         self.commit_cond = threading.Condition()
-        self._stopping = threading.Event()
-        self._thread: threading.Thread | None = None
         self._socket_servers: list[SocketServer] = []
+
+        self._loop: EventLoop[NodeEvent] = EventLoop()
+        self._loop.register(MessageIn, self._on_message_in)
+        self._loop.register(MessageExpired, self._on_message_expired)
+        self._loop.register(ReconcilePeers, self._on_reconcile_peers)
 
     @property
     def mgmt_reader(self) -> MgmtReader:
@@ -121,50 +154,41 @@ class _BaseNode:
         self.stop()
 
     def start(self) -> None:
-        if self._thread is not None:
-            return
-        self._stopping = threading.Event()
         self.follower.start()
         self._reconcile_peers()
         self.postman.start()
         for srv in self._socket_servers:
             srv.start()
-        prefix = "replica" if isinstance(self, ReplicaNode) else "node"
-        self._thread = threading.Thread(
-            target=self._run,
-            name=f"{prefix}-{self.me.public.hex()[:8]}",
-            daemon=True,
-        )
-        self._thread.start()
+        self._loop.start()
+        self._schedule_reconcile()
 
     def stop(self) -> None:
-        thread = self._thread
-        if thread is None:
-            return
-        self._thread = None
-        self._stopping.set()
+        self._loop.stop()
         for srv in self._socket_servers:
             srv.stop()
         self.follower.stop()
         self.postman.stop()
-        thread.join()
         self.store.close()
 
-    def _run(self) -> None:
-        tick_interval = self.tunables.tick_interval.as_seconds
-        while not self._stopping.is_set():
-            now = Millis.now()
-            for output in self.postman.drain_output(timeout=tick_interval):
-                for d in output.delivered:
-                    self._on_delivered(d, now)
-            with contextlib.suppress(DudeError):
-                self._tick(now)
+    # -- event handlers --------------------------------------------------------
 
-    def _tick(self, now: Millis) -> None:
+    def _on_message_in(self, event: MessageIn) -> None:
+        self._on_delivered(event.delivered, Millis.now())
+
+    def _on_message_expired(self, event: MessageExpired) -> None:
+        self.inflight.on_expired(event.prefix)
+
+    def _on_reconcile_peers(self, _event: ReconcilePeers) -> None:
         self._reconcile_peers()
         checkpoint_block = self.follower.needs_checkpoint()
         if checkpoint_block is not None:
             self._download_checkpoint()
+        self._schedule_reconcile()
+
+    def _schedule_reconcile(self) -> None:
+        self._loop.schedule(
+            Millis.now() + self.tunables.tick_interval, ReconcilePeers()
+        )
 
     def _on_delivered(self, d: Delivered, now: Millis) -> None:
         raise NotImplementedError
@@ -181,7 +205,7 @@ class _BaseNode:
         mid = self.postman.send_raw(peer, verb, body, self.tunables.ttl_exchange)
         tick = self.tunables.tick_interval.as_seconds
         deadline = time.monotonic() + timeout_sec
-        while time.monotonic() < deadline and not self._stopping.is_set():
+        while time.monotonic() < deadline and self._loop.running:
             remaining = min(tick, deadline - time.monotonic())
             if remaining <= 0:
                 break
@@ -206,7 +230,7 @@ class _BaseNode:
         get_cp_verb, get_cp_body = GetCheckpoint().encode()
 
         for peer in peers:
-            if self._stopping.is_set():
+            if not self._loop.running:
                 return
             d = self._send_and_wait(peer, get_cp_verb, get_cp_body, timeout)
             if d is None or d.verb != Verb.CHECKPOINT_META or not d.body:
@@ -221,7 +245,7 @@ class _BaseNode:
             chunks: list = []
             offset = 0
             ok = True
-            while not self._stopping.is_set():
+            while self._loop.running:
                 req_verb, req_body = GetChunks(checkpoint_id=checkpoint_id, offset=offset).encode()
                 d = self._send_and_wait(peer, req_verb, req_body, timeout)
                 if d is None or d.verb != Verb.CHUNKS_REPLY:
@@ -233,7 +257,7 @@ class _BaseNode:
                     break
                 offset += len(reply.chunks)
 
-            if not ok or self._stopping.is_set():
+            if not ok or not self._loop.running:
                 continue
 
             with self.store.write() as w:
@@ -346,26 +370,12 @@ class Node(_BaseNode):
         self.coordinator.stop()
         super().stop()
 
-    def _run(self) -> None:
-        tick_interval = self.tunables.tick_interval.as_seconds
-        while not self._stopping.is_set():
-            now = Millis.now()
-            for output in self.postman.drain_output():
-                for d in output.delivered:
-                    self._on_delivered(d, now)
-            with contextlib.suppress(DudeError):
-                self._tick(now)
-            self._stopping.wait(timeout=tick_interval)
-
     @property
     def mempool(self) -> Mempool:
         return self.coordinator.mempool
 
     def set_immediate(self, enabled: bool = True) -> None:
         self.coordinator.set_immediate(enabled)
-
-    def _tick(self, now: Millis) -> None:
-        self._reconcile_peers()
 
     def _notify_followers(self) -> None:
         reply = serve_height(self.store)
@@ -632,24 +642,6 @@ class ReplicaNode(_BaseNode):
     def session(self, store_id: int = ops.STORE_DATA) -> SessionRW:
         sub = _ReplicaSubstrate(self)
         return SessionRW(sub, store_id)
-
-    def _run(self) -> None:
-        tick_interval = self.tunables.tick_interval.as_seconds
-        while not self._stopping.is_set():
-            now = Millis.now()
-            for output in self.postman.drain_output(timeout=tick_interval):
-                for d in output.delivered:
-                    self._on_delivered(d, now)
-                for e in output.expired:
-                    self.inflight.on_expired(e.prefix)
-            with contextlib.suppress(DudeError):
-                self._tick(now)
-
-    def _on_settled_block(self, d: Delivered, now: Millis) -> None:
-        super()._on_settled_block(d, now)
-        with self.commit_cond:
-            self.commit_seq += 1
-            self.commit_cond.notify_all()
 
     def _on_delivered(self, d: Delivered, now: Millis) -> None:
         if d.in_reply_to is not None and self.inflight.on_reply(

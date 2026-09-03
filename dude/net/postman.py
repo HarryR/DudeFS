@@ -2,7 +2,7 @@ import contextlib
 import queue
 import threading
 from abc import ABC, abstractmethod
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import NamedTuple
@@ -133,6 +133,7 @@ class Output(NamedTuple):
 class Postman:
     me: crypto.Keypair
     tunables: Tunables
+    on_output: Callable[[Output], None] = field(default=lambda _: None)
 
     mailbox: Mailbox = field(default_factory=Mailbox)
     peers: dict[crypto.PublicKey, Peer] = field(default_factory=dict)
@@ -388,20 +389,20 @@ class Postman:
             self._do_link_established(link)
 
         reply_to = env.env.reply_to
-        self._output.put(
-            Output(
-                delivered=(
-                    Delivered(
-                        frm=env.frm,
-                        verb=env.env.verb,
-                        body=env.env.body,
-                        mid=env.env.mid,
-                        in_reply_to=MessageId(reply_to) if reply_to else None,
-                    ),
+        out = Output(
+            delivered=(
+                Delivered(
+                    frm=env.frm,
+                    verb=env.env.verb,
+                    body=env.env.body,
+                    mid=env.env.mid,
+                    in_reply_to=MessageId(reply_to) if reply_to else None,
                 ),
-                expired=(),
-            )
+            ),
+            expired=(),
         )
+        self._output.put(out)
+        self.on_output(out)
 
     def _maintain_links(self) -> None:
         desired = self.tunables.desired_links_per_peer
@@ -438,7 +439,9 @@ class Postman:
             )
         expired = self._reap(now)
         if expired:
-            self._output.put(Output(delivered=(), expired=expired))
+            out = Output(delivered=(), expired=expired)
+            self._output.put(out)
+            self.on_output(out)
 
     def _act(self, decision: Decision, t: Transmit, now: Millis) -> None:
         match decision:
