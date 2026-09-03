@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -33,12 +34,9 @@ CANNOT_APPLY = Refusal.CANNOT_APPLY
 class Mempool:
     tunables: Tunables = field(default_factory=Tunables)
     pending: dict[Bucket, dict[crypto.Digest, ops.SignedTransaction]] = field(default_factory=dict)
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def valid(
-        # on; collapsing them hides which door it was turned away at.
-        # THE CLOCK MAY CHOOSE, IT MAY NOT JUDGE: `now` is read here and in `propose`,
-        # never in verifying a proposal. A clock read anywhere else turns skew from a throughput
-        # cost into a liveness or safety failure.
         self,
         tx: ops.SignedTransaction,
         now: Millis,
@@ -52,16 +50,9 @@ class Mempool:
             return Refusal.TOO_NEW
         if not tx.verify():
             return Refusal.UNSIGNED
-        # One operation, once. A tx carrying the same mutation twice applies it twice in the
-        # preview that computes a block's anchors and once in the store, which is a log position
-        # of disagreement between what a block is signed for and what it settles. `apply_to` and
-        # `_apply_within` both dedup now, so this is not what holds that -- it refuses the shape
-        # at the door instead of letting every later stage carry the question.
         mutations = [step.mutation for step in tx.steps]
         if len(set(mutations)) != len(mutations):
             return Refusal.REPEATED_OP
-        # A settled tx MUST NOT re-enter (#dedup-content-address). This is why the parameter is
-        # `Ledger` and not `Reader`: an overlay has no log, so admitting against one cannot compile.
         if reader.has_settled(tx.op_hash):
             return Refusal.DUPLICATE
         if settle.would_apply(reader, (tx,), auth).rejects:
@@ -100,36 +91,44 @@ class Mempool:
         reader: Ledger,
         auth: settle.Authoriser,
     ) -> Refusal | None:
-        if any(tx.op_hash in held for held in self.pending.values()):
-            return Refusal.DUPLICATE
-        if (why := self.valid(tx, now, reader, auth)) is not None:
-            return why
-        t = self.tunables
-        landed = max(t.bucket(Millis(tx.ts)), t.bucket(now))
-        self.pending.setdefault(landed, {})[tx.op_hash] = tx
-        return None
+        with self._lock:
+            if any(tx.op_hash in held for held in self.pending.values()):
+                return Refusal.DUPLICATE
+            if (why := self.valid(tx, now, reader, auth)) is not None:
+                return why
+            t = self.tunables
+            landed = max(t.bucket(Millis(tx.ts)), t.bucket(now))
+            self.pending.setdefault(landed, {})[tx.op_hash] = tx
+            return None
 
     def buckets(self) -> tuple[Bucket, ...]:
-        return tuple(sorted(b for b, held in self.pending.items() if held))
+        with self._lock:
+            return tuple(sorted(b for b, held in self.pending.items() if held))
 
     def all_hashes(self) -> frozenset[crypto.Digest]:
-        return frozenset(op_hash for txs in self.pending.values() for op_hash in txs)
+        with self._lock:
+            return frozenset(op_hash for txs in self.pending.values() for op_hash in txs)
 
     def all_bodies(self) -> dict[crypto.Digest, ops.SignedTransaction]:
-        return {tx.op_hash: tx for txs in self.pending.values() for tx in txs.values()}
+        with self._lock:
+            return {tx.op_hash: tx for txs in self.pending.values() for tx in txs.values()}
 
     def snapshot(self) -> Mempool:
-        return Mempool(
-            tunables=self.tunables,
-            pending={b: dict(txs) for b, txs in self.pending.items() if txs},
-        )
+        with self._lock:
+            return Mempool(
+                tunables=self.tunables,
+                pending={b: dict(txs) for b, txs in self.pending.items() if txs},
+            )
 
     def evict_settled(self, reader: Ledger) -> None:
-        for bucket_txs in self.pending.values():
-            for h in list(bucket_txs):
-                if reader.has_settled(h):
+        with self._lock:
+            all_hashes = tuple(h for txs in self.pending.values() for h in txs)
+            settled = reader.has_settled(*all_hashes)
+            for bucket_txs in self.pending.values():
+                for h in settled & bucket_txs.keys():
                     del bucket_txs[h]
-        self.pending = {b: txs for b, txs in self.pending.items() if txs}
+            self.pending = {b: txs for b, txs in self.pending.items() if txs}
 
     def __len__(self) -> int:
-        return sum(len(held) for held in self.pending.values())
+        with self._lock:
+            return sum(len(held) for held in self.pending.values())

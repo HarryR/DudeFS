@@ -1,9 +1,17 @@
 import contextlib
 import threading
 import time
+from collections.abc import Callable
 
-from .consensus import Coordinator, Mempool, RoundAdapter, SettleAdapter
+from .consensus import Mempool
 from .consensus.canonical import bodies_canonical
+from .consensus.coordinator import (
+    BlockSettled,
+    Coordinator,
+    RoundMessage,
+    SendConsensus,
+    SettleMessage,
+)
 from .consensus.settle_round import SettledBlock
 from .core import codec, crypto
 from .core.errors import DudeError
@@ -31,6 +39,7 @@ from .sync.checkpoint_adapter import (
 )
 from .sync.checkpoint_server import CheckpointServer
 from .sync.follower import (
+    BlockCommitted,
     Follower,
     PeerAdded,
     PeerMessage,
@@ -58,7 +67,13 @@ from .tunables import DEFAULT, Tunables
 
 
 class _BaseNode:
-    def __init__(self, me: crypto.Keypair, store: Store, tunables: Tunables = DEFAULT) -> None:
+    def __init__(
+        self,
+        me: crypto.Keypair,
+        store: Store,
+        on_follower_commit: Callable[[BlockCommitted], None],
+        tunables: Tunables = DEFAULT,
+    ) -> None:
         self.me = me
         self.store = store
         self.tunables = tunables
@@ -69,7 +84,7 @@ class _BaseNode:
 
         self.follower = Follower(
             me=me, store=store, mgmt_reader=store.mgmt_reader,
-            tunables=tunables, on_send=_on_send,
+            tunables=tunables, on_send=_on_send, on_commit=on_follower_commit,
         )
         self.inflight = Inflight()
         self.commit_seq = 0
@@ -300,18 +315,36 @@ CONSENSUS_ONLY = frozenset({Verb.BODIES, Verb.HELD, Verb.SIG, Verb.SETTLE_SIG})
 
 class Node(_BaseNode):
     def __init__(self, me: crypto.Keypair, store: Store, tunables: Tunables = DEFAULT) -> None:
-        super().__init__(me, store, tunables)
-        self.adapter = RoundAdapter(me, self.postman, tunables.ttl_round)
-        self.settle_adapter = SettleAdapter(me, self.postman, tunables.ttl_round)
+        def _on_follower_commit(_e: BlockCommitted) -> None:
+            with self.commit_cond:
+                self.commit_seq += 1
+                self.commit_cond.notify_all()
+            self._notify_followers()
+
+        super().__init__(me, store, on_follower_commit=_on_follower_commit, tunables=tunables)
+
+        def _on_consensus_send(e: SendConsensus) -> None:
+            verb, body = e.msg.encode()
+            self.postman.send_raw(e.peer, verb, body, tunables.ttl_round, await_reply=False)
+
+        def _on_block_settled(_e: BlockSettled) -> None:
+            self._notify_followers()
+
         self.coordinator = Coordinator(
-            me,
-            store,
-            self.adapter,
-            self.settle_adapter,
-            tunables,
-            self.follower.behind,
+            me, store, tunables,
+            behind=self.follower.behind,
+            on_send=_on_consensus_send,
+            on_settled=_on_block_settled,
         )
         self.checkpoint_server: CheckpointServer | None = None
+
+    def start(self) -> None:
+        super().start()
+        self.coordinator.start()
+
+    def stop(self) -> None:
+        self.coordinator.stop()
+        super().stop()
 
     def _run(self) -> None:
         tick_interval = self.tunables.tick_interval.as_seconds
@@ -333,17 +366,12 @@ class Node(_BaseNode):
 
     def _tick(self, now: Millis) -> None:
         self._reconcile_peers()
-        prev_head = self.store.head_block_num()
-        self.coordinator.tick(now)
-        if self.store.head_block_num() != prev_head:
-            self._notify_followers()
 
     def _notify_followers(self) -> None:
         reply = serve_height(self.store)
-        roster = frozenset(self.roster())
+        verb, body = reply.encode()
         for pub in self.postman.peers:
-            if pub not in roster:
-                self.postman.send(pub, reply, self.tunables.ttl_exchange)
+            self.postman.send_raw(pub, verb, body, self.tunables.ttl_exchange, await_reply=False)
 
     # -- inbound dispatch ---------------------------------------------------
 
@@ -353,14 +381,10 @@ class Node(_BaseNode):
         match d.verb:
             case Verb.SUBMIT:
                 self._on_submit(d, now)
-            case Verb.HELD:
-                self._on_held(d, now)
-            case Verb.SIG:
-                self._on_sig(d, now)
-            case Verb.BODIES:
-                self._on_bodies(d, now)
+            case Verb.HELD | Verb.SIG | Verb.BODIES:
+                self.coordinator.post(RoundMessage(d.frm, d.verb, d.body))
             case Verb.SETTLE_SIG:
-                self._on_settle_sig(d, now)
+                self.coordinator.post(SettleMessage(d.frm, d.verb, d.body))
             case Verb.HEIGHT:
                 self._on_height(d, now)
             case Verb.HEIGHT_REPLY:
@@ -397,18 +421,6 @@ class Node(_BaseNode):
         if refusal is not None:
             return self._reply(d, Verb.REFUSED, refusal.value.encode())
         return self._reply(d, Verb.ACCEPTED, tx.op_hash)
-
-    def _on_held(self, d: Delivered, now: Millis) -> None:
-        self.coordinator.on_round_msg(d.frm, d.verb, d.body, now)
-
-    def _on_sig(self, d: Delivered, now: Millis) -> None:
-        self.coordinator.on_round_msg(d.frm, d.verb, d.body, now)
-
-    def _on_bodies(self, d: Delivered, now: Millis) -> None:
-        self.coordinator.on_round_msg(d.frm, d.verb, d.body, now)
-
-    def _on_settle_sig(self, d: Delivered, now: Millis) -> None:
-        self.coordinator.on_settle_msg(d.frm, d.verb, d.body, now)
 
     # -- provisioning -------------------------------------------------------
 
@@ -601,6 +613,14 @@ class Node(_BaseNode):
 
 
 class ReplicaNode(_BaseNode):
+    def __init__(self, me: crypto.Keypair, store: Store, tunables: Tunables = DEFAULT) -> None:
+        def _on_follower_commit(_e: BlockCommitted) -> None:
+            with self.commit_cond:
+                self.commit_seq += 1
+                self.commit_cond.notify_all()
+
+        super().__init__(me, store, on_follower_commit=_on_follower_commit, tunables=tunables)
+
     def submit(self, tx: ops.SignedTransaction, to: crypto.PublicKey) -> MessageId:
         return self.postman.send_raw(
             to,

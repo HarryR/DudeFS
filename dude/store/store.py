@@ -279,8 +279,15 @@ class StoreReader(View, Ledger, _ExportSource):
         for st, name, value, cred, epoch in rows:
             yield PathRow(int(st), name, value, cred, int(epoch))
 
-    def has_settled(self, op_hash: crypto.Digest) -> bool:
-        return bool(self.settled_hashes((op_hash,)))
+    def has_settled(self, *op_hashes: crypto.Digest) -> frozenset[crypto.Digest]:
+        if not op_hashes:
+            return frozenset()
+        marks = ",".join("?" * len(op_hashes))
+        rows = self._conn.execute(
+            f"SELECT op_hash FROM entry WHERE op_hash IN ({marks})",  # noqa: S608
+            op_hashes,
+        ).fetchall()
+        return frozenset(r[0] for r in rows)
 
     def settlement_of(self, op_hash: crypto.Digest) -> Settled | None:
         row = self._conn.execute(
@@ -292,16 +299,6 @@ class StoreReader(View, Ledger, _ExportSource):
         if row is None:
             return None
         return Settled(op_hash, row[0], crypto.Digest(bytes(row[1])))
-
-    def settled_hashes(self, want: tuple[crypto.Digest, ...]) -> set[crypto.Digest]:
-        if not want:
-            return set()
-        marks = ",".join("?" * len(want))
-        rows = self._conn.execute(
-            f"SELECT op_hash FROM entry WHERE op_hash IN ({marks})",
-            want,
-        ).fetchall()
-        return {r[0] for r in rows}
 
     @property
     def mgmt_reader(self) -> MgmtReader:
@@ -426,7 +423,7 @@ class StoreWriter(StoreReader, _ImportTarget):
     ) -> Applied:
         settled: list[tuple[Index, crypto.Digest]] = []
         dropped: list[Dropped] = []
-        already = self.settled_hashes(tuple(tx.op_hash for tx in batch))
+        already = set(self.has_settled(*(tx.op_hash for tx in batch)))
         acc = self.accumulator()
         idx = self.head()
         for tx in batch:
@@ -644,9 +641,9 @@ class Store(View, Ledger):
         with self.snapshot() as r:
             yield from list(r._rows_in_path_range(lo, hi))
 
-    def has_settled(self, op_hash: crypto.Digest) -> bool:
+    def has_settled(self, *op_hashes: crypto.Digest) -> frozenset[crypto.Digest]:
         with self.snapshot() as r:
-            return r.has_settled(op_hash)
+            return r.has_settled(*op_hashes)
 
     def settlement_of(self, op_hash: crypto.Digest) -> Settled | None:
         with self.snapshot() as r:
@@ -663,10 +660,6 @@ class Store(View, Ledger):
     def checkpoint_chunks(self, offset: int, limit: int) -> tuple[bytes, ...]:
         with self.snapshot() as r:
             return r.checkpoint_chunks(offset, limit)
-
-    def settled_hashes(self, want: tuple[crypto.Digest, ...]) -> set[crypto.Digest]:
-        with self.snapshot() as r:
-            return r.settled_hashes(want)
 
     @property
     def is_frozen(self) -> bool:

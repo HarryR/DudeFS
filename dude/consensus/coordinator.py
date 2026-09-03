@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import logging
+from abc import ABC
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from ..core import crypto
 from ..core.errors import DudeError, InvariantError
+from ..core.event_loop import Event, EventLoop, Scheduled
 from ..core.units import Bucket, Millis
 from ..net.envelope import Verb
+from ..net.postman import Encodable, recipients
 from ..store import settle
 from ..store.layer import Index, Layer
 from ..store.management import MgmtReader
@@ -17,11 +20,74 @@ from ..tunables import Tunables
 from .canonical import CanonicalBatch
 from .mempool import Mempool, Refusal
 from .round import Block, Bodies, Round, RoundAdapterError, RoundMsg
-from .round_adapter import RoundAdapter
-from .settle_adapter import SettleAdapter
-from .settle_round import Anchors, SettleAdapterError, SettleRound, SettleSig, genesis_stamp
+from .settle_round import (
+    Anchors,
+    SettleAdapterError,
+    SettleRound,
+    SettleSig,
+    genesis_stamp,
+)
 
 _log = logging.getLogger(__name__)
+
+
+# -- events ----------------------------------------------------------------
+
+
+class CoordinatorEvent(Event, ABC):
+    __slots__ = ()
+
+
+@dataclass(frozen=True, slots=True)
+class RoundMessage(CoordinatorEvent):
+    frm: crypto.PublicKey
+    verb: Verb
+    body: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class SettleMessage(CoordinatorEvent):
+    frm: crypto.PublicKey
+    verb: Verb
+    body: bytes
+
+
+class RoundClose(CoordinatorEvent):
+    __slots__ = ("bucket",)
+
+    def __init__(self, bucket: Bucket) -> None:
+        self.bucket = bucket
+
+
+class RoundAbandon(CoordinatorEvent):
+    __slots__ = ("bucket",)
+
+    def __init__(self, bucket: Bucket) -> None:
+        self.bucket = bucket
+
+
+class SettleAbandon(CoordinatorEvent):
+    __slots__ = ("slice_hash",)
+
+    def __init__(self, slice_hash: crypto.Digest) -> None:
+        self.slice_hash = slice_hash
+
+
+class BucketTick(CoordinatorEvent):
+    __slots__ = ()
+
+
+@dataclass(frozen=True, slots=True)
+class SendConsensus(CoordinatorEvent):
+    peer: crypto.PublicKey
+    msg: Encodable
+
+
+class BlockSettled(CoordinatorEvent):
+    __slots__ = ()
+
+
+# -- internal ---------------------------------------------------------------
 
 
 @dataclass(slots=True)
@@ -36,44 +102,113 @@ class _Settling:
     settle_round: SettleRound
 
 
-@dataclass(slots=True)
+# -- coordinator ------------------------------------------------------------
+
+
 class Coordinator:
-    me: crypto.Keypair
-    store: Store
-    adapter: RoundAdapter
-    settle_adapter: SettleAdapter
-    tunables: Tunables
+    __slots__ = (
+        "_bucket_timer",
+        "_force_close",
+        "_loop",
+        "_on_send",
+        "_on_settled",
+        "_round_abandon_timer",
+        "_round_close_timer",
+        "_settle_abandon_timer",
+        "_settle_stalls",
+        "behind",
+        "current_bucket",
+        "current_round",
+        "me",
+        "mempool",
+        "settling",
+        "store",
+        "tunables",
+    )
 
-    behind: Callable[[Millis], bool]
-    """`Follower.behind`. REQUIRED, never defaulted: a default is wrong for whichever caller
-    forgets it, and the symptom -- a node leading a bucket over a chain it does not hold, or a
-    cluster silently producing nothing -- is invisible from inside this class."""
+    def __init__(
+        self,
+        me: crypto.Keypair,
+        store: Store,
+        tunables: Tunables,
+        behind: Callable[[Millis], bool],
+        on_send: Callable[[SendConsensus], None],
+        on_settled: Callable[[BlockSettled], None],
+    ) -> None:
+        self.me = me
+        self.store = store
+        self.tunables = tunables
+        self.behind = behind
+        self._on_send = on_send
+        self._on_settled = on_settled
 
-    # ONE OF EACH, NEVER A QUEUE. Turning any of these three into a collection is a different
-    # protocol, not an optimisation.
-    mempool: Mempool = field(init=False)
-    current_round: Round | None = field(init=False, default=None)
-    settling: _Settling | None = field(init=False, default=None)
-    current_bucket: Bucket = field(init=False, default=-1)
-    _settle_stalls: int = field(init=False, default=0)
-    _force_close: bool = field(init=False, default=False)
+        self.mempool = Mempool(tunables)
+        self.current_round: Round | None = None
+        self.settling: _Settling | None = None
+        self.current_bucket: Bucket = -1
+        self._settle_stalls = 0
+        self._force_close = False
 
-    def __post_init__(self) -> None:
-        self.mempool = Mempool(self.tunables)
+        self._round_close_timer: Scheduled[CoordinatorEvent] | None = None
+        self._round_abandon_timer: Scheduled[CoordinatorEvent] | None = None
+        self._settle_abandon_timer: Scheduled[CoordinatorEvent] | None = None
+        self._bucket_timer: Scheduled[CoordinatorEvent] | None = None
+
+        self._loop: EventLoop[CoordinatorEvent] = EventLoop()
+        self._loop.register(RoundMessage, self._on_round_msg)
+        self._loop.register(SettleMessage, self._on_settle_msg)
+        self._loop.register(RoundClose, self._on_round_close)
+        self._loop.register(RoundAbandon, self._on_round_abandon)
+        self._loop.register(SettleAbandon, self._on_settle_abandon_event)
+        self._loop.register(BucketTick, self._on_bucket_tick)
+        self._loop.register(BlockSettled, self._on_block_settled)
+
+    # -- lifecycle -------------------------------------------------------------
+
+    def post(self, event: CoordinatorEvent) -> None:
+        self._loop.post(event)
+
+    def start(self) -> None:
+        self._loop.start()
+        now = Millis.now()
+        if self.current_bucket < 0:
+            self.current_bucket = self._bucket_of(now)
+        self._loop.post(BucketTick())
+
+    def stop(self) -> None:
+        self._loop.stop()
+
+    # -- synchronous (not routed through the loop) -----------------------------
+
+    def submit(self, tx: SignedTransaction, now: Millis) -> Refusal | None:
+        if not self.in_roster:
+            return Refusal.NOT_IN_ROSTER
+        return self.mempool.admit(tx, now, self.store, self.mgmt_reader)
 
     def set_immediate(self, enabled: bool = True) -> None:
         self._force_close = enabled
+        if enabled:
+            self._loop.post(BucketTick())
+
+    # -- outbound event handlers -----------------------------------------------
+
+    def _on_block_settled(self, event: BlockSettled) -> None:
+        self._on_settled(event)
+
+    # -- properties ------------------------------------------------------------
 
     @property
     def mgmt_reader(self) -> MgmtReader:
         return MgmtReader(self.store.mgmt_session())
 
+    @property
+    def in_roster(self) -> bool:
+        return self.mgmt_reader.is_member(self.me.public)
+
     def _bucket_of(self, now: Millis) -> Bucket:
         return self.tunables.bucket(now)
 
     def _prev_block(self) -> crypto.Digest:
-        """The Round is keyed on this and the anchors carry it; they MUST be the same value, or
-        the block's own quorum did not agree what it follows."""
         prev = self.store.head_block_hash()
         if prev is not None:
             return prev
@@ -82,55 +217,76 @@ class Coordinator:
             raise InvariantError("store has no manager anchor; cannot compute genesis stamp")
         return genesis_stamp(manager)
 
-    # THE CADENCE GRID. During window W:
-    #
-    #     Mempool(W) collects | Round(W-1) converges holdings, cuts a slice, settles it
-    #
-    # Round(B) opens at W=B+1 and lives entirely inside that window; phase 2 gets whatever
-    # `cut_reserve` leaves. Every deadline is bucket arithmetic and NONE is measured from `now`:
-    # measured from `now`, each node runs on its own phase, and nodes that fall out of step never
-    # share a bucket again.
-
     def _close_by(self, bucket: Bucket) -> Millis:
         return self._abandon_by(bucket) - self.tunables.cut_reserve
 
     def _abandon_by(self, bucket: Bucket) -> Millis:
         return self.tunables.bucket_start(bucket + 2)
 
-    @property
-    def in_roster(self) -> bool:
-        """Whether we hold a seat RIGHT NOW. The Follower can adopt a roster change at any tick,
-        so this is read at each decision rather than cached at construction."""
-        return self.mgmt_reader.is_member(self.me.public)
+    # -- timer scheduling ------------------------------------------------------
 
-    def submit(self, tx: SignedTransaction, now: Millis) -> Refusal | None:
-        if not self.in_roster:
-            # A non-member ACCEPTED submissions and then discarded its whole mempool at the
-            # bucket boundary -- rotation happens before _open_round declines -- so the
-            # client held an ACCEPTED for a tx that vanished without a trace. Refused here,
-            # the client knows to try a roster member instead.
-            return Refusal.NOT_IN_ROSTER
-        return self.mempool.admit(tx, now, self.store, self.mgmt_reader)
+    def _cancel_round_timers(self) -> None:
+        if self._round_close_timer is not None:
+            self._round_close_timer.cancel()
+            self._round_close_timer = None
+        if self._round_abandon_timer is not None:
+            self._round_abandon_timer.cancel()
+            self._round_abandon_timer = None
 
-    def on_round_msg(self, frm: crypto.PublicKey, verb: Verb, body: bytes, now: Millis) -> None:
+    def _cancel_settle_timer(self) -> None:
+        if self._settle_abandon_timer is not None:
+            self._settle_abandon_timer.cancel()
+            self._settle_abandon_timer = None
+
+    def _schedule_bucket_tick(self, now: Millis) -> None:
+        if self._bucket_timer is not None:
+            self._bucket_timer.cancel()
+        next_boundary = self.tunables.bucket_start(self.current_bucket + 1)
+        if next_boundary <= now:
+            self._loop.post(BucketTick())
+            self._bucket_timer = None
+        else:
+            self._bucket_timer = self._loop.schedule(next_boundary, BucketTick())
+
+    # -- inbound event handlers ------------------------------------------------
+
+    def _catch_up(self, now: Millis) -> None:
+        if self.settling is not None:
+            self.settling.settle_round.tick(now)
+            self._flush_settle()
+            self._check_settled()
+        if self.current_round is not None:
+            self.current_round.tick(now)
+            self._flush_round()
+            if self.current_round is not None and self.current_round.abandoned():
+                self._cancel_round_timers()
+                self.current_round = None
+        self._check_ratified()
+        self._close_current_bucket(now)
+
+    def _on_round_msg(self, event: RoundMessage) -> None:
         try:
-            bucket = RoundMsg.bucket_of(body)
+            bucket = RoundMsg.bucket_of(event.body)
         except RoundAdapterError:
             return
-        self.tick(now)
+        now = Millis.now()
+        self._catch_up(now)
         r = self.current_round
         if r is None or r.bucket() != bucket:
             return
         try:
-            if verb is Verb.BODIES:
-                self._absorb_bodies(frm, verb, body, r, now)
+            if event.verb is Verb.BODIES:
+                self._absorb_bodies(event.frm, event.verb, event.body, r)
             else:
-                self.adapter.deliver(frm, verb, body, r, now)
+                msg = RoundMsg.decode(event.verb, event.body)
+                r.receive(msg, from_=event.frm, now=Millis.now())
         except RoundAdapterError:
             return
+        self._flush_round()
+        self._check_ratified()
 
     def _absorb_bodies(
-        self, frm: crypto.PublicKey, verb: Verb, body: bytes, r: Round, _now: Millis
+        self, frm: crypto.PublicKey, verb: Verb, body: bytes, r: Round
     ) -> None:
         msg = RoundMsg.decode(verb, body)
         if not isinstance(msg, Bodies):
@@ -142,54 +298,100 @@ class Coordinator:
         )
         r.absorb(msg, frm, good)
 
-    def on_settle_msg(self, frm: crypto.PublicKey, verb: Verb, body: bytes, now: Millis) -> None:
+    def _on_settle_msg(self, event: SettleMessage) -> None:
         try:
-            sh = SettleSig.slice_hash_of(body)
+            sh = SettleSig.slice_hash_of(event.body)
         except SettleAdapterError:
             return
-        self.tick(now)
+        now = Millis.now()
+        self._catch_up(now)
         if self.settling is None or self.settling.block.slice_hash != sh:
             return
         try:
-            self.settle_adapter.deliver(frm, verb, body, self.settling.settle_round, now)
+            msg = SettleSig.decode(event.verb, event.body)
+            self.settling.settle_round.receive(msg, from_=event.frm, now=now)
         except SettleAdapterError:
             return
+        self._flush_settle()
+        self._check_settled()
 
-    def tick(self, now: Millis) -> None:
-        if self.current_bucket < 0:
-            self.current_bucket = self._bucket_of(now)
+    def _on_round_close(self, event: RoundClose) -> None:
+        r = self.current_round
+        if r is None or r.bucket() != event.bucket:
+            return
+        now = Millis.now()
+        r.tick(now)
+        self._flush_round()
+        self._check_ratified()
 
-        if self.settling is not None:
-            self.settling.settle_round.tick(now)
-            self.settle_adapter.flush(self.settling.settle_round, now)
-            if self.settling.settle_round.settled() is not None:
-                self._on_settled(now)
-            elif self.settling.settle_round.abandoned():
-                self._on_settle_abandoned(now)
+    def _on_round_abandon(self, event: RoundAbandon) -> None:
+        r = self.current_round
+        if r is None or r.bucket() != event.bucket:
+            return
+        now = Millis.now()
+        r.tick(now)
+        if r.abandoned():
+            self._cancel_round_timers()
+            self.current_round = None
 
-        if self.current_round is not None:
-            self.current_round.tick(now)
-            self.adapter.flush(self.current_round, now)
-            if self.current_round.abandoned():
-                self._on_round_abandoned(now)
+    def _on_settle_abandon_event(self, event: SettleAbandon) -> None:
+        s = self.settling
+        if s is None or s.block.slice_hash != event.slice_hash:
+            return
+        now = Millis.now()
+        s.settle_round.tick(now)
+        if s.settle_round.abandoned():
+            self._cancel_settle_timer()
+            self._do_settle_abandoned()
 
+    def _on_bucket_tick(self, _event: BucketTick) -> None:
+        now = Millis.now()
+        self._close_current_bucket(now)
+        self._schedule_bucket_tick(now)
+
+    # -- flush outboxes as events ----------------------------------------------
+
+    def _flush_round(self) -> None:
+        r = self.current_round
+        if r is None:
+            return
+        roster = r.roster()
+        for target, msg in r.outbox():
+            for peer in recipients(target, roster, self.me.public):
+                self._on_send(SendConsensus(peer, msg))
+
+    def _flush_settle(self) -> None:
+        s = self.settling
+        if s is None:
+            return
+        roster = s.settle_round.roster()
+        for target, msg in s.settle_round.outbox():
+            for peer in recipients(target, roster, self.me.public):
+                self._on_send(SendConsensus(peer, msg))
+
+    # -- state transitions -----------------------------------------------------
+
+    def _check_ratified(self) -> None:
         if (
             self.current_round is not None
             and self.current_round.ratified() is not None
             and self.settling is None
         ):
             try:
-                self._promote_to_settling(now)
+                self._promote_to_settling(Millis.now())
             except DudeError as e:
-                # NOT CATCHABLE. Promote refuses by returning; anything that RAISES past that
-                # point is the evaluator, the SMT or an accumulator failing, which is corruption
-                # or non-determinism rather than a peer's fault. Left as a DudeError it was
-                # swallowed at the crash-only boundary and the bucket's agreed work disappeared
-                # in silence. Fatal means the supervisor respawns us and the Follower resyncs --
-                # which is the only way to actually rely on core machinery not failing.
                 raise InvariantError(f"promote to settling raised mid-transition: {e}") from e
 
-        self._close_current_bucket(now)
+    def _check_settled(self) -> None:
+        s = self.settling
+        if s is None:
+            return
+        if s.settle_round.settled() is not None:
+            self._cancel_settle_timer()
+            self._do_settled()
+        elif s.settle_round.abandoned():
+            self._cancel_settle_timer()
+            self._do_settle_abandoned()
 
     def _close_current_bucket(self, now: Millis) -> None:
         forced = self._force_close
@@ -209,8 +411,7 @@ class Coordinator:
 
     def _open_round(self, bucket: Bucket, frozen: Mempool, now: Millis) -> None:
         if not self.in_roster:
-            return  # follower-only: Round refuses `me not in roster`, and the raise would tear
-            # down the node's tick. Sit out consensus and let the Follower catch us up.
+            return
         roster = self.mgmt_reader.roster()
         r = Round(
             bucket=bucket,
@@ -224,21 +425,18 @@ class Coordinator:
         )
         r.add_local(frozen.all_bodies().values())
         self.current_round = r
-        self.adapter.flush(r, now)
+
+        self._round_close_timer = self._loop.schedule(
+            self._close_by(bucket), RoundClose(bucket)
+        )
+        self._round_abandon_timer = self._loop.schedule(
+            self._abandon_by(bucket), RoundAbandon(bucket)
+        )
+
+        self._flush_round()
 
     def _screen_slice(self, candidate: CanonicalBatch) -> frozenset[crypto.Digest]:
-        """Which of `candidate`'s op_hashes this node can actually apply. Returns membership, not
-        bodies -- Round filters the canonical candidate by this set, so "narrow" and "in apply
-        order" are structural rather than asserted.
-
-        The already-settled filter is a LOG read and has to happen here: `apply_to` works over an
-        Overlay, which has no log, so a transaction settled in an earlier block would re-apply and
-        surface only at commit as an anchors mismatch.
-
-        Deterministic across the quorum because every member screens the same canonical batch
-        against the same committed base -- a node on a different base is not a participant, it is
-        a node that needs to catch up."""
-        already = self.store.settled_hashes(tuple(tx.op_hash for tx in candidate))
+        already = self.store.has_settled(*(tx.op_hash for tx in candidate))
         fresh = tuple(tx for tx in candidate if tx.op_hash not in already)
         survivors = settle.apply_to(Layer(self.store), fresh, self.mgmt_reader).survivors
         for tx in survivors:
@@ -247,16 +445,7 @@ class Coordinator:
                 return frozenset({tx.op_hash})
         return frozenset(tx.op_hash for tx in survivors)
 
-    def _on_round_abandoned(self, _now: Millis) -> None:
-        if self.current_round is None:
-            raise InvariantError("_on_round_abandoned called with no in-flight Round")
-        self.current_round = None
-
     def _promote_to_settling(self, now: Millis) -> None:
-        """REFUSE FIRST, THEN COMMIT. Every decline sits above the first mutation; everything
-        below it is core machinery whose failure is not a peer's fault. Interleaving the two lets
-        a raise between them clear the round without assigning `settling` -- the bucket's work
-        vanishes with no error at the crash-only boundary."""
         r = self.current_round
         if r is None:
             raise InvariantError("_promote_to_settling with no in-flight Round")
@@ -264,18 +453,14 @@ class Coordinator:
         if block is None:
             raise InvariantError("_promote_to_settling with unratified Round")
         if not self.in_roster:
-            # The Follower adopted a roster change removing us between open and promote. The
-            # round is void: the remaining quorum settles this block and we adopt it as any
-            # follower does. What the round held is NOT re-admitted -- a node without a seat
-            # cannot open a round, is refused at `submit`, and has no way to hand its mempool
-            # to anyone, so re-admitting only reads as a recovery it cannot perform. Clients
-            # holding an ACCEPTED from us lose it; that is what losing the seat means.
+            self._cancel_round_timers()
             self.current_round = None
             return
         bucket = r.bucket()
         slice_txs = r.slice_bodies()
         surviving = r.surviving()
         if self._prev_block() != r.prev_block():
+            self._cancel_round_timers()
             self.current_round = None
             return
         roster = self.mgmt_reader.roster()
@@ -283,14 +468,12 @@ class Coordinator:
         layer = Layer(self.store)
         screened = settle.apply_to(layer, slice_txs, self.mgmt_reader)
         if screened.rejects:
-            # LOCAL non-determinism: the same screen ran at the cut against the same base and
-            # agreed. Other ratifiers settle without us; we adopt via the Follower. Crashing
-            # would take an honest node down for its own anomaly.
             _log.error(
                 "promote screen disagreed with cut screen at bucket %d: %r",
                 bucket,
                 screened.rejects,
             )
+            self._cancel_round_timers()
             self.current_round = None
             return
         applied = screened.survivors
@@ -331,17 +514,23 @@ class Coordinator:
             first_height=base_head + 1,
             settle_round=sr,
         )
-        self.current_round = None  # released only now that `settling` holds the ratified block
-        self.settle_adapter.flush(sr, now)
+        self._cancel_round_timers()
+        self.current_round = None
 
-    def _on_settled(self, _now: Millis) -> None:
+        self._settle_abandon_timer = self._loop.schedule(
+            self._abandon_by(bucket), SettleAbandon(block.slice_hash)
+        )
+
+        self._flush_settle()
+
+    def _do_settled(self) -> None:
         s = self.settling
         if s is None:
-            raise InvariantError("_on_settled called with no settling slot")
+            raise InvariantError("_do_settled called with no settling slot")
 
         settled = s.settle_round.settled()
         if settled is None:
-            raise InvariantError("_on_settled fired but SettleRound has no SettledBlock")
+            raise InvariantError("_do_settled fired but SettleRound has no SettledBlock")
         block_bytes = settled.encode()
         block_hash = settled.block_hash
         self.store.commit_block(
@@ -354,26 +543,24 @@ class Coordinator:
         )
 
         _expect_anchors(s.anchors, self.store)
-
         self.mempool.evict_settled(self.store)
-
         self.settling = None
         self._settle_stalls = 0
 
-    def _on_settle_abandoned(self, _now: Millis) -> None:
+        self._loop.post(BlockSettled())
+        self._loop.post(BucketTick())
+
+    def _do_settle_abandoned(self) -> None:
         s = self.settling
         if s is None:
-            raise InvariantError("_on_settle_abandoned called with no settling slot")
+            raise InvariantError("_do_settle_abandoned called with no settling slot")
         divergences = s.settle_round.divergences()
         self.settling = None
 
         if not divergences:
-            # Absence heals on its own: no log, no counter.
             self._settle_stalls = 0
             return
         self._settle_stalls += 1
-        # Divergence needs an operator, not a crash: crashing takes an honest node down for a
-        # peer's state, and restart resets the counter without fixing anything.
         _log.warning(
             "settlement abandoned with divergent anchors at bucket %d (%d consecutive): %s",
             s.bucket,
@@ -390,6 +577,4 @@ def _expect_anchors(signed: Anchors, store: Store) -> None:
     if store.accumulator() != signed.acc_state:
         raise InvariantError("post-settle A_state differs from signed anchors")
     if store.log_accumulator() != signed.acc_log:
-        # NOT catchable: a mismatch means our evaluator produced different mutations between
-        # preview and commit, which is non-determinism, not a peer's fault.
         raise InvariantError("post-settle A_log differs from signed anchors")

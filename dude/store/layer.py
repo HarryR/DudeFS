@@ -57,7 +57,7 @@ class Reader(ABC):
 
 class Ledger(Reader):
     @abstractmethod
-    def has_settled(self, op_hash: crypto.Digest) -> bool: ...
+    def has_settled(self, *op_hashes: crypto.Digest) -> frozenset[crypto.Digest]: ...
 
 
 class View(Reader):

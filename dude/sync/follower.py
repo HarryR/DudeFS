@@ -76,6 +76,10 @@ class SendToPeer(FollowerEvent):
     msg: SyncMsg
 
 
+class BlockCommitted(FollowerEvent):
+    __slots__ = ()
+
+
 # -- data ------------------------------------------------------------------
 
 
@@ -104,6 +108,7 @@ class Follower:
         "_last_fail_at",
         "_last_ok_at",
         "_loop",
+        "_on_commit",
         "_on_send",
         "_poll_timers",
         "_pull_timer",
@@ -121,6 +126,7 @@ class Follower:
         mgmt_reader: MgmtReader,
         tunables: Tunables,
         on_send: Callable[[SendToPeer], None],
+        on_commit: Callable[[BlockCommitted], None] = lambda _: None,
     ) -> None:
         self.me = me
         self.store = store
@@ -134,6 +140,7 @@ class Follower:
         self._last_fail_at: dict[crypto.PublicKey, Millis] = {}
         self._compacted_at: dict[crypto.PublicKey, int] = {}
         self._on_send = on_send
+        self._on_commit = on_commit
 
         self._loop: EventLoop[FollowerEvent] = EventLoop()
         self._loop.register(PeerMessage, self._on_peer_message)
@@ -143,6 +150,7 @@ class Follower:
         self._loop.register(PollPeer, self._on_poll_peer)
         self._loop.register(PullExpiry, self._on_pull_expiry)
         self._loop.register(SendToPeer, self._on_send_to_peer)
+        self._loop.register(BlockCommitted, self._on_block_committed)
 
     def post(self, event: FollowerEvent) -> None:
         self._loop.post(event)
@@ -157,6 +165,9 @@ class Follower:
 
     def _on_send_to_peer(self, event: SendToPeer) -> None:
         self._on_send(event)
+
+    def _on_block_committed(self, event: BlockCommitted) -> None:
+        self._on_commit(event)
 
     def _on_peer_added(self, event: PeerAdded) -> None:
         if event.peer == self.me.public or event.peer in self._poll_timers:
@@ -268,6 +279,7 @@ class Follower:
             batch=ordered,
             auth=self.mgmt_reader,
         )
+        self._on_commit(BlockCommitted())
         return True
 
     def _on_refused(self, msg: Refused, from_: crypto.PublicKey, now: Millis) -> None:
