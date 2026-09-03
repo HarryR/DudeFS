@@ -11,6 +11,7 @@ from dude.core.errors import DudeError
 from dude.net.address import Address, Endpoint, Scheme
 from dude.store import layer as layer_mod
 from dude.store import management, ops, settle, store
+from dude.store.layer import element
 
 D = ops.STORE_DATA
 DK = crypto.NameToken(crypto.h(b"k"))
@@ -165,7 +166,7 @@ class TestAccumulator(unittest.TestCase):
         rows = self.s.db.execute("SELECT store, name, value, epoch FROM live").fetchall()
         want = functools.reduce(
             crypto.acc_add,
-            (store.element(st, crypto.NameToken(n), v, e) for st, n, v, e in rows),
+            (element(st, crypto.NameToken(n), v, e) for st, n, v, e in rows),
             crypto.ACC_IDENTITY,
         )
         self.assertEqual(self.s.accumulator(), want)
@@ -197,14 +198,14 @@ class TestTheAccumulatorCancelsByEpoch(unittest.TestCase):
         rows = self.s.db.execute("SELECT store, name, value, epoch FROM live").fetchall()
         want = functools.reduce(
             crypto.acc_add,
-            (store.element(st, crypto.NameToken(nm), val, e) for st, nm, val, e in rows),
+            (element(st, crypto.NameToken(nm), val, e) for st, nm, val, e in rows),
             crypto.ACC_IDENTITY,
         )
         self.assertEqual(self.s.accumulator(), want, "the epoch-1 element was never subtracted")
 
     def test_the_element_distinguishes_epochs(self):
         n = crypto.NameToken(crypto.h(b"k"))
-        self.assertNotEqual(store.element(0, n, b"v", 1), store.element(0, n, b"v", 2))
+        self.assertNotEqual(element(0, n, b"v", 1), element(0, n, b"v", 2))
 
 
 class TestReplayEquivalence(unittest.TestCase):

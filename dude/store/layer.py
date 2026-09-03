@@ -7,6 +7,14 @@ from . import ops, smt
 from .errors import StoreError
 
 
+def element(store: int, name: bytes, value: bytes, epoch: int) -> crypto.Accumulator:
+    return crypto.acc_element(codec.encode([store, name, value, epoch]))
+
+
+def log_element(idx: int, op_hash: crypto.Digest) -> crypto.Accumulator:
+    return crypto.acc_element(codec.encode([b"log", idx, op_hash]))
+
+
 class LayerError(StoreError): ...
 
 
@@ -141,8 +149,6 @@ class Layer(Overlay[View], View):
         self._smt_memo: dict[tuple[int, bytes], crypto.Digest] = {}
 
     def accumulator(self) -> crypto.Accumulator:
-        from .store import element
-
         acc = self._base.accumulator()
         for (st, name), held in self._delta.items():
             was = self._base.get(st, name)

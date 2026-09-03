@@ -17,10 +17,9 @@ from ..core.errors import InvariantError
 from ..core.event_loop import Event, EventLoop, Scheduled
 from ..core.units import Millis
 from ..store import Layer, Store, settle
-from ..store.layer import Index
+from ..store.layer import Index, log_element
 from ..store.management import MgmtReader
 from ..store.ops import SignedTransaction
-from ..store.store import log_element
 from ..tunables import Tunables
 from . import chain
 from .adapter import (

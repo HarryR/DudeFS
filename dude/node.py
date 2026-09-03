@@ -24,8 +24,10 @@ from .net.postman import Delivered, Output, Postman
 from .net.socket_server import SocketServer
 from .session import Inflight, KeyCache, SessionRW, SubmitHandle, SubmitResult, Substrate
 from .store import Store, ops
+from .store.checkpoint import CheckpointMeta
 from .store.layer import BlockHead, Held
 from .store.management import MgmtReader, Role
+from .store.smt_sync import TreeImporter
 from .sync.adapter import (
     GetBlocks,
     Refused,
@@ -220,8 +222,6 @@ class _BaseNode:
         return None
 
     def _download_checkpoint(self) -> None:
-        from .store.checkpoint import CheckpointMeta
-        from .store.smt_sync import TreeImporter
 
         peers = list(self.follower.compacted_peers())
         if not peers:

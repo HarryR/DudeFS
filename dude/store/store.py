@@ -14,7 +14,7 @@ from ..core import codec, crypto
 from ..core.errors import InvariantError
 from ..session import Session, Settled
 from . import ops, settle, smt
-from .layer import Held, Index, Ledger, PathRow, View, holds
+from .layer import Held, Index, Ledger, PathRow, View, element, holds, log_element
 from .management import MgmtReader, MgmtWriter
 from .smt_sync import _ExportSource, _ImportTarget
 
@@ -114,18 +114,6 @@ class Dropped(NamedTuple):
 class Applied:
     settled: tuple[tuple[Index, crypto.Digest], ...]
     dropped: tuple[Dropped, ...]
-
-
-def log_element(idx: int, op_hash: crypto.Digest) -> crypto.Accumulator:
-    return crypto.acc_element(codec.encode([b"log", idx, op_hash]))
-
-
-def element(store: int, name: bytes, value: bytes, epoch: int) -> crypto.Accumulator:
-    """SUBTRACT WITH THE OLD ROW'S EPOCH AND ADD WITH THE NEW ONE. The accumulator cancels a row
-    by subtracting the exact element it added, so a subtraction carrying the wrong epoch removes
-    something that was never there -- and every node corrupts `A_state` identically, which is why
-    nothing would notice."""
-    return crypto.acc_element(codec.encode([store, name, value, epoch]))
 
 
 def _unverified(e: Entry) -> str | None:

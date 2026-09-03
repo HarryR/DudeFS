@@ -6,9 +6,10 @@ from ..core.units import Millis
 from ..net.address import Endpoint
 from ..store import ops, settle
 from ..store.layer import Layer
-from ..store.management import Cert, MgmtWriter, NodeRecord, Role
+from ..store.management import P_POP, Cert, Grant, MgmtWriter, NodeRecord, Role
 from ..store.ops import SignedTransaction
-from ..store.store import Store, log_element
+from ..store.layer import log_element
+from ..store.store import Store
 from .canonical import bodies_canonical, hashes_canonical
 from .round import Block
 from .settle_round import (
@@ -148,8 +149,6 @@ def compose_genesis(
     rw_clients: Sequence[crypto.Keypair] = (),
     ts: Millis = Millis(0),
 ) -> tuple[SignedTransaction, ...]:
-    from ..store.management import P_POP, Grant
-
     scratch = Store()
     scratch.provision(anchor.public)
     w = MgmtWriter(scratch.mgmt_session())

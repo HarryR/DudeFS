@@ -1,6 +1,6 @@
 from . import management, ops, settle
 from .errors import StoreError
-from .layer import Layer, LayerError, Overlay, Reader, View, holds
+from .layer import Layer, LayerError, Overlay, Reader, View, holds, log_element
 from .ops import (
     Absent,
     Del,
@@ -13,7 +13,7 @@ from .ops import (
     writes,
 )
 from .settle import Verdict, evaluate, would_apply
-from .store import Applied, Commitment, Entry, Index, Store, element
+from .store import Applied, Commitment, Entry, Index, Store
 
 __all__ = [
     "Absent",
@@ -35,9 +35,9 @@ __all__ = [
     "Transaction",
     "Verdict",
     "View",
-    "element",
     "evaluate",
     "holds",
+    "log_element",
     "management",
     "ops",
     "settle",

@@ -4,9 +4,8 @@ import unittest
 
 from dude.core import crypto
 from dude.store import Store
-from dude.store.layer import PathRow
+from dude.store.layer import PathRow, element
 from dude.store.smt_sync import Chunk, TreeExporter, TreeImporter, TreeSyncError
-from dude.store.store import element
 
 
 def _populate(store: Store, n: int, value_size: int = 64) -> crypto.Accumulator:

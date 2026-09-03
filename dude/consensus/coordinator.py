@@ -15,7 +15,8 @@ from ..store import settle
 from ..store.layer import Index, Layer
 from ..store.management import MgmtReader
 from ..store.ops import SignedTransaction
-from ..store.store import Store, log_element
+from ..store.layer import log_element
+from ..store.store import Store
 from ..tunables import Tunables
 from .canonical import CanonicalBatch
 from .mempool import Mempool, Refusal
