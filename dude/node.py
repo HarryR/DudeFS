@@ -30,7 +30,15 @@ from .sync.checkpoint_adapter import (
     GetChunks,
 )
 from .sync.checkpoint_server import CheckpointServer
-from .sync.follower import Follower, serve_getblocks, serve_height
+from .sync.follower import (
+    Follower,
+    PeerAdded,
+    PeerMessage,
+    PullCancelled,
+    SendToPeer,
+    serve_getblocks,
+    serve_height,
+)
 from .sync.lite import serve_get_anchors, serve_get_proof
 from .sync.lite_adapter import (
     GetAnchors,
@@ -55,8 +63,13 @@ class _BaseNode:
         self.store = store
         self.tunables = tunables
         self.postman = Postman(me, tunables)
+
+        def _on_send(e: SendToPeer) -> None:
+            self.postman.send(e.peer, e.msg, tunables.ttl_exchange)
+
         self.follower = Follower(
-            me=me, store=store, mgmt_reader=store.mgmt_reader, tunables=tunables
+            me=me, store=store, mgmt_reader=store.mgmt_reader,
+            tunables=tunables, on_send=_on_send,
         )
         self.inflight = Inflight()
         self.commit_seq = 0
@@ -96,6 +109,7 @@ class _BaseNode:
         if self._thread is not None:
             return
         self._stopping = threading.Event()
+        self.follower.start()
         self._reconcile_peers()
         self.postman.start()
         for srv in self._socket_servers:
@@ -116,6 +130,7 @@ class _BaseNode:
         self._stopping.set()
         for srv in self._socket_servers:
             srv.stop()
+        self.follower.stop()
         self.postman.stop()
         thread.join()
         self.store.close()
@@ -135,9 +150,6 @@ class _BaseNode:
         checkpoint_block = self.follower.needs_checkpoint()
         if checkpoint_block is not None:
             self._download_checkpoint()
-            return
-        self.follower.tick(now)
-        self._flush_follower(now)
 
     def _on_delivered(self, d: Delivered, now: Millis) -> None:
         raise NotImplementedError
@@ -229,7 +241,6 @@ class _BaseNode:
     def _reconcile_peers(self) -> None:
         nodes = self.mgmt_reader.nodes()
         roster = self.mgmt_reader.roster()
-        now = Millis.now()
         peers: dict[crypto.PublicKey, tuple] = {}
         for pk in roster:
             if pk == self.me.public:
@@ -237,7 +248,7 @@ class _BaseNode:
             rec = nodes.get(pk)
             if rec is not None and rec.endpoints:
                 peers[pk] = rec.endpoints
-            self.follower.add_peer(pk, now)
+            self.follower.post(PeerAdded(pk))
         self.postman.sync(peers, authorized=self.mgmt_reader.authorized_identities())
 
     # -- shared helpers -----------------------------------------------------
@@ -252,10 +263,6 @@ class _BaseNode:
             reply_to=d.mid,
         )
 
-    def _flush_follower(self, now: Millis) -> None:
-        for peer, msg in self.follower.outbox():
-            self.postman.send(peer, msg, self.tunables.ttl_exchange)
-
     # -- sync verb handlers (shared) ----------------------------------------
 
     def _on_ping(self, d: Delivered, now: Millis) -> MessageId:
@@ -266,23 +273,22 @@ class _BaseNode:
             msg = SyncMsg.decode(d.verb, d.body)
         except SyncAdapterError:
             return
-        self.follower.receive(msg, d.frm, now)
+        self.follower.post(PeerMessage(msg, d.frm))
 
     def _on_settled_block(self, d: Delivered, now: Millis) -> None:
         try:
             msg = SyncMsg.decode(d.verb, d.body)
         except (SyncAdapterError, DudeError):
-            self.follower.cancel_pull(d.frm, now)
+            self.follower.post(PullCancelled(d.frm))
             return
-        self.follower.receive(msg, d.frm, now)
+        self.follower.post(PeerMessage(msg, d.frm))
 
     def _on_sync_refused(self, d: Delivered, now: Millis) -> None:
         try:
             msg = SyncMsg.decode(d.verb, d.body)
         except SyncAdapterError:
             return
-        self.follower.receive(msg, d.frm, now)
-        self._flush_follower(now)
+        self.follower.post(PeerMessage(msg, d.frm))
 
 
 # ---------------------------------------------------------------------------
@@ -331,8 +337,6 @@ class Node(_BaseNode):
         self.coordinator.tick(now)
         if self.store.head_block_num() != prev_head:
             self._notify_followers()
-        self.follower.tick(now)
-        self._flush_follower(now)
 
     def _notify_followers(self) -> None:
         reply = serve_height(self.store)

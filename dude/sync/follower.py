@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from abc import ABC
+from collections.abc import Callable
+from dataclasses import dataclass, replace
 
 from .. import quorum
 from ..consensus.canonical import bodies_canonical
@@ -12,6 +14,7 @@ from ..consensus.settle_round import (
 )
 from ..core import crypto
 from ..core.errors import InvariantError
+from ..core.event_loop import Event, EventLoop, Scheduled
 from ..core.units import Millis
 from ..store import Layer, Store, settle
 from ..store.layer import Index
@@ -31,6 +34,51 @@ from .adapter import (
 )
 
 
+class FollowerEvent(Event, ABC):
+    __slots__ = ()
+
+
+@dataclass(frozen=True, slots=True)
+class PeerMessage(FollowerEvent):
+    msg: SyncMsg
+    frm: crypto.PublicKey
+
+
+@dataclass(frozen=True, slots=True)
+class PeerAdded(FollowerEvent):
+    peer: crypto.PublicKey
+
+
+@dataclass(frozen=True, slots=True)
+class PeerRemoved(FollowerEvent):
+    peer: crypto.PublicKey
+
+
+@dataclass(frozen=True, slots=True)
+class PullCancelled(FollowerEvent):
+    peer: crypto.PublicKey
+
+
+@dataclass(frozen=True, slots=True)
+class PollPeer(FollowerEvent):
+    peer: crypto.PublicKey
+
+
+@dataclass(frozen=True, slots=True)
+class PullExpiry(FollowerEvent):
+    peer: crypto.PublicKey
+    sent_at: Millis
+
+
+@dataclass(frozen=True, slots=True)
+class SendToPeer(FollowerEvent):
+    peer: crypto.PublicKey
+    msg: SyncMsg
+
+
+# -- data ------------------------------------------------------------------
+
+
 @dataclass(frozen=True, slots=True)
 class HeightReport:
     block_num: Index
@@ -46,149 +94,164 @@ class PullInFlight:
     sent_at: Millis
 
 
-type OutboxItem = tuple[crypto.PublicKey, SyncMsg]
+# -- the follower ----------------------------------------------------------
 
 
-@dataclass(slots=True)
 class Follower:
-    me: crypto.Keypair
-    store: Store
-    mgmt_reader: MgmtReader
-    tunables: Tunables
-    _heads: dict[crypto.PublicKey, HeightReport] = field(default_factory=dict)
-    _poll_at: dict[crypto.PublicKey, Millis] = field(default_factory=dict)
-    _pulling: PullInFlight | None = None
-    _last_ok_at: dict[crypto.PublicKey, Millis] = field(default_factory=dict)
-    _last_fail_at: dict[crypto.PublicKey, Millis] = field(default_factory=dict)
-    _outbox: list[OutboxItem] = field(default_factory=list)
-    _compacted_at: dict[crypto.PublicKey, int] = field(default_factory=dict)
+    __slots__ = (
+        "_compacted_at",
+        "_heads",
+        "_last_fail_at",
+        "_last_ok_at",
+        "_loop",
+        "_on_send",
+        "_poll_timers",
+        "_pull_timer",
+        "_pulling",
+        "me",
+        "mgmt_reader",
+        "store",
+        "tunables",
+    )
 
-    def add_peer(self, peer: crypto.PublicKey, now: Millis) -> None:
-        if peer == self.me.public or peer in self._poll_at:
+    def __init__(
+        self,
+        me: crypto.Keypair,
+        store: Store,
+        mgmt_reader: MgmtReader,
+        tunables: Tunables,
+        on_send: Callable[[SendToPeer], None],
+    ) -> None:
+        self.me = me
+        self.store = store
+        self.mgmt_reader = mgmt_reader
+        self.tunables = tunables
+        self._heads: dict[crypto.PublicKey, HeightReport] = {}
+        self._poll_timers: dict[crypto.PublicKey, Scheduled] = {}
+        self._pulling: PullInFlight | None = None
+        self._pull_timer: Scheduled | None = None
+        self._last_ok_at: dict[crypto.PublicKey, Millis] = {}
+        self._last_fail_at: dict[crypto.PublicKey, Millis] = {}
+        self._compacted_at: dict[crypto.PublicKey, int] = {}
+        self._on_send = on_send
+
+        self._loop: EventLoop[FollowerEvent] = EventLoop()
+        self._loop.register(PeerMessage, self._on_peer_message)
+        self._loop.register(PeerAdded, self._on_peer_added)
+        self._loop.register(PeerRemoved, self._on_peer_removed)
+        self._loop.register(PullCancelled, self._on_pull_cancelled)
+        self._loop.register(PollPeer, self._on_poll_peer)
+        self._loop.register(PullExpiry, self._on_pull_expiry)
+        self._loop.register(SendToPeer, self._on_send_to_peer)
+
+    def post(self, event: FollowerEvent) -> None:
+        self._loop.post(event)
+
+    def start(self) -> None:
+        self._loop.start()
+
+    def stop(self) -> None:
+        self._loop.stop()
+
+    # -- event handlers --------------------------------------------------------
+
+    def _on_send_to_peer(self, event: SendToPeer) -> None:
+        self._on_send(event)
+
+    def _on_peer_added(self, event: PeerAdded) -> None:
+        if event.peer == self.me.public or event.peer in self._poll_timers:
             return
-        self._poll_at[peer] = now
+        self._schedule_poll(event.peer, Millis.now())
 
-    def remove_peer(self, peer: crypto.PublicKey) -> None:
-        self._poll_at.pop(peer, None)
-        self._heads.pop(peer, None)
-        self._last_ok_at.pop(peer, None)
-        self._last_fail_at.pop(peer, None)
-        if self._pulling is not None and self._pulling.peer == peer:
+    def _on_peer_removed(self, event: PeerRemoved) -> None:
+        timer = self._poll_timers.pop(event.peer, None)
+        if timer is not None:
+            timer.cancel()
+        self._heads.pop(event.peer, None)
+        self._last_ok_at.pop(event.peer, None)
+        self._last_fail_at.pop(event.peer, None)
+        if self._pulling is not None and self._pulling.peer == event.peer:
+            self._cancel_pull_timer()
             self._pulling = None
 
-    def receive(self, msg: SyncMsg, from_: crypto.PublicKey, now: Millis) -> None:
-        if from_ == self.me.public:
+    def _on_peer_message(self, event: PeerMessage) -> None:
+        if event.frm == self.me.public:
             return
-        if isinstance(msg, HeightReply):
-            self._on_height_reply(msg, from_, now)
-        elif isinstance(msg, SettledBlockReply):
-            self._on_settled_blocks(msg, from_, now)
-        elif isinstance(msg, Refused):
-            self._on_refused(msg, from_, now)
+        now = Millis.now()
+        if isinstance(event.msg, HeightReply):
+            self._on_height_reply(event.msg, event.frm, now)
+        elif isinstance(event.msg, SettledBlockReply):
+            self._on_settled_blocks(event.msg, event.frm, now)
+        elif isinstance(event.msg, Refused):
+            self._on_refused(event.msg, event.frm, now)
 
-    def cancel_pull(self, from_: crypto.PublicKey, now: Millis) -> None:
-        if self._pulling is not None and self._pulling.peer == from_:
+    def _on_pull_cancelled(self, event: PullCancelled) -> None:
+        if self._pulling is not None and self._pulling.peer == event.peer:
+            self._cancel_pull_timer()
             self._pulling = None
-            self._last_fail_at[from_] = now
+            self._last_fail_at[event.peer] = Millis.now()
+            self._try_pull()
 
-    def tick(self, now: Millis) -> None:
-        for peer, deadline in list(self._poll_at.items()):
-            if now >= deadline:
-                self._enqueue(peer, HeightAsk())
-                self._poll_at[peer] = now + self.tunables.poll_interval
+    def _on_poll_peer(self, event: PollPeer) -> None:
+        if event.peer not in self._poll_timers:
+            return
+        self._loop.post(SendToPeer(event.peer, HeightAsk()))
+        self._schedule_poll(event.peer, Millis.now() + self.tunables.poll_interval)
+
+    def _on_pull_expiry(self, event: PullExpiry) -> None:
         p = self._pulling
-        if p is not None and now - p.sent_at > self.tunables.pull_timeout:
-            self._last_fail_at[p.peer] = now
-            self._pulling = None
-        if self._pulling is None:
-            source = self._pick_pull_source()
-            if source is not None:
-                self._pull_from(source, now)
+        if p is None or p.peer != event.peer or p.sent_at != event.sent_at:
+            return
+        self._pulling = None
+        self._pull_timer = None
+        self._last_fail_at[p.peer] = Millis.now()
+        self._try_pull()
 
-    def _pull_from(self, peer: crypto.PublicKey, now: Millis) -> None:
-        frm = (self.store.head_block_num() or 0) + 1
-        count = self.tunables.pull_batch
-        self._enqueue(peer, GetBlocks(frm=frm, count=count))
-        self._pulling = PullInFlight(peer, frm, count, now)
+    # -- timer management ------------------------------------------------------
 
-    def outbox(self) -> tuple[OutboxItem, ...]:
-        drained = tuple(self._outbox)
-        self._outbox.clear()
-        return drained
+    def _schedule_poll(self, peer: crypto.PublicKey, at: Millis) -> None:
+        old = self._poll_timers.get(peer)
+        if old is not None:
+            old.cancel()
+        self._poll_timers[peer] = self._loop.schedule(at, PollPeer(peer))
 
-    def behind(self, now: Millis) -> bool:
-        """`f+1` LIVE witnesses reporting a head ABOVE ours. POSITIVE EVIDENCE, in this direction:
-        silence, empty roster, and stale reports all answer False, so a node with no data keeps
-        working. Flipping to "f+1 AGREEING with our tip" couples liveness to the height-poll loop
-        -- reports age out between buckets and every node quietly stops leading.
+    def _cancel_pull_timer(self) -> None:
+        if self._pull_timer is not None:
+            self._pull_timer.cancel()
+            self._pull_timer = None
 
-        Freshness is the clock's, not the newest report's, or a silent peer vouches for its own
-        last word forever. NOT `chain.is_stale`: that gates on the CHAIN advancing, and a stopped
-        chain would then prevent any node from restarting it."""
-        roster = self.mgmt_reader.roster()
-        if not roster:
-            return False
-        my_num = self.store.head_block_num() or 0
-        ahead = 0
-        for peer, hr in self._heads.items():
-            if peer not in roster:
-                continue
-            if now - hr.at > self.tunables.freshness_window:
-                continue
-            if hr.block_num > my_num:
-                ahead += 1
-        return ahead >= quorum.corroboration(len(roster))
-
-    def _head_bucket(self) -> int:
-        n = self.store.head_block_num()
-        raw = self.store.settled_at(n) if n is not None else None
-        if raw is None:
-            return chain.NO_BUCKET
-        return SettledBlock.decode(raw).block.bucket
+    # -- sync logic (unchanged from tick-based version) ------------------------
 
     def _on_height_reply(self, msg: HeightReply, from_: crypto.PublicKey, now: Millis) -> None:
-        # NOT credited to `_last_ok_at`: that is the pull-source priority, and answering a poll
-        # is not serving a block. Credited here, a peer keeps top priority by replying while
-        # failing every pull, and a joiner retries it forever.
         self._heads[from_] = HeightReport(msg.block_num, msg.tip_hash, now)
+        self._try_pull()
 
     def _on_settled_blocks(
         self, msg: SettledBlockReply, from_: crypto.PublicKey, now: Millis
     ) -> None:
-        # Only from the peer we asked. An unsolicited run of state, applied, was a real break:
-        # a stranger with no grant and no roster seat added itself to a catching-up node's
-        # roster with one frame.
         p = self._pulling
         if p is None or from_ != p.peer:
             return
+        self._cancel_pull_timer()
         self._pulling = None
         served = 0
         for offer in msg.payload:
             if offer.block.anchors.block_num != p.frm + served or not self._adopt(offer):
-                # A fail mark, NOT a shun (#no-shun-only-priority): the peer stays a candidate
-                # and this only orders it behind peers that have not failed. Without it, a
-                # peer that SERVES unverifiable blocks -- unlike one that refuses -- kept its
-                # claimed head and kept winning the pick, and a fresh joiner with one such
-                # peer above it never asked the honest sources at all.
                 self._last_fail_at[from_] = now
                 return
             served += 1
         if served == 0:
             return
         self._last_ok_at[from_] = now
+        self._try_pull()
 
     def _adopt(self, offer: SettledBlockWithBodies) -> bool:
-        """One block: link, quorum proof, bodies, replay, commit. Per block rather than per
-        range, because the roster comes from the log and only committing the previous block
-        makes its roster change visible (#roster-at-ratification)."""
         sb = offer.block
         walked = chain.advance(
             self._tip(), (sb,), self.mgmt_reader.roster(), self._require_anchor()
         )
         if isinstance(walked, chain.ChainRefusal):
             return False
-        # Equality: a block names exactly what it applied, so bodies short of the hash list
-        # mean a withholding sender and a state_root we never saw.
         if frozenset(tx.op_hash for tx in offer.bodies) != frozenset(sb.block.hashes):
             return False
         for tx in offer.bodies:
@@ -211,19 +274,52 @@ class Follower:
         p = self._pulling
         if p is None or from_ != p.peer:
             return
+        self._cancel_pull_timer()
         self._pulling = None
         if msg.reason is SyncRefusal.NOT_YET_SETTLED:
             hr = self._heads.get(from_)
             if hr is not None:
                 self._heads[from_] = replace(hr, block_num=p.frm - 1)
-            source = self._pick_pull_source()
-            if source is not None:
-                self._pull_from(source, now)
+            self._try_pull()
         elif msg.reason is SyncRefusal.COMPACTED and msg.checkpoint_block_num is not None:
             self._compacted_at[from_] = msg.checkpoint_block_num
             self._last_fail_at[from_] = now
         else:
             self._last_fail_at[from_] = now
+
+    def _try_pull(self) -> None:
+        if self._pulling is not None:
+            return
+        source = self._pick_pull_source()
+        if source is not None:
+            self._pull_from(source, Millis.now())
+
+    def _pull_from(self, peer: crypto.PublicKey, now: Millis) -> None:
+        frm = (self.store.head_block_num() or 0) + 1
+        count = self.tunables.pull_batch
+        self._loop.post(SendToPeer(peer, GetBlocks(frm=frm, count=count)))
+        self._pulling = PullInFlight(peer, frm, count, now)
+        self._cancel_pull_timer()
+        self._pull_timer = self._loop.schedule(
+            now + self.tunables.pull_timeout, PullExpiry(peer, now)
+        )
+
+    # -- queries (called from outside, read-only) ------------------------------
+
+    def behind(self, now: Millis) -> bool:
+        roster = self.mgmt_reader.roster()
+        if not roster:
+            return False
+        my_num = self.store.head_block_num() or 0
+        ahead = 0
+        for peer, hr in self._heads.items():
+            if peer not in roster:
+                continue
+            if now - hr.at > self.tunables.freshness_window:
+                continue
+            if hr.block_num > my_num:
+                ahead += 1
+        return ahead >= quorum.corroboration(len(roster))
 
     def needs_checkpoint(self) -> int | None:
         if not self._compacted_at:
@@ -242,18 +338,13 @@ class Follower:
     def clear_compacted(self) -> None:
         self._compacted_at.clear()
 
-    def _enqueue(self, peer: crypto.PublicKey, msg: SyncMsg) -> None:
-        self._outbox.append((peer, msg))
+    # -- internals -------------------------------------------------------------
 
     def _pick_pull_source(self) -> crypto.PublicKey | None:
         my_num = self.store.head_block_num() or 0
         candidates = [(peer, hr) for peer, hr in self._heads.items() if hr.block_num > my_num]
         if not candidates:
             return None
-        # Fail-recency sits between success-recency and claimed height: a fresh joiner has no
-        # ok-history, so height decided alone, and one peer whose pulls always fail -- silent
-        # after claiming, or serving garbage -- outbid every honest source forever on the
-        # strength of its claim.
         candidates.sort(
             key=lambda p_hr: (
                 -self._last_ok_at.get(p_hr[0], 0),
