@@ -1,6 +1,5 @@
 import contextlib
 import queue
-import threading
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
@@ -9,6 +8,7 @@ from typing import NamedTuple
 
 from ..core import crypto
 from ..core.errors import DudeError
+from ..core.event_loop import Event, EventLoop, Scheduled
 from ..core.units import Millis
 from ..tunables import Tunables
 from .address import Address, Endpoint
@@ -45,16 +45,16 @@ class Encodable(ABC):
 
 
 # ---------------------------------------------------------------------------
-# Input events — everything that goes INTO the postman's single queue.
+# Postman events — everything the loop dispatches.
 # ---------------------------------------------------------------------------
 
 
-class _Cmd:
+class _PostmanEvent(Event, ABC):
     __slots__ = ()
 
 
 @dataclass(frozen=True, slots=True)
-class _Send(_Cmd):
+class _PostSend(_PostmanEvent):
     to: crypto.PublicKey
     verb: Verb
     body: bytes
@@ -65,44 +65,52 @@ class _Send(_Cmd):
 
 
 @dataclass(frozen=True, slots=True)
-class _Sync(_Cmd):
+class _SyncPeers(_PostmanEvent):
     peers: dict[crypto.PublicKey, tuple[Endpoint, ...]]
     authorized: frozenset[crypto.PublicKey]
 
 
 @dataclass(frozen=True, slots=True)
-class _AddPeer(_Cmd):
+class _AddPeer(_PostmanEvent):
     pubkey: crypto.PublicKey
     endpoints: tuple[Endpoint, ...]
 
 
 @dataclass(frozen=True, slots=True)
-class _RemovePeer(_Cmd):
+class _RemovePeer(_PostmanEvent):
     pubkey: crypto.PublicKey
 
 
 @dataclass(frozen=True, slots=True)
-class _FrameIn(_Cmd):
+class _FrameIn(_PostmanEvent):
     frame: Frame
     link: Link
 
 
 @dataclass(frozen=True, slots=True)
-class _LinkEstablished(_Cmd):
+class _LinkUp(_PostmanEvent):
     link: Link
 
 
 @dataclass(frozen=True, slots=True)
-class _LinkDied(_Cmd):
+class _LinkDown(_PostmanEvent):
     link: Link
 
 
 @dataclass(frozen=True, slots=True)
-class _LinkBroken(_Cmd):
+class _LinkBroken(_PostmanEvent):
     address: Address
 
 
-class _Stop(_Cmd):
+class _RetryDue(_PostmanEvent):
+    __slots__ = ()
+
+
+class _ReapCheck(_PostmanEvent):
+    __slots__ = ()
+
+
+class _MaintainLinks(_PostmanEvent):
     __slots__ = ()
 
 
@@ -140,16 +148,31 @@ class Postman:
 
     _authorized: frozenset[crypto.PublicKey] = field(default_factory=frozenset, init=False)
 
-    _input: queue.SimpleQueue[_Cmd] = field(default_factory=queue.SimpleQueue, init=False)
+    _loop: EventLoop[_PostmanEvent] = field(init=False)
     _output: queue.SimpleQueue[Output] = field(default_factory=queue.SimpleQueue, init=False)
 
-    _thread: threading.Thread | None = field(default=None, init=False)
+    _retry_timer: Scheduled[_PostmanEvent] | None = field(default=None, init=False)
+    _reap_timer: Scheduled[_PostmanEvent] | None = field(default=None, init=False)
+    _link_timer: Scheduled[_PostmanEvent] | None = field(default=None, init=False)
+
     _acceptors: list[Acceptor] = field(default_factory=list, init=False)
     _dialers: list[Dialer] = field(default_factory=list, init=False)
 
     def __post_init__(self) -> None:
         self._dialers.append(TCPDialer(self.tunables))
         self._dialers.append(OnionDialer(self.tunables))
+        self._loop = EventLoop()
+        self._loop.register(_PostSend, self._on_post_send)
+        self._loop.register(_SyncPeers, self._on_sync_peers)
+        self._loop.register(_AddPeer, self._on_add_peer)
+        self._loop.register(_RemovePeer, self._on_remove_peer)
+        self._loop.register(_FrameIn, self._on_frame_in)
+        self._loop.register(_LinkUp, self._on_link_up)
+        self._loop.register(_LinkDown, self._on_link_down)
+        self._loop.register(_LinkBroken, self._on_link_broken)
+        self._loop.register(_RetryDue, self._on_retry_due)
+        self._loop.register(_ReapCheck, self._on_reap_check)
+        self._loop.register(_MaintainLinks, self._on_maintain_links)
 
     # -- public interface: queue puts, never direct state mutation -----------
 
@@ -163,13 +186,13 @@ class Postman:
         verb, body = msg.encode()
         if mid is None:
             mid = MessageId.random()
-        self._input.put(_Send(to, verb, body, ttl, True, MessageId(b""), mid))
+        self._loop.post(_PostSend(to, verb, body, ttl, True, MessageId(b""), mid))
         return mid
 
     def reply(self, d: Delivered, msg: Encodable, ttl: Millis) -> MessageId:
         verb, body = msg.encode()
         new_mid = MessageId.random()
-        self._input.put(_Send(d.frm, verb, body, ttl, False, d.mid, new_mid))
+        self._loop.post(_PostSend(d.frm, verb, body, ttl, False, d.mid, new_mid))
         return new_mid
 
     def send_raw(
@@ -186,7 +209,7 @@ class Postman:
             reply_to = MessageId(b"")
         if mid is None:
             mid = MessageId.random()
-        self._input.put(_Send(to, verb, body, ttl, await_reply, reply_to, mid))
+        self._loop.post(_PostSend(to, verb, body, ttl, await_reply, reply_to, mid))
         return mid
 
     def sync(
@@ -194,13 +217,13 @@ class Postman:
         peers: dict[crypto.PublicKey, tuple[Endpoint, ...]],
         authorized: frozenset[crypto.PublicKey] = frozenset(),
     ) -> None:
-        self._input.put(_Sync(peers, authorized))
+        self._loop.post(_SyncPeers(peers, authorized))
 
     def add_peer(self, pubkey: crypto.PublicKey, endpoints: tuple[Endpoint, ...]) -> None:
-        self._input.put(_AddPeer(pubkey, endpoints))
+        self._loop.post(_AddPeer(pubkey, endpoints))
 
     def remove_peer(self, pubkey: crypto.PublicKey) -> None:
-        self._input.put(_RemovePeer(pubkey))
+        self._loop.post(_RemovePeer(pubkey))
 
     def drain_output(self, timeout: float | None = None) -> Iterator[Output]:
         if timeout is not None:
@@ -218,34 +241,26 @@ class Postman:
 
     def add_acceptor(self, acceptor: Acceptor) -> None:
         self._acceptors.append(acceptor)
-        if self._thread is not None:
+        if self._loop.running:
             acceptor.start(self._on_frame, self._on_link_established)
 
     def add_dialer(self, dialer: Dialer) -> None:
         self._dialers.append(dialer)
-        if self._thread is not None:
+        if self._loop.running:
             dialer.start(self._on_frame, self._on_link_established)
 
     def start(self) -> None:
-        if self._thread is not None:
+        if self._loop.running:
             return
         for acceptor in self._acceptors:
             acceptor.start(self._on_frame, self._on_link_established)
         for dialer in self._dialers:
             dialer.start(self._on_frame, self._on_link_established)
-        self._thread = threading.Thread(
-            target=self._run,
-            name=f"postman-{self.me.public.hex()[:8]}",
-            daemon=True,
-        )
-        self._thread.start()
+        self._loop.start()
+        self._schedule_link_maintenance()
 
     def stop(self) -> None:
-        self._input.put(_Stop())
-        thread = self._thread
-        self._thread = None
-        if thread is not None:
-            thread.join()
+        self._loop.stop()
         for acceptor in self._acceptors:
             with contextlib.suppress(Exception):
                 acceptor.stop()
@@ -253,64 +268,126 @@ class Postman:
             with contextlib.suppress(Exception):
                 dialer.stop()
 
-    def _run(self) -> None:
-        tick_interval = self.tunables.tick_interval.as_seconds
-        while True:
-            try:
-                cmd = self._input.get(timeout=tick_interval)
-            except queue.Empty:
-                cmd = None
-            if isinstance(cmd, _Stop):
-                return
-            now = Millis.now()
-            if cmd is not None:
-                self._process(cmd, now)
-            self._drain_input(now)
-            self._tick(now)
-
-    def _drain_input(self, now: Millis) -> None:
-        while True:
-            try:
-                cmd = self._input.get_nowait()
-            except queue.Empty:
-                return
-            if isinstance(cmd, _Stop):
-                self._input.put(cmd)
-                return
-            self._process(cmd, now)
-
     # -- transport callbacks (called from transport threads, thread-safe) ----
 
     def _on_frame(self, frame: Frame, link: Link) -> None:
-        self._input.put(_FrameIn(frame, link))
+        self._loop.post(_FrameIn(frame, link))
 
     def _on_link_established(self, link: Link) -> None:
-        link.on_close = lambda ln: self._input.put(_LinkDied(ln))
-        self._input.put(_LinkEstablished(link))
+        link.on_close = lambda ln: self._loop.post(_LinkDown(ln))
+        self._loop.post(_LinkUp(link))
 
-    # -- command dispatch (runs on the postman's own thread only) -----------
+    # -- event handlers (run on the postman's loop thread only) -------------
 
-    def _process(self, cmd: _Cmd, now: Millis) -> None:
-        match cmd:
-            case _Send(to, verb, body, ttl, await_reply, reply_to, prefix):
-                env = Envelope(
-                    to, verb, MessageId(prefix + b"\x00"), body, reply_to=MessageId(reply_to)
-                )
-                self.mailbox.post(env, now, ttl, await_reply)
-            case _Sync(peers, authorized):
-                self._do_sync(peers, authorized)
-            case _AddPeer(pubkey, endpoints):
-                self._do_add_peer(pubkey, endpoints)
-            case _RemovePeer(pubkey):
-                self._do_remove_peer(pubkey)
-            case _FrameIn(frame, link):
-                self._do_deliver(frame, link, now)
-            case _LinkEstablished(link):
-                self._do_link_established(link)
-            case _LinkDied(link):
-                self._do_link_died(link)
-            case _LinkBroken(address):
-                self._do_link_broken(address, now)
+    def _on_post_send(self, event: _PostSend) -> None:
+        now = Millis.now()
+        env = Envelope(
+            event.to,
+            event.verb,
+            MessageId(event.prefix + b"\x00"),
+            event.body,
+            reply_to=MessageId(event.reply_to),
+        )
+        self.mailbox.post(env, now, event.ttl, event.await_reply)
+        self._schedule_retry()
+        self._schedule_reap()
+
+    def _on_sync_peers(self, event: _SyncPeers) -> None:
+        self._do_sync(event.peers, event.authorized)
+        for pk in event.peers:
+            peer = self.peers.get(pk)
+            if peer is not None:
+                self._dial_peer(peer)
+
+    def _on_add_peer(self, event: _AddPeer) -> None:
+        self._do_add_peer(event.pubkey, event.endpoints)
+        peer = self.peers.get(event.pubkey)
+        if peer is not None:
+            self._dial_peer(peer)
+
+    def _on_remove_peer(self, event: _RemovePeer) -> None:
+        self._do_remove_peer(event.pubkey)
+
+    def _on_frame_in(self, event: _FrameIn) -> None:
+        self._do_deliver(event.frame, event.link, Millis.now())
+
+    def _on_link_up(self, event: _LinkUp) -> None:
+        self._do_link_established(event.link)
+
+    def _on_link_down(self, event: _LinkDown) -> None:
+        self._do_link_died(event.link)
+        if event.link.identity is not None:
+            peer = self.peers.get(event.link.identity)
+            if peer is not None:
+                self._dial_peer(peer)
+
+    def _on_link_broken(self, event: _LinkBroken) -> None:
+        self._do_link_broken(event.address, Millis.now())
+
+    def _on_retry_due(self, _event: _RetryDue) -> None:
+        self._retry_timer = None
+        now = Millis.now()
+        for t in self.mailbox.due(now):
+            peer = self.peers.get(t.to)
+            if peer is None:
+                self.mailbox.failed(t.prefix, retry_at(self.tunables, t.attempt, now))
+                continue
+            self._act(
+                plan_next(self.tunables, peer, t.attempt, now, self.mailbox.deadline(t.prefix)),
+                t,
+                now,
+            )
+        self._schedule_retry()
+
+    def _on_reap_check(self, _event: _ReapCheck) -> None:
+        self._reap_timer = None
+        now = Millis.now()
+        expired = self._reap(now)
+        if expired:
+            out = Output(delivered=(), expired=expired)
+            self._output.put(out)
+            self.on_output(out)
+        self._schedule_reap()
+
+    def _on_maintain_links(self, _event: _MaintainLinks) -> None:
+        self._link_timer = None
+        self._maintain_links()
+        self._schedule_link_maintenance()
+
+    # -- timer scheduling (postman thread only) ----------------------------
+
+    def _schedule_retry(self) -> None:
+        if self._retry_timer is not None:
+            self._retry_timer.cancel()
+            self._retry_timer = None
+        earliest: Millis | None = None
+        for p in self.mailbox.pending.values():
+            if (
+                p.envelope is not None
+                and not p.in_flight
+                and p.next_at < p.deadline
+                and (earliest is None or p.next_at < earliest)
+            ):
+                earliest = p.next_at
+        if earliest is not None:
+            self._retry_timer = self._loop.schedule(earliest, _RetryDue())
+
+    def _schedule_reap(self) -> None:
+        if self._reap_timer is not None:
+            self._reap_timer.cancel()
+            self._reap_timer = None
+        earliest: Millis | None = None
+        for p in self.mailbox.pending.values():
+            if earliest is None or p.deadline < earliest:
+                earliest = p.deadline
+        if earliest is not None:
+            self._reap_timer = self._loop.schedule(earliest, _ReapCheck())
+
+    def _schedule_link_maintenance(self) -> None:
+        if self._link_timer is not None:
+            self._link_timer.cancel()
+        interval = self.tunables.tick_interval * 10
+        self._link_timer = self._loop.schedule(Millis.now() + interval, _MaintainLinks())
 
     # -- peer management (postman thread only) ------------------------------
 
@@ -404,17 +481,22 @@ class Postman:
         self._output.put(out)
         self.on_output(out)
 
-    def _maintain_links(self) -> None:
+    # -- link maintenance (postman thread only) ----------------------------
+
+    def _dial_peer(self, peer: Peer) -> None:
         desired = self.tunables.desired_links_per_peer
-        for peer in self.peers.values():
-            if len(peer.links) >= desired:
+        if len(peer.links) >= desired:
+            return
+        for address in peer.dial_targets:
+            if any(ln.address == address for ln in peer.links):
                 continue
-            for address in peer.dial_targets:
-                if any(ln.address == address for ln in peer.links):
-                    continue
-                for dialer in self._dialers:
-                    if dialer.dial(address):
-                        break
+            for dialer in self._dialers:
+                if dialer.dial(address):
+                    break
+
+    def _maintain_links(self) -> None:
+        for peer in self.peers.values():
+            self._dial_peer(peer)
 
     def _do_link_broken(self, address: Address, now: Millis) -> None:
         for peer in self.peers.values():
@@ -422,26 +504,9 @@ class Postman:
                 if link.address == address:
                     link.on_expired(now)
         self.mailbox.failed_on(address, retry_at(self.tunables, 0, now))
+        self._schedule_retry()
 
-    # -- the tick (postman thread only) -------------------------------------
-
-    def _tick(self, now: Millis) -> None:
-        self._maintain_links()
-        for t in self.mailbox.due(now):
-            peer = self.peers.get(t.to)
-            if peer is None:
-                self.mailbox.failed(t.prefix, retry_at(self.tunables, t.attempt, now))
-                continue
-            self._act(
-                plan_next(self.tunables, peer, t.attempt, now, self.mailbox.deadline(t.prefix)),
-                t,
-                now,
-            )
-        expired = self._reap(now)
-        if expired:
-            out = Output(delivered=(), expired=expired)
-            self._output.put(out)
-            self.on_output(out)
+    # -- send / retry machinery (postman thread only) ----------------------
 
     def _act(self, decision: Decision, t: Transmit, now: Millis) -> None:
         match decision:
