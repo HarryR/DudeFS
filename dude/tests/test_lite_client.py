@@ -325,7 +325,7 @@ class TestByzantineBootstrapReply(unittest.TestCase):
         lc = LightClient(me=kp, anchor=self.c.anchor.public, postman=postman)
         lc.state = State.BOOTSTRAPPING
         for node in self.c.nodes:
-            lc._bootstrap_peers[node.me.public] = _BootstrapReply()
+            lc.bootstrap_peers[node.me.public] = _BootstrapReply()
 
         now = _now_for_store(self.c)
         for node in self.c.nodes:
@@ -358,7 +358,7 @@ class TestByzantineBootstrapReply(unittest.TestCase):
         lc = LightClient(me=kp, anchor=self.c.anchor.public, postman=postman)
         lc.state = State.BOOTSTRAPPING
         for node in self.c.nodes:
-            lc._bootstrap_peers[node.me.public] = _BootstrapReply()
+            lc.bootstrap_peers[node.me.public] = _BootstrapReply()
 
         now = _now_for_store(self.c)
         for node in self.c.nodes:

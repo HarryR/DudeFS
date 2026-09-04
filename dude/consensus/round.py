@@ -5,7 +5,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from enum import Enum, auto
 from itertools import combinations
-from typing import ClassVar
+from typing import ClassVar, Self
 
 from .. import quorum
 from ..core import codec, crypto
@@ -34,18 +34,22 @@ class RoundMsg(Encodable):
     different heights ratify together and only find out two stages later, at the anchors."""
 
     @abstractmethod
-    def _encode(self) -> bytes: ...
+    def encode_inner(self) -> bytes: ...
+
+    @classmethod
+    @abstractmethod
+    def decode_inner(cls, body: bytes) -> Self: ...
 
     def encode(self) -> tuple[Verb, bytes]:
-        return self.verb, self._encode()
+        return self.verb, self.encode_inner()
 
     @classmethod
     def decode(cls, verb: Verb, body: bytes) -> RoundMsg:
         try:
-            handler = _DECODERS[verb]
+            handler = _ROUND_MSG_TO_CLASS[verb]
         except KeyError as e:
             raise RoundAdapterError(f"not a Round verb: {verb.name}") from e
-        return handler(body)
+        return handler.decode_inner(body)
 
     @classmethod
     def bucket_of(cls, body: bytes) -> Bucket:
@@ -64,11 +68,11 @@ class Held(RoundMsg):
     prev_block: crypto.Digest
     hashes: frozenset[crypto.Digest]
 
-    def _encode(self) -> bytes:
+    def encode_inner(self) -> bytes:
         return codec.encode([self.bucket, self.prev_block, hashes_canonical(self.hashes)])
 
     @classmethod
-    def _decode(cls, body: bytes) -> Held:
+    def decode_inner(cls, body: bytes) -> Held:
         try:
             p = codec.as_seq(codec.decode(body), 3)
             hashes = frozenset(crypto.Digest(codec.as_bytes(h)) for h in codec.as_seq(p[2]))
@@ -105,11 +109,11 @@ class Sig(RoundMsg):
     def verify(self, pk: crypto.PublicKey) -> bool:
         return pk.verify(_sig_payload(self.bucket, self.prev_block, self.slice_hash), self.sig)
 
-    def _encode(self) -> bytes:
+    def encode_inner(self) -> bytes:
         return codec.encode([self.bucket, self.prev_block, self.slice_hash, self.sig])
 
     @classmethod
-    def _decode(cls, body: bytes) -> Sig:
+    def decode_inner(cls, body: bytes) -> Sig:
         try:
             p = codec.as_seq(codec.decode(body), 4)
             return cls(
@@ -136,11 +140,11 @@ class Bodies(RoundMsg):
     prev_block: crypto.Digest
     txs: tuple[SignedTransaction, ...]
 
-    def _encode(self) -> bytes:
+    def encode_inner(self) -> bytes:
         return codec.encode([self.bucket, self.prev_block, [tx.raw for tx in self.txs]])
 
     @classmethod
-    def _decode(cls, body: bytes) -> Bodies:
+    def decode_inner(cls, body: bytes) -> Bodies:
         try:
             p = codec.as_seq(codec.decode(body), 3)
             txs = tuple(SignedTransaction.decode(codec.as_bytes(raw)) for raw in codec.as_seq(p[2]))
@@ -154,9 +158,7 @@ class Bodies(RoundMsg):
 
 
 _ROUND_MSG_CLASSES: tuple[type[RoundMsg], ...] = (Held, Sig, Bodies)
-
-
-_DECODERS: dict[Verb, Callable[[bytes], RoundMsg]] = {c.verb: c._decode for c in _ROUND_MSG_CLASSES}
+_ROUND_MSG_TO_CLASS: dict[Verb, type[RoundMsg]] = {c.verb: c for c in _ROUND_MSG_CLASSES}
 
 
 @dataclass(frozen=True, slots=True)

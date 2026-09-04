@@ -133,7 +133,7 @@ class Read(InflightHandle):
             self.client.resolve_read(self, msg, now)
         except DudeError as e:
             self.result = Failed(reason=f"responder reply refused: {e}")
-        self.client._note_read_result(self, now)
+        self.client.note_read_result(self, now)
 
     def on_expired(self) -> None:
         self.result = Failed(reason="request expired")
@@ -180,10 +180,10 @@ class LightClient:
     state: State = State.UNBOOTSTRAPPED
     trusted_state: TrustedState | None = None
 
-    _bootstrap_peers: dict[crypto.PublicKey, _BootstrapReply] = field(default_factory=dict)
+    bootstrap_peers: dict[crypto.PublicKey, _BootstrapReply] = field(default_factory=dict)
     inflight: Inflight = field(default_factory=Inflight, init=False)
     _key_cache: KeyCache | None = field(default=None, init=False)
-    _peer_views: dict[crypto.PublicKey, PeerView] = field(default_factory=dict, init=False)
+    peer_views: dict[crypto.PublicKey, PeerView] = field(default_factory=dict, init=False)
 
     commit_cond: threading.Condition = field(default_factory=threading.Condition, init=False)
     commit_seq: int = field(default=0, init=False)
@@ -191,15 +191,15 @@ class LightClient:
     _thread: threading.Thread | None = field(default=None, init=False)
     _socket_servers: list = field(default_factory=list, init=False)
 
-    def _peer_view(self, peer: crypto.PublicKey) -> PeerView:
-        pv = self._peer_views.get(peer)
+    def peer_view(self, peer: crypto.PublicKey) -> PeerView:
+        pv = self.peer_views.get(peer)
         if pv is None:
             pv = PeerView()
-            self._peer_views[peer] = pv
+            self.peer_views[peer] = pv
         return pv
 
-    def _note_read_result(self, req: "Read", now: Millis) -> None:
-        pv = self._peer_view(req.peer)
+    def note_read_result(self, req: "Read", now: Millis) -> None:
+        pv = self.peer_view(req.peer)
         pv.last_activity = now
         if isinstance(req.result, GetResult):
             pv.last_block_num = req.result.block_num
@@ -209,16 +209,16 @@ class LightClient:
 
     def add_bootstrap_peer(self, peer: crypto.PublicKey, endpoints: tuple[Endpoint, ...]) -> None:
         self.postman.add_peer(peer, endpoints)
-        self._bootstrap_peers[peer] = _BootstrapReply()
+        self.bootstrap_peers[peer] = _BootstrapReply()
 
     def bootstrap(self, timeout: float | None = None, now: Millis | None = None) -> None:
         if self.state is State.READY:
             return
         if self.state is State.UNBOOTSTRAPPED:
-            if not self._bootstrap_peers:
+            if not self.bootstrap_peers:
                 raise LightClientError("no bootstrap peers registered")
             self.state = State.BOOTSTRAPPING
-            self._ask_for_anchors(self._bootstrap_peers, now or Millis.now())
+            self._ask_for_anchors(self.bootstrap_peers, now or Millis.now())
         budget = timeout if timeout is not None else self.tunables.evict_after.as_seconds
         deadline = time.monotonic() + budget
         while time.monotonic() < deadline:
@@ -238,7 +238,7 @@ class LightClient:
         waiting = {r.peer for r in self.inflight.pending_of_type(_BootstrapRequest)}
         stale = [
             peer
-            for peer, entry in self._bootstrap_peers.items()
+            for peer, entry in self.bootstrap_peers.items()
             if peer not in waiting
             and (
                 entry.anchors_reply is None
@@ -297,9 +297,9 @@ class LightClient:
             daemon=True,
         )
         self._thread.start()
-        if self.state is State.UNBOOTSTRAPPED and self._bootstrap_peers:
+        if self.state is State.UNBOOTSTRAPPED and self.bootstrap_peers:
             self.state = State.BOOTSTRAPPING
-            self._ask_for_anchors(self._bootstrap_peers, Millis.now())
+            self._ask_for_anchors(self.bootstrap_peers, Millis.now())
 
     def stop(self) -> None:
         self._stopping.set()
@@ -342,7 +342,7 @@ class LightClient:
     # -- bootstrap ----------------------------------------------------------
 
     def forget_bootstrap_peer(self, peer: crypto.PublicKey) -> None:
-        self._bootstrap_peers.pop(peer, None)
+        self.bootstrap_peers.pop(peer, None)
 
     def on_bootstrap_reply(self, peer: crypto.PublicKey, msg: LiteMsg, now: Millis) -> None:
         if self.state is not State.BOOTSTRAPPING:
@@ -358,11 +358,11 @@ class LightClient:
             return
         if not _verify_settle_sigs_against_bundle(self.anchor, msg, msg.bundle):
             return
-        entry = self._bootstrap_peers.setdefault(peer, _BootstrapReply())
+        entry = self.bootstrap_peers.setdefault(peer, _BootstrapReply())
         entry.fingerprint = msg.roster_fingerprint
         entry.bundle = msg.bundle
         entry.anchors_reply = msg
-        pv = self._peer_view(peer)
+        pv = self.peer_view(peer)
         pv.last_block_num = msg.head.anchors.block_num
         pv.last_activity = now
         pv.consecutive_failures = 0
@@ -370,7 +370,7 @@ class LightClient:
 
     def _check_bootstrap_convergence(self, now: Millis) -> None:
         agreed: dict[crypto.Digest, list[_BootstrapReply]] = {}
-        for entry in self._bootstrap_peers.values():
+        for entry in self.bootstrap_peers.values():
             if entry.fingerprint is None or entry.anchors_reply is None:
                 continue
             if chain.is_stale(entry.anchors_reply.head.block.bucket, now, self.tunables):
@@ -497,7 +497,7 @@ class _TxStatusHandle(InflightHandle):
             self.result = msg.status
             self.block_num = msg.block_num
             self.block_hash = msg.block_hash
-            pv = self.client._peer_view(self.peer)
+            pv = self.client.peer_view(self.peer)
             pv.last_activity = Millis.now()
             pv.consecutive_failures = 0
 
@@ -520,7 +520,7 @@ class _SubmitPeerHandle(InflightHandle):
     fan: _SubmitFanOut
 
     def on_reply(self, verb: Verb, body: bytes) -> None:
-        pv = self.fan.client._peer_view(self.peer)
+        pv = self.fan.client.peer_view(self.peer)
         pv.last_activity = Millis.now()
         pv.consecutive_failures = 0
         if self.fan.accepted:
@@ -556,9 +556,9 @@ class _LiteSubstrate(Substrate):
     def _ranked_peers(self) -> list[crypto.PublicKey]:
         ts = self._lc.trusted_state
         if ts is None or not ts.roster:
-            return list(self._lc._bootstrap_peers)
+            return list(self._lc.bootstrap_peers)
         head_num = ts.head.anchors.block_num
-        views = self._lc._peer_views
+        views = self._lc.peer_views
 
         def rank(peer: crypto.PublicKey) -> tuple[int, int, int]:
             pv = views.get(peer)

@@ -115,8 +115,12 @@ class _BaseNode:
             self.postman.send(e.peer, e.msg, tunables.ttl_exchange)
 
         self.follower = Follower(
-            me=me, store=store, mgmt_reader=store.mgmt_reader,
-            tunables=tunables, on_send=_on_send, on_commit=on_follower_commit,
+            me=me,
+            store=store,
+            mgmt_reader=store.mgmt_reader,
+            tunables=tunables,
+            on_send=_on_send,
+            on_commit=on_follower_commit,
         )
         self.inflight = Inflight()
         self.commit_seq = 0
@@ -188,9 +192,7 @@ class _BaseNode:
         self._schedule_reconcile()
 
     def _schedule_reconcile(self) -> None:
-        self._loop.schedule(
-            Millis.now() + self.tunables.tick_interval, ReconcilePeers()
-        )
+        self._loop.schedule(Millis.now() + self.tunables.tick_interval, ReconcilePeers())
 
     def _on_delivered(self, d: Delivered) -> None:
         raise NotImplementedError
@@ -355,7 +357,9 @@ class Node(_BaseNode):
             self._notify_followers()
 
         self.coordinator = Coordinator(
-            me, store, tunables,
+            me,
+            store,
+            tunables,
             behind=self.follower.behind,
             on_send=_on_consensus_send,
             on_settled=_on_block_settled,

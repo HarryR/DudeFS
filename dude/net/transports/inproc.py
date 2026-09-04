@@ -29,10 +29,10 @@ class _InProcConn:
         )
 
     def send_frame(self, frame: Frame) -> None:
-        target = self._nexus._listeners.get(self._reply_to)
+        target = self._nexus.get(self._reply_to)
         if target is None:
             raise LinkError(f"in-process reply target no longer registered: {self._reply_to!r}")
-        target._deliver(frame, sender=self._me)
+        target.deliver(frame, sender=self._me)
 
     def close(self) -> None:
         pass
@@ -45,14 +45,11 @@ class InProcListener(Acceptor, Dialer):
     _on_frame: OnFrame | None = field(init=False, default=None)
     _on_link: OnLink | None = field(init=False, default=None)
     _buffered: list[tuple[Frame, Link]] = field(init=False, default_factory=list)
-    _conns: dict[bytes, _InProcConn] = field(init=False, default_factory=dict)
+    conns: dict[bytes, _InProcConn] = field(init=False, default_factory=dict)
     _stopped: bool = field(init=False, default=False)
 
     def __post_init__(self) -> None:
-        key = bytes(self.identity)
-        if key in self.nexus._listeners:
-            raise LinkError(f"in-process identity already registered: {self.identity.hex()[:8]}")
-        self.nexus._listeners[key] = self
+        self.nexus.register(bytes(self.identity), self)
 
     @property
     def endpoint(self) -> Endpoint:
@@ -62,10 +59,10 @@ class InProcListener(Acceptor, Dialer):
     def endpoint_for(identity: crypto.PublicKey) -> Endpoint:
         return Endpoint(Address(Scheme.INPROC, identity.hex()))
 
-    def _deliver(self, frame: Frame, sender: bytes) -> None:
+    def deliver(self, frame: Frame, sender: bytes) -> None:
         if self._stopped:
             return
-        conn = self._conns.get(sender)
+        conn = self.conns.get(sender)
         if conn is None:
             conn = _InProcConn(
                 reply_to=sender,
@@ -73,7 +70,7 @@ class InProcListener(Acceptor, Dialer):
                 address=Address(Scheme.INPROC, sender.hex()),
                 nexus=self.nexus,
             )
-            self._conns[sender] = conn
+            self.conns[sender] = conn
             if self._on_link is not None:
                 self._on_link(conn.link)
         conn.link.last_activity = Millis.now()
@@ -82,14 +79,19 @@ class InProcListener(Acceptor, Dialer):
         else:
             self._buffered.append((frame, conn.link))
 
+    def remove_conn(self, peer_key: bytes) -> None:
+        conn = self.conns.pop(peer_key, None)
+        if conn is not None:
+            conn.link.notify_closed()
+
     def start(self, on_frame: OnFrame, on_link: OnLink) -> None:
         self._stopped = False
         me = bytes(self.identity)
-        if me not in self.nexus._listeners:
-            self.nexus._listeners[me] = self
+        if self.nexus.get(me) is None:
+            self.nexus.register(me, self)
         self._on_frame = on_frame
         self._on_link = on_link
-        for conn in self._conns.values():
+        for conn in self.conns.values():
             on_link(conn.link)
         for frame, link in self._buffered:
             on_frame(frame, link)
@@ -99,7 +101,7 @@ class InProcListener(Acceptor, Dialer):
         if address.scheme is not Scheme.INPROC or self._on_link is None:
             return False
         target_key = bytes.fromhex(address.value)
-        if target_key not in self.nexus._listeners or target_key in self._conns:
+        if self.nexus.get(target_key) is None or target_key in self.conns:
             return False
         conn = _InProcConn(
             reply_to=target_key,
@@ -107,7 +109,7 @@ class InProcListener(Acceptor, Dialer):
             address=address,
             nexus=self.nexus,
         )
-        self._conns[target_key] = conn
+        self.conns[target_key] = conn
         self._on_link(conn.link)
         return True
 
@@ -116,14 +118,11 @@ class InProcListener(Acceptor, Dialer):
         self._on_frame = None
         self._on_link = None
         me = bytes(self.identity)
-        self.nexus._listeners.pop(me, None)
-        for conn in self._conns.values():
+        self.nexus.unregister(me)
+        for conn in self.conns.values():
             conn.link.close()
-        self._conns.clear()
-        for listener in list(self.nexus._listeners.values()):
-            remote_conn = listener._conns.pop(me, None)
-            if remote_conn is not None:
-                remote_conn.link.notify_closed()
+        self.conns.clear()
+        self.nexus.disconnect_peer(me)
 
 
 class InProcNexus:
@@ -131,6 +130,21 @@ class InProcNexus:
 
     def __init__(self) -> None:
         self._listeners: dict[bytes, InProcListener] = {}
+
+    def get(self, key: bytes) -> InProcListener | None:
+        return self._listeners.get(key)
+
+    def register(self, key: bytes, listener: InProcListener) -> None:
+        if key in self._listeners:
+            raise LinkError(f"in-process identity already registered: {key.hex()[:8]}")
+        self._listeners[key] = listener
+
+    def unregister(self, key: bytes) -> None:
+        self._listeners.pop(key, None)
+
+    def disconnect_peer(self, peer_key: bytes) -> None:
+        for listener in list(self._listeners.values()):
+            listener.remove_conn(peer_key)
 
     def attach(self, target: Postman | _BaseNode) -> InProcListener:
         pub = target.me.public

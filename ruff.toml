@@ -81,6 +81,7 @@ ignore = [
 # Tests exercise internals on purpose: they poke private caches to build negative controls, use
 # `assert`, and seed a deliberately NON-cryptographic RNG so runs are reproducible.
 "dude/tests/*" = ["S101", "S311", "SLF001", "PLR0915"]
+"dude/cli/*" = ["ARG002"]
 
 [format]
 docstring-code-format = false

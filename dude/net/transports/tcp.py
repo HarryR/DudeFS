@@ -38,7 +38,7 @@ class _TCPTiming:
 
 
 class _TCPConn:
-    __slots__ = ("_closed", "_out", "_reader", "_sock", "_writer", "link")
+    __slots__ = ("_out", "_reader", "_sock", "_writer", "closed", "link")
 
     def __init__(
         self,
@@ -51,7 +51,7 @@ class _TCPConn:
         sock.setblocking(True)
         _bound_sends(sock, timing.send_sec)
         self._sock = sock
-        self._closed = False
+        self.closed = False
         self._out: queue.Queue[bytes | None] = queue.Queue(maxsize=_OUTBOX_DEPTH)
 
         self.link = Link(
@@ -70,7 +70,7 @@ class _TCPConn:
         self._writer.start()
 
     def _enqueue(self, frame: Frame) -> None:
-        if self._closed:
+        if self.closed:
             raise LinkError("tcp connection is closed")
         payload = frame.raw
         if len(payload) > MAX_FRAME_BYTES:
@@ -82,9 +82,9 @@ class _TCPConn:
         self.link.last_activity = Millis.now()
 
     def _shutdown(self) -> None:
-        if self._closed:
+        if self.closed:
             return
-        self._closed = True
+        self.closed = True
         with contextlib.suppress(queue.Full):
             self._out.put_nowait(None)
         with contextlib.suppress(OSError):
@@ -212,7 +212,7 @@ class _DialWorker:
         self.connected = True
         conn = _TCPConn(sock, self._address, self._timing, self._on_frame, self._on_link)
         conn.link.on_close = lambda _ln: None
-        while not conn._closed and not self._stopping.is_set():
+        while not conn.closed and not self._stopping.is_set():
             self._stopping.wait(timeout=self._timing.idle_wait_sec)
         conn.join()
 
@@ -418,4 +418,4 @@ class TCPListener(Acceptor):
                 self._on_link,
             )
             self._conns.append(conn)
-            self._conns = [c for c in self._conns if not c._closed]
+            self._conns = [c for c in self._conns if not c.closed]

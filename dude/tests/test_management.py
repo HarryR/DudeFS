@@ -36,7 +36,7 @@ def unauthorised_certs(mgmt: MgmtWriter) -> str | None:
     for who, rec in mgmt.nodes().items():
         if not mgmt.verify_cert(rec.cert):
             return f"node row {who.hex()[:8]} carries a cert signed by {rec.cert.signer.hex()[:8]}"
-    for who in mgmt._grants.keys():
+    for who in mgmt.grants_map.keys():
         who_pk = crypto.PublicKey(who)
         grant = mgmt.grant_of(who_pk)
         if grant is None:
@@ -325,7 +325,7 @@ class TestRevocationIsCompound(unittest.TestCase):
         the write until management operations become typed opcodes."""
         anchor, warm, s, mgmt, _kps = self._cluster_admitted_by_a_warm_manager()
         bare = ops.writes(
-            ops.Del(ops.STORE_MANAGEMENT, mgmt._grants.entry_name(warm.public)),
+            ops.Del(ops.STORE_MANAGEMENT, mgmt.grants_map.entry_name(warm.public)),
             ops.Del(ops.STORE_MANAGEMENT, P_POP + warm.public),
         )
         s.apply((_sign(anchor, bare),), auth=mgmt)
@@ -809,7 +809,7 @@ class TestMalformedRowsDoNotPoison(unittest.TestCase):
 
     def test_garbage_grant_row_refuses_authority_not_raising(self):
         writer = crypto.Keypair.generate()
-        self._settle_garbage(self.mgmt._grants.entry_name(writer.public))
+        self._settle_garbage(self.mgmt.grants_map.entry_name(writer.public))
         self.assertIsNone(self.mgmt.grant_of(writer.public))
         attempt = ops.writes(ops.Set(ops.STORE_DATA, DK, b"v")).sign(writer, T0 + 2)
         applied = self.s.apply((attempt,), auth=self.mgmt)
@@ -990,7 +990,7 @@ class TestReadAndWriteAreScopedTheSameWay(unittest.TestCase):
         plant = ops.writes(
             ops.Set(
                 ops.STORE_MANAGEMENT,
-                s.mgmt_reader._grants.entry_name(who.public),
+                s.mgmt_reader.grants_map.entry_name(who.public),
                 MapEntry.encode(0, forged.encode_row()),
             )
         ).sign(anchor, T0)

@@ -12,10 +12,9 @@ from ..core.units import Bucket, Millis
 from ..net.envelope import Verb
 from ..net.postman import Encodable, recipients
 from ..store import settle
-from ..store.layer import Index, Layer
+from ..store.layer import Index, Layer, log_element
 from ..store.management import MgmtReader
 from ..store.ops import SignedTransaction
-from ..store.layer import log_element
 from ..store.store import Store
 from ..tunables import Tunables
 from .canonical import CanonicalBatch
@@ -286,9 +285,7 @@ class Coordinator:
         self._flush_round()
         self._check_ratified()
 
-    def _absorb_bodies(
-        self, frm: crypto.PublicKey, verb: Verb, body: bytes, r: Round
-    ) -> None:
+    def _absorb_bodies(self, frm: crypto.PublicKey, verb: Verb, body: bytes, r: Round) -> None:
         msg = RoundMsg.decode(verb, body)
         if not isinstance(msg, Bodies):
             return
@@ -427,9 +424,7 @@ class Coordinator:
         r.add_local(frozen.all_bodies().values())
         self.current_round = r
 
-        self._round_close_timer = self._loop.schedule(
-            self._close_by(bucket), RoundClose(bucket)
-        )
+        self._round_close_timer = self._loop.schedule(self._close_by(bucket), RoundClose(bucket))
         self._round_abandon_timer = self._loop.schedule(
             self._abandon_by(bucket), RoundAbandon(bucket)
         )

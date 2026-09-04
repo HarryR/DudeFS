@@ -256,9 +256,9 @@ class StoreReader(View, Ledger, _ExportSource):
 
     def subtree_rows(self, prefix: bytes, depth: int) -> tuple[PathRow, ...]:
         lo, hi = smt.bounds(prefix, depth)
-        return tuple(self._rows_in_path_range(lo, hi))
+        return tuple(self.rows_in_path_range(lo, hi))
 
-    def _rows_in_path_range(self, lo: bytes, hi: bytes) -> Iterator[PathRow]:
+    def rows_in_path_range(self, lo: bytes, hi: bytes) -> Iterator[PathRow]:
         rows = self._conn.execute(
             "SELECT store, name, value, cred, epoch FROM live"
             " WHERE path BETWEEN ? AND ? ORDER BY path",
@@ -625,9 +625,9 @@ class Store(View, Ledger):
         with self.snapshot() as r:
             return r.holds(pred)
 
-    def _rows_in_path_range(self, lo: bytes, hi: bytes) -> Iterator[PathRow]:
+    def rows_in_path_range(self, lo: bytes, hi: bytes) -> Iterator[PathRow]:
         with self.snapshot() as r:
-            yield from list(r._rows_in_path_range(lo, hi))
+            yield from list(r.rows_in_path_range(lo, hi))
 
     def has_settled(self, *op_hashes: crypto.Digest) -> frozenset[crypto.Digest]:
         with self.snapshot() as r:

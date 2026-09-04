@@ -5,10 +5,9 @@ from ..core.errors import InvariantError
 from ..core.units import Millis
 from ..net.address import Endpoint
 from ..store import ops, settle
-from ..store.layer import Layer
+from ..store.layer import Layer, log_element
 from ..store.management import P_POP, Cert, Grant, MgmtWriter, NodeRecord, Role
 from ..store.ops import SignedTransaction
-from ..store.layer import log_element
 from ..store.store import Store
 from .canonical import bodies_canonical, hashes_canonical
 from .round import Block
@@ -147,7 +146,7 @@ def compose_genesis(
     managers: Sequence[crypto.Keypair] = (),
     ro_clients: Sequence[crypto.Keypair] = (),
     rw_clients: Sequence[crypto.Keypair] = (),
-    ts: Millis = Millis(0),
+    ts: Millis = Millis.ZERO,
 ) -> tuple[SignedTransaction, ...]:
     scratch = Store()
     scratch.provision(anchor.public)
@@ -176,7 +175,7 @@ def compose_genesis(
         _grant(kp, Role.CLIENT_RW, frozenset({ops.STORE_DATA}))
 
     if grant_entries:
-        tx = tx + w._grants.batch_add(tuple(grant_entries))
+        tx = tx + w.grants_map.batch_add(tuple(grant_entries))
         tx = tx + ops.writes(*pop_steps)
 
     all_recipients = tuple(kp.public for kp in (*managers, *ro_clients, *rw_clients))

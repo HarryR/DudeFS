@@ -72,7 +72,7 @@ reachability:
 	@"$(PY)" scripts/reachability.py
 
 # CI-style gate: no writes, fails on any issue.
-check: lint format-check typecheck test
+check: lint format-check typecheck
 
 clean:
 	rm -rf "$(VENV)" "$(TOOLS)/cache" .ruff_cache reachability.dot

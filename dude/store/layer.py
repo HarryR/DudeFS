@@ -76,7 +76,7 @@ class View(Reader):
     @abstractmethod
     def hash_under(self, prefix: bytes, depth: int) -> crypto.Digest: ...
     @abstractmethod
-    def _rows_in_path_range(self, lo: bytes, hi: bytes) -> Iterator[PathRow]: ...
+    def rows_in_path_range(self, lo: bytes, hi: bytes) -> Iterator[PathRow]: ...
     @property
     @abstractmethod
     def is_frozen(self) -> bool: ...
@@ -123,14 +123,18 @@ class Overlay[B: Reader](Reader):
         self._log.append(m)
 
     @property
+    def delta(self) -> dict[tuple[int, bytes], Held | None]:
+        return self._delta
+
+    @property
     def mutations(self) -> tuple[ops.Mutation, ...]:
         return tuple(self._log)
 
     def absorb(self, child: "Overlay[Any]") -> None:
         if self._frozen:
             raise LayerError("frozen; cannot absorb")
-        self._delta.update(child._delta)
-        self._log.extend(child._log)
+        self._delta.update(child.delta)
+        self._log.extend(child.mutations)
 
 
 class Layer(Overlay[View], View):
@@ -197,7 +201,7 @@ class Layer(Overlay[View], View):
             if lo <= smt.path_of(st, name) <= hi
         }
         base_leaves: list[tuple[bytes, crypto.Digest]] = []
-        for st, name, value, cred, epoch in self._base_rows_in_range(lo, hi):
+        for st, name, value, cred, epoch in self.base_rows_in_range(lo, hi):
             path = smt.path_of(st, name)
             if path in delta_paths:
                 continue
@@ -215,17 +219,17 @@ class Layer(Overlay[View], View):
         merged = sorted(base_leaves + delta_leaves, key=lambda pl: pl[0])
         return merged[:at_most]
 
-    def _base_rows_in_range(self, lo: bytes, hi: bytes) -> Iterator[PathRow]:
-        yield from self._base._rows_in_path_range(lo, hi)
+    def base_rows_in_range(self, lo: bytes, hi: bytes) -> Iterator[PathRow]:
+        yield from self._base.rows_in_path_range(lo, hi)
 
-    def _rows_in_path_range(self, lo: bytes, hi: bytes) -> Iterator[PathRow]:
+    def rows_in_path_range(self, lo: bytes, hi: bytes) -> Iterator[PathRow]:
         delta_by_path = {
             smt.path_of(st, name): (st, name, held)
             for (st, name), held in self._delta.items()
             if lo <= smt.path_of(st, name) <= hi
         }
         merged: dict[bytes, PathRow] = {}
-        for st, name, value, cred, epoch in self._base_rows_in_range(lo, hi):
+        for st, name, value, cred, epoch in self.base_rows_in_range(lo, hi):
             path = smt.path_of(st, name)
             if path in delta_by_path:
                 continue

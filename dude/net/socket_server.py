@@ -79,7 +79,7 @@ class SocketServer:
             with cond:
                 baseline = last
                 cond.wait_for(
-                    lambda: self._sub.commit_seq > baseline or self._stopping.is_set(),
+                    lambda b=baseline: self._sub.commit_seq > b or self._stopping.is_set(),
                     timeout=1.0,
                 )
             cur = self._sub.commit_seq

@@ -366,7 +366,7 @@ class MgmtReader(Authoriser):
         self._session = session
         self._anchor = session.anchor
         self._nodes = ManagedMap(P_NODE, session)
-        self._grants = ManagedMap(P_GRANT, session)
+        self.grants_map = ManagedMap(P_GRANT, session)
 
     @property
     def anchor(self) -> crypto.PublicKey:
@@ -433,7 +433,7 @@ class MgmtReader(Authoriser):
 
     def authorized_identities(self) -> frozenset[crypto.PublicKey]:
         out: set[crypto.PublicKey] = {self._anchor}
-        for key in self._grants.keys():
+        for key in self.grants_map.keys():
             who = crypto.PublicKey(key)
             if self.valid_grant(who) is not None:
                 out.add(who)
@@ -441,7 +441,7 @@ class MgmtReader(Authoriser):
 
     def manager_grants(self) -> tuple[Grant, ...]:
         out: list[Grant] = []
-        for key in self._grants.keys():
+        for key in self.grants_map.keys():
             who = crypto.PublicKey(key)
             grant = self._read_grant(who)
             if grant is None or grant.role is not Role.MANAGER:
@@ -476,14 +476,14 @@ class MgmtReader(Authoriser):
 
     def _read_grant(self, who: crypto.PublicKey, reader: Reader | None = None) -> Grant | None:
         if reader is not None:
-            held = reader.get(ops.STORE_MANAGEMENT, self._grants.entry_name(who))
+            held = reader.get(ops.STORE_MANAGEMENT, self.grants_map.entry_name(who))
             if held is None:
                 return None
             try:
                 return Grant.decode_row(who, MapEntry.decode(held.value).value)
             except (DudeError, ValueError, IndexError):
                 return None
-        entry = self._grants.entry(who)
+        entry = self.grants_map.entry(who)
         if entry is None:
             return None
         try:
@@ -699,7 +699,7 @@ class MgmtWriter(MgmtReader):
                 f"cert does not verify or signer is not authorised for role {role.name}"
             )
         record = Grant(who, role, stores, kinds, cert).encode_row()
-        return self._grants.add(who, record) + ops.writes(
+        return self.grants_map.add(who, record) + ops.writes(
             ops.Set(self._session.store_id, P_POP + who, pop)
         )
 
@@ -728,7 +728,7 @@ class MgmtWriter(MgmtReader):
         tx = ops.Transaction(())
         for att in attested:
             tx = tx + self._reissue(att, reissue_signer)
-        tx = tx + self._grants.remove(who)
+        tx = tx + self.grants_map.remove(who)
         return tx + ops.writes(ops.Del(self._session.store_id, P_POP + who))
 
     def _reissue(self, att: Attestation, signer: crypto.Keypair) -> ops.Transaction:
@@ -746,7 +746,7 @@ class MgmtWriter(MgmtReader):
             )
         identity = crypto.PublicKey(att.subject)
         is_node = att.key == self._nodes.entry_name(identity)
-        target_map = self._nodes if is_node else self._grants
+        target_map = self._nodes if is_node else self.grants_map
         entry = target_map.entry(identity)
         if entry is None:
             raise ManagementError(f"row {att.key!r} vanished while composing a revocation")

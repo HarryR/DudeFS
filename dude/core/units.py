@@ -46,6 +46,11 @@ class Millis(int):
     def __neg__(self) -> Millis:
         return Millis(int.__neg__(self))
 
+    ZERO: Millis
+
+
+Millis.ZERO = Millis(0)
+
 
 type Bucket = int
 """``floor(t / delta)``. A UNIT, not a consensus concept, and it lives here so ``tunables`` can name

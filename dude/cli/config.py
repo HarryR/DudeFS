@@ -31,7 +31,7 @@ log = logging.getLogger(__name__)
 
 @dataclass(slots=True)
 class TCPListenConfig:
-    host: str = "0.0.0.0"
+    host: str = "127.0.0.1"
     port: int = 9000
 
     def acceptor(self, tunables: Tunables) -> Acceptor:
