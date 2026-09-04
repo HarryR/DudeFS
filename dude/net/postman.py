@@ -114,6 +114,13 @@ class _MaintainLinks(_PostmanEvent):
     __slots__ = ()
 
 
+@dataclass(frozen=True, slots=True)
+class _Broadcast(_PostmanEvent):
+    verb: Verb
+    body: bytes
+    ttl: Millis
+
+
 # ---------------------------------------------------------------------------
 # Output events — everything that comes OUT of the postman to the node.
 # ---------------------------------------------------------------------------
@@ -173,6 +180,7 @@ class Postman:
         self._loop.register(_RetryDue, self._on_retry_due)
         self._loop.register(_ReapCheck, self._on_reap_check)
         self._loop.register(_MaintainLinks, self._on_maintain_links)
+        self._loop.register(_Broadcast, self._on_broadcast)
 
     # -- public interface: queue puts, never direct state mutation -----------
 
@@ -224,6 +232,9 @@ class Postman:
 
     def remove_peer(self, pubkey: crypto.PublicKey) -> None:
         self._loop.post(_RemovePeer(pubkey))
+
+    def broadcast(self, verb: Verb, body: bytes, ttl: Millis) -> None:
+        self._loop.post(_Broadcast(verb, body, ttl))
 
     def drain_output(self, timeout: float | None = None) -> Iterator[Output]:
         if timeout is not None:
@@ -353,6 +364,21 @@ class Postman:
         self._link_timer = None
         self._maintain_links()
         self._schedule_link_maintenance()
+
+    def _on_broadcast(self, event: _Broadcast) -> None:
+        now = Millis.now()
+        for pub in self.peers:
+            mid = MessageId.random()
+            env = Envelope(
+                pub,
+                event.verb,
+                MessageId(mid + b"\x00"),
+                event.body,
+                reply_to=MessageId(b""),
+            )
+            self.mailbox.post(env, now, event.ttl, False)
+        self._schedule_retry()
+        self._schedule_reap()
 
     # -- timer scheduling (postman thread only) ----------------------------
 

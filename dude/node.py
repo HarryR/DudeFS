@@ -384,8 +384,7 @@ class Node(_BaseNode):
     def _notify_followers(self) -> None:
         reply = serve_height(self.store)
         verb, body = reply.encode()
-        for pub in self.postman.peers:
-            self.postman.send_raw(pub, verb, body, self.tunables.ttl_exchange, await_reply=False)
+        self.postman.broadcast(verb, body, self.tunables.ttl_exchange)
 
     # -- inbound dispatch ---------------------------------------------------
 

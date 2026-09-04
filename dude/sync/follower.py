@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from abc import ABC
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -112,6 +113,7 @@ class Follower:
         "_poll_timers",
         "_pull_timer",
         "_pulling",
+        "_shared_lock",
         "me",
         "mgmt_reader",
         "store",
@@ -138,6 +140,7 @@ class Follower:
         self._last_ok_at: dict[crypto.PublicKey, Millis] = {}
         self._last_fail_at: dict[crypto.PublicKey, Millis] = {}
         self._compacted_at: dict[crypto.PublicKey, int] = {}
+        self._shared_lock = threading.Lock()
         self._on_send = on_send
         self._on_commit = on_commit
 
@@ -177,7 +180,8 @@ class Follower:
         timer = self._poll_timers.pop(event.peer, None)
         if timer is not None:
             timer.cancel()
-        self._heads.pop(event.peer, None)
+        with self._shared_lock:
+            self._heads.pop(event.peer, None)
         self._last_ok_at.pop(event.peer, None)
         self._last_fail_at.pop(event.peer, None)
         if self._pulling is not None and self._pulling.peer == event.peer:
@@ -233,7 +237,8 @@ class Follower:
     # -- sync logic (unchanged from tick-based version) ------------------------
 
     def _on_height_reply(self, msg: HeightReply, from_: crypto.PublicKey, now: Millis) -> None:
-        self._heads[from_] = HeightReport(msg.block_num, msg.tip_hash, now)
+        with self._shared_lock:
+            self._heads[from_] = HeightReport(msg.block_num, msg.tip_hash, now)
         self._try_pull()
 
     def _on_settled_blocks(
@@ -288,12 +293,14 @@ class Follower:
         self._cancel_pull_timer()
         self._pulling = None
         if msg.reason is SyncRefusal.NOT_YET_SETTLED:
-            hr = self._heads.get(from_)
-            if hr is not None:
-                self._heads[from_] = replace(hr, block_num=p.frm - 1)
+            with self._shared_lock:
+                hr = self._heads.get(from_)
+                if hr is not None:
+                    self._heads[from_] = replace(hr, block_num=p.frm - 1)
             self._try_pull()
         elif msg.reason is SyncRefusal.COMPACTED and msg.checkpoint_block_num is not None:
-            self._compacted_at[from_] = msg.checkpoint_block_num
+            with self._shared_lock:
+                self._compacted_at[from_] = msg.checkpoint_block_num
             self._last_fail_at[from_] = now
         else:
             self._last_fail_at[from_] = now
@@ -322,8 +329,10 @@ class Follower:
         if not roster:
             return False
         my_num = self.store.head_block_num() or 0
+        with self._shared_lock:
+            heads = dict(self._heads)
         ahead = 0
-        for peer, hr in self._heads.items():
+        for peer, hr in heads.items():
             if peer not in roster:
                 continue
             if now - hr.at > self.tunables.freshness_window:
@@ -333,21 +342,24 @@ class Follower:
         return ahead >= quorum.corroboration(len(roster))
 
     def needs_checkpoint(self) -> int | None:
-        if not self._compacted_at:
+        with self._shared_lock:
+            if not self._compacted_at:
+                return None
+            my_num = self.store.head_block_num() or 0
+            peers_with_heads = {p for p in self._heads if self._heads[p].block_num > my_num}
+            if not peers_with_heads:
+                return None
+            if all(p in self._compacted_at for p in peers_with_heads):
+                return max(self._compacted_at.values())
             return None
-        my_num = self.store.head_block_num() or 0
-        peers_with_heads = {p for p in self._heads if self._heads[p].block_num > my_num}
-        if not peers_with_heads:
-            return None
-        if all(p in self._compacted_at for p in peers_with_heads):
-            return max(self._compacted_at.values())
-        return None
 
     def compacted_peers(self) -> tuple[crypto.PublicKey, ...]:
-        return tuple(self._compacted_at)
+        with self._shared_lock:
+            return tuple(self._compacted_at)
 
     def clear_compacted(self) -> None:
-        self._compacted_at.clear()
+        with self._shared_lock:
+            self._compacted_at.clear()
 
     # -- internals -------------------------------------------------------------
 
