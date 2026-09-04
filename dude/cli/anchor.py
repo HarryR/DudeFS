@@ -10,7 +10,7 @@ from ..core import codec, crypto
 from ..core.units import Millis
 from ..net.address import Address, Endpoint
 from ..net.envelope import Verb
-from ..net.postman import Postman
+from ..net.postman import OutputQueue, Postman
 from ..store import Store
 from .config import DudeConfig
 from .state import (
@@ -51,15 +51,16 @@ def _parse_node_specs(raw: tuple[str, ...]) -> list[tuple[crypto.PublicKey, tupl
 
 
 def _wait_for_verb(
-    postman: Postman,
+    replies: OutputQueue,
     pub: crypto.PublicKey,
     verb: Verb,
     timeout_ms: Millis,
 ) -> bool:
     deadline = time.monotonic() + timeout_ms.as_seconds
     while time.monotonic() < deadline:
-        for output in postman.drain_output(timeout=0.1):
-            for d in output.delivered:
+        out = replies.get(timeout=0.1)
+        if out is not None:
+            for d in out.delivered:
                 if d.frm == pub and d.verb == verb:
                     return True
     return False
@@ -89,7 +90,8 @@ def genesis(cfg: DudeConfig, nodes: tuple[str, ...], dry_run: bool) -> None:
     anchor = load_keypair(dir_path)
     node_specs = _parse_node_specs(nodes)
 
-    postman = Postman(anchor, cfg.tunables)
+    replies = OutputQueue()
+    postman = Postman(anchor, cfg.tunables, on_output=replies)
     for pub, endpoints in node_specs:
         postman.add_peer(pub, endpoints)
     postman.start()
@@ -97,7 +99,7 @@ def genesis(cfg: DudeConfig, nodes: tuple[str, ...], dry_run: bool) -> None:
     log.info("verifying node liveness...")
     for pub, _eps in node_specs:
         postman.send_raw(pub, Verb.PING, b"", cfg.tunables.ttl_exchange)
-        if not _wait_for_verb(postman, pub, Verb.PONG, cfg.tunables.ttl_exchange):
+        if not _wait_for_verb(replies, pub, Verb.PONG, cfg.tunables.ttl_exchange):
             postman.stop()
             raise CLIError(f"node {pub.hex()[:16]}... did not respond to PING")
         log.info("  %s alive", pub.hex()[:16])
@@ -123,7 +125,7 @@ def genesis(cfg: DudeConfig, nodes: tuple[str, ...], dry_run: bool) -> None:
     log.info("provisioning nodes...")
     for pub, _eps in node_specs:
         postman.send_raw(pub, Verb.PROVISION, genesis_wire, cfg.tunables.ttl_exchange)
-        if not _wait_for_verb(postman, pub, Verb.ACCEPTED, cfg.tunables.ttl_exchange):
+        if not _wait_for_verb(replies, pub, Verb.ACCEPTED, cfg.tunables.ttl_exchange):
             postman.stop()
             raise CLIError(f"node {pub.hex()[:16]}... did not acknowledge PROVISION")
         log.info("  %s provisioned", pub.hex()[:16])

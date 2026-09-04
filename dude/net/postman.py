@@ -1,7 +1,7 @@
 import contextlib
 import queue
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import NamedTuple
@@ -139,6 +139,22 @@ class Output(NamedTuple):
     expired: tuple[Expired, ...]
 
 
+class OutputQueue:
+    __slots__ = ("_q",)
+
+    def __init__(self) -> None:
+        self._q: queue.SimpleQueue[Output] = queue.SimpleQueue()
+
+    def __call__(self, out: Output) -> None:
+        self._q.put(out)
+
+    def get(self, timeout: float | None = None) -> Output | None:
+        try:
+            return self._q.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+
 # ---------------------------------------------------------------------------
 # The actor.
 # ---------------------------------------------------------------------------
@@ -148,7 +164,7 @@ class Output(NamedTuple):
 class Postman:
     me: crypto.Keypair
     tunables: Tunables
-    on_output: Callable[[Output], None] = field(default=lambda _: None)
+    on_output: Callable[[Output], None]
 
     mailbox: Mailbox = field(default_factory=Mailbox)
     peers: dict[crypto.PublicKey, Peer] = field(default_factory=dict)
@@ -156,7 +172,6 @@ class Postman:
     _authorized: frozenset[crypto.PublicKey] = field(default_factory=frozenset, init=False)
 
     _loop: EventLoop[_PostmanEvent] = field(init=False)
-    _output: queue.SimpleQueue[Output] = field(default_factory=queue.SimpleQueue, init=False)
 
     _retry_timer: Scheduled[_PostmanEvent] | None = field(default=None, init=False)
     _reap_timer: Scheduled[_PostmanEvent] | None = field(default=None, init=False)
@@ -235,18 +250,6 @@ class Postman:
 
     def broadcast(self, verb: Verb, body: bytes, ttl: Millis) -> None:
         self._loop.post(_Broadcast(verb, body, ttl))
-
-    def drain_output(self, timeout: float | None = None) -> Iterator[Output]:
-        if timeout is not None:
-            try:
-                yield self._output.get(timeout=timeout)
-            except queue.Empty:
-                return
-        while True:
-            try:
-                yield self._output.get_nowait()
-            except queue.Empty:
-                return
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -355,9 +358,7 @@ class Postman:
         now = Millis.now()
         expired = self._reap(now)
         if expired:
-            out = Output(delivered=(), expired=expired)
-            self._output.put(out)
-            self.on_output(out)
+            self.on_output(Output(delivered=(), expired=expired))
         self._schedule_reap()
 
     def _on_maintain_links(self, _event: _MaintainLinks) -> None:
@@ -504,7 +505,6 @@ class Postman:
             ),
             expired=(),
         )
-        self._output.put(out)
         self.on_output(out)
 
     # -- link maintenance (postman thread only) ----------------------------

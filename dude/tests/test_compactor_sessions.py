@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 
 from dude.core import crypto
-from dude.net.postman import Postman
+from dude.net.postman import OutputQueue, Postman
 from dude.store import ops
 from dude.store.checkpoint import CheckpointMeta
 from dude.store.management import Cert, MgmtWriter, Role
@@ -72,7 +72,7 @@ class TestCompactorFromLightClient(unittest.TestCase):
             )
             c.wait_settled(anchor_node.session().submit(grant).wait())
 
-            postman = Postman(compactor_kp, c.tunables)
+            postman = Postman(compactor_kp, c.tunables, on_output=OutputQueue())
             c.nexus.attach(postman)
             lc = LightClient(me=compactor_kp, anchor=c.anchor.public, postman=postman)
             for node in c.nodes:

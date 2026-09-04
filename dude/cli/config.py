@@ -9,7 +9,7 @@ import dacite
 
 from ..core.units import Millis
 from ..net.link import Acceptor
-from ..net.postman import Postman
+from ..net.postman import OutputQueue, Postman
 from ..net.transports.tcp import TCPListener
 from ..node import Node, ReplicaNode
 from ..store import Store
@@ -143,7 +143,7 @@ class DudeConfig:
     def light_client(self, role_dir: Path, role_cfg: RoleConfig | None = None) -> LightClient:
         kp = load_keypair(role_dir)
         seed = BootstrapSeed.load(role_dir)
-        postman = Postman(kp, self.tunables)
+        postman = Postman(kp, self.tunables, on_output=OutputQueue())
         lc = LightClient(me=kp, anchor=seed.anchor, postman=postman)
         for pub, endpoints in seed.peers:
             lc.add_bootstrap_peer(pub, endpoints)

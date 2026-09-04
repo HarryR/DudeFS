@@ -4,7 +4,7 @@ from collections.abc import Callable
 from ..consensus.bootstrap import bootstrap, compose_genesis
 from ..core import crypto
 from ..core.units import Millis
-from ..net.postman import Postman
+from ..net.postman import OutputQueue, Postman
 from ..net.transports.inproc import InProcNexus
 from ..node import Node, ReplicaNode
 from ..session import Settled
@@ -100,7 +100,7 @@ class Cluster:
         kp: crypto.Keypair,
         into: list[LightClient],
     ) -> LightClient:
-        postman = Postman(kp, self.tunables)
+        postman = Postman(kp, self.tunables, on_output=OutputQueue())
         self.nexus.attach(postman)
         lc = LightClient(me=kp, anchor=self.anchor.public, postman=postman)
         for node in self.nodes:

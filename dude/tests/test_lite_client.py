@@ -8,7 +8,7 @@ from ..core.errors import DudeError
 from ..core.units import Millis
 from ..net.address import Address, Endpoint, Scheme
 from ..net.envelope import MessageId
-from ..net.postman import Delivered, Postman
+from ..net.postman import Delivered, OutputQueue, Postman
 from ..store import ops
 from ..store.management import Cert, Grant, NodeRecord, Role, RosterCommitment
 from ..sync import chain
@@ -157,7 +157,7 @@ def _get_real_proof_reply(c: Cluster, store_id: int, name: bytes) -> ProofReply:
 
 def _make_unstarted_lc(c: Cluster, head_behind: int = 0) -> LightClient:
     kp = crypto.Keypair.generate()
-    postman = Postman(kp, c.tunables)
+    postman = Postman(kp, c.tunables, on_output=OutputQueue())
     lc = LightClient(me=kp, anchor=c.anchor.public, postman=postman)
     ts = _trusted_state_from_cluster(c)
     if head_behind > 0:
@@ -321,7 +321,7 @@ class TestByzantineBootstrapReply(unittest.TestCase):
         forged = replace(reply, head=forged_head)
 
         kp = crypto.Keypair.generate()
-        postman = Postman(kp, self.c.tunables)
+        postman = Postman(kp, self.c.tunables, on_output=OutputQueue())
         lc = LightClient(me=kp, anchor=self.c.anchor.public, postman=postman)
         lc.state = State.BOOTSTRAPPING
         for node in self.c.nodes:
@@ -353,7 +353,7 @@ class TestByzantineBootstrapReply(unittest.TestCase):
         assert isinstance(honest_reply, AnchorsReply)
 
         kp = crypto.Keypair.generate()
-        postman = Postman(kp, self.c.tunables)
+        postman = Postman(kp, self.c.tunables, on_output=OutputQueue())
         lc = LightClient(me=kp, anchor=self.c.anchor.public, postman=postman)
         lc.state = State.BOOTSTRAPPING
         for node in self.c.nodes:

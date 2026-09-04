@@ -7,7 +7,7 @@ from ..consensus.bootstrap import bootstrap, compose_genesis
 from ..core import codec, crypto
 from ..core.units import Millis
 from ..net.envelope import Verb
-from ..net.postman import Postman
+from ..net.postman import OutputQueue, Postman
 from ..net.transports.inproc import InProcNexus
 from ..node import Node
 from ..store import Store, ops
@@ -39,7 +39,8 @@ def _provision_cluster(
     settled = bootstrap(scratch, anchor, genesis_bodies, bucket=TUNABLES.bucket(T0))
     genesis_wire = codec.encode([settled.block.encode(), [tx.raw for tx in settled.bodies]])
 
-    anchor_postman = Postman(anchor, TUNABLES)
+    replies = OutputQueue()
+    anchor_postman = Postman(anchor, TUNABLES, on_output=replies)
     nexus.attach(anchor_postman)
     for pub, endpoints in node_endpoints:
         anchor_postman.add_peer(pub, endpoints)
@@ -51,8 +52,9 @@ def _provision_cluster(
     deadline = time.monotonic() + 5.0
     provisioned: set[crypto.PublicKey] = set()
     while len(provisioned) < len(node_keys) and time.monotonic() < deadline:
-        for output in anchor_postman.drain_output(timeout=0.1):
-            for d in output.delivered:
+        out = replies.get(timeout=0.1)
+        if out is not None:
+            for d in out.delivered:
                 if d.verb == Verb.ACCEPTED:
                     provisioned.add(d.frm)
 
