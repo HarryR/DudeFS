@@ -349,9 +349,6 @@ class _BaseNode:
 
     # -- sync verb handlers (shared) ----------------------------------------
 
-    def _on_ping(self, d: Delivered) -> MessageId:
-        return self._reply(d, Verb.PONG, b"")
-
     def _on_height_reply(self, d: Delivered) -> None:
         try:
             msg = SyncMsg.decode(d.verb, d.body)
@@ -452,8 +449,6 @@ class Node(_BaseNode):
                 self._on_settled_block(d)
             case Verb.SYNC_REFUSED:
                 self._on_sync_refused(d)
-            case Verb.PING:
-                self._on_ping(d)
             case Verb.GET_ANCHORS:
                 self._on_get_anchors(d)
             case Verb.GET_PROOF:
@@ -702,8 +697,6 @@ class ReplicaNode(_BaseNode):
                 self._on_settled_block(d)
             case Verb.SYNC_REFUSED:
                 self._on_sync_refused(d)
-            case Verb.PING:
-                self._on_ping(d)
 
 
 class _ReplicaSubstrate(Substrate):

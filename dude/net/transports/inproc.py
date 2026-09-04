@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import queue
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -46,6 +48,10 @@ class InProcListener(Acceptor, Dialer):
     _on_link: OnLink | None = field(init=False, default=None)
     _buffered: list[tuple[Frame, Link]] = field(init=False, default_factory=list)
     conns: dict[bytes, _InProcConn] = field(init=False, default_factory=dict)
+    _inbox: queue.SimpleQueue[tuple[Frame, bytes]] = field(
+        init=False, default_factory=queue.SimpleQueue
+    )
+    _post: Callable[[], None] | None = field(init=False, default=None)
     _stopped: bool = field(init=False, default=False)
 
     def __post_init__(self) -> None:
@@ -59,30 +65,43 @@ class InProcListener(Acceptor, Dialer):
     def endpoint_for(identity: crypto.PublicKey) -> Endpoint:
         return Endpoint(Address(Scheme.INPROC, identity.hex()))
 
+    def set_notify(self, post: Callable[[], None]) -> None:
+        self._post = post
+
     def deliver(self, frame: Frame, sender: bytes) -> None:
         if self._stopped:
             return
-        conn = self.conns.get(sender)
-        if conn is None:
-            conn = _InProcConn(
-                reply_to=sender,
-                me=bytes(self.identity),
-                address=Address(Scheme.INPROC, sender.hex()),
-                nexus=self.nexus,
-            )
-            self.conns[sender] = conn
-            if self._on_link is not None:
-                self._on_link(conn.link)
-        conn.link.last_activity = Millis.now()
-        if self._on_frame is not None:
-            self._on_frame(frame, conn.link)
-        else:
-            self._buffered.append((frame, conn.link))
+        self._inbox.put((frame, sender))
+        if self._post is not None:
+            self._post()
+
+    def drain_inbox(self) -> None:
+        while True:
+            try:
+                frame, sender = self._inbox.get_nowait()
+            except queue.Empty:
+                return
+            conn = self.conns.get(sender)
+            if conn is None:
+                conn = _InProcConn(
+                    reply_to=sender,
+                    me=bytes(self.identity),
+                    address=Address(Scheme.INPROC, sender.hex()),
+                    nexus=self.nexus,
+                )
+                self.conns[sender] = conn
+                if self._on_link is not None:
+                    self._on_link(conn.link)
+            conn.link.last_activity = Millis.now()
+            if self._on_frame is not None:
+                self._on_frame(frame, conn.link)
+            else:
+                self._buffered.append((frame, conn.link))
 
     def remove_conn(self, peer_key: bytes) -> None:
-        conn = self.conns.pop(peer_key, None)
+        conn = self.conns.get(peer_key)
         if conn is not None:
-            conn.link.notify_closed()
+            conn.link.close()
 
     def start(self, on_frame: OnFrame, on_link: OnLink) -> None:
         self._stopped = False
@@ -96,12 +115,16 @@ class InProcListener(Acceptor, Dialer):
         for frame, link in self._buffered:
             on_frame(frame, link)
         self._buffered.clear()
+        self.drain_inbox()
 
     def dial(self, address: Address) -> bool:
         if address.scheme is not Scheme.INPROC or self._on_link is None:
             return False
         target_key = bytes.fromhex(address.value)
-        if self.nexus.get(target_key) is None or target_key in self.conns:
+        target = self.nexus.get(target_key)
+        if target is None:
+            return False
+        if target_key in self.conns:
             return False
         conn = _InProcConn(
             reply_to=target_key,
@@ -119,7 +142,7 @@ class InProcListener(Acceptor, Dialer):
         self._on_link = None
         me = bytes(self.identity)
         self.nexus.unregister(me)
-        for conn in self.conns.values():
+        for conn in list(self.conns.values()):
             conn.link.close()
         self.conns.clear()
         self.nexus.disconnect_peer(me)

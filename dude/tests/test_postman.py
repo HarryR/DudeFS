@@ -28,13 +28,13 @@ type _Pair = tuple[crypto.Keypair, crypto.Keypair, Postman, OutputQueue, Postman
 @dataclass(frozen=True)
 class Ping(Encodable):
     def encode(self) -> tuple[Verb, bytes]:
-        return Verb.PING, b""
+        return Verb.HEIGHT, b""
 
 
 @dataclass(frozen=True)
 class Pong(Encodable):
     def encode(self) -> tuple[Verb, bytes]:
-        return Verb.PONG, b""
+        return Verb.HEIGHT_REPLY, b""
 
 
 @dataclass(frozen=True)
@@ -125,7 +125,7 @@ class _PostmanTests(unittest.TestCase):
         got = _drain_delivered(bq)
         self.assertEqual(len(got), 1)
         self.assertEqual(got[0].frm, a.public)
-        self.assertEqual(got[0].verb, Verb.PING)
+        self.assertEqual(got[0].verb, Verb.HEIGHT)
 
     def test_body_is_delivered_intact(self) -> None:
         _a, b, ap, _aq, _bp, bq = self._make_pair()
@@ -146,7 +146,7 @@ class _PostmanTests(unittest.TestCase):
 
         reply = _drain_delivered(aq)
         self.assertEqual(len(reply), 1)
-        self.assertEqual(reply[0].verb, Verb.PONG)
+        self.assertEqual(reply[0].verb, Verb.HEIGHT_REPLY)
         irt = reply[0].in_reply_to
         self.assertIsNotNone(irt)
         assert irt is not None

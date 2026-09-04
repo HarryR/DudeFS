@@ -21,6 +21,7 @@ from .link import (
 )
 from .mailbox import Expired, Mailbox, Reply, Transmit
 from .plan import Decision, GiveUp, Send, Wait, decorrelated, plan_next, retry_at
+from .transports.inproc import InProcListener
 from .transports.tcp import OnionDialer, TCPDialer
 
 
@@ -125,6 +126,10 @@ class _KeepAlive(_PostmanEvent):
     __slots__ = ()
 
 
+class _InProcReady(_PostmanEvent):
+    __slots__ = ()
+
+
 # ---------------------------------------------------------------------------
 # Output events — everything that comes OUT of the postman to the node.
 # ---------------------------------------------------------------------------
@@ -220,6 +225,7 @@ class Postman:
         self._loop.register(_MaintainLinks, self._on_maintain_links)
         self._loop.register(_Broadcast, self._on_broadcast)
         self._loop.register(_KeepAlive, self._on_keepalive)
+        self._loop.register(_InProcReady, self._on_inproc_ready)
 
     # -- public interface: queue puts, never direct state mutation -----------
 
@@ -299,6 +305,7 @@ class Postman:
 
     def add_acceptor(self, acceptor: Acceptor) -> None:
         self._acceptors.append(acceptor)
+        self._wire_inproc(acceptor)
         if self._loop.running:
             acceptor.start(self._on_frame, self._on_link_established)
 
@@ -411,6 +418,15 @@ class Postman:
         self._maintain_links()
         self._schedule_link_maintenance()
 
+    def _on_inproc_ready(self, _event: _InProcReady) -> None:
+        for acceptor in self._acceptors:
+            if isinstance(acceptor, InProcListener):
+                acceptor.drain_inbox()
+
+    def _wire_inproc(self, acceptor: Acceptor) -> None:
+        if isinstance(acceptor, InProcListener):
+            acceptor.set_notify(lambda: self._loop.post(_InProcReady()))
+
     def _on_broadcast(self, event: _Broadcast) -> None:
         now = Millis.now()
         for pub in self.peers:
@@ -477,6 +493,12 @@ class Postman:
                 if link.available(now) and link.last_rtt_at < threshold:
                     self._ping_link(peer, link, now)
         self._schedule_keepalive()
+
+    def _reply_pong(
+        self, to: crypto.PublicKey, ping_mid: MessageId, link: Link, now: Millis
+    ) -> None:
+        env = Envelope(to, Verb.PONG, MessageId.random(), b"", reply_to=ping_mid)
+        link.send(env.sign(self.me, now).seal(), now)
 
     def _ping_link(self, peer: Peer, link: Link, now: Millis) -> None:
         mid = MessageId.random()
@@ -568,6 +590,10 @@ class Postman:
         if link.identity is None:
             link.bind(env.frm)
             self._do_link_established(link)
+
+        if env.env.verb is Verb.PING:
+            self._reply_pong(env.frm, env.env.mid, link, now)
+            return
 
         reply_to = env.env.reply_to
         out = Output(
