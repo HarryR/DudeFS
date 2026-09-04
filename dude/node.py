@@ -1,8 +1,8 @@
 import threading
-import time
 from abc import ABC
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import NamedTuple
 
 from .consensus import Mempool
 from .consensus.canonical import bodies_canonical
@@ -22,7 +22,15 @@ from .net import MessageId, Verb
 from .net.link import Acceptor, Dialer
 from .net.postman import Delivered, Output, Postman
 from .net.socket_server import SocketServer
-from .session import Inflight, KeyCache, SessionRW, SubmitHandle, SubmitResult, Substrate
+from .session import (
+    Inflight,
+    InflightHandle,
+    KeyCache,
+    SessionRW,
+    SubmitHandle,
+    SubmitResult,
+    Substrate,
+)
 from .store import Store, ops
 from .store.checkpoint import CheckpointMeta
 from .store.layer import BlockHead, Held
@@ -87,6 +95,35 @@ class ReconcilePeers(NodeEvent):
 
 
 # ---------------------------------------------------------------------------
+# _ReplyWaiter — an InflightHandle that blocks a thread until the reply arrives.
+# ---------------------------------------------------------------------------
+
+
+class _Reply(NamedTuple):
+    verb: Verb
+    body: bytes
+
+
+class _ReplyWaiter(InflightHandle):
+    __slots__ = ("_event", "_reply")
+
+    def __init__(self) -> None:
+        self._event = threading.Event()
+        self._reply: _Reply | None = None
+
+    def on_reply(self, verb: Verb, body: bytes) -> None:
+        self._reply = _Reply(verb, body)
+        self._event.set()
+
+    def on_expired(self) -> None:
+        self._event.set()
+
+    def wait(self, timeout: float) -> _Reply | None:
+        self._event.wait(timeout)
+        return self._reply
+
+
+# ---------------------------------------------------------------------------
 # Base — the run loop, lifecycle, peer reconciliation, follower, sync handlers.
 # ---------------------------------------------------------------------------
 
@@ -124,6 +161,7 @@ class _BaseNode:
         self.commit_seq = 0
         self.commit_cond = threading.Condition()
         self._socket_servers: list[SocketServer] = []
+        self._downloading = False
 
         self._loop.register(MessageIn, self._on_message_in)
         self._loop.register(MessageExpired, self._on_message_expired)
@@ -197,44 +235,49 @@ class _BaseNode:
     def _on_delivered(self, d: Delivered) -> None:
         raise NotImplementedError
 
-    # -- checkpoint download (synchronous, blocks the tick loop) ------------
+    # -- checkpoint download (runs on a dedicated thread) --------------------
 
-    def _send_and_wait(
+    def _request_reply(
         self,
         peer: crypto.PublicKey,
         verb: Verb,
         body: bytes,
         timeout_sec: float,
-    ) -> Delivered | None:
+    ) -> _Reply | None:
+        waiter = _ReplyWaiter()
         mid = self.postman.send_raw(peer, verb, body, self.tunables.ttl_exchange)
-        tick = self.tunables.tick_interval.as_seconds
-        deadline = time.monotonic() + timeout_sec
-        while time.monotonic() < deadline and self._loop.running:
-            remaining = min(tick, deadline - time.monotonic())
-            if remaining <= 0:
-                break
-            for output in self.postman.drain_output(timeout=remaining):
-                for d in output.delivered:
-                    if (
-                        d.in_reply_to is not None
-                        and d.in_reply_to.correlation_id == mid.correlation_id
-                    ):
-                        return d
-                    self._on_delivered(d)
-        return None
+        self.inflight.register(mid, waiter)
+        return waiter.wait(timeout_sec)
 
     def _download_checkpoint(self) -> None:
-
         peers = list(self.follower.compacted_peers())
         if not peers:
             return
+        if self._downloading:
+            return
+        self._downloading = True
+        thread = threading.Thread(
+            target=self._download_checkpoint_worker,
+            args=(peers,),
+            name="checkpoint-dl",
+            daemon=True,
+        )
+        thread.start()
+
+    def _download_checkpoint_worker(self, peers: list[crypto.PublicKey]) -> None:
+        try:
+            self._do_download(peers)
+        finally:
+            self._downloading = False
+
+    def _do_download(self, peers: list[crypto.PublicKey]) -> None:
         timeout = self.tunables.ttl_exchange.as_seconds
         get_cp_verb, get_cp_body = GetCheckpoint().encode()
 
         for peer in peers:
             if not self._loop.running:
                 return
-            d = self._send_and_wait(peer, get_cp_verb, get_cp_body, timeout)
+            d = self._request_reply(peer, get_cp_verb, get_cp_body, timeout)
             if d is None or d.verb != Verb.CHECKPOINT_META or not d.body:
                 continue
 
@@ -249,7 +292,7 @@ class _BaseNode:
             ok = True
             while self._loop.running:
                 req_verb, req_body = GetChunks(checkpoint_id=checkpoint_id, offset=offset).encode()
-                d = self._send_and_wait(peer, req_verb, req_body, timeout)
+                d = self._request_reply(peer, req_verb, req_body, timeout)
                 if d is None or d.verb != Verb.CHUNKS_REPLY:
                     ok = False
                     break
@@ -386,6 +429,10 @@ class Node(_BaseNode):
     # -- inbound dispatch ---------------------------------------------------
 
     def _on_delivered(self, d: Delivered) -> None:
+        if d.in_reply_to is not None and self.inflight.on_reply(
+            d.in_reply_to.correlation_id, d.verb, d.body
+        ):
+            return
         if d.verb in CONSENSUS_ONLY and not self._is_node(d.frm):
             return
         match d.verb:

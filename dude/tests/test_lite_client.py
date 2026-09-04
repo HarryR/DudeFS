@@ -190,7 +190,7 @@ def _feed_reply(
         mid=MessageId.random(),
         in_reply_to=mid,
     )
-    lc._on_delivered(delivered, Millis.now())
+    lc._on_delivered(delivered)
     return read
 
 
@@ -327,7 +327,6 @@ class TestByzantineBootstrapReply(unittest.TestCase):
         for node in self.c.nodes:
             lc.bootstrap_peers[node.me.public] = _BootstrapReply()
 
-        now = _now_for_store(self.c)
         for node in self.c.nodes:
             mid = MessageId.random()
             lc.inflight.register(mid, _BootstrapRequest(mid=mid, peer=node.me.public, client=lc))
@@ -339,7 +338,7 @@ class TestByzantineBootstrapReply(unittest.TestCase):
                 mid=MessageId.random(),
                 in_reply_to=mid,
             )
-            lc._on_delivered(delivered, now)
+            lc._on_delivered(delivered)
 
         self.assertFalse(lc.bootstrapped(), "forged quorum proof was accepted")
         self.assertIsNone(lc.trusted_state)
@@ -360,7 +359,6 @@ class TestByzantineBootstrapReply(unittest.TestCase):
         for node in self.c.nodes:
             lc.bootstrap_peers[node.me.public] = _BootstrapReply()
 
-        now = _now_for_store(self.c)
         for node in self.c.nodes:
             mid = MessageId.random()
             lc.inflight.register(mid, _BootstrapRequest(mid=mid, peer=node.me.public, client=lc))
@@ -372,7 +370,7 @@ class TestByzantineBootstrapReply(unittest.TestCase):
                 mid=MessageId.random(),
                 in_reply_to=mid,
             )
-            lc._on_delivered(delivered, now)
+            lc._on_delivered(delivered)
         self.assertTrue(lc.bootstrapped(), "honest bootstrap failed")
         assert lc.trusted_state is not None
         honest_roster = lc.trusted_state.roster

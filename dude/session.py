@@ -82,28 +82,33 @@ class InflightHandle(ABC):
 
 
 class Inflight:
-    __slots__ = ("_pending",)
+    __slots__ = ("_lock", "_pending")
 
     def __init__(self) -> None:
         self._pending: dict[bytes, InflightHandle] = {}
+        self._lock = threading.Lock()
 
     def register(self, mid: MessageId, handle: InflightHandle) -> None:
-        self._pending[mid.correlation_id] = handle
+        with self._lock:
+            self._pending[mid.correlation_id] = handle
 
     def on_reply(self, correlation_id: bytes, verb: Verb, body: bytes) -> bool:
-        handle = self._pending.pop(correlation_id, None)
+        with self._lock:
+            handle = self._pending.pop(correlation_id, None)
         if handle is None:
             return False
         handle.on_reply(verb, body)
         return True
 
     def on_expired(self, correlation_id: bytes) -> None:
-        handle = self._pending.pop(correlation_id, None)
+        with self._lock:
+            handle = self._pending.pop(correlation_id, None)
         if handle is not None:
             handle.on_expired()
 
     def pending_of_type[T](self, cls: type[T]) -> list[T]:
-        return [h for h in self._pending.values() if isinstance(h, cls)]
+        with self._lock:
+            return [h for h in self._pending.values() if isinstance(h, cls)]
 
 
 @dataclass(slots=True)

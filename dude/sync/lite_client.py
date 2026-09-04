@@ -1,6 +1,6 @@
-import contextlib
 import threading
 import time
+from abc import ABC
 from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from enum import Enum, auto
@@ -9,10 +9,11 @@ from .. import quorum
 from ..consensus.settle_round import SettledBlock, _settle_payload
 from ..core import crypto
 from ..core.errors import DudeError
+from ..core.event_loop import Event, EventLoop, Scheduled
 from ..core.units import Millis
 from ..net.address import Endpoint
 from ..net.envelope import MessageId, Verb
-from ..net.postman import Delivered, Postman
+from ..net.postman import Delivered, Output, Postman
 from ..net.socket_server import SocketServer
 from ..session import (
     Inflight,
@@ -54,6 +55,24 @@ from .lite_adapter import (
 
 
 class LightClientError(DudeError): ...
+
+
+class _LiteEvent(Event, ABC):
+    __slots__ = ()
+
+
+@dataclass(frozen=True, slots=True)
+class _LiteDelivered(_LiteEvent):
+    delivered: Delivered
+
+
+@dataclass(frozen=True, slots=True)
+class _LiteExpired(_LiteEvent):
+    prefix: bytes
+
+
+class _CheckStalePeers(_LiteEvent):
+    __slots__ = ()
 
 
 class State(Enum):
@@ -187,9 +206,12 @@ class LightClient:
 
     commit_cond: threading.Condition = field(default_factory=threading.Condition, init=False)
     commit_seq: int = field(default=0, init=False)
-    _stopping: threading.Event = field(default_factory=threading.Event, init=False)
-    _thread: threading.Thread | None = field(default=None, init=False)
+    _loop: EventLoop[_LiteEvent] = field(init=False)
+    _stale_timer: Scheduled[_LiteEvent] | None = field(default=None, init=False)
     _socket_servers: list = field(default_factory=list, init=False)
+
+    def __post_init__(self) -> None:
+        self._init_loop()
 
     def peer_view(self, peer: crypto.PublicKey) -> PeerView:
         pv = self.peer_views.get(peer)
@@ -285,59 +307,71 @@ class LightClient:
     def __exit__(self, *_: object) -> None:
         self.stop()
 
+    def _init_loop(self) -> None:
+        self._loop = EventLoop()
+        self._loop.register(_LiteDelivered, self._on_lite_delivered)
+        self._loop.register(_LiteExpired, self._on_lite_expired)
+        self._loop.register(_CheckStalePeers, self._on_check_stale_peers)
+
+        def _on_postman_output(out: Output) -> None:
+            for d in out.delivered:
+                self._loop.post(_LiteDelivered(d))
+            for e in out.expired:
+                self._loop.post(_LiteExpired(e.prefix))
+
+        self.postman.on_output = _on_postman_output
+
     def start(self) -> None:
-        if self._thread is not None:
+        if self._loop.running:
             return
         self.postman.start()
         for srv in self._socket_servers:
             srv.start()
-        self._thread = threading.Thread(
-            target=self._run,
-            name=f"lite-{self.me.public.hex()[:8]}",
-            daemon=True,
-        )
-        self._thread.start()
+        self._loop.start()
         if self.state is State.UNBOOTSTRAPPED and self.bootstrap_peers:
             self.state = State.BOOTSTRAPPING
             self._ask_for_anchors(self.bootstrap_peers, Millis.now())
+            self._schedule_stale_check()
 
     def stop(self) -> None:
-        self._stopping.set()
+        self._loop.stop()
         for srv in self._socket_servers:
             srv.stop()
         self.postman.stop()
-        thread = self._thread
-        self._thread = None
-        if thread is not None:
-            thread.join()
 
-    def _run(self) -> None:
-        tick_interval = self.tunables.tick_interval.as_seconds
-        while not self._stopping.is_set():
-            now = Millis.now()
-            activity = False
-            for output in self.postman.drain_output(timeout=tick_interval):
-                for d in output.delivered:
-                    self._on_delivered(d, now)
-                    activity = True
-                for e in output.expired:
-                    self.inflight.on_expired(e.prefix)
-                    activity = True
-            if activity:
-                with self.commit_cond:
-                    self.commit_cond.notify_all()
-            if self.state is State.BOOTSTRAPPING:
-                with contextlib.suppress(DudeError):
-                    self._ask_stale_peers(now)
+    # -- event handlers --------------------------------------------------------
 
-    def _on_delivered(self, d: Delivered, _now: Millis) -> None:
+    def _on_lite_delivered(self, event: _LiteDelivered) -> None:
+        self._on_delivered(event.delivered)
+
+    def _on_delivered(self, d: Delivered) -> None:
         if d.in_reply_to is None:
             if d.verb == Verb.HEIGHT_REPLY:
                 with self.commit_cond:
                     self.commit_seq += 1
                     self.commit_cond.notify_all()
             return
-        self.inflight.on_reply(d.in_reply_to.correlation_id, d.verb, d.body)
+        if self.inflight.on_reply(d.in_reply_to.correlation_id, d.verb, d.body):
+            with self.commit_cond:
+                self.commit_cond.notify_all()
+
+    def _on_lite_expired(self, event: _LiteExpired) -> None:
+        self.inflight.on_expired(event.prefix)
+        with self.commit_cond:
+            self.commit_cond.notify_all()
+
+    def _on_check_stale_peers(self, _event: _CheckStalePeers) -> None:
+        self._stale_timer = None
+        if self.state is State.BOOTSTRAPPING:
+            self._ask_stale_peers(Millis.now())
+            self._schedule_stale_check()
+
+    def _schedule_stale_check(self) -> None:
+        if self._stale_timer is not None:
+            self._stale_timer.cancel()
+        self._stale_timer = self._loop.schedule(
+            Millis.now() + self.tunables.poll_interval, _CheckStalePeers()
+        )
 
     # -- bootstrap ----------------------------------------------------------
 
