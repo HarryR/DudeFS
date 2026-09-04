@@ -103,6 +103,8 @@ class _BaseNode:
         self.store = store
         self.tunables = tunables
 
+        self._loop: EventLoop[Event] = EventLoop()
+
         def _on_postman_output(out: Output) -> None:
             for d in out.delivered:
                 self._loop.post(MessageIn(d))
@@ -111,26 +113,23 @@ class _BaseNode:
 
         self.postman = Postman(me, tunables, on_output=_on_postman_output)
 
-        def _on_send(e: SendToPeer) -> None:
-            self.postman.send(e.peer, e.msg, tunables.ttl_exchange)
-
         self.follower = Follower(
             me=me,
             store=store,
             mgmt_reader=store.mgmt_reader,
             tunables=tunables,
-            on_send=_on_send,
-            on_commit=on_follower_commit,
+            loop=self._loop,
         )
         self.inflight = Inflight()
         self.commit_seq = 0
         self.commit_cond = threading.Condition()
         self._socket_servers: list[SocketServer] = []
 
-        self._loop: EventLoop[NodeEvent] = EventLoop()
         self._loop.register(MessageIn, self._on_message_in)
         self._loop.register(MessageExpired, self._on_message_expired)
         self._loop.register(ReconcilePeers, self._on_reconcile_peers)
+        self._loop.register(SendToPeer, self._on_send_to_peer)
+        self._loop.register(BlockCommitted, on_follower_commit)
 
     @property
     def mgmt_reader(self) -> MgmtReader:
@@ -160,7 +159,6 @@ class _BaseNode:
         self.stop()
 
     def start(self) -> None:
-        self.follower.start()
         self._reconcile_peers()
         self.postman.start()
         for srv in self._socket_servers:
@@ -172,7 +170,6 @@ class _BaseNode:
         self._loop.stop()
         for srv in self._socket_servers:
             srv.stop()
-        self.follower.stop()
         self.postman.stop()
         self.store.close()
 
@@ -190,6 +187,9 @@ class _BaseNode:
         if checkpoint_block is not None:
             self._download_checkpoint()
         self._schedule_reconcile()
+
+    def _on_send_to_peer(self, event: SendToPeer) -> None:
+        self.postman.send(event.peer, event.msg, self.tunables.ttl_exchange)
 
     def _schedule_reconcile(self) -> None:
         self._loop.schedule(Millis.now() + self.tunables.tick_interval, ReconcilePeers())
@@ -349,30 +349,27 @@ class Node(_BaseNode):
 
         super().__init__(me, store, on_follower_commit=_on_follower_commit, tunables=tunables)
 
-        def _on_consensus_send(e: SendConsensus) -> None:
-            verb, body = e.msg.encode()
-            self.postman.send_raw(e.peer, verb, body, tunables.ttl_round, await_reply=False)
-
-        def _on_block_settled(_e: BlockSettled) -> None:
-            self._notify_followers()
-
         self.coordinator = Coordinator(
             me,
             store,
             tunables,
             behind=self.follower.behind,
-            on_send=_on_consensus_send,
-            on_settled=_on_block_settled,
+            loop=self._loop,
         )
+        self._loop.register(SendConsensus, self._on_consensus_send)
+        self._loop.register(BlockSettled, self._on_block_settled)
         self.checkpoint_server: CheckpointServer | None = None
+
+    def _on_consensus_send(self, e: SendConsensus) -> None:
+        verb, body = e.msg.encode()
+        self.postman.send_raw(e.peer, verb, body, self.tunables.ttl_round, await_reply=False)
+
+    def _on_block_settled(self, _e: BlockSettled) -> None:
+        self._notify_followers()
 
     def start(self) -> None:
         super().start()
         self.coordinator.start()
-
-    def stop(self) -> None:
-        self.coordinator.stop()
-        super().stop()
 
     @property
     def mempool(self) -> Mempool:

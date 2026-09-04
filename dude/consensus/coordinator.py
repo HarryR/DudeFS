@@ -110,8 +110,6 @@ class Coordinator:
         "_bucket_timer",
         "_force_close",
         "_loop",
-        "_on_send",
-        "_on_settled",
         "_round_abandon_timer",
         "_round_close_timer",
         "_settle_abandon_timer",
@@ -132,15 +130,12 @@ class Coordinator:
         store: Store,
         tunables: Tunables,
         behind: Callable[[Millis], bool],
-        on_send: Callable[[SendConsensus], None],
-        on_settled: Callable[[BlockSettled], None],
+        loop: EventLoop,
     ) -> None:
         self.me = me
         self.store = store
         self.tunables = tunables
         self.behind = behind
-        self._on_send = on_send
-        self._on_settled = on_settled
 
         self.mempool = Mempool(tunables)
         self.current_round: Round | None = None
@@ -154,14 +149,13 @@ class Coordinator:
         self._settle_abandon_timer: Scheduled[CoordinatorEvent] | None = None
         self._bucket_timer: Scheduled[CoordinatorEvent] | None = None
 
-        self._loop: EventLoop[CoordinatorEvent] = EventLoop()
+        self._loop = loop
         self._loop.register(RoundMessage, self._on_round_msg)
         self._loop.register(SettleMessage, self._on_settle_msg)
         self._loop.register(RoundClose, self._on_round_close)
         self._loop.register(RoundAbandon, self._on_round_abandon)
         self._loop.register(SettleAbandon, self._on_settle_abandon_event)
         self._loop.register(BucketTick, self._on_bucket_tick)
-        self._loop.register(BlockSettled, self._on_block_settled)
 
     # -- lifecycle -------------------------------------------------------------
 
@@ -169,14 +163,13 @@ class Coordinator:
         self._loop.post(event)
 
     def start(self) -> None:
-        self._loop.start()
         now = Millis.now()
         if self.current_bucket < 0:
             self.current_bucket = self._bucket_of(now)
         self._loop.post(BucketTick())
 
     def stop(self) -> None:
-        self._loop.stop()
+        pass
 
     # -- synchronous (not routed through the loop) -----------------------------
 
@@ -189,11 +182,6 @@ class Coordinator:
         self._force_close = enabled
         if enabled:
             self._loop.post(BucketTick())
-
-    # -- outbound event handlers -----------------------------------------------
-
-    def _on_block_settled(self, event: BlockSettled) -> None:
-        self._on_settled(event)
 
     # -- properties ------------------------------------------------------------
 
@@ -356,7 +344,7 @@ class Coordinator:
         roster = r.roster()
         for target, msg in r.outbox():
             for peer in recipients(target, roster, self.me.public):
-                self._on_send(SendConsensus(peer, msg))
+                self._loop.post(SendConsensus(peer, msg))
 
     def _flush_settle(self) -> None:
         s = self.settling
@@ -365,7 +353,7 @@ class Coordinator:
         roster = s.settle_round.roster()
         for target, msg in s.settle_round.outbox():
             for peer in recipients(target, roster, self.me.public):
-                self._on_send(SendConsensus(peer, msg))
+                self._loop.post(SendConsensus(peer, msg))
 
     # -- state transitions -----------------------------------------------------
 
