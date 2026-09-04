@@ -10,7 +10,7 @@ from ..core import codec, crypto
 from ..core.units import Millis
 from ..net.address import Address, Endpoint
 from ..net.envelope import Verb
-from ..net.postman import OutputQueue, Postman
+from ..net.postman import OutputQueue, PeerStatus, Postman
 from ..store import Store
 from .config import DudeConfig
 from .state import (
@@ -48,6 +48,28 @@ def _parse_node_specs(raw: tuple[str, ...]) -> list[tuple[crypto.PublicKey, tupl
     if not specs:
         raise CLIError("no nodes specified")
     return specs
+
+
+def _peer_alive(status: dict[crypto.PublicKey, PeerStatus], pub: crypto.PublicKey) -> bool:
+    ps = status.get(pub)
+    return ps is not None and ps.connected
+
+
+def _wait_all_connected(
+    postman: Postman,
+    pubs: list[crypto.PublicKey],
+    timeout: Millis,
+) -> None:
+    deadline = time.monotonic() + timeout.as_seconds
+    while time.monotonic() < deadline:
+        status = postman.peer_status()
+        if all(_peer_alive(status, pub) for pub in pubs):
+            return
+        time.sleep(0.05)
+    status = postman.peer_status()
+    for pub in pubs:
+        if not _peer_alive(status, pub):
+            raise CLIError(f"node {pub.hex()[:16]}... not reachable")
 
 
 def _wait_for_verb(
@@ -97,11 +119,9 @@ def genesis(cfg: DudeConfig, nodes: tuple[str, ...], dry_run: bool) -> None:
     postman.start()
 
     log.info("verifying node liveness...")
-    for pub, _eps in node_specs:
-        postman.send_raw(pub, Verb.PING, b"", cfg.tunables.ttl_exchange)
-        if not _wait_for_verb(replies, pub, Verb.PONG, cfg.tunables.ttl_exchange):
-            postman.stop()
-            raise CLIError(f"node {pub.hex()[:16]}... did not respond to PING")
+    pubs = [pub for pub, _ in node_specs]
+    _wait_all_connected(postman, pubs, cfg.tunables.ttl_exchange)
+    for pub in pubs:
         log.info("  %s alive", pub.hex()[:16])
 
     if dry_run:

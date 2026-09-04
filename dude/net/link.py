@@ -54,6 +54,7 @@ class Link:
     # Estimator (RFC 6298 EWMA)
     srtt: float | None = field(default=None, repr=False)
     rttvar: float = field(default=0.0, repr=False)
+    last_rtt_at: Millis = field(default=Millis(0), repr=False)
 
     # CircuitBreaker
     breaker_failures: int = field(default=0, repr=False)
@@ -86,6 +87,7 @@ class Link:
         self.breaker_open = False
         if rtt is None:
             return
+        self.last_rtt_at = now
         r = float(rtt)
         if self.srtt is None:
             self.srtt, self.rttvar = r, r / 2

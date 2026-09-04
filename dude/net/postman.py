@@ -20,7 +20,7 @@ from .link import (
     Peer,
 )
 from .mailbox import Expired, Mailbox, Reply, Transmit
-from .plan import Decision, GiveUp, Send, Wait, plan_next, retry_at
+from .plan import Decision, GiveUp, Send, Wait, decorrelated, plan_next, retry_at
 from .transports.tcp import OnionDialer, TCPDialer
 
 
@@ -121,6 +121,10 @@ class _Broadcast(_PostmanEvent):
     ttl: Millis
 
 
+class _KeepAlive(_PostmanEvent):
+    __slots__ = ()
+
+
 # ---------------------------------------------------------------------------
 # Output events — everything that comes OUT of the postman to the node.
 # ---------------------------------------------------------------------------
@@ -137,6 +141,23 @@ class Delivered(NamedTuple):
 class Output(NamedTuple):
     delivered: tuple[Delivered, ...]
     expired: tuple[Expired, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class LinkStatus:
+    address: Address
+    rtt_ms: float | None
+    last_rtt_at: Millis
+    last_activity: Millis
+    breaker_open: bool
+    available: bool
+
+
+@dataclass(frozen=True, slots=True)
+class PeerStatus:
+    identity: crypto.PublicKey
+    links: tuple[LinkStatus, ...]
+    connected: bool
 
 
 class OutputQueue:
@@ -176,6 +197,8 @@ class Postman:
     _retry_timer: Scheduled[_PostmanEvent] | None = field(default=None, init=False)
     _reap_timer: Scheduled[_PostmanEvent] | None = field(default=None, init=False)
     _link_timer: Scheduled[_PostmanEvent] | None = field(default=None, init=False)
+    _keepalive_timer: Scheduled[_PostmanEvent] | None = field(default=None, init=False)
+    _keepalive_pending: dict[bytes, tuple[Link, Millis]] = field(default_factory=dict, init=False)
 
     _acceptors: list[Acceptor] = field(default_factory=list, init=False)
     _dialers: list[Dialer] = field(default_factory=list, init=False)
@@ -196,6 +219,7 @@ class Postman:
         self._loop.register(_ReapCheck, self._on_reap_check)
         self._loop.register(_MaintainLinks, self._on_maintain_links)
         self._loop.register(_Broadcast, self._on_broadcast)
+        self._loop.register(_KeepAlive, self._on_keepalive)
 
     # -- public interface: queue puts, never direct state mutation -----------
 
@@ -251,6 +275,26 @@ class Postman:
     def broadcast(self, verb: Verb, body: bytes, ttl: Millis) -> None:
         self._loop.post(_Broadcast(verb, body, ttl))
 
+    def peer_status(self) -> dict[crypto.PublicKey, PeerStatus]:
+        now = Millis.now()
+        result: dict[crypto.PublicKey, PeerStatus] = {}
+        for pk, peer in dict(self.peers).items():
+            links = tuple(
+                LinkStatus(
+                    address=ln.address,
+                    rtt_ms=ln.srtt,
+                    last_rtt_at=ln.last_rtt_at,
+                    last_activity=ln.last_activity,
+                    breaker_open=ln.breaker_open,
+                    available=ln.available(now),
+                )
+                for ln in list(peer.links)
+            )
+            result[pk] = PeerStatus(
+                identity=pk, links=links, connected=any(ls.available for ls in links)
+            )
+        return result
+
     # -- lifecycle ----------------------------------------------------------
 
     def add_acceptor(self, acceptor: Acceptor) -> None:
@@ -272,6 +316,7 @@ class Postman:
             dialer.start(self._on_frame, self._on_link_established)
         self._loop.start()
         self._schedule_link_maintenance()
+        self._schedule_keepalive()
 
     def stop(self) -> None:
         self._loop.stop()
@@ -416,6 +461,30 @@ class Postman:
         interval = self.tunables.tick_interval * 10
         self._link_timer = self._loop.schedule(Millis.now() + interval, _MaintainLinks())
 
+    def _schedule_keepalive(self) -> None:
+        if self._keepalive_timer is not None:
+            self._keepalive_timer.cancel()
+        bt = int(self.tunables.block_time)
+        interval = Millis(decorrelated(bt * 2, bt * 3))
+        self._keepalive_timer = self._loop.schedule(Millis.now() + interval, _KeepAlive())
+
+    def _on_keepalive(self, _event: _KeepAlive) -> None:
+        self._keepalive_timer = None
+        now = Millis.now()
+        threshold = now - self.tunables.block_time * 2
+        for peer in self.peers.values():
+            for link in peer.links:
+                if link.available(now) and link.last_rtt_at < threshold:
+                    self._ping_link(peer, link, now)
+        self._schedule_keepalive()
+
+    def _ping_link(self, peer: Peer, link: Link, now: Millis) -> None:
+        mid = MessageId.random()
+        env = Envelope(peer.identity, Verb.PING, mid, b"")
+        stamped = env.sign(self.me, now)
+        if link.send(stamped.seal(), now) is None:
+            self._keepalive_pending[mid.correlation_id] = (link, now)
+
     # -- peer management (postman thread only) ------------------------------
 
     def _do_sync(
@@ -484,9 +553,17 @@ class Postman:
 
         if solicited:
             self._credit(env.frm, reply, now)
-        elif env.frm not in self.peers and env.frm not in self._authorized:
-            link.close()
-            return
+        else:
+            reply_to = env.env.reply_to
+            if reply_to and len(reply_to) >= MessageId.SIZE:
+                ka = self._keepalive_pending.pop(MessageId(reply_to).correlation_id, None)
+                if ka is not None:
+                    ka_link, sent_at = ka
+                    ka_link.on_reply(now, now - sent_at)
+                    return
+            if env.frm not in self.peers and env.frm not in self._authorized:
+                link.close()
+                return
 
         if link.identity is None:
             link.bind(env.frm)
