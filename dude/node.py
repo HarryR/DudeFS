@@ -18,6 +18,7 @@ from .core import codec, crypto
 from .core.errors import DudeError
 from .core.event_loop import Event, EventLoop
 from .core.units import Millis
+from .introspect import serve_node_status
 from .net import MessageId, Verb
 from .net.postman import Delivered, Output, Postman
 from .net.socket_server import SocketServer
@@ -448,9 +449,27 @@ class Node(_BaseNode):
                 self._on_get_chunks(d)
             case Verb.PROVISION:
                 self._on_provision(d)
+            case Verb.NODE_STATUS:
+                self._on_node_status(d)
 
     def _is_node(self, who: crypto.PublicKey) -> bool:
         return who == self.store.anchor() or self.mgmt_reader.is_member(who)
+
+    def _manager_authorised(self, who: crypto.PublicKey) -> bool:
+        if who == self.store.anchor():
+            return True
+        grant = self.mgmt_reader.valid_grant(who)
+        return grant is not None and grant.role is Role.MANAGER
+
+    def _on_node_status(self, d: Delivered) -> MessageId | None:
+        if not self._manager_authorised(d.frm):
+            return self._reply(d, Verb.REFUSED, b"unauthorised")
+        snapshot = serve_node_status(
+            self.store,
+            self.postman,
+            mempool_size=len(self.coordinator.mempool),
+        )
+        return self.postman.reply(d, snapshot, self.tunables.ttl_exchange)
 
     # -- consensus verb handlers --------------------------------------------
 

@@ -1,12 +1,16 @@
 import time
+from abc import ABC, abstractmethod
 from collections.abc import Callable
 
 from ..consensus.bootstrap import bootstrap, compose_genesis
 from ..core import crypto
 from ..core.units import Millis
+from ..net.address import Endpoint
 from ..net.postman import OutputQueue, Postman
 from ..net.transports.inproc import InProcNexus
+from ..net.transports.tcp import TCPListener
 from ..node import Node, ReplicaNode
+from ..participant import Participant
 from ..session import Settled
 from ..store import Store, ops
 from ..sync.lite_client import LightClient
@@ -17,6 +21,54 @@ T0 = Millis(1_700_000_000_000)
 TUNABLES = Tunables(rtt_max=Millis(50), clock_skew=Millis(25), held_convergence_max=2)
 
 
+class Fabric(ABC):
+    @abstractmethod
+    def endpoint_for(self, pub: crypto.PublicKey) -> Endpoint: ...
+
+    @abstractmethod
+    def attach(self, target: Participant | Postman) -> None: ...
+
+
+class InProcFabric(Fabric):
+    def __init__(self) -> None:
+        self.nexus = InProcNexus()
+
+    def endpoint_for(self, pub: crypto.PublicKey) -> Endpoint:
+        return self.nexus.endpoint_for(pub)
+
+    def attach(self, target: Participant | Postman) -> None:
+        self.nexus.attach(target)
+
+
+class TCPFabric(Fabric):
+    def __init__(self) -> None:
+        self._tunables: Tunables | None = None
+        self._listeners: dict[bytes, TCPListener] = {}
+
+    def set_tunables(self, tunables: Tunables) -> None:
+        self._tunables = tunables
+
+    def reserve(self, pub: crypto.PublicKey) -> None:
+        assert self._tunables is not None
+        key = bytes(pub)
+        if key not in self._listeners:
+            self._listeners[key] = TCPListener(
+                self._tunables,
+                listen_host="127.0.0.1",
+                listen_port=0,
+            )
+
+    def endpoint_for(self, pub: crypto.PublicKey) -> Endpoint:
+        self.reserve(pub)
+        return Endpoint(self._listeners[bytes(pub)].bound_address)
+
+    def attach(self, target: Participant | Postman) -> None:
+        pub = target.me.public
+        self.reserve(pub)
+        listener = self._listeners[bytes(pub)]
+        target.add_acceptor(listener)
+
+
 class Cluster:
     def __init__(
         self,
@@ -25,9 +77,12 @@ class Cluster:
         ro: int = 0,
         rw: int = 0,
         tunables: Tunables | None = None,
+        fabric: Fabric | None = None,
     ):
-        self.nexus = InProcNexus()
         self.tunables = tunables or TUNABLES
+        self.fabric = fabric or InProcFabric()
+        if isinstance(self.fabric, TCPFabric):
+            self.fabric.set_tunables(self.tunables)
         self.anchor = crypto.Keypair.generate()
 
         node_keys = [crypto.Keypair.generate() for _ in range(nodes)]
@@ -39,11 +94,15 @@ class Cluster:
 
         self.nodes: list[Node] = []
         for kp in node_keys:
-            self._boot_node(kp)
+            self._make_node(kp)
+        for node in self.nodes:
+            node.start()
 
         self.replicas: list[ReplicaNode] = []
         for kp in mgmt_keys:
-            self.boot_replica(kp)
+            self._make_replica(kp)
+        for rn in self.replicas:
+            rn.start()
 
         self.ro_clients: list[LightClient] = []
         for kp in ro_keys:
@@ -64,7 +123,9 @@ class Cluster:
     ) -> tuple[ops.SignedTransaction, ...]:
         return compose_genesis(
             anchor=self.anchor,
-            node_endpoints=[(kp.public, (self.nexus.endpoint_for(kp.public),)) for kp in node_keys],
+            node_endpoints=[
+                (kp.public, (self.fabric.endpoint_for(kp.public),)) for kp in node_keys
+            ],
             managers=mgmt_keys,
             ro_clients=ro_keys,
             rw_clients=rw_keys,
@@ -79,19 +140,22 @@ class Cluster:
 
     # -- adding participants ------------------------------------------------
 
-    def _boot_node(self, kp: crypto.Keypair) -> Node:
+    def _make_node(self, kp: crypto.Keypair) -> Node:
         store = self.provisioned()
         node = Node(kp, store, self.tunables)
-        self.nexus.attach(node)
-        node.start()
+        self.fabric.attach(node)
         self.nodes.append(node)
         return node
 
     def boot_replica(self, kp: crypto.Keypair) -> ReplicaNode:
+        rn = self._make_replica(kp)
+        rn.start()
+        return rn
+
+    def _make_replica(self, kp: crypto.Keypair) -> ReplicaNode:
         store = self.provisioned()
         rn = ReplicaNode(kp, store, self.tunables)
-        self.nexus.attach(rn)
-        rn.start()
+        self.fabric.attach(rn)
         self.replicas.append(rn)
         return rn
 
@@ -101,12 +165,12 @@ class Cluster:
         into: list[LightClient],
     ) -> LightClient:
         postman = Postman(kp, self.tunables, on_output=OutputQueue())
-        self.nexus.attach(postman)
+        self.fabric.attach(postman)
         lc = LightClient(me=kp, anchor=self.anchor.public, postman=postman)
         for node in self.nodes:
             lc.add_bootstrap_peer(
                 node.me.public,
-                (self.nexus.endpoint_for(node.me.public),),
+                (self.fabric.endpoint_for(node.me.public),),
             )
         lc.start()
         into.append(lc)

@@ -15,7 +15,7 @@ from ...core.units import Millis
 from ...tunables import Tunables
 from ..address import Address, Scheme
 from ..envelope import MAX_FRAME_BYTES, Frame
-from ..link import Acceptor, Dialer, Link, LinkError, OnFrame, OnLink
+from ..link import Acceptor, Dialer, Link, LinkDirection, LinkError, ListenerStats, OnFrame, OnLink
 
 _LEN = struct.Struct(">I")
 
@@ -132,6 +132,7 @@ class _TCPConn:
         while len(buf) >= _LEN.size:
             (length,) = _LEN.unpack_from(buf, 0)
             if length > MAX_FRAME_BYTES:
+                self.link.bad_frames += 1
                 return True
             if len(buf) < _LEN.size + length:
                 return False
@@ -140,7 +141,10 @@ class _TCPConn:
             try:
                 frame = Frame.decode(payload)
             except DudeError:
+                self.link.bad_frames += 1
                 continue
+            self.link.msgs_recv += 1
+            self.link.bytes_recv += length
             self.link.last_activity = Millis.now()
             on_frame(frame, self.link)
         return False
@@ -350,6 +354,7 @@ class TCPListener(Acceptor):
     tunables: Tunables
     listen_host: str = "127.0.0.1"
     listen_port: int = 0
+    conns_accepted: int = field(init=False, default=0)
     _timing: _TCPTiming = field(init=False)
     _listener: socket.socket = field(init=False)
     _bound_port: int = field(init=False, default=0)
@@ -371,20 +376,29 @@ class TCPListener(Acceptor):
                 self._listener.close()
             raise
         self._bound_port = self._listener.getsockname()[1]
-        self._thread = threading.Thread(
-            target=self._accept_loop, name=f"tcp-accept-{self._bound_port}", daemon=True
-        )
-        self._thread.start()
 
     @property
     def bound_address(self) -> Address:
         return Address(Scheme.TCP, f"{self.listen_host}:{self._bound_port}")
+
+    def stats(self) -> ListenerStats:
+        return ListenerStats(
+            scheme=Scheme.TCP,
+            address=self.bound_address,
+            extra={"conns_accepted": self.conns_accepted},
+        )
 
     def start(self, on_frame: OnFrame, on_link: OnLink) -> None:
         if self._on_frame is not None:
             raise RuntimeError("TCPListener already started")
         self._on_frame = on_frame
         self._on_link = on_link
+        self._thread = threading.Thread(
+            target=self._accept_loop,
+            name=f"tcp-accept-{self._bound_port}",
+            daemon=True,
+        )
+        self._thread.start()
 
     def stop(self) -> None:
         self._stopping.set()
@@ -409,6 +423,7 @@ class TCPListener(Acceptor):
             if self._on_frame is None or self._on_link is None:
                 conn_sock.close()
                 continue
+            self.conns_accepted += 1
             host, port = peer_addr[:2]
             conn = _TCPConn(
                 conn_sock,
@@ -417,5 +432,7 @@ class TCPListener(Acceptor):
                 self._on_frame,
                 self._on_link,
             )
+            conn.link.direction = LinkDirection.INBOUND
+            conn.link.listener_addr = self.bound_address
             self._conns.append(conn)
             self._conns = [c for c in self._conns if not c.closed]

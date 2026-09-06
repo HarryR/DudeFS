@@ -45,6 +45,9 @@ class Verb(IntEnum):
     PROOF_REPLY = 43
     LITE_REFUSED = 44
 
+    NODE_STATUS = 50
+    NODE_STATUS_REPLY = 51
+
     REFUSED = 90
     """A node's answer to a client's SUBMIT, body a `mempool.Refusal` value. Sync refusals are
     `SYNC_REFUSED`."""

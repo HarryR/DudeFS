@@ -17,6 +17,8 @@ from .link import (
     Acceptor,
     Dialer,
     Link,
+    LinkDirection,
+    ListenerStats,
     Peer,
 )
 from .mailbox import Expired, Mailbox, Reply, Transmit
@@ -156,6 +158,14 @@ class LinkStatus:
     last_activity: Millis
     breaker_open: bool
     available: bool
+    msgs_sent: int
+    msgs_recv: int
+    bytes_sent: int
+    bytes_recv: int
+    bad_frames: int
+    established_at: Millis
+    direction: LinkDirection
+    listener_addr: Address | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -293,6 +303,14 @@ class Postman:
                     last_activity=ln.last_activity,
                     breaker_open=ln.breaker_open,
                     available=ln.available(now),
+                    msgs_sent=ln.msgs_sent,
+                    msgs_recv=ln.msgs_recv,
+                    bytes_sent=ln.bytes_sent,
+                    bytes_recv=ln.bytes_recv,
+                    bad_frames=ln.bad_frames,
+                    established_at=ln.established_at,
+                    direction=ln.direction,
+                    listener_addr=ln.listener_addr,
                 )
                 for ln in list(peer.links)
             )
@@ -300,6 +318,9 @@ class Postman:
                 identity=pk, links=links, connected=any(ls.available for ls in links)
             )
         return result
+
+    def listener_stats(self) -> list[ListenerStats]:
+        return [acc.stats() for acc in self._acceptors]
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -563,11 +584,13 @@ class Postman:
 
     def _do_deliver(self, frame: Frame, link: Link, now: Millis) -> None:
         if not frame.addressed_to(self.me.public):
+            link.bad_frames += 1
             return
         try:
             env = frame.unseal(self.me)
             env.accept(self.me.public, now, self.tunables.window)
         except (EnvelopeError, DudeError):
+            link.bad_frames += 1
             return
 
         reply = self.mailbox.arrived(env, now)

@@ -1,12 +1,14 @@
-from __future__ import annotations
-
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from ..consensus.settle_round import SettledBlock
 from ..core import crypto
+from ..core.errors import DudeError
+from ..introspect import NodeStatusReply
 from ..net.address import Endpoint
+from ..net.envelope import Verb
 from ..net.postman import LinkStatus
+from ..session import InflightHandle
 from .lite_client import LightClient, TrustedState
 
 log = logging.getLogger(__name__)
@@ -30,18 +32,39 @@ class ClusterStatus:
     bootstrapped: bool
 
 
-@dataclass(slots=True)
-class ClusterObserver:
-    lc: LightClient
-    _known_endpoints: dict[crypto.PublicKey, tuple[Endpoint, ...]] = field(
-        init=False,
-        default_factory=dict,
-    )
+@dataclass(frozen=True, slots=True)
+class TopologySnapshot:
+    cluster: ClusterStatus
+    nodes: dict[crypto.PublicKey, NodeStatusReply]
 
-    def __post_init__(self) -> None:
-        self.lc.on_ready = self._on_ready
-        self.lc.on_block = self._on_block
-        self.lc.on_trust_lost = self._on_trust_lost
+
+@dataclass(slots=True)
+class _StatusHandle(InflightHandle):
+    observer: "ClusterObserver"
+    peer: crypto.PublicKey
+
+    def on_reply(self, verb: Verb, body: bytes) -> None:
+        if verb is not Verb.NODE_STATUS_REPLY:
+            return
+        try:
+            snapshot = NodeStatusReply.decode(body)
+        except (DudeError, ValueError, KeyError):
+            log.warning("bad NODE_STATUS_REPLY from %s", self.peer.hex()[:16])
+            return
+        self.observer.note_node_status(self.peer, snapshot)
+
+    def on_expired(self) -> None:
+        pass
+
+
+class ClusterObserver:
+    def __init__(self, lc: LightClient) -> None:
+        self.lc = lc
+        self._known_endpoints: dict[crypto.PublicKey, tuple[Endpoint, ...]] = {}
+        self._node_snapshots: dict[crypto.PublicKey, NodeStatusReply] = {}
+        lc.on_ready = self._on_ready
+        lc.on_block = self._on_block
+        lc.on_trust_lost = self._on_trust_lost
 
     def _on_ready(self, ts: TrustedState) -> None:
         old_keys = set(self._known_endpoints)
@@ -49,6 +72,7 @@ class ClusterObserver:
         for pub in old_keys - new_keys:
             log.info("roster: removed %s", pub.hex()[:16])
             self.lc.postman.remove_peer(pub)
+            self._node_snapshots.pop(pub, None)
         for pub in new_keys:
             self.lc.postman.add_peer(pub, ts.node_endpoints[pub])
             if pub not in old_keys:
@@ -65,6 +89,20 @@ class ClusterObserver:
 
     def _on_trust_lost(self) -> None:
         log.warning("trust lost — awaiting re-bootstrap")
+
+    def note_node_status(self, peer: crypto.PublicKey, snapshot: NodeStatusReply) -> None:
+        self._node_snapshots[peer] = snapshot
+
+    def query_topology(self) -> None:
+        ttl = self.lc.tunables.ttl_exchange
+        for pub in self._known_endpoints:
+            self.lc.request_raw(
+                pub,
+                Verb.NODE_STATUS,
+                b"",
+                ttl,
+                _StatusHandle(observer=self, peer=pub),
+            )
 
     def status(self) -> ClusterStatus:
         ts = self.lc.trusted_state
@@ -87,4 +125,10 @@ class ClusterObserver:
             managers=ts.managers if ts else (),
             nodes=nodes,
             bootstrapped=ts is not None,
+        )
+
+    def topology(self) -> TopologySnapshot:
+        return TopologySnapshot(
+            cluster=self.status(),
+            nodes=dict(self._node_snapshots),
         )

@@ -9,10 +9,10 @@ from ...core import crypto
 from ...core.units import Millis
 from ..address import Address, Endpoint, Scheme
 from ..envelope import Frame
-from ..link import Acceptor, Dialer, Link, LinkError, OnFrame, OnLink
+from ..link import Acceptor, Dialer, Link, LinkDirection, LinkError, ListenerStats, OnFrame, OnLink
 
 if TYPE_CHECKING:
-    from ...node import _BaseNode
+    from ...participant import Participant
     from ..postman import Postman
 
 
@@ -89,9 +89,12 @@ class InProcListener(Acceptor, Dialer):
                     address=Address(Scheme.INPROC, sender.hex()),
                     nexus=self.nexus,
                 )
+                conn.link.direction = LinkDirection.INBOUND
                 self.conns[sender] = conn
                 if self._on_link is not None:
                     self._on_link(conn.link)
+            conn.link.msgs_recv += 1
+            conn.link.bytes_recv += len(frame.raw)
             conn.link.last_activity = Millis.now()
             if self._on_frame is not None:
                 self._on_frame(frame, conn.link)
@@ -102,6 +105,13 @@ class InProcListener(Acceptor, Dialer):
         conn = self.conns.get(peer_key)
         if conn is not None:
             conn.link.close()
+
+    def stats(self) -> ListenerStats:
+        return ListenerStats(
+            scheme=Scheme.INPROC,
+            address=self.endpoint.address,
+            extra={"peer_count": len(self.conns)},
+        )
 
     def start(self, on_frame: OnFrame, on_link: OnLink) -> None:
         self._stopped = False
@@ -169,7 +179,7 @@ class InProcNexus:
         for listener in list(self._listeners.values()):
             listener.remove_conn(peer_key)
 
-    def attach(self, target: Postman | _BaseNode) -> InProcListener:
+    def attach(self, target: Postman | Participant) -> InProcListener:
         pub = target.me.public
         inproc = InProcListener(pub, self)
         target.add_acceptor(inproc)

@@ -73,12 +73,12 @@ class TestCompactorFromLightClient(unittest.TestCase):
             c.wait_settled(anchor_node.session().submit(grant).wait())
 
             postman = Postman(compactor_kp, c.tunables, on_output=OutputQueue())
-            c.nexus.attach(postman)
+            c.fabric.attach(postman)
             lc = LightClient(me=compactor_kp, anchor=c.anchor.public, postman=postman)
             for node in c.nodes:
                 lc.add_bootstrap_peer(
                     node.me.public,
-                    (c.nexus.endpoint_for(node.me.public),),
+                    (c.fabric.endpoint_for(node.me.public),),
                 )
             lc.start()
             lc.bootstrap()

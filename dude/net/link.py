@@ -4,13 +4,13 @@ import contextlib
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import Enum, StrEnum
 
 from ..core import crypto
 from ..core.errors import DudeError
 from ..core.units import Millis
 from ..tunables import Tunables
-from .address import Address, Endpoint
+from .address import Address, Endpoint, Scheme
 from .envelope import Frame
 
 type OnFrame = Callable[[Frame, "Link"], None]
@@ -20,11 +20,20 @@ type OnLink = Callable[["Link"], None]
 class LinkError(DudeError): ...
 
 
+@dataclass(frozen=True, slots=True)
+class ListenerStats:
+    scheme: Scheme
+    address: Address
+    extra: dict[str, int | str | float]
+
+
 class Acceptor(ABC):
     @abstractmethod
     def start(self, on_frame: OnFrame, on_link: OnLink) -> None: ...
     @abstractmethod
     def stop(self) -> None: ...
+    @abstractmethod
+    def stats(self) -> ListenerStats: ...
 
 
 class Dialer(ABC):
@@ -39,6 +48,11 @@ class Dialer(ABC):
 class Refused(Enum):
     CIRCUIT_OPEN = "circuit-open"
     TRANSPORT = "transport"
+
+
+class LinkDirection(StrEnum):
+    INBOUND = "inbound"
+    OUTBOUND = "outbound"
 
 
 @dataclass(slots=True)
@@ -61,6 +75,16 @@ class Link:
     breaker_opened_at: Millis = field(default=Millis(0), repr=False)
     breaker_open: bool = field(default=False, repr=False)
 
+    # I/O counters
+    msgs_sent: int = field(default=0, repr=False)
+    msgs_recv: int = field(default=0, repr=False)
+    bytes_sent: int = field(default=0, repr=False)
+    bytes_recv: int = field(default=0, repr=False)
+    bad_frames: int = field(default=0, repr=False)
+    established_at: Millis = field(default_factory=Millis.now, repr=False)
+    direction: LinkDirection = field(default=LinkDirection.OUTBOUND, repr=False)
+    listener_addr: Address | None = field(default=None, repr=False)
+
     _closed: bool = field(default=False, init=False)
     _close_notified: bool = field(default=False, init=False)
     on_close: Callable[[Link], None] | None = None
@@ -78,6 +102,8 @@ class Link:
             self._on_failed(now)
             self.close()
             return Refused.TRANSPORT
+        self.msgs_sent += 1
+        self.bytes_sent += len(frame.raw)
         self.last_activity = now
         return None
 
@@ -158,7 +184,7 @@ class Peer:
     def reconfigure(self, wanted_eps: tuple[Endpoint, ...]) -> None:
         wanted = {e.address: e for e in wanted_eps}
         for link in tuple(self.links):
-            if link.address not in wanted:
+            if link.direction is LinkDirection.OUTBOUND and link.address not in wanted:
                 link.close()
         self.dial_targets = wanted
 
