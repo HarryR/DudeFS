@@ -5,7 +5,6 @@ import logging
 import click
 
 from ..core import crypto
-from ..net.socket_substrate import SocketSubstrate
 from ..session import SessionRW, Settled
 from ..store import ops
 from ..store.management import Cert, MgmtWriter, Role
@@ -15,7 +14,6 @@ from .state import (
     CLIError,
     load_keypair,
     save_keypair,
-    socket_path,
     until_terminated,
 )
 
@@ -63,7 +61,7 @@ def grant(cfg: DudeConfig, pub: crypto.PublicKey, pop: crypto.Signature, role: R
     cert = Cert.sign_grant(signer, pub, role)
     stores = frozenset({ops.STORE_MANAGEMENT, ops.STORE_DATA})
 
-    with SocketSubstrate(socket_path(dir_path), cfg.tunables) as sub:
+    with cfg.substrate(cfg.manager_dir, cfg.manager_cfg) as sub:
         session = SessionRW(sub, ops.STORE_MANAGEMENT)
         w = MgmtWriter(session)
         tx = w.authorise(pub, role, stores=stores, pop=pop, cert=cert)
@@ -80,7 +78,7 @@ def revoke(cfg: DudeConfig, pub: crypto.PublicKey) -> None:
     dir_path = cfg.manager_dir
     signer = load_keypair(dir_path)
 
-    with SocketSubstrate(socket_path(dir_path), cfg.tunables) as sub:
+    with cfg.substrate(cfg.manager_dir, cfg.manager_cfg) as sub:
         session = SessionRW(sub, ops.STORE_MANAGEMENT)
         w = MgmtWriter(session)
         tx = w.revoke(pub, reissue_signer=signer)

@@ -14,7 +14,7 @@ from ..core import codec, crypto
 from ..core.errors import InvariantError
 from ..session import Session, Settled
 from . import ops, settle, smt
-from .layer import Held, Index, Ledger, PathRow, View, element, holds, log_element
+from .layer import Held, Index, Ledger, PathRow, View, holds
 from .management import MgmtReader, MgmtWriter
 from .smt_sync import _ExportSource, _ImportTarget
 
@@ -114,6 +114,18 @@ class Dropped(NamedTuple):
 class Applied:
     settled: tuple[tuple[Index, crypto.Digest], ...]
     dropped: tuple[Dropped, ...]
+
+
+def log_element(idx: int, op_hash: crypto.Digest) -> crypto.Accumulator:
+    return crypto.acc_element(codec.encode([b"log", idx, op_hash]))
+
+
+def element(store: int, name: bytes, value: bytes, epoch: int) -> crypto.Accumulator:
+    """SUBTRACT WITH THE OLD ROW'S EPOCH AND ADD WITH THE NEW ONE. The accumulator cancels a row
+    by subtracting the exact element it added, so a subtraction carrying the wrong epoch removes
+    something that was never there -- and every node corrupts `A_state` identically, which is why
+    nothing would notice."""
+    return crypto.acc_element(codec.encode([store, name, value, epoch]))
 
 
 def _unverified(e: Entry) -> str | None:
@@ -267,15 +279,15 @@ class StoreReader(View, Ledger, _ExportSource):
         for st, name, value, cred, epoch in rows:
             yield PathRow(int(st), name, value, cred, int(epoch))
 
-    def has_settled(self, *op_hashes: crypto.Digest) -> frozenset[crypto.Digest]:
+    def has_settled(self, *op_hashes: crypto.Digest) -> set[crypto.Digest]:
         if not op_hashes:
-            return frozenset()
+            return set()
         marks = ",".join("?" * len(op_hashes))
         rows = self._conn.execute(
             f"SELECT op_hash FROM entry WHERE op_hash IN ({marks})",  # noqa: S608
             op_hashes,
         ).fetchall()
-        return frozenset(r[0] for r in rows)
+        return {r[0] for r in rows}
 
     def settlement_of(self, op_hash: crypto.Digest) -> Settled | None:
         row = self._conn.execute(
@@ -411,7 +423,7 @@ class StoreWriter(StoreReader, _ImportTarget):
     ) -> Applied:
         settled: list[tuple[Index, crypto.Digest]] = []
         dropped: list[Dropped] = []
-        already = set(self.has_settled(*(tx.op_hash for tx in batch)))
+        already = self.has_settled(*(tx.op_hash for tx in batch))
         acc = self.accumulator()
         idx = self.head()
         for tx in batch:
@@ -629,7 +641,7 @@ class Store(View, Ledger):
         with self.snapshot() as r:
             yield from list(r.rows_in_path_range(lo, hi))
 
-    def has_settled(self, *op_hashes: crypto.Digest) -> frozenset[crypto.Digest]:
+    def has_settled(self, *op_hashes: crypto.Digest) -> set[crypto.Digest]:
         with self.snapshot() as r:
             return r.has_settled(*op_hashes)
 

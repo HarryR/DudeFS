@@ -16,6 +16,7 @@ class PublicKeyParam(click.ParamType):
         param: click.Parameter | None,
         ctx: click.Context | None,
     ) -> crypto.PublicKey:
+        value = value.removeprefix("0x")
         try:
             raw = bytes.fromhex(value)
         except ValueError:

@@ -6,14 +6,12 @@ import sys
 import click
 
 from ..core import crypto
-from ..net.socket_substrate import SocketSubstrate
 from ..session import SessionRW, Settled
 from ..store import ops
 from .config import DudeConfig
 from .state import (
     CLIError,
     save_keypair,
-    socket_path,
     until_terminated,
 )
 
@@ -50,7 +48,7 @@ def serve(cfg: DudeConfig) -> None:
 @click.argument("key")
 @click.pass_obj
 def get(cfg: DudeConfig, key: str) -> None:
-    with SocketSubstrate(socket_path(cfg.client_dir), cfg.tunables) as sub:
+    with cfg.substrate(cfg.client_dir, cfg.client_cfg) as sub:
         session = SessionRW(sub, ops.STORE_DATA)
         rec = session.get(key)
         if rec.absent:
@@ -65,7 +63,7 @@ def get(cfg: DudeConfig, key: str) -> None:
 @click.argument("value")
 @click.pass_obj
 def put(cfg: DudeConfig, key: str, value: str) -> None:
-    with SocketSubstrate(socket_path(cfg.client_dir), cfg.tunables) as sub:
+    with cfg.substrate(cfg.client_dir, cfg.client_cfg) as sub:
         session = SessionRW(sub, ops.STORE_DATA)
         result = session.put(key, value.encode()).wait()
         if not isinstance(result, Settled):
@@ -77,7 +75,7 @@ def put(cfg: DudeConfig, key: str, value: str) -> None:
 @click.argument("key")
 @click.pass_obj
 def delete(cfg: DudeConfig, key: str) -> None:
-    with SocketSubstrate(socket_path(cfg.client_dir), cfg.tunables) as sub:
+    with cfg.substrate(cfg.client_dir, cfg.client_cfg) as sub:
         session = SessionRW(sub, ops.STORE_DATA)
         result = session.delete(key).wait()
         if not isinstance(result, Settled):

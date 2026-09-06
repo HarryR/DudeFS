@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 import tomllib
+from collections.abc import Generator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -10,6 +12,7 @@ import dacite
 from ..core.units import Millis
 from ..net.link import Acceptor
 from ..net.postman import OutputQueue, Postman
+from ..net.socket_substrate import SocketSubstrate
 from ..net.transports.tcp import TCPListener
 from ..node import Node, ReplicaNode
 from ..store import Store
@@ -109,6 +112,15 @@ class DudeConfig:
         if role_cfg is not None and role_cfg.socket is not None:
             return role_cfg.socket
         return socket_path(role_dir)
+
+    @contextmanager
+    def substrate(
+        self,
+        role_dir: Path,
+        role_cfg: RoleConfig | None = None,
+    ) -> Generator[SocketSubstrate]:
+        with SocketSubstrate(self._role_socket(role_cfg, role_dir), self.tunables) as sub:
+            yield sub
 
     def node(self) -> Node:
         node_dir = self.node_dir

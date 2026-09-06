@@ -1,7 +1,7 @@
 import threading
 import time
 from abc import ABC
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
 from enum import Enum, auto
 
@@ -203,6 +203,10 @@ class LightClient:
     inflight: Inflight = field(default_factory=Inflight, init=False)
     _key_cache: KeyCache | None = field(default=None, init=False)
     peer_views: dict[crypto.PublicKey, PeerView] = field(default_factory=dict, init=False)
+
+    on_ready: Callable[[TrustedState], None] | None = field(default=None)
+    on_block: Callable[[SettledBlock], None] | None = field(default=None)
+    on_trust_lost: Callable[[], None] | None = field(default=None)
 
     commit_cond: threading.Condition = field(default_factory=threading.Condition, init=False)
     commit_seq: int = field(default=0, init=False)
@@ -432,6 +436,8 @@ class LightClient:
             head=head,
         )
         self.state = State.READY
+        if self.on_ready is not None:
+            self.on_ready(self.trusted_state)
 
     # -- read resolution ----------------------------------------------------
 
@@ -442,6 +448,8 @@ class LightClient:
             if msg.reason in (SyncRefusal.FORK_DETECTED, SyncRefusal.COMPACTED):
                 self.state = State.UNBOOTSTRAPPED
                 self.trusted_state = None
+                if self.on_trust_lost is not None:
+                    self.on_trust_lost()
             return
         if not isinstance(msg, ProofReply):
             entry.result = Failed(reason="unexpected reply verb")
@@ -453,6 +461,8 @@ class LightClient:
             entry.result = Failed(reason="roster changed; re-bootstrap")
             self.state = State.UNBOOTSTRAPPED
             self.trusted_state = None
+            if self.on_trust_lost is not None:
+                self.on_trust_lost()
             return
         if not self._advance_head(msg.headers, msg.head):
             entry.result = Failed(reason="header chain-link or settle_sigs verify failed")
@@ -506,6 +516,8 @@ class LightClient:
         if isinstance(walked, chain.ChainRefusal):
             return False
         self.trusted_state = replace(ts, head=walked)
+        if self.on_block is not None:
+            self.on_block(walked)
         return True
 
     def session(self, store_id: int = 1) -> SessionRW:
