@@ -7,9 +7,20 @@ from dataclasses import dataclass, field
 from .core import codec, crypto
 from .core.errors import DudeError
 from .net.envelope import MessageId, Verb
-from .store import ops
 from .store.layer import BlockHead, Index, Reader
 from .store.management import blind_key, epoch_key, wrap_key
+from .store.ops import (
+    EPOCH_NONE,
+    STORE_MANAGEMENT,
+    Absent,
+    Del,
+    Holds,
+    Predicate,
+    Set,
+    Step,
+    Transaction,
+    value_digest,
+)
 
 
 class SessionError(DudeError): ...
@@ -113,7 +124,6 @@ class Inflight:
 
 @dataclass(slots=True)
 class SubmitHandle(InflightHandle):
-    mid: MessageId
     op_hash: crypto.Digest
     _sub: "Substrate"
     peer: crypto.PublicKey | None = None
@@ -163,7 +173,7 @@ class SubmitHandle(InflightHandle):
 
 class Substrate(Reader, ABC):
     @abstractmethod
-    def submit(self, tx: ops.Transaction) -> "SubmitHandle": ...
+    def submit(self, tx: Transaction) -> "SubmitHandle": ...
     @abstractmethod
     def settled(self, op_hash: crypto.Digest) -> "SubmitResult | None": ...
     @abstractmethod
@@ -221,7 +231,7 @@ class KeyCache:
         sk = self._keys(store_id)
         if sk.name_key is not None:
             return sk.name_key
-        raw = self._reader.get(ops.STORE_MANAGEMENT, blind_key(store_id, self._kp.public))
+        raw = self._reader.get(STORE_MANAGEMENT, blind_key(store_id, self._kp.public))
         if raw is None:
             raise SessionError(
                 f"{self._kp.public.hex()[:8]} has no blinding key for store {store_id}"
@@ -234,7 +244,7 @@ class KeyCache:
         sk = self._keys(store_id)
         if epoch not in sk.masters:
             raw = self._reader.get(
-                ops.STORE_MANAGEMENT,
+                STORE_MANAGEMENT,
                 wrap_key(store_id, epoch, self._kp.public),
             )
             if raw is None:
@@ -250,7 +260,7 @@ class KeyCache:
         sk = self._keys(store_id)
         if sk.current_epoch is not None:
             return sk.current_epoch
-        raw = self._reader.get(ops.STORE_MANAGEMENT, epoch_key(store_id))
+        raw = self._reader.get(STORE_MANAGEMENT, epoch_key(store_id))
         if raw is None:
             raise SessionError(f"no epoch for store {store_id}")
         sk.current_epoch = codec.as_int(codec.decode(raw.value))
@@ -292,19 +302,19 @@ class Session:
         return self._store_id
 
     def token(self, name: str | bytes) -> bytes:
-        if self._store_id == ops.STORE_MANAGEMENT:
+        if self._store_id == STORE_MANAGEMENT:
             return name if isinstance(name, bytes) else name.encode()
         if not isinstance(name, str):
             raise SessionError("data store keys must be str, not bytes")
         raise SessionError("data store token requires a Substrate with crypto")
 
     def seal(self, name: str | bytes, value: bytes) -> tuple[bytes, bytes, int]:
-        if self._store_id == ops.STORE_MANAGEMENT:
-            return self.token(name), value, ops.EPOCH_NONE
+        if self._store_id == STORE_MANAGEMENT:
+            return self.token(name), value, EPOCH_NONE
         raise SessionError("data store seal requires a Substrate with crypto")
 
     def _decrypt(self, name: str | bytes, ciphertext: bytes, epoch: int) -> bytes:  # noqa: ARG002
-        if self._store_id == ops.STORE_MANAGEMENT:
+        if self._store_id == STORE_MANAGEMENT:
             return ciphertext
         raise SessionError("data store decrypt requires a Substrate with crypto")
 
@@ -341,21 +351,21 @@ class SessionRW(Session):
         self._sub = sub
 
     def token(self, name: str | bytes) -> bytes:
-        if self._store_id == ops.STORE_MANAGEMENT:
+        if self._store_id == STORE_MANAGEMENT:
             return name if isinstance(name, bytes) else name.encode()
         if not isinstance(name, str):
             raise SessionError("data store keys must be str, not bytes")
         return self._sub.token(self._store_id, name)
 
     def seal(self, name: str | bytes, value: bytes) -> tuple[bytes, bytes, int]:
-        if self._store_id == ops.STORE_MANAGEMENT:
-            return self.token(name), value, ops.EPOCH_NONE
+        if self._store_id == STORE_MANAGEMENT:
+            return self.token(name), value, EPOCH_NONE
         if not isinstance(name, str):
             raise SessionError("data store keys must be str, not bytes")
         return self._sub.seal(self._store_id, name, value)
 
     def _decrypt(self, name: str | bytes, ciphertext: bytes, epoch: int) -> bytes:
-        if self._store_id == ops.STORE_MANAGEMENT:
+        if self._store_id == STORE_MANAGEMENT:
             return ciphertext
         if not isinstance(name, str):
             raise SessionError("data store keys must be str, not bytes")
@@ -365,90 +375,90 @@ class SessionRW(Session):
         self,
         name: str,
         value: bytes,
-        *predicates: ops.Predicate | Record,
+        *predicates: Predicate | Record,
         expect: Record | None = None,
         absent: bool = False,
     ) -> SubmitHandle:
         token, sealed, epoch = self.seal(name, value)
         guards = _collect_guards(self._store_id, token, predicates, expect, absent)
-        tx = ops.Transaction((ops.Step(guards, ops.Set(self._store_id, token, sealed, epoch)),))
+        tx = Transaction((Step(guards, Set(self._store_id, token, sealed, epoch)),))
         return self.submit(tx)
 
     def delete(
         self,
         name: str,
-        *predicates: ops.Predicate | Record,
+        *predicates: Predicate | Record,
         expect: Record | None = None,
     ) -> SubmitHandle:
         token = self.token(name)
         guards = _collect_guards(self._store_id, token, predicates, expect, False)
-        tx = ops.Transaction((ops.Step(guards, ops.Del(self._store_id, token)),))
+        tx = Transaction((Step(guards, Del(self._store_id, token)),))
         return self.submit(tx)
 
     def begin(self) -> "TxBuilder":
         return TxBuilder(self)
 
-    def submit(self, tx: ops.Transaction) -> SubmitHandle:
+    def submit(self, tx: Transaction) -> SubmitHandle:
         return self._sub.submit(tx)
 
 
 class TxBuilder:
     def __init__(self, session: SessionRW) -> None:
         self._session = session
-        self._steps: list[ops.Step] = []
+        self._steps: list[Step] = []
 
     def put(
         self,
         name: str,
         value: bytes,
-        *predicates: ops.Predicate | Record,
+        *predicates: Predicate | Record,
         expect: Record | None = None,
         absent: bool = False,
     ) -> "TxBuilder":
         s = self._session
         token, sealed, epoch = s.seal(name, value)
         guards = _collect_guards(s.store_id, token, predicates, expect, absent)
-        self._steps.append(ops.Step(guards, ops.Set(s.store_id, token, sealed, epoch)))
+        self._steps.append(Step(guards, Set(s.store_id, token, sealed, epoch)))
         return self
 
     def delete(
         self,
         name: str,
-        *predicates: ops.Predicate | Record,
+        *predicates: Predicate | Record,
         expect: Record | None = None,
     ) -> "TxBuilder":
         s = self._session
         token = s.token(name)
         guards = _collect_guards(s.store_id, token, predicates, expect, False)
-        self._steps.append(ops.Step(guards, ops.Del(s.store_id, token)))
+        self._steps.append(Step(guards, Del(s.store_id, token)))
         return self
 
     def submit(self) -> SubmitHandle:
         if not self._steps:
             raise SessionError("empty transaction")
-        tx = ops.Transaction(tuple(self._steps))
+        tx = Transaction(tuple(self._steps))
         return self._session.submit(tx)
 
 
 def _collect_guards(
     store_id: int,
     token: bytes,
-    predicates: tuple[ops.Predicate | Record, ...],
+    predicates: tuple[Predicate | Record, ...],
     expect: Record | None,
     absent: bool,
-) -> tuple[ops.Predicate, ...]:
-    out: list[ops.Predicate] = []
+) -> tuple[Predicate, ...]:
+    out: list[Predicate] = []
     for p in predicates:
         if isinstance(p, Record):
             if p.absent:
                 raise SessionError("cannot use an absent record as a dependency")
-            out.append(ops.Holds(p.store_id, p.token, ops.value_digest(p.raw)))
+            out.append(Holds(p.store_id, p.token, value_digest(p.raw)))
         else:
             out.append(p)
     if expect is not None:
         if expect.absent:
             raise SessionError("expected record is absent; use absent=True instead")
-        out.append(ops.Holds(store_id, token, ops.value_digest(expect.raw)))
+        out.append(Holds(store_id, token, value_digest(expect.raw)))
     if absent:
-        out.append(ops.Absent(store_id, token))
+        out.append(Absent(store_id, token))
     return tuple(out)

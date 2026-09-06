@@ -8,7 +8,6 @@ import threading
 from ..core import codec, crypto
 from ..core.errors import DudeError
 from ..core.units import Millis
-from ..net.envelope import MessageId
 from ..session import SubmitHandle, SubmitResult, Substrate
 from ..store import ops
 from ..store.layer import BlockHead, Held
@@ -101,7 +100,6 @@ class SocketSubstrate(Substrate):
     def submit(self, tx: ops.Transaction) -> SubmitHandle:
         corr_id = os.urandom(16)
         tx_bytes = tx.encode()
-        mid = MessageId.random()
         slot = _ReplySlot()
         self._pending[corr_id] = slot
         self._send(Request.SUBMIT, corr_id, tx_bytes)
@@ -109,7 +107,7 @@ class SocketSubstrate(Substrate):
             op_hash = crypto.Digest(slot.wait(self._request_timeout))
         finally:
             self._pending.pop(corr_id, None)
-        handle = SubmitHandle(mid=mid, op_hash=op_hash, _sub=self)
+        handle = SubmitHandle(op_hash=op_hash, _sub=self)
         handle.mark_accepted()
         return handle
 

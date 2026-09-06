@@ -2,7 +2,7 @@ import threading
 import time
 from abc import ABC
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from enum import Enum, auto
 
 from .. import quorum
@@ -12,11 +12,11 @@ from ..core.errors import DudeError
 from ..core.event_loop import Event, EventLoop, Scheduled
 from ..core.units import Millis
 from ..net.address import Endpoint
-from ..net.envelope import MessageId, Verb
+from ..net.envelope import Verb
 from ..net.postman import Delivered, Output, Postman
 from ..net.socket_server import SocketServer
+from ..participant import Participant
 from ..session import (
-    Inflight,
     InflightHandle,
     KeyCache,
     SessionRW,
@@ -35,7 +35,6 @@ from ..store.management import (
     Role,
     RosterCommitment,
 )
-from ..tunables import Tunables
 from . import chain
 from .lite_adapter import (
     AnchorsReply,
@@ -131,7 +130,6 @@ PENDING = _Pending()
 
 @dataclass(slots=True)
 class Read(InflightHandle):
-    mid: MessageId
     peer: crypto.PublicKey
     client: "LightClient"
     store_id: int
@@ -160,7 +158,6 @@ class Read(InflightHandle):
 
 @dataclass(slots=True)
 class _BootstrapRequest(InflightHandle):
-    mid: MessageId
     peer: crypto.PublicKey
     client: "LightClient"
 
@@ -186,35 +183,29 @@ class _BootstrapReply:
     anchors_reply: AnchorsReply | None = None
 
 
-@dataclass(slots=True)
-class LightClient:
-    me: crypto.Keypair
-    anchor: crypto.PublicKey
-    postman: Postman
+class LightClient(Participant):
+    def __init__(
+        self,
+        me: crypto.Keypair,
+        anchor: crypto.PublicKey,
+        postman: Postman,
+    ) -> None:
+        super().__init__(me, postman)
+        self.anchor = anchor
 
-    @property
-    def tunables(self) -> Tunables:
-        return self.postman.tunables
+        self.state: State = State.UNBOOTSTRAPPED
+        self.trusted_state: TrustedState | None = None
+        self.bootstrap_peers: dict[crypto.PublicKey, _BootstrapReply] = {}
+        self._key_cache: KeyCache | None = None
+        self.peer_views: dict[crypto.PublicKey, PeerView] = {}
 
-    state: State = State.UNBOOTSTRAPPED
-    trusted_state: TrustedState | None = None
+        self.on_ready: Callable[[TrustedState], None] | None = None
+        self.on_block: Callable[[SettledBlock], None] | None = None
+        self.on_trust_lost: Callable[[], None] | None = None
 
-    bootstrap_peers: dict[crypto.PublicKey, _BootstrapReply] = field(default_factory=dict)
-    inflight: Inflight = field(default_factory=Inflight, init=False)
-    _key_cache: KeyCache | None = field(default=None, init=False)
-    peer_views: dict[crypto.PublicKey, PeerView] = field(default_factory=dict, init=False)
+        self._stale_timer: Scheduled[_LiteEvent] | None = None
+        self._socket_servers: list[SocketServer] = []
 
-    on_ready: Callable[[TrustedState], None] | None = field(default=None)
-    on_block: Callable[[SettledBlock], None] | None = field(default=None)
-    on_trust_lost: Callable[[], None] | None = field(default=None)
-
-    commit_cond: threading.Condition = field(default_factory=threading.Condition, init=False)
-    commit_seq: int = field(default=0, init=False)
-    _loop: EventLoop[_LiteEvent] = field(init=False)
-    _stale_timer: Scheduled[_LiteEvent] | None = field(default=None, init=False)
-    _socket_servers: list = field(default_factory=list, init=False)
-
-    def __post_init__(self) -> None:
         self._init_loop()
 
     def peer_view(self, peer: crypto.PublicKey) -> PeerView:
@@ -256,9 +247,8 @@ class LightClient:
     def _ask_for_anchors(self, peers: Iterable[crypto.PublicKey], _now: Millis) -> None:
         req = GetAnchors(known_roster_fingerprint=None, known_trusted_block=None)
         for peer in peers:
-            mid = MessageId.random()
-            self.inflight.register(mid, _BootstrapRequest(mid=mid, peer=peer, client=self))
-            self.postman.send(peer, req, self.tunables.ttl_lite, mid=mid)
+            handle = _BootstrapRequest(peer=peer, client=self)
+            self.request(peer, req, self.tunables.ttl_lite, handle)
 
     def _ask_stale_peers(self, now: Millis) -> None:
         waiting = {r.peer for r in self.inflight.pending_of_type(_BootstrapRequest)}
@@ -289,10 +279,8 @@ class LightClient:
                 self.trusted_state.head.anchors.block_num, self.trusted_state.head.block_hash
             ),
         )
-        mid = MessageId.random()
-        handle = Read(mid=mid, peer=peer, client=self, store_id=store_id, name=name)
-        self.inflight.register(mid, handle)
-        self.postman.send(peer, req, self.tunables.ttl_lite, mid=mid)
+        handle = Read(peer=peer, client=self, store_id=store_id, name=name)
+        self.request(peer, req, self.tunables.ttl_lite, handle)
         return handle
 
     # -- the run loop -------------------------------------------------------
@@ -527,7 +515,6 @@ class LightClient:
 
 @dataclass(slots=True)
 class _TxStatusHandle(InflightHandle):
-    mid: MessageId
     peer: crypto.PublicKey
     client: "LightClient"
     result: TxStatusKind | None = None
@@ -659,29 +646,28 @@ class _LiteSubstrate(Substrate):
         count = quorum.corroboration(len(ts.roster)) if ts is not None else 1
         targets = peers[: max(count, 1)]
 
-        mid = MessageId.random()
-        handle = SubmitHandle(mid=mid, op_hash=signed.op_hash, _sub=self, peer=targets[0])
+        handle = SubmitHandle(
+            op_hash=signed.op_hash,
+            _sub=self,
+            peer=targets[0],
+        )
         fan = _SubmitFanOut(handle=handle, total=len(targets), client=self._lc)
 
         for target in targets:
-            peer_mid = MessageId.random()
-            self._lc.inflight.register(peer_mid, _SubmitPeerHandle(peer=target, fan=fan))
-            self._lc.postman.send_raw(
+            self._lc.request_raw(
                 target,
                 Verb.SUBMIT,
                 signed.raw,
                 self._lc.tunables.ttl_exchange,
-                mid=peer_mid,
+                _SubmitPeerHandle(peer=target, fan=fan),
             )
 
         return handle
 
     def settled(self, op_hash: crypto.Digest) -> SubmitResult | None:
         peer = self._pick_peer()
-        mid = MessageId.random()
-        handle = _TxStatusHandle(mid=mid, peer=peer, client=self._lc)
-        self._lc.inflight.register(mid, handle)
-        self._lc.postman.send(peer, TxStatus(op_hash=op_hash), self._lc.tunables.ttl_lite, mid=mid)
+        handle = _TxStatusHandle(peer=peer, client=self._lc)
+        self._lc.request(peer, TxStatus(op_hash=op_hash), self._lc.tunables.ttl_lite, handle)
         deadline_ms = Millis.now() + self._lc.tunables.ttl_lite
         with self._lc.commit_cond:
             while Millis.now() < deadline_ms:

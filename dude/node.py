@@ -19,11 +19,10 @@ from .core.errors import DudeError
 from .core.event_loop import Event, EventLoop
 from .core.units import Millis
 from .net import MessageId, Verb
-from .net.link import Acceptor, Dialer
 from .net.postman import Delivered, Output, Postman
 from .net.socket_server import SocketServer
+from .participant import Participant
 from .session import (
-    Inflight,
     InflightHandle,
     KeyCache,
     SessionRW,
@@ -128,7 +127,7 @@ class _ReplyWaiter(InflightHandle):
 # ---------------------------------------------------------------------------
 
 
-class _BaseNode:
+class _BaseNode(Participant):
     def __init__(
         self,
         me: crypto.Keypair,
@@ -136,10 +135,6 @@ class _BaseNode:
         on_follower_commit: Callable[[BlockCommitted], None],
         tunables: Tunables = DEFAULT,
     ) -> None:
-        self.me = me
-        self.store = store
-        self.tunables = tunables
-
         self._loop: EventLoop[Event] = EventLoop()
 
         def _on_postman_output(out: Output) -> None:
@@ -148,7 +143,9 @@ class _BaseNode:
             for e in out.expired:
                 self._loop.post(MessageExpired(e.prefix))
 
-        self.postman = Postman(me, tunables, on_output=_on_postman_output)
+        super().__init__(me, Postman(me, tunables, on_output=_on_postman_output))
+        self.store = store
+        self._socket_servers: list[SocketServer] = []
 
         self.follower = Follower(
             me=me,
@@ -157,10 +154,6 @@ class _BaseNode:
             tunables=tunables,
             loop=self._loop,
         )
-        self.inflight = Inflight()
-        self.commit_seq = 0
-        self.commit_cond = threading.Condition()
-        self._socket_servers: list[SocketServer] = []
         self._downloading = False
 
         self._loop.register(MessageIn, self._on_message_in)
@@ -177,12 +170,6 @@ class _BaseNode:
         return self.store.mgmt_reader.roster()
 
     # -- lifecycle ----------------------------------------------------------
-
-    def add_acceptor(self, acceptor: Acceptor) -> None:
-        self.postman.add_acceptor(acceptor)
-
-    def add_dialer(self, dialer: Dialer) -> None:
-        self.postman.add_dialer(dialer)
 
     def add_socket(self, path: str) -> None:
         sub = _ReplicaSubstrate(self)
@@ -732,15 +719,13 @@ class _ReplicaSubstrate(Substrate):
         if not roster:
             raise DudeError("no roster members to submit to")
         target = roster[0]
-        mid = MessageId.random()
-        handle = SubmitHandle(mid=mid, op_hash=signed.op_hash, _sub=self)
-        self._node.inflight.register(mid, handle)
-        self._node.postman.send_raw(
+        handle = SubmitHandle(op_hash=signed.op_hash, _sub=self)
+        self._node.request_raw(
             target,
             Verb.SUBMIT,
             signed.raw,
             self._node.tunables.ttl_exchange,
-            mid=mid,
+            handle,
         )
         return handle
 

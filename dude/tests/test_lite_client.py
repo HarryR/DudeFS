@@ -180,7 +180,7 @@ def _feed_reply(
     name: bytes = b"",
 ) -> Read:
     mid = MessageId.random()
-    read = Read(mid=mid, peer=peer, client=lc, store_id=store_id, name=name)
+    read = Read(peer=peer, client=lc, store_id=store_id, name=name)
     lc.inflight.register(mid, read)
     verb, body = reply.encode()
     delivered = Delivered(
@@ -329,7 +329,7 @@ class TestByzantineBootstrapReply(unittest.TestCase):
 
         for node in self.c.nodes:
             mid = MessageId.random()
-            lc.inflight.register(mid, _BootstrapRequest(mid=mid, peer=node.me.public, client=lc))
+            lc.inflight.register(mid, _BootstrapRequest(peer=node.me.public, client=lc))
             verb, body = forged.encode()
             delivered = Delivered(
                 frm=node.me.public,
@@ -361,7 +361,7 @@ class TestByzantineBootstrapReply(unittest.TestCase):
 
         for node in self.c.nodes:
             mid = MessageId.random()
-            lc.inflight.register(mid, _BootstrapRequest(mid=mid, peer=node.me.public, client=lc))
+            lc.inflight.register(mid, _BootstrapRequest(peer=node.me.public, client=lc))
             verb, body = honest_reply.encode()
             delivered = Delivered(
                 frm=node.me.public,
