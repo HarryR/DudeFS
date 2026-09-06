@@ -153,6 +153,14 @@ class Mailbox:
                 hit += 1
         return hit
 
+    def expire(self, prefix: bytes) -> Expired | None:
+        p = self.pending.pop(prefix, None)
+        if p is None:
+            return None
+        n = len(p.attempts)
+        charge = next(iter(p.attempts.values())).address if n == 1 else None
+        return Expired(prefix, p.to, Expiry.UNDELIVERED, n, charge)
+
     def expired(self, now: Millis) -> tuple[Expired, ...]:
         done: list[Expired] = []
         for prefix in sorted(m for m, p in self.pending.items() if now >= p.deadline):

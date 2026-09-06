@@ -3,7 +3,8 @@
 Generates a cProfile output file that can be viewed with:
     python -m snakeviz /tmp/tcp_slowness.prof
     # or
-    python -c "import pstats; p = pstats.Stats('/tmp/tcp_slowness.prof'); p.sort_stats('cumulative'); p.print_stats(30)"
+    python -c "import pstats; p = pstats.Stats('/tmp/tcp_slowness.prof'); \
+        p.sort_stats('cumulative'); p.print_stats(30)"
 
 Run:
     python -m dude.tests.profile_tcp_slowness
@@ -31,7 +32,7 @@ def main() -> None:
     time.sleep(1)
 
     store = c.nodes[0].store
-    prof_path = "/tmp/tcp_slowness.prof"
+    prof_path = "/tmp/tcp_slowness.prof"  # noqa: S108
 
     print("Profiling store reads with TCP active...", flush=True)
     profiler = cProfile.Profile()
@@ -42,7 +43,7 @@ def main() -> None:
     profiler.disable()
 
     profiler.dump_stats(prof_path)
-    print(f"\nWall clock: {elapsed:.0f}ms for 3 iterations ({elapsed/3:.0f}ms each)")
+    print(f"\nWall clock: {elapsed:.0f}ms for 3 iterations ({elapsed / 3:.0f}ms each)")
     print(f"Profile saved to {prof_path}")
     print()
 

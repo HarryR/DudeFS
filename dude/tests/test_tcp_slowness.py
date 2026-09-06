@@ -10,7 +10,7 @@ Run:
 import time
 import unittest
 
-from .cluster import Cluster, InProcFabric, TCPFabric
+from .cluster import Cluster, TCPFabric
 
 
 class TestSQLiteSlownessWithTCP(unittest.TestCase):
@@ -42,10 +42,7 @@ class TestSQLiteSlownessWithTCP(unittest.TestCase):
             # This currently fails — TCP reads take 1-4 seconds
             # The test documents the bug; remove the skip when fixed
             if ms > 100:
-                self.fail(
-                    f"TCP reads take {ms:.0f}ms per cycle "
-                    f"(expected <50ms, same as InProc)"
-                )
+                self.fail(f"TCP reads take {ms:.0f}ms per cycle (expected <50ms, same as InProc)")
         finally:
             c.close()
 

@@ -469,12 +469,14 @@ class Postman:
         if self._retry_timer is not None:
             self._retry_timer.cancel()
             self._retry_timer = None
+        now = Millis.now()
         earliest: Millis | None = None
         for p in self.mailbox.pending.values():
             if (
                 p.envelope is not None
                 and not p.in_flight
                 and p.next_at < p.deadline
+                and now < p.deadline
                 and (earliest is None or p.next_at < earliest)
             ):
                 earliest = p.next_at
@@ -663,7 +665,9 @@ class Postman:
     def _act(self, decision: Decision, t: Transmit, now: Millis) -> None:
         match decision:
             case GiveUp():
-                self.mailbox.failed(t.prefix, now)
+                exp = self.mailbox.expire(t.prefix)
+                if exp is not None:
+                    self.on_output(Output(delivered=(), expired=(exp,)))
             case Wait(until=until):
                 self.mailbox.failed(t.prefix, until)
             case Send(link=link, again_at=again_at):
