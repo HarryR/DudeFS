@@ -7,7 +7,7 @@ import click
 from ..core import crypto
 from .config import DudeConfig, NodeListenConfig, TCPListenConfig
 from .params import LISTEN, PUBKEY
-from .state import save_anchor, save_keypair, until_terminated
+from .state import load_pubkey, save_anchor, save_keypair, until_terminated
 
 log = logging.getLogger(__name__)
 
@@ -30,6 +30,12 @@ def init(cfg: DudeConfig, anchor: crypto.PublicKey) -> None:
     click.echo(f"  public key: {kp.public.hex()}")
     click.echo(f"  possession: {pop.hex()}")
     click.echo(f"  anchor:     {anchor.hex()[:16]}...")
+
+
+@group.command()
+@click.pass_obj
+def pubkey(cfg: DudeConfig) -> None:
+    click.echo(load_pubkey(cfg.node_dir).hex())
 
 
 @group.command()

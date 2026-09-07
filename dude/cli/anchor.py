@@ -17,6 +17,7 @@ from .state import (
     BootstrapSeed,
     CLIError,
     load_keypair,
+    load_pubkey,
     save_genesis,
     save_keypair,
     store_path,
@@ -101,6 +102,12 @@ def init(cfg: DudeConfig) -> None:
     save_keypair(dir_path, kp)
     click.echo(f"anchor identity created in {dir_path}")
     click.echo(f"  public key: {kp.public.hex()}")
+
+
+@group.command()
+@click.pass_obj
+def pubkey(cfg: DudeConfig) -> None:
+    click.echo(load_pubkey(cfg.anchor_dir).hex())
 
 
 @group.command()

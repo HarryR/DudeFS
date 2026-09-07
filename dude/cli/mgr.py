@@ -13,6 +13,7 @@ from .params import PUBKEY, ROLE, SIGNATURE
 from .state import (
     CLIError,
     load_keypair,
+    load_pubkey,
     save_keypair,
     until_terminated,
 )
@@ -35,6 +36,12 @@ def init(cfg: DudeConfig) -> None:
     click.echo(f"manager identity created in {dir_path}")
     click.echo(f"  public key: {kp.public.hex()}")
     click.echo(f"  possession: {pop.hex()}")
+
+
+@group.command()
+@click.pass_obj
+def pubkey(cfg: DudeConfig) -> None:
+    click.echo(load_pubkey(cfg.manager_dir).hex())
 
 
 @group.command()

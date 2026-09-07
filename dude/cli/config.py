@@ -4,7 +4,7 @@ import logging
 import tomllib
 from collections.abc import Generator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import dacite
@@ -52,16 +52,8 @@ class OnionListenConfig:
 
 @dataclass(slots=True)
 class NodeListenConfig:
-    tcp: list[TCPListenConfig]
-    onion: list[OnionListenConfig]
-
-    def __init__(
-        self,
-        tcp: list[TCPListenConfig] | None = None,
-        onion: list[OnionListenConfig] | None = None,
-    ) -> None:
-        self.tcp = tcp or []
-        self.onion = onion or []
+    tcp: list[TCPListenConfig] = field(default_factory=list)
+    onion: list[OnionListenConfig] = field(default_factory=list)
 
     def acceptors(self, tunables: Tunables) -> tuple[Acceptor, ...]:
         return tuple(c.acceptor(tunables) for c in (*self.tcp, *self.onion))

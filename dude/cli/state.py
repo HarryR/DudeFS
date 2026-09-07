@@ -24,6 +24,7 @@ class CLIError(DudeError): ...
 
 
 KEYFILE = "identity.key"
+PUBKEY_FILE = "identity.pub"
 ANCHOR_PUBKEY = "anchor.pub"
 STORE_DB = "store.sqlite"
 BOOTSTRAP_SEED = "bootstrap.json"
@@ -43,6 +44,15 @@ def save_keypair(dir_path: Path, kp: crypto.Keypair) -> None:
         raise CLIError(f"identity already exists: {target}")
     target.write_bytes(bytes(kp.seed))
     target.chmod(0o600)
+    (dir_path / PUBKEY_FILE).write_bytes(bytes(kp.public))
+
+
+def load_pubkey(dir_path: Path) -> crypto.PublicKey:
+    pub_path = dir_path / PUBKEY_FILE
+    if pub_path.exists():
+        return crypto.PublicKey(pub_path.read_bytes())
+    kp = load_keypair(dir_path)
+    return kp.public
 
 
 def save_anchor(dir_path: Path, anchor: crypto.PublicKey) -> None:

@@ -11,6 +11,7 @@ from ..store import ops
 from .config import DudeConfig
 from .state import (
     CLIError,
+    load_pubkey,
     save_keypair,
     until_terminated,
 )
@@ -33,6 +34,12 @@ def init(cfg: DudeConfig) -> None:
     click.echo(f"client identity created in {dir_path}")
     click.echo(f"  public key: {kp.public.hex()}")
     click.echo(f"  possession: {pop.hex()}")
+
+
+@group.command()
+@click.pass_obj
+def pubkey(cfg: DudeConfig) -> None:
+    click.echo(load_pubkey(cfg.client_dir).hex())
 
 
 @group.command()
