@@ -17,12 +17,20 @@ if TYPE_CHECKING:
 
 
 class _InProcConn:
-    __slots__ = ("_me", "_nexus", "_reply_to", "link")
+    __slots__ = ("_me", "_nexus", "_on_close", "_reply_to", "link")
 
-    def __init__(self, reply_to: bytes, me: bytes, address: Address, nexus: InProcNexus) -> None:
+    def __init__(
+        self,
+        reply_to: bytes,
+        me: bytes,
+        address: Address,
+        nexus: InProcNexus,
+        on_close: Callable[[], None] | None = None,
+    ) -> None:
         self._reply_to = reply_to
         self._me = me
         self._nexus = nexus
+        self._on_close = on_close
         self.link = Link(
             address=address,
             identity=None,
@@ -37,7 +45,8 @@ class _InProcConn:
         target.deliver(frame, sender=self._me)
 
     def close(self) -> None:
-        pass
+        if self._on_close is not None:
+            self._on_close()
 
 
 @dataclass(slots=True)
@@ -83,11 +92,13 @@ class InProcListener(Acceptor, Dialer):
                 return
             conn = self.conns.get(sender)
             if conn is None:
+                key = sender
                 conn = _InProcConn(
                     reply_to=sender,
                     me=bytes(self.identity),
                     address=Address(Scheme.INPROC, sender.hex()),
                     nexus=self.nexus,
+                    on_close=lambda k=key: self._drop_conn(k),
                 )
                 conn.link.direction = LinkDirection.INBOUND
                 self.conns[sender] = conn
@@ -100,6 +111,9 @@ class InProcListener(Acceptor, Dialer):
                 self._on_frame(frame, conn.link)
             else:
                 self._buffered.append((frame, conn.link))
+
+    def _drop_conn(self, key: bytes) -> None:
+        self.conns.pop(key, None)
 
     def remove_conn(self, peer_key: bytes) -> None:
         conn = self.conns.pop(peer_key, None)
@@ -136,11 +150,13 @@ class InProcListener(Acceptor, Dialer):
             return False
         if target_key in self.conns:
             return False
+        key = target_key
         conn = _InProcConn(
             reply_to=target_key,
             me=bytes(self.identity),
             address=address,
             nexus=self.nexus,
+            on_close=lambda k=key: self._drop_conn(k),
         )
         self.conns[target_key] = conn
         self._on_link(conn.link)

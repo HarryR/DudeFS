@@ -132,6 +132,11 @@ class _InProcReady(_PostmanEvent):
     __slots__ = ()
 
 
+@dataclass(frozen=True, slots=True)
+class _ReapUnbound(_PostmanEvent):
+    link: Link
+
+
 # ---------------------------------------------------------------------------
 # Output events — everything that comes OUT of the postman to the node.
 # ---------------------------------------------------------------------------
@@ -239,6 +244,7 @@ class Postman:
         self._loop.register(_Broadcast, self._on_broadcast)
         self._loop.register(_KeepAlive, self._on_keepalive)
         self._loop.register(_InProcReady, self._on_inproc_ready)
+        self._loop.register(_ReapUnbound, self._on_reap_unbound)
 
     # -- public interface: queue puts, never direct state mutation -----------
 
@@ -451,6 +457,10 @@ class Postman:
         self._maintain_links()
         self._schedule_link_maintenance()
 
+    def _on_reap_unbound(self, event: _ReapUnbound) -> None:
+        if event.link.identity is None:
+            event.link.close()
+
     def _on_inproc_ready(self, _event: _InProcReady) -> None:
         for acceptor in self._acceptors:
             if isinstance(acceptor, InProcListener):
@@ -586,6 +596,10 @@ class Postman:
                     link.bind(peer.identity)
                     break
         if link.identity is None:
+            self._loop.schedule(
+                Millis.now() + self.tunables.unauthenticated_link_lifetime,
+                _ReapUnbound(link),
+            )
             return
         peer = self.peers.get(link.identity)
         if peer is None:
@@ -608,22 +622,23 @@ class Postman:
     # -- inbound frame processing (postman thread only) ---------------------
 
     def _do_deliver(self, frame: Frame, link: Link, now: Millis) -> None:
+        # -- validate: cryptographic failures kill the link --------------------
         if not frame.addressed_to(self.me.public):
-            link.bad_frames += 1
+            link.close()
             return
         try:
             env = frame.unseal(self.me)
             env.accept(self.me.public, now, self.tunables.window)
         except (EnvelopeError, DudeError):
-            link.bad_frames += 1
+            link.close()
             return
 
+        # -- solicited reply ---------------------------------------------------
         reply = self.mailbox.arrived(env, now)
-        solicited = reply is not None
-
-        if solicited:
+        if reply is not None:
             self._credit(env.frm, reply, now)
         else:
+            # keepalive pong
             reply_to = env.env.reply_to
             if reply_to and len(reply_to) >= MessageId.SIZE:
                 ka = self._keepalive_pending.pop(MessageId(reply_to).correlation_id, None)
@@ -631,15 +646,16 @@ class Postman:
                     ka_link, sent_at = ka
                     ka_link.on_reply(now, now - sent_at)
                     return
+            # unknown sender: drop the frame, link lifecycle is separate
             if env.frm not in self.peers and env.frm not in self._authorized:
-                if now - link.established_at > self.tunables.unauthenticated_link_lifetime:
-                    link.close()
                 return
 
+        # -- bind on first accepted frame -------------------------------------
         if link.identity is None:
             link.bind(env.frm)
             self._do_link_established(link)
 
+        # -- dispatch ---------------------------------------------------------
         if env.env.verb is Verb.PING:
             self._reply_pong(env.frm, env.env.mid, link, now)
             return

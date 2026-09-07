@@ -140,7 +140,7 @@ class _TCPConn:
                 frame = Frame.decode(payload)
             except DudeError:
                 self.link.bad_frames += 1
-                continue
+                return True
             self.link.msgs_recv += 1
             self.link.bytes_recv += length
             self.link.last_activity = Millis.now()
@@ -213,7 +213,14 @@ class _DialWorker:
             return
         self.connected = True
         conn = _TCPConn(sock, self._address, self._timing, self._on_frame, self._on_link)
-        conn.link.on_close = lambda _ln: self._stopping.set()
+        postman_on_close = conn.link.on_close
+
+        def _on_close(ln: Link) -> None:
+            self._stopping.set()
+            if postman_on_close is not None:
+                postman_on_close(ln)
+
+        conn.link.on_close = _on_close
         self._stopping.wait()
         conn.join()
 
