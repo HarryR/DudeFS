@@ -7,7 +7,7 @@ import click
 from ..core import crypto
 from .config import DudeConfig, NodeListenConfig, TCPListenConfig
 from .params import LISTEN, PUBKEY
-from .state import load_pubkey, save_anchor, save_keypair, until_terminated
+from .state import load_pubkey, pidfile, save_anchor, save_keypair, until_terminated
 
 log = logging.getLogger(__name__)
 
@@ -46,7 +46,7 @@ def serve(cfg: DudeConfig, listen: TCPListenConfig | None) -> None:
         if cfg.node_listen is None:
             cfg.node_listen = NodeListenConfig()
         cfg.node_listen.tcp.append(listen)
-    with cfg.node() as n:
+    with cfg.node() as n, pidfile(cfg.node_dir):
         if n.store.head_block_num() is None:
             log.info("unprovisioned — waiting for genesis from anchor")
         else:

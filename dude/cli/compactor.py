@@ -14,6 +14,7 @@ from .config import DudeConfig
 from .state import (
     CLIError,
     load_keypair,
+    pidfile,
     save_keypair,
     until_terminated,
 )
@@ -61,7 +62,7 @@ def run(cfg: DudeConfig) -> None:
 @click.pass_obj
 def serve(cfg: DudeConfig, interval: int) -> None:
     kp = load_keypair(cfg.compactor_dir)
-    with cfg.replica(cfg.compactor_dir, cfg.compactor_cfg) as rn:
+    with cfg.replica(cfg.compactor_dir, cfg.compactor_cfg) as rn, pidfile(cfg.compactor_dir):
         log.info("compactor %s running (interval=%ds)", kp.public.hex()[:16], interval)
         with until_terminated() as stop:
             while not stop.is_set():

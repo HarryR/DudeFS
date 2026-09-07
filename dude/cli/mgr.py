@@ -14,6 +14,7 @@ from .state import (
     CLIError,
     load_keypair,
     load_pubkey,
+    pidfile,
     save_keypair,
     until_terminated,
 )
@@ -47,7 +48,7 @@ def pubkey(cfg: DudeConfig) -> None:
 @group.command()
 @click.pass_obj
 def serve(cfg: DudeConfig) -> None:
-    with cfg.replica(cfg.manager_dir, cfg.manager_cfg) as rn:
+    with cfg.replica(cfg.manager_dir, cfg.manager_cfg) as rn, pidfile(cfg.manager_dir):
         log.info("manager %s running", rn.me.public.hex()[:16])
         with until_terminated():
             log.info("shutting down")

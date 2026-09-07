@@ -12,6 +12,7 @@ from .config import DudeConfig
 from .state import (
     CLIError,
     load_pubkey,
+    pidfile,
     save_keypair,
     until_terminated,
 )
@@ -45,7 +46,7 @@ def pubkey(cfg: DudeConfig) -> None:
 @group.command()
 @click.pass_obj
 def serve(cfg: DudeConfig) -> None:
-    with cfg.light_client(cfg.client_dir, cfg.client_cfg) as lc:
+    with cfg.light_client(cfg.client_dir, cfg.client_cfg) as lc, pidfile(cfg.client_dir):
         log.info("client %s running", lc.me.public.hex()[:16])
         with until_terminated():
             log.info("shutting down")

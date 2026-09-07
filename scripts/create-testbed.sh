@@ -53,9 +53,17 @@ WRAPPER
     chmod +x "$TARGET/$name.sh"
 }
 
+# --- shared tunables config ---
+TUNABLES_TOML='[tunables]
+rtt_max = 50
+clock_skew = 25
+held_convergence_max = 2
+'
+
 # --- anchor ---
 $DUDE --home "$TARGET/.anchor" anchor init
 ANCHOR_PK=$($DUDE --home "$TARGET/.anchor" anchor pubkey)
+echo "$TUNABLES_TOML" > "$TARGET/.anchor/anchor/config.toml"
 write_wrapper "anchor" "$TARGET/.anchor"
 
 # --- nodes ---
@@ -67,6 +75,7 @@ for i in $(seq 0 $((NODES - 1))); do
     $DUDE --home "$NODE_DIR" node init --anchor "$ANCHOR_PK"
 
     cat > "$NODE_DIR/config.toml" << TOML
+${TUNABLES_TOML}
 [[node.listen.tcp]]
 host = "127.0.0.1"
 port = $PORT

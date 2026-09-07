@@ -10,8 +10,11 @@ from ..core import codec, crypto
 from ..core.units import Millis
 from ..net.address import Address, Endpoint
 from ..net.envelope import Verb
+from ..net.link import LinkDirection
 from ..net.postman import OutputQueue, PeerStatus, Postman
 from ..store import Store
+from ..sync.lite_client import LightClient
+from ..sync.observer import ClusterObserver
 from .config import DudeConfig
 from .state import (
     BootstrapSeed,
@@ -169,3 +172,76 @@ def genesis(cfg: DudeConfig, nodes: tuple[str, ...], dry_run: bool) -> None:
     click.echo(f"genesis created: {len(node_specs)} node(s) seated")
     click.echo(f"  bootstrap seed: {dir_path / 'bootstrap.json'}")
     click.echo(f"  genesis data:   {dir_path / 'genesis.bin'}")
+
+
+def _render_topology(obs: ClusterObserver) -> None:
+    topo = obs.topology()
+    cs = topo.cluster
+
+    if not cs.bootstrapped:
+        click.echo("not bootstrapped")
+        return
+
+    click.echo(f"Block: {cs.block_num}  Roster: {len(cs.roster)} nodes")
+    click.echo()
+
+    for pub, ns in topo.nodes.items():
+        click.echo(f"  {pub.hex()[:16]}  block={ns.head_block}  mempool={ns.mempool_size or 0}")
+        for link in ns.peers:
+            arrow = "  " + link.identity.hex()[:16]
+            click.echo(f"    {arrow}  connected={link.connected}  links={len(link.links)}")
+            for ln in link.links:
+                d = "out" if ln.direction == LinkDirection.OUTBOUND.value else " in"
+                rtt = f"{ln.rtt_ms:.1f}ms" if ln.rtt_ms is not None else "—"
+                click.echo(
+                    f"      {d}  rtt={rtt}  sent={ln.msgs_sent}/{ln.bytes_sent}b"
+                    f"  recv={ln.msgs_recv}/{ln.bytes_recv}b"
+                )
+        for ls in ns.listeners:
+            click.echo(f"    listen {ls.address}  {ls.extra}")
+        click.echo()
+
+    for pub, ns in cs.nodes.items():
+        if pub not in topo.nodes:
+            status = "connected" if ns.connected else "unreachable"
+            click.echo(f"  {pub.hex()[:16]}  {status} (no status reply)")
+
+
+@group.command()
+@click.option("--watch", is_flag=True, help="continuously refresh")
+@click.option("--interval", type=float, default=2.0, help="refresh interval (seconds)")
+@click.option("--timeout", type=float, default=10.0, help="max wait time for oneshot mode")
+@click.pass_obj
+def observe(cfg: DudeConfig, watch: bool, interval: float, timeout: float) -> None:
+    kp = load_keypair(cfg.anchor_dir)
+    seed = BootstrapSeed.load(cfg.anchor_dir)
+    postman = Postman(kp, cfg.tunables, on_output=OutputQueue())
+    lc = LightClient(me=kp, anchor=seed.anchor, postman=postman)
+    for pub, endpoints in seed.peers:
+        lc.add_bootstrap_peer(pub, endpoints)
+
+    obs = ClusterObserver(lc)
+    lc.start()
+    lc.bootstrap()
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        obs.query_topology()
+        topo = obs.topology()
+        if topo.nodes:
+            break
+        time.sleep(0.5)
+
+    if watch:
+        try:
+            while True:
+                click.clear()
+                _render_topology(obs)
+                obs.query_topology()
+                time.sleep(interval)
+        except KeyboardInterrupt:
+            pass
+    else:
+        _render_topology(obs)
+
+    lc.stop()

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import signal as _signal
 import threading
 from collections.abc import Generator
@@ -30,6 +31,7 @@ STORE_DB = "store.sqlite"
 BOOTSTRAP_SEED = "bootstrap.json"
 GENESIS_DATA = "genesis.bin"
 SOCKET = "dude.sock"
+PIDFILE = "dude.pid"
 
 
 def ensure_dir(path: Path) -> Path:
@@ -157,6 +159,20 @@ def open_store_with_genesis(dir_path: Path) -> Store:
         )
         log.info("genesis block applied (block %d)", sb.anchors.block_num)
     return store
+
+
+def pid_path(dir_path: Path) -> Path:
+    return dir_path / PIDFILE
+
+
+@contextmanager
+def pidfile(dir_path: Path) -> Generator[None]:
+    p = pid_path(dir_path)
+    p.write_text(str(os.getpid()))
+    try:
+        yield
+    finally:
+        p.unlink(missing_ok=True)
 
 
 @contextmanager
