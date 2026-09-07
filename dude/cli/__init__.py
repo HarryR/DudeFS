@@ -5,7 +5,7 @@ from pathlib import Path
 
 import click
 
-from . import anchor, client, compactor, mgr, node
+from . import anchor, client, compactor, mgr, node, testbed
 from .config import DudeConfig
 
 
@@ -34,6 +34,7 @@ cli.add_command(node.group)
 cli.add_command(client.group)
 cli.add_command(mgr.group)
 cli.add_command(compactor.group)
+cli.add_command(testbed.group)
 
 
 def main() -> None:

@@ -12,7 +12,7 @@ from .state import load_pubkey, pidfile, save_anchor, save_keypair, until_termin
 log = logging.getLogger(__name__)
 
 
-@click.group("node")
+@click.group("node", help="Consensus node — init, serve, identity.")
 def group() -> None:
     pass
 

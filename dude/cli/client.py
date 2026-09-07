@@ -20,7 +20,7 @@ from .state import (
 log = logging.getLogger(__name__)
 
 
-@click.group("client")
+@click.group("client", help="Data client — get, put, delete via light client.")
 def group() -> None:
     pass
 

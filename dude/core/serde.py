@@ -10,21 +10,25 @@ from . import crypto
 from .units import Millis
 
 
-def _convert(obj):
+def json_safe(obj):
     if isinstance(obj, Enum):
         v = obj.value
         return v.decode() if isinstance(v, bytes) else v
     if isinstance(obj, bytes):
         return obj.hex()
     if isinstance(obj, dict):
-        return {k: _convert(v) for k, v in obj.items()}
+        return {k: json_safe(v) for k, v in obj.items()}
     if isinstance(obj, list):
-        return [_convert(v) for v in obj]
+        return [json_safe(v) for v in obj]
     return obj
 
 
+def dumps(obj) -> str:
+    return json.dumps(json_safe(dataclasses.asdict(obj)))
+
+
 def dump(obj) -> bytes:
-    return json.dumps(_convert(dataclasses.asdict(obj))).encode()
+    return dumps(obj).encode()
 
 
 _HOOKS: dict[type, Callable] = {

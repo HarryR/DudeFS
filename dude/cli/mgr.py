@@ -22,7 +22,7 @@ from .state import (
 log = logging.getLogger(__name__)
 
 
-@click.group("mgr")
+@click.group("mgr", help="Manager — grants, revocations, roster changes.")
 def group() -> None:
     pass
 

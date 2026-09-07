@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import dataclasses
+import json
 import logging
 import time
 
@@ -7,6 +9,7 @@ import click
 
 from ..consensus.bootstrap import bootstrap, compose_genesis
 from ..core import codec, crypto
+from ..core.serde import json_safe
 from ..core.units import Millis
 from ..net.address import Address, Endpoint
 from ..net.envelope import Verb
@@ -92,7 +95,7 @@ def _wait_for_verb(
     return False
 
 
-@click.group("anchor")
+@click.group("anchor", help="Cluster anchor — genesis, provisioning, observation.")
 def group() -> None:
     pass
 
@@ -207,12 +210,25 @@ def _render_topology(obs: ClusterObserver) -> None:
             click.echo(f"  {pub.hex()[:16]}  {status} (no status reply)")
 
 
+def _render_json(obs: ClusterObserver, compact: bool = False) -> None:
+    topo = obs.topology()
+    data = {
+        "block_num": topo.cluster.block_num,
+        "roster": [pk.hex() for pk in topo.cluster.roster],
+        "managers": [pk.hex() for pk in topo.cluster.managers],
+        "bootstrapped": topo.cluster.bootstrapped,
+        "nodes": {pk.hex(): json_safe(dataclasses.asdict(ns)) for pk, ns in topo.nodes.items()},
+    }
+    click.echo(json.dumps(data) if compact else json.dumps(data, indent=2))
+
+
 @group.command()
 @click.option("--watch", is_flag=True, help="continuously refresh")
 @click.option("--interval", type=float, default=2.0, help="refresh interval (seconds)")
 @click.option("--timeout", type=float, default=10.0, help="max wait time for oneshot mode")
+@click.option("--json", "as_json", is_flag=True, help="output as JSON")
 @click.pass_obj
-def observe(cfg: DudeConfig, watch: bool, interval: float, timeout: float) -> None:
+def observe(cfg: DudeConfig, watch: bool, interval: float, timeout: float, as_json: bool) -> None:
     kp = load_keypair(cfg.anchor_dir)
     seed = BootstrapSeed.load(cfg.anchor_dir)
     postman = Postman(kp, cfg.tunables, on_output=OutputQueue())
@@ -222,7 +238,7 @@ def observe(cfg: DudeConfig, watch: bool, interval: float, timeout: float) -> No
 
     obs = ClusterObserver(lc)
     lc.start()
-    lc.bootstrap()
+    lc.bootstrap(timeout=timeout)
 
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -235,12 +251,17 @@ def observe(cfg: DudeConfig, watch: bool, interval: float, timeout: float) -> No
     if watch:
         try:
             while True:
-                click.clear()
-                _render_topology(obs)
+                if as_json:
+                    _render_json(obs, compact=True)
+                else:
+                    click.clear()
+                    _render_topology(obs)
                 obs.query_topology()
                 time.sleep(interval)
         except KeyboardInterrupt:
             pass
+    elif as_json:
+        _render_json(obs)
     else:
         _render_topology(obs)
 

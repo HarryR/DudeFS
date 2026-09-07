@@ -22,7 +22,7 @@ from .state import (
 log = logging.getLogger(__name__)
 
 
-@click.group("compactor")
+@click.group("compactor", help="Compactor — log compaction and checkpoints.")
 def group() -> None:
     pass
 
