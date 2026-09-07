@@ -222,7 +222,7 @@ class Cluster:
         while time.monotonic() < deadline:
             if predicate(self):
                 return
-            time.sleep(self.tunables.tick_interval.as_seconds)
+            time.sleep(self.tunables.rtt_max.as_seconds)
         raise TimeoutError(f"predicate not satisfied within {t:.1f}s")
 
     def wait_settled(

@@ -156,12 +156,15 @@ class _BaseNode(Participant):
             loop=self._loop,
         )
         self._downloading = False
+        self._cached_peers: dict[crypto.PublicKey, tuple] = {}
+        self._cached_authorized: frozenset[crypto.PublicKey] = frozenset()
 
+        self._on_follower_commit = on_follower_commit
         self._loop.register(MessageIn, self._on_message_in)
         self._loop.register(MessageExpired, self._on_message_expired)
         self._loop.register(ReconcilePeers, self._on_reconcile_peers)
         self._loop.register(SendToPeer, self._on_send_to_peer)
-        self._loop.register(BlockCommitted, on_follower_commit)
+        self._loop.register(BlockCommitted, self._on_block_committed)
 
     @property
     def mgmt_reader(self) -> MgmtReader:
@@ -192,6 +195,9 @@ class _BaseNode(Participant):
         self._loop.start()
         self._schedule_reconcile()
 
+    def _schedule_reconcile(self) -> None:
+        self._loop.schedule(Millis.now() + self.tunables.rtt_max, ReconcilePeers())
+
     def stop(self) -> None:
         self._loop.stop()
         for srv in self._socket_servers:
@@ -207,6 +213,13 @@ class _BaseNode(Participant):
     def _on_message_expired(self, event: MessageExpired) -> None:
         self.inflight.on_expired(event.prefix)
 
+    def _on_block_committed(self, event: BlockCommitted) -> None:
+        self._on_follower_commit(event)
+        self._reconcile_peers()
+        checkpoint_block = self.follower.needs_checkpoint()
+        if checkpoint_block is not None:
+            self._download_checkpoint()
+
     def _on_reconcile_peers(self, _event: ReconcilePeers) -> None:
         self._reconcile_peers()
         checkpoint_block = self.follower.needs_checkpoint()
@@ -216,9 +229,6 @@ class _BaseNode(Participant):
 
     def _on_send_to_peer(self, event: SendToPeer) -> None:
         self.postman.send(event.peer, event.msg, self.tunables.ttl_exchange)
-
-    def _schedule_reconcile(self) -> None:
-        self._loop.schedule(Millis.now() + self.tunables.tick_interval, ReconcilePeers())
 
     def _on_delivered(self, d: Delivered) -> None:
         raise NotImplementedError

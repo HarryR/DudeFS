@@ -22,7 +22,7 @@ from .link import (
     Peer,
 )
 from .mailbox import Expired, Mailbox, Reply, Transmit
-from .plan import Decision, GiveUp, Send, Wait, decorrelated, plan_next, retry_at
+from .plan import Decision, GiveUp, Send, Wait, plan_next, retry_at
 from .transports.inproc import InProcListener
 from .transports.tcp import OnionDialer, TCPDialer
 
@@ -497,20 +497,23 @@ class Postman:
     def _schedule_link_maintenance(self) -> None:
         if self._link_timer is not None:
             self._link_timer.cancel()
-        interval = self.tunables.tick_interval * 10
-        self._link_timer = self._loop.schedule(Millis.now() + interval, _MaintainLinks())
+        self._link_timer = self._loop.schedule(
+            Millis.now() + self.tunables.link_maintenance_interval,
+            _MaintainLinks(),
+        )
 
     def _schedule_keepalive(self) -> None:
         if self._keepalive_timer is not None:
             self._keepalive_timer.cancel()
-        bt = int(self.tunables.block_time)
-        interval = Millis(decorrelated(bt * 2, bt * 3))
-        self._keepalive_timer = self._loop.schedule(Millis.now() + interval, _KeepAlive())
+        self._keepalive_timer = self._loop.schedule(
+            Millis.now() + self.tunables.keepalive_interval,
+            _KeepAlive(),
+        )
 
     def _on_keepalive(self, _event: _KeepAlive) -> None:
         self._keepalive_timer = None
         now = Millis.now()
-        threshold = now - self.tunables.block_time * 2
+        threshold = now - self.tunables.keepalive_threshold
         for peer in self.peers.values():
             for link in peer.links:
                 if link.available(now) and link.last_rtt_at < threshold:

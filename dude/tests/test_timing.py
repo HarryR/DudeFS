@@ -58,7 +58,6 @@ class TestTheDeclaredSetIsSmall(unittest.TestCase):
                 "retry_budget",
                 "rtt_max",
                 "safety_margin",
-                "ticks_per_cadence",
                 "transports",
                 "windows_to_settle",
             ],

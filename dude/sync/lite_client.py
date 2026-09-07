@@ -241,7 +241,7 @@ class LightClient(Participant):
         while time.monotonic() < deadline:
             if self.state is State.READY:
                 return
-            time.sleep(self.tunables.tick_interval.as_seconds)
+            time.sleep(self.tunables.rtt_max.as_seconds)
         raise LightClientError("bootstrap did not converge")
 
     def _ask_for_anchors(self, peers: Iterable[crypto.PublicKey], _now: Millis) -> None:

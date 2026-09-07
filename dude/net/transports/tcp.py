@@ -26,14 +26,12 @@ _OUTBOX_DEPTH = 64
 class _TCPTiming:
     connect_sec: float
     send_sec: float
-    idle_wait_sec: float
 
     @classmethod
     def from_tunables(cls, t: Tunables) -> _TCPTiming:
         return cls(
             connect_sec=t.tcp_connect.as_seconds,
             send_sec=t.tcp_send.as_seconds,
-            idle_wait_sec=t.tick_interval.as_seconds,
         )
 
 
@@ -215,9 +213,8 @@ class _DialWorker:
             return
         self.connected = True
         conn = _TCPConn(sock, self._address, self._timing, self._on_frame, self._on_link)
-        conn.link.on_close = lambda _ln: None
-        while not conn.closed and not self._stopping.is_set():
-            self._stopping.wait(timeout=self._timing.idle_wait_sec)
+        conn.link.on_close = lambda _ln: self._stopping.set()
+        self._stopping.wait()
         conn.join()
 
     def _try_connect(self) -> socket.socket | None:

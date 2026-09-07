@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .core import crypto
 from .core.errors import InvariantError
 from .core.units import Bucket, Millis
 
@@ -65,8 +66,6 @@ class Tunables:
 
     windows_to_settle: int = 2
     """Collect in W, apply in W+1."""
-
-    ticks_per_cadence: int = 10
 
     pull_batch: int = 32
     """Message-size bound, not a rate."""
@@ -197,11 +196,6 @@ class Tunables:
         return self.rtt_max
 
     @property
-    def tick_interval(self) -> Millis:
-        """Sampled against `cut_reserve`, the tightest deadline the loop must not overshoot."""
-        return max(Millis(1), self.cut_reserve // self.ticks_per_cadence)
-
-    @property
     def breaker_cooldown(self) -> Millis:
         """A breaker cannot hold a link out across the bucket that needed it."""
         return self.block_time_floor
@@ -219,6 +213,21 @@ class Tunables:
     @property
     def tcp_send(self) -> Millis:
         return self.rtt_max * 2
+
+    @property
+    def link_maintenance_interval(self) -> Millis:
+        return self.block_time
+
+    @property
+    def keepalive_interval(self) -> Millis:
+        lo = int(self.block_time) * 2
+        hi = int(self.block_time) * 3
+        span = hi - lo + 1
+        return Millis(lo + int.from_bytes(crypto.random_bytes(8), "big") % span)
+
+    @property
+    def keepalive_threshold(self) -> Millis:
+        return self.block_time * 2
 
     def skew_buckets(self) -> int:
         """Clock skew in buckets -- freshness tolerance against a peer whose clock lags."""
@@ -240,7 +249,6 @@ class Tunables:
             ("held_convergence_max", self.held_convergence_max),
             ("safety_margin", self.safety_margin),
             ("windows_to_settle", self.windows_to_settle),
-            ("ticks_per_cadence", self.ticks_per_cadence),
             ("pull_batch", self.pull_batch),
             ("max_attempts", self.max_attempts),
             ("desired_links_per_peer", self.desired_links_per_peer),

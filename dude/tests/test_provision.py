@@ -103,7 +103,7 @@ class TestLiveProvisioning(unittest.TestCase):
             self.assertIsNone(refusal, f"submit refused: {refusal}")
 
             budget = TUNABLES.block_time.as_seconds * 10
-            tick = TUNABLES.tick_interval.as_seconds
+            tick = TUNABLES.rtt_max.as_seconds
             deadline = time.monotonic() + budget
             while time.monotonic() < deadline:
                 if all(n.store.has_settled(tx.op_hash) for n in nodes):
