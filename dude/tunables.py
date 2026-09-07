@@ -229,6 +229,12 @@ class Tunables:
     def keepalive_threshold(self) -> Millis:
         return self.block_time * 2
 
+    @property
+    def unauthenticated_link_lifetime(self) -> Millis:
+        """How long an inbound link may live before its first authenticated frame. Covers the
+        window where peer-sync events and inbound frames race on separate loops."""
+        return self.rtt_max * 3
+
     def skew_buckets(self) -> int:
         """Clock skew in buckets -- freshness tolerance against a peer whose clock lags."""
         return -(-self.clock_skew // self.block_time)

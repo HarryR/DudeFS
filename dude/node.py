@@ -55,6 +55,7 @@ from .sync.follower import (
     Follower,
     PeerAdded,
     PeerMessage,
+    PeerRemoved,
     PullCancelled,
     SendToPeer,
     serve_getblocks,
@@ -148,6 +149,16 @@ class _BaseNode(Participant):
         self.store = store
         self._socket_servers: list[SocketServer] = []
 
+        def _on_peers_changed(
+            added: frozenset[crypto.PublicKey], removed: frozenset[crypto.PublicKey]
+        ) -> None:
+            for pk in added:
+                self._loop.post(PeerAdded(pk))
+            for pk in removed:
+                self._loop.post(PeerRemoved(pk))
+
+        self.postman.on_peers_changed = _on_peers_changed
+
         self.follower = Follower(
             me=me,
             store=store,
@@ -156,8 +167,6 @@ class _BaseNode(Participant):
             loop=self._loop,
         )
         self._downloading = False
-        self._cached_peers: dict[crypto.PublicKey, tuple] = {}
-        self._cached_authorized: frozenset[crypto.PublicKey] = frozenset()
 
         self._on_follower_commit = on_follower_commit
         self._loop.register(MessageIn, self._on_message_in)
@@ -196,7 +205,7 @@ class _BaseNode(Participant):
         self._schedule_reconcile()
 
     def _schedule_reconcile(self) -> None:
-        self._loop.schedule(Millis.now() + self.tunables.rtt_max, ReconcilePeers())
+        self._loop.schedule(Millis.now() + self.tunables.block_time, ReconcilePeers())
 
     def stop(self) -> None:
         self._loop.stop()
@@ -330,7 +339,6 @@ class _BaseNode(Participant):
             rec = nodes.get(pk)
             if rec is not None and rec.endpoints:
                 peers[pk] = rec.endpoints
-            self.follower.post(PeerAdded(pk))
         self.postman.sync(peers, authorized=self.mgmt_reader.authorized_identities())
 
     # -- shared helpers -----------------------------------------------------
@@ -403,6 +411,7 @@ class Node(_BaseNode):
         self.postman.send_raw(e.peer, verb, body, self.tunables.ttl_round, await_reply=False)
 
     def _on_block_settled(self, _e: BlockSettled) -> None:
+        self._reconcile_peers()
         self._notify_followers()
 
     def start(self) -> None:

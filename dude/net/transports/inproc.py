@@ -102,7 +102,7 @@ class InProcListener(Acceptor, Dialer):
                 self._buffered.append((frame, conn.link))
 
     def remove_conn(self, peer_key: bytes) -> None:
-        conn = self.conns.get(peer_key)
+        conn = self.conns.pop(peer_key, None)
         if conn is not None:
             conn.link.close()
 

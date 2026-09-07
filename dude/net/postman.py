@@ -201,6 +201,9 @@ class Postman:
     me: crypto.Keypair
     tunables: Tunables
     on_output: Callable[[Output], None]
+    on_peers_changed: (
+        Callable[[frozenset[crypto.PublicKey], frozenset[crypto.PublicKey]], None] | None
+    ) = None
 
     mailbox: Mailbox = field(default_factory=Mailbox)
     peers: dict[crypto.PublicKey, Peer] = field(default_factory=dict)
@@ -380,20 +383,29 @@ class Postman:
         self._schedule_reap()
 
     def _on_sync_peers(self, event: _SyncPeers) -> None:
+        before = frozenset(self.peers)
         self._do_sync(event.peers, event.authorized)
         for pk in event.peers:
             peer = self.peers.get(pk)
             if peer is not None:
                 self._dial_peer(peer)
+        after = frozenset(self.peers)
+        self._notify_peers_changed(after - before, before - after)
 
     def _on_add_peer(self, event: _AddPeer) -> None:
+        was_new = event.pubkey not in self.peers
         self._do_add_peer(event.pubkey, event.endpoints)
         peer = self.peers.get(event.pubkey)
         if peer is not None:
             self._dial_peer(peer)
+        if was_new and event.pubkey in self.peers:
+            self._notify_peers_changed(frozenset({event.pubkey}), frozenset())
 
     def _on_remove_peer(self, event: _RemovePeer) -> None:
+        existed = event.pubkey in self.peers
         self._do_remove_peer(event.pubkey)
+        if existed:
+            self._notify_peers_changed(frozenset(), frozenset({event.pubkey}))
 
     def _on_frame_in(self, event: _FrameIn) -> None:
         self._do_deliver(event.frame, event.link, Millis.now())
@@ -533,6 +545,14 @@ class Postman:
         if link.send(stamped.seal(), now) is None:
             self._keepalive_pending[mid.correlation_id] = (link, now)
 
+    def _notify_peers_changed(
+        self,
+        added: frozenset[crypto.PublicKey],
+        removed: frozenset[crypto.PublicKey],
+    ) -> None:
+        if self.on_peers_changed is not None and (added or removed):
+            self.on_peers_changed(added, removed)
+
     # -- peer management (postman thread only) ------------------------------
 
     def _do_sync(
@@ -612,7 +632,8 @@ class Postman:
                     ka_link.on_reply(now, now - sent_at)
                     return
             if env.frm not in self.peers and env.frm not in self._authorized:
-                link.close()
+                if now - link.established_at > self.tunables.unauthenticated_link_lifetime:
+                    link.close()
                 return
 
         if link.identity is None:
