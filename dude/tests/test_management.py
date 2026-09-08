@@ -9,9 +9,9 @@ from ..consensus.settle_round import _settle_payload
 from ..core import codec, crypto
 from ..core.errors import DudeError, InvariantError
 from ..core.units import Millis
+from ..ds.managed_map import MapEntry
 from ..net.address import Address, Endpoint, Scheme
-from ..store import Store, ops, settle
-from ..store.managed import MapEntry
+from ..store import ops, settle
 from ..store.management import (
     P_POP,
     Authorization,
@@ -23,6 +23,7 @@ from ..store.management import (
     Role,
     RosterCommitment,
 )
+from ..store.store import Store
 from .cluster import TUNABLES, Cluster
 
 T0 = Millis(1_700_000_000_000)

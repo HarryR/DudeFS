@@ -12,7 +12,8 @@ from ..net.transports.tcp import TCPListener
 from ..node import Node, ReplicaNode
 from ..participant import Participant
 from ..session import Settled
-from ..store import Store, ops
+from ..store import ops
+from ..store.store import Store
 from ..sync.lite_client import LightClient
 from ..tunables import Tunables
 

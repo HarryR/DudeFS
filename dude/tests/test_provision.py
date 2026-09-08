@@ -10,7 +10,8 @@ from ..net.envelope import Verb
 from ..net.postman import OutputQueue, Postman
 from ..net.transports.inproc import InProcNexus
 from ..node import Node
-from ..store import Store, ops
+from ..store import ops
+from ..store.store import Store
 from ..tunables import Tunables
 
 T0 = Millis(1_700_000_000_000)

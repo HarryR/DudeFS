@@ -31,11 +31,12 @@ from .session import (
     SubmitResult,
     Substrate,
 )
-from .store import Store, ops
+from .store import ops
 from .store.checkpoint import CheckpointMeta
 from .store.layer import BlockHead, Held
 from .store.management import MgmtReader, Role
 from .store.smt_sync import TreeImporter
+from .store.store import Store
 from .sync.adapter import (
     GetBlocks,
     Refused,

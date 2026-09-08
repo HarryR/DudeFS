@@ -10,9 +10,10 @@ from dude.core import codec, crypto
 from dude.core.errors import DudeError
 from dude.core.units import Millis
 from dude.session import KeyCache, SessionRW, SubmitHandle, SubmitResult, Substrate
-from dude.store import Store, ops, settle
+from dude.store import ops, settle
 from dude.store.layer import Held
 from dude.store.management import Cert, MgmtWriter, Role, epoch_key
+from dude.store.store import Store
 
 from .cluster import Cluster
 

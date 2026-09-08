@@ -30,7 +30,8 @@ from ..quorum import (
     tolerates,
     would_brick,
 )
-from ..store import Store, ops, settle
+from ..store import ops, settle
+from ..store.store import Store
 from ..tunables import Tunables
 
 D = ops.STORE_DATA

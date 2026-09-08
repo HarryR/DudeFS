@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from ..consensus.settle_round import SettledBlock
 from ..core import crypto
-from ..store import Store, ops
+from ..store import ops
 from ..store.management import MgmtReader, RosterCommitment
-from ..store.store import StoreReader
+from ..store.store import Store, StoreReader
 from .lite_adapter import (
     ABSENT_MARKER,
     AnchorsReply,

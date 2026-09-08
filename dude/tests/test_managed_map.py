@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import unittest
 
+from ..ds.managed_map import ManagedMap
 from ..session import Refused, Settled
 from ..store import ops
-from ..store.managed import ManagedMap
 from .cluster import Cluster
 
 

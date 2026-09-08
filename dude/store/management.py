@@ -8,11 +8,11 @@ from typing import TYPE_CHECKING
 from .. import quorum
 from ..core import codec, crypto
 from ..core.errors import DudeError
+from ..ds.managed_map import ManagedMap, MapEntry
 from ..net.address import Endpoint
 from . import ops
 from .errors import StoreError
 from .layer import Reader
-from .managed import ManagedMap, MapEntry
 from .settle import Authoriser
 
 if TYPE_CHECKING:

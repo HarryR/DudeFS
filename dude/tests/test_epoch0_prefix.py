@@ -9,8 +9,9 @@ import unittest
 
 from ..core import codec, crypto
 from ..core.units import Millis
-from ..store import Store, management, ops, smt
+from ..store import management, ops, smt
 from ..store.settle import Reason
+from ..store.store import Store
 from ..tests.cluster import Cluster
 
 

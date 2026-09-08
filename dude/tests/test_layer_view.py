@@ -8,7 +8,8 @@ import unittest
 from collections.abc import Sequence
 
 from ..core import crypto
-from ..store import Layer, LayerError, Overlay, Store, ops
+from ..store import Layer, LayerError, Overlay, ops
+from ..store.store import Store
 
 D = ops.STORE_DATA
 
