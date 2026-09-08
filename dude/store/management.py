@@ -365,7 +365,7 @@ class MgmtReader(Authoriser):
     def __init__(
         self,
         session: Session,
-        roster_serial_fn: Callable[[], int] | None = None,
+        roster_serial_fn: Callable[[], int | None] | None = None,
     ) -> None:
         self._session = session
         self._anchor = session.anchor
@@ -373,7 +373,7 @@ class MgmtReader(Authoriser):
         self.grants_map = ManagedMap(P_GRANT, session)
         self._roster_serial_fn = roster_serial_fn
         self._roster_cache: tuple[crypto.PublicKey, ...] | None = None
-        self._roster_serial: int = -1
+        self._roster_serial: int | None = None
 
     @property
     def anchor(self) -> crypto.PublicKey:

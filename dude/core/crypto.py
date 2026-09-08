@@ -20,15 +20,27 @@ def _ed25519_sign(sk: Seed, msg: bytes) -> Signature:
     return Signature(nacl.signing.SigningKey(sk).sign(msg).signature)
 
 
-def _ed25519_public(sk: Seed) -> PublicKey:
-    return PublicKey(bytes(nacl.signing.SigningKey(sk).verify_key))
+_verify_key_cache: dict[bytes, nacl.signing.VerifyKey] = {}
+_curve25519_cache: dict[bytes, nacl.public.PublicKey] = {}
+
+
+def _cached_verify_key(pk: PublicKey) -> nacl.signing.VerifyKey | None:
+    vk = _verify_key_cache.get(pk)
+    if vk is not None:
+        return vk
+    if not nacl.bindings.crypto_core_ed25519_is_valid_point(pk):
+        return None
+    vk = nacl.signing.VerifyKey(pk)
+    _verify_key_cache[pk] = vk
+    return vk
 
 
 def _ed25519_verify(pk: PublicKey, msg: bytes, sig: Signature) -> VerifyFailure | None:
-    if not nacl.bindings.crypto_core_ed25519_is_valid_point(pk):
+    vk = _cached_verify_key(pk)
+    if vk is None:
         return VerifyFailure.MALFORMED_KEY
     try:
-        nacl.signing.VerifyKey(pk).verify(msg, sig)
+        vk.verify(msg, sig)
     except (nacl.exceptions.BadSignatureError, nacl.exceptions.CryptoError, ValueError):
         return VerifyFailure.BAD_SIGNATURE
     return None
@@ -202,7 +214,10 @@ class PublicKey(_Fixed):
         return _ed25519_verify(self, msg, sig)
 
     def seal(self, msg: bytes) -> SealedBlob:
-        xpk = nacl.signing.VerifyKey(self).to_curve25519_public_key()
+        xpk = _curve25519_cache.get(self)
+        if xpk is None:
+            xpk = nacl.signing.VerifyKey(self).to_curve25519_public_key()
+            _curve25519_cache[self] = xpk
         return SealedBlob(nacl.public.SealedBox(xpk).encrypt(msg))
 
     def verify_possession(self, pop: Signature) -> bool:
@@ -213,11 +228,13 @@ class PublicKey(_Fixed):
 
 
 class Keypair:
-    __slots__ = ("_public", "_seed")
+    __slots__ = ("_public", "_seed", "_sk", "_xsk")
 
     def __init__(self, seed: Seed):
         self._seed = Seed(seed)
-        self._public = PublicKey(_ed25519_public(seed))
+        self._sk = nacl.signing.SigningKey(seed)
+        self._public = PublicKey(bytes(self._sk.verify_key))
+        self._xsk = self._sk.to_curve25519_private_key()
 
     @classmethod
     def generate(cls) -> Self:
@@ -236,19 +253,17 @@ class Keypair:
         return self._seed
 
     def sign(self, msg: bytes) -> Signature:
-        return Signature(_ed25519_sign(self._seed, msg))
+        return Signature(self._sk.sign(msg).signature)
 
     def open_sealed_raw(self, blob: SealedBlob) -> bytes:
         try:
-            xsk = nacl.signing.SigningKey(self._seed).to_curve25519_private_key()
-            return nacl.public.SealedBox(xsk).decrypt(blob)
+            return nacl.public.SealedBox(self._xsk).decrypt(blob)
         except (nacl.exceptions.CryptoError, ValueError) as e:
             raise SealedBoxError("sealed box would not open (not ours, or tampered)") from e
 
     def open_sealed(self, blob: SealedBlob) -> Master:
         try:
-            xsk = nacl.signing.SigningKey(self._seed).to_curve25519_private_key()
-            return Master(nacl.public.SealedBox(xsk).decrypt(blob))
+            return Master(nacl.public.SealedBox(self._xsk).decrypt(blob))
         except (nacl.exceptions.CryptoError, ValueError) as e:
             raise SealedBoxError("sealed box would not open (not ours, or tampered)") from e
 

@@ -209,15 +209,21 @@ def group(ctx: click.Context, tb_dir: str | None) -> None:
 @click.option("--ro", default=0, help="number of read-only clients")
 @click.option("--rw", default=0, help="number of read-write clients")
 @click.option("--port", "base_port", default=9001, help="starting TCP port")
+@click.option("--production", is_flag=True, help="use production tunables (long block times)")
 @click.pass_obj
-def create(base: Path, nodes: int, mgmt: int, ro: int, rw: int, base_port: int) -> None:
+def create(
+    base: Path, nodes: int, mgmt: int, ro: int, rw: int, base_port: int, production: bool
+) -> None:
     if (base / CLUSTER_JSON).exists():
         raise CLIError(f"testbed already exists at {base}")
 
     base.mkdir(parents=True, exist_ok=True)
     dude = _dude_cmd()
 
-    tunables_toml = "[tunables]\nrtt_max = 50\nclock_skew = 25\nheld_convergence_max = 2\n"
+    if production:
+        tunables_toml = "[tunables]\n"
+    else:
+        tunables_toml = "[tunables]\nrtt_max = 50\nclock_skew = 25\nheld_convergence_max = 2\n"
 
     anchor_dir = str(base / ".a")
     _run([*dude, "--home", anchor_dir, "anchor", "init"])

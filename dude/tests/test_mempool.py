@@ -101,11 +101,12 @@ class TestBuckets(unittest.TestCase):
         communication, because the bucket is arithmetic on the transaction's own timestamp."""
         a, b = Tunables(rtt_max=Millis(200)), Tunables(rtt_max=Millis(200))
         d = a.block_time
+        t0 = a.bucket_start(a.bucket(T0))
         self.assertEqual(a.block_time, b.block_time, "the same inputs must derive the same block")
-        for ts in (T0, T0 + 1, T0 + d - 1, T0 + d, T0 + d * 5 + d // 2):
+        for ts in (t0, t0 + 1, t0 + d - 1, t0 + d, t0 + d * 5 + d // 2):
             self.assertEqual(a.bucket(ts), b.bucket(ts))
-        self.assertEqual(a.bucket(T0 + d - 1) - a.bucket(T0), 0)
-        self.assertEqual(a.bucket(T0 + d) - a.bucket(T0), 1)
+        self.assertEqual(a.bucket(t0 + d - 1) - a.bucket(t0), 0)
+        self.assertEqual(a.bucket(t0 + d) - a.bucket(t0), 1)
 
 
 class TestAdmission(unittest.TestCase):

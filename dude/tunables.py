@@ -61,7 +61,7 @@ class Tunables:
     """Maximum HELD/BODIES sub-rounds a wave accepts. Steady state converges in 1-2; partition
     or asymmetric client load can take more."""
 
-    safety_margin: int = 2
+    safety_margin: float = 1.5
     """`block_time = safety_margin * block_time_floor`. Slack above the coherent minimum."""
 
     windows_to_settle: int = 2
@@ -102,7 +102,7 @@ class Tunables:
 
     @property
     def block_time(self) -> Millis:
-        return self.block_time_floor * self.safety_margin
+        return Millis(int(int(self.block_time_floor) * self.safety_margin))
 
     @property
     def cut_reserve(self) -> Millis:
