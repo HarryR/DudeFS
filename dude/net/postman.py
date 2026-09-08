@@ -376,15 +376,36 @@ class Postman:
     # -- event handlers (run on the postman's loop thread only) -------------
 
     def _on_post_send(self, event: _PostSend) -> None:
-        now = Millis.now()
-        env = Envelope(
+        self._do_post(
             event.to,
             event.verb,
-            MessageId(event.prefix + b"\x00"),
             event.body,
-            reply_to=MessageId(event.reply_to),
+            event.ttl,
+            event.await_reply,
+            event.reply_to,
+            event.prefix,
         )
-        self.mailbox.post(env, now, event.ttl, event.await_reply)
+
+    def _do_post(
+        self,
+        to: crypto.PublicKey,
+        verb: Verb,
+        body: bytes,
+        ttl: Millis,
+        await_reply: bool,
+        reply_to: bytes = b"",
+        prefix: bytes | None = None,
+    ) -> None:
+        now = Millis.now()
+        mid = prefix if prefix is not None else MessageId.random()
+        env = Envelope(
+            to,
+            verb,
+            MessageId(mid + b"\x00"),
+            body,
+            reply_to=MessageId(reply_to),
+        )
+        self.mailbox.post(env, now, ttl, await_reply)
         self._schedule_retry()
         self._schedule_reap()
 
@@ -471,19 +492,8 @@ class Postman:
             acceptor.set_notify(lambda: self._loop.post(_InProcReady()))
 
     def _on_broadcast(self, event: _Broadcast) -> None:
-        now = Millis.now()
         for pub in self.peers:
-            mid = MessageId.random()
-            env = Envelope(
-                pub,
-                event.verb,
-                MessageId(mid + b"\x00"),
-                event.body,
-                reply_to=MessageId(b""),
-            )
-            self.mailbox.post(env, now, event.ttl, False)
-        self._schedule_retry()
-        self._schedule_reap()
+            self._do_post(pub, event.verb, event.body, event.ttl, await_reply=False)
 
     # -- timer scheduling (postman thread only) ----------------------------
 
