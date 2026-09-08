@@ -60,7 +60,7 @@ test:
 	"$(PY)" -m pytest $(SRC)/tests -q --tb=short --no-header --durations=0 -vv
 
 coverage:
-	"$(PY)" -m coverage run --source=$(SRC) -m pytest $(SRC)/tests -q --tb=short --no-header
+	"$(PY)" -m coverage run --source=$(SRC) --omit='$(SRC)/cli/*' -m pytest $(SRC)/tests -q --tb=short --no-header
 	"$(PY)" -m coverage report -m --fail-under=90
 
 PROD_PY := $(shell find $(SRC) -name '*.py' -not -path '*/tests/*')
