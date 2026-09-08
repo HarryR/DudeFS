@@ -173,11 +173,28 @@ class LinkStatus:
     listener_addr: Address | None
 
 
+@dataclass(slots=True)
+class VerbStats:
+    sent: int = 0
+    recv: int = 0
+    bytes_sent: int = 0
+    bytes_recv: int = 0
+    retries: int = 0
+
+    def snapshot(self) -> "VerbStats":
+        v = VerbStats()
+        v.sent, v.recv = self.sent, self.recv
+        v.bytes_sent, v.bytes_recv = self.bytes_sent, self.bytes_recv
+        v.retries = self.retries
+        return v
+
+
 @dataclass(frozen=True, slots=True)
 class PeerStatus:
     identity: crypto.PublicKey
     links: tuple[LinkStatus, ...]
     connected: bool
+    verbs: dict[Verb, VerbStats]
 
 
 class OutputQueue:
@@ -212,6 +229,9 @@ class Postman:
 
     mailbox: Mailbox = field(default_factory=Mailbox)
     peers: dict[crypto.PublicKey, Peer] = field(default_factory=dict)
+    _verb_stats: dict[crypto.PublicKey, dict[Verb, VerbStats]] = field(
+        default_factory=dict, init=False
+    )
 
     _authorized: frozenset[crypto.PublicKey] = field(default_factory=frozenset, init=False)
 
@@ -323,10 +343,25 @@ class Postman:
                 )
                 for ln in list(peer.links)
             )
+            peer_verbs = self._verb_stats.get(pk, {})
             result[pk] = PeerStatus(
-                identity=pk, links=links, connected=any(ls.available for ls in links)
+                identity=pk,
+                links=links,
+                connected=any(ls.available for ls in links),
+                verbs={v: s.snapshot() for v, s in peer_verbs.items()},
             )
         return result
+
+    def _verb(self, peer: crypto.PublicKey, verb: Verb) -> VerbStats:
+        by_verb = self._verb_stats.get(peer)
+        if by_verb is None:
+            by_verb = {}
+            self._verb_stats[peer] = by_verb
+        s = by_verb.get(verb)
+        if s is None:
+            s = VerbStats()
+            by_verb[verb] = s
+        return s
 
     def listener_stats(self) -> list[ListenerStats]:
         return [acc.stats() for acc in self._acceptors]
@@ -665,6 +700,11 @@ class Postman:
             link.bind(env.frm)
             self._do_link_established(link)
 
+        # -- stats ------------------------------------------------------------
+        vs = self._verb(env.frm, env.env.verb)
+        vs.recv += 1
+        vs.bytes_recv += len(frame.raw)
+
         # -- dispatch ---------------------------------------------------------
         if env.env.verb is Verb.PING:
             self._reply_pong(env.frm, env.env.mid, link, now)
@@ -729,8 +769,14 @@ class Postman:
                     t.envelope.reply_to,
                 )
                 stamped = env.sign(self.me, now)
-                if link.send(stamped.seal(), now) is None:
+                sealed = stamped.seal()
+                if link.send(sealed, now) is None:
                     self.mailbox.sent(t.prefix, t.attempt, link.address, now, again_at=again_at)
+                    vs = self._verb(t.to, t.envelope.verb)
+                    vs.sent += 1
+                    vs.bytes_sent += len(sealed.raw)
+                    if t.attempt > 0:
+                        vs.retries += 1
                 else:
                     self.mailbox.failed(t.prefix, retry_at(self.tunables, t.attempt, now))
 

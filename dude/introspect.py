@@ -26,10 +26,21 @@ class NodeLinkInfo:
 
 
 @dataclass(frozen=True, slots=True)
+class NodeVerbStats:
+    verb: str
+    sent: int
+    recv: int
+    bytes_sent: int
+    bytes_recv: int
+    retries: int
+
+
+@dataclass(frozen=True, slots=True)
 class NodePeerInfo:
     identity: crypto.PublicKey
     connected: bool
     links: list[NodeLinkInfo]
+    verb_stats: list[NodeVerbStats]
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,7 +94,20 @@ def serve_node_status(
             )
             for ls in ps.links
         ]
-        peers.append(NodePeerInfo(identity=pk, connected=ps.connected, links=links))
+        verbs = [
+            NodeVerbStats(
+                verb=v.name,
+                sent=s.sent,
+                recv=s.recv,
+                bytes_sent=s.bytes_sent,
+                bytes_recv=s.bytes_recv,
+                retries=s.retries,
+            )
+            for v, s in ps.verbs.items()
+        ]
+        peers.append(
+            NodePeerInfo(identity=pk, connected=ps.connected, links=links, verb_stats=verbs)
+        )
 
     listeners = [
         ListenerInfo(
