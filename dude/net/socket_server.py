@@ -198,3 +198,24 @@ class _ClientHandler:
                     self._respond(Response.QUERY, corr_id, result.encode())
                 else:
                     self._respond(Response.QUERY, corr_id, QUERY_PENDING)
+            case Request.COUNT_PREFIX:
+                parts = codec.as_seq(codec.decode(payload), 2)
+                store_id = codec.as_int(parts[0])
+                prefix = codec.as_bytes(parts[1])
+                count = self._sub.count_prefix(store_id, prefix)
+                self._respond(Response.COUNT_PREFIX, corr_id, codec.encode(count))
+            case Request.NTH_PREFIX:
+                parts = codec.as_seq(codec.decode(payload), 3)
+                store_id = codec.as_int(parts[0])
+                prefix = codec.as_bytes(parts[1])
+                n = codec.as_int(parts[2])
+                result = self._sub.nth_prefix(store_id, prefix, n)
+                if result is None:
+                    self._respond(Response.NTH_PREFIX, corr_id, b"")
+                else:
+                    name, held = result
+                    self._respond(
+                        Response.NTH_PREFIX,
+                        corr_id,
+                        codec.encode([name, held.value, held.epoch, held.cred]),
+                    )

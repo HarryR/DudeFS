@@ -50,11 +50,13 @@ class _StoreSubstrate(Substrate):
     def get(self, store: int, name: bytes) -> Held | None:
         return self._store.get(store, name)
 
-    def token(self, store_id: int, name: str) -> bytes:
-        return self._cache.token(store_id, name)
+    def token(self, store_id: int, name: str, *, plaintext: bool = False) -> bytes:
+        return self._cache.token(store_id, name, plaintext=plaintext)
 
-    def seal(self, store_id: int, name: str, value: bytes) -> tuple[bytes, bytes, int]:
-        return self._cache.seal(store_id, name, value)
+    def seal(
+        self, store_id: int, name: str, value: bytes, *, plaintext: bool = False
+    ) -> tuple[bytes, bytes, int]:
+        return self._cache.seal(store_id, name, value, plaintext=plaintext)
 
     def decrypt(self, store_id: int, name: str, ciphertext: bytes, epoch: int) -> bytes:
         return self._cache.decrypt(store_id, name, ciphertext, epoch)

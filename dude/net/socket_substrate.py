@@ -84,10 +84,16 @@ class SocketSubstrate(Substrate):
             return None
         return Held.decode(reply)
 
-    def token(self, store_id: int, name: str) -> bytes:
+    def token(self, store_id: int, name: str, *, plaintext: bool = False) -> bytes:
+        if plaintext:
+            return name.encode()
         return self._request(Request.TOKEN, codec.encode([store_id, name.encode()]))
 
-    def seal(self, store_id: int, name: str, value: bytes) -> tuple[bytes, bytes, int]:
+    def seal(
+        self, store_id: int, name: str, value: bytes, *, plaintext: bool = False
+    ) -> tuple[bytes, bytes, int]:
+        if plaintext:
+            return name.encode(), value, ops.EPOCH_NONE
         reply = self._request(Request.SEAL, codec.encode([store_id, name.encode(), value]))
         parts = codec.as_seq(codec.decode(reply), 3)
         return codec.as_bytes(parts[0]), codec.as_bytes(parts[1]), codec.as_int(parts[2])
@@ -95,6 +101,19 @@ class SocketSubstrate(Substrate):
     def decrypt(self, store_id: int, name: str, ciphertext: bytes, epoch: int) -> bytes:
         return self._request(
             Request.DECRYPT, codec.encode([store_id, name.encode(), ciphertext, epoch])
+        )
+
+    def count_prefix(self, store_id: int, prefix: bytes) -> int:
+        reply = self._request(Request.COUNT_PREFIX, codec.encode([store_id, prefix]))
+        return codec.as_int(codec.decode(reply))
+
+    def nth_prefix(self, store_id: int, prefix: bytes, n: int) -> tuple[bytes, Held] | None:
+        reply = self._request(Request.NTH_PREFIX, codec.encode([store_id, prefix, n]))
+        if not reply:
+            return None
+        parts = codec.as_seq(codec.decode(reply), 4)
+        return codec.as_bytes(parts[0]), Held(
+            codec.as_bytes(parts[1]), codec.as_int(parts[2]), codec.as_bytes(parts[3])
         )
 
     def submit(self, tx: ops.Transaction) -> SubmitHandle:

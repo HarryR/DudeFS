@@ -72,9 +72,16 @@ def _data_row_shape(layer: Reader, auth: Authoriser, m: ops.Mutation) -> Reason 
     check binds both; a copy in `Mempool.valid` alone is how the two halves came apart over
     duplicate transactions.
 
-    Management rows are exempt from both, and must be: nodes enforce authorisation out of store 0,
-    so it is never encrypted and its names are structured (`grant/` + pubkey) rather than blinded.
-    The one management row with a rule of its own is a store's epoch counter."""
+    Management rows are exempt from the encrypted-name and epoch checks, and must be: nodes
+    enforce authorisation out of store 0, so it is never encrypted and its names are structured
+    (`grant/` + pubkey) rather than blinded.  The one management row with a rule of its own is
+    a store's epoch counter.
+
+    epoch=0 (EPOCH_NONE) is always valid on any store: the client is explicitly writing a
+    plaintext name and unencrypted value.  Encrypted writes accept the current epoch and
+    the previous epoch (grace window during key rotation)."""
+    if len(m.name) > ops.MAX_NAME_BYTES:
+        return Reason.NAME_SHAPE
     if isinstance(m, ops.Del):
         if m.store == ops.STORE_MANAGEMENT and auth.epoch_target(m.name) is not None:
             return Reason.EPOCH_JUMP
@@ -82,13 +89,12 @@ def _data_row_shape(layer: Reader, auth: Authoriser, m: ops.Mutation) -> Reason 
     if m.store == ops.STORE_MANAGEMENT:
         target = auth.epoch_target(m.name)
         return None if target is None else _epoch_step(layer, auth, m, target)
+    if m.epoch == ops.EPOCH_NONE:
+        return None
     if len(m.name) != crypto.DIGEST_SIZE:
-        # A name a node can read is a name it can correlate. The client API types this as a
-        # `NameToken`; the width is what stops a plaintext name arriving by accident.
         return Reason.NAME_SHAPE
-    if m.epoch != auth.current_epoch(m.store, layer):
-        # Written under a key that is no longer the one readers will reach for. Refused rather
-        # than stored, so a stale ciphertext never becomes the current value of a row.
+    current = auth.current_epoch(m.store, layer)
+    if m.epoch != current and (current < 2 or m.epoch != current - 1):
         return Reason.EPOCH
     return None
 

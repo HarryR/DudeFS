@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from .core import codec, crypto
 from .core.errors import DudeError
 from .net.envelope import MessageId, Verb
-from .store.layer import BlockHead, Index, Reader
+from .store.layer import BlockHead, Held, Index, Reader
 from .store.management import blind_key, epoch_key, wrap_key
 from .store.ops import (
     EPOCH_NONE,
@@ -178,6 +178,12 @@ class Substrate(Reader, ABC):
     def settled(self, op_hash: crypto.Digest) -> "SubmitResult | None": ...
     @abstractmethod
     def evict_after_sec(self) -> float: ...
+    def count_prefix(self, store_id: int, prefix: bytes) -> int:
+        raise NotImplementedError
+
+    def nth_prefix(self, store_id: int, prefix: bytes, n: int) -> tuple[bytes, Held] | None:
+        raise NotImplementedError
+
     @abstractmethod
     def wait_for_commit(self, timeout: float, since: int = -1) -> None: ...
     @property
@@ -189,9 +195,11 @@ class Substrate(Reader, ABC):
     @abstractmethod
     def head(self) -> BlockHead | None: ...
     @abstractmethod
-    def token(self, store_id: int, name: str) -> bytes: ...
+    def token(self, store_id: int, name: str, *, plaintext: bool = False) -> bytes: ...
     @abstractmethod
-    def seal(self, store_id: int, name: str, value: bytes) -> tuple[bytes, bytes, int]: ...
+    def seal(
+        self, store_id: int, name: str, value: bytes, *, plaintext: bool = False
+    ) -> tuple[bytes, bytes, int]: ...
     @abstractmethod
     def decrypt(self, store_id: int, name: str, ciphertext: bytes, epoch: int) -> bytes: ...
 
@@ -262,15 +270,21 @@ class KeyCache:
             return sk.current_epoch
         raw = self._reader.get(STORE_MANAGEMENT, epoch_key(store_id))
         if raw is None:
-            raise SessionError(f"no epoch for store {store_id}")
+            return EPOCH_NONE
         sk.current_epoch = codec.as_int(codec.decode(raw.value))
         return sk.current_epoch
 
-    def token(self, store_id: int, name: str) -> bytes:
+    def token(self, store_id: int, name: str, *, plaintext: bool = False) -> bytes:
+        if plaintext:
+            return unicodedata.normalize("NFC", name).encode()
         nk = self.ensure_blinding(store_id)
         return crypto.derive_name_token(nk, unicodedata.normalize("NFC", name).encode())
 
-    def seal(self, store_id: int, name: str, value: bytes) -> tuple[bytes, bytes, int]:
+    def seal(
+        self, store_id: int, name: str, value: bytes, *, plaintext: bool = False
+    ) -> tuple[bytes, bytes, int]:
+        if plaintext:
+            return unicodedata.normalize("NFC", name).encode(), value, EPOCH_NONE
         epoch = self.current_epoch(store_id)
         nt = crypto.NameToken(self.token(store_id, name))
         vk = self.value_key(store_id, epoch)
@@ -279,6 +293,8 @@ class KeyCache:
         return nt, bytes(crypto.AeadXcs1.seal(item, aad, value)), epoch
 
     def decrypt(self, store_id: int, name: str, ciphertext: bytes, epoch: int) -> bytes:
+        if epoch == EPOCH_NONE:
+            return ciphertext
         nt = crypto.NameToken(self.token(store_id, name))
         vk = self.value_key(store_id, epoch)
         item = crypto.derive_item_key(vk, nt)
@@ -301,25 +317,27 @@ class Session:
     def store_id(self) -> int:
         return self._store_id
 
-    def token(self, name: str | bytes) -> bytes:
-        if self._store_id == STORE_MANAGEMENT:
+    def token(self, name: str | bytes, *, plaintext: bool = False) -> bytes:
+        if self._store_id == STORE_MANAGEMENT or plaintext:
             return name if isinstance(name, bytes) else name.encode()
         if not isinstance(name, str):
             raise SessionError("data store keys must be str, not bytes")
         raise SessionError("data store token requires a Substrate with crypto")
 
-    def seal(self, name: str | bytes, value: bytes) -> tuple[bytes, bytes, int]:
-        if self._store_id == STORE_MANAGEMENT:
-            return self.token(name), value, EPOCH_NONE
+    def seal(
+        self, name: str | bytes, value: bytes, *, plaintext: bool = False
+    ) -> tuple[bytes, bytes, int]:
+        if self._store_id == STORE_MANAGEMENT or plaintext:
+            return self.token(name, plaintext=True), value, EPOCH_NONE
         raise SessionError("data store seal requires a Substrate with crypto")
 
     def _decrypt(self, name: str | bytes, ciphertext: bytes, epoch: int) -> bytes:  # noqa: ARG002
-        if self._store_id == STORE_MANAGEMENT:
+        if self._store_id == STORE_MANAGEMENT or epoch == EPOCH_NONE:
             return ciphertext
         raise SessionError("data store decrypt requires a Substrate with crypto")
 
-    def get(self, name: str | bytes) -> Record:
-        token = self.token(name)
+    def get(self, name: str | bytes, *, plaintext: bool = False) -> Record:
+        token = self.token(name, plaintext=plaintext)
         raw = self._reader.get(self._store_id, token)
         if raw is None:
             return Record(
@@ -331,12 +349,12 @@ class Session:
                 epoch=0,
                 absent=True,
             )
-        plaintext = self._decrypt(name, raw.value, raw.epoch)
+        decrypted = self._decrypt(name, raw.value, raw.epoch)
         return Record(
             name=name,
             store_id=self._store_id,
             token=token,
-            value=plaintext,
+            value=decrypted,
             raw=raw.value,
             epoch=raw.epoch,
             absent=False,
@@ -350,22 +368,24 @@ class SessionRW(Session):
         super().__init__(sub, store_id)
         self._sub = sub
 
-    def token(self, name: str | bytes) -> bytes:
-        if self._store_id == STORE_MANAGEMENT:
+    def token(self, name: str | bytes, *, plaintext: bool = False) -> bytes:
+        if self._store_id == STORE_MANAGEMENT or plaintext:
             return name if isinstance(name, bytes) else name.encode()
         if not isinstance(name, str):
             raise SessionError("data store keys must be str, not bytes")
         return self._sub.token(self._store_id, name)
 
-    def seal(self, name: str | bytes, value: bytes) -> tuple[bytes, bytes, int]:
-        if self._store_id == STORE_MANAGEMENT:
-            return self.token(name), value, EPOCH_NONE
+    def seal(
+        self, name: str | bytes, value: bytes, *, plaintext: bool = False
+    ) -> tuple[bytes, bytes, int]:
+        if self._store_id == STORE_MANAGEMENT or plaintext:
+            return self.token(name, plaintext=True), value, EPOCH_NONE
         if not isinstance(name, str):
             raise SessionError("data store keys must be str, not bytes")
         return self._sub.seal(self._store_id, name, value)
 
     def _decrypt(self, name: str | bytes, ciphertext: bytes, epoch: int) -> bytes:
-        if self._store_id == STORE_MANAGEMENT:
+        if self._store_id == STORE_MANAGEMENT or epoch == EPOCH_NONE:
             return ciphertext
         if not isinstance(name, str):
             raise SessionError("data store keys must be str, not bytes")
@@ -378,8 +398,9 @@ class SessionRW(Session):
         *predicates: Predicate | Record,
         expect: Record | None = None,
         absent: bool = False,
+        plaintext: bool = False,
     ) -> SubmitHandle:
-        token, sealed, epoch = self.seal(name, value)
+        token, sealed, epoch = self.seal(name, value, plaintext=plaintext)
         guards = _collect_guards(self._store_id, token, predicates, expect, absent)
         tx = Transaction((Step(guards, Set(self._store_id, token, sealed, epoch)),))
         return self.submit(tx)
@@ -389,8 +410,9 @@ class SessionRW(Session):
         name: str,
         *predicates: Predicate | Record,
         expect: Record | None = None,
+        plaintext: bool = False,
     ) -> SubmitHandle:
-        token = self.token(name)
+        token = self.token(name, plaintext=plaintext)
         guards = _collect_guards(self._store_id, token, predicates, expect, False)
         tx = Transaction((Step(guards, Del(self._store_id, token)),))
         return self.submit(tx)
@@ -414,9 +436,10 @@ class TxBuilder:
         *predicates: Predicate | Record,
         expect: Record | None = None,
         absent: bool = False,
+        plaintext: bool = False,
     ) -> "TxBuilder":
         s = self._session
-        token, sealed, epoch = s.seal(name, value)
+        token, sealed, epoch = s.seal(name, value, plaintext=plaintext)
         guards = _collect_guards(s.store_id, token, predicates, expect, absent)
         self._steps.append(Step(guards, Set(s.store_id, token, sealed, epoch)))
         return self
@@ -426,9 +449,10 @@ class TxBuilder:
         name: str,
         *predicates: Predicate | Record,
         expect: Record | None = None,
+        plaintext: bool = False,
     ) -> "TxBuilder":
         s = self._session
-        token = s.token(name)
+        token = s.token(name, plaintext=plaintext)
         guards = _collect_guards(s.store_id, token, predicates, expect, False)
         self._steps.append(Step(guards, Del(s.store_id, token)))
         return self

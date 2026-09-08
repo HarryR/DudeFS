@@ -8,9 +8,12 @@ from ..store.store import StoreReader
 from .lite_adapter import (
     ABSENT_MARKER,
     AnchorsReply,
+    CountPrefix,
+    CountPrefixReply,
     GetAnchors,
     GetProof,
     LiteRefused,
+    NthPrefix,
     ProofReply,
     RosterBundle,
     SyncRefusal,
@@ -142,6 +145,7 @@ def _proof(
     headers = _headers_since(r, tb, head_num, liveness_window)
 
     return ProofReply(
+        name=request.name,
         value=value,
         credential=credential,
         absent=absent,
@@ -169,6 +173,60 @@ def _build_bundle(mgmt: MgmtReader, commitment: RosterCommitment) -> RosterBundl
         entries=entries,
         managers=mgmt.manager_grants(),
     )
+
+
+def serve_count_prefix(store: Store, request: CountPrefix) -> CountPrefixReply:
+    with store.snapshot() as r:
+        return CountPrefixReply(count=r.count_prefix(request.store_id, request.prefix))
+
+
+def serve_nth_prefix(
+    store: Store,
+    request: NthPrefix,
+    liveness_window: int,
+) -> ProofReply | LiteRefused:
+    with store.snapshot() as r:
+        mgmt = r.mgmt_reader
+        head_num = r.head_block_num()
+        if not head_num:
+            return LiteRefused(SyncRefusal.NO_STATE)
+
+        result = r.nth_prefix(request.store_id, request.prefix, request.n)
+        if result is None:
+            return LiteRefused(SyncRefusal.NOT_YET_SETTLED)
+
+        name, held = result
+        proof = r.prove(request.store_id, name).encode()
+
+        commitment = mgmt.roster_commitment()
+        if commitment is None:
+            return LiteRefused(SyncRefusal.NO_STATE)
+
+        head_bytes = r.settled_at(head_num)
+        if head_bytes is None:
+            return LiteRefused(SyncRefusal.INTERNAL)
+        head_block = SettledBlock.decode(head_bytes)
+
+        roster_fingerprint = crypto.Digest(commitment.cert.subject)
+        bundle: RosterBundle | None = None
+        if request.known_roster_fingerprint is None:
+            bundle = _build_bundle(mgmt, commitment)
+
+        tb = request.known_trusted_block
+        headers = _headers_since(r, tb, head_num, liveness_window)
+
+        return ProofReply(
+            name=name,
+            value=held.value,
+            credential=held.cred,
+            absent=False,
+            proof=proof,
+            epoch=held.epoch,
+            head=head_block,
+            roster_fingerprint=roster_fingerprint,
+            bundle=bundle,
+            headers=headers,
+        )
 
 
 def _headers_since(
