@@ -113,7 +113,7 @@ class Mailbox:
         if p is None:
             return
         p.attempts[attempt] = Attempt(address, now)
-        if again_at is not None:
+        if again_at is not None and p.awaiting_reply:
             p.in_flight, p.next_at = False, again_at
             return
         if p.awaiting_reply:
