@@ -506,6 +506,9 @@ class Store(View, Ledger):
             isolation_level=None,
         )
         self._writer_lock = threading.RLock()
+        self._reader_conn: sqlite3.Connection | None = None
+        self._reader_lock = threading.Lock()
+        self._mgmt_reader: MgmtReader | None = None
         self._writer_conn.execute("PRAGMA journal_mode=WAL")
         self._writer_conn.execute("PRAGMA foreign_keys=ON")
         self._writer_conn.executescript(_SCHEMA)
@@ -518,6 +521,10 @@ class Store(View, Ledger):
         return self._writer_conn
 
     def close(self) -> None:
+        if self._reader_conn is not None:
+            with contextlib.suppress(sqlite3.Error):
+                self._reader_conn.close()
+            self._reader_conn = None
         with contextlib.suppress(sqlite3.Error):
             self._writer_conn.close()
         if self._tempfile_path is not None:
@@ -541,7 +548,14 @@ class Store(View, Ledger):
 
     @contextmanager
     def snapshot(self) -> Generator[StoreReader]:
-        conn = self._open_reader_conn()
+        if self._reader_lock.acquire(blocking=False):
+            if self._reader_conn is None:
+                self._reader_conn = self._open_reader_conn()
+            conn = self._reader_conn
+            owned = False
+        else:
+            conn = self._open_reader_conn()
+            owned = True
         try:
             conn.execute("BEGIN")
             conn.execute("SELECT 1 FROM meta LIMIT 0").fetchone()
@@ -552,7 +566,10 @@ class Store(View, Ledger):
                 conn.execute("ROLLBACK")
                 raise
         finally:
-            conn.close()
+            if owned:
+                conn.close()
+            else:
+                self._reader_lock.release()
 
     @contextmanager
     def write(self) -> Generator[StoreWriter]:
@@ -670,7 +687,11 @@ class Store(View, Ledger):
 
     @property
     def mgmt_reader(self) -> MgmtReader:
-        return MgmtReader(self.mgmt_session())
+        r = self._mgmt_reader
+        if r is None:
+            r = MgmtReader(self.mgmt_session(), roster_serial_fn=self.head_block_num)
+            self._mgmt_reader = r
+        return r
 
     @property
     def mgmt_writer(self) -> MgmtWriter:

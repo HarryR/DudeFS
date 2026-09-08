@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from enum import Enum
 from typing import TYPE_CHECKING
@@ -362,11 +362,18 @@ def attestations_by(
 
 
 class MgmtReader(Authoriser):
-    def __init__(self, session: Session) -> None:
+    def __init__(
+        self,
+        session: Session,
+        roster_serial_fn: Callable[[], int] | None = None,
+    ) -> None:
         self._session = session
         self._anchor = session.anchor
         self._nodes = ManagedMap(P_NODE, session)
         self.grants_map = ManagedMap(P_GRANT, session)
+        self._roster_serial_fn = roster_serial_fn
+        self._roster_cache: tuple[crypto.PublicKey, ...] | None = None
+        self._roster_serial: int = -1
 
     @property
     def anchor(self) -> crypto.PublicKey:
@@ -393,7 +400,15 @@ class MgmtReader(Authoriser):
         )
 
     def roster(self) -> tuple[crypto.PublicKey, ...]:
-        return tuple(sorted(who for who, rec in self.nodes().items() if self._seats(who, rec)))
+        if self._roster_serial_fn is not None:
+            serial = self._roster_serial_fn()
+            if serial == self._roster_serial and self._roster_cache is not None:
+                return self._roster_cache
+        result = tuple(sorted(who for who, rec in self.nodes().items() if self._seats(who, rec)))
+        if self._roster_serial_fn is not None:
+            self._roster_serial = self._roster_serial_fn()
+        self._roster_cache = result
+        return result
 
     def is_member(self, who: crypto.PublicKey) -> bool:
         entry = self._nodes.entry(who)
