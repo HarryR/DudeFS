@@ -103,15 +103,15 @@ class SocketSubstrate(Substrate):
             Request.DECRYPT, codec.encode([store_id, name.encode(), ciphertext, epoch])
         )
 
-    def count_prefix(self, store_id: int, prefix: bytes) -> int:
-        reply = self._request(Request.COUNT_PREFIX, codec.encode([store_id, prefix]))
+    def count_prefix(self, store: int, prefix: bytes) -> int:
+        reply = self._request(Request.COUNT_PREFIX, codec.encode([store, prefix]))
         return codec.as_int(codec.decode(reply))
 
     def nth_prefix(
-        self, store_id: int, prefix: bytes, n: int, *, descending: bool = False
+        self, store: int, prefix: bytes, n: int, *, descending: bool = False
     ) -> tuple[bytes, Held] | None:
         reply = self._request(
-            Request.NTH_PREFIX, codec.encode([store_id, prefix, n, 1 if descending else 0])
+            Request.NTH_PREFIX, codec.encode([store, prefix, n, 1 if descending else 0])
         )
         if not reply:
             return None

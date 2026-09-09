@@ -51,6 +51,14 @@ class _StoreSubstrate(Substrate):
     def get(self, store: int, name: bytes) -> Held | None:
         return self._store.get(store, name)
 
+    def count_prefix(self, store: int, prefix: bytes) -> int:
+        return self._store.count_prefix(store, prefix)
+
+    def nth_prefix(
+        self, store: int, prefix: bytes, n: int, *, descending: bool = False
+    ) -> tuple[bytes, Held] | None:
+        return self._store.nth_prefix(store, prefix, n, descending=descending)
+
     def token(self, store_id: int, name: str, *, plaintext: bool = False) -> bytes:
         return self._cache.token(store_id, name, plaintext=plaintext)
 

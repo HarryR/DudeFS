@@ -706,12 +706,12 @@ class _LiteSubstrate(Substrate):
     def decrypt(self, store_id: int, name: str, ciphertext: bytes, epoch: int) -> bytes:
         return self._ensure_cache().decrypt(store_id, name, ciphertext, epoch)
 
-    def count_prefix(self, store_id: int, prefix: bytes) -> int:
+    def count_prefix(self, store: int, prefix: bytes) -> int:
         peer = self._pick_peer()
         handle = _PrefixCountHandle()
         self._lc.request(
             peer,
-            CountPrefix(store_id=store_id, prefix=prefix),
+            CountPrefix(store_id=store, prefix=prefix),
             self._lc.tunables.ttl_lite,
             handle,
         )
@@ -727,17 +727,17 @@ class _LiteSubstrate(Substrate):
         return 0
 
     def nth_prefix(
-        self, store_id: int, prefix: bytes, n: int, *, descending: bool = False
+        self, store: int, prefix: bytes, n: int, *, descending: bool = False
     ) -> tuple[bytes, Held] | None:
         ts = self._lc.trusted_state
         if ts is None:
             return None
         peer = self._pick_peer()
-        handle = _PrefixNthHandle(store_id=store_id, lc=self._lc)
+        handle = _PrefixNthHandle(store_id=store, lc=self._lc)
         self._lc.request(
             peer,
             NthPrefix(
-                store_id=store_id,
+                store_id=store,
                 prefix=prefix,
                 n=n,
                 descending=descending,

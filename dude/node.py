@@ -798,13 +798,13 @@ class _ReplicaSubstrate(Substrate):
     def decrypt(self, store_id: int, name: str, ciphertext: bytes, epoch: int) -> bytes:
         return self._ensure_cache().decrypt(store_id, name, ciphertext, epoch)
 
-    def count_prefix(self, store_id: int, prefix: bytes) -> int:
-        return self._node.store.count_prefix(store_id, prefix)
+    def count_prefix(self, store: int, prefix: bytes) -> int:
+        return self._node.store.count_prefix(store, prefix)
 
     def nth_prefix(
-        self, store_id: int, prefix: bytes, n: int, *, descending: bool = False
+        self, store: int, prefix: bytes, n: int, *, descending: bool = False
     ) -> tuple[bytes, Held] | None:
-        return self._node.store.nth_prefix(store_id, prefix, n, descending=descending)
+        return self._node.store.nth_prefix(store, prefix, n, descending=descending)
 
     def submit(self, tx: ops.Transaction) -> SubmitHandle:
         signed = tx.sign(self._node.me, Millis.now())

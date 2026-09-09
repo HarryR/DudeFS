@@ -11,6 +11,7 @@ import unittest
 
 from ..core import codec, crypto
 from ..core.units import Millis
+from ..ds.plaintext_map import PlaintextMap
 from ..net.socket_server import SocketServer
 from ..net.socket_substrate import SocketSubstrate
 from ..node import _ReplicaSubstrate
@@ -20,7 +21,6 @@ from ..store.settle import Reason
 from ..store.store import Store
 from ..sync.lite_client import _LiteSubstrate
 from ..tests.cluster import Cluster
-from ..tunables import DEFAULT
 
 # ---------------------------------------------------------------------------
 # Settlement (store-level, no substrate)
@@ -279,7 +279,7 @@ class TestSocketSubstrate(_SubstrateTests):
         self._real_sub = _ReplicaSubstrate(self.c.replicas[0])
         self._server = SocketServer(self._sock_path, self._real_sub)
         self._server.start()
-        self._sub = SocketSubstrate(self._sock_path, DEFAULT)
+        self._sub = SocketSubstrate(self._sock_path, self.c.tunables)
 
         s = self.c.replicas[0].session()
         for i in range(3):
@@ -326,6 +326,221 @@ class TestLightClientSubstrate(_SubstrateTests):
 
     def _session(self) -> SessionRW:
         return self.lc.session()
+
+
+# ---------------------------------------------------------------------------
+# PlaintextMap (data-structure level, over ReplicaSubstrate)
+# ---------------------------------------------------------------------------
+
+
+class TestPlaintextMap(unittest.TestCase):
+    def setUp(self) -> None:
+        self.c = Cluster(nodes=3, mgmt=1)
+        self.session = self.c.replicas[0].session()
+        self.m = PlaintextMap(b"pm/", self.session)
+
+    def tearDown(self) -> None:
+        self.c.close()
+
+    def _submit(self, tx: ops.Transaction) -> None:
+        self.c.wait_settled(self.session.submit(tx).wait())
+
+    def test_put_and_get(self) -> None:
+        self._submit(self.m.tx_put(b"k1", b"v1", absent=True))
+        rec = self.m.get(b"k1")
+        self.assertFalse(rec.absent)
+        self.assertEqual(rec.value, b"v1")
+        self.assertEqual(rec.epoch, 0)
+
+    def test_count(self) -> None:
+        self._submit(self.m.tx_put(b"a", b"1") + self.m.tx_put(b"b", b"2"))
+        self.assertEqual(self.m.count(), 2)
+
+    def test_nth_ascending_and_descending(self) -> None:
+        self._submit(
+            self.m.tx_put(b"x", b"vx") + self.m.tx_put(b"y", b"vy") + self.m.tx_put(b"z", b"vz")
+        )
+        first = self.m.nth(0)
+        assert first is not None
+        self.assertEqual(first[0], b"x")
+        self.assertEqual(first[1].value, b"vx")
+
+        last = self.m.nth(0, descending=True)
+        assert last is not None
+        self.assertEqual(last[0], b"z")
+        self.assertEqual(last[1].value, b"vz")
+
+    def test_delete_decrements_count(self) -> None:
+        self._submit(self.m.tx_put(b"d1", b"v") + self.m.tx_put(b"d2", b"v"))
+        self.assertEqual(self.m.count(), 2)
+        rec = self.m.get(b"d1")
+        self._submit(self.m.tx_delete(b"d1", expect=rec))
+        self.assertEqual(self.m.count(), 1)
+        self.assertTrue(self.m.get(b"d1").absent)
+
+    def test_cas_with_expect(self) -> None:
+        self._submit(self.m.tx_put(b"cas", b"v1", absent=True))
+        rec = self.m.get(b"cas")
+        self._submit(self.m.tx_put(b"cas", b"v2", expect=rec))
+        self.assertEqual(self.m.get(b"cas").value, b"v2")
+
+    def test_stale_expect_refused(self) -> None:
+        self._submit(self.m.tx_put(b"stale", b"v1", absent=True))
+        stale = self.m.get(b"stale")
+        self._submit(self.m.tx_put(b"stale", b"v2", expect=stale))
+        result = self.session.submit(self.m.tx_put(b"stale", b"v3", expect=stale)).wait()
+        self.assertNotIsInstance(result, type(None))
+
+    def test_absent_guard_refuses_duplicate(self) -> None:
+        self._submit(self.m.tx_put(b"dup", b"v1", absent=True))
+        self.session.submit(self.m.tx_put(b"dup", b"v2", absent=True)).wait()
+        self.assertEqual(self.m.get(b"dup").value, b"v1")
+
+    def test_cross_map_atomic_move(self) -> None:
+        src = PlaintextMap(b"src/", self.session)
+        dst = PlaintextMap(b"dst/", self.session)
+        self._submit(src.tx_put(b"job", b"payload", absent=True))
+
+        rec = src.get(b"job")
+        tx = src.tx_delete(b"job", expect=rec) + dst.tx_put(b"job", rec.value, absent=True)
+        self._submit(tx)
+
+        self.assertTrue(src.get(b"job").absent)
+        self.assertEqual(dst.get(b"job").value, b"payload")
+
+    def test_keys_and_items(self) -> None:
+        self._submit(
+            self.m.tx_put(b"b", b"2") + self.m.tx_put(b"a", b"1") + self.m.tx_put(b"c", b"3")
+        )
+        self.assertEqual(self.m.keys(), [b"a", b"b", b"c"])
+        self.assertEqual(self.m.items(), [(b"a", b"1"), (b"b", b"2"), (b"c", b"3")])
+
+
+# ---------------------------------------------------------------------------
+# PlaintextMap substrate tests — shared base + per-substrate subclasses.
+# ---------------------------------------------------------------------------
+
+
+class _PlaintextMapSubstrateTests(unittest.TestCase):
+    __test__ = False
+    PREFIX = b"pm/"
+
+    def _session(self) -> SessionRW:
+        raise NotImplementedError
+
+    def _submit(self, tx: ops.Transaction) -> None:
+        raise NotImplementedError
+
+    def _map(self) -> PlaintextMap:
+        return PlaintextMap(self.PREFIX, self._session())
+
+    def test_put_get_round_trip(self) -> None:
+        m = self._map()
+        self._submit(m.tx_put(b"k", b"v", absent=True))
+        rec = m.get(b"k")
+        self.assertFalse(rec.absent)
+        self.assertEqual(rec.value, b"v")
+
+    def test_count(self) -> None:
+        m = self._map()
+        self.assertEqual(m.count(), 4)
+
+    def test_nth_ascending(self) -> None:
+        m = self._map()
+        result = m.nth(0)
+        assert result is not None
+        self.assertEqual(result[0], b"0")
+        self.assertEqual(result[1].value, b"v0")
+
+    def test_nth_descending(self) -> None:
+        m = self._map()
+        result = m.nth(0, descending=True)
+        assert result is not None
+        self.assertEqual(result[0], b"3")
+        self.assertEqual(result[1].value, b"v3")
+
+    def test_nth_out_of_range(self) -> None:
+        self.assertIsNone(self._map().nth(99))
+
+    def test_expect_round_trip(self) -> None:
+        m = self._map()
+        rec = m.get(b"0")
+        self._submit(m.tx_put(b"0", b"updated", expect=rec))
+        self.assertEqual(m.get(b"0").value, b"updated")
+
+
+class TestPMReplica(_PlaintextMapSubstrateTests):
+    __test__ = True
+
+    def setUp(self) -> None:
+        self.c = Cluster(nodes=3, mgmt=1)
+        s = self.c.replicas[0].session()
+        for i in range(4):
+            s.put(f"pm/{i}", f"v{i}".encode(), plaintext=True).wait()
+        self.c.wait_settled(s.put("pm/3", b"v3", plaintext=True).wait())
+
+    def tearDown(self) -> None:
+        self.c.close()
+
+    def _session(self) -> SessionRW:
+        return self.c.replicas[0].session()
+
+    def _submit(self, tx: ops.Transaction) -> None:
+        self.c.wait_settled(self._session().submit(tx).wait())
+
+
+class TestPMSocket(_PlaintextMapSubstrateTests):
+    __test__ = True
+
+    def setUp(self) -> None:
+        self.c = Cluster(nodes=3, mgmt=1)
+        self._tmpdir = tempfile.mkdtemp()
+        self._sock_path = os.path.join(self._tmpdir, "test.sock")
+        self._real_sub = _ReplicaSubstrate(self.c.replicas[0])
+        self._server = SocketServer(self._sock_path, self._real_sub)
+        self._server.start()
+        self._sub = SocketSubstrate(self._sock_path, self.c.tunables)
+
+        s = self.c.replicas[0].session()
+        for i in range(4):
+            s.put(f"pm/{i}", f"v{i}".encode(), plaintext=True).wait()
+        self.c.wait_settled(s.put("pm/3", b"v3", plaintext=True).wait())
+
+    def tearDown(self) -> None:
+        self._sub.close()
+        self._server.stop()
+        self.c.close()
+        os.rmdir(self._tmpdir)
+
+    def _session(self) -> SessionRW:
+        return SessionRW(self._sub, ops.STORE_DATA)
+
+    def _submit(self, tx: ops.Transaction) -> None:
+        self.c.wait_settled(self._session().submit(tx).wait())
+
+
+class TestPMLiteClient(_PlaintextMapSubstrateTests):
+    __test__ = True
+
+    def setUp(self) -> None:
+        self.c = Cluster(nodes=3, mgmt=1, rw=1)
+        self.lc = self.c.rw_clients[0]
+        self.lc.bootstrap()
+
+        s = self.lc.session()
+        for i in range(4):
+            s.put(f"pm/{i}", f"v{i}".encode(), plaintext=True).wait()
+        self.c.wait_settled(s.put("pm/3", b"v3", plaintext=True).wait())
+        s.get("pm/0", plaintext=True)
+
+    def tearDown(self) -> None:
+        self.c.close()
+
+    def _session(self) -> SessionRW:
+        return self.lc.session()
+
+    def _submit(self, tx: ops.Transaction) -> None:
+        self.c.wait_settled(self._session().submit(tx).wait())
 
 
 if __name__ == "__main__":

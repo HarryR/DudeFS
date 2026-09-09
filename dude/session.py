@@ -178,14 +178,6 @@ class Substrate(Reader, ABC):
     def settled(self, op_hash: crypto.Digest) -> "SubmitResult | None": ...
     @abstractmethod
     def evict_after_sec(self) -> float: ...
-    def count_prefix(self, store_id: int, prefix: bytes) -> int:
-        raise NotImplementedError
-
-    def nth_prefix(
-        self, store_id: int, prefix: bytes, n: int, *, descending: bool = False
-    ) -> tuple[bytes, Held] | None:
-        raise NotImplementedError
-
     @abstractmethod
     def wait_for_commit(self, timeout: float, since: int = -1) -> None: ...
     @property
@@ -362,6 +354,14 @@ class Session:
             absent=False,
         )
 
+    def count_prefix(self, prefix: bytes) -> int:
+        return self._reader.count_prefix(self._store_id, prefix)
+
+    def nth_prefix(
+        self, prefix: bytes, n: int, *, descending: bool = False
+    ) -> tuple[bytes, Held] | None:
+        return self._reader.nth_prefix(self._store_id, prefix, n, descending=descending)
+
 
 class SessionRW(Session):
     __slots__ = ("_sub",)
@@ -403,7 +403,7 @@ class SessionRW(Session):
         plaintext: bool = False,
     ) -> SubmitHandle:
         token, sealed, epoch = self.seal(name, value, plaintext=plaintext)
-        guards = _collect_guards(self._store_id, token, predicates, expect, absent)
+        guards = collect_guards(self._store_id, token, predicates, expect, absent)
         tx = Transaction((Step(guards, Set(self._store_id, token, sealed, epoch)),))
         return self.submit(tx)
 
@@ -415,7 +415,7 @@ class SessionRW(Session):
         plaintext: bool = False,
     ) -> SubmitHandle:
         token = self.token(name, plaintext=plaintext)
-        guards = _collect_guards(self._store_id, token, predicates, expect, False)
+        guards = collect_guards(self._store_id, token, predicates, expect, False)
         tx = Transaction((Step(guards, Del(self._store_id, token)),))
         return self.submit(tx)
 
@@ -442,7 +442,7 @@ class TxBuilder:
     ) -> "TxBuilder":
         s = self._session
         token, sealed, epoch = s.seal(name, value, plaintext=plaintext)
-        guards = _collect_guards(s.store_id, token, predicates, expect, absent)
+        guards = collect_guards(s.store_id, token, predicates, expect, absent)
         self._steps.append(Step(guards, Set(s.store_id, token, sealed, epoch)))
         return self
 
@@ -455,7 +455,7 @@ class TxBuilder:
     ) -> "TxBuilder":
         s = self._session
         token = s.token(name, plaintext=plaintext)
-        guards = _collect_guards(s.store_id, token, predicates, expect, False)
+        guards = collect_guards(s.store_id, token, predicates, expect, False)
         self._steps.append(Step(guards, Del(s.store_id, token)))
         return self
 
@@ -466,7 +466,7 @@ class TxBuilder:
         return self._session.submit(tx)
 
 
-def _collect_guards(
+def collect_guards(
     store_id: int,
     token: bytes,
     predicates: tuple[Predicate | Record, ...],

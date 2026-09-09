@@ -9,7 +9,6 @@ from ..net.socket_substrate import SocketSubstrate
 from ..node import _ReplicaSubstrate
 from ..session import SessionRW
 from ..store import ops
-from ..tunables import DEFAULT
 from .cluster import Cluster
 
 
@@ -29,7 +28,7 @@ class TestSocketSubstrate(unittest.TestCase):
         os.rmdir(self._tmpdir)
 
     def _session(self, store_id: int = ops.STORE_DATA) -> SessionRW:
-        sub = SocketSubstrate(self._sock_path, DEFAULT)
+        sub = SocketSubstrate(self._sock_path, self.c.tunables)
         self.addCleanup(sub.close)
         return SessionRW(sub, store_id)
 
@@ -105,7 +104,7 @@ class TestSocketSubstrate(unittest.TestCase):
         self.assertEqual(rec.value, b"v")
 
     def test_head_updates_after_commit(self) -> None:
-        sub = SocketSubstrate(self._sock_path, DEFAULT)
+        sub = SocketSubstrate(self._sock_path, self.c.tunables)
         self.addCleanup(sub.close)
         s = SessionRW(sub, ops.STORE_DATA)
         self.c.wait_settled(s.put("probe", b"v").wait())
