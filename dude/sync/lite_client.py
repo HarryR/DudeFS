@@ -615,6 +615,9 @@ class _PrefixNthHandle(InflightHandle):
         if msg.absent:
             self.done = True
             return
+        if not self.lc._advance_head(msg.headers, msg.head):  # noqa: SLF001
+            self.done = True
+            return
         ts = self.lc.trusted_state
         if ts is None:
             self.done = True
@@ -723,7 +726,9 @@ class _LiteSubstrate(Substrate):
                 self._lc.commit_cond.wait(remaining)
         return 0
 
-    def nth_prefix(self, store_id: int, prefix: bytes, n: int) -> tuple[bytes, Held] | None:
+    def nth_prefix(
+        self, store_id: int, prefix: bytes, n: int, *, descending: bool = False
+    ) -> tuple[bytes, Held] | None:
         ts = self._lc.trusted_state
         if ts is None:
             return None
@@ -735,6 +740,7 @@ class _LiteSubstrate(Substrate):
                 store_id=store_id,
                 prefix=prefix,
                 n=n,
+                descending=descending,
                 block_num=ts.head.anchors.block_num,
                 known_roster_fingerprint=ts.roster_fingerprint,
                 known_trusted_block=TrustedBlock(

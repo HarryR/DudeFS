@@ -107,8 +107,12 @@ class SocketSubstrate(Substrate):
         reply = self._request(Request.COUNT_PREFIX, codec.encode([store_id, prefix]))
         return codec.as_int(codec.decode(reply))
 
-    def nth_prefix(self, store_id: int, prefix: bytes, n: int) -> tuple[bytes, Held] | None:
-        reply = self._request(Request.NTH_PREFIX, codec.encode([store_id, prefix, n]))
+    def nth_prefix(
+        self, store_id: int, prefix: bytes, n: int, *, descending: bool = False
+    ) -> tuple[bytes, Held] | None:
+        reply = self._request(
+            Request.NTH_PREFIX, codec.encode([store_id, prefix, n, 1 if descending else 0])
+        )
         if not reply:
             return None
         parts = codec.as_seq(codec.decode(reply), 4)

@@ -1,18 +1,30 @@
 """Tests for epoch=0 plaintext keys and prefix query primitives.
 
-Verifies that epoch=0 writes settle on data stores, that count_prefix and
-nth_prefix work correctly, and that the plaintext flag threads through
-all substrate implementations.
+Settlement tests verify epoch=0 rules at the store level.  Substrate tests
+run the same assertions over ReplicaNode, SocketSubstrate, and LightClient
+to verify the full stack.
 """
 
+import os
+import tempfile
 import unittest
 
 from ..core import codec, crypto
 from ..core.units import Millis
+from ..net.socket_server import SocketServer
+from ..net.socket_substrate import SocketSubstrate
+from ..node import _ReplicaSubstrate
+from ..session import SessionRW, Substrate
 from ..store import management, ops, smt
 from ..store.settle import Reason
 from ..store.store import Store
+from ..sync.lite_client import _LiteSubstrate
 from ..tests.cluster import Cluster
+from ..tunables import DEFAULT
+
+# ---------------------------------------------------------------------------
+# Settlement (store-level, no substrate)
+# ---------------------------------------------------------------------------
 
 
 class TestEpoch0Settlement(unittest.TestCase):
@@ -98,7 +110,12 @@ class TestEpoch0Settlement(unittest.TestCase):
         )
 
 
-class TestPrefixQueries(unittest.TestCase):
+# ---------------------------------------------------------------------------
+# Store-level prefix queries (no network)
+# ---------------------------------------------------------------------------
+
+
+class TestStorePrefixQueries(unittest.TestCase):
     def setUp(self) -> None:
         self.kp = crypto.Keypair.generate()
         self.s = Store()
@@ -115,24 +132,6 @@ class TestPrefixQueries(unittest.TestCase):
             auth=self.s.mgmt_reader,
         )
 
-    def test_count_prefix(self) -> None:
-        self.assertEqual(self.s.count_prefix(ops.STORE_DATA, b"pending/"), 3)
-        self.assertEqual(self.s.count_prefix(ops.STORE_DATA, b"active/"), 1)
-        self.assertEqual(self.s.count_prefix(ops.STORE_DATA, b"missing/"), 0)
-
-    def test_nth_prefix_returns_sorted(self) -> None:
-        r0 = self.s.nth_prefix(ops.STORE_DATA, b"pending/", 0)
-        r1 = self.s.nth_prefix(ops.STORE_DATA, b"pending/", 1)
-        r2 = self.s.nth_prefix(ops.STORE_DATA, b"pending/", 2)
-        r3 = self.s.nth_prefix(ops.STORE_DATA, b"pending/", 3)
-        assert r0 is not None
-        assert r1 is not None
-        assert r2 is not None
-        self.assertIsNone(r3)
-        self.assertEqual(r0[0], b"pending/aaa")
-        self.assertEqual(r1[0], b"pending/bbb")
-        self.assertEqual(r2[0], b"pending/ccc")
-
     def test_nth_prefix_result_is_provable(self) -> None:
         result = self.s.nth_prefix(ops.STORE_DATA, b"pending/", 0)
         assert result is not None
@@ -141,13 +140,7 @@ class TestPrefixQueries(unittest.TestCase):
             proof = r.prove(ops.STORE_DATA, name)
             root = r.state_root()
         self.assertTrue(
-            smt.verify(
-                root,
-                ops.STORE_DATA,
-                name,
-                (held.value, held.cred, held.epoch),
-                proof,
-            )
+            smt.verify(root, ops.STORE_DATA, name, (held.value, held.cred, held.epoch), proof)
         )
 
     def test_count_only_matches_epoch0(self) -> None:
@@ -178,52 +171,161 @@ class TestPrefixQueries(unittest.TestCase):
             "epoch!=0 key should not be counted",
         )
 
+    def test_expiry_queue_pattern(self) -> None:
+        self.s.apply(
+            (
+                ops.writes(
+                    ops.Set(ops.STORE_DATA, b"expiry/0000000010/j1", b""),
+                    ops.Set(ops.STORE_DATA, b"expiry/0000000020/j2", b""),
+                    ops.Set(ops.STORE_DATA, b"expiry/0000000030/j3", b""),
+                ).sign(self.kp, Millis.now()),
+            ),
+            auth=self.s.mgmt_reader,
+        )
+        oldest = self.s.nth_prefix(ops.STORE_DATA, b"expiry/", 0)
+        assert oldest is not None
+        self.assertEqual(oldest[0], b"expiry/0000000010/j1")
 
-class TestSessionPlaintextFlag(unittest.TestCase):
-    def test_replica_session_plaintext_put_and_get(self) -> None:
-        c = Cluster(nodes=3)
-        try:
-            s = c.replicas[0].session()
-            s.put("queue/job1", b"pointer", plaintext=True).wait()
-            c.wait_settled(s.put("queue/job2", b"ptr2", plaintext=True).wait())
+        newest = self.s.nth_prefix(ops.STORE_DATA, b"expiry/", 0, descending=True)
+        assert newest is not None
+        self.assertEqual(newest[0], b"expiry/0000000030/j3")
 
-            rec = s.get("queue/job1", plaintext=True)
-            self.assertFalse(rec.absent)
-            self.assertEqual(rec.value, b"pointer")
-            self.assertEqual(rec.epoch, 0)
-            self.assertEqual(rec.token, b"queue/job1")
 
-            rec2 = s.get("queue/job2", plaintext=True)
-            self.assertFalse(rec2.absent)
-            self.assertEqual(rec2.value, b"ptr2")
-        finally:
-            for n in c.nodes:
-                n.stop()
-            for r in c.replicas:
-                r.stop()
+# ---------------------------------------------------------------------------
+# Shared substrate tests — run over ReplicaNode, Socket, and LightClient.
+# ---------------------------------------------------------------------------
 
-    def test_direct_store_prefix_queries(self) -> None:
-        c = Cluster(nodes=3)
-        try:
-            s = c.replicas[0].session()
-            for i in range(3):
-                s.put(f"q/{i}", f"v{i}".encode(), plaintext=True).wait()
-            c.wait_settled(s.put("q/3", b"v3", plaintext=True).wait())
 
-            store = c.replicas[0].store
-            count = store.count_prefix(ops.STORE_DATA, b"q/")
-            self.assertEqual(count, 4)
+class _SubstrateTests(unittest.TestCase):
+    """Shared assertions for plaintext put/get, count_prefix, and nth_prefix.
+    Subclasses provide _substrate() and _session()."""
 
-            nth = store.nth_prefix(ops.STORE_DATA, b"q/", 0)
-            assert nth is not None
-            name, held = nth
-            self.assertEqual(name, b"q/0")
-            self.assertEqual(held.value, b"v0")
-        finally:
-            for n in c.nodes:
-                n.stop()
-            for r in c.replicas:
-                r.stop()
+    __test__ = False
+    PREFIX = b"t/"
+
+    def _substrate(self) -> Substrate:
+        raise NotImplementedError
+
+    def _session(self) -> SessionRW:
+        raise NotImplementedError
+
+    def test_plaintext_put_and_get(self) -> None:
+        s = self._session()
+        rec = s.get("t/0", plaintext=True)
+        self.assertFalse(rec.absent)
+        self.assertEqual(rec.value, b"v0")
+        self.assertEqual(rec.epoch, 0)
+        self.assertEqual(rec.token, b"t/0")
+
+    def test_count_prefix(self) -> None:
+        self.assertEqual(self._substrate().count_prefix(ops.STORE_DATA, self.PREFIX), 4)
+
+    def test_count_prefix_empty(self) -> None:
+        self.assertEqual(self._substrate().count_prefix(ops.STORE_DATA, b"missing/"), 0)
+
+    def test_nth_prefix_ascending(self) -> None:
+        result = self._substrate().nth_prefix(ops.STORE_DATA, self.PREFIX, 0)
+        assert result is not None
+        self.assertEqual(result[0], b"t/0")
+        self.assertEqual(result[1].value, b"v0")
+
+    def test_nth_prefix_descending(self) -> None:
+        result = self._substrate().nth_prefix(ops.STORE_DATA, self.PREFIX, 0, descending=True)
+        assert result is not None
+        self.assertEqual(result[0], b"t/3")
+        self.assertEqual(result[1].value, b"v3")
+
+    def test_nth_prefix_out_of_range(self) -> None:
+        self.assertIsNone(self._substrate().nth_prefix(ops.STORE_DATA, self.PREFIX, 99))
+
+
+# ---------------------------------------------------------------------------
+# ReplicaNode substrate
+# ---------------------------------------------------------------------------
+
+
+class TestReplicaSubstrate(_SubstrateTests):
+    __test__ = True
+
+    def setUp(self) -> None:
+        self.c = Cluster(nodes=3, mgmt=1)
+        s = self.c.replicas[0].session()
+        for i in range(3):
+            s.put(f"t/{i}", f"v{i}".encode(), plaintext=True).wait()
+        self.c.wait_settled(s.put("t/3", b"v3", plaintext=True).wait())
+
+    def tearDown(self) -> None:
+        self.c.close()
+
+    def _substrate(self) -> Substrate:
+        return _ReplicaSubstrate(self.c.replicas[0])
+
+    def _session(self) -> SessionRW:
+        return self.c.replicas[0].session()
+
+
+# ---------------------------------------------------------------------------
+# SocketSubstrate
+# ---------------------------------------------------------------------------
+
+
+class TestSocketSubstrate(_SubstrateTests):
+    __test__ = True
+
+    def setUp(self) -> None:
+        self.c = Cluster(nodes=3, mgmt=1)
+        self._tmpdir = tempfile.mkdtemp()
+        self._sock_path = os.path.join(self._tmpdir, "test.sock")
+        self._real_sub = _ReplicaSubstrate(self.c.replicas[0])
+        self._server = SocketServer(self._sock_path, self._real_sub)
+        self._server.start()
+        self._sub = SocketSubstrate(self._sock_path, DEFAULT)
+
+        s = self.c.replicas[0].session()
+        for i in range(3):
+            s.put(f"t/{i}", f"v{i}".encode(), plaintext=True).wait()
+        self.c.wait_settled(s.put("t/3", b"v3", plaintext=True).wait())
+
+    def tearDown(self) -> None:
+        self._sub.close()
+        self._server.stop()
+        self.c.close()
+        os.rmdir(self._tmpdir)
+
+    def _substrate(self) -> Substrate:
+        return self._sub
+
+    def _session(self) -> SessionRW:
+        return SessionRW(self._sub, ops.STORE_DATA)
+
+
+# ---------------------------------------------------------------------------
+# LightClient substrate
+# ---------------------------------------------------------------------------
+
+
+class TestLightClientSubstrate(_SubstrateTests):
+    __test__ = True
+
+    def setUp(self) -> None:
+        self.c = Cluster(nodes=3, mgmt=1, rw=1)
+        self.lc = self.c.rw_clients[0]
+        self.lc.bootstrap()
+
+        s = self.lc.session()
+        for i in range(3):
+            s.put(f"t/{i}", f"v{i}".encode(), plaintext=True).wait()
+        self.c.wait_settled(s.put("t/3", b"v3", plaintext=True).wait())
+        s.get("t/0", plaintext=True)
+
+    def tearDown(self) -> None:
+        self.c.close()
+
+    def _substrate(self) -> Substrate:
+        return _LiteSubstrate(self.lc)
+
+    def _session(self) -> SessionRW:
+        return self.lc.session()
 
 
 if __name__ == "__main__":

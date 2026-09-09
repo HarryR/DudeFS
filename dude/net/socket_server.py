@@ -205,11 +205,12 @@ class _ClientHandler:
                 count = self._sub.count_prefix(store_id, prefix)
                 self._respond(Response.COUNT_PREFIX, corr_id, codec.encode(count))
             case Request.NTH_PREFIX:
-                parts = codec.as_seq(codec.decode(payload), 3)
+                parts = codec.as_seq(codec.decode(payload), 4)
                 store_id = codec.as_int(parts[0])
                 prefix = codec.as_bytes(parts[1])
                 n = codec.as_int(parts[2])
-                result = self._sub.nth_prefix(store_id, prefix, n)
+                descending = codec.as_int(parts[3]) == 1
+                result = self._sub.nth_prefix(store_id, prefix, n, descending=descending)
                 if result is None:
                     self._respond(Response.NTH_PREFIX, corr_id, b"")
                 else:

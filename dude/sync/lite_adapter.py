@@ -366,6 +366,7 @@ class NthPrefix(LiteMsg):
     store_id: int
     prefix: bytes
     n: int
+    descending: bool
     block_num: int
     known_roster_fingerprint: crypto.Digest | None
     known_trusted_block: TrustedBlock | None
@@ -376,6 +377,7 @@ class NthPrefix(LiteMsg):
                 self.store_id,
                 self.prefix,
                 self.n,
+                1 if self.descending else 0,
                 self.block_num,
                 self.known_roster_fingerprint or b"",
                 TrustedBlock.encode_optional(self.known_trusted_block),
@@ -385,14 +387,15 @@ class NthPrefix(LiteMsg):
     @classmethod
     def decode_inner(cls, body: bytes) -> NthPrefix:
         try:
-            p = codec.as_seq(codec.decode(body), 6)
-            fp_raw = codec.as_bytes(p[4])
-            trusted = TrustedBlock.decode_optional(codec.as_bytes(p[5]))
+            p = codec.as_seq(codec.decode(body), 7)
+            fp_raw = codec.as_bytes(p[5])
+            trusted = TrustedBlock.decode_optional(codec.as_bytes(p[6]))
             return cls(
                 store_id=codec.as_int(p[0]),
                 prefix=codec.as_bytes(p[1]),
                 n=codec.as_int(p[2]),
-                block_num=codec.as_int(p[3]),
+                descending=codec.as_int(p[3]) == 1,
+                block_num=codec.as_int(p[4]),
                 known_roster_fingerprint=crypto.Digest(fp_raw) if fp_raw else None,
                 known_trusted_block=trusted,
             )

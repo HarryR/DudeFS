@@ -191,7 +191,9 @@ def serve_nth_prefix(
         if not head_num:
             return LiteRefused(SyncRefusal.NO_STATE)
 
-        result = r.nth_prefix(request.store_id, request.prefix, request.n)
+        result = r.nth_prefix(
+            request.store_id, request.prefix, request.n, descending=request.descending
+        )
         if result is None:
             return LiteRefused(SyncRefusal.NOT_YET_SETTLED)
 

@@ -801,8 +801,10 @@ class _ReplicaSubstrate(Substrate):
     def count_prefix(self, store_id: int, prefix: bytes) -> int:
         return self._node.store.count_prefix(store_id, prefix)
 
-    def nth_prefix(self, store_id: int, prefix: bytes, n: int) -> tuple[bytes, Held] | None:
-        return self._node.store.nth_prefix(store_id, prefix, n)
+    def nth_prefix(
+        self, store_id: int, prefix: bytes, n: int, *, descending: bool = False
+    ) -> tuple[bytes, Held] | None:
+        return self._node.store.nth_prefix(store_id, prefix, n, descending=descending)
 
     def submit(self, tx: ops.Transaction) -> SubmitHandle:
         signed = tx.sign(self._node.me, Millis.now())

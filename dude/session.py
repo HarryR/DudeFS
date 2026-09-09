@@ -181,7 +181,9 @@ class Substrate(Reader, ABC):
     def count_prefix(self, store_id: int, prefix: bytes) -> int:
         raise NotImplementedError
 
-    def nth_prefix(self, store_id: int, prefix: bytes, n: int) -> tuple[bytes, Held] | None:
+    def nth_prefix(
+        self, store_id: int, prefix: bytes, n: int, *, descending: bool = False
+    ) -> tuple[bytes, Held] | None:
         raise NotImplementedError
 
     @abstractmethod
