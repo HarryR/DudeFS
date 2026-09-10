@@ -12,6 +12,7 @@ import unittest
 from ..core import codec, crypto
 from ..core.units import Millis
 from ..ds.plaintext_map import PlaintextMap
+from ..ds.queue import Queue
 from ..net.socket_server import SocketServer
 from ..net.socket_substrate import SocketSubstrate
 from ..node import _ReplicaSubstrate
@@ -412,8 +413,8 @@ class TestPlaintextMap(unittest.TestCase):
         self._submit(
             self.m.tx_put(b"b", b"2") + self.m.tx_put(b"a", b"1") + self.m.tx_put(b"c", b"3")
         )
-        self.assertEqual(self.m.keys(), [b"a", b"b", b"c"])
-        self.assertEqual(self.m.items(), [(b"a", b"1"), (b"b", b"2"), (b"c", b"3")])
+        self.assertEqual(list(self.m.keys()), [b"a", b"b", b"c"])
+        self.assertEqual(list(self.m.items()), [(b"a", b"1"), (b"b", b"2"), (b"c", b"3")])
 
 
 # ---------------------------------------------------------------------------
@@ -541,6 +542,158 @@ class TestPMLiteClient(_PlaintextMapSubstrateTests):
 
     def _submit(self, tx: ops.Transaction) -> None:
         self.c.wait_settled(self._session().submit(tx).wait())
+
+
+class TestQueue(unittest.TestCase):
+    def setUp(self) -> None:
+        self.c = Cluster(nodes=3, mgmt=1)
+        self.session = self.c.replicas[0].session()
+        self.q = Queue(b"q/", self.session)
+
+    def tearDown(self) -> None:
+        self.c.close()
+
+    def _submit(self, tx: ops.Transaction) -> None:
+        self.c.wait_settled(self.session.submit(tx).wait())
+
+    def test_submit_and_claim(self) -> None:
+        self._submit(self.q.submit(b"j1", b"payload1"))
+        self.assertEqual(self.q.pending.count(), 1)
+
+        result = self.q.claim(b"w1", 9999)
+        assert result is not None
+        claim, tx = result
+        self.assertEqual(claim.job_id, b"j1")
+        self.assertEqual(claim.payload, b"payload1")
+        self.assertEqual(claim.worker, b"w1")
+        self.assertEqual(claim.deadline, 9999)
+        self._submit(tx)
+
+        self.assertEqual(self.q.pending.count(), 0)
+        self.assertEqual(self.q.active_map(b"w1").count(), 1)
+        self.assertEqual(self.q.lease.count(), 1)
+
+    def test_complete_removes_from_queue(self) -> None:
+        self._submit(self.q.submit(b"j1", b"data"))
+        result = self.q.claim(b"w1", 9999)
+        assert result is not None
+        claim, tx = result
+        self._submit(tx)
+
+        self._submit(self.q.complete(claim))
+        self.assertEqual(self.q.active_map(b"w1").count(), 0)
+        self.assertEqual(self.q.lease.count(), 0)
+
+    def test_claim_empty_returns_none(self) -> None:
+        self.assertIsNone(self.q.claim(b"w1", 9999))
+
+    def test_competing_claims(self) -> None:
+        self._submit(self.q.submit(b"j1", b"data"))
+
+        r1 = self.q.claim(b"w1", 9999)
+        r2 = self.q.claim(b"w2", 9999)
+        assert r1 is not None and r2 is not None
+
+        self._submit(r1[1])
+        self.session.submit(r2[1]).wait()
+
+        self.assertEqual(self.q.active_map(b"w1").count(), 1)
+        self.assertEqual(self.q.active_map(b"w2").count(), 0)
+
+    def test_pending_and_active_count(self) -> None:
+        self._submit(self.q.submit(b"j1", b"d1") + self.q.submit(b"j2", b"d2"))
+        self.assertEqual(self.q.pending_count(), 2)
+        self.assertEqual(self.q.active_count(b"w1"), 0)
+
+        result = self.q.claim(b"w1", 9999)
+        assert result is not None
+        self._submit(result[1])
+
+        self.assertEqual(self.q.pending_count(), 1)
+        self.assertEqual(self.q.active_count(b"w1"), 1)
+
+    def test_claim_job(self) -> None:
+        self._submit(self.q.submit(b"j1", b"d1") + self.q.submit(b"j2", b"d2"))
+
+        result = self.q.claim_job(b"w1", 9999, b"j2")
+        assert result is not None
+        claim, tx = result
+        self.assertEqual(claim.job_id, b"j2")
+        self.assertEqual(claim.payload, b"d2")
+        self._submit(tx)
+
+        self.assertEqual(self.q.pending_count(), 1)
+        self.assertEqual(self.q.pending.get(b"j1").value, b"d1")
+        self.assertTrue(self.q.pending.get(b"j2").absent)
+
+    def test_claim_job_missing(self) -> None:
+        self.assertIsNone(self.q.claim_job(b"w1", 9999, b"nope"))
+
+    def test_reclaim_expired(self) -> None:
+        self._submit(self.q.submit(b"j1", b"d1") + self.q.submit(b"j2", b"d2"))
+        c1 = self.q.claim(b"w1", 100)
+        assert c1 is not None
+        self._submit(c1[1])
+        c2 = self.q.claim(b"w2", 9999)
+        assert c2 is not None
+        self._submit(c2[1])
+
+        self.assertEqual(self.q.pending_count(), 0)
+        ejected, tx = self.q.reclaim_expired(200)
+        self._submit(tx)
+
+        self.assertEqual(ejected, [b"j1"])
+        self.assertEqual(self.q.pending_count(), 1)
+        self.assertEqual(self.q.pending.get(b"j1").value, b"d1")
+        self.assertEqual(self.q.active_count(b"w1"), 0)
+        self.assertEqual(self.q.active_count(b"w2"), 1)
+
+    def test_reclaim_expired_bounded(self) -> None:
+        for i in range(5):
+            self._submit(self.q.submit(f"j{i}".encode(), f"d{i}".encode()))
+            result = self.q.claim(b"w1", 100 + i)
+            assert result is not None
+            self._submit(result[1])
+
+        ejected, tx = self.q.reclaim_expired(9999, limit=2)
+        self._submit(tx)
+        self.assertEqual(len(ejected), 2)
+        self.assertEqual(self.q.pending_count(), 2)
+        self.assertEqual(self.q.active_count(b"w1"), 3)
+
+    def test_renew_lease(self) -> None:
+        self._submit(self.q.submit(b"j1", b"data"))
+        result = self.q.claim(b"w1", 100)
+        assert result is not None
+        claim, tx = result
+        self._submit(tx)
+
+        renewed, renew_tx = self.q.renew_lease(claim, 500)
+        self.assertEqual(renewed.deadline, 500)
+        self._submit(renew_tx)
+
+        ejected, tx = self.q.reclaim_expired(200)
+        self._submit(tx)
+        self.assertEqual(ejected, [])
+        self.assertEqual(self.q.pending_count(), 0, "renewed lease should survive reclaim at 200")
+        self.assertEqual(self.q.active_count(b"w1"), 1)
+
+    def test_claim_random(self) -> None:
+        for i in range(10):
+            self._submit(self.q.submit(f"j{i}".encode(), f"d{i}".encode()))
+
+        claimed_ids: set[bytes] = set()
+        for i in range(10):
+            result = self.q.claim_random(f"w{i}".encode(), 9999)
+            assert result is not None
+            claimed_ids.add(result[0].job_id)
+            self._submit(result[1])
+
+        self.assertEqual(len(claimed_ids), 10)
+        self.assertEqual(self.q.pending_count(), 0)
+
+    def test_claim_random_empty(self) -> None:
+        self.assertIsNone(self.q.claim_random(b"w1", 9999))
 
 
 if __name__ == "__main__":

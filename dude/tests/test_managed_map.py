@@ -28,8 +28,8 @@ class TestManagedMap(unittest.TestCase):
 
     def test_empty_map(self) -> None:
         self.assertIsNone(self.m.meta())
-        self.assertEqual(self.m.keys(), [])
-        self.assertEqual(self.m.items(), [])
+        self.assertEqual(list(self.m.keys()), [])
+        self.assertEqual(list(self.m.items()), [])
         self.assertIsNone(self.m.entry(b"x"))
 
     def test_add_one(self) -> None:
@@ -38,7 +38,7 @@ class TestManagedMap(unittest.TestCase):
         self.assertIsNotNone(meta)
         assert meta is not None
         self.assertEqual(meta.count, 1)
-        self.assertEqual(self.m.keys(), [b"alice"])
+        self.assertEqual(list(self.m.keys()), [b"alice"])
         e = self.m.entry(b"alice")
         self.assertIsNotNone(e)
         assert e is not None
@@ -67,7 +67,7 @@ class TestManagedMap(unittest.TestCase):
         self.assertIsNotNone(meta)
         assert meta is not None
         self.assertEqual(meta.count, 0)
-        self.assertEqual(self.m.keys(), [])
+        self.assertEqual(list(self.m.keys()), [])
         self.assertIsNone(self.m.entry(b"alice"))
 
     def test_remove_last_element(self) -> None:
@@ -178,7 +178,7 @@ class TestManagedMap(unittest.TestCase):
             self.assertTrue(self._apply(self.m.add(k, k)))
         self.assertTrue(self._apply(self.m.remove(b"key_1")))
         self.assertTrue(self._apply(self.m.remove(b"key_3")))
-        remaining = self.m.keys()
+        remaining = list(self.m.keys())
         self.assertEqual(len(remaining), 3)
         for k in remaining:
             e = self.m.entry(k)

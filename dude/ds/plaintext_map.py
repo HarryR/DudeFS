@@ -1,15 +1,11 @@
-from __future__ import annotations
+from collections.abc import Iterator
 
-from typing import TYPE_CHECKING
-
-from ..session import Record, collect_guards
+from ..session import Record, Session, collect_guards
 from ..store.ops import EPOCH_NONE, Del, Predicate, Set, Step, Transaction
-
-if TYPE_CHECKING:
-    from ..session import Session
+from . import Map
 
 
-class PlaintextMap:
+class PlaintextMap(Map):
     __slots__ = ("_session", "prefix")
 
     def __init__(self, prefix: bytes, session: Session) -> None:
@@ -47,23 +43,23 @@ class PlaintextMap:
             absent=False,
         )
 
-    def keys(self) -> list[bytes]:
-        out: list[bytes] = []
+    def keys(self) -> Iterator[bytes]:
         for i in range(self.count()):
             result = self.nth(i)
             if result is None:
                 break
-            out.append(result[0])
-        return out
+            yield result[0]
 
-    def items(self) -> list[tuple[bytes, bytes]]:
-        out: list[tuple[bytes, bytes]] = []
+    def records(self) -> Iterator[tuple[bytes, Record]]:
         for i in range(self.count()):
             result = self.nth(i)
             if result is None:
                 break
-            out.append((result[0], result[1].value))
-        return out
+            yield result
+
+    def items(self) -> Iterator[tuple[bytes, bytes]]:
+        for key, rec in self.records():
+            yield key, rec.value
 
     # -- transaction builders (caller submits) ---------------------------------
 

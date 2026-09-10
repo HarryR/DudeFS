@@ -1,11 +1,14 @@
-from __future__ import annotations
-
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Self
 
 from ..core import codec, crypto
 from ..core.errors import DudeError
 from ..store.errors import StoreError
+from . import Map
+
+if TYPE_CHECKING:
+    from ..session import Session
 from ..store.ops import (
     Absent,
     Del,
@@ -16,9 +19,6 @@ from ..store.ops import (
     Transaction,
     value_digest,
 )
-
-if TYPE_CHECKING:
-    from ..session import Session
 
 
 class ManagedMapError(StoreError): ...
@@ -35,10 +35,10 @@ class MapAcc:
     def _element(prefix: bytes, key: bytes) -> crypto.Accumulator:
         return crypto.acc_element(codec.encode([prefix, key]))
 
-    def add(self, key: bytes) -> MapAcc:
+    def add(self, key: bytes) -> "MapAcc":
         return MapAcc(self._prefix, crypto.acc_add(self._acc, self._element(self._prefix, key)))
 
-    def sub(self, key: bytes) -> MapAcc:
+    def sub(self, key: bytes) -> "MapAcc":
         return MapAcc(self._prefix, crypto.acc_sub(self._acc, self._element(self._prefix, key)))
 
     @property
@@ -78,10 +78,10 @@ class MapEntry:
         return cls(codec.as_int(p[0]), codec.as_bytes(p[1]), raw)
 
 
-class ManagedMap:
+class ManagedMap(Map):
     __slots__ = ("_session", "prefix")
 
-    def __init__(self, prefix: bytes, session: Session) -> None:
+    def __init__(self, prefix: bytes, session: "Session") -> None:
         self.prefix = prefix
         self._session = session
 
@@ -120,24 +120,24 @@ class ManagedMap:
     def key_at(self, idx: int) -> bytes | None:
         return self._get(self._index_name(idx))
 
-    def keys(self) -> list[bytes]:
+    def count(self) -> int:
+        m = self.meta()
+        return m.count if m else 0
+
+    def keys(self) -> Iterator[bytes]:
         m = self.meta()
         if m is None:
-            return []
-        out: list[bytes] = []
+            return
         for i in range(m.count):
             k = self.key_at(i)
             if k is not None:
-                out.append(k)
-        return out
+                yield k
 
-    def items(self) -> list[tuple[bytes, bytes]]:
-        out: list[tuple[bytes, bytes]] = []
+    def items(self) -> Iterator[tuple[bytes, bytes]]:
         for key in self.keys():
             e = self.entry(key)
             if e is not None:
-                out.append((key, e.value))
-        return out
+                yield key, e.value
 
     # -- writes (return Transaction, caller applies) ------------------------
 
