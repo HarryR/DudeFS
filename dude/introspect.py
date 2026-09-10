@@ -6,7 +6,7 @@ from .core.units import Millis
 from .net.envelope import Verb
 from .net.link import LinkDirection
 from .net.postman import Encodable, Postman
-from .store import Store
+from .store.store import Store
 
 
 @dataclass(frozen=True, slots=True)

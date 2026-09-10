@@ -14,6 +14,7 @@ STORE_DATA = 1
 
 
 EPOCH_NONE = 0
+MAX_NAME_BYTES = 128
 
 _SET = b"s"
 _DEL = b"d"

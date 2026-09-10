@@ -38,11 +38,14 @@ from ..store.management import (
 from . import chain
 from .lite_adapter import (
     AnchorsReply,
+    CountPrefix,
+    CountPrefixReply,
     GetAnchors,
     GetProof,
     LiteAdapterError,
     LiteMsg,
     LiteRefused,
+    NthPrefix,
     ProofReply,
     RosterBundle,
     SyncRefusal,
@@ -469,6 +472,9 @@ class LightClient(Participant):
         except DudeError:
             entry.result = Failed(reason="malformed proof")
             return
+        if msg.name != entry.name:
+            entry.result = Failed(reason="reply name does not match request")
+            return
         held = None if msg.absent else (msg.value, msg.credential, msg.epoch)
         if self.trusted_state is None:
             entry.result = Failed(reason="trusted state lost; re-bootstrap")
@@ -476,7 +482,7 @@ class LightClient(Participant):
         if not smt.verify(
             self.trusted_state.head.anchors.state_root,
             entry.store_id,
-            entry.name,
+            msg.name,
             held,
             proof,
         ):
@@ -571,6 +577,67 @@ class _SubmitPeerHandle(InflightHandle):
         pass
 
 
+@dataclass(slots=True)
+class _PrefixCountHandle(InflightHandle):
+    count: int | None = None
+
+    def on_reply(self, verb: Verb, body: bytes) -> None:
+        if verb == Verb.COUNT_PREFIX_REPLY:
+            try:
+                msg = CountPrefixReply.decode_inner(body)
+                self.count = msg.count
+            except (LiteAdapterError, DudeError):
+                self.count = 0
+
+    def on_expired(self) -> None:
+        self.count = 0
+
+
+@dataclass(slots=True)
+class _PrefixNthHandle(InflightHandle):
+    store_id: int
+    lc: "LightClient"
+    done: bool = False
+    result: tuple[bytes, Held] | None = None
+
+    def on_reply(self, verb: Verb, body: bytes) -> None:
+        if verb == Verb.LITE_REFUSED:
+            self.done = True
+            return
+        if verb != Verb.PROOF_REPLY:
+            self.done = True
+            return
+        try:
+            msg = ProofReply.decode_inner(body)
+        except (LiteAdapterError, DudeError):
+            self.done = True
+            return
+        if msg.absent:
+            self.done = True
+            return
+        if not self.lc._advance_head(msg.headers, msg.head):  # noqa: SLF001
+            self.done = True
+            return
+        ts = self.lc.trusted_state
+        if ts is None:
+            self.done = True
+            return
+        held = (msg.value, msg.credential, msg.epoch)
+        try:
+            proof = smt.Proof.decode(msg.proof)
+        except DudeError:
+            self.done = True
+            return
+        if not smt.verify(ts.head.anchors.state_root, self.store_id, msg.name, held, proof):
+            self.done = True
+            return
+        self.result = (msg.name, Held(msg.value, msg.epoch, msg.credential))
+        self.done = True
+
+    def on_expired(self) -> None:
+        self.done = True
+
+
 class _LiteSubstrate(Substrate):
     __slots__ = ("_key_cache", "_lc")
 
@@ -628,14 +695,72 @@ class _LiteSubstrate(Substrate):
                     self._lc.commit_cond.wait(remaining)
         return None
 
-    def token(self, store_id: int, name: str) -> bytes:
-        return self._ensure_cache().token(store_id, name)
+    def token(self, store_id: int, name: str, *, plaintext: bool = False) -> bytes:
+        return self._ensure_cache().token(store_id, name, plaintext=plaintext)
 
-    def seal(self, store_id: int, name: str, value: bytes) -> tuple[bytes, bytes, int]:
-        return self._ensure_cache().seal(store_id, name, value)
+    def seal(
+        self, store_id: int, name: str, value: bytes, *, plaintext: bool = False
+    ) -> tuple[bytes, bytes, int]:
+        return self._ensure_cache().seal(store_id, name, value, plaintext=plaintext)
 
     def decrypt(self, store_id: int, name: str, ciphertext: bytes, epoch: int) -> bytes:
         return self._ensure_cache().decrypt(store_id, name, ciphertext, epoch)
+
+    def count_prefix(self, store: int, prefix: bytes) -> int:
+        peer = self._pick_peer()
+        handle = _PrefixCountHandle()
+        self._lc.request(
+            peer,
+            CountPrefix(store_id=store, prefix=prefix),
+            self._lc.tunables.ttl_lite,
+            handle,
+        )
+        deadline_ms = Millis.now() + self._lc.tunables.ttl_lite
+        with self._lc.commit_cond:
+            while Millis.now() < deadline_ms:
+                if handle.count is not None:
+                    return handle.count
+                remaining = Millis(deadline_ms - Millis.now()).as_seconds
+                if remaining <= 0:
+                    break
+                self._lc.commit_cond.wait(remaining)
+        return 0
+
+    def nth_prefix(
+        self, store: int, prefix: bytes, n: int, *, descending: bool = False
+    ) -> tuple[bytes, Held] | None:
+        ts = self._lc.trusted_state
+        if ts is None:
+            return None
+        peer = self._pick_peer()
+        handle = _PrefixNthHandle(store_id=store, lc=self._lc)
+        self._lc.request(
+            peer,
+            NthPrefix(
+                store_id=store,
+                prefix=prefix,
+                n=n,
+                descending=descending,
+                block_num=ts.head.anchors.block_num,
+                known_roster_fingerprint=ts.roster_fingerprint,
+                known_trusted_block=TrustedBlock(
+                    ts.head.anchors.block_num,
+                    ts.head.block_hash,
+                ),
+            ),
+            self._lc.tunables.ttl_lite,
+            handle,
+        )
+        deadline_ms = Millis.now() + self._lc.tunables.ttl_lite
+        with self._lc.commit_cond:
+            while Millis.now() < deadline_ms:
+                if handle.done:
+                    return handle.result
+                remaining = Millis(deadline_ms - Millis.now()).as_seconds
+                if remaining <= 0:
+                    break
+                self._lc.commit_cond.wait(remaining)
+        return None
 
     def submit(self, tx: ops.Transaction) -> SubmitHandle:
         signed = tx.sign(self._lc.me, Millis.now())

@@ -4,7 +4,7 @@ import unittest
 
 from dude.consensus.settle_round import SettledBlock
 from dude.core import crypto
-from dude.store import Store, ops
+from dude.store import ops
 from dude.store.checkpoint import CheckpointMeta
 from dude.store.management import (
     Cert,
@@ -12,6 +12,7 @@ from dude.store.management import (
     Role,
 )
 from dude.store.smt_sync import TreeExporter, TreeImporter
+from dude.store.store import Store
 from dude.tests.cluster import Cluster
 
 

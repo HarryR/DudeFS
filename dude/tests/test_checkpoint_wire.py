@@ -3,10 +3,11 @@ from __future__ import annotations
 import unittest
 
 from dude.core import crypto
-from dude.store import Store, ops
+from dude.store import ops
 from dude.store.checkpoint import CheckpointMeta
 from dude.store.management import Cert, MgmtWriter, Role
 from dude.store.smt_sync import TreeImporter
+from dude.store.store import Store
 from dude.sync.checkpoint_adapter import (
     CheckpointMetaReply,
     ChunksReply,

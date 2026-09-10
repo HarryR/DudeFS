@@ -29,6 +29,8 @@ class Request(bytes, Enum):
     DECRYPT = b"y"
     SUBMIT = b"s"
     QUERY = b"q"
+    COUNT_PREFIX = b"c"
+    NTH_PREFIX = b"n"
 
 
 class Response(bytes, Enum):
@@ -41,6 +43,8 @@ class Response(bytes, Enum):
     SUBMIT_ACK = b"S"
     QUERY = b"Q"
     COMMIT = b"C"
+    COUNT_PREFIX = b"K"
+    NTH_PREFIX = b"N"
 
 
 QUERY_PENDING = b"P"

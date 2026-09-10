@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from ..core import crypto
-from ..store import Store
 from ..store.checkpoint import CheckpointMeta
 from ..store.smt_sync import TreeExporter
+from ..store.store import Store
 from .checkpoint_adapter import (
     CheckpointMetaReply,
     ChunksReply,

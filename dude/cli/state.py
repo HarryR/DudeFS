@@ -15,8 +15,8 @@ from ..consensus.settle_round import SettledBlock
 from ..core import codec, crypto
 from ..core.errors import DudeError
 from ..net.address import Address, Endpoint
-from ..store import Store
 from ..store.ops import SignedTransaction
+from ..store.store import Store
 
 log = logging.getLogger(__name__)
 

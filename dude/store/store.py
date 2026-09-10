@@ -162,6 +162,33 @@ class StoreReader(View, Ledger, _ExportSource):
     def prove(self, store: int, name: bytes) -> smt.Proof:
         return self._tree.prove(store, name)
 
+    def count_prefix(self, store: int, prefix: bytes) -> int:
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM live WHERE store=? AND epoch=0 AND name>=? AND name<?",
+            (store, prefix, prefix + b"\xff"),
+        ).fetchone()
+        return row[0]
+
+    _NTH_ASC = (
+        "SELECT name, value, epoch, cred FROM live"
+        " WHERE store=? AND epoch=0 AND name>=? AND name<?"
+        " ORDER BY name ASC LIMIT 1 OFFSET ?"
+    )
+    _NTH_DESC = (
+        "SELECT name, value, epoch, cred FROM live"
+        " WHERE store=? AND epoch=0 AND name>=? AND name<?"
+        " ORDER BY name DESC LIMIT 1 OFFSET ?"
+    )
+
+    def nth_prefix(
+        self, store: int, prefix: bytes, n: int, *, descending: bool = False
+    ) -> tuple[bytes, Held] | None:
+        sql = self._NTH_DESC if descending else self._NTH_ASC
+        row = self._conn.execute(sql, (store, prefix, prefix + b"\xff", n)).fetchone()
+        if row is None:
+            return None
+        return bytes(row[0]), Held(row[1], row[2], row[3])
+
     @property
     def is_frozen(self) -> bool:
         return True
@@ -677,6 +704,16 @@ class Store(View, Ledger):
     def checkpoint_chunks(self, offset: int, limit: int) -> tuple[bytes, ...]:
         with self.snapshot() as r:
             return r.checkpoint_chunks(offset, limit)
+
+    def count_prefix(self, store: int, prefix: bytes) -> int:
+        with self.snapshot() as r:
+            return r.count_prefix(store, prefix)
+
+    def nth_prefix(
+        self, store: int, prefix: bytes, n: int, *, descending: bool = False
+    ) -> tuple[bytes, Held] | None:
+        with self.snapshot() as r:
+            return r.nth_prefix(store, prefix, n, descending=descending)
 
     @property
     def is_frozen(self) -> bool:

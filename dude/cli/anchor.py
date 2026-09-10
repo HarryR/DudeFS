@@ -15,7 +15,7 @@ from ..net.address import Address, Endpoint
 from ..net.envelope import Verb
 from ..net.link import LinkDirection
 from ..net.postman import OutputQueue, PeerStatus, Postman
-from ..store import Store
+from ..store.store import Store
 from ..sync.lite_client import LightClient
 from ..sync.observer import ClusterObserver
 from .config import DudeConfig

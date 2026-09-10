@@ -207,6 +207,7 @@ ABSENT_MARKER = b""
 class ProofReply(LiteMsg):
     verb: ClassVar[Verb] = Verb.PROOF_REPLY
 
+    name: bytes
     value: bytes
     credential: bytes
     absent: bool
@@ -223,6 +224,7 @@ class ProofReply(LiteMsg):
     def encode_inner(self) -> bytes:
         return codec.encode(
             [
+                self.name,
                 self.value,
                 self.credential,
                 1 if self.absent else 0,
@@ -238,18 +240,19 @@ class ProofReply(LiteMsg):
     @classmethod
     def decode_inner(cls, body: bytes) -> ProofReply:
         try:
-            p = codec.as_seq(codec.decode(body), 9)
-            head = SettledBlock.decode(codec.as_bytes(p[5]))
-            roster_fingerprint = crypto.Digest(codec.as_bytes(p[6]))
-            bundle_bytes = codec.as_bytes(p[7])
+            p = codec.as_seq(codec.decode(body), 10)
+            head = SettledBlock.decode(codec.as_bytes(p[6]))
+            roster_fingerprint = crypto.Digest(codec.as_bytes(p[7]))
+            bundle_bytes = codec.as_bytes(p[8])
             bundle = RosterBundle.decode(bundle_bytes) if bundle_bytes else None
-            headers = tuple(SettledBlock.decode(codec.as_bytes(h)) for h in codec.as_seq(p[8]))
+            headers = tuple(SettledBlock.decode(codec.as_bytes(h)) for h in codec.as_seq(p[9]))
             return cls(
-                value=codec.as_bytes(p[0]),
-                credential=codec.as_bytes(p[1]),
-                absent=codec.as_int(p[2]) == 1,
-                proof=codec.as_bytes(p[3]),
-                epoch=codec.as_int(p[4]),
+                name=codec.as_bytes(p[0]),
+                value=codec.as_bytes(p[1]),
+                credential=codec.as_bytes(p[2]),
+                absent=codec.as_int(p[3]) == 1,
+                proof=codec.as_bytes(p[4]),
+                epoch=codec.as_int(p[5]),
                 head=head,
                 roster_fingerprint=roster_fingerprint,
                 bundle=bundle,
@@ -322,6 +325,84 @@ class TxStatusReply(LiteMsg):
             raise LiteAdapterError(f"malformed TX_STATUS_REPLY body: {e}") from e
 
 
+@dataclass(frozen=True, slots=True)
+class CountPrefix(LiteMsg):
+    verb: ClassVar[Verb] = Verb.COUNT_PREFIX
+    store_id: int
+    prefix: bytes
+
+    def encode_inner(self) -> bytes:
+        return codec.encode([self.store_id, self.prefix])
+
+    @classmethod
+    def decode_inner(cls, body: bytes) -> CountPrefix:
+        try:
+            p = codec.as_seq(codec.decode(body), 2)
+            return cls(store_id=codec.as_int(p[0]), prefix=codec.as_bytes(p[1]))
+        except DudeError as e:
+            raise LiteAdapterError(f"malformed COUNT_PREFIX: {e}") from e
+
+
+@dataclass(frozen=True, slots=True)
+class CountPrefixReply(LiteMsg):
+    verb: ClassVar[Verb] = Verb.COUNT_PREFIX_REPLY
+    count: int
+
+    def encode_inner(self) -> bytes:
+        return codec.encode([self.count])
+
+    @classmethod
+    def decode_inner(cls, body: bytes) -> CountPrefixReply:
+        try:
+            p = codec.as_seq(codec.decode(body), 1)
+            return cls(count=codec.as_int(p[0]))
+        except DudeError as e:
+            raise LiteAdapterError(f"malformed COUNT_PREFIX_REPLY: {e}") from e
+
+
+@dataclass(frozen=True, slots=True)
+class NthPrefix(LiteMsg):
+    verb: ClassVar[Verb] = Verb.NTH_PREFIX
+    store_id: int
+    prefix: bytes
+    n: int
+    descending: bool
+    block_num: int
+    known_roster_fingerprint: crypto.Digest | None
+    known_trusted_block: TrustedBlock | None
+
+    def encode_inner(self) -> bytes:
+        return codec.encode(
+            [
+                self.store_id,
+                self.prefix,
+                self.n,
+                1 if self.descending else 0,
+                self.block_num,
+                self.known_roster_fingerprint or b"",
+                TrustedBlock.encode_optional(self.known_trusted_block),
+            ]
+        )
+
+    @classmethod
+    def decode_inner(cls, body: bytes) -> NthPrefix:
+        try:
+            p = codec.as_seq(codec.decode(body), 7)
+            fp_raw = codec.as_bytes(p[5])
+            trusted = TrustedBlock.decode_optional(codec.as_bytes(p[6]))
+            return cls(
+                store_id=codec.as_int(p[0]),
+                prefix=codec.as_bytes(p[1]),
+                n=codec.as_int(p[2]),
+                descending=codec.as_int(p[3]) == 1,
+                block_num=codec.as_int(p[4]),
+                known_roster_fingerprint=crypto.Digest(fp_raw) if fp_raw else None,
+                known_trusted_block=trusted,
+            )
+        except DudeError as e:
+            raise LiteAdapterError(f"malformed NTH_PREFIX: {e}") from e
+
+
 _LITE_MSG_CLASSES: tuple[type[LiteMsg], ...] = (
     GetAnchors,
     AnchorsReply,
@@ -330,6 +411,9 @@ _LITE_MSG_CLASSES: tuple[type[LiteMsg], ...] = (
     LiteRefused,
     TxStatus,
     TxStatusReply,
+    CountPrefix,
+    CountPrefixReply,
+    NthPrefix,
 )
 
 _LITE_MSG_VERB_TO_CLASS: dict[Verb, type[LiteMsg]] = {c.verb: c for c in _LITE_MSG_CLASSES}

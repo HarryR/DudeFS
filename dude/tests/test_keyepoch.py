@@ -10,9 +10,10 @@ from dude.core import codec, crypto
 from dude.core.errors import DudeError
 from dude.core.units import Millis
 from dude.session import KeyCache, SessionRW, SubmitHandle, SubmitResult, Substrate
-from dude.store import Store, ops, settle
+from dude.store import ops, settle
 from dude.store.layer import Held
 from dude.store.management import Cert, MgmtWriter, Role, epoch_key
+from dude.store.store import Store
 
 from .cluster import Cluster
 
@@ -50,11 +51,21 @@ class _StoreSubstrate(Substrate):
     def get(self, store: int, name: bytes) -> Held | None:
         return self._store.get(store, name)
 
-    def token(self, store_id: int, name: str) -> bytes:
-        return self._cache.token(store_id, name)
+    def count_prefix(self, store: int, prefix: bytes) -> int:
+        return self._store.count_prefix(store, prefix)
 
-    def seal(self, store_id: int, name: str, value: bytes) -> tuple[bytes, bytes, int]:
-        return self._cache.seal(store_id, name, value)
+    def nth_prefix(
+        self, store: int, prefix: bytes, n: int, *, descending: bool = False
+    ) -> tuple[bytes, Held] | None:
+        return self._store.nth_prefix(store, prefix, n, descending=descending)
+
+    def token(self, store_id: int, name: str, *, plaintext: bool = False) -> bytes:
+        return self._cache.token(store_id, name, plaintext=plaintext)
+
+    def seal(
+        self, store_id: int, name: str, value: bytes, *, plaintext: bool = False
+    ) -> tuple[bytes, bytes, int]:
+        return self._cache.seal(store_id, name, value, plaintext=plaintext)
 
     def decrypt(self, store_id: int, name: str, ciphertext: bytes, epoch: int) -> bytes:
         return self._cache.decrypt(store_id, name, ciphertext, epoch)

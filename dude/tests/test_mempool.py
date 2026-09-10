@@ -30,7 +30,8 @@ from ..quorum import (
     tolerates,
     would_brick,
 )
-from ..store import Store, ops, settle
+from ..store import ops, settle
+from ..store.store import Store
 from ..tunables import Tunables
 
 D = ops.STORE_DATA
@@ -138,10 +139,13 @@ class TestAdmission(unittest.TestCase):
         reports `CANNOT_APPLY`, since it forwards the evaluator's refusal rather than restating
         which of its rules fired."""
         plaintext = ops.writes(ops.Set(ops.STORE_DATA, b"config/thing", b"v")).sign(self.kp, T0)
-        self.assertEqual(self._admit(plaintext), CANNOT_APPLY)
+        self.assertIsNone(self._admit(plaintext), "epoch=0 plaintext is valid")
 
         wrong_epoch = ops.writes(ops.Set(ops.STORE_DATA, DK, b"v", 3)).sign(self.kp, T0)
         self.assertEqual(self._admit(wrong_epoch), CANNOT_APPLY)
+
+        too_long = ops.writes(ops.Set(ops.STORE_DATA, b"x" * 129, b"v")).sign(self.kp, T0)
+        self.assertEqual(self._admit(too_long), CANNOT_APPLY)
 
         ok = ops.writes(ops.Set(ops.STORE_DATA, DK, b"v")).sign(self.kp, T0)
         self.assertIsNone(self._admit(ok), "a token at the current epoch must pass the door")

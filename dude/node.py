@@ -31,11 +31,12 @@ from .session import (
     SubmitResult,
     Substrate,
 )
-from .store import Store, ops
+from .store import ops
 from .store.checkpoint import CheckpointMeta
 from .store.layer import BlockHead, Held
 from .store.management import MgmtReader, Role
 from .store.smt_sync import TreeImporter
+from .store.store import Store
 from .sync.adapter import (
     GetBlocks,
     Refused,
@@ -61,13 +62,15 @@ from .sync.follower import (
     serve_getblocks,
     serve_height,
 )
-from .sync.lite import serve_get_anchors, serve_get_proof
+from .sync.lite import serve_count_prefix, serve_get_anchors, serve_get_proof, serve_nth_prefix
 from .sync.lite_adapter import (
+    CountPrefix,
     GetAnchors,
     GetProof,
     LiteAdapterError,
     LiteMsg,
     LiteRefused,
+    NthPrefix,
     TxStatus,
     TxStatusKind,
     TxStatusReply,
@@ -462,6 +465,10 @@ class Node(_BaseNode):
                 self._on_get_proof(d)
             case Verb.TX_STATUS:
                 self._on_tx_status(d)
+            case Verb.COUNT_PREFIX:
+                self._on_count_prefix(d)
+            case Verb.NTH_PREFIX:
+                self._on_nth_prefix(d)
             case Verb.GET_CHECKPOINT:
                 self._on_get_checkpoint(d)
             case Verb.GET_CHUNKS:
@@ -650,6 +657,44 @@ class Node(_BaseNode):
             self.tunables.ttl_lite,
         )
 
+    def _on_count_prefix(self, d: Delivered) -> MessageId | None:
+        if not self._lite_authorised(d.frm):
+            return self.postman.reply(
+                d, LiteRefused(SyncRefusal.UNAUTHORISED), self.tunables.ttl_lite
+            )
+        try:
+            req = LiteMsg.decode(d.verb, d.body)
+        except (LiteAdapterError, DudeError):
+            return self.postman.reply(
+                d, LiteRefused(SyncRefusal.MALFORMED_QUERY), self.tunables.ttl_lite
+            )
+        if not isinstance(req, CountPrefix):
+            return None
+        return self.postman.reply(d, serve_count_prefix(self.store, req), self.tunables.ttl_lite)
+
+    def _on_nth_prefix(self, d: Delivered) -> MessageId | None:
+        if not self._lite_authorised(d.frm):
+            return self.postman.reply(
+                d, LiteRefused(SyncRefusal.UNAUTHORISED), self.tunables.ttl_lite
+            )
+        try:
+            req = LiteMsg.decode(d.verb, d.body)
+        except (LiteAdapterError, DudeError):
+            return self.postman.reply(
+                d, LiteRefused(SyncRefusal.MALFORMED_QUERY), self.tunables.ttl_lite
+            )
+        if not isinstance(req, NthPrefix):
+            return None
+        if not self.mgmt_reader.may_read(self.store, d.frm, req.store_id):
+            return self.postman.reply(
+                d, LiteRefused(SyncRefusal.UNAUTHORISED), self.tunables.ttl_lite
+            )
+        return self.postman.reply(
+            d,
+            serve_nth_prefix(self.store, req, self.tunables.liveness_window),
+            self.tunables.ttl_lite,
+        )
+
     def _on_tx_status(self, d: Delivered) -> MessageId | None:
         if not self._lite_authorised(d.frm):
             return self.postman.reply(
@@ -742,14 +787,24 @@ class _ReplicaSubstrate(Substrate):
     def get(self, store: int, name: bytes) -> Held | None:
         return self._node.store.get(store, name)
 
-    def token(self, store_id: int, name: str) -> bytes:
-        return self._ensure_cache().token(store_id, name)
+    def token(self, store_id: int, name: str, *, plaintext: bool = False) -> bytes:
+        return self._ensure_cache().token(store_id, name, plaintext=plaintext)
 
-    def seal(self, store_id: int, name: str, value: bytes) -> tuple[bytes, bytes, int]:
-        return self._ensure_cache().seal(store_id, name, value)
+    def seal(
+        self, store_id: int, name: str, value: bytes, *, plaintext: bool = False
+    ) -> tuple[bytes, bytes, int]:
+        return self._ensure_cache().seal(store_id, name, value, plaintext=plaintext)
 
     def decrypt(self, store_id: int, name: str, ciphertext: bytes, epoch: int) -> bytes:
         return self._ensure_cache().decrypt(store_id, name, ciphertext, epoch)
+
+    def count_prefix(self, store: int, prefix: bytes) -> int:
+        return self._node.store.count_prefix(store, prefix)
+
+    def nth_prefix(
+        self, store: int, prefix: bytes, n: int, *, descending: bool = False
+    ) -> tuple[bytes, Held] | None:
+        return self._node.store.nth_prefix(store, prefix, n, descending=descending)
 
     def submit(self, tx: ops.Transaction) -> SubmitHandle:
         signed = tx.sign(self._node.me, Millis.now())

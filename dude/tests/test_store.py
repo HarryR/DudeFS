@@ -616,12 +616,26 @@ class TestADataRowMustBeShapedForEncryption(unittest.TestCase):
         got = self.s.apply((ops.writes(*muts).sign(self.kp, self.ts),), auth=self.mgmt)
         return got.dropped[0].why if got.dropped else None
 
-    def test_a_plaintext_name_is_refused_because_a_node_could_read_it(self):
+    def test_epoch0_plaintext_name_is_accepted(self):
+        self.assertIsNone(
+            self._apply(ops.Set(ops.STORE_DATA, b"config/thing", b"v", epoch=0)),
+        )
+
+    def test_encrypted_write_with_non_token_name_is_refused(self):
         self.assertIs(
-            self._apply(ops.Set(ops.STORE_DATA, b"config/thing", b"v")),
+            self._apply(ops.Set(ops.STORE_DATA, b"config/thing", b"v", epoch=1)),
             settle.Reason.NAME_SHAPE,
         )
         self.assertIsNone(self._apply(ops.Set(ops.STORE_DATA, DK, b"v")), "a token is fine")
+
+    def test_name_over_128_bytes_is_refused(self):
+        self.assertIs(
+            self._apply(ops.Set(ops.STORE_DATA, b"x" * 129, b"v", epoch=0)),
+            settle.Reason.NAME_SHAPE,
+        )
+        self.assertIsNone(
+            self._apply(ops.Set(ops.STORE_DATA, b"x" * 128, b"v", epoch=0)),
+        )
 
     def test_management_names_are_exempt_because_nodes_must_read_them(self):
         """Store 0 carries `grant/` + pubkey and friends; nodes enforce authorisation out of it,
@@ -629,9 +643,9 @@ class TestADataRowMustBeShapedForEncryption(unittest.TestCase):
         self.assertIsNone(self._apply(ops.Set(ops.STORE_MANAGEMENT, b"anything at all", b"v")))
 
     def test_a_write_at_the_wrong_epoch_is_refused(self):
-        """`EPOCH_NONE` while no epoch has been minted, so plaintext is the default rather than a
-        special case. Once one exists, a write under the old key is refused rather than stored --
-        a stale ciphertext must never become the current value of a row."""
+        """Once an epoch has been minted, a write under the wrong key is refused rather than
+        stored — a stale ciphertext must never become the current value of a row.  epoch=0
+        (plaintext) is always valid regardless of the store's current epoch."""
         self.assertIsNone(self._apply(ops.Set(ops.STORE_DATA, DK, b"v")))
         self.assertIs(self._apply(ops.Set(ops.STORE_DATA, DK, b"v", 1)), settle.Reason.EPOCH)
 
@@ -640,12 +654,16 @@ class TestADataRowMustBeShapedForEncryption(unittest.TestCase):
         )
         self.assertEqual(self.mgmt.current_epoch(ops.STORE_DATA), 1, "the mint did not land")
 
-        self.assertIs(
+        self.assertIsNone(
             self._apply(ops.Set(ops.STORE_DATA, DK, b"v")),
-            settle.Reason.EPOCH,
-            "epoch 0 stayed writable after a rotation",
+            "epoch=0 is always valid (plaintext bypass)",
         )
         self.assertIsNone(self._apply(ops.Set(ops.STORE_DATA, DK, b"v", 1)))
+        self.assertIs(
+            self._apply(ops.Set(ops.STORE_DATA, DK, b"v", 2)),
+            settle.Reason.EPOCH,
+            "epoch 2 is invalid when current is 1",
+        )
 
     def test_the_epoch_is_read_from_the_same_view_the_write_is_evaluated_against(self):
         """A rotation and a write in ONE transaction: the write must see the bump its own

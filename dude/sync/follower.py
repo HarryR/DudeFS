@@ -16,10 +16,11 @@ from ..core import crypto
 from ..core.errors import InvariantError
 from ..core.event_loop import Event, EventLoop, Scheduled
 from ..core.units import Millis
-from ..store import Layer, Store, settle
+from ..store import Layer, settle
 from ..store.layer import Index, log_element
 from ..store.management import MgmtReader
 from ..store.ops import SignedTransaction
+from ..store.store import Store
 from ..tunables import Tunables
 from . import chain
 from .adapter import (

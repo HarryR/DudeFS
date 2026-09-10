@@ -61,6 +61,12 @@ class Reader(ABC):
     def get(self, store: int, name: bytes) -> Held | None: ...
     @abstractmethod
     def anchor(self) -> crypto.PublicKey: ...
+    @abstractmethod
+    def count_prefix(self, store: int, prefix: bytes) -> int: ...
+    @abstractmethod
+    def nth_prefix(
+        self, store: int, prefix: bytes, n: int, *, descending: bool = False
+    ) -> tuple[bytes, Held] | None: ...
 
 
 class Ledger(Reader):
@@ -106,6 +112,46 @@ class Overlay[B: Reader](Reader):
         if key not in self._delta:
             return self._base.get(store, name)
         return self._delta[key]
+
+    def count_prefix(self, store: int, prefix: bytes) -> int:
+        upper = prefix + b"\xff"
+        count = self._base.count_prefix(store, prefix)
+        for (st, name), held in self._delta.items():
+            if st != store or not (prefix <= name < upper):
+                continue
+            was = self._base.get(st, name)
+            was_counted = was is not None and was.epoch == ops.EPOCH_NONE
+            now_counted = held is not None and held.epoch == ops.EPOCH_NONE
+            if now_counted and not was_counted:
+                count += 1
+            elif was_counted and not now_counted:
+                count -= 1
+        return count
+
+    def nth_prefix(
+        self, store: int, prefix: bytes, n: int, *, descending: bool = False
+    ) -> tuple[bytes, Held] | None:
+        upper = prefix + b"\xff"
+        merged: dict[bytes, Held] = {}
+        i = 0
+        while True:
+            result = self._base.nth_prefix(store, prefix, i)
+            if result is None:
+                break
+            merged[result[0]] = result[1]
+            i += 1
+        for (st, name), held in self._delta.items():
+            if st != store or not (prefix <= name < upper):
+                continue
+            if held is not None and held.epoch == ops.EPOCH_NONE:
+                merged[name] = held
+            else:
+                merged.pop(name, None)
+        keys = sorted(merged, reverse=descending)
+        if n >= len(keys):
+            return None
+        k = keys[n]
+        return k, merged[k]
 
     @property
     def is_frozen(self) -> bool:

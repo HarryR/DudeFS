@@ -15,7 +15,7 @@ from ..net.postman import OutputQueue, Postman
 from ..net.socket_substrate import SocketSubstrate
 from ..net.transports.tcp import TCPListener
 from ..node import Node, ReplicaNode
-from ..store import Store
+from ..store.store import Store
 from ..sync.lite_client import LightClient, LightClientError
 from ..tunables import DEFAULT, Tunables
 from .state import (
