@@ -83,21 +83,21 @@ class TestLightClientRead(unittest.TestCase):
         self.c.close()
 
     def test_put_and_get_via_session(self) -> None:
-        s = self.lc.session()
+        s = self.lc.session_rw()
         self.c.wait_settled(s.put("hello", b"world").wait())
         rec = s.get("hello")
         self.assertFalse(rec.absent)
         self.assertEqual(rec.value, b"world")
 
     def test_value_is_encrypted_on_disk(self) -> None:
-        s = self.lc.session()
+        s = self.lc.session_rw()
         s.put("secret", b"plaintext").wait()
         rec = s.get("secret")
         self.assertNotEqual(rec.raw, b"plaintext")
         self.assertEqual(rec.value, b"plaintext")
 
     def test_handle_outlives_inflight(self) -> None:
-        s = self.lc.session()
+        s = self.lc.session_rw()
         s.put("outlive", b"value").wait()
         rec = s.get("outlive")
         self.assertFalse(rec.absent)
@@ -197,7 +197,7 @@ def _feed_reply(
 class TestByzantineProofReply(unittest.TestCase):
     def setUp(self) -> None:
         self.c = Cluster(nodes=3, mgmt=1, ro=0, rw=0)
-        ms = self.c.replicas[0].session()
+        ms = self.c.replicas[0].session_rw()
         self.c.wait_settled(ms.put("byz-target", b"real-value").wait())
         self.c.wait_settled(ms.put("byz-pad", b"x").wait())
 
@@ -208,7 +208,7 @@ class TestByzantineProofReply(unittest.TestCase):
         return _make_unstarted_lc(self.c)
 
     def _token(self) -> bytes:
-        ms = self.c.replicas[0].session()
+        ms = self.c.replicas[0].session_rw()
         return ms.get("byz-target").token
 
     def _real_reply(self) -> ProofReply:

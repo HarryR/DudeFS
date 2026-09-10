@@ -11,6 +11,7 @@ from .store.layer import BlockHead, Held, Index, Reader
 from .store.management import blind_key, epoch_key, wrap_key
 from .store.ops import (
     EPOCH_NONE,
+    STORE_DATA,
     STORE_MANAGEMENT,
     Absent,
     Del,
@@ -204,6 +205,17 @@ class Substrate(Reader, ABC):
 
     def __exit__(self, *_: object) -> None:
         self.close()
+
+
+class SessionProvider(ABC):
+    @abstractmethod
+    def substrate(self) -> Substrate: ...
+
+    @abstractmethod
+    def session_rw(self, store_id: int = STORE_DATA) -> "SessionRW": ...
+
+    def session_ro(self, store_id: int = STORE_DATA) -> "Session":
+        return self.session_rw(store_id)
 
 
 @dataclass(slots=True)

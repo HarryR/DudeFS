@@ -26,6 +26,7 @@ from .participant import Participant
 from .session import (
     InflightHandle,
     KeyCache,
+    SessionProvider,
     SessionRW,
     SubmitHandle,
     SubmitResult,
@@ -734,7 +735,7 @@ class Node(_BaseNode):
 # ---------------------------------------------------------------------------
 
 
-class ReplicaNode(_BaseNode):
+class ReplicaNode(_BaseNode, SessionProvider):
     def __init__(self, me: crypto.Keypair, store: Store, tunables: Tunables = DEFAULT) -> None:
         def _on_follower_commit(_e: BlockCommitted) -> None:
             with self.commit_cond:
@@ -751,9 +752,11 @@ class ReplicaNode(_BaseNode):
             self.tunables.ttl_exchange,
         )
 
-    def session(self, store_id: int = ops.STORE_DATA) -> SessionRW:
-        sub = _ReplicaSubstrate(self)
-        return SessionRW(sub, store_id)
+    def substrate(self) -> Substrate:
+        return _ReplicaSubstrate(self)
+
+    def session_rw(self, store_id: int = ops.STORE_DATA) -> SessionRW:
+        return SessionRW(self.substrate(), store_id)
 
     def _on_delivered(self, d: Delivered) -> None:
         if d.in_reply_to is not None and self.inflight.on_reply(

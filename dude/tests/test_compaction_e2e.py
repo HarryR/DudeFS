@@ -19,14 +19,14 @@ from dude.tests.cluster import Cluster
 class TestCompactionEndToEnd(unittest.TestCase):
     def _boot(self):
         c = Cluster(nodes=3, mgmt=1)
-        s = c.replicas[0].session()
+        s = c.replicas[0].session_rw()
         return c, s
 
     def _grant_compactor(self, c):
         kp = crypto.Keypair.generate()
         anchor_node = c.boot_replica(c.anchor)
         c.wait_head(c.nodes[0].store.head(), nodes=[anchor_node])
-        anchor_s = anchor_node.session()
+        anchor_s = anchor_node.session_rw()
         w = anchor_node.store.mgmt_writer
         c.wait_settled(
             anchor_s.submit(
@@ -44,7 +44,7 @@ class TestCompactionEndToEnd(unittest.TestCase):
     def _compactor_session(self, c, compactor_kp):
         rn = c.boot_replica(compactor_kp)
         c.wait_head(c.nodes[0].store.head(), nodes=[rn])
-        return rn.session(store_id=ops.STORE_MANAGEMENT)
+        return rn.session_rw(store_id=ops.STORE_MANAGEMENT)
 
     def _submit_pivot(self, c, cs):
         block_num = c.nodes[0].store.head_block_num() or 0
@@ -102,7 +102,7 @@ class TestCompactionEndToEnd(unittest.TestCase):
 
     def test_full_compaction_through_consensus(self):
         with Cluster(nodes=3, mgmt=1) as c:
-            s = c.replicas[0].session()
+            s = c.replicas[0].session_rw()
             last = None
             for i in range(5):
                 last = s.put(f"data-{i}", f"value-{i}".encode()).wait()
@@ -122,7 +122,7 @@ class TestCompactionEndToEnd(unittest.TestCase):
 
     def test_gc_all_nodes_then_joiner_catches_up(self):
         with Cluster(nodes=3, mgmt=1) as c:
-            s = c.replicas[0].session()
+            s = c.replicas[0].session_rw()
             last = None
             for i in range(5):
                 last = s.put(f"k{i}", f"v{i}".encode()).wait()
@@ -158,7 +158,7 @@ class TestCompactionEndToEnd(unittest.TestCase):
 
     def test_all_nodes_converge_after_gc(self):
         with Cluster(nodes=3, mgmt=1) as c:
-            s = c.replicas[0].session()
+            s = c.replicas[0].session_rw()
             last = None
             for i in range(5):
                 last = s.put(f"d{i}", f"v{i}".encode()).wait()
@@ -186,7 +186,7 @@ class TestCompactionEndToEnd(unittest.TestCase):
 
     def test_consecutive_pivots(self):
         with Cluster(nodes=3, mgmt=1) as c:
-            s = c.replicas[0].session()
+            s = c.replicas[0].session_rw()
             last = None
             for i in range(3):
                 last = s.put(f"wave1-{i}", f"a{i}".encode()).wait()

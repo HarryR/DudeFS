@@ -11,7 +11,7 @@ from .cluster import Cluster
 class TestManagedMap(unittest.TestCase):
     def setUp(self) -> None:
         self.c = Cluster(nodes=3, mgmt=1)
-        self.s = self.c.replicas[0].session(store_id=ops.STORE_MANAGEMENT)
+        self.s = self.c.replicas[0].session_rw(store_id=ops.STORE_MANAGEMENT)
         self.m = ManagedMap(b"test/", self.s)
 
     def tearDown(self) -> None:

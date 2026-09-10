@@ -48,7 +48,7 @@ def run(cfg: DudeConfig) -> None:
             raise CLIError("light client failed to bootstrap")
         block_num = head.head.anchors.block_num
 
-        s = lc.session(store_id=ops.STORE_MANAGEMENT)
+        s = lc.session_rw(store_id=ops.STORE_MANAGEMENT)
         result = s.submit(MgmtWriter(s).compact(block_num)).wait()
         if not isinstance(result, Settled):
             raise CLIError(f"compact transaction did not settle: {result!r}")
@@ -76,7 +76,7 @@ def _run_compaction_cycle(rn, kp: crypto.Keypair) -> None:
     if head_num is None or head_num < 2:
         return
 
-    s = rn.session(store_id=ops.STORE_MANAGEMENT)
+    s = rn.session_rw(store_id=ops.STORE_MANAGEMENT)
     result = s.submit(MgmtWriter(s).compact(head_num)).wait()
     if not isinstance(result, Settled):
         log.warning("compact did not settle: %r", result)

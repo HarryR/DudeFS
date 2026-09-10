@@ -15,7 +15,7 @@ class TestCompactorFromReplicaNode(unittest.TestCase):
     def test_replica_compactor_submits_pivot(self):
         c = Cluster(nodes=3, mgmt=1)
         try:
-            s = c.replicas[0].session()
+            s = c.replicas[0].session_rw()
             last = None
             for i in range(3):
                 last = s.put(f"k{i}", f"v{i}".encode()).wait()
@@ -33,11 +33,11 @@ class TestCompactorFromReplicaNode(unittest.TestCase):
                 pop=compactor_kp.prove_possession(),
                 cert=Cert.sign_grant(c.anchor, compactor_kp.public, Role.COMPACTOR),
             )
-            c.wait_settled(anchor_node.session().submit(grant).wait())
+            c.wait_settled(anchor_node.session_rw().submit(grant).wait())
 
             compactor_node = c.boot_replica(compactor_kp)
             c.wait_head(c.nodes[0].store.head(), nodes=[compactor_node])
-            cs = compactor_node.session(store_id=ops.STORE_MANAGEMENT)
+            cs = compactor_node.session_rw(store_id=ops.STORE_MANAGEMENT)
 
             block_num = c.nodes[0].store.head_block_num() or 0
             c.wait_settled(cs.submit(MgmtWriter(cs).compact(block_num)).wait())
@@ -52,7 +52,7 @@ class TestCompactorFromLightClient(unittest.TestCase):
     def test_light_client_compactor_submits_pivot(self):
         c = Cluster(nodes=3, mgmt=1, rw=0)
         try:
-            s = c.replicas[0].session()
+            s = c.replicas[0].session_rw()
             last = None
             for i in range(3):
                 last = s.put(f"k{i}", f"v{i}".encode()).wait()
@@ -70,7 +70,7 @@ class TestCompactorFromLightClient(unittest.TestCase):
                 pop=compactor_kp.prove_possession(),
                 cert=Cert.sign_grant(c.anchor, compactor_kp.public, Role.COMPACTOR),
             )
-            c.wait_settled(anchor_node.session().submit(grant).wait())
+            c.wait_settled(anchor_node.session_rw().submit(grant).wait())
 
             postman = Postman(compactor_kp, c.tunables, on_output=OutputQueue())
             c.fabric.attach(postman)
@@ -83,7 +83,7 @@ class TestCompactorFromLightClient(unittest.TestCase):
             lc.start()
             lc.bootstrap()
 
-            cs = lc.session(store_id=ops.STORE_MANAGEMENT)
+            cs = lc.session_rw(store_id=ops.STORE_MANAGEMENT)
             assert lc.trusted_state is not None
             block_num = lc.trusted_state.head.anchors.block_num
             c.wait_settled(cs.submit(MgmtWriter(cs).compact(block_num)).wait())

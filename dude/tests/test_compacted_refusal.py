@@ -38,7 +38,7 @@ class TestServeGetblocksCompacted(unittest.TestCase):
     def test_gc_then_request_returns_compacted(self):
         c = Cluster(nodes=3, mgmt=1)
         try:
-            s = c.replicas[0].session()
+            s = c.replicas[0].session_rw()
             last = None
             for i in range(3):
                 last = s.put(f"k{i}", f"v{i}".encode()).wait()
@@ -59,7 +59,7 @@ class TestServeGetblocksCompacted(unittest.TestCase):
     def test_request_above_gc_returns_blocks(self):
         c = Cluster(nodes=3, mgmt=1)
         try:
-            s = c.replicas[0].session()
+            s = c.replicas[0].session_rw()
             c.wait_settled(s.put("x", b"y").wait())
 
             store = c.nodes[0].store

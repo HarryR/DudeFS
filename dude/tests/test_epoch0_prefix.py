@@ -15,12 +15,10 @@ from ..ds.plaintext_map import PlaintextMap
 from ..ds.queue import Queue
 from ..net.socket_server import SocketServer
 from ..net.socket_substrate import SocketSubstrate
-from ..node import _ReplicaSubstrate
 from ..session import SessionRW, Substrate
 from ..store import management, ops, smt
 from ..store.settle import Reason
 from ..store.store import Store
-from ..sync.lite_client import _LiteSubstrate
 from ..tests.cluster import Cluster
 
 # ---------------------------------------------------------------------------
@@ -250,7 +248,7 @@ class TestReplicaSubstrate(_SubstrateTests):
 
     def setUp(self) -> None:
         self.c = Cluster(nodes=3, mgmt=1)
-        s = self.c.replicas[0].session()
+        s = self.c.replicas[0].session_rw()
         for i in range(3):
             s.put(f"t/{i}", f"v{i}".encode(), plaintext=True).wait()
         self.c.wait_settled(s.put("t/3", b"v3", plaintext=True).wait())
@@ -259,10 +257,10 @@ class TestReplicaSubstrate(_SubstrateTests):
         self.c.close()
 
     def _substrate(self) -> Substrate:
-        return _ReplicaSubstrate(self.c.replicas[0])
+        return self.c.replicas[0].substrate()
 
     def _session(self) -> SessionRW:
-        return self.c.replicas[0].session()
+        return self.c.replicas[0].session_rw()
 
 
 # ---------------------------------------------------------------------------
@@ -277,12 +275,12 @@ class TestSocketSubstrate(_SubstrateTests):
         self.c = Cluster(nodes=3, mgmt=1)
         self._tmpdir = tempfile.mkdtemp()
         self._sock_path = os.path.join(self._tmpdir, "test.sock")
-        self._real_sub = _ReplicaSubstrate(self.c.replicas[0])
+        self._real_sub = self.c.replicas[0].substrate()
         self._server = SocketServer(self._sock_path, self._real_sub)
         self._server.start()
         self._sub = SocketSubstrate(self._sock_path, self.c.tunables)
 
-        s = self.c.replicas[0].session()
+        s = self.c.replicas[0].session_rw()
         for i in range(3):
             s.put(f"t/{i}", f"v{i}".encode(), plaintext=True).wait()
         self.c.wait_settled(s.put("t/3", b"v3", plaintext=True).wait())
@@ -313,7 +311,7 @@ class TestLightClientSubstrate(_SubstrateTests):
         self.lc = self.c.rw_clients[0]
         self.lc.bootstrap()
 
-        s = self.lc.session()
+        s = self.lc.session_rw()
         for i in range(3):
             s.put(f"t/{i}", f"v{i}".encode(), plaintext=True).wait()
         self.c.wait_settled(s.put("t/3", b"v3", plaintext=True).wait())
@@ -323,10 +321,10 @@ class TestLightClientSubstrate(_SubstrateTests):
         self.c.close()
 
     def _substrate(self) -> Substrate:
-        return _LiteSubstrate(self.lc)
+        return self.lc.substrate()
 
     def _session(self) -> SessionRW:
-        return self.lc.session()
+        return self.lc.session_rw()
 
 
 # ---------------------------------------------------------------------------
@@ -337,7 +335,7 @@ class TestLightClientSubstrate(_SubstrateTests):
 class TestPlaintextMap(unittest.TestCase):
     def setUp(self) -> None:
         self.c = Cluster(nodes=3, mgmt=1)
-        self.session = self.c.replicas[0].session()
+        self.session = self.c.replicas[0].session_rw()
         self.m = PlaintextMap(b"pm/", self.session)
 
     def tearDown(self) -> None:
@@ -475,7 +473,7 @@ class TestPMReplica(_PlaintextMapSubstrateTests):
 
     def setUp(self) -> None:
         self.c = Cluster(nodes=3, mgmt=1)
-        s = self.c.replicas[0].session()
+        s = self.c.replicas[0].session_rw()
         for i in range(4):
             s.put(f"pm/{i}", f"v{i}".encode(), plaintext=True).wait()
         self.c.wait_settled(s.put("pm/3", b"v3", plaintext=True).wait())
@@ -484,7 +482,7 @@ class TestPMReplica(_PlaintextMapSubstrateTests):
         self.c.close()
 
     def _session(self) -> SessionRW:
-        return self.c.replicas[0].session()
+        return self.c.replicas[0].session_rw()
 
     def _submit(self, tx: ops.Transaction) -> None:
         self.c.wait_settled(self._session().submit(tx).wait())
@@ -497,12 +495,12 @@ class TestPMSocket(_PlaintextMapSubstrateTests):
         self.c = Cluster(nodes=3, mgmt=1)
         self._tmpdir = tempfile.mkdtemp()
         self._sock_path = os.path.join(self._tmpdir, "test.sock")
-        self._real_sub = _ReplicaSubstrate(self.c.replicas[0])
+        self._real_sub = self.c.replicas[0].substrate()
         self._server = SocketServer(self._sock_path, self._real_sub)
         self._server.start()
         self._sub = SocketSubstrate(self._sock_path, self.c.tunables)
 
-        s = self.c.replicas[0].session()
+        s = self.c.replicas[0].session_rw()
         for i in range(4):
             s.put(f"pm/{i}", f"v{i}".encode(), plaintext=True).wait()
         self.c.wait_settled(s.put("pm/3", b"v3", plaintext=True).wait())
@@ -528,7 +526,7 @@ class TestPMLiteClient(_PlaintextMapSubstrateTests):
         self.lc = self.c.rw_clients[0]
         self.lc.bootstrap()
 
-        s = self.lc.session()
+        s = self.lc.session_rw()
         for i in range(4):
             s.put(f"pm/{i}", f"v{i}".encode(), plaintext=True).wait()
         self.c.wait_settled(s.put("pm/3", b"v3", plaintext=True).wait())
@@ -538,7 +536,7 @@ class TestPMLiteClient(_PlaintextMapSubstrateTests):
         self.c.close()
 
     def _session(self) -> SessionRW:
-        return self.lc.session()
+        return self.lc.session_rw()
 
     def _submit(self, tx: ops.Transaction) -> None:
         self.c.wait_settled(self._session().submit(tx).wait())
@@ -547,7 +545,7 @@ class TestPMLiteClient(_PlaintextMapSubstrateTests):
 class TestQueue(unittest.TestCase):
     def setUp(self) -> None:
         self.c = Cluster(nodes=3, mgmt=1)
-        self.session = self.c.replicas[0].session()
+        self.session = self.c.replicas[0].session_rw()
         self.q = Queue(b"q/", self.session)
 
     def tearDown(self) -> None:

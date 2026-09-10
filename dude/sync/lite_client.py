@@ -19,6 +19,7 @@ from ..participant import Participant
 from ..session import (
     InflightHandle,
     KeyCache,
+    SessionProvider,
     SessionRW,
     Settled,
     SubmitHandle,
@@ -186,7 +187,7 @@ class _BootstrapReply:
     anchors_reply: AnchorsReply | None = None
 
 
-class LightClient(Participant):
+class LightClient(Participant, SessionProvider):
     def __init__(
         self,
         me: crypto.Keypair,
@@ -514,9 +515,11 @@ class LightClient(Participant):
             self.on_block(walked)
         return True
 
-    def session(self, store_id: int = 1) -> SessionRW:
-        sub = _LiteSubstrate(self)
-        return SessionRW(sub, store_id)
+    def substrate(self) -> Substrate:
+        return _LiteSubstrate(self)
+
+    def session_rw(self, store_id: int = ops.STORE_DATA) -> SessionRW:
+        return SessionRW(self.substrate(), store_id)
 
 
 @dataclass(slots=True)
