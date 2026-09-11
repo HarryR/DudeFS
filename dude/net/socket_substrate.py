@@ -8,7 +8,7 @@ import threading
 from ..core import codec, crypto
 from ..core.errors import DudeError
 from ..core.units import Millis
-from ..session import SubmitHandle, SubmitResult, Substrate
+from ..session import Pending, SettleResult, SubmitHandle, Substrate, Unknown
 from ..store import ops
 from ..store.layer import BlockHead, Held
 from ..tunables import Tunables
@@ -134,13 +134,13 @@ class SocketSubstrate(Substrate):
         handle.mark_accepted()
         return handle
 
-    def settled(self, op_hash: crypto.Digest) -> SubmitResult | None:
+    def tx_status(self, op_hash: crypto.Digest) -> SettleResult:
         reply = self._request(Request.QUERY, bytes(op_hash))
         if reply == QUERY_PENDING:
-            return None
+            return Pending()
         if reply == QUERY_UNKNOWN:
-            raise SocketSubstrateError(f"server has no record of {op_hash.hex()[:16]}")
-        return SubmitResult.decode(reply)
+            return Unknown()
+        return SettleResult.decode(reply)
 
     def evict_after_sec(self) -> float:
         if self._evict_cache is None:

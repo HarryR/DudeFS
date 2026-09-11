@@ -9,7 +9,7 @@ from dude.consensus.bootstrap import bootstrap, intervene, mint_first_keyepoch
 from dude.core import codec, crypto
 from dude.core.errors import DudeError
 from dude.core.units import Millis
-from dude.session import KeyCache, SessionRW, SubmitHandle, SubmitResult, Substrate
+from dude.session import KeyCache, SessionRW, SettleResult, SubmitHandle, Substrate
 from dude.store import ops, settle
 from dude.store.layer import Held
 from dude.store.management import Cert, MgmtWriter, Role, epoch_key
@@ -73,7 +73,7 @@ class _StoreSubstrate(Substrate):
     def submit(self, tx: ops.Transaction) -> SubmitHandle:
         raise NotImplementedError
 
-    def settled(self, op_hash: crypto.Digest) -> SubmitResult | None:
+    def tx_status(self, op_hash: crypto.Digest) -> SettleResult:
         raise NotImplementedError
 
     def evict_after_sec(self) -> float:

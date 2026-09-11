@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 
 from ..ds.managed_map import ManagedMap
-from ..session import Refused, Settled
+from ..session import Settled, SubmitRefused
 from ..store import ops
 from .cluster import Cluster
 
@@ -22,7 +22,7 @@ class TestManagedMap(unittest.TestCase):
         if isinstance(result, Settled):
             self.c.wait_settled(result)
             return True
-        if isinstance(result, Refused):
+        if isinstance(result, SubmitRefused):
             return False
         raise AssertionError(f"expected Settled or Refused, got {result!r}")
 

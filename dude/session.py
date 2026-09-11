@@ -27,6 +27,18 @@ from .store.ops import (
 class SessionError(DudeError): ...
 
 
+class SessionTimeoutError(SessionError): ...
+
+
+class AckTimeoutError(SessionTimeoutError): ...
+
+
+class SettleTimeoutError(SessionTimeoutError): ...
+
+
+class TxStatusTimeoutError(SessionTimeoutError): ...
+
+
 @dataclass(frozen=True, slots=True)
 class Record:
     name: str | bytes
@@ -38,52 +50,70 @@ class Record:
     absent: bool
 
 
-class SubmitResult(ABC):
-    @abstractmethod
-    def encode(self) -> bytes: ...
+# -- result type hierarchies ------------------------------------------------
 
-    @classmethod
-    def decode(cls, raw: bytes) -> "SubmitResult":
-        parts = codec.as_seq(codec.decode(raw))
-        tag = codec.as_bytes(parts[0])
-        if tag == b"S":
-            return Settled(
-                crypto.Digest(codec.as_bytes(parts[1])),
-                codec.as_int(parts[2]),
-                crypto.Digest(codec.as_bytes(parts[3])),
-            )
-        if tag == b"R":
-            return Refused(codec.as_bytes(parts[1]).decode())
-        if tag == b"D":
-            reason = codec.as_bytes(parts[1]).decode() if len(parts) > 1 else ""
-            return Dropped(reason)
-        raise DudeError(f"unknown SubmitResult tag: {tag!r}")
+
+class AckResult: ...
 
 
 @dataclass(frozen=True, slots=True)
-class Settled(SubmitResult):
+class Accepted(AckResult):
     op_hash: crypto.Digest
-    block_num: Index
-    block_hash: crypto.Digest
-
-    def encode(self) -> bytes:
-        return codec.encode([b"S", self.op_hash, self.block_num, self.block_hash])
 
 
 @dataclass(frozen=True, slots=True)
-class Refused(SubmitResult):
+class SubmitRefused(AckResult):
     reason: str
 
     def encode(self) -> bytes:
         return codec.encode([b"R", self.reason.encode()])
 
 
+class SettleResult:
+    def encode(self) -> bytes:
+        raise NotImplementedError
+
+    @staticmethod
+    def decode(raw: bytes) -> "Settled | Pending | Unknown":
+        parts = codec.as_seq(codec.decode(raw))
+        tag = codec.as_bytes(parts[0])
+        if tag == b"settled":
+            p = codec.as_seq(codec.decode(raw), 4)
+            return Settled(
+                crypto.Digest(codec.as_bytes(p[1])),
+                codec.as_int(p[2]),
+                crypto.Digest(codec.as_bytes(p[3])),
+            )
+        if tag == b"pending":
+            return Pending()
+        if tag == b"unknown":
+            return Unknown()
+        raise SessionError(f"unknown settle tag: {tag!r}")
+
+
 @dataclass(frozen=True, slots=True)
-class Dropped(SubmitResult):
-    reason: str = ""
+class Settled(SettleResult):
+    op_hash: crypto.Digest
+    block_num: Index
+    block_hash: crypto.Digest
 
     def encode(self) -> bytes:
-        return codec.encode([b"D", self.reason.encode()])
+        return codec.encode([b"settled", self.op_hash, self.block_num, self.block_hash])
+
+
+@dataclass(frozen=True, slots=True)
+class Pending(SettleResult):
+    def encode(self) -> bytes:
+        return codec.encode([b"pending"])
+
+
+@dataclass(frozen=True, slots=True)
+class Unknown(SettleResult):
+    def encode(self) -> bytes:
+        return codec.encode([b"unknown"])
+
+
+# -- inflight tracking ------------------------------------------------------
 
 
 class InflightHandle(ABC):
@@ -130,6 +160,7 @@ class SubmitHandle(InflightHandle):
     peer: crypto.PublicKey | None = None
     _accepted: bool = False
     _refused_reason: str | None = None
+    _expired: bool = False
     _ack: threading.Event = field(default_factory=threading.Event)
 
     def on_reply(self, verb: Verb, body: bytes) -> None:
@@ -145,38 +176,50 @@ class SubmitHandle(InflightHandle):
 
     def on_expired(self) -> None:
         if not self._accepted and self._refused_reason is None:
-            self._refused_reason = "expired"
+            self._expired = True
         self._ack.set()
 
-    def poll(self) -> SubmitResult | None:
-        if self._refused_reason is not None:
-            return Refused(self._refused_reason)
-        return self._sub.settled(self.op_hash)
-
-    def wait(self) -> SubmitResult:
+    def wait_ack(self) -> AckResult:
         evict = self._sub.evict_after_sec()
         if not self._ack.wait(evict):
-            return Dropped("no acknowledgement from node")
+            raise AckTimeoutError("no reply from node")
         if self._refused_reason is not None:
-            return Refused(self._refused_reason)
+            return SubmitRefused(self._refused_reason)
+        if self._expired:
+            raise AckTimeoutError("message expired")
+        return Accepted(self.op_hash)
+
+    def wait_settled(self) -> SettleResult:
+        evict = self._sub.evict_after_sec()
         deadline = time.monotonic() + evict
         while time.monotonic() < deadline:
             gen = self._sub.commit_seq
-            result = self._sub.settled(self.op_hash)
-            if result is not None:
-                return result
+            status = self._sub.tx_status(self.op_hash)
+            if not isinstance(status, Pending):
+                return status
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
             self._sub.wait_for_commit(min(remaining, evict), since=gen)
-        return Dropped("settlement timeout after acceptance")
+        raise SettleTimeoutError("settlement not observed within timeout")
+
+    def poll(self) -> AckResult | SettleResult:
+        if self._refused_reason is not None:
+            return SubmitRefused(self._refused_reason)
+        return self._sub.tx_status(self.op_hash)
+
+    def wait(self) -> AckResult | SettleResult:
+        ack = self.wait_ack()
+        if not isinstance(ack, Accepted):
+            return ack
+        return self.wait_settled()
 
 
 class Substrate(Reader, ABC):
     @abstractmethod
     def submit(self, tx: Transaction) -> "SubmitHandle": ...
     @abstractmethod
-    def settled(self, op_hash: crypto.Digest) -> "SubmitResult | None": ...
+    def tx_status(self, op_hash: crypto.Digest) -> SettleResult: ...
     @abstractmethod
     def evict_after_sec(self) -> float: ...
     @abstractmethod

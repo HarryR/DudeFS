@@ -9,7 +9,7 @@ from ..core import codec, crypto
 from ..core.errors import DudeError
 from ..net.envelope import Verb
 from ..net.postman import Encodable
-from .refusal import SyncRefusal
+from .refusal import SyncRefusedReason
 
 
 class SyncAdapterError(DudeError): ...
@@ -111,10 +111,10 @@ class SettledBlockReply(SyncMsg):
 
 
 @dataclass(frozen=True, slots=True)
-class Refused(SyncMsg):
+class SyncRefused(SyncMsg):
     verb: ClassVar[Verb] = Verb.SYNC_REFUSED
 
-    reason: SyncRefusal
+    reason: SyncRefusedReason
     checkpoint_block_num: int | None = None
 
     def encode_inner(self) -> bytes:
@@ -123,16 +123,16 @@ class Refused(SyncMsg):
         return self.reason.value.encode()
 
     @classmethod
-    def decode_inner(cls, body: bytes) -> Refused:
+    def decode_inner(cls, body: bytes) -> SyncRefused:
         try:
             parts = codec.as_seq(codec.decode(body))
-            reason = SyncRefusal(codec.as_bytes(parts[0]).decode("utf-8"))
+            reason = SyncRefusedReason(codec.as_bytes(parts[0]).decode("utf-8"))
             block_num = codec.as_int(parts[1]) if len(parts) > 1 else None
             return cls(reason=reason, checkpoint_block_num=block_num)
         except (DudeError, ValueError, UnicodeDecodeError):
             pass
         try:
-            reason = SyncRefusal(body.decode("utf-8"))
+            reason = SyncRefusedReason(body.decode("utf-8"))
         except (ValueError, UnicodeDecodeError) as e:
             raise SyncAdapterError(f"unknown SYNC_REFUSED reason: {body!r}") from e
         return cls(reason=reason)
@@ -143,7 +143,7 @@ _SYNC_MSG_CLASSES: tuple[type[SyncMsg], ...] = (
     HeightReply,
     GetBlocks,
     SettledBlockReply,
-    Refused,
+    SyncRefused,
 )
 
 _SYNC_MSG_VERB_TO_CLASS: dict[Verb, type[SyncMsg]] = {c.verb: c for c in _SYNC_MSG_CLASSES}
@@ -153,8 +153,8 @@ __all__ = [
     "GetBlocks",
     "HeightAsk",
     "HeightReply",
-    "Refused",
     "SettledBlockReply",
     "SyncAdapterError",
     "SyncMsg",
+    "SyncRefused",
 ]

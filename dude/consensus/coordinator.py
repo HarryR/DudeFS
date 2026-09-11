@@ -108,7 +108,6 @@ class _Settling:
 class Coordinator:
     __slots__ = (
         "_bucket_timer",
-        "_force_close",
         "_loop",
         "_round_abandon_timer",
         "_round_close_timer",
@@ -142,7 +141,6 @@ class Coordinator:
         self.settling: _Settling | None = None
         self.current_bucket: Bucket = -1
         self._settle_stalls = 0
-        self._force_close = False
 
         self._round_close_timer: Scheduled[CoordinatorEvent] | None = None
         self._round_abandon_timer: Scheduled[CoordinatorEvent] | None = None
@@ -177,11 +175,6 @@ class Coordinator:
         if not self.in_roster:
             return Refusal.NOT_IN_ROSTER
         return self.mempool.admit(tx, now, self.store, self.mgmt_reader)
-
-    def set_immediate(self, enabled: bool = True) -> None:
-        self._force_close = enabled
-        if enabled:
-            self._loop.post(BucketTick())
 
     # -- properties ------------------------------------------------------------
 
@@ -380,16 +373,15 @@ class Coordinator:
             self._do_settle_abandoned()
 
     def _close_current_bucket(self, now: Millis) -> None:
-        forced = self._force_close
-        closed = self.current_bucket if forced else self._bucket_of(now) - 1
+        closed = self._bucket_of(now) - 1
         if self.current_round is not None:
             return
         if closed < self.current_bucket:
             return
-        if not forced and now >= self._close_by(closed):
+        if now >= self._close_by(closed):
             self.current_bucket = closed + 1
             return
-        if not forced and self.behind(now):
+        if self.behind(now):
             self.current_bucket = closed + 1
             return
         self._open_round(closed, self.mempool.snapshot(), now)

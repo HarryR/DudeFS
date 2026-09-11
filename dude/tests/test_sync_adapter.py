@@ -22,12 +22,12 @@ from ..sync.adapter import (
     GetBlocks,
     HeightAsk,
     HeightReply,
-    Refused,
     SettledBlockReply,
     SyncAdapterError,
     SyncMsg,
+    SyncRefused,
 )
-from ..sync.refusal import SyncRefusal
+from ..sync.refusal import SyncRefusedReason
 
 
 class TestHeightPoll(unittest.TestCase):
@@ -107,8 +107,8 @@ class TestRefusal(unittest.TestCase):
     """`Refused` bodies carry a closed-enum reason (#getblock-refuses-with-reason)."""
 
     def test_each_reason_roundtrips(self):
-        for reason in (SyncRefusal.NOT_YET_SETTLED, SyncRefusal.UNKNOWN):
-            msg = Refused(reason=reason)
+        for reason in (SyncRefusedReason.NOT_YET_SETTLED, SyncRefusedReason.UNKNOWN):
+            msg = SyncRefused(reason=reason)
             verb, body = msg.encode()
             self.assertIs(verb, Verb.SYNC_REFUSED)
             self.assertEqual(SyncMsg.decode(verb, body), msg)
@@ -130,13 +130,13 @@ class TestRefusal(unittest.TestCase):
         not send it, and if a byzantine one does, it lands on the same 'try another peer'
         branch as any other `Refused` reason. The port-safety property is what stops a Go
         zero-valued field silently meaning NOT_YET_SETTLED."""
-        _, body = Refused(reason=SyncRefusal.INVALID).encode()
+        _, body = SyncRefused(reason=SyncRefusedReason.INVALID).encode()
         self.assertEqual(
-            SyncMsg.decode(Verb.SYNC_REFUSED, body), Refused(reason=SyncRefusal.INVALID)
+            SyncMsg.decode(Verb.SYNC_REFUSED, body), SyncRefused(reason=SyncRefusedReason.INVALID)
         )
 
 
-class TestSubmitRefusalsAreNotSyncRefusals(unittest.TestCase):
+class TestSubmitRefusalsAreNotSyncRefusedReasons(unittest.TestCase):
     """SUBMIT and GETBLOCK refusals live on distinct verbs -- one verb carrying both
     vocabularies collides the first time their value spaces overlap."""
 
@@ -168,7 +168,7 @@ class TestSyncMsgIsAbstract(unittest.TestCase):
 
 
 class TestTheRefusalVocabularyIsOneClosedSet(unittest.TestCase):
-    """Both sync paths share `SyncRefusal`, and both are expected to match it EXHAUSTIVELY --
+    """Both sync paths share `SyncRefusedReason`, and both are expected to match it EXHAUSTIVELY --
     `Follower._on_refused` and `LightClient._on_read_reply`. Nothing at runtime notices a member
     with no case: a `match` without a wildcard just falls through. This pins the set so adding
     one is a decision that visits both handlers, the same reason encode/decode pairs are pinned
@@ -176,7 +176,7 @@ class TestTheRefusalVocabularyIsOneClosedSet(unittest.TestCase):
 
     def test_the_members_and_their_wire_strings(self):
         self.assertEqual(
-            [(r.name, r.value) for r in SyncRefusal],
+            [(r.name, r.value) for r in SyncRefusedReason],
             [
                 ("INVALID", "invalid"),
                 ("NOT_YET_SETTLED", "not-yet-settled"),
@@ -194,9 +194,9 @@ class TestTheRefusalVocabularyIsOneClosedSet(unittest.TestCase):
         )
 
     def test_every_member_survives_the_wire(self):
-        for reason in SyncRefusal:
-            verb, body = Refused(reason=reason).encode()
-            self.assertEqual(SyncMsg.decode(verb, body), Refused(reason=reason))
+        for reason in SyncRefusedReason:
+            verb, body = SyncRefused(reason=reason).encode()
+            self.assertEqual(SyncMsg.decode(verb, body), SyncRefused(reason=reason))
 
 
 if __name__ == "__main__":

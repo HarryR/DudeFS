@@ -249,9 +249,10 @@ class TestReplicaSubstrate(_SubstrateTests):
     def setUp(self) -> None:
         self.c = Cluster(nodes=3, mgmt=1)
         s = self.c.replicas[0].session_rw()
-        for i in range(3):
-            s.put(f"t/{i}", f"v{i}".encode(), plaintext=True).wait()
-        self.c.wait_settled(s.put("t/3", b"v3", plaintext=True).wait())
+        tx = s.begin()
+        for i in range(4):
+            tx.put(f"t/{i}", f"v{i}".encode(), plaintext=True)
+        self.c.wait_settled(tx.submit().wait())
 
     def tearDown(self) -> None:
         self.c.close()
@@ -261,11 +262,6 @@ class TestReplicaSubstrate(_SubstrateTests):
 
     def _session(self) -> SessionRW:
         return self.c.replicas[0].session_rw()
-
-
-# ---------------------------------------------------------------------------
-# SocketSubstrate
-# ---------------------------------------------------------------------------
 
 
 class TestSocketSubstrate(_SubstrateTests):
@@ -281,9 +277,10 @@ class TestSocketSubstrate(_SubstrateTests):
         self._sub = SocketSubstrate(self._sock_path, self.c.tunables)
 
         s = self.c.replicas[0].session_rw()
-        for i in range(3):
-            s.put(f"t/{i}", f"v{i}".encode(), plaintext=True).wait()
-        self.c.wait_settled(s.put("t/3", b"v3", plaintext=True).wait())
+        tx = s.begin()
+        for i in range(4):
+            tx.put(f"t/{i}", f"v{i}".encode(), plaintext=True)
+        self.c.wait_settled(tx.submit().wait())
 
     def tearDown(self) -> None:
         self._sub.close()
@@ -298,11 +295,6 @@ class TestSocketSubstrate(_SubstrateTests):
         return SessionRW(self._sub, ops.STORE_DATA)
 
 
-# ---------------------------------------------------------------------------
-# LightClient substrate
-# ---------------------------------------------------------------------------
-
-
 class TestLightClientSubstrate(_SubstrateTests):
     __test__ = True
 
@@ -312,9 +304,10 @@ class TestLightClientSubstrate(_SubstrateTests):
         self.lc.bootstrap()
 
         s = self.lc.session_rw()
-        for i in range(3):
-            s.put(f"t/{i}", f"v{i}".encode(), plaintext=True).wait()
-        self.c.wait_settled(s.put("t/3", b"v3", plaintext=True).wait())
+        tx = s.begin()
+        for i in range(4):
+            tx.put(f"t/{i}", f"v{i}".encode(), plaintext=True)
+        self.c.wait_settled(tx.submit().wait())
         s.get("t/0", plaintext=True)
 
     def tearDown(self) -> None:
@@ -474,9 +467,10 @@ class TestPMReplica(_PlaintextMapSubstrateTests):
     def setUp(self) -> None:
         self.c = Cluster(nodes=3, mgmt=1)
         s = self.c.replicas[0].session_rw()
+        tx = s.begin()
         for i in range(4):
-            s.put(f"pm/{i}", f"v{i}".encode(), plaintext=True).wait()
-        self.c.wait_settled(s.put("pm/3", b"v3", plaintext=True).wait())
+            tx.put(f"pm/{i}", f"v{i}".encode(), plaintext=True)
+        self.c.wait_settled(tx.submit().wait())
 
     def tearDown(self) -> None:
         self.c.close()
@@ -501,9 +495,10 @@ class TestPMSocket(_PlaintextMapSubstrateTests):
         self._sub = SocketSubstrate(self._sock_path, self.c.tunables)
 
         s = self.c.replicas[0].session_rw()
+        tx = s.begin()
         for i in range(4):
-            s.put(f"pm/{i}", f"v{i}".encode(), plaintext=True).wait()
-        self.c.wait_settled(s.put("pm/3", b"v3", plaintext=True).wait())
+            tx.put(f"pm/{i}", f"v{i}".encode(), plaintext=True)
+        self.c.wait_settled(tx.submit().wait())
 
     def tearDown(self) -> None:
         self._sub.close()
@@ -527,9 +522,10 @@ class TestPMLiteClient(_PlaintextMapSubstrateTests):
         self.lc.bootstrap()
 
         s = self.lc.session_rw()
+        tx = s.begin()
         for i in range(4):
-            s.put(f"pm/{i}", f"v{i}".encode(), plaintext=True).wait()
-        self.c.wait_settled(s.put("pm/3", b"v3", plaintext=True).wait())
+            tx.put(f"pm/{i}", f"v{i}".encode(), plaintext=True)
+        self.c.wait_settled(tx.submit().wait())
         s.get("pm/0", plaintext=True)
 
     def tearDown(self) -> None:

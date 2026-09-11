@@ -45,7 +45,7 @@ class Dialer(ABC):
     def stop(self) -> None: ...
 
 
-class Refused(Enum):
+class LinkSendRefused(Enum):
     CIRCUIT_OPEN = "circuit-open"
     TRANSPORT = "transport"
 
@@ -89,19 +89,19 @@ class Link:
     _close_notified: bool = field(default=False, init=False)
     on_close: Callable[[Link], None] | None = None
 
-    def send(self, frame: Frame, now: Millis) -> Refused | None:
+    def send(self, frame: Frame, now: Millis) -> LinkSendRefused | None:
         if self._closed:
-            return Refused.TRANSPORT
+            return LinkSendRefused.TRANSPORT
         if self.breaker_open:
             if now - self.breaker_opened_at < self._breaker_cooldown():
-                return Refused.CIRCUIT_OPEN
+                return LinkSendRefused.CIRCUIT_OPEN
             self.breaker_open = False
         try:
             self._send_frame(frame)
         except LinkError:
             self._on_failed(now)
             self.close()
-            return Refused.TRANSPORT
+            return LinkSendRefused.TRANSPORT
         self.msgs_sent += 1
         self.bytes_sent += len(frame.raw)
         self.last_activity = now

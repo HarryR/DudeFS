@@ -3,7 +3,7 @@ from __future__ import annotations
 from enum import Enum
 
 
-class SyncRefusal(Enum):
+class SyncRefusedReason(Enum):
     """ONE vocabulary for both sync paths. A node's block pull and a light client's read refused
     in two private enums that overlapped on `INVALID` and `NOT_YET_SETTLED` and disagreed about
     everything else, so neither side could match a peer's refusal exhaustively and both ended up

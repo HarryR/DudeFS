@@ -2,35 +2,35 @@ from __future__ import annotations
 
 import unittest
 
-from dude.sync.adapter import GetBlocks, Refused, SettledBlockReply, SyncMsg
+from dude.sync.adapter import GetBlocks, SettledBlockReply, SyncMsg, SyncRefused
 from dude.sync.follower import serve_getblocks
-from dude.sync.refusal import SyncRefusal
+from dude.sync.refusal import SyncRefusedReason
 from dude.tests.cluster import Cluster
 
 
 class TestCompactedRefusalWire(unittest.TestCase):
     def test_compacted_with_payload_roundtrips(self):
-        msg = Refused(reason=SyncRefusal.COMPACTED, checkpoint_block_num=42)
+        msg = SyncRefused(reason=SyncRefusedReason.COMPACTED, checkpoint_block_num=42)
         verb, body = msg.encode()
         decoded = SyncMsg.decode(verb, body)
-        assert isinstance(decoded, Refused)
-        self.assertEqual(decoded.reason, SyncRefusal.COMPACTED)
+        assert isinstance(decoded, SyncRefused)
+        self.assertEqual(decoded.reason, SyncRefusedReason.COMPACTED)
         self.assertEqual(decoded.checkpoint_block_num, 42)
 
     def test_plain_refusal_still_roundtrips(self):
-        msg = Refused(reason=SyncRefusal.NOT_YET_SETTLED)
+        msg = SyncRefused(reason=SyncRefusedReason.NOT_YET_SETTLED)
         verb, body = msg.encode()
         decoded = SyncMsg.decode(verb, body)
-        assert isinstance(decoded, Refused)
-        self.assertEqual(decoded.reason, SyncRefusal.NOT_YET_SETTLED)
+        assert isinstance(decoded, SyncRefused)
+        self.assertEqual(decoded.reason, SyncRefusedReason.NOT_YET_SETTLED)
         self.assertIsNone(decoded.checkpoint_block_num)
 
     def test_compacted_without_payload_roundtrips(self):
-        msg = Refused(reason=SyncRefusal.COMPACTED)
+        msg = SyncRefused(reason=SyncRefusedReason.COMPACTED)
         verb, body = msg.encode()
         decoded = SyncMsg.decode(verb, body)
-        assert isinstance(decoded, Refused)
-        self.assertEqual(decoded.reason, SyncRefusal.COMPACTED)
+        assert isinstance(decoded, SyncRefused)
+        self.assertEqual(decoded.reason, SyncRefusedReason.COMPACTED)
         self.assertIsNone(decoded.checkpoint_block_num)
 
 
@@ -50,8 +50,8 @@ class TestServeGetblocksCompacted(unittest.TestCase):
             store.gc_below(pivot)
 
             response = serve_getblocks(store, GetBlocks(frm=0, count=5), cap=10)
-            assert isinstance(response, Refused)
-            self.assertEqual(response.reason, SyncRefusal.COMPACTED)
+            assert isinstance(response, SyncRefused)
+            self.assertEqual(response.reason, SyncRefusedReason.COMPACTED)
             self.assertEqual(response.checkpoint_block_num, pivot)
         finally:
             c.close()
@@ -79,7 +79,7 @@ class TestServeGetblocksCompacted(unittest.TestCase):
             store = c.nodes[0].store
             future = (store.head_block_num() or 0) + 100
             response = serve_getblocks(store, GetBlocks(frm=future, count=5), cap=10)
-            assert isinstance(response, Refused)
-            self.assertEqual(response.reason, SyncRefusal.NOT_YET_SETTLED)
+            assert isinstance(response, SyncRefused)
+            self.assertEqual(response.reason, SyncRefusedReason.NOT_YET_SETTLED)
         finally:
             c.close()
