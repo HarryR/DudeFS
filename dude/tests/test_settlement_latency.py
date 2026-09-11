@@ -8,10 +8,8 @@ import unittest
 
 from ..net.socket_server import SocketServer
 from ..net.socket_substrate import SocketSubstrate
-from ..node import _ReplicaSubstrate
 from ..session import SessionRW, Settled
 from ..store import ops
-from ..sync.lite_client import _LiteSubstrate
 from .cluster import Cluster
 
 
@@ -26,14 +24,14 @@ class TestSettlementLatency(unittest.TestCase):
 
     def test_replica_direct(self) -> None:
         with Cluster(nodes=3, mgmt=1) as c:
-            self._measure(c.replicas[0].session(), c, "replica_direct")
+            self._measure(c.replicas[0].session_rw(), c, "replica_direct")
 
     def test_replica_via_socket(self) -> None:
         tmpdir = tempfile.mkdtemp()
         sock_path = os.path.join(tmpdir, "test.sock")
         try:
             with Cluster(nodes=3, mgmt=1) as c:
-                sub = _ReplicaSubstrate(c.replicas[0])
+                sub = c.replicas[0].substrate()
                 with (
                     SocketServer(sock_path, sub),
                     SocketSubstrate(sock_path, c.tunables) as client_sub,
@@ -46,7 +44,7 @@ class TestSettlementLatency(unittest.TestCase):
         with Cluster(nodes=3, mgmt=0, rw=1) as c:
             lc = c.rw_clients[0]
             lc.bootstrap()
-            self._measure(lc.session(), c, "lite_direct")
+            self._measure(lc.session_rw(), c, "lite_direct")
 
     def test_light_client_via_socket(self) -> None:
         tmpdir = tempfile.mkdtemp()
@@ -56,7 +54,7 @@ class TestSettlementLatency(unittest.TestCase):
                 lc = c.rw_clients[0]
                 lc.bootstrap()
 
-                sub = _LiteSubstrate(lc)
+                sub = lc.substrate()
                 with (
                     SocketServer(sock_path, sub),
                     SocketSubstrate(sock_path, c.tunables) as client_sub,

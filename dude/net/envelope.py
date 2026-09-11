@@ -35,8 +35,8 @@ class Verb(IntEnum):
     GET_CHUNKS = 37
     CHUNKS_REPLY = 38
     """A Node's answer to a Node's GETBLOCK. SEPARATE FROM `REFUSED`, which answers a client's
-    SUBMIT: one verb carried both, so the body was a `SyncRefusal` value or a `mempool.Refusal`
-    value depending on who sent it and nothing said which. The two value sets merely happened not
+    SUBMIT: one verb carried both, so the body was a `SyncRefusedReason` value or a
+    `mempool.Refusal` value depending on who sent it and nothing said which. The two value sets
     to overlap; both are still growing."""
 
     GET_ANCHORS = 40

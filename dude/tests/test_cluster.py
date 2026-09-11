@@ -10,7 +10,7 @@ D = ops.STORE_DATA
 class TestSessionViaReplicaNode(unittest.TestCase):
     def setUp(self) -> None:
         self.c = Cluster(nodes=3, mgmt=1, ro=0, rw=0)
-        self.s = self.c.replicas[0].session()
+        self.s = self.c.replicas[0].session_rw()
 
     def tearDown(self) -> None:
         self.c.close()
@@ -84,21 +84,21 @@ class TestSessionViaLightClient(unittest.TestCase):
         self.c.close()
 
     def test_put_and_get(self) -> None:
-        s = self.lc.session()
+        s = self.lc.session_rw()
         self.c.wait_settled(s.put("hello", b"world").wait())
         rec = s.get("hello")
         self.assertFalse(rec.absent)
         self.assertEqual(rec.value, b"world")
 
     def test_value_is_encrypted(self) -> None:
-        s = self.lc.session()
+        s = self.lc.session_rw()
         self.c.wait_settled(s.put("secret", b"plaintext").wait())
         rec = s.get("secret")
         self.assertNotEqual(rec.raw, b"plaintext")
         self.assertEqual(rec.value, b"plaintext")
 
     def test_guarded_put(self) -> None:
-        s = self.lc.session()
+        s = self.lc.session_rw()
         self.c.wait_settled(s.put("k", b"v1").wait())
         rec = s.get("k")
         self.c.wait_settled(s.put("k", b"v2", expect=rec).wait())

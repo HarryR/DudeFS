@@ -179,13 +179,6 @@ class Cluster:
 
     # -- forcing blocks (test acceleration) -----------------------------------
 
-    def set_immediate(self, enabled: bool = True) -> None:
-        for node in self.nodes:
-            node.set_immediate(enabled)
-
-    def force_block(self) -> None:
-        self.set_immediate(True)
-
     # -- waiting for convergence --------------------------------------------
 
     def _default_timeout(self, blocks: int = 10) -> float:

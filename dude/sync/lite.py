@@ -16,7 +16,7 @@ from .lite_adapter import (
     NthPrefix,
     ProofReply,
     RosterBundle,
-    SyncRefusal,
+    SyncRefusedReason,
 )
 
 
@@ -37,14 +37,14 @@ def _anchors(
     mgmt = r.mgmt_reader
     head_num = r.head_block_num()
     if not head_num:
-        return LiteRefused(SyncRefusal.NO_STATE)
+        return LiteRefused(SyncRefusedReason.NO_STATE)
     commitment = mgmt.roster_commitment()
     if commitment is None:
-        return LiteRefused(SyncRefusal.NO_STATE)
+        return LiteRefused(SyncRefusedReason.NO_STATE)
 
     head_bytes = r.settled_at(head_num)
     if head_bytes is None:
-        return LiteRefused(SyncRefusal.INTERNAL)
+        return LiteRefused(SyncRefusedReason.INTERNAL)
     head_block = SettledBlock.decode(head_bytes)
 
     tb = request.known_trusted_block
@@ -53,9 +53,9 @@ def _anchors(
         if client_num <= head_num:
             client_bytes = r.settled_at(client_num)
             if client_bytes is None:
-                return LiteRefused(SyncRefusal.COMPACTED)
+                return LiteRefused(SyncRefusedReason.COMPACTED)
             if SettledBlock.decode(client_bytes).block_hash != client_hash:
-                return LiteRefused(SyncRefusal.FORK_DETECTED)
+                return LiteRefused(SyncRefusedReason.FORK_DETECTED)
 
     roster_fingerprint = crypto.Digest(commitment.cert.subject)
 
@@ -98,21 +98,21 @@ def _proof(
     mgmt = r.mgmt_reader
     head_num = r.head_block_num()
     if not head_num:
-        return LiteRefused(SyncRefusal.NO_STATE)
+        return LiteRefused(SyncRefusedReason.NO_STATE)
     if request.block_num > head_num:
-        return LiteRefused(SyncRefusal.NOT_YET_SETTLED)
+        return LiteRefused(SyncRefusedReason.NOT_YET_SETTLED)
     if request.block_num < 1:
-        return LiteRefused(SyncRefusal.MALFORMED_QUERY)
+        return LiteRefused(SyncRefusedReason.MALFORMED_QUERY)
     if not request.name:
-        return LiteRefused(SyncRefusal.MALFORMED_QUERY)
+        return LiteRefused(SyncRefusedReason.MALFORMED_QUERY)
 
     commitment = mgmt.roster_commitment()
     if commitment is None:
-        return LiteRefused(SyncRefusal.NO_STATE)
+        return LiteRefused(SyncRefusedReason.NO_STATE)
 
     head_bytes = r.settled_at(head_num)
     if head_bytes is None:
-        return LiteRefused(SyncRefusal.INTERNAL)
+        return LiteRefused(SyncRefusedReason.INTERNAL)
     head_block = SettledBlock.decode(head_bytes)
 
     tb = request.known_trusted_block
@@ -121,9 +121,9 @@ def _proof(
         if client_num <= head_num:
             client_bytes = r.settled_at(client_num)
             if client_bytes is None:
-                return LiteRefused(SyncRefusal.COMPACTED)
+                return LiteRefused(SyncRefusedReason.COMPACTED)
             if SettledBlock.decode(client_bytes).block_hash != client_hash:
-                return LiteRefused(SyncRefusal.FORK_DETECTED)
+                return LiteRefused(SyncRefusedReason.FORK_DETECTED)
 
     held = r.get(request.store_id, request.name)
     if held is None:
@@ -189,24 +189,24 @@ def serve_nth_prefix(
         mgmt = r.mgmt_reader
         head_num = r.head_block_num()
         if not head_num:
-            return LiteRefused(SyncRefusal.NO_STATE)
+            return LiteRefused(SyncRefusedReason.NO_STATE)
 
         result = r.nth_prefix(
             request.store_id, request.prefix, request.n, descending=request.descending
         )
         if result is None:
-            return LiteRefused(SyncRefusal.NOT_YET_SETTLED)
+            return LiteRefused(SyncRefusedReason.NOT_YET_SETTLED)
 
         name, held = result
         proof = r.prove(request.store_id, name).encode()
 
         commitment = mgmt.roster_commitment()
         if commitment is None:
-            return LiteRefused(SyncRefusal.NO_STATE)
+            return LiteRefused(SyncRefusedReason.NO_STATE)
 
         head_bytes = r.settled_at(head_num)
         if head_bytes is None:
-            return LiteRefused(SyncRefusal.INTERNAL)
+            return LiteRefused(SyncRefusedReason.INTERNAL)
         head_block = SettledBlock.decode(head_bytes)
 
         roster_fingerprint = crypto.Digest(commitment.cert.subject)

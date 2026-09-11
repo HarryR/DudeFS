@@ -7,7 +7,7 @@ import threading
 
 from ..core import codec, crypto
 from ..core.errors import DudeError
-from ..session import SubmitHandle, Substrate
+from ..session import Settled, SubmitHandle, SubmitRefused, Substrate
 from ..store import ops
 from .socket_framing import (
     QUERY_PENDING,
@@ -193,9 +193,12 @@ class _ClientHandler:
                     self._respond(Response.QUERY, corr_id, QUERY_UNKNOWN)
                     return
                 result = handle.poll()
-                if result is not None:
+                if isinstance(result, Settled):
                     self._inflight.pop(op_hash, None)
                     self._respond(Response.QUERY, corr_id, result.encode())
+                elif isinstance(result, SubmitRefused):
+                    self._inflight.pop(op_hash, None)
+                    self._respond(Response.QUERY, corr_id, QUERY_UNKNOWN)
                 else:
                     self._respond(Response.QUERY, corr_id, QUERY_PENDING)
             case Request.COUNT_PREFIX:

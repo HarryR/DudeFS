@@ -19,11 +19,13 @@ from ..participant import Participant
 from ..session import (
     InflightHandle,
     KeyCache,
+    SessionProvider,
     SessionRW,
-    Settled,
+    SettleResult,
     SubmitHandle,
-    SubmitResult,
     Substrate,
+    TxStatusTimeoutError,
+    Unknown,
 )
 from ..store import ops, smt
 from ..store.layer import BlockHead, Held
@@ -48,11 +50,9 @@ from .lite_adapter import (
     NthPrefix,
     ProofReply,
     RosterBundle,
-    SyncRefusal,
+    SyncRefusedReason,
     TrustedBlock,
     TxStatus,
-    TxStatusKind,
-    TxStatusReply,
 )
 
 
@@ -186,7 +186,7 @@ class _BootstrapReply:
     anchors_reply: AnchorsReply | None = None
 
 
-class LightClient(Participant):
+class LightClient(Participant, SessionProvider):
     def __init__(
         self,
         me: crypto.Keypair,
@@ -436,7 +436,7 @@ class LightClient(Participant):
         entry = req
         if isinstance(msg, LiteRefused):
             entry.result = Failed(reason=msg.reason.value)
-            if msg.reason in (SyncRefusal.FORK_DETECTED, SyncRefusal.COMPACTED):
+            if msg.reason in (SyncRefusedReason.FORK_DETECTED, SyncRefusedReason.COMPACTED):
                 self.state = State.UNBOOTSTRAPPED
                 self.trusted_state = None
                 if self.on_trust_lost is not None:
@@ -514,34 +514,29 @@ class LightClient(Participant):
             self.on_block(walked)
         return True
 
-    def session(self, store_id: int = 1) -> SessionRW:
-        sub = _LiteSubstrate(self)
-        return SessionRW(sub, store_id)
+    def substrate(self) -> Substrate:
+        return _LiteSubstrate(self)
+
+    def session_rw(self, store_id: int = ops.STORE_DATA) -> SessionRW:
+        return SessionRW(self.substrate(), store_id)
 
 
 @dataclass(slots=True)
 class _TxStatusHandle(InflightHandle):
     peer: crypto.PublicKey
     client: "LightClient"
-    result: TxStatusKind | None = None
-    block_num: int | None = None
-    block_hash: crypto.Digest | None = None
+    result: SettleResult | None = None
 
     def on_reply(self, verb: Verb, body: bytes) -> None:
-        try:
-            msg = LiteMsg.decode(verb, body)
-        except (LiteAdapterError, DudeError):
+        if verb != Verb.TX_STATUS_REPLY:
             return
-        if isinstance(msg, TxStatusReply):
-            self.result = msg.status
-            self.block_num = msg.block_num
-            self.block_hash = msg.block_hash
-            pv = self.client.peer_view(self.peer)
-            pv.last_activity = Millis.now()
-            pv.consecutive_failures = 0
+        self.result = SettleResult.decode(body)
+        pv = self.client.peer_view(self.peer)
+        pv.last_activity = Millis.now()
+        pv.consecutive_failures = 0
 
     def on_expired(self) -> None:
-        self.result = TxStatusKind.UNKNOWN
+        self.result = Unknown()
 
 
 @dataclass(slots=True)
@@ -789,7 +784,7 @@ class _LiteSubstrate(Substrate):
 
         return handle
 
-    def settled(self, op_hash: crypto.Digest) -> SubmitResult | None:
+    def tx_status(self, op_hash: crypto.Digest) -> SettleResult:
         peer = self._pick_peer()
         handle = _TxStatusHandle(peer=peer, client=self._lc)
         self._lc.request(peer, TxStatus(op_hash=op_hash), self._lc.tunables.ttl_lite, handle)
@@ -797,18 +792,12 @@ class _LiteSubstrate(Substrate):
         with self._lc.commit_cond:
             while Millis.now() < deadline_ms:
                 if handle.result is not None:
-                    if (
-                        handle.result is TxStatusKind.SETTLED
-                        and handle.block_num is not None
-                        and handle.block_hash is not None
-                    ):
-                        return Settled(op_hash, handle.block_num, handle.block_hash)
-                    return None
+                    return handle.result
                 remaining = Millis(deadline_ms - Millis.now()).as_seconds
                 if remaining <= 0:
                     break
                 self._lc.commit_cond.wait(remaining)
-        return None
+        raise TxStatusTimeoutError("no reply from consensus node")
 
     def evict_after_sec(self) -> float:
         return self._lc.tunables.evict_after.as_seconds

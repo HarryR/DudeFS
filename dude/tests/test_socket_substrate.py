@@ -6,7 +6,6 @@ import unittest
 
 from ..net.socket_server import SocketServer
 from ..net.socket_substrate import SocketSubstrate
-from ..node import _ReplicaSubstrate
 from ..session import SessionRW
 from ..store import ops
 from .cluster import Cluster
@@ -18,7 +17,7 @@ class TestSocketSubstrate(unittest.TestCase):
         self._tmpdir = tempfile.mkdtemp()
         self._sock_path = os.path.join(self._tmpdir, "test.sock")
         replica = self.c.replicas[0]
-        self._real_sub = _ReplicaSubstrate(replica)
+        self._real_sub = replica.substrate()
         self._server = SocketServer(self._sock_path, self._real_sub)
         self._server.start()
 

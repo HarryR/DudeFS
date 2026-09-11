@@ -71,7 +71,7 @@ class TestCheckpointRoundTrip(unittest.TestCase):
 
     def test_checkpoint_produces_matching_state(self):
         with Cluster(nodes=3, mgmt=1) as c:
-            s = c.replicas[0].session()
+            s = c.replicas[0].session_rw()
             last = None
             for i in range(5):
                 last = s.put(f"key-{i}", f"value-{i}".encode()).wait()
@@ -87,7 +87,7 @@ class TestCheckpointRoundTrip(unittest.TestCase):
 
     def test_post_pivot_replay_matches(self):
         with Cluster(nodes=3, mgmt=1) as c:
-            s = c.replicas[0].session()
+            s = c.replicas[0].session_rw()
             last = None
             for i in range(3):
                 last = s.put(f"early-{i}", f"v{i}".encode()).wait()
@@ -111,7 +111,7 @@ class TestCheckpointRoundTrip(unittest.TestCase):
 
     def test_holds_guards_pass_after_checkpoint(self):
         with Cluster(nodes=3, mgmt=1) as c:
-            s = c.replicas[0].session()
+            s = c.replicas[0].session_rw()
             c.wait_settled(s.put("guarded", b"v1").wait())
 
             source = c.nodes[0].store
@@ -128,7 +128,7 @@ class TestCheckpointRoundTrip(unittest.TestCase):
 
     def test_all_values_readable_after_checkpoint(self):
         with Cluster(nodes=3, mgmt=1) as c:
-            s = c.replicas[0].session()
+            s = c.replicas[0].session_rw()
             last = None
             for i in range(8):
                 last = s.put(f"key-{i}", f"value-{i}".encode()).wait()
@@ -149,7 +149,7 @@ class TestCheckpointRoundTrip(unittest.TestCase):
 
     def test_gc_then_checkpoint_then_replay(self):
         with Cluster(nodes=3, mgmt=1) as c:
-            s = c.replicas[0].session()
+            s = c.replicas[0].session_rw()
             last = None
             for i in range(5):
                 last = s.put(f"k{i}", f"v{i}".encode()).wait()

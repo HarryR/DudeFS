@@ -4,20 +4,20 @@ from .adapter import (
     GetBlocks,
     HeightAsk,
     HeightReply,
-    Refused,
     SettledBlockReply,
     SyncAdapterError,
     SyncMsg,
+    SyncRefused,
 )
-from .refusal import SyncRefusal
+from .refusal import SyncRefusedReason
 
 __all__ = [
     "GetBlocks",
     "HeightAsk",
     "HeightReply",
-    "Refused",
     "SettledBlockReply",
     "SyncAdapterError",
     "SyncMsg",
-    "SyncRefusal",
+    "SyncRefused",
+    "SyncRefusedReason",
 ]

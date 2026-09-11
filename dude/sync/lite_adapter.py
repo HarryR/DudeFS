@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from abc import abstractmethod
 from dataclasses import dataclass
-from enum import Enum
 from typing import ClassVar, Self
 
 from ..consensus.settle_round import SettledBlock
@@ -11,16 +10,10 @@ from ..core.errors import DudeError
 from ..net.envelope import Verb
 from ..net.postman import Encodable
 from ..store.management import Cert, Grant, NodeRecord
-from .refusal import SyncRefusal
+from .refusal import SyncRefusedReason
 
 
 class LiteAdapterError(DudeError): ...
-
-
-class TxStatusKind(Enum):
-    SETTLED = "settled"
-    PENDING = "pending"
-    UNKNOWN = "unknown"
 
 
 @dataclass(frozen=True, slots=True)
@@ -266,7 +259,7 @@ class ProofReply(LiteMsg):
 class LiteRefused(LiteMsg):
     verb: ClassVar[Verb] = Verb.LITE_REFUSED
 
-    reason: SyncRefusal
+    reason: SyncRefusedReason
 
     def encode_inner(self) -> bytes:
         return self.reason.value.encode()
@@ -274,7 +267,7 @@ class LiteRefused(LiteMsg):
     @classmethod
     def decode_inner(cls, body: bytes) -> LiteRefused:
         try:
-            reason = SyncRefusal(body.decode("utf-8"))
+            reason = SyncRefusedReason(body.decode("utf-8"))
         except (ValueError, UnicodeDecodeError) as e:
             raise LiteAdapterError(f"unknown LITE_REFUSED reason: {body!r}") from e
         return cls(reason=reason)
@@ -295,34 +288,6 @@ class TxStatus(LiteMsg):
             return cls(op_hash=crypto.Digest(codec.as_bytes(p[0])))
         except (DudeError, ValueError) as e:
             raise LiteAdapterError(f"malformed TX_STATUS body: {e}") from e
-
-
-@dataclass(frozen=True, slots=True)
-class TxStatusReply(LiteMsg):
-    verb: ClassVar[Verb] = Verb.TX_STATUS_REPLY
-    status: TxStatusKind
-    block_num: int | None = None
-    block_hash: crypto.Digest | None = None
-
-    def encode_inner(self) -> bytes:
-        if self.block_num is not None and self.block_hash is not None:
-            return codec.encode([self.status.value.encode(), self.block_num, self.block_hash])
-        return self.status.value.encode()
-
-    @classmethod
-    def decode_inner(cls, body: bytes) -> TxStatusReply:
-        try:
-            parts = codec.as_seq(codec.decode(body))
-            status = TxStatusKind(codec.as_bytes(parts[0]).decode("utf-8"))
-            block_num = codec.as_int(parts[1]) if len(parts) > 1 else None
-            block_hash = crypto.Digest(codec.as_bytes(parts[2])) if len(parts) > 2 else None
-            return cls(status=status, block_num=block_num, block_hash=block_hash)
-        except (DudeError, ValueError, UnicodeDecodeError):
-            pass
-        try:
-            return cls(status=TxStatusKind(body.decode("utf-8")))
-        except (ValueError, UnicodeDecodeError) as e:
-            raise LiteAdapterError(f"malformed TX_STATUS_REPLY body: {e}") from e
 
 
 @dataclass(frozen=True, slots=True)
@@ -410,7 +375,6 @@ _LITE_MSG_CLASSES: tuple[type[LiteMsg], ...] = (
     ProofReply,
     LiteRefused,
     TxStatus,
-    TxStatusReply,
     CountPrefix,
     CountPrefixReply,
     NthPrefix,

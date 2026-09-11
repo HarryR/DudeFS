@@ -8,7 +8,7 @@ from dude.tests.cluster import Cluster
 class TestStoreGC(unittest.TestCase):
     def setUp(self) -> None:
         self.c = Cluster(nodes=3, mgmt=1)
-        self.s = self.c.replicas[0].session()
+        self.s = self.c.replicas[0].session_rw()
 
     def tearDown(self) -> None:
         self.c.close()

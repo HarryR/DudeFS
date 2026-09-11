@@ -14,7 +14,7 @@ class TestColdJoinerCatchesUpViaCheckpoint(unittest.TestCase):
     def test_joiner_downloads_checkpoint_and_converges(self):
         c = Cluster(nodes=3, mgmt=1)
         try:
-            s = c.replicas[0].session()
+            s = c.replicas[0].session_rw()
             last = None
             for i in range(5):
                 last = s.put(f"k{i}", f"v{i}".encode()).wait()
@@ -22,7 +22,7 @@ class TestColdJoinerCatchesUpViaCheckpoint(unittest.TestCase):
 
             anchor_node = c.boot_replica(c.anchor)
             c.wait_head(c.nodes[0].store.head(), nodes=[anchor_node])
-            anchor_s = anchor_node.session()
+            anchor_s = anchor_node.session_rw()
             compactor_kp = crypto.Keypair.generate()
             w = anchor_node.store.mgmt_writer
             c.wait_settled(
@@ -39,7 +39,7 @@ class TestColdJoinerCatchesUpViaCheckpoint(unittest.TestCase):
 
             compactor_node = c.boot_replica(compactor_kp)
             c.wait_head(c.nodes[0].store.head(), nodes=[compactor_node])
-            cs = compactor_node.session(store_id=ops.STORE_MANAGEMENT)
+            cs = compactor_node.session_rw(store_id=ops.STORE_MANAGEMENT)
             c.wait_settled(
                 cs.submit(MgmtWriter(cs).compact(c.nodes[0].store.head_block_num() or 0)).wait()
             )

@@ -27,10 +27,10 @@ from .adapter import (
     GetBlocks,
     HeightAsk,
     HeightReply,
-    Refused,
     SettledBlockReply,
     SyncMsg,
-    SyncRefusal,
+    SyncRefused,
+    SyncRefusedReason,
 )
 
 
@@ -175,7 +175,7 @@ class Follower:
             self._on_height_reply(event.msg, event.frm, now)
         elif isinstance(event.msg, SettledBlockReply):
             self._on_settled_blocks(event.msg, event.frm, now)
-        elif isinstance(event.msg, Refused):
+        elif isinstance(event.msg, SyncRefused):
             self._on_refused(event.msg, event.frm, now)
 
     def _on_pull_cancelled(self, event: PullCancelled) -> None:
@@ -265,19 +265,19 @@ class Follower:
         self._loop.post(BlockCommitted())
         return True
 
-    def _on_refused(self, msg: Refused, from_: crypto.PublicKey, now: Millis) -> None:
+    def _on_refused(self, msg: SyncRefused, from_: crypto.PublicKey, now: Millis) -> None:
         p = self._pulling
         if p is None or from_ != p.peer:
             return
         self._cancel_pull_timer()
         self._pulling = None
-        if msg.reason is SyncRefusal.NOT_YET_SETTLED:
+        if msg.reason is SyncRefusedReason.NOT_YET_SETTLED:
             with self._shared_lock:
                 hr = self._heads.get(from_)
                 if hr is not None:
                     self._heads[from_] = replace(hr, block_num=p.frm - 1)
             self._try_pull()
-        elif msg.reason is SyncRefusal.COMPACTED and msg.checkpoint_block_num is not None:
+        elif msg.reason is SyncRefusedReason.COMPACTED and msg.checkpoint_block_num is not None:
             with self._shared_lock:
                 self._compacted_at[from_] = msg.checkpoint_block_num
             self._last_fail_at[from_] = now
@@ -413,9 +413,9 @@ def serve_getblocks(store: Store, req: GetBlocks, cap: int) -> SyncMsg:
     if not out:
         oldest = store.oldest_block_num()
         if oldest is not None and req.frm < oldest:
-            return Refused(
-                reason=SyncRefusal.COMPACTED,
+            return SyncRefused(
+                reason=SyncRefusedReason.COMPACTED,
                 checkpoint_block_num=oldest,
             )
-        return Refused(reason=SyncRefusal.NOT_YET_SETTLED)
+        return SyncRefused(reason=SyncRefusedReason.NOT_YET_SETTLED)
     return SettledBlockReply(payload=tuple(out))

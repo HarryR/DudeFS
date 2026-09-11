@@ -16,7 +16,7 @@ from dude.tests.cluster import Cluster
 class TestCompactTransaction(unittest.TestCase):
     def setUp(self) -> None:
         self.c = Cluster(nodes=3, mgmt=1)
-        self.s = self.c.replicas[0].session()
+        self.s = self.c.replicas[0].session_rw()
 
     def tearDown(self) -> None:
         self.c.close()
@@ -26,7 +26,7 @@ class TestCompactTransaction(unittest.TestCase):
         anchor_node = self.c.boot_replica(self.c.anchor)
         self.c.wait_head(self.c.nodes[0].store.head(), nodes=[anchor_node])
         self.c.wait_settled(
-            anchor_node.session()
+            anchor_node.session_rw()
             .submit(
                 anchor_node.store.mgmt_writer.authorise(
                     compactor_kp.public,
@@ -47,7 +47,7 @@ class TestCompactTransaction(unittest.TestCase):
     def _compactor_session(self, compactor_kp: crypto.Keypair):
         rn = self.c.boot_replica(compactor_kp)
         self.c.wait_head(self.c.nodes[0].store.head(), nodes=[rn])
-        return rn.session(store_id=ops.STORE_MANAGEMENT)
+        return rn.session_rw(store_id=ops.STORE_MANAGEMENT)
 
     def test_compactor_can_write_compact_key(self):
         compactor_kp = self._grant_compactor()

@@ -135,7 +135,7 @@ class TestLinkCounters(unittest.TestCase):
         lc = c.rw_clients[0]
         lc.bootstrap()
 
-        s = lc.session()
+        s = lc.session_rw()
         c.wait_settled(s.put("counter-test", b"v").wait())
 
         node = c.nodes[0]
@@ -206,7 +206,7 @@ class TestTCPFabric(unittest.TestCase):
         c = Cluster(nodes=3, mgmt=1, fabric=TCPFabric())
         c.wait_block(1)
 
-        s = c.replicas[0].session()
+        s = c.replicas[0].session_rw()
         c.wait_settled(s.put("tcp-test", b"works").wait())
         self.assertEqual(s.get("tcp-test").value, b"works")
 
@@ -219,7 +219,7 @@ class TestTCPFabric(unittest.TestCase):
         lc = c.rw_clients[0]
         lc.bootstrap()
 
-        s = lc.session()
+        s = lc.session_rw()
         c.wait_settled(s.put("tcp-counter", b"v").wait())
 
         node = c.nodes[0]
