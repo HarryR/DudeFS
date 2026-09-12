@@ -272,36 +272,49 @@ class _StoreKeys:
 
 
 class KeyCache:
-    __slots__ = ("_kp", "_reader", "_stores")
+    __slots__ = ("_kp", "_lock", "_reader", "_stores")
 
     def __init__(self, kp: crypto.Keypair, reader: Reader) -> None:
         self._kp = kp
         self._reader = reader
         self._stores: dict[int, _StoreKeys] = {}
+        self._lock = threading.Lock()
 
     def _keys(self, store_id: int) -> _StoreKeys:
         sk = self._stores.get(store_id)
-        if sk is None:
+        if sk is not None:
+            return sk
+        with self._lock:
+            sk = self._stores.get(store_id)
+            if sk is not None:
+                return sk
             sk = _StoreKeys()
             self._stores[store_id] = sk
-        return sk
+            return sk
 
     def ensure_blinding(self, store_id: int) -> crypto.NameKey:
         sk = self._keys(store_id)
         if sk.name_key is not None:
             return sk.name_key
-        raw = self._reader.get(STORE_MANAGEMENT, blind_key(store_id, self._kp.public))
-        if raw is None:
-            raise SessionError(
-                f"{self._kp.public.hex()[:8]} has no blinding key for store {store_id}"
-            )
-        sk.blinding = crypto.Master(self._kp.open_sealed_raw(crypto.SealedBlob(raw.value)))
-        sk.name_key = crypto.derive_name_key(sk.blinding)
-        return sk.name_key
+        with self._lock:
+            if sk.name_key is not None:
+                return sk.name_key
+            raw = self._reader.get(STORE_MANAGEMENT, blind_key(store_id, self._kp.public))
+            if raw is None:
+                raise SessionError(
+                    f"{self._kp.public.hex()[:8]} has no blinding key for store {store_id}"
+                )
+            sk.blinding = crypto.Master(self._kp.open_sealed_raw(crypto.SealedBlob(raw.value)))
+            sk.name_key = crypto.derive_name_key(sk.blinding)
+            return sk.name_key
 
     def value_key(self, store_id: int, epoch: int) -> crypto.ValueKey:
         sk = self._keys(store_id)
-        if epoch not in sk.masters:
+        if epoch in sk.masters:
+            return crypto.EpochKeys.derive(sk.masters[epoch]).value_key
+        with self._lock:
+            if epoch in sk.masters:
+                return crypto.EpochKeys.derive(sk.masters[epoch]).value_key
             raw = self._reader.get(
                 STORE_MANAGEMENT,
                 wrap_key(store_id, epoch, self._kp.public),
@@ -313,17 +326,20 @@ class KeyCache:
             sk.masters[epoch] = crypto.Master(
                 self._kp.open_sealed_raw(crypto.SealedBlob(raw.value))
             )
-        return crypto.EpochKeys.derive(sk.masters[epoch]).value_key
+            return crypto.EpochKeys.derive(sk.masters[epoch]).value_key
 
     def current_epoch(self, store_id: int) -> int:
         sk = self._keys(store_id)
         if sk.current_epoch is not None:
             return sk.current_epoch
-        raw = self._reader.get(STORE_MANAGEMENT, epoch_key(store_id))
-        if raw is None:
-            return EPOCH_NONE
-        sk.current_epoch = codec.as_int(codec.decode(raw.value))
-        return sk.current_epoch
+        with self._lock:
+            if sk.current_epoch is not None:
+                return sk.current_epoch
+            raw = self._reader.get(STORE_MANAGEMENT, epoch_key(store_id))
+            if raw is None:
+                return EPOCH_NONE
+            sk.current_epoch = codec.as_int(codec.decode(raw.value))
+            return sk.current_epoch
 
     def token(self, store_id: int, name: str, *, plaintext: bool = False) -> bytes:
         if plaintext:

@@ -200,8 +200,8 @@ class LightClient(Participant, SessionProvider):
         self.state: State = State.UNBOOTSTRAPPED
         self.trusted_state: TrustedState | None = None
         self.bootstrap_peers: dict[crypto.PublicKey, _BootstrapReply] = {}
-        self._key_cache: KeyCache | None = None
         self.peer_views: dict[crypto.PublicKey, PeerView] = {}
+        self._substrate = _LiteSubstrate(self)
 
         self.on_ready: Callable[[TrustedState], None] | None = None
         self.on_block: Callable[[SettledBlock], None] | None = None
@@ -290,8 +290,7 @@ class LightClient(Participant, SessionProvider):
     # -- the run loop -------------------------------------------------------
 
     def add_socket(self, path: str) -> SocketServer:
-        sub = _LiteSubstrate(self)
-        srv = SocketServer(path, sub)
+        srv = SocketServer(path, self._substrate)
         self._socket_servers.append(srv)
         return srv
 
@@ -516,10 +515,10 @@ class LightClient(Participant, SessionProvider):
         return True
 
     def substrate(self) -> Substrate:
-        return _LiteSubstrate(self)
+        return self._substrate
 
     def session_rw(self, store_id: int = ops.STORE_DATA) -> SessionRW:
-        return SessionRW(self.substrate(), store_id)
+        return SessionRW(self._substrate, store_id)
 
 
 @dataclass(slots=True)

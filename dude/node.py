@@ -153,6 +153,8 @@ class _BaseNode(Participant):
 
         super().__init__(me, Postman(me, tunables, on_output=_on_postman_output))
         self.store = store
+        self._key_cache = KeyCache(me, store)
+        self._substrate = _ReplicaSubstrate(self, self._key_cache)
         self._socket_servers: list[SocketServer] = []
 
         def _on_peers_changed(
@@ -191,8 +193,7 @@ class _BaseNode(Participant):
     # -- lifecycle ----------------------------------------------------------
 
     def add_socket(self, path: str) -> None:
-        sub = _ReplicaSubstrate(self)
-        srv = SocketServer(path, sub)
+        srv = SocketServer(path, self._substrate)
         self._socket_servers.append(srv)
 
     def __enter__(self):
@@ -748,10 +749,10 @@ class ReplicaNode(_BaseNode, SessionProvider):
         )
 
     def substrate(self) -> Substrate:
-        return _ReplicaSubstrate(self)
+        return self._substrate
 
     def session_rw(self, store_id: int = ops.STORE_DATA) -> SessionRW:
-        return SessionRW(self.substrate(), store_id)
+        return SessionRW(self._substrate, store_id)
 
     def _on_delivered(self, d: Delivered) -> None:
         if d.in_reply_to is not None and self.inflight.on_reply(
@@ -770,14 +771,9 @@ class ReplicaNode(_BaseNode, SessionProvider):
 class _ReplicaSubstrate(Substrate):
     __slots__ = ("_key_cache", "_node")
 
-    def __init__(self, node: _BaseNode) -> None:
+    def __init__(self, node: _BaseNode, key_cache: KeyCache) -> None:
         self._node = node
-        self._key_cache: KeyCache | None = None
-
-    def _ensure_cache(self) -> KeyCache:
-        if self._key_cache is None:
-            self._key_cache = KeyCache(self._node.me, self)
-        return self._key_cache
+        self._key_cache = key_cache
 
     def anchor(self) -> crypto.PublicKey:
         return self._node.store.anchor()
@@ -786,13 +782,13 @@ class _ReplicaSubstrate(Substrate):
         return self._node.store.get(store, name)
 
     def token(self, store_id: int, name: str, *, plaintext: bool = False) -> bytes:
-        return self._ensure_cache().token(store_id, name, plaintext=plaintext)
+        return self._key_cache.token(store_id, name, plaintext=plaintext)
 
     def seal(self, store_id: int, name: str, value: bytes, *, plaintext: bool = False) -> Sealed:
-        return self._ensure_cache().seal(store_id, name, value, plaintext=plaintext)
+        return self._key_cache.seal(store_id, name, value, plaintext=plaintext)
 
     def decrypt(self, store_id: int, name: str, ciphertext: bytes, epoch: int) -> bytes:
-        return self._ensure_cache().decrypt(store_id, name, ciphertext, epoch)
+        return self._key_cache.decrypt(store_id, name, ciphertext, epoch)
 
     def count_prefix(self, store: int, prefix: bytes) -> int:
         return self._node.store.count_prefix(store, prefix)
