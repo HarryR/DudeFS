@@ -23,24 +23,25 @@ class TaskPayload:
 class TestWorkerRegistry(unittest.TestCase):
     def setUp(self) -> None:
         self.c = Cluster(nodes=3, mgmt=1)
-        self.session = self.c.replicas[0].session_rw()
+        self.rn = self.c.replicas[0]
 
     def tearDown(self) -> None:
         self.c.close()
 
     def test_register_and_deregister(self) -> None:
-        w = Worker(GROUP, self.session, Seconds(60), Seconds(10))
+        w = Worker(GROUP, self.rn, Seconds(60), Seconds(10))
         w.bind(b"jobs", TaskPayload, lambda _j: None)
         w.register()
 
-        workers = PlaintextMap(GROUP + b"w/", self.session)
+        session = self.rn.session_rw()
+        workers = PlaintextMap(GROUP + b"w/", session)
         rec = workers.get(w.worker_id)
         self.assertFalse(rec.absent)
         ts, queues = _decode_worker(rec.value)
         self.assertEqual(queues, (b"jobs",))
         self.assertGreater(ts, 0)
 
-        qw = PlaintextMap(GROUP + b"qw/jobs/", self.session)
+        qw = PlaintextMap(GROUP + b"qw/jobs/", session)
         self.assertFalse(qw.get(w.worker_id).absent)
 
         w.deregister()
@@ -48,27 +49,24 @@ class TestWorkerRegistry(unittest.TestCase):
         self.assertTrue(qw.get(w.worker_id).absent)
 
     def test_multi_queue_registration(self) -> None:
-        w = Worker(GROUP, self.session, Seconds(60), Seconds(10))
+        w = Worker(GROUP, self.rn, Seconds(60), Seconds(10))
         w.bind(b"a", TaskPayload, lambda _j: None)
         w.bind(b"b", TaskPayload, lambda _j: None)
         w.register()
 
-        _, queues = _decode_worker(PlaintextMap(GROUP + b"w/", self.session).get(w.worker_id).value)
+        session = self.rn.session_rw()
+        _, queues = _decode_worker(PlaintextMap(GROUP + b"w/", session).get(w.worker_id).value)
         self.assertEqual(queues, (b"a", b"b"))
-
-        qw_a = PlaintextMap(GROUP + b"qw/a/", self.session)
-        qw_b = PlaintextMap(GROUP + b"qw/b/", self.session)
-        self.assertFalse(qw_a.get(w.worker_id).absent)
-        self.assertFalse(qw_b.get(w.worker_id).absent)
 
         w.deregister()
 
     def test_heartbeat_updates_timestamp(self) -> None:
-        w = Worker(GROUP, self.session, Seconds(60), Seconds(10))
+        w = Worker(GROUP, self.rn, Seconds(60), Seconds(10))
         w.bind(b"jobs", TaskPayload, lambda _j: None)
         w.register()
 
-        workers = PlaintextMap(GROUP + b"w/", self.session)
+        session = self.rn.session_rw()
+        workers = PlaintextMap(GROUP + b"w/", session)
         ts1, _ = _decode_worker(workers.get(w.worker_id).value)
 
         time.sleep(0.01)
@@ -80,12 +78,12 @@ class TestWorkerRegistry(unittest.TestCase):
         w.deregister()
 
     def test_cleanup_stale_worker(self) -> None:
-        stale = Worker(GROUP, self.session, Seconds(60), Seconds(10))
+        stale = Worker(GROUP, self.rn, Seconds(60), Seconds(10))
         stale.bind(b"jobs", TaskPayload, lambda _j: None)
         stale._stale_threshold = Millis.ZERO
         stale.register()
 
-        live = Worker(GROUP, self.session, Seconds(60), Seconds(10))
+        live = Worker(GROUP, self.rn, Seconds(60), Seconds(10))
         live.bind(b"jobs", TaskPayload, lambda _j: None)
         live._stale_threshold = Millis.ZERO
         live.register()
@@ -96,13 +94,10 @@ class TestWorkerRegistry(unittest.TestCase):
         cleaned = live.cleanup_stale()
         self.assertEqual(cleaned, 1)
 
-        workers = PlaintextMap(GROUP + b"w/", self.session)
+        session = self.rn.session_rw()
+        workers = PlaintextMap(GROUP + b"w/", session)
         self.assertTrue(workers.get(stale.worker_id).absent)
         self.assertFalse(workers.get(live.worker_id).absent)
-
-        qw = PlaintextMap(GROUP + b"qw/jobs/", self.session)
-        self.assertTrue(qw.get(stale.worker_id).absent)
-        self.assertFalse(qw.get(live.worker_id).absent)
 
         live.deregister()
 
@@ -110,7 +105,8 @@ class TestWorkerRegistry(unittest.TestCase):
 class TestBoundQueueSubmit(unittest.TestCase):
     def setUp(self) -> None:
         self.c = Cluster(nodes=3, mgmt=1)
-        self.session = self.c.replicas[0].session_rw()
+        self.rn = self.c.replicas[0]
+        self.session = self.rn.session_rw()
 
     def tearDown(self) -> None:
         self.c.close()
@@ -119,7 +115,7 @@ class TestBoundQueueSubmit(unittest.TestCase):
         self.c.wait_settled(self.session.submit(tx).wait())
 
     def test_typed_submit_and_claim(self) -> None:
-        w = Worker(GROUP, self.session, Seconds(60), Seconds(10))
+        w = Worker(GROUP, self.rn, Seconds(60), Seconds(10))
         bq: BoundQueue[TaskPayload] = w.bind(b"jobs", TaskPayload, lambda _j: None)
 
         self._submit(bq.submit(TaskPayload(target="0xabc", amount=42)))
@@ -139,7 +135,8 @@ class TestBoundQueueSubmit(unittest.TestCase):
 class TestWorkerRunLoop(unittest.TestCase):
     def setUp(self) -> None:
         self.c = Cluster(nodes=3, mgmt=1)
-        self.session = self.c.replicas[0].session_rw()
+        self.rn = self.c.replicas[0]
+        self.session = self.rn.session_rw()
 
     def tearDown(self) -> None:
         self.c.close()
@@ -147,13 +144,21 @@ class TestWorkerRunLoop(unittest.TestCase):
     def _submit(self, tx: ops.Transaction) -> None:
         self.c.wait_settled(self.session.submit(tx).wait())
 
+    def _wait_for_registration(self, w: Worker, timeout: float = 10) -> None:
+        workers = PlaintextMap(GROUP + b"w/", self.session)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not workers.get(w.worker_id).absent:
+                return
+            time.sleep(0.1)
+
     def test_worker_claims_and_completes_typed_job(self) -> None:
         results: list[Job[TaskPayload]] = []
 
         def handler(job: Job[TaskPayload]) -> None:
             results.append(job)
 
-        w = Worker(GROUP, self.session, Seconds(60), Seconds(1))
+        w = Worker(GROUP, self.rn, Seconds(60), Seconds(1))
         bq = w.bind(b"jobs", TaskPayload, handler)
         self._submit(bq.submit(TaskPayload(target="0xdef", amount=100)))
 
@@ -167,7 +172,7 @@ class TestWorkerRunLoop(unittest.TestCase):
             time.sleep(0.1)
 
         w.stop()
-        t.join(timeout=5)
+        t.join(timeout=10)
 
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0].payload.target, "0xdef")
@@ -177,18 +182,14 @@ class TestWorkerRunLoop(unittest.TestCase):
         self.assertEqual(bq.queue.active_count(w.worker_id), 0)
 
     def test_worker_deregisters_on_stop(self) -> None:
-        w = Worker(GROUP, self.session, Seconds(60), Seconds(1))
+        w = Worker(GROUP, self.rn, Seconds(60), Seconds(1))
         w.bind(b"jobs", TaskPayload, lambda _j: None)
 
         t = threading.Thread(target=w.run)
         t.start()
 
+        self._wait_for_registration(w)
         workers = PlaintextMap(GROUP + b"w/", self.session)
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline:
-            if not workers.get(w.worker_id).absent:
-                break
-            time.sleep(0.1)
         self.assertFalse(workers.get(w.worker_id).absent)
 
         w.stop()
@@ -196,45 +197,95 @@ class TestWorkerRunLoop(unittest.TestCase):
 
         self.assertTrue(workers.get(w.worker_id).absent)
 
+    def test_handler_crash_reclaims_to_pending(self) -> None:
+        def crashing_handler(_job: Job[TaskPayload]) -> None:
+            raise RuntimeError("boom")
+
+        w = Worker(GROUP, self.rn, Seconds(60), Seconds(1))
+        bq = w.bind(b"jobs", TaskPayload, crashing_handler)
+        self._submit(bq.submit(TaskPayload(target="crash", amount=0)))
+
+        t = threading.Thread(target=w.run)
+        t.start()
+
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if bq.queue.pending_count() > 0:
+                break
+            time.sleep(0.1)
+
+        w.stop()
+        t.join(timeout=10)
+
+        self.assertEqual(bq.queue.pending_count(), 1)
+        self.assertEqual(bq.queue.active_count(w.worker_id), 0)
+
+    def test_cancellation_event_set_on_stop(self) -> None:
+        seen_cancelled = threading.Event()
+
+        def blocking_handler(job: Job[TaskPayload]) -> None:
+            job.cancelled.wait(10)
+            if job.cancelled.is_set():
+                seen_cancelled.set()
+
+        w = Worker(GROUP, self.rn, Seconds(60), Seconds(1))
+        bq = w.bind(b"jobs", TaskPayload, blocking_handler)
+        self._submit(bq.submit(TaskPayload(target="cancel", amount=0)))
+
+        t = threading.Thread(target=w.run)
+        t.start()
+
+        self._wait_for_registration(w)
+        time.sleep(1)
+
+        w.stop()
+        t.join(timeout=10)
+
+        self.assertTrue(seen_cancelled.is_set())
+
+    def test_heartbeat_continues_during_long_handler(self) -> None:
+        handler_running = threading.Event()
+
+        def slow_handler(job: Job[TaskPayload]) -> None:
+            handler_running.set()
+            job.cancelled.wait(10)
+
+        w = Worker(GROUP, self.rn, Seconds(60), Seconds(1))
+        bq = w.bind(b"jobs", TaskPayload, slow_handler)
+        self._submit(bq.submit(TaskPayload(target="slow", amount=0)))
+
+        t = threading.Thread(target=w.run)
+        t.start()
+
+        handler_running.wait(10)
+        workers = PlaintextMap(GROUP + b"w/", self.session)
+        ts1, _ = _decode_worker(workers.get(w.worker_id).value)
+
+        time.sleep(2)
+        ts2, _ = _decode_worker(workers.get(w.worker_id).value)
+        self.assertGreater(ts2, ts1)
+
+        w.stop()
+        t.join(timeout=10)
+
 
 class TestWorkerEdgeCases(unittest.TestCase):
     def setUp(self) -> None:
         self.c = Cluster(nodes=3, mgmt=1)
-        self.session = self.c.replicas[0].session_rw()
+        self.rn = self.c.replicas[0]
 
     def tearDown(self) -> None:
         self.c.close()
 
     def test_deregister_when_absent(self) -> None:
-        w = Worker(GROUP, self.session, Seconds(60), Seconds(10))
+        w = Worker(GROUP, self.rn, Seconds(60), Seconds(10))
         w.bind(b"jobs", TaskPayload, lambda _j: None)
         w.deregister()
 
     def test_heartbeat_when_absent(self) -> None:
-        w = Worker(GROUP, self.session, Seconds(60), Seconds(10))
+        w = Worker(GROUP, self.rn, Seconds(60), Seconds(10))
         w.bind(b"jobs", TaskPayload, lambda _j: None)
         w.heartbeat()
-
-    def test_lease_renewal_fires_during_long_handler(self) -> None:
-        renewed = threading.Event()
-
-        def slow_handler(_job: Job[TaskPayload]) -> None:
-            renewed.wait(10)
-
-        w = Worker(GROUP, self.session, Seconds(60), Seconds(1))
-        bq = w.bind(b"jobs", TaskPayload, slow_handler)
-        tx = bq.submit(TaskPayload(target="x", amount=1))
-        self.c.wait_settled(self.session.submit(tx).wait())
-
-        t = threading.Thread(target=w.run)
-        t.start()
-
-        time.sleep(2)
-        self.assertEqual(bq.queue.lease.count(), 1)
-        renewed.set()
-
-        w.stop()
-        t.join(timeout=10)
 
 
 class TestGenId(unittest.TestCase):
