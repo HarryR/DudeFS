@@ -5,6 +5,7 @@ from typing import Any, NamedTuple
 from ..core import codec, crypto
 from . import ops, smt
 from .errors import StoreError
+from .ops import Held
 
 
 def element(store: int, name: bytes, value: bytes, epoch: int) -> crypto.Accumulator:
@@ -27,20 +28,6 @@ class PathRow(NamedTuple):
     value: bytes
     credential: bytes
     epoch: int
-
-
-class Held(NamedTuple):
-    value: bytes
-    epoch: int
-    cred: bytes
-
-    def encode(self) -> bytes:
-        return codec.encode([self.value, self.epoch, self.cred])
-
-    @classmethod
-    def decode(cls, raw: bytes) -> "Held":
-        parts = codec.as_seq(codec.decode(raw), 3)
-        return cls(codec.as_bytes(parts[0]), codec.as_int(parts[1]), codec.as_bytes(parts[2]))
 
 
 class BlockHead(NamedTuple):

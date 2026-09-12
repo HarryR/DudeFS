@@ -1,9 +1,17 @@
 import random
+import string
 from typing import NamedTuple
 
 from ..session import Record, Session
 from ..store.ops import Transaction
 from .plaintext_map import PlaintextMap
+
+_ID_ALPHABET = string.ascii_letters + string.digits
+_ID_LENGTH = 11
+
+
+def gen_id() -> bytes:
+    return "".join(random.choices(_ID_ALPHABET, k=_ID_LENGTH)).encode()
 
 
 class Claim(NamedTuple):
@@ -14,12 +22,12 @@ class Claim(NamedTuple):
 
 
 def _lease_key(deadline: int, job_id: bytes) -> bytes:
-    return b"%016d/%b" % (deadline, job_id)
+    return b"%08X/%b" % (deadline, job_id)
 
 
 def _parse_lease_key(key: bytes) -> tuple[int, bytes]:
-    deadline_bytes, job_id = key.split(b"/", 1)
-    return int(deadline_bytes), job_id
+    deadline_hex, job_id = key.split(b"/", 1)
+    return int(deadline_hex, 16), job_id
 
 
 class Queue:
@@ -28,11 +36,11 @@ class Queue:
     def __init__(self, prefix: bytes, session: Session) -> None:
         self._prefix = prefix
         self._session = session
-        self.pending = PlaintextMap(prefix + b"pending/", session)
-        self.lease = PlaintextMap(prefix + b"lease/", session)
+        self.pending = PlaintextMap(prefix + b"P/", session)
+        self.lease = PlaintextMap(prefix + b"L/", session)
 
     def active_map(self, worker: bytes) -> PlaintextMap:
-        return PlaintextMap(self._prefix + b"active/" + worker + b"/", self._session)
+        return PlaintextMap(self._prefix + b"A/" + worker + b"/", self._session)
 
     def pending_count(self) -> int:
         return self.pending.count()

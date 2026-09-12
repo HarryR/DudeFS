@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from .core import codec, crypto
 from .core.errors import DudeError
 from .net.envelope import MessageId, Verb
-from .store.layer import BlockHead, Held, Index, Reader
+from .store.layer import BlockHead, Index, Reader
 from .store.management import blind_key, epoch_key, wrap_key
 from .store.ops import (
     EPOCH_NONE,
@@ -15,8 +15,10 @@ from .store.ops import (
     STORE_MANAGEMENT,
     Absent,
     Del,
+    Held,
     Holds,
     Predicate,
+    Sealed,
     Set,
     Step,
     Transaction,
@@ -237,7 +239,7 @@ class Substrate(Reader, ABC):
     @abstractmethod
     def seal(
         self, store_id: int, name: str, value: bytes, *, plaintext: bool = False
-    ) -> tuple[bytes, bytes, int]: ...
+    ) -> Sealed: ...
     @abstractmethod
     def decrypt(self, store_id: int, name: str, ciphertext: bytes, epoch: int) -> bytes: ...
 
@@ -329,17 +331,15 @@ class KeyCache:
         nk = self.ensure_blinding(store_id)
         return crypto.derive_name_token(nk, unicodedata.normalize("NFC", name).encode())
 
-    def seal(
-        self, store_id: int, name: str, value: bytes, *, plaintext: bool = False
-    ) -> tuple[bytes, bytes, int]:
+    def seal(self, store_id: int, name: str, value: bytes, *, plaintext: bool = False) -> Sealed:
         if plaintext:
-            return unicodedata.normalize("NFC", name).encode(), value, EPOCH_NONE
+            return Sealed(unicodedata.normalize("NFC", name).encode(), value, EPOCH_NONE)
         epoch = self.current_epoch(store_id)
         nt = crypto.NameToken(self.token(store_id, name))
         vk = self.value_key(store_id, epoch)
         item = crypto.derive_item_key(vk, nt)
         aad = codec.encode([store_id, bytes(nt), epoch])
-        return nt, bytes(crypto.AeadXcs1.seal(item, aad, value)), epoch
+        return Sealed(nt, bytes(crypto.AeadXcs1.seal(item, aad, value)), epoch)
 
     def decrypt(self, store_id: int, name: str, ciphertext: bytes, epoch: int) -> bytes:
         if epoch == EPOCH_NONE:
@@ -373,11 +373,9 @@ class Session:
             raise SessionError("data store keys must be str, not bytes")
         raise SessionError("data store token requires a Substrate with crypto")
 
-    def seal(
-        self, name: str | bytes, value: bytes, *, plaintext: bool = False
-    ) -> tuple[bytes, bytes, int]:
+    def seal(self, name: str | bytes, value: bytes, *, plaintext: bool = False) -> Sealed:
         if self._store_id == STORE_MANAGEMENT or plaintext:
-            return self.token(name, plaintext=True), value, EPOCH_NONE
+            return Sealed(self.token(name, plaintext=True), value, EPOCH_NONE)
         raise SessionError("data store seal requires a Substrate with crypto")
 
     def _decrypt(self, name: str | bytes, ciphertext: bytes, epoch: int) -> bytes:  # noqa: ARG002
@@ -432,11 +430,9 @@ class SessionRW(Session):
             raise SessionError("data store keys must be str, not bytes")
         return self._sub.token(self._store_id, name)
 
-    def seal(
-        self, name: str | bytes, value: bytes, *, plaintext: bool = False
-    ) -> tuple[bytes, bytes, int]:
+    def seal(self, name: str | bytes, value: bytes, *, plaintext: bool = False) -> Sealed:
         if self._store_id == STORE_MANAGEMENT or plaintext:
-            return self.token(name, plaintext=True), value, EPOCH_NONE
+            return Sealed(self.token(name, plaintext=True), value, EPOCH_NONE)
         if not isinstance(name, str):
             raise SessionError("data store keys must be str, not bytes")
         return self._sub.seal(self._store_id, name, value)
@@ -480,6 +476,9 @@ class SessionRW(Session):
     def submit(self, tx: Transaction) -> SubmitHandle:
         return self._sub.submit(tx)
 
+    def wait_for_commit(self, timeout: float, since: int = -1) -> None:
+        self._sub.wait_for_commit(timeout, since=since)
+
 
 class TxBuilder:
     def __init__(self, session: SessionRW) -> None:
@@ -514,11 +513,13 @@ class TxBuilder:
         self._steps.append(Step(guards, Del(s.store_id, token)))
         return self
 
-    def submit(self) -> SubmitHandle:
+    def as_tx(self) -> Transaction:
         if not self._steps:
             raise SessionError("empty transaction")
-        tx = Transaction(tuple(self._steps))
-        return self._session.submit(tx)
+        return Transaction(tuple(self._steps))
+
+    def submit(self) -> SubmitHandle:
+        return self._session.submit(self.as_tx())
 
 
 def collect_guards(

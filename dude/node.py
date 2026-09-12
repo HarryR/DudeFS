@@ -37,8 +37,9 @@ from .session import (
 )
 from .store import ops
 from .store.checkpoint import CheckpointMeta
-from .store.layer import BlockHead, Held
+from .store.layer import BlockHead
 from .store.management import MgmtReader, Role
+from .store.ops import Held, Sealed
 from .store.smt_sync import TreeImporter
 from .store.store import Store
 from .sync.adapter import (
@@ -787,9 +788,7 @@ class _ReplicaSubstrate(Substrate):
     def token(self, store_id: int, name: str, *, plaintext: bool = False) -> bytes:
         return self._ensure_cache().token(store_id, name, plaintext=plaintext)
 
-    def seal(
-        self, store_id: int, name: str, value: bytes, *, plaintext: bool = False
-    ) -> tuple[bytes, bytes, int]:
+    def seal(self, store_id: int, name: str, value: bytes, *, plaintext: bool = False) -> Sealed:
         return self._ensure_cache().seal(store_id, name, value, plaintext=plaintext)
 
     def decrypt(self, store_id: int, name: str, ciphertext: bytes, epoch: int) -> bytes:

@@ -28,7 +28,7 @@ from ..session import (
     Unknown,
 )
 from ..store import ops, smt
-from ..store.layer import BlockHead, Held
+from ..store.layer import BlockHead
 from ..store.management import (
     CERT_PURPOSE_ROSTER,
     CERT_PURPOSE_ROSTER_COMMITMENT,
@@ -37,6 +37,7 @@ from ..store.management import (
     Role,
     RosterCommitment,
 )
+from ..store.ops import Held, Sealed
 from . import chain
 from .lite_adapter import (
     AnchorsReply,
@@ -475,7 +476,7 @@ class LightClient(Participant, SessionProvider):
         if msg.name != entry.name:
             entry.result = Failed(reason="reply name does not match request")
             return
-        held = None if msg.absent else (msg.value, msg.credential, msg.epoch)
+        held = None if msg.absent else Held(msg.value, msg.epoch, msg.credential)
         if self.trusted_state is None:
             entry.result = Failed(reason="trusted state lost; re-bootstrap")
             return
@@ -617,7 +618,7 @@ class _PrefixNthHandle(InflightHandle):
         if ts is None:
             self.done = True
             return
-        held = (msg.value, msg.credential, msg.epoch)
+        held = Held(msg.value, msg.epoch, msg.credential)
         try:
             proof = smt.Proof.decode(msg.proof)
         except DudeError:
@@ -693,9 +694,7 @@ class _LiteSubstrate(Substrate):
     def token(self, store_id: int, name: str, *, plaintext: bool = False) -> bytes:
         return self._ensure_cache().token(store_id, name, plaintext=plaintext)
 
-    def seal(
-        self, store_id: int, name: str, value: bytes, *, plaintext: bool = False
-    ) -> tuple[bytes, bytes, int]:
+    def seal(self, store_id: int, name: str, value: bytes, *, plaintext: bool = False) -> Sealed:
         return self._ensure_cache().seal(store_id, name, value, plaintext=plaintext)
 
     def decrypt(self, store_id: int, name: str, ciphertext: bytes, epoch: int) -> bytes:

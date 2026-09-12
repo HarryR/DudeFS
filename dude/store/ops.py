@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import NamedTuple
 
 from ..core import codec, crypto
 from .errors import StoreError
@@ -14,6 +15,28 @@ STORE_DATA = 1
 
 
 EPOCH_NONE = 0
+
+
+class Sealed(NamedTuple):
+    token: bytes
+    ciphertext: bytes
+    epoch: int
+
+
+class Held(NamedTuple):
+    value: bytes
+    epoch: int
+    cred: bytes
+
+    def encode(self) -> bytes:
+        return codec.encode([self.value, self.epoch, self.cred])
+
+    @classmethod
+    def decode(cls, raw: bytes) -> Held:
+        parts = codec.as_seq(codec.decode(raw), 3)
+        return cls(codec.as_bytes(parts[0]), codec.as_int(parts[1]), codec.as_bytes(parts[2]))
+
+
 MAX_NAME_BYTES = 128
 
 _SET = b"s"
