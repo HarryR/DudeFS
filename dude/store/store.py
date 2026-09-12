@@ -14,8 +14,9 @@ from ..core import codec, crypto
 from ..core.errors import InvariantError
 from ..session import Session, Settled
 from . import ops, settle, smt
-from .layer import Held, Index, Ledger, PathRow, View, holds
+from .layer import Index, Ledger, PathRow, View, holds
 from .management import MgmtReader, MgmtWriter
+from .ops import Held
 from .smt_sync import _ExportSource, _ImportTarget
 
 _SCHEMA = """

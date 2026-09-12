@@ -138,9 +138,7 @@ class TestStorePrefixQueries(unittest.TestCase):
         with self.s.snapshot() as r:
             proof = r.prove(ops.STORE_DATA, name)
             root = r.state_root()
-        self.assertTrue(
-            smt.verify(root, ops.STORE_DATA, name, (held.value, held.cred, held.epoch), proof)
-        )
+        self.assertTrue(smt.verify(root, ops.STORE_DATA, name, held, proof))
 
     def test_count_only_matches_epoch0(self) -> None:
         self.s.apply(

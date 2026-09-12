@@ -1,16 +1,11 @@
-from __future__ import annotations
-
 import sqlite3
 from dataclasses import dataclass
 
 from dude.core import codec, crypto
 
-MAX_DEPTH = 256
+from .ops import Held
 
-type Held = tuple[bytes, bytes, int]
-"""Everything the leaf commits to besides the path: value, credential, keyepoch. A TRIPLE so the
-epoch cannot be forgotten -- as a separate argument it was one defaulted parameter away from being
-left out of a root again."""
+MAX_DEPTH = 256
 
 EMPTY = crypto.Digest(bytes(crypto.DIGEST_SIZE))
 
@@ -72,7 +67,7 @@ class Proof:
         return codec.encode([list(self.siblings), occ])
 
     @classmethod
-    def decode(cls, raw: bytes) -> Proof:
+    def decode(cls, raw: bytes) -> "Proof":
         p = codec.as_seq(codec.decode(raw), 2)
         occ = codec.as_seq(p[1])
         return cls(
@@ -98,8 +93,7 @@ def _fold(
 def _present(root: crypto.Digest, path: bytes, held: Held, proof: Proof) -> bool:
     if proof.occupant is None or proof.occupant[0] != path:
         return False
-    value, credential, epoch = held
-    term = leaf_hash(path, crypto.h(value), crypto.h(credential), epoch)
+    term = leaf_hash(path, crypto.h(held.value), crypto.h(held.cred), held.epoch)
     if proof.occupant[1] != term:
         return False
     return _fold(path, term, proof.siblings) == root
@@ -120,7 +114,7 @@ def verify(
     root: crypto.Digest,
     store: int,
     name: bytes,
-    held: Held | None,
+    held: "Held | None",
     proof: Proof,
 ) -> bool:
     if len(proof.siblings) > MAX_DEPTH:

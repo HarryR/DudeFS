@@ -11,8 +11,8 @@ from dude.core.errors import DudeError
 from dude.core.units import Millis
 from dude.session import KeyCache, SessionRW, SettleResult, SubmitHandle, Substrate
 from dude.store import ops, settle
-from dude.store.layer import Held
 from dude.store.management import Cert, MgmtWriter, Role, epoch_key
+from dude.store.ops import Held, Sealed
 from dude.store.store import Store
 
 from .cluster import Cluster
@@ -62,9 +62,7 @@ class _StoreSubstrate(Substrate):
     def token(self, store_id: int, name: str, *, plaintext: bool = False) -> bytes:
         return self._cache.token(store_id, name, plaintext=plaintext)
 
-    def seal(
-        self, store_id: int, name: str, value: bytes, *, plaintext: bool = False
-    ) -> tuple[bytes, bytes, int]:
+    def seal(self, store_id: int, name: str, value: bytes, *, plaintext: bool = False) -> Sealed:
         return self._cache.seal(store_id, name, value, plaintext=plaintext)
 
     def decrypt(self, store_id: int, name: str, ciphertext: bytes, epoch: int) -> bytes:

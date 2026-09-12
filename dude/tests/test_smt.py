@@ -11,6 +11,7 @@ import unittest
 
 from dude.core import crypto
 from dude.store import ops, smt, store
+from dude.store.ops import Held
 from dude.tests.test_store import tx
 
 D = ops.STORE_DATA
@@ -43,10 +44,8 @@ class _Fixture(unittest.TestCase):
         everywhere would let a leaf that ignored the credential pass every test here."""
         return b"cred:" + bytes([st]) + name
 
-    def held(self, name: bytes, value: bytes, st: int = D, epoch: int = ops.EPOCH_NONE) -> smt.Held:
-        """What `verify` asks about — value, the credential that authorised it, and the keyepoch
-        it is encrypted under, never one without the others."""
-        return value, self.cred(name, st), epoch
+    def held(self, name: bytes, value: bytes, st: int = D, epoch: int = ops.EPOCH_NONE) -> Held:
+        return Held(value, epoch, self.cred(name, st))
 
     def put(
         self,
@@ -298,7 +297,7 @@ class TestThroughTheStore(unittest.TestCase):
                 self.s.state_root(),
                 D,
                 k,
-                (b"v", self.s.credential(D, k), ops.EPOCH_NONE),
+                Held(value=b"v", epoch=ops.EPOCH_NONE, cred=self.s.credential(D, k)),
                 self.s.prove(D, k),
             )
         )
@@ -395,10 +394,20 @@ class TestTheCredentialIsInTheLeaf(_Fixture):
 
         self.assertTrue(smt.verify(self.t.root(), D, b"k7", self.held(b"k7", b"v7"), proof))
         self.assertFalse(
-            smt.verify(self.t.root(), D, b"k7", (b"v7", self.cred(b"k9"), ops.EPOCH_NONE), proof),
+            smt.verify(
+                self.t.root(),
+                D,
+                b"k7",
+                Held(value=b"v7", epoch=ops.EPOCH_NONE, cred=self.cred(b"k9")),
+                proof,
+            ),
             "another key's valid credential vouched for this row",
         )
-        self.assertFalse(smt.verify(self.t.root(), D, b"k7", (b"v7", b"", ops.EPOCH_NONE), proof))
+        self.assertFalse(
+            smt.verify(
+                self.t.root(), D, b"k7", Held(value=b"v7", epoch=ops.EPOCH_NONE, cred=b""), proof
+            )
+        )
 
     def test_a_neighbours_credential_is_not_disclosed_by_an_absence_proof(self):
         """The occupant quotes a LEAF HASH, so proving our key absent tells the asker where someone

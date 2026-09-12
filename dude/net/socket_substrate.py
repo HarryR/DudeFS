@@ -10,7 +10,8 @@ from ..core.errors import DudeError
 from ..core.units import Millis
 from ..session import Pending, SettleResult, SubmitHandle, Substrate, Unknown
 from ..store import ops
-from ..store.layer import BlockHead, Held
+from ..store.layer import BlockHead
+from ..store.ops import Held, Sealed
 from ..tunables import Tunables
 from .socket_framing import (
     QUERY_PENDING,
@@ -89,14 +90,12 @@ class SocketSubstrate(Substrate):
             return name.encode()
         return self._request(Request.TOKEN, codec.encode([store_id, name.encode()]))
 
-    def seal(
-        self, store_id: int, name: str, value: bytes, *, plaintext: bool = False
-    ) -> tuple[bytes, bytes, int]:
+    def seal(self, store_id: int, name: str, value: bytes, *, plaintext: bool = False) -> Sealed:
         if plaintext:
-            return name.encode(), value, ops.EPOCH_NONE
+            return Sealed(name.encode(), value, ops.EPOCH_NONE)
         reply = self._request(Request.SEAL, codec.encode([store_id, name.encode(), value]))
         parts = codec.as_seq(codec.decode(reply), 3)
-        return codec.as_bytes(parts[0]), codec.as_bytes(parts[1]), codec.as_int(parts[2])
+        return Sealed(codec.as_bytes(parts[0]), codec.as_bytes(parts[1]), codec.as_int(parts[2]))
 
     def decrypt(self, store_id: int, name: str, ciphertext: bytes, epoch: int) -> bytes:
         return self._request(
