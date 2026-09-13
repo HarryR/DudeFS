@@ -94,6 +94,17 @@ class Queue:
             lk, expect=lease_rec
         )
 
+    def reclaim(self, claim: Claim) -> Transaction:
+        active = self.active_map(claim.worker)
+        rec = active.get(claim.job_id)
+        lk = _lease_key(claim.deadline, claim.job_id)
+        lease_rec = self.lease.get(lk)
+        return (
+            active.tx_delete(claim.job_id, expect=rec)
+            + self.lease.tx_delete(lk, expect=lease_rec)
+            + self.pending.tx_put(claim.job_id, rec.value)
+        )
+
     def renew_lease(self, claim: Claim, new_deadline: int) -> tuple[Claim, Transaction]:
         old_lk = _lease_key(claim.deadline, claim.job_id)
         old_rec = self.lease.get(old_lk)
