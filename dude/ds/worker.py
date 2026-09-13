@@ -14,6 +14,8 @@ log = logging.getLogger(__name__)
 
 
 class JobID(bytes): ...
+
+
 class WorkerID(bytes): ...
 
 
@@ -89,14 +91,14 @@ class WorkerMembership:
     def heartbeat(
         self, active_queue: bytes | None = None, active_job_id: bytes | None = None
     ) -> Transaction:
-        workers = self._registry._workers(self._session)
+        workers = self._registry.workers(self._session)
         rec = workers.get(self.worker_id)
         if rec.absent:
             return Transaction(())
         value = _encode_worker(Millis.now(), self._queue_names)
         tx = workers.tx_put(self.worker_id, value, expect=rec)
         for name in self._queue_names:
-            qw = self._registry._qw(name, self._session)
+            qw = self._registry.qw(name, self._session)
             qw_rec = qw.get(self.worker_id)
             if not qw_rec.absent:
                 job_id = active_job_id if (active_queue == name and active_job_id) else b""
@@ -104,7 +106,7 @@ class WorkerMembership:
         return tx
 
     def leave(self) -> Transaction:
-        tx = self._registry._deregister_tx(self.worker_id, self._queue_names, self._session)
+        tx = self._registry.deregister_tx(self.worker_id, self._queue_names, self._session)
         if tx.steps:
             log.info("worker %s deregistered", self.worker_id.decode())
         return tx
@@ -117,22 +119,22 @@ class WorkerRegistry:
         self._group = group
         self._provider = provider
 
-    def _workers(self, session: SessionRW) -> PlaintextMap:
+    def workers(self, session: SessionRW) -> PlaintextMap:
         return PlaintextMap(self._group + b"w/", session)
 
-    def _qw(self, queue_name: bytes, session: SessionRW) -> PlaintextMap:
+    def qw(self, queue_name: bytes, session: SessionRW) -> PlaintextMap:
         return PlaintextMap(self._group + b"qw/" + queue_name + b"/", session)
 
-    def _deregister_tx(
+    def deregister_tx(
         self, wid: bytes, queue_names: tuple[bytes, ...], session: SessionRW
     ) -> Transaction:
-        workers = self._workers(session)
+        workers = self.workers(session)
         rec = workers.get(wid)
         if rec.absent:
             return Transaction(())
         tx = workers.tx_delete(wid, expect=rec)
         for name in queue_names:
-            qw = self._qw(name, session)
+            qw = self.qw(name, session)
             qw_rec = qw.get(wid)
             if not qw_rec.absent:
                 tx = tx + qw.tx_delete(wid, expect=qw_rec)
@@ -143,18 +145,18 @@ class WorkerRegistry:
     ) -> tuple[WorkerMembership, Transaction]:
         log.info("worker %s registering on queues %s", worker_id.decode(), queue_names)
         session = self._provider.session_rw()
-        workers = self._workers(session)
+        workers = self.workers(session)
         value = _encode_worker(Millis.now(), queue_names)
         tx = workers.tx_put(worker_id, value, absent=True)
         for name in queue_names:
-            tx = tx + self._qw(name, session).tx_put(worker_id, b"", absent=True)
+            tx = tx + self.qw(name, session).tx_put(worker_id, b"", absent=True)
         return WorkerMembership(self, session, worker_id, queue_names), tx
 
     def cleanup_stale(
         self, threshold: Millis, *, limit: int | None = None
     ) -> tuple[int, Transaction]:
         session = self._provider.session_rw()
-        workers = self._workers(session)
+        workers = self.workers(session)
         now = Millis.now()
         tx = Transaction(())
         cleaned = 0
@@ -164,20 +166,20 @@ class WorkerRegistry:
             ts, queue_names = _decode_worker(rec.value)
             if now - ts <= threshold:
                 continue
-            tx = tx + self._deregister_tx(wid, queue_names, session)
+            tx = tx + self.deregister_tx(wid, queue_names, session)
             log.info("cleaned stale worker %s", wid.decode())
             cleaned += 1
         return cleaned, tx
 
     def list_workers(self) -> Iterator[tuple[bytes, int, tuple[bytes, ...]]]:
         session = self._provider.session_rw()
-        for wid, rec in self._workers(session).records():
+        for wid, rec in self.workers(session).records():
             ts, queue_names = _decode_worker(rec.value)
             yield wid, ts, queue_names
 
     def workers_for_queue(self, queue_name: bytes) -> Iterator[tuple[bytes, bytes]]:
         session = self._provider.session_rw()
-        yield from self._qw(queue_name, session).items()
+        yield from self.qw(queue_name, session).items()
 
 
 class Worker:

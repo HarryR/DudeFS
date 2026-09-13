@@ -88,7 +88,11 @@ class TestWorkerWorkflow(unittest.TestCase):
         t = threading.Thread(target=w.run)
         t.start()
 
-        self._wait_for(lambda: bq.queue.active_count(w.worker_id) == 0 and bq.queue.pending.get(job_id).absent is False)
+        self._wait_for(
+            lambda: (
+                bq.queue.active_count(w.worker_id) == 0 and not bq.queue.pending.get(job_id).absent
+            )
+        )
 
         time.sleep(1)
 
@@ -109,7 +113,7 @@ class TestWorkerWorkflow(unittest.TestCase):
         w = Worker(GROUP, self.rn, Seconds(60), Seconds(1))
         bq = w.bind(b"jobs", TaskPayload, blocking_handler)
 
-        job_id, tx = bq.submit(TaskPayload(target="cancel", amount=0), self.session)
+        _, tx = bq.submit(TaskPayload(target="cancel", amount=0), self.session)
         self._submit(tx)
 
         t = threading.Thread(target=w.run)
@@ -223,7 +227,7 @@ class TestWorkerWorkflow(unittest.TestCase):
         t = threading.Thread(target=w.run)
         t.start()
 
-        self._wait_for(lambda: done.is_set())
+        self._wait_for(done.is_set)
 
         w.stop()
         t.join(timeout=10)
