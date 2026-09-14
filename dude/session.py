@@ -2,7 +2,9 @@ import threading
 import time
 import unicodedata
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from dataclasses import dataclass, field
+from typing import TypedDict, Unpack
 
 from .core import codec, crypto
 from .core.errors import DudeError
@@ -15,8 +17,11 @@ from .store.ops import (
     STORE_MANAGEMENT,
     Absent,
     Del,
+    Exists,
     Held,
     Holds,
+    HoldsAny,
+    Mutation,
     Predicate,
     Sealed,
     Set,
@@ -50,6 +55,14 @@ class Record:
     raw: bytes
     epoch: int
     absent: bool
+
+
+class GuardOpts(TypedDict, total=False):
+    expect: Record | Sequence[Record] | None
+    guards: Predicate | Sequence[Predicate]
+    absent: bool | None
+    exists: bool | None
+    soft: bool
 
 
 # -- result type hierarchies ------------------------------------------------
@@ -464,26 +477,23 @@ class SessionRW(Session):
         self,
         name: str,
         value: bytes,
-        *predicates: Predicate | Record,
-        expect: Record | None = None,
-        absent: bool = False,
+        *,
         plaintext: bool = False,
+        **opts: Unpack[GuardOpts],
     ) -> SubmitHandle:
         token, sealed, epoch = self.seal(name, value, plaintext=plaintext)
-        guards = collect_guards(self._store_id, token, predicates, expect, absent)
-        tx = Transaction((Step(guards, Set(self._store_id, token, sealed, epoch)),))
+        tx = Transaction((build_step(Set(self._store_id, token, sealed, epoch), **opts),))
         return self.submit(tx)
 
     def delete(
         self,
         name: str,
-        *predicates: Predicate | Record,
-        expect: Record | None = None,
+        *,
         plaintext: bool = False,
+        **opts: Unpack[GuardOpts],
     ) -> SubmitHandle:
         token = self.token(name, plaintext=plaintext)
-        guards = collect_guards(self._store_id, token, predicates, expect, False)
-        tx = Transaction((Step(guards, Del(self._store_id, token)),))
+        tx = Transaction((build_step(Del(self._store_id, token), **opts),))
         return self.submit(tx)
 
     def begin(self) -> "TxBuilder":
@@ -505,28 +515,25 @@ class TxBuilder:
         self,
         name: str,
         value: bytes,
-        *predicates: Predicate | Record,
-        expect: Record | None = None,
-        absent: bool = False,
+        *,
         plaintext: bool = False,
+        **opts: Unpack[GuardOpts],
     ) -> "TxBuilder":
         s = self._session
         token, sealed, epoch = s.seal(name, value, plaintext=plaintext)
-        guards = collect_guards(s.store_id, token, predicates, expect, absent)
-        self._steps.append(Step(guards, Set(s.store_id, token, sealed, epoch)))
+        self._steps.append(build_step(Set(s.store_id, token, sealed, epoch), **opts))
         return self
 
     def delete(
         self,
         name: str,
-        *predicates: Predicate | Record,
-        expect: Record | None = None,
+        *,
         plaintext: bool = False,
+        **opts: Unpack[GuardOpts],
     ) -> "TxBuilder":
         s = self._session
         token = s.token(name, plaintext=plaintext)
-        guards = collect_guards(s.store_id, token, predicates, expect, False)
-        self._steps.append(Step(guards, Del(s.store_id, token)))
+        self._steps.append(build_step(Del(s.store_id, token), **opts))
         return self
 
     def as_tx(self) -> Transaction:
@@ -541,22 +548,40 @@ class TxBuilder:
 def collect_guards(
     store_id: int,
     token: bytes,
-    predicates: tuple[Predicate | Record, ...],
-    expect: Record | None,
-    absent: bool,
+    **opts: Unpack[GuardOpts],
 ) -> tuple[Predicate, ...]:
+    expect = opts.get("expect")
+    guards = opts.get("guards")
+    absent = opts.get("absent")
+    exists = opts.get("exists")
+    if absent is not None and exists is not None and absent == exists:
+        raise SessionError("absent and exists cannot both be " + str(absent))
     out: list[Predicate] = []
-    for p in predicates:
-        if isinstance(p, Record):
-            if p.absent:
-                raise SessionError("cannot use an absent record as a dependency")
-            out.append(Holds(p.store_id, p.token, value_digest(p.raw)))
+    if guards is not None:
+        if isinstance(guards, Predicate):
+            out.append(guards)
         else:
-            out.append(p)
+            out.extend(guards)
     if expect is not None:
-        if expect.absent:
-            raise SessionError("expected record is absent; use absent=True instead")
-        out.append(Holds(store_id, token, value_digest(expect.raw)))
-    if absent:
+        if isinstance(expect, Record):
+            if expect.absent:
+                raise SessionError("expected record is absent; use absent=True instead")
+            out.append(Holds(store_id, token, value_digest(expect.raw)))
+        else:
+            digests: list[crypto.Digest] = []
+            for r in expect:
+                if r.absent:
+                    raise SessionError("expected record is absent")
+                digests.append(value_digest(r.raw))
+            out.append(HoldsAny(store_id, token, tuple(digests)))
+    if absent is True or exists is False:
         out.append(Absent(store_id, token))
+    elif absent is False or exists is True:
+        out.append(Exists(store_id, token))
     return tuple(out)
+
+
+def build_step(mutation: Mutation, **opts: Unpack[GuardOpts]) -> Step:
+    soft = opts.pop("soft", False)
+    guards = collect_guards(mutation.store, mutation.name, **opts)
+    return Step(guards, mutation, soft=soft)

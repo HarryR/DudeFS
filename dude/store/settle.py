@@ -60,9 +60,11 @@ def evaluate(
             return Verdict(Reason.AUTHORITY, i), layer
         if (why := _data_row_shape(layer, auth, m)) is not None:
             return Verdict(why, i), layer
-        for g in step.guards:
-            if not holds(layer, g):
-                return Verdict(Reason.GUARD, i), layer
+        guard_ok = all(holds(layer, g) for g in step.guards)
+        if not guard_ok:
+            if step.soft:
+                continue
+            return Verdict(Reason.GUARD, i), layer
         layer.apply(m, tx.raw)
     return OK, layer
 
@@ -85,6 +87,8 @@ def _data_row_shape(layer: Reader, auth: Authoriser, m: ops.Mutation) -> Reason 
     if isinstance(m, ops.Del):
         if m.store == ops.STORE_MANAGEMENT and auth.epoch_target(m.name) is not None:
             return Reason.EPOCH_JUMP
+        return None
+    if not isinstance(m, ops.Set):
         return None
     if m.store == ops.STORE_MANAGEMENT:
         target = auth.epoch_target(m.name)

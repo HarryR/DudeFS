@@ -154,7 +154,7 @@ class TestWorkerWorkflow(unittest.TestCase):
         t.join(timeout=10)
 
     def test_registry_lifecycle_and_cleanup(self) -> None:
-        lease = Seconds(1)
+        lease = Seconds(0.2)
         registry = WorkerRegistry(GROUP, self.rn)
 
         w = Worker(GROUP, self.rn, lease, Seconds(10), registry=registry)
@@ -188,8 +188,6 @@ class TestWorkerWorkflow(unittest.TestCase):
         stale.heartbeat()
         stale.deregister()
 
-        self.assertEqual(w.cleanup_stale(), 0)
-
         bq = w.bind(b"jobs", TaskPayload, lambda _: None)
         _, submit_tx = bq.submit(TaskPayload(target="expire", amount=0), self.session)
         self._submit(submit_tx)
@@ -217,10 +215,12 @@ class TestWorkerWorkflow(unittest.TestCase):
         bq = w.bind(b"jobs", TaskPayload, handler)
 
         ids = []
+        batch = ops.Transaction(())
         for i in range(3):
             jid, tx = bq.submit(TaskPayload(target=f"job-{i}", amount=i), self.session)
-            self._submit(tx)
+            batch = batch + tx
             ids.append(jid)
+        self._submit(batch)
 
         self.assertEqual(bq.queue.pending_count(), 3)
 

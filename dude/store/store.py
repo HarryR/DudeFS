@@ -96,7 +96,7 @@ CREATE TABLE IF NOT EXISTS checkpoint (
 @dataclass(frozen=True, slots=True)
 class Entry:
     idx: Index
-    item: ops.LogEntry
+    item: ops.SignedTransaction
 
 
 class Commitment(NamedTuple):

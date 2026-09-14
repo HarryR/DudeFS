@@ -1,7 +1,8 @@
 from collections.abc import Iterator
+from typing import Unpack
 
-from ..session import Record, Session, collect_guards
-from ..store.ops import EPOCH_NONE, Del, Predicate, Set, Step, Transaction
+from ..session import GuardOpts, Record, Session, build_step
+from ..store.ops import EPOCH_NONE, Del, Set, Transaction
 from . import Map
 
 
@@ -63,26 +64,11 @@ class PlaintextMap(Map):
 
     # -- transaction builders (caller submits) ---------------------------------
 
-    def tx_put(
-        self,
-        key: bytes,
-        value: bytes,
-        *guards: Predicate | Record,
-        expect: Record | None = None,
-        absent: bool = False,
-    ) -> Transaction:
+    def tx_put(self, key: bytes, value: bytes, **opts: Unpack[GuardOpts]) -> Transaction:
         name = self.full_name(key)
         s = self._session.store_id
-        all_guards = collect_guards(s, name, guards, expect, absent)
-        return Transaction((Step(all_guards, Set(s, name, value, EPOCH_NONE)),))
+        return Transaction((build_step(Set(s, name, value, EPOCH_NONE), **opts),))
 
-    def tx_delete(
-        self,
-        key: bytes,
-        *guards: Predicate | Record,
-        expect: Record | None = None,
-    ) -> Transaction:
+    def tx_delete(self, key: bytes, **opts: Unpack[GuardOpts]) -> Transaction:
         name = self.full_name(key)
-        s = self._session.store_id
-        all_guards = collect_guards(s, name, guards, expect, False)
-        return Transaction((Step(all_guards, Del(s, name)),))
+        return Transaction((build_step(Del(self._session.store_id, name), **opts),))

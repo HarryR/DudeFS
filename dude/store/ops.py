@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import enum
+import typing
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import NamedTuple
+from typing import NamedTuple, Self
 
 from ..core import codec, crypto
 from .errors import StoreError
@@ -32,94 +35,178 @@ class Held(NamedTuple):
         return codec.encode([self.value, self.epoch, self.cred])
 
     @classmethod
-    def decode(cls, raw: bytes) -> Held:
+    def decode(cls, raw: bytes) -> Self:
         parts = codec.as_seq(codec.decode(raw), 3)
         return cls(codec.as_bytes(parts[0]), codec.as_int(parts[1]), codec.as_bytes(parts[2]))
 
 
 MAX_NAME_BYTES = 128
 
-_SET = b"s"
-_DEL = b"d"
+
+class OpType(bytes, enum.Enum):
+    SET = b"s"
+    DEL = b"d"
+    ABSENT = b"a"
+    HOLDS = b"h"
+    EXISTS = b"e"
+    HOLDS_ANY = b"A"
+
+
+type EncodedOp = tuple[OpType, *tuple[codec.Bencodable, ...]]
+
+
+class Mutation(ABC):
+    store: int
+    name: bytes
+
+    @abstractmethod
+    def encode(self) -> EncodedOp: ...
+
+    registry: typing.ClassVar[dict[bytes, type[Self]]] = {}
+
+    @classmethod
+    def decode(cls, v: codec.Bencodable) -> Self:
+        p = codec.as_seq(v)
+        tag = codec.as_bytes(p[0]) if p else b""
+        sub = cls.registry.get(tag)
+        if sub is None:
+            raise OpError(f"unknown mutation tag {tag!r}")
+        return sub.decode(v)
 
 
 @dataclass(frozen=True, slots=True)
-class Set:
+class Set(Mutation):
     store: int
     name: bytes
     value: bytes
     epoch: int = EPOCH_NONE
 
-    def encode(self) -> list:
-        return [_SET, self.store, self.name, self.value, self.epoch]
+    def encode(self) -> EncodedOp:
+        return (OpType.SET, self.store, self.name, self.value, self.epoch)
 
-
-@dataclass(frozen=True, slots=True)
-class Del:
-    store: int
-    name: bytes
-
-    def encode(self) -> list:
-        return [_DEL, self.store, self.name]
-
-
-type Mutation = Set | Del
-
-
-def _mutation_from(v: codec.Bencodable) -> Mutation:
-    p = codec.as_seq(v)
-    tag = codec.as_bytes(p[0]) if p else b""
-    if tag == _SET:
+    @classmethod
+    def decode(cls, v: codec.Bencodable) -> Self:
         p = codec.as_seq(v, 5)
-        return Set(
+        return cls(
             codec.as_int(p[1]), codec.as_bytes(p[2]), codec.as_bytes(p[3]), codec.as_int(p[4])
         )
-    if tag == _DEL:
-        p = codec.as_seq(v, 3)
-        return Del(codec.as_int(p[1]), codec.as_bytes(p[2]))
-    raise OpError(f"unknown mutation tag {tag!r}")
 
 
-_ABSENT = b"a"
-_HOLDS = b"h"
+Mutation.registry[OpType.SET] = Set
 
 
 @dataclass(frozen=True, slots=True)
-class Absent:
+class Del(Mutation):
     store: int
     name: bytes
 
-    def encode(self) -> list:
-        return [_ABSENT, self.store, self.name]
+    def encode(self) -> EncodedOp:
+        return (OpType.DEL, self.store, self.name)
+
+    @classmethod
+    def decode(cls, v: codec.Bencodable) -> Self:
+        p = codec.as_seq(v, 3)
+        return cls(codec.as_int(p[1]), codec.as_bytes(p[2]))
+
+
+Mutation.registry[OpType.DEL] = Del
+
+
+class Predicate(ABC):
+    store: int
+    name: bytes
+
+    @abstractmethod
+    def encode(self) -> EncodedOp: ...
+
+    registry: typing.ClassVar[dict[bytes, type[Self]]] = {}
+
+    @classmethod
+    def decode(cls, v: codec.Bencodable) -> Self:
+        p = codec.as_seq(v)
+        tag = codec.as_bytes(p[0]) if p else b""
+        sub = cls.registry.get(tag)
+        if sub is None:
+            raise OpError(f"unknown predicate tag {tag!r}")
+        return sub.decode(v)
 
 
 @dataclass(frozen=True, slots=True)
-class Holds:
+class Absent(Predicate):
+    store: int
+    name: bytes
+
+    def encode(self) -> EncodedOp:
+        return (OpType.ABSENT, self.store, self.name)
+
+    @classmethod
+    def decode(cls, v: codec.Bencodable) -> Self:
+        p = codec.as_seq(v, 3)
+        return cls(codec.as_int(p[1]), codec.as_bytes(p[2]))
+
+
+Predicate.registry[OpType.ABSENT] = Absent
+
+
+@dataclass(frozen=True, slots=True)
+class Holds(Predicate):
     store: int
     name: bytes
     digest: crypto.Digest
 
-    def encode(self) -> list:
-        return [_HOLDS, self.store, self.name, self.digest]
+    def encode(self) -> EncodedOp:
+        return (OpType.HOLDS, self.store, self.name, self.digest)
 
-
-type Predicate = Absent | Holds
-
-
-def _predicate_from(v: codec.Bencodable) -> Predicate:
-    p = codec.as_seq(v)
-    tag = codec.as_bytes(p[0]) if p else b""
-    if tag == _ABSENT:
-        p = codec.as_seq(v, 3)
-        return Absent(codec.as_int(p[1]), codec.as_bytes(p[2]))
-    if tag == _HOLDS:
+    @classmethod
+    def decode(cls, v: codec.Bencodable) -> Self:
         p = codec.as_seq(v, 4)
-        return Holds(
+        return cls(
             codec.as_int(p[1]),
             codec.as_bytes(p[2]),
             crypto.Digest(codec.as_bytes(p[3])),
         )
-    raise OpError(f"unknown predicate tag {tag!r}")
+
+
+Predicate.registry[OpType.HOLDS] = Holds
+
+
+@dataclass(frozen=True, slots=True)
+class Exists(Predicate):
+    store: int
+    name: bytes
+
+    def encode(self) -> EncodedOp:
+        return (OpType.EXISTS, self.store, self.name)
+
+    @classmethod
+    def decode(cls, v: codec.Bencodable) -> Self:
+        p = codec.as_seq(v, 3)
+        return cls(codec.as_int(p[1]), codec.as_bytes(p[2]))
+
+
+Predicate.registry[OpType.EXISTS] = Exists
+
+
+@dataclass(frozen=True, slots=True)
+class HoldsAny(Predicate):
+    store: int
+    name: bytes
+    digests: tuple[crypto.Digest, ...]
+
+    def encode(self) -> EncodedOp:
+        return (OpType.HOLDS_ANY, self.store, self.name, self.digests)
+
+    @classmethod
+    def decode(cls, v: codec.Bencodable) -> Self:
+        p = codec.as_seq(v, 4)
+        return cls(
+            codec.as_int(p[1]),
+            codec.as_bytes(p[2]),
+            tuple(crypto.Digest(codec.as_bytes(d)) for d in codec.as_seq(p[3])),
+        )
+
+
+Predicate.registry[OpType.HOLDS_ANY] = HoldsAny
 
 
 def value_digest(ciphertext: bytes) -> crypto.Digest:
@@ -130,14 +217,19 @@ def value_digest(ciphertext: bytes) -> crypto.Digest:
 class Step:
     guards: tuple[Predicate, ...]
     mutation: Mutation
+    soft: bool = False
 
-    def encode(self) -> list:
-        return [[g.encode() for g in self.guards], self.mutation.encode()]
+    def encode(self) -> tuple[tuple[EncodedOp, ...], EncodedOp, int]:
+        guards = tuple(g.encode() for g in self.guards)
+        return (guards, self.mutation.encode(), int(self.soft))
 
     @classmethod
-    def decode(cls, v: codec.Bencodable) -> Step:
-        p = codec.as_seq(v, 2)
-        return cls(tuple(_predicate_from(x) for x in codec.as_seq(p[0])), _mutation_from(p[1]))
+    def decode(cls, v: codec.Bencodable) -> Self:
+        p = codec.as_seq(v, 3)
+        guards = tuple(Predicate.decode(x) for x in codec.as_seq(p[0]))
+        mutation = Mutation.decode(p[1])
+        soft = codec.as_int(p[2]) != 0
+        return cls(guards, mutation, soft)
 
 
 @dataclass(frozen=True, slots=True)
@@ -152,8 +244,11 @@ class Transaction:
     def then(self, mutation: Mutation, *guards: Predicate) -> Transaction:
         return Transaction((*self.steps, Step(tuple(guards), mutation)))
 
+    def then_soft(self, mutation: Mutation, *guards: Predicate) -> Transaction:
+        return Transaction((*self.steps, Step(tuple(guards), mutation, soft=True)))
+
     def encode(self) -> bytes:
-        return codec.encode([st.encode() for st in self.steps])
+        return codec.encode(tuple(st.encode() for st in self.steps))
 
     @classmethod
     def decode(cls, raw: bytes) -> Transaction:
@@ -199,7 +294,7 @@ def writes(*mutations: Mutation) -> Transaction:
 
 
 def _body_bytes(author: crypto.PublicKey, ts: int, steps: tuple[Step, ...]) -> bytes:
-    return codec.encode([author, ts, [st.encode() for st in steps]])
+    return codec.encode((author, ts, tuple(st.encode() for st in steps)))
 
 
 @dataclass(frozen=True, slots=True)
@@ -250,6 +345,3 @@ class SignedTransaction:
 
     def effects(self) -> dict[tuple[int, bytes], crypto.Digest | None]:
         return self.txn.effects()
-
-
-type LogEntry = SignedTransaction

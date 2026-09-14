@@ -278,4 +278,10 @@ def holds(reader: Reader, pred: ops.Predicate) -> bool:
     cur = reader.get(pred.store, pred.name)
     if isinstance(pred, ops.Absent):
         return cur is None
-    return cur is not None and ops.value_digest(cur.value) == pred.digest
+    if isinstance(pred, ops.Exists):
+        return cur is not None
+    if isinstance(pred, ops.HoldsAny):
+        return cur is not None and ops.value_digest(cur.value) in pred.digests
+    if isinstance(pred, ops.Holds):
+        return cur is not None and ops.value_digest(cur.value) == pred.digest
+    raise ops.OpError(f"unknown predicate type {type(pred)}")
