@@ -1,64 +1,51 @@
-# Working in this repository
+# Rules
 
-## Never move the working tree to a committed state
+## Memory
 
-`git checkout -- <path>`, `git restore`, `git reset --hard`, `git stash`, `git clean` and
-`git show HEAD:<path> > <path>` all replace a file with HEAD, silently, taking every uncommitted
-change in it. There is no reflog for a file that was never committed.
+Keep CLAUDE.md concise. Don't duplicate rules into memory files.
+Memory is for things not visible at project level: user context,
+design assumptions, process pointers.
 
-**To undo an edit, reverse the edit**, as narrowly as the change was. Gutting a function for a
-revert-check? `cp` to the scratchpad first, `cp` back after, `diff` to prove the restore.
+## Git safety
 
-Switching branches (`git checkout -b`, `git switch`) is fine. It is the **path form** that destroys.
+Never: checkout/restore/reset/stash/clean on paths. To undo, reverse the edit.
+Never checkout old commits to compare — use `git show`.
 
 ## Comments and documents
 
-**A comment must name the specific regression that returns silently if it is deleted.** If you
-cannot name one, delete it. This kills header essays, banners, cross-references, restatements of
-the code below them, and most docstrings. What survives is traps: why a value is that value, why
-the obvious simplification is wrong.
+A comment names the silent regression it prevents. Nothing else survives.
+No new documents. Reasoning in commits, work tracking in GitHub issues.
 
-**Do not add a document.** Reasoning goes in commit messages, work not yet done goes in GitHub
-issues, and neither goes into a new file. A stale justification is worse than none: it reads as
-authority.
+## Gate
 
-## The gate
+`make check` green before every commit.
+Don't re-run the suite for flakes without asking.
+Don't install packages without explicit permission. Use uv + Makefile.
 
-`make check` — lint, format-check, typecheck, test. Green before a commit.
+## Tests
 
-Repeated runs of the suite to hunt a flake cost about eight minutes of CPU. **Ask first**, and only
-for scheduling, threading, ordering, timing or the wire. Where two runs cannot differ, six greens
-say exactly what one green said.
-
-## Three rules about tests
-
-- **Test the production path, driven the way production drives it.** A test calling a handler
-  directly proves the handler works and says nothing about whether anything calls it.
-- **Revert-check every fix, and the revert must fail for the reason you predicted.** A revert that
-  dies of `AttributeError` because the old shape no longer resolves has proved nothing and
-  certified something. A fix whose test passes either way is not held by anything.
-- **A test that passes first time is a suspect, not a result.** Instrument it: assert that the
-  state it claims to exercise actually moved.
+Write tests that exercise the production path end-to-end as a real caller
+would use it. Run coverage to find untested edges, then fold those into
+existing tests where the state is already set up.
 
 ## Working agreements
 
-- Ask decisions as **plain-text options in the reply**, never the popup — it is copy-hostile.
-- A review request means **reading only**. Do not run the gate during a review.
-- **Smallest-correct, no option-keeping.** Do not preserve alternatives "in case".
-- Commit whole subjects. Granular commits that leave the tree half-working corrupt the history.
+Decisions as plain-text options, never the popup.
+Review = read-only, don't run the gate.
+Smallest-correct, no option-keeping.
+Commit whole subjects, never half-working.
+Don't commit without explicit authorisation.
+Don't spawn subagents without explicit permission.
+Python 3.12+. No `from __future__ import annotations` in new files.
 
-## Traps this codebase keeps hitting
+## Design assumptions
 
-1. **Two halves of one fact drifting apart, in SILENCE.** Encode and decode; the preview that
-   computes a block's anchors and the applier that settles it. Each half stays self-consistent
-   alone, so round-trips do not catch it. Pin the pair against each other.
-2. **Applying locally what the quorum should agree.** Assert `log_accumulator()` across nodes, not
-   just `accumulator()`.
-3. **Routine outcomes raised as exceptions.** Decisions are returned, not raised. Anything that is
-   not a `DudeError` sails through the crash-only boundary.
-4. **Blind edits.** `assert old in v` before every string replace. Never run a line-rewrapper over
-   source — it cannot tell code from prose. Moving code between scopes means `Write` the whole file.
-5. **A default right for one caller and silently wrong for another.** Make the wrong thing
-   unsayable.
-6. **State advanced on a timer, raced by the events that depend on it.** A dispatch path must
-   advance the state it dispatches on.
+Wall time (NTP) is load-bearing. Freshness is a wall-clock bound.
+Do not replace with logical clocks or re-derive the opposite.
+
+## Traps
+
+1. Encode and decode must live on the same class. Split pairs drift.
+2. Expected outcomes are return values, not exceptions. Exceptions are bugs.
+3. Assert old content before replacing. No blind edits.
+4. A dispatch path must advance the state it dispatches on. Timers race events.
