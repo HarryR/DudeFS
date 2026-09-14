@@ -671,8 +671,10 @@ class TestQueue(unittest.TestCase):
         self.assertEqual(self.q.active_count(b"w1"), 1)
 
     def test_claim_random(self) -> None:
+        tx = ops.Transaction(())
         for i in range(10):
-            self._submit(self.q.submit(f"j{i}".encode(), f"d{i}".encode()))
+            tx = tx + self.q.submit(f"j{i}".encode(), f"d{i}".encode())
+        self._submit(tx)
 
         claimed_ids: set[bytes] = set()
         for i in range(10):
