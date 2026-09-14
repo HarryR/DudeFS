@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 from ..core.units import Millis, Seconds
 from ..ds.plaintext_map import PlaintextMap
-from ..ds.worker import Job, Worker, WorkerRegistry, _decode_worker
+from ..ds.worker import Job, Worker, WorkerRegistry, _decode_worker, _encode_worker
 from ..store import ops
 from .cluster import Cluster
 
@@ -154,16 +154,15 @@ class TestWorkerWorkflow(unittest.TestCase):
         t.join(timeout=10)
 
     def test_registry_lifecycle_and_cleanup(self) -> None:
-        lease = Seconds(0.2)
         registry = WorkerRegistry(GROUP, self.rn)
 
-        w = Worker(GROUP, self.rn, lease, Seconds(10), registry=registry)
+        w = Worker(GROUP, self.rn, Seconds(60), Seconds(10), registry=registry)
         w.bind(b"jobs", TaskPayload, lambda _j: None)
 
         w.heartbeat()
         w.deregister()
 
-        stale = Worker(GROUP, self.rn, lease, Seconds(10), registry=registry)
+        stale = Worker(GROUP, self.rn, Seconds(60), Seconds(10), registry=registry)
         stale.bind(b"jobs", TaskPayload, lambda _j: None)
         stale.register()
 
@@ -172,11 +171,15 @@ class TestWorkerWorkflow(unittest.TestCase):
         self.assertEqual(len(list(registry.list_workers())), 2)
         self.assertEqual(len(list(registry.workers_for_queue(b"jobs"))), 2)
 
-        threshold = Millis(int(lease * 3000))
-        time.sleep(threshold / 1000 + 0.1)
+        session = self.rn.session_rw()
+        workers_map = registry.workers(session)
+        rec = workers_map.get(stale.worker_id)
+        old_value = _encode_worker(0, (b"jobs",))
+        self._submit(workers_map.tx_put(stale.worker_id, old_value, expect=rec))
+
         w.heartbeat()
 
-        cleaned, tx = registry.cleanup_stale(threshold)
+        cleaned, tx = registry.cleanup_stale(Millis(1000))
         self._submit(tx)
         self.assertEqual(cleaned, 1)
 

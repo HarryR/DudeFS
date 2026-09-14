@@ -1,201 +1,122 @@
 # DudeFS Python code style
 
-> **Status:** the conventions the `dudefs/` package is written to. Recorded so
-> they survive across sessions and contributors. The overriding aims: **strict,
-> honest typing** and **a straightforward path to idiomatic Rust and Go** — the
-> POC is a reference implementation, so its shapes should translate, not fight
-> the translator. Where a Python-ism has no clean Rust/Go analogue, prefer the
-> form that does. `make check` (ruff + ty + tests) is the gate; keep it green.
+> The conventions the `dude/` package is written to. The overriding aims:
+> strict, honest typing and a straightforward path to idiomatic Rust and
+> Go. The POC is a reference implementation, so its shapes should translate,
+> not fight the translator. Where a Python-ism has no clean Rust/Go
+> analogue, prefer the form that does. `make check` (ruff + ty + tests)
+> is the gate; keep it green.
 
-## 0. Toolchain — self-contained, never global
+## 0. Toolchain
 
-- Dev tooling lives **under the project**: `make install` puts `uv` in `./.uv`
-  (via `UV_UNMANAGED_INSTALL`, never `~/.local/bin`) and a `./.venv` with **ruff**
-  (lint + format) and **ty** (Astral's Rust type checker). Nothing touches `$HOME`.
-- **Never install anything globally, or install anything at all without explicit
-  consent.** "We both know this tool" is not consent.
-- `ruff` is lint + format; it is **not** a type checker. `ty` is the type checker
-  (Pylance/pyright also runs in-editor). Don't conflate them.
-- `make check` = `ruff check` + `ruff format --check` + `ty check` + `unittest`.
-  It must stay green; that is the definition of "done" for a change.
+Dev tooling lives under the project: `make install` puts `uv` in `./.uv`
+and a `./.venv` with ruff (lint + format) and ty (typecheck). Nothing
+touches `$HOME`. Never install anything globally, or install anything at
+all without explicit consent.
+
+`make check` = `ruff check` + `ruff format --check` + `ty check`. It must
+stay green.
 
 ## 1. Modern Python (target 3.12+)
 
-Use current language features; do **not** hand-stringify hints or reach for
-legacy `typing` shims.
+Use current language features.
 
-- **PEP 695 type aliases**: `type Bencodable = int | bytes | ...`, not
-  `Bencodable = "..."` string aliases or `TypeAlias`.
-- **Built-in generics and unions**: `list[T]`, `dict[K, V]`, `tuple[...]`,
-  `X | None` — never `typing.List`/`Optional`/`Union`.
-- **`typing.Self`** for methods returning their own class (classmethods /
-  instance methods). Plain unqualified class name where `Self` is invalid
-  (staticmethods).
-- **`@functools.total_ordering`** to derive the comparison operators from
-  `__eq__` + one of `__lt__`/`__le__` (see `HLC`, `Ballot`) — don't hand-write
-  `__gt__`/`__ge__` (their absence is also a real bug: `>=` silently works via
-  reflected ops but a type checker flags it).
-- `from __future__ import annotations` is fine and used — it keeps annotations
-  lazy (clean forward refs, no import-time cost). It is *not* the "stringized
-  hints" that are discouraged; that means **manually** quoting types.
+- Built-in generics and unions: `list[T]`, `dict[K, V]`, `tuple[...]`,
+  `X | None`. Never `typing.List`, `Optional`, `Union`.
+- `typing.Self` for methods returning their own class.
+- `@functools.total_ordering` to derive comparison operators.
+- `TypedDict` with `Unpack` for shared kwargs patterns (`GuardOpts`).
+- `from __future__ import annotations` is present in some files but not
+  required on 3.12+. Do not add it to new files.
 
 ## 2. Types are strict and honest
 
-The type checker is a design tool, not a formality. Two rules:
+The type checker is a design tool, not a formality.
 
-1. **No `Any` except at a genuinely dynamic boundary.** The bencode `codec.decode`
-   returns `Bencodable` (a real recursive union), not `Any`. `Any`/`object`
-   survive only where the value truly is dynamic: `codec.encode(value: object)`
-   (accepts anything and validates at runtime), a build-side dict fed straight to
-   `encode`, or a decoded control-op body handled dynamically.
-2. **The wire→typed boundary is a set of *validating extractors*, not casts.**
-   `codec.as_int/as_bytes/as_seq/as_dict` turn a `Bencodable` into a concrete
-   type *or raise* `CodecError`. This is real validation — a malformed field
-   fails at the boundary, not confusingly three layers down. Prefer these over
-   `cast`. The library is **cast-free**: the one place that looked like it needed
-   a cast (`Op.from_bytes` re-keying) instead validates via `Field(k)`.
+1. No `Any` except at a genuinely dynamic boundary. The bencode
+   `codec.decode` returns `Bencodable` (a real recursive union), not
+   `Any`.
+2. The wire-to-typed boundary is a set of validating extractors, not
+   casts. `codec.as_int/as_bytes/as_seq/as_dict` turn a `Bencodable`
+   into a concrete type or raise `CodecError`.
 
-### `tuple` over `list` for immutable/decoded data
+### ABCs over type aliases for polymorphic types
 
-`Bencodable`'s sequence arm is `tuple[Bencodable, ...]`, not `list`:
+A closed set of related types with shared interface is an ABC hierarchy,
+not a `type X = A | B` union alias. The ABC defines the abstract
+interface (`encode`, `decode`), each subclass owns its own
+implementation. This gives isinstance narrowing, registry patterns for
+decode dispatch, and a single place to add new variants.
 
-- Decoded wire data is **immutable** by nature — a tuple enforces it and is
-  lower-memory.
-- Tuples are **covariant** (because immutable), so a `tuple[int, ...]` from
-  `HLC.encode()` *is* a `tuple[Bencodable, ...]` — constructing bencodable
-  structures needs no cast past `list`'s invariance.
-- Tuples are **concrete**, so `isinstance(v, tuple)` narrows cleanly. (A
-  covariant *abstract* `Sequence` was tried and reverted: narrowing it back to a
-  concrete type degrades the element type to `Unknown`.)
+`@dataclass(frozen=True, slots=True)` on ABC subclasses: the decorator
+creates a new class when adding `__slots__`, so `__init_subclass__`
+registrations see the pre-dataclass class. Register subclasses after
+the dataclass decorator runs, not inside `__init_subclass__`.
 
-Rule of thumb: **`list` only when you actually mutate it; `tuple` for fixed,
-returned, or decoded sequences.**
+### `tuple` over `list` for immutable data
+
+Decoded wire data is immutable by nature. `list` only when you actually
+mutate it; `tuple` for fixed, returned, or decoded sequences.
 
 ### `TypedDict` for known-shape records
 
 A dict with a fixed set of string keys is a struct, not a mapping. Use
-`TypedDict` (`fold.SnapEntry`, `Cert`, `Genesis`). `dict[str, Any]` for a
-known-shape record is a smell (and untranslatable — Rust/Go want a struct).
-
-### Decouple with `Protocol`
-
-To avoid an import cycle between layers, depend on a structural `Protocol`, not
-the concrete class (see `handlers.data.StateReader` standing in for the fold's
-`StateView`).
+`TypedDict`. `dict[str, Any]` for a known-shape record is a smell.
 
 ## 3. Enums, not string/byte constants
 
-A closed set of values is an enum. This is both a strictness win and the
-Rust/Go-faithful form (a Rust `enum`, a Go typed-constant group).
+A closed set of values is an enum.
 
-- **Values that go on the wire** (encoded in ops/artifacts) → **`BytesEnum`**
-  (`class X(bytes, Enum)`): members *are* bytes, so they encode via the codec,
-  hash/compare as their value, and work as dict keys interchangeably with plain
-  bytes. Examples: `OpClass`, `Guard`, `Mutation`, `Field`, `TxnField`,
-  `ControlKind`, `Cap`.
-- **Values persisted / serialized** (DB, wire response) → **`StrEnum`** (stable
-  string `.value` round-trips): e.g. `store.EvidenceKind`.
-- **Purely in-memory** result/reason enums → **plain `Enum`** with `auto()` —
-  the strictest form: a member is *not* equal to a raw string, so it cannot be
-  compared to a string by accident. Examples: `acceptor.RejectReason`,
-  `handlers.data.OpaqueReason`.
+- Values that go on the wire: `class X(bytes, enum.Enum)`. Members are
+  bytes, so they encode via the codec and compare as their value.
+  Example: `OpType` for mutation and predicate wire tags.
+- Values persisted or serialized: `StrEnum` (stable string `.value`).
+- Purely in-memory result/reason enums: plain `Enum` with `auto()`.
 
-Field-*key* constants are a closed set too — they became `Field`/`TxnField`
-(`BytesEnum`), not loose `K_*` module constants. The only bare constant left is
-a lone discriminator key (`control.BK_KIND`) where an enum-of-one adds nothing.
+## 4. Errors: a typed hierarchy
 
-## 4. Errors: a typed hierarchy, never string flavours
+If you find yourself testing an error by its string message, the
+distinction wants to be a type.
 
-If you find yourself **testing an error by its string message**, or catching a
-typed exception only to re-raise it with `str(e)` as the message, stop — the
-distinction wants to be a **type**, not a string.
-
-**Package hierarchy** (`dudefs/errors.py` holds only the root; per-module bases
-live in their modules):
+The hierarchy (`dude/core/errors.py` holds the root):
 
 ```
-DudeFSError                      # catch-all: `except DudeFSError`
-├── codec.CodecError             # per-module bases: `except codec.CodecError`
-├── crypto.CryptoError
-└── artifacts.ArtifactError
-    ├── artifacts.UnknownField   # typed leaves: `except UnknownField`
-    └── artifacts.MissingField   # both carry `.key: bytes` (structured, not a message)
+DudeError                         # catch-all
+  codec.CodecError                # wire/parse errors
+  StoreError                      # store-layer errors
+    OpError                       # operation encoding/decoding
+  SessionError                    # session-layer errors
+  LinkError                       # network link errors
+  RoundError                      # consensus round errors
+  CLIError                        # CLI user-facing errors
 ```
 
-A leaf earns its existence by being a distinct *kind* of failure, not a distinct
-*message*. Counter-example we removed: a "MalformedField" that only asserted a
-decoded tuple's arity — that's a bencode *shape* check, so it lives in the codec
-(`codec.as_seq(v, n)` → `CodecError`), in the same family as `as_int`/`as_bytes`,
-not as a bespoke artifact error. Artifact leaves are about *keys* (unknown /
-missing); shape is the codec's job.
+A consumer can `except DudeError` (all), `except StoreError` (one
+layer), or `except OpError` (one failure kind).
 
-- A consumer can `except DudeFSError` (all), `except <module>.<Base>` (one
-  module), or `except <Leaf>` (one failure) — the three granularities.
-- **Leaves carry structured data, not string messages.** `UnknownField(key)` and
-  `MissingField(key)` expose `.key: bytes`; the constructor sets a human-readable
-  message for *display only*. Code branches on the **type** (and reads
-  attributes), never on `str(e)`.
-- **The catch-all is a real guarantee: no decode/parse path may leak a bare
-  `KeyError`/`ValueError`.** Required-field access goes through a helper that
-  raises the typed `MissingField` (`artifacts._require`), not `dict[key]`. When a
-  stdlib call raises (e.g. `Field(k)` raising `ValueError`), translate it to a
-  typed leaf immediately — don't stringify it.
-- **Diagnostic messages are fine** on a typed error, as long as they are for
-  humans and never the differentiator. A single error type with a message *is*
-  acceptable for genuinely fine-grained, minor variants that no one branches on
-  (e.g. the many `CodecError` bencode-parse messages) — don't over-fragment those
-  into leaves.
-- **Result-shaped "errors" are not exceptions.** An expected outcome is
-  *returned*, not raised — a `Result`-style variant. Exceptions are for genuine,
-  unexpected errors (a broken invariant, a bug): those deserve a real signal (a
-  stack trace), never a quiet `None`. A garbled frame *from the wire* is expected
-  (attackers send garbage) → a returned `Dropped`/`MalformedReply` variant; a
-  garbled value from a trusted in-process caller is a bug → let it raise.
-- **A `Result` can have many variants; absence is `Option`, never a lossy
-  `None`.** `bytes | None` is fine when `None` is a *clean* Option the caller
-  needs one bit of ("reply / no-reply", `daemon.serve`). But do **not** collapse
-  several *distinct* causes into one `None`/one umbrella — that erases the *why*.
-  Model the outcome as a union of cause-named variants:
-  `lmsg.classify_inbound → Gated | Refused | Dropped`,
-  `lmsg.classify_reply → Reply | NoReply | MalformedReply | WrongPeer`
-  (not a single `Unusable(reason: str)` we removed).
-- **Say why, not what** (intent-based nominative determinism). A status, variant,
-  or reason is named for its **cause**, not its category. `"is not a string"` →
-  `"expected an int in range"`. A peer-gate refusal is `Rejected(NOT_A_MEMBER)` /
-  `Rejected(STALE_ENVELOPE)` — the door check that failed — not a generic
-  `BAD_AUTHZ`. The *why* must flow back unambiguously at the boundary so it *can*
-  be logged (whether we log now is a separate choice); a caught-all reason that
-  says only "it didn't work" is a bug in the API, not a convenience.
-- Vendored code (`vendor/ed25519.py`) stays standalone and may raise stdlib
-  `ValueError` on misuse — it is deliberately not coupled to this hierarchy.
+Leaves carry structured data, not string messages. Code branches on the
+type (and reads attributes), never on `str(e)`.
 
-## 5. I/O lives at the edges — a pure core, sans-io
+Result-shaped outcomes are not exceptions. An expected outcome is
+returned, not raised. `SettleResult` is `Settled | Pending | Unknown`,
+not three exception types. `AckResult` is `Accepted | SubmitRefused`.
+Exceptions are for genuine, unexpected errors.
 
-The encoding/logic layer does **no I/O**: no sockets, no blocking, no timeouts, no
-threads. It takes bytes/values and returns bytes/typed-values, and is trivially
-testable without a network. The **transport** owns the I/O — it opens the socket,
-sets the timeout, retries — and *renders* the pure layer's typed outcome into its
-carrier: a reply to send, or that carrier's native "nothing" (a closed frame, no
-XMPP stanza, an HTTP 404).
+## 5. I/O lives at the edges
 
-- A function that both **encodes and sends** is the smell — split it. The codec
-  builds the bytes; the transport moves them.
-- Don't hide I/O behind a callback to fake purity. *Anti-pattern we deleted:*
-  `peerwire.call(send=lambda …)` took a send-callback and orchestrated
-  send → block → recv — I/O smuggled into the codec layer, which also forced a
-  synchronous request/reply shape onto a "push a message, get a reply — maybe"
-  transport. The fix: `lmsg` is pure (`author`/`gate`/`classify_*`), and
-  `daemon`/`client`/`cli` own the sockets and render the outcomes.
-- Message-oriented transports are **event-driven**: emit an envelope, handle the
-  reply as a later inbound event (or via gossip, keyed by request-hash). The pure
-  layer must not *assume* a synchronous reply — a unix socket may await inline, but
-  that's the transport's private business, not the codec's contract.
+The store, consensus, and data-structure layers do no I/O. They take
+bytes/values and return bytes/typed-values. The transport and substrate
+layers own sockets, timeouts, and threading. The session layer bridges
+the two: it knows how to submit a transaction and wait for settlement,
+but the actual I/O is in the substrate implementation.
+
+A function that both encodes and sends is the smell. The codec builds
+the bytes; the transport moves them.
 
 ## 6. Small things
 
-- Docstrings cite the normative doc section (`DESIGN §6`, `PROTOCOL §1.1`) — the
-  code is an implementation *of* the design; keep the trace.
 - Line length 100; ruff formats. Don't hand-align against the formatter.
-- Prefer a validating constructor/extractor at a boundary over trusting input and
-  failing later. "Parse, don't validate" — turn bytes into typed values once, at
-  the edge, and work with the typed values inside.
+- Prefer a validating constructor at a boundary over trusting input and
+  failing later. Parse, don't validate.
+- Comments name the specific regression that returns silently if deleted.
+  If you cannot name one, delete the comment.
